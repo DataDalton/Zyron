@@ -288,6 +288,24 @@ pub enum Keyword {
     Columnar,
     Heap,
 
+    // Lakehouse format and clustering
+    Zyronlake,
+    Cluster,
+    Clustering,
+    Derived,
+    Auto,
+    Force,
+    Incremental,
+    Peer,
+    Server,
+    Address,
+    Follow,
+    Unfollow,
+    Continuous,
+    Ondemand,
+    Zorder,
+    Enforced,
+
     // TTL / data retention
     Ttl,
     Days,
@@ -298,7 +316,7 @@ pub enum Keyword {
     Retain,
     Expire,
 
-    // Phase 17 data lifecycle
+    // Data lifecycle
     Legal,
     Forget,
     Tier,
@@ -405,6 +423,7 @@ pub enum Keyword {
     Versioning,
     Period,
     Of,
+    Clone,
 
     // Pipeline / Medallion
     Pipeline,
@@ -615,9 +634,18 @@ pub enum Token {
 
     /// Integer literal.
     Integer(i64),
+    /// The magnitude of a whole number literal too wide for i64.
+    ///
+    /// Unsigned because the sign is a separate token, and the largest
+    /// negative i128 has a magnitude one past the largest positive one, so
+    /// a signed token could not carry it. The parser applies the sign.
+    BigInteger(u128),
 
     /// Floating-point literal.
     Float(f64),
+    /// A fixed-point literal wider than f64 exactness, as unscaled digits
+    /// and scale. Narrow fixed-point literals lex as Float.
+    Decimal(i128, u8),
 
     /// String literal (single-quoted).
     String(String),
@@ -685,7 +713,11 @@ impl std::fmt::Display for Token {
         match self {
             Token::Keyword(kw) => write!(f, "{kw}"),
             Token::Integer(n) => write!(f, "{n}"),
+            Token::BigInteger(n) => write!(f, "{n}"),
             Token::Float(n) => write!(f, "{n}"),
+            Token::Decimal(digits, scale) => {
+                write!(f, "{}", zyron_common::format_decimal(*digits, *scale))
+            }
             Token::String(s) => write!(f, "'{s}'"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::Parameter(n) => write!(f, "${n}"),
@@ -1007,6 +1039,24 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "COLUMNAR" => Some(Keyword::Columnar),
         "HEAP" => Some(Keyword::Heap),
 
+        // Lakehouse format and clustering
+        "ZYRONLAKE" => Some(Keyword::Zyronlake),
+        "CLUSTER" => Some(Keyword::Cluster),
+        "CLUSTERING" => Some(Keyword::Clustering),
+        "DERIVED" => Some(Keyword::Derived),
+        "PEER" => Some(Keyword::Peer),
+        "SERVER" => Some(Keyword::Server),
+        "FOLLOW" => Some(Keyword::Follow),
+        "UNFOLLOW" => Some(Keyword::Unfollow),
+        "ADDRESS" => Some(Keyword::Address),
+        "AUTO" => Some(Keyword::Auto),
+        "FORCE" => Some(Keyword::Force),
+        "INCREMENTAL" => Some(Keyword::Incremental),
+        "CONTINUOUS" => Some(Keyword::Continuous),
+        "ONDEMAND" => Some(Keyword::Ondemand),
+        "ZORDER" => Some(Keyword::Zorder),
+        "ENFORCED" => Some(Keyword::Enforced),
+
         // TTL / data retention
         "TTL" => Some(Keyword::Ttl),
         "DAYS" => Some(Keyword::Days),
@@ -1017,7 +1067,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "RETAIN" => Some(Keyword::Retain),
         "EXPIRE" => Some(Keyword::Expire),
 
-        // Phase 17 data lifecycle
+        // Data lifecycle
         "LEGAL" => Some(Keyword::Legal),
         "FORGET" => Some(Keyword::Forget),
         "TIER" => Some(Keyword::Tier),
@@ -1083,6 +1133,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "VERSIONING" => Some(Keyword::Versioning),
         "PERIOD" => Some(Keyword::Period),
         "OF" => Some(Keyword::Of),
+        "CLONE" => Some(Keyword::Clone),
 
         // Pipeline
         "PIPELINE" => Some(Keyword::Pipeline),

@@ -633,10 +633,6 @@ fn compute_json_diff(old: &JsonValue, new: &JsonValue, path: &str, ops: &mut Vec
     }
 }
 
-fn escape_json_pointer(s: &str) -> String {
-    s.replace('~', "~0").replace('/', "~1")
-}
-
 /// Joins a JSON Pointer path with a child key. Avoids the format! +
 /// double-replace allocations of escape_json_pointer when the key has no
 /// special characters (the common case in 99%+ of real-world JSON)

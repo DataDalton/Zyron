@@ -9,6 +9,7 @@ zyron-common = { path = "../zyron-common" }
 zyron-cdc = { path = "../zyron-cdc" }
 zyron-catalog = { path = "../zyron-catalog" }
 zyron-storage = { path = "../zyron-storage" }
+zyron-wal = { path = "../zyron-wal" }
 zyron-auth = { path = "../zyron-auth" }
 parking_lot = { workspace = true }
 scc = { workspace = true }

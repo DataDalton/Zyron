@@ -6,8 +6,8 @@
 // non-empty line as an object, coercing fields to StreamValue per TypeId.
 // The writer emits one compact JSON object per row followed by a newline.
 
-use super::{ColumnSpec, FormatReader, FormatWriter};
 use super::schema::{json_to_stream_value, stream_value_to_json};
+use super::{ColumnSpec, FormatReader, FormatWriter};
 use crate::row_codec::StreamValue;
 use zyron_common::{Result, ZyronError};
 
@@ -18,14 +18,9 @@ use zyron_common::{Result, ZyronError};
 pub struct JsonLinesReader;
 
 impl FormatReader for JsonLinesReader {
-    fn read_rows(
-        &mut self,
-        bytes: &[u8],
-        schema: &[ColumnSpec],
-    ) -> Result<Vec<Vec<StreamValue>>> {
-        let text = std::str::from_utf8(bytes).map_err(|e| {
-            ZyronError::StreamingError(format!("jsonl: invalid UTF-8: {e}"))
-        })?;
+    fn read_rows(&mut self, bytes: &[u8], schema: &[ColumnSpec]) -> Result<Vec<Vec<StreamValue>>> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| ZyronError::StreamingError(format!("jsonl: invalid UTF-8: {e}")))?;
         let mut rows = Vec::new();
         for (i, line) in text.lines().enumerate() {
             let trimmed = line.trim();
@@ -48,17 +43,12 @@ impl FormatReader for JsonLinesReader {
 pub struct JsonLinesWriter;
 
 impl FormatWriter for JsonLinesWriter {
-    fn write_rows(
-        &mut self,
-        rows: &[Vec<StreamValue>],
-        schema: &[ColumnSpec],
-    ) -> Result<Vec<u8>> {
+    fn write_rows(&mut self, rows: &[Vec<StreamValue>], schema: &[ColumnSpec]) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         for row in rows {
             let obj = row_to_object(row, schema)?;
-            let s = serde_json::to_string(&obj).map_err(|e| {
-                ZyronError::StreamingError(format!("jsonl: serialize error: {e}"))
-            })?;
+            let s = serde_json::to_string(&obj)
+                .map_err(|e| ZyronError::StreamingError(format!("jsonl: serialize error: {e}")))?;
             out.extend_from_slice(s.as_bytes());
             out.push(b'\n');
         }

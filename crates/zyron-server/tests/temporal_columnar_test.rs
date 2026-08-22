@@ -4,7 +4,7 @@
 //! A `TIMESTAMP(9)` / `TIMESTAMPTZ(12)` column is physically a 16-byte i128
 //! picosecond value, and `HLC` is a 16-byte packed instant. This test proves
 //! those 16-byte values survive byte-identically through:
-//!   (a) the heap -> .zyr fold (physical width derived from ts_precision),
+//!   (a) the heap -> .zyr fold (physical width derived from fractional_digits),
 //!   (b) a value patch + supersede in the .zyrpatch overlay,
 //!   (c) the incremental merge that folds the patch into a new base segment,
 //! including the `MAX_TIMESTAMP_PS` open-interval sentinel (a live versioned
@@ -111,22 +111,12 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -152,11 +142,11 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
 
     let te = catalog.get_table_by_id(table_id).unwrap();
-    // ts_precision must be persisted on the catalog column or the fold path
+    // fractional_digits must be persisted on the catalog column or the fold path
     // can't derive the 16-byte physical width.
     let t9c = te.columns.iter().find(|c| c.name == "t9").unwrap();
     assert_eq!(
-        t9c.ts_precision,
+        t9c.fractional_digits,
         Some(9),
         "TIMESTAMP(9) precision persisted"
     );
@@ -165,7 +155,7 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
             .iter()
             .find(|c| c.name == "t12")
             .unwrap()
-            .ts_precision,
+            .fractional_digits,
         Some(12)
     );
 
@@ -213,7 +203,6 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let run = |c: &Catalog, t: &Arc<TransactionManager>| -> (u64, u64) {
@@ -223,7 +212,7 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None)
+            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None, None)
         })
     };
 
@@ -283,9 +272,9 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let rid0 = seg.sys_rowid_lo; // rowid order == insertion order here
     let new_t9: i128 = 1_775_000_000_000_000i128 * 1_000_000 + 999;
     store
-        .append_value_patch(fid, rid0, t9_col, 50, 1, &new_t9.to_le_bytes())
+        .append_value_patch(0, fid, rid0, t9_col, 50, 1, &new_t9.to_le_bytes())
         .unwrap();
-    store.append_supersede(fid, rid0 + 1, 60, 2).unwrap();
+    store.append_supersede(0, fid, rid0 + 1, 60, 2).unwrap();
     let o0 = store.row_overlay(fid, rid0).expect("value overlay");
     assert_eq!(
         i128::from_le_bytes(o0.patches[&t9_col][0].value[..16].try_into().unwrap()),
@@ -348,22 +337,12 @@ async fn encoder_selection_is_dense_on_folded_columns() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8192 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -420,7 +399,6 @@ async fn encoder_selection_is_dense_on_folded_columns() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let (rows, segs) = {
@@ -430,7 +408,7 @@ async fn encoder_selection_is_dense_on_folded_columns() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None)
+            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None, None)
         })
     };
     assert_eq!(rows, N as u64);

@@ -781,7 +781,6 @@ fn decode_ean_like(modules: &[bool], total_digits: usize, ean8: bool) -> Result<
 struct QrCode {
     size: usize,
     modules: Vec<bool>,
-    function: Vec<bool>,
 }
 
 const QR_VERSIONS: usize = 10;
@@ -960,7 +959,6 @@ fn qr_build(data: &[u8], ec: QrErrorCorrection) -> Result<QrCode> {
     Ok(QrCode {
         size,
         modules: final_modules,
-        function,
     })
 }
 
@@ -2909,13 +2907,6 @@ fn dm_data_dims(sym: &DmSymbol) -> (usize, usize) {
         sym.regions_v as usize * sym.region_inner_rows as usize,
         sym.regions_h as usize * sym.region_inner_cols as usize,
     )
-}
-
-/// Backwards-compat helper: returns square dim. Panics if symbol is rectangular
-fn dm_data_dim(sym: &DmSymbol) -> usize {
-    let (r, c) = dm_data_dims(sym);
-    debug_assert_eq!(r, c, "dm_data_dim called on rectangular symbol");
-    r
 }
 
 fn dm_wrap_coords(mut r: i32, mut c: i32, nrow: i32, ncol: i32) -> (usize, usize) {

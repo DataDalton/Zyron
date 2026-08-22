@@ -1,0 +1,81 @@
+{
+  "id": "2026-08-21_135319_6456b90-local",
+  "date": "2026-08-21 13:53:22Z",
+  "ts": 1787320402,
+  "commit": "6456b90-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Arrow IPC Write": {
+      "rows/sec at batch=10000": {
+        "average": 21223749.811803,
+        "runs": [19621116.25, 20638343.98, 21904365.54, 22447696.87, 21507226.43],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Avro Write": {
+      "rows/sec at batch=10000": {
+        "average": 1806322.505008,
+        "runs": [1806861.01, 1812007.81, 1802113.52, 1801821.28, 1808808.90],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CSV Write": {
+      "rows/sec at batch=10000": {
+        "average": 6069310.976454,
+        "runs": [6002112.74, 6096966.15, 6130982.31, 6092397.30, 6024096.39],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "JSON Write": {
+      "rows/sec at batch=10000": {
+        "average": 1781272.073241,
+        "runs": [1694831.95, 1660098.21, 1748303.71, 1987226.11, 1815900.39],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "JSONL Write": {
+      "rows/sec at batch=10000": {
+        "average": 3573831.707596,
+        "runs": [3534055.93, 3587881.57, 3582367.59, 3587714.23, 3577139.22],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parquet Write": {
+      "rows/sec at batch=10000": {
+        "average": 8844915.865160,
+        "runs": [9202679.82, 8541095.48, 8434619.05, 8641324.54, 9404860.43],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

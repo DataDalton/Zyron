@@ -12,28 +12,55 @@ use crate::optimizer::rules::{encoding_pushdown, parallel_plan};
 use crate::physical::*;
 use std::sync::Arc;
 use zyron_catalog::{Catalog, IndexEntry};
-use zyron_common::{Result, TypeId};
+use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::{BinaryOperator, JoinType};
 
 /// Converts an optimized logical plan into a physical plan using cost-based decisions.
-pub fn build_physical_plan(logical: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
+///
+/// `peers` is this node's view of the mesh, needed to cost a scan of a table
+/// that lives on one. It is passed rather than looked up, because peer
+/// membership is node-local state the catalog deliberately does not hold,
+/// and a planner reaching for a global would make two plans of the same
+/// query differ by which node built them without saying so. None costs
+/// every peer as unknown, which is the conservative estimate.
+pub fn build_physical_plan(
+    logical: LogicalPlan,
+    catalog: &Catalog,
+    peers: Option<&zyron_common::PeerRegistry>,
+) -> Result<PhysicalPlan> {
     let cost_model = CostModel::default();
-    PhysicalPlanner::new(catalog, cost_model).plan(logical)
+    PhysicalPlanner::new(catalog, cost_model, peers).plan(logical)
 }
 
 struct PhysicalPlanner<'a> {
     catalog: &'a Catalog,
     cost_model: CostModel,
+    peers: Option<&'a zyron_common::PeerRegistry>,
 }
 
 impl<'a> PhysicalPlanner<'a> {
-    fn new(catalog: &'a Catalog, cost_model: CostModel) -> Self {
+    fn new(
+        catalog: &'a Catalog,
+        cost_model: CostModel,
+        peers: Option<&'a zyron_common::PeerRegistry>,
+    ) -> Self {
         Self {
             catalog,
             cost_model,
+            peers,
         }
     }
 
+    /// Converts one logical node into a physical one, recursing into its
+    /// children.
+    ///
+    /// Each arm is its own method rather than being written inline. That is
+    /// load bearing, not tidiness: this recurses once per plan node, so one
+    /// frame is paid at every level, and a debug build gives each arm's
+    /// locals their own slot in this frame instead of sharing them. Inline,
+    /// one `plan` frame cost 51 KB whichever arm it took; delegating brings
+    /// it to roughly 10 KB, which is what keeps a wide join inside the
+    /// default 2 MiB thread stack
     fn plan(&self, logical: LogicalPlan) -> Result<PhysicalPlan> {
         match logical {
             LogicalPlan::Scan {
@@ -43,149 +70,13 @@ impl<'a> PhysicalPlanner<'a> {
                 as_of,
                 ..
             } => self.plan_scan(table_id, columns, None, encoding_hints, as_of, None),
-            LogicalPlan::Filter { predicate, child } => {
-                // Try to push the filter into a scan (index scan opportunity).
-                // Probe by reference, then take ownership only on the matching
-                // path so the shared Arc child is moved out at most once.
-                if matches!(child.as_ref(), LogicalPlan::Scan { .. }) {
-                    if let LogicalPlan::Scan {
-                        table_id,
-                        columns,
-                        encoding_hints,
-                        as_of,
-                        ..
-                    } = Arc::unwrap_or_clone(child)
-                    {
-                        // A subquery in the predicate is evaluated by a Filter
-                        // operator, not the scan: a correlated subquery needs the
-                        // outer row the scan does not carry, and an uncorrelated
-                        // one is folded at the Filter. Split the conjuncts so
-                        // subquery-free ones still push into the scan and only the
-                        // subquery-bearing ones stay above it.
-                        let conjuncts = split_conjuncts(&predicate);
-                        let (sub_conjuncts, simple_conjuncts): (Vec<_>, Vec<_>) =
-                            conjuncts.into_iter().partition(predicate_has_subquery);
-                        if sub_conjuncts.is_empty() {
-                            return self.plan_scan(
-                                table_id,
-                                columns,
-                                Some(predicate),
-                                encoding_hints,
-                                as_of,
-                                None,
-                            );
-                        }
-                        let scan_predicate = if simple_conjuncts.is_empty() {
-                            None
-                        } else {
-                            Some(combine_conjuncts(simple_conjuncts))
-                        };
-                        let scan = self.plan_scan(
-                            table_id,
-                            columns,
-                            scan_predicate,
-                            encoding_hints,
-                            as_of,
-                            None,
-                        )?;
-                        let scan_cost = *scan.cost();
-                        let filter_predicate = combine_conjuncts(sub_conjuncts);
-                        let selectivity =
-                            self.cost_model
-                                .estimate_selectivity(&filter_predicate, None, None);
-                        let cost = PlanCost {
-                            io_cost: 0.0,
-                            cpu_cost: scan_cost.row_count * self.cost_model.cpu_operator_cost,
-                            row_count: (scan_cost.row_count * selectivity).max(1.0),
-                        };
-                        return Ok(PhysicalPlan::Filter {
-                            predicate: filter_predicate,
-                            child: Box::new(scan),
-                            cost,
-                        });
-                    }
-                    unreachable!("child matched Scan above");
-                }
-
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
-                let child_cost = *child_plan.cost();
-                let selectivity = self.cost_model.estimate_selectivity(&predicate, None, None);
-                let cost = PlanCost {
-                    io_cost: 0.0,
-                    cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
-                    row_count: (child_cost.row_count * selectivity).max(1.0),
-                };
-                Ok(PhysicalPlan::Filter {
-                    predicate,
-                    child: Box::new(child_plan),
-                    cost,
-                })
-            }
+            LogicalPlan::Filter { predicate, child } => self.plan_filter(predicate, child),
             LogicalPlan::Project {
                 expressions,
                 aliases,
                 child,
                 output_table_idx,
-            } => {
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
-                let child_cost = *child_plan.cost();
-                let cost = PlanCost {
-                    io_cost: 0.0,
-                    cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
-                    row_count: child_cost.row_count,
-                };
-
-                // Collect window functions from expressions. If any exist, we
-                // insert a Window node between the child and Project, and rewrite
-                // each WindowFunction occurrence as a ColumnRef pointing to the
-                // appended window output column.
-                let mut window_exprs: Vec<crate::binder::BoundExpr> = Vec::new();
-                let mut window_names: Vec<String> = Vec::new();
-
-                let rewritten: Vec<crate::binder::BoundExpr> = expressions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        rewrite_window_refs(
-                            e,
-                            &mut window_exprs,
-                            &mut window_names,
-                            aliases.get(i).and_then(|a| a.clone()),
-                        )
-                    })
-                    .collect();
-
-                if !window_exprs.is_empty() {
-                    let window_cost = PlanCost {
-                        io_cost: 0.0,
-                        cpu_cost: child_cost.row_count
-                            * self.cost_model.cpu_operator_cost
-                            * window_exprs.len() as f64,
-                        row_count: child_cost.row_count,
-                    };
-                    let window_plan = PhysicalPlan::Window {
-                        window_exprs,
-                        window_names,
-                        child: Box::new(child_plan),
-                        cost: window_cost,
-                    };
-                    return Ok(PhysicalPlan::Project {
-                        expressions: rewritten,
-                        aliases,
-                        child: Box::new(window_plan),
-                        cost,
-                        output_table_idx,
-                    });
-                }
-
-                Ok(PhysicalPlan::Project {
-                    expressions,
-                    aliases,
-                    child: Box::new(child_plan),
-                    cost,
-                    output_table_idx,
-                })
-            }
+            } => self.plan_project(expressions, aliases, child, output_table_idx),
             LogicalPlan::Join {
                 left,
                 right,
@@ -203,134 +94,32 @@ impl<'a> PhysicalPlanner<'a> {
                 subquery_table_idx,
                 join_type,
                 condition,
-            } => {
-                let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
-                let left_cost = *left_plan.cost();
-                let left_schema = left_plan.output_schema();
-                // The right schema is the lateral output relabeled under the
-                // subquery's table index, NULLable when the join is a LEFT join.
-                let force_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
-                let right_schema: Vec<LogicalColumn> = subquery
-                    .0
-                    .output_schema
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| LogicalColumn {
-                        table_idx: Some(subquery_table_idx),
-                        column_id: zyron_catalog::ColumnId(i as u16),
-                        name: col.name.clone(),
-                        type_id: col.type_id,
-                        nullable: col.nullable || force_nullable,
-                        ts_precision: col.ts_precision,
-                    })
-                    .collect();
-                let cost = PlanCost {
-                    io_cost: left_cost.io_cost,
-                    cpu_cost: left_cost.cpu_cost
-                        + left_cost.row_count * self.cost_model.cpu_operator_cost * 4.0,
-                    row_count: left_cost.row_count,
-                };
-                Ok(PhysicalPlan::LateralJoin {
-                    left: Box::new(left_plan),
-                    subquery: *subquery.0,
-                    subquery_table_idx,
-                    join_type,
-                    condition,
-                    left_schema,
-                    right_schema,
-                    cost,
-                })
-            }
+            } => self.plan_lateral_join(left, subquery, subquery_table_idx, join_type, condition),
             LogicalPlan::Aggregate {
                 group_by,
                 aggregates,
                 child,
             } => self.plan_aggregate(group_by, aggregates, Arc::unwrap_or_clone(child)),
-            LogicalPlan::Sort { order_by, child } => {
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
-                let child_cost = *child_plan.cost();
-                let sort_cost = self.cost_model.cost_sort(&child_cost);
-                Ok(PhysicalPlan::Sort {
-                    order_by,
-                    child: Box::new(child_plan),
-                    limit: None,
-                    cost: PlanCost {
-                        io_cost: 0.0,
-                        cpu_cost: sort_cost.cpu_cost - child_cost.cpu_cost,
-                        row_count: child_cost.row_count,
-                    },
-                })
-            }
+            LogicalPlan::Sort { order_by, child } => self.plan_sort(order_by, child),
             LogicalPlan::Limit {
                 limit,
                 offset,
                 child,
-            } => {
-                // When the limit sits directly over a scan (optionally through a
-                // Filter), thread k into the scan so a vector-distance predicate
-                // becomes a real KNN VectorScan. When it sits over a
-                // Sort(ST_Distance) the three nodes collapse into a spatial KNN
-                // scan. Otherwise the child plans normally.
-                let limit_k = limit.map(|l| l as usize);
-                let scan_child = if offset.unwrap_or(0) == 0 {
-                    self.try_plan_knn_under_limit(child.as_ref(), limit_k)?
-                } else {
-                    None
-                };
-                let child_plan = match scan_child {
-                    Some(plan) => plan,
-                    None => self.plan(Arc::unwrap_or_clone(child))?,
-                };
-                let rows = limit
-                    .map(|l| (l as f64).min(child_plan.cost().row_count))
-                    .unwrap_or(child_plan.cost().row_count);
-                let cost = PlanCost {
-                    io_cost: 0.0,
-                    cpu_cost: rows * self.cost_model.cpu_tuple_cost,
-                    row_count: rows,
-                };
-                Ok(PhysicalPlan::Limit {
-                    limit,
-                    offset,
-                    child: Box::new(child_plan),
-                    cost,
-                })
-            }
-            LogicalPlan::Distinct { child } => {
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
-                let child_cost = *child_plan.cost();
-                let cost = PlanCost {
-                    io_cost: 0.0,
-                    cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
-                    row_count: child_cost.row_count * 0.8,
-                };
-                Ok(PhysicalPlan::HashDistinct {
-                    child: Box::new(child_plan),
-                    cost,
-                })
-            }
+            } => self.plan_limit(limit, offset, child),
+            LogicalPlan::Distinct { child } => self.plan_distinct(child),
+            LogicalPlan::LockRows {
+                table_id,
+                mode,
+                wait,
+                cap,
+                child,
+            } => self.plan_lock_rows(table_id, mode, wait, cap, child),
             LogicalPlan::SetOp {
                 op,
                 all,
                 left,
                 right,
-            } => {
-                let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
-                let right_plan = self.plan(Arc::unwrap_or_clone(right))?;
-                let cost = PlanCost {
-                    io_cost: 0.0,
-                    cpu_cost: (left_plan.cost().row_count + right_plan.cost().row_count)
-                        * self.cost_model.cpu_tuple_cost,
-                    row_count: left_plan.cost().row_count + right_plan.cost().row_count,
-                };
-                Ok(PhysicalPlan::SetOp {
-                    op,
-                    all,
-                    left: Box::new(left_plan),
-                    right: Box::new(right_plan),
-                    cost,
-                })
-            }
+            } => self.plan_set_op(op, all, left, right),
             LogicalPlan::Insert {
                 table_id,
                 target_columns,
@@ -338,137 +127,712 @@ impl<'a> PhysicalPlanner<'a> {
                 check_constraints,
                 expectations,
                 source,
-            } => {
-                let source_plan = self.plan(Arc::unwrap_or_clone(source))?;
-                let cost = *source_plan.cost();
-                Ok(PhysicalPlan::Insert {
-                    table_id,
-                    target_columns,
-                    column_defaults,
-                    check_constraints,
-                    expectations,
-                    source: Box::new(source_plan),
-                    cost,
-                })
-            }
-            LogicalPlan::Values { rows, schema } => {
-                let cost = PlanCost {
-                    io_cost: 0.0,
-                    cpu_cost: rows.len() as f64 * self.cost_model.cpu_tuple_cost,
-                    row_count: rows.len() as f64,
-                };
-                Ok(PhysicalPlan::Values { rows, schema, cost })
-            }
+            } => self.plan_insert(
+                table_id,
+                target_columns,
+                column_defaults,
+                check_constraints,
+                expectations,
+                source,
+            ),
+            LogicalPlan::Values { rows, schema } => self.plan_values(rows, schema),
             LogicalPlan::Update {
                 table_id,
                 assignments,
                 check_constraints,
                 child,
-            } => {
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
-                let cost = *child_plan.cost();
-                Ok(PhysicalPlan::Update {
-                    table_id,
-                    assignments,
-                    check_constraints,
-                    child: Box::new(child_plan),
-                    cost,
-                })
-            }
-            LogicalPlan::Delete { table_id, child } => {
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
-                let cost = *child_plan.cost();
-                Ok(PhysicalPlan::Delete {
-                    table_id,
-                    child: Box::new(child_plan),
-                    cost,
-                })
-            }
+            } => self.plan_update(table_id, assignments, check_constraints, child),
+            LogicalPlan::Delete { table_id, child } => self.plan_delete(table_id, child),
             LogicalPlan::GraphAlgorithm {
                 schema_name,
                 algorithm,
                 params,
                 output_columns,
-            } => {
-                let algo_type = match algorithm.as_str() {
-                    "pagerank" => GraphAlgorithmType::PageRank,
-                    "shortest_path" => GraphAlgorithmType::ShortestPath,
-                    "bfs" => GraphAlgorithmType::Bfs,
-                    "connected_components" => GraphAlgorithmType::ConnectedComponents,
-                    "community_detection" => GraphAlgorithmType::CommunityDetection,
-                    "betweenness_centrality" => GraphAlgorithmType::BetweennessCentrality,
-                    other => {
-                        return Err(zyron_common::ZyronError::PlanError(format!(
-                            "unknown graph algorithm '{}'",
-                            other
-                        )));
-                    }
-                };
-
-                // Cost estimates are tied to big-O complexity of each algorithm.
-                // Without edge/node counts at plan time, we use a nominal graph
-                // size of V=10_000 nodes and E=100_000 edges so the optimizer
-                // can at least rank graph queries against each other.
-                let v: f64 = 10_000.0;
-                let e: f64 = 100_000.0;
-                let pagerank_iters: f64 = 20.0;
-                let (cpu, row_count) = match algo_type {
-                    // O(iter * (V + E))
-                    GraphAlgorithmType::PageRank => (pagerank_iters * (v + e), v),
-                    // O(V + E) Dijkstra-equivalent, one path out
-                    GraphAlgorithmType::ShortestPath => (v + e, v.sqrt()),
-                    // O(V + E) level-limited, bounded by reachable subgraph
-                    GraphAlgorithmType::Bfs => (v + e, v),
-                    // O(V + E) union-find
-                    GraphAlgorithmType::ConnectedComponents => (v + e, v),
-                    // O(iter * (V + E)) Louvain-style
-                    GraphAlgorithmType::CommunityDetection => (10.0 * (v + e), v),
-                    // O(V * (V + E)) Brandes' algorithm, worst-case of the set
-                    GraphAlgorithmType::BetweennessCentrality => (v * (v + e), v),
-                };
-                let cost = PlanCost {
-                    io_cost: v, // single pass to read the graph backing tables
-                    cpu_cost: cpu,
-                    row_count,
-                };
-
-                Ok(PhysicalPlan::GraphAlgorithm {
-                    algorithm: algo_type,
-                    schema_name,
-                    params,
-                    output_columns,
-                    cost,
-                })
-            }
+            } => self.plan_graph_algorithm(schema_name, algorithm, params, output_columns),
             LogicalPlan::AnalyticsTableFunction {
                 function_name,
                 named_args,
                 positional_args,
                 output_columns,
-            } => {
-                // Cost: a single scan over the input source plus per-row work
-                // proportional to the function. Without source size info we
-                // use a nominal 10k-row estimate so the optimizer has a value
-                // to compare against.
-                let nominal_rows: f64 = 10_000.0;
-                let cost = PlanCost {
-                    io_cost: nominal_rows,
-                    cpu_cost: nominal_rows * 4.0,
-                    row_count: match function_name.as_str() {
-                        "DATA_PROFILE" | "COLUMN_PROFILE" => output_columns.len() as f64,
-                        "CORRELATION_MATRIX" => positional_args.len().pow(2) as f64,
-                        _ => nominal_rows,
-                    },
-                };
-                Ok(PhysicalPlan::AnalyticsTableFunction {
-                    function_name,
-                    named_args,
-                    positional_args,
-                    output_columns,
-                    cost,
-                })
-            }
+            } => self.plan_analytics_table_function(
+                function_name,
+                named_args,
+                positional_args,
+                output_columns,
+            ),
         }
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_filter(
+        &self,
+        predicate: crate::binder::BoundExpr,
+        child: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        // Try to push the filter into a scan (index scan opportunity).
+        // Probe by reference, then take ownership only on the matching
+        // path so the shared Arc child is moved out at most once.
+        if matches!(child.as_ref(), LogicalPlan::Scan { .. }) {
+            if let LogicalPlan::Scan {
+                table_id,
+                columns,
+                encoding_hints,
+                as_of,
+                ..
+            } = Arc::unwrap_or_clone(child)
+            {
+                // A subquery in the predicate is evaluated by a Filter
+                // operator, not the scan: a correlated subquery needs the
+                // outer row the scan does not carry, and an uncorrelated
+                // one is folded at the Filter. Split the conjuncts so
+                // subquery-free ones still push into the scan and only the
+                // subquery-bearing ones stay above it.
+                let conjuncts = split_conjuncts(&predicate);
+                let (sub_conjuncts, simple_conjuncts): (Vec<_>, Vec<_>) =
+                    conjuncts.into_iter().partition(predicate_has_subquery);
+                if sub_conjuncts.is_empty() {
+                    return self.plan_scan(
+                        table_id,
+                        columns,
+                        Some(predicate),
+                        encoding_hints,
+                        as_of,
+                        None,
+                    );
+                }
+                let scan_predicate = if simple_conjuncts.is_empty() {
+                    None
+                } else {
+                    Some(combine_conjuncts(simple_conjuncts))
+                };
+                let scan = self.plan_scan(
+                    table_id,
+                    columns,
+                    scan_predicate,
+                    encoding_hints,
+                    as_of,
+                    None,
+                )?;
+                let scan_cost = *scan.cost();
+                let filter_predicate = combine_conjuncts(sub_conjuncts);
+                let selectivity =
+                    self.cost_model
+                        .estimate_selectivity(&filter_predicate, None, None);
+                let cost = PlanCost {
+                    io_cost: 0.0,
+                    cpu_cost: scan_cost.row_count * self.cost_model.cpu_operator_cost,
+                    row_count: (scan_cost.row_count * selectivity).max(1.0),
+                };
+                return Ok(PhysicalPlan::Filter {
+                    predicate: filter_predicate,
+                    child: Box::new(scan),
+                    cost,
+                });
+            }
+            unreachable!("child matched Scan above");
+        }
+
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        let child_cost = *child_plan.cost();
+        let selectivity = self.cost_model.estimate_selectivity(&predicate, None, None);
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
+            row_count: (child_cost.row_count * selectivity).max(1.0),
+        };
+        Ok(PhysicalPlan::Filter {
+            predicate,
+            child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_project(
+        &self,
+        expressions: Vec<crate::binder::BoundExpr>,
+        aliases: Vec<Option<String>>,
+        child: Arc<LogicalPlan>,
+        output_table_idx: Option<usize>,
+    ) -> Result<PhysicalPlan> {
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        let child_cost = *child_plan.cost();
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
+            row_count: child_cost.row_count,
+        };
+
+        // Collect window functions from expressions. If any exist, we
+        // insert a Window node between the child and Project, and rewrite
+        // each WindowFunction occurrence as a ColumnRef pointing to the
+        // appended window output column.
+        let mut window_exprs: Vec<crate::binder::BoundExpr> = Vec::new();
+        let mut window_names: Vec<String> = Vec::new();
+
+        let rewritten: Vec<crate::binder::BoundExpr> = expressions
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                rewrite_window_refs(
+                    e,
+                    &mut window_exprs,
+                    &mut window_names,
+                    aliases.get(i).and_then(|a| a.clone()),
+                )
+            })
+            .collect();
+
+        if !window_exprs.is_empty() {
+            let window_cost = PlanCost {
+                io_cost: 0.0,
+                cpu_cost: child_cost.row_count
+                    * self.cost_model.cpu_operator_cost
+                    * window_exprs.len() as f64,
+                row_count: child_cost.row_count,
+            };
+            let window_plan = PhysicalPlan::Window {
+                window_exprs,
+                window_names,
+                child: Box::new(child_plan),
+                cost: window_cost,
+            };
+            return Ok(PhysicalPlan::Project {
+                expressions: rewritten,
+                aliases,
+                child: Box::new(window_plan),
+                cost,
+                output_table_idx,
+            });
+        }
+
+        Ok(PhysicalPlan::Project {
+            expressions,
+            aliases,
+            child: Box::new(child_plan),
+            cost,
+            output_table_idx,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_lateral_join(
+        &self,
+        left: Arc<LogicalPlan>,
+        subquery: crate::logical::LateralSubquery,
+        subquery_table_idx: usize,
+        join_type: JoinType,
+        condition: Option<crate::binder::BoundExpr>,
+    ) -> Result<PhysicalPlan> {
+        let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
+        let left_cost = *left_plan.cost();
+        let left_schema = left_plan.output_schema();
+        // The right schema is the lateral output relabeled under the
+        // subquery's table index, NULLable when the join is a LEFT join.
+        let force_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
+        let right_schema: Vec<LogicalColumn> = subquery
+            .0
+            .output_schema
+            .iter()
+            .enumerate()
+            .map(|(i, col)| LogicalColumn {
+                table_idx: Some(subquery_table_idx),
+                column_id: zyron_catalog::ColumnId(i as u16),
+                name: col.name.clone(),
+                type_id: col.type_id,
+                nullable: col.nullable || force_nullable,
+                fractional_digits: col.fractional_digits,
+            })
+            .collect();
+        let cost = PlanCost {
+            io_cost: left_cost.io_cost,
+            cpu_cost: left_cost.cpu_cost
+                + left_cost.row_count * self.cost_model.cpu_operator_cost * 4.0,
+            row_count: left_cost.row_count,
+        };
+        Ok(PhysicalPlan::LateralJoin {
+            left: Box::new(left_plan),
+            subquery: subquery.0,
+            subquery_table_idx,
+            join_type,
+            condition,
+            left_schema,
+            right_schema,
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_sort(
+        &self,
+        order_by: Vec<crate::binder::BoundOrderBy>,
+        child: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        // An index whose key order already matches the requested one
+        // answers the ORDER BY by being read in order, so the sort
+        // is removed rather than run over rows that arrive sorted
+        if let Some(scan) = self.try_plan_ordered_index_scan(&order_by, child.as_ref())? {
+            return Ok(scan);
+        }
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        let child_cost = *child_plan.cost();
+        let sort_cost = self.cost_model.cost_sort(&child_cost);
+        Ok(PhysicalPlan::Sort {
+            order_by,
+            child: Box::new(child_plan),
+            limit: None,
+            cost: PlanCost {
+                io_cost: 0.0,
+                cpu_cost: sort_cost.cpu_cost - child_cost.cpu_cost,
+                row_count: child_cost.row_count,
+            },
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_limit(
+        &self,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        child: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        // When the limit sits directly over a scan (optionally through a
+        // Filter), thread k into the scan so a vector-distance predicate
+        // becomes a real KNN VectorScan. When it sits over a
+        // Sort(ST_Distance) the three nodes collapse into a spatial KNN
+        // scan. Otherwise the child plans normally.
+        let limit_k = limit.map(|l| l as usize);
+        let scan_child = if offset.unwrap_or(0) == 0 {
+            self.try_plan_knn_under_limit(child.as_ref(), limit_k)?
+        } else {
+            None
+        };
+        let mut child_plan = match scan_child {
+            Some(plan) => plan,
+            None => self.plan(Arc::unwrap_or_clone(child))?,
+        };
+        // A foreign scan can serve the cap itself. Every row the
+        // offset skips still has to arrive, so the peer is asked for
+        // both
+        if let Some(rows) = limit {
+            let cap = (rows as usize).saturating_add(offset.unwrap_or(0) as usize);
+            push_limit_to_foreign_scan(&mut child_plan, cap);
+        }
+        let rows = limit
+            .map(|l| (l as f64).min(child_plan.cost().row_count))
+            .unwrap_or(child_plan.cost().row_count);
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: rows * self.cost_model.cpu_tuple_cost,
+            row_count: rows,
+        };
+        Ok(PhysicalPlan::Limit {
+            limit,
+            offset,
+            child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_distinct(&self, child: Arc<LogicalPlan>) -> Result<PhysicalPlan> {
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        let child_cost = *child_plan.cost();
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
+            row_count: child_cost.row_count * 0.8,
+        };
+        Ok(PhysicalPlan::HashDistinct {
+            child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_lock_rows(
+        &self,
+        table_id: zyron_catalog::TableId,
+        mode: crate::binder::RowLockMode,
+        wait: crate::binder::RowLockWait,
+        cap: Option<u64>,
+        child: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        let child_cost = *child_plan.cost();
+        let rows = cap
+            .map(|c| (c as f64).min(child_cost.row_count))
+            .unwrap_or(child_cost.row_count);
+        // one lock table insert per emitted row
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: rows * self.cost_model.cpu_operator_cost,
+            row_count: rows,
+        };
+        Ok(PhysicalPlan::LockRows {
+            table_id,
+            mode,
+            wait,
+            cap,
+            child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_set_op(
+        &self,
+        op: zyron_parser::ast::SetOpType,
+        all: bool,
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
+        let right_plan = self.plan(Arc::unwrap_or_clone(right))?;
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: (left_plan.cost().row_count + right_plan.cost().row_count)
+                * self.cost_model.cpu_tuple_cost,
+            row_count: left_plan.cost().row_count + right_plan.cost().row_count,
+        };
+        Ok(PhysicalPlan::SetOp {
+            op,
+            all,
+            left: Box::new(left_plan),
+            right: Box::new(right_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_insert(
+        &self,
+        table_id: zyron_catalog::TableId,
+        target_columns: Vec<zyron_catalog::ColumnId>,
+        column_defaults: Vec<(zyron_catalog::ColumnId, crate::binder::BoundExpr)>,
+        check_constraints: Vec<crate::binder::BoundExpr>,
+        expectations: Vec<crate::binder::BoundExpectation>,
+        source: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        let source_plan = self.plan(Arc::unwrap_or_clone(source))?;
+        let cost = *source_plan.cost();
+        Ok(PhysicalPlan::Insert {
+            table_id,
+            target_columns,
+            column_defaults,
+            check_constraints,
+            expectations,
+            source: Box::new(source_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_values(
+        &self,
+        rows: Vec<Vec<crate::binder::BoundExpr>>,
+        schema: Vec<crate::logical::LogicalColumn>,
+    ) -> Result<PhysicalPlan> {
+        let cost = PlanCost {
+            io_cost: 0.0,
+            cpu_cost: rows.len() as f64 * self.cost_model.cpu_tuple_cost,
+            row_count: rows.len() as f64,
+        };
+        Ok(PhysicalPlan::Values { rows, schema, cost })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_update(
+        &self,
+        table_id: zyron_catalog::TableId,
+        assignments: Vec<crate::binder::BoundAssignment>,
+        check_constraints: Vec<crate::binder::BoundExpr>,
+        child: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        if let Some(lake) = self.plan_lake_update(
+            table_id,
+            assignments.clone(),
+            check_constraints.clone(),
+            &child_plan,
+        )? {
+            return Ok(lake);
+        }
+        let cost = *child_plan.cost();
+        Ok(PhysicalPlan::Update {
+            table_id,
+            assignments,
+            check_constraints,
+            child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_delete(
+        &self,
+        table_id: zyron_catalog::TableId,
+        child: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        if let Some(lake) = self.plan_lake_delete(table_id, &child_plan)? {
+            return Ok(lake);
+        }
+        let cost = *child_plan.cost();
+        Ok(PhysicalPlan::Delete {
+            table_id,
+            child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_graph_algorithm(
+        &self,
+        schema_name: String,
+        algorithm: String,
+        params: Vec<(String, crate::binder::BoundExpr)>,
+        output_columns: Vec<crate::logical::LogicalColumn>,
+    ) -> Result<PhysicalPlan> {
+        let algo_type = match algorithm.as_str() {
+            "pagerank" => GraphAlgorithmType::PageRank,
+            "shortest_path" => GraphAlgorithmType::ShortestPath,
+            "bfs" => GraphAlgorithmType::Bfs,
+            "connected_components" => GraphAlgorithmType::ConnectedComponents,
+            "community_detection" => GraphAlgorithmType::CommunityDetection,
+            "betweenness_centrality" => GraphAlgorithmType::BetweennessCentrality,
+            other => {
+                return Err(zyron_common::ZyronError::PlanError(format!(
+                    "unknown graph algorithm '{}'",
+                    other
+                )));
+            }
+        };
+
+        // Cost estimates are tied to big-O complexity of each algorithm.
+        // Without edge/node counts at plan time, we use a nominal graph
+        // size of V=10_000 nodes and E=100_000 edges so the optimizer
+        // can at least rank graph queries against each other.
+        let v: f64 = 10_000.0;
+        let e: f64 = 100_000.0;
+        let pagerank_iters: f64 = 20.0;
+        let (cpu, row_count) = match algo_type {
+            // O(iter * (V + E))
+            GraphAlgorithmType::PageRank => (pagerank_iters * (v + e), v),
+            // O(V + E) Dijkstra-equivalent, one path out
+            GraphAlgorithmType::ShortestPath => (v + e, v.sqrt()),
+            // O(V + E) level-limited, bounded by reachable subgraph
+            GraphAlgorithmType::Bfs => (v + e, v),
+            // O(V + E) union-find
+            GraphAlgorithmType::ConnectedComponents => (v + e, v),
+            // O(iter * (V + E)) Louvain-style
+            GraphAlgorithmType::CommunityDetection => (10.0 * (v + e), v),
+            // O(V * (V + E)) Brandes' algorithm, worst-case of the set
+            GraphAlgorithmType::BetweennessCentrality => (v * (v + e), v),
+        };
+        let cost = PlanCost {
+            io_cost: v, // single pass to read the graph backing tables
+            cpu_cost: cpu,
+            row_count,
+        };
+
+        Ok(PhysicalPlan::GraphAlgorithm {
+            algorithm: algo_type,
+            schema_name,
+            params,
+            output_columns,
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_analytics_table_function(
+        &self,
+        function_name: String,
+        named_args: Vec<(String, crate::binder::BoundExpr)>,
+        positional_args: Vec<crate::binder::BoundExpr>,
+        output_columns: Vec<crate::logical::LogicalColumn>,
+    ) -> Result<PhysicalPlan> {
+        // Cost: a single scan over the input source plus per-row work
+        // proportional to the function. Without source size info we
+        // use a nominal 10k-row estimate so the optimizer has a value
+        // to compare against.
+        let nominal_rows: f64 = 10_000.0;
+        let cost = PlanCost {
+            io_cost: nominal_rows,
+            cpu_cost: nominal_rows * 4.0,
+            row_count: match function_name.as_str() {
+                "DATA_PROFILE" | "COLUMN_PROFILE" => output_columns.len() as f64,
+                "CORRELATION_MATRIX" => positional_args.len().pow(2) as f64,
+                _ => nominal_rows,
+            },
+        };
+        Ok(PhysicalPlan::AnalyticsTableFunction {
+            function_name,
+            named_args,
+            positional_args,
+            output_columns,
+            cost,
+        })
+    }
+
+    /// Answers an ORDER BY by reading a B+tree index in key order instead of
+    /// sorting, when the index provably yields exactly the requested order.
+    ///
+    /// Returns the scan that replaces the whole `Sort -> [Filter] -> Scan`
+    /// subtree, or None to leave the sort in place. Every condition below is
+    /// a correctness precondition, not a heuristic:
+    ///
+    /// - The ORDER BY terms are plain columns of the scanned table, matching
+    ///   a leading run of the index's key columns in order.
+    /// - Those columns are NOT NULL. A row with a null in any key component
+    ///   is left out of the index entirely, so an index scan over a nullable
+    ///   key column would drop rows rather than reorder them.
+    /// - Those columns are fixed width. A variable-length component runs into
+    ///   the key's row-locator suffix, so byte order does not provably equal
+    ///   value order and the rows would come back subtly misordered.
+    /// - Every term runs the same way, so one walk direction serves them all.
+    ///   Forward for ascending, backward for descending.
+    /// - The table is heap format with no folded columnar segments, and there
+    ///   is no time-travel target. A lake table's index is a lake artifact
+    ///   rather than a B+tree, and the other two are the conditions that keep
+    ///   the predicate-driven index path off those tables.
+    fn try_plan_ordered_index_scan(
+        &self,
+        order_by: &[crate::binder::BoundOrderBy],
+        child: &LogicalPlan,
+    ) -> Result<Option<PhysicalPlan>> {
+        if order_by.is_empty() {
+            return Ok(None);
+        }
+        // A Filter between the sort and the scan becomes the scan's residual
+        // predicate. Anything else in between is left alone
+        let mut node = child;
+        let mut residual: Option<BoundExpr> = None;
+        if let LogicalPlan::Filter { predicate, child } = node {
+            residual = Some(predicate.clone());
+            node = child.as_ref();
+        }
+        let LogicalPlan::Scan {
+            table_id,
+            columns,
+            as_of,
+            ..
+        } = node
+        else {
+            return Ok(None);
+        };
+        if as_of.is_some() {
+            return Ok(None);
+        }
+        let Ok(te) = self.catalog.get_table_by_id(*table_id) else {
+            return Ok(None);
+        };
+        // A lake table's index is a lake artifact committed into its own
+        // transaction log, not a B+tree over heap addresses, so the catalog
+        // entry describing it cannot be walked by an index scan
+        if te.lake.is_lake() || !te.columnar.segments.is_empty() {
+            return Ok(None);
+        }
+
+        // Every term must be a plain column of this table, and they must all
+        // run the same way
+        let ascending = order_by[0].asc;
+        let mut wanted: Vec<zyron_catalog::ColumnId> = Vec::with_capacity(order_by.len());
+        for term in order_by {
+            if term.asc != ascending {
+                return Ok(None);
+            }
+            let BoundExpr::ColumnRef(col) = &term.expr else {
+                return Ok(None);
+            };
+            wanted.push(col.column_id);
+        }
+
+        for index in self.catalog.get_indexes_for_table(*table_id) {
+            if index.index_type != zyron_catalog::IndexType::BTree
+                || index.columns.len() < wanted.len()
+            {
+                continue;
+            }
+            let mut usable = true;
+            for (position, want) in wanted.iter().enumerate() {
+                let key = &index.columns[position];
+                if key.column_id != *want {
+                    usable = false;
+                    break;
+                }
+                let Some(col) = te.columns.iter().find(|c| c.id == *want) else {
+                    usable = false;
+                    break;
+                };
+                let phys = col.physical_type_id();
+                if col.nullable || phys.fixed_size().is_none() || !phys.btree_index_encodable() {
+                    usable = false;
+                    break;
+                }
+            }
+            if !usable {
+                continue;
+            }
+
+            let table_stats = self.catalog.get_stats(*table_id);
+            let cost = match &table_stats {
+                Some(s) => self.cost_model.cost_seq_scan(&s.0),
+                None => PlanCost::zero(),
+            };
+            return Ok(Some(PhysicalPlan::IndexScan {
+                table_id: *table_id,
+                index_id: index.id,
+                index: Arc::clone(&index),
+                columns: columns.clone(),
+                // No bound is derived from the ordering, the whole index is
+                // walked. A residual predicate still filters the rows it
+                // yields, and filtering preserves their order
+                predicate: BoundExpr::Literal {
+                    value: zyron_parser::ast::LiteralValue::Boolean(true),
+                    type_id: TypeId::Boolean,
+                },
+                remaining_predicate: residual,
+                scan_direction: if ascending {
+                    ScanDirection::Forward
+                } else {
+                    ScanDirection::Backward
+                },
+                ordered_by: Some(order_by.to_vec()),
+                cost,
+                as_of: None,
+            }));
+        }
+        Ok(None)
     }
 
     /// Recognizes a KNN-shaped plan directly under a LIMIT and, when matched,
@@ -544,11 +908,26 @@ impl<'a> PhysicalPlanner<'a> {
                     node = child.as_ref();
                 }
                 let LogicalPlan::Scan {
-                    table_id, columns, ..
+                    table_id,
+                    columns,
+                    as_of,
+                    ..
                 } = node
                 else {
                     return Ok(None);
                 };
+                // Same routing rule the predicate path uses: a lake table
+                // answers a search at any version, and on the other stores a
+                // time-travel read stays on the storage scan
+                let searchable = as_of.is_none()
+                    || self
+                        .catalog
+                        .get_table_by_id(*table_id)
+                        .map(|te| te.lake.is_lake())
+                        .unwrap_or(false);
+                if !searchable {
+                    return Ok(None);
+                }
                 for index in &self.catalog.get_indexes_for_table(*table_id) {
                     if index.index_type == zyron_catalog::IndexType::Spatial {
                         let cost = PlanCost {
@@ -562,6 +941,7 @@ impl<'a> PhysicalPlanner<'a> {
                             columns: columns.clone(),
                             kind: SpatialScanKind::Knn { query_point, k },
                             remaining_predicate,
+                            as_of: as_of.clone(),
                             cost,
                         }));
                     }
@@ -576,6 +956,297 @@ impl<'a> PhysicalPlanner<'a> {
     // Scan planning: SeqScan vs IndexScan
     // -----------------------------------------------------------------------
 
+    /// Routes a DELETE on a lake table to the predicate-delete node.
+    /// Returns None for a heap or columnar table, so the row-addressed
+    /// delete path is untouched. A predicate with no exact lake
+    /// equivalent is refused rather than approximated
+    fn plan_lake_delete(
+        &self,
+        table_id: zyron_catalog::TableId,
+        child: &PhysicalPlan,
+    ) -> Result<Option<PhysicalPlan>> {
+        let Ok(te) = self.catalog.get_table_by_id(table_id) else {
+            return Ok(None);
+        };
+        if !te.lake.is_lake() {
+            return Ok(None);
+        }
+        let (bound, lowered) = self.lake_dml_predicate(&te, child, "DELETE")?;
+        let sql = lowered
+            .as_ref()
+            .map(|p| crate::lake_predicate::render_sql(p, &te.columns))
+            .unwrap_or_else(|| "TRUE".to_string());
+        Ok(Some(PhysicalPlan::LakeDelete {
+            table_id,
+            predicate: lowered,
+            bound_predicate: bound,
+            sql,
+            cost: *child.cost(),
+        }))
+    }
+
+    /// Extracts the row-selecting predicate from a lake DML child plan and
+    /// lowers it. Returns the bound form, for a scan that must reproduce
+    /// exactly the same rows, alongside the lake form that records the
+    /// mutation. A predicate with no exact lake equivalent is refused
+    fn lake_dml_predicate(
+        &self,
+        te: &zyron_catalog::TableEntry,
+        child: &PhysicalPlan,
+        what: &str,
+    ) -> Result<(Option<BoundExpr>, Option<zyron_lake::LakePredicate>)> {
+        // The child is the table's own scan, optionally under one residual
+        // filter the scan could not absorb
+        let (scan_predicate, residual) = match child {
+            PhysicalPlan::LakeScan { predicate, .. } => (predicate.as_ref(), None),
+            PhysicalPlan::Filter {
+                child: inner,
+                predicate,
+                ..
+            } => match inner.as_ref() {
+                PhysicalPlan::LakeScan {
+                    predicate: scan_pred,
+                    ..
+                } => (scan_pred.as_ref(), Some(predicate)),
+                _ => {
+                    return Err(ZyronError::PlanError(format!(
+                        "{} on lake table \"{}\" requires a predicate over its own columns",
+                        what, te.name
+                    )));
+                }
+            },
+            _ => {
+                return Err(ZyronError::PlanError(format!(
+                    "{} on lake table \"{}\" requires a predicate over its own columns",
+                    what, te.name
+                )));
+            }
+        };
+
+        let mut bound: Option<BoundExpr> = None;
+        let mut lowered: Option<zyron_lake::LakePredicate> = None;
+        for part in [scan_predicate, residual].into_iter().flatten() {
+            let one =
+                crate::lake_predicate::lower_predicate(part, &te.columns, &te.cluster.derived)
+                    .ok_or_else(|| {
+                        ZyronError::PlanError(format!(
+                            "{} on lake table \"{}\" needs a predicate the lake format can record, \
+                     this one uses a construct with no exact equivalent",
+                            what, te.name
+                        ))
+                    })?;
+            lowered = Some(match lowered {
+                Some(existing) => zyron_lake::LakePredicate::And(vec![existing, one]),
+                None => one,
+            });
+            bound = Some(match bound {
+                Some(existing) => BoundExpr::BinaryOp {
+                    left: Box::new(existing),
+                    op: zyron_parser::ast::BinaryOperator::And,
+                    right: Box::new(part.clone()),
+                    type_id: TypeId::Boolean,
+                },
+                None => part.clone(),
+            });
+        }
+        Ok((bound, lowered))
+    }
+
+    /// Routes an UPDATE on a lake table to the read-assign-replace node.
+    /// Returns None for a heap or columnar table
+    fn plan_lake_update(
+        &self,
+        table_id: zyron_catalog::TableId,
+        assignments: Vec<crate::binder::BoundAssignment>,
+        check_constraints: Vec<BoundExpr>,
+        child: &PhysicalPlan,
+    ) -> Result<Option<PhysicalPlan>> {
+        let Ok(te) = self.catalog.get_table_by_id(table_id) else {
+            return Ok(None);
+        };
+        if !te.lake.is_lake() {
+            return Ok(None);
+        }
+        let (bound, lowered) = self.lake_dml_predicate(&te, child, "UPDATE")?;
+        let sql = lowered
+            .as_ref()
+            .map(|p| crate::lake_predicate::render_sql(p, &te.columns))
+            .unwrap_or_else(|| "TRUE".to_string());
+
+        // The new row image needs every column, so the scan is rebuilt
+        // over the full projection rather than the narrower one the
+        // logical plan asked for
+        let table_idx = match child {
+            PhysicalPlan::LakeScan { columns, .. } => {
+                columns.first().and_then(|c| c.table_idx).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let columns: Vec<crate::logical::LogicalColumn> = te
+            .columns
+            .iter()
+            .map(|c| crate::logical::LogicalColumn {
+                table_idx: Some(table_idx),
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                fractional_digits: c.fractional_digits,
+            })
+            .collect();
+        let cost = *child.cost();
+        let cluster_fit = lake_cluster_fit(&te, lowered.as_ref());
+        let bloom_redundant = lake_redundant_blooms(&te);
+        let scan = PhysicalPlan::LakeScan {
+            table_id,
+            columns,
+            predicate: bound,
+            lowered: lowered.clone(),
+            cluster_fit,
+            bloom_redundant,
+            as_of: None,
+            cost,
+        };
+        Ok(Some(PhysicalPlan::LakeUpdate {
+            table_id,
+            assignments,
+            check_constraints,
+            predicate: lowered,
+            sql,
+            child: Box::new(scan),
+            cost,
+        }))
+    }
+
+    /// Builds the scan of a table that lives on a peer.
+    ///
+    /// The predicate is split rather than chosen between: each conjunct that
+    /// renders faithfully as SQL goes to the remote, and each one that does
+    /// not stays here as a residual. Splitting is what makes a filter like
+    /// `region = 'west' AND f(x)` push its cheap half instead of neither, and
+    /// a conjunct never lands in both places, so no row is filtered twice.
+    ///
+    /// A LIMIT travels only when nothing is left to filter locally: a remote
+    /// row cap applied before a residual would cut rows the residual was
+    /// going to keep, which changes the answer rather than the cost.
+    fn plan_foreign_scan(
+        &self,
+        te: &zyron_catalog::TableEntry,
+        columns: Vec<crate::logical::LogicalColumn>,
+        predicate: Option<BoundExpr>,
+        as_of: Option<crate::logical::AsOfTarget>,
+        limit: Option<usize>,
+    ) -> Result<PhysicalPlan> {
+        let Some((peer, remote_table)) = te.foreign.remote() else {
+            return Err(ZyronError::PlanError(format!(
+                "table \"{}\" is marked foreign but names no peer",
+                te.name
+            )));
+        };
+        // Time travel is a property of a table's own history, and this node
+        // holds none for a table it does not store. Reporting that beats
+        // returning the peer's current rows under an AS OF the peer never saw
+        if as_of.is_some() {
+            return Err(ZyronError::PlanError(format!(
+                "AS OF on foreign table \"{}\" is not available, its history belongs to \
+                 peer \"{}\" and this node holds none of it",
+                te.name, peer
+            )));
+        }
+        if columns.is_empty() {
+            return Err(ZyronError::PlanError(format!(
+                "scan of foreign table \"{}\" projects no column",
+                te.name
+            )));
+        }
+
+        // Only the projected columns cross the wire, named as the peer knows
+        // them. A column the catalog declares but this plan does not read is
+        // never fetched
+        let mut names = Vec::with_capacity(columns.len());
+        let mut types = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let entry = te
+                .columns
+                .iter()
+                .find(|c| c.id == column.column_id)
+                .ok_or_else(|| {
+                    ZyronError::PlanError(format!(
+                        "foreign table \"{}\" has no column with id {}",
+                        te.name, column.column_id.0
+                    ))
+                })?;
+            names.push(entry.name.clone());
+            types.push(entry.type_id);
+        }
+
+        // Conjunct by conjunct: what renders goes to the peer, what does not
+        // stays here
+        let (pushed, residual) = match &predicate {
+            None => (None, None),
+            Some(p) => {
+                let (mut sendable, mut local) = (Vec::new(), Vec::new());
+                for conjunct in split_conjuncts(p) {
+                    match crate::bound_predicate_sql::bound_predicate_to_sql(&conjunct, &te.columns)
+                    {
+                        Some(sql) => sendable.push(sql),
+                        None => local.push(conjunct),
+                    }
+                }
+                (
+                    (!sendable.is_empty()).then(|| sendable.join(" AND ")),
+                    (!local.is_empty()).then(|| combine_conjuncts(local)),
+                )
+            }
+        };
+
+        let request = zyron_common::ForeignRequest {
+            peer: peer.to_string(),
+            table: remote_table.to_string(),
+            columns: names,
+            column_types: types,
+            predicate: pushed,
+            limit: residual.is_none().then_some(limit).flatten(),
+        };
+
+        // What the peer said it stores, which is what decides whether the
+        // pushed filter saves it file reads or index walks
+        let mode = self
+            .peers
+            .and_then(|registry| registry.get(peer))
+            .and_then(|entry| entry.effective_mode());
+        let stats = self.catalog.get_stats(te.id);
+        let selectivity = match &predicate {
+            None => 1.0,
+            Some(p) => self.cost_model.estimate_selectivity(p, None, None),
+        };
+        let cost = match &stats {
+            Some(s) => self.cost_model.cost_foreign_scan(
+                mode,
+                &s.0,
+                selectivity,
+                columns.len(),
+                request.is_filtered(),
+            ),
+            // Nothing local was ever analyzed for a table this node does not
+            // store, so the shape of the estimate comes from the request
+            // rather than from statistics that do not exist
+            None => PlanCost {
+                io_cost: 100.0 + columns.len() as f64,
+                cpu_cost: 10.0,
+                row_count: 1000.0 * selectivity.clamp(0.0, 1.0).max(0.01),
+            },
+        };
+
+        Ok(PhysicalPlan::ForeignScan {
+            table_id: te.id,
+            columns,
+            residual,
+            request,
+            cost,
+        })
+    }
+
     fn plan_scan(
         &self,
         table_id: zyron_catalog::TableId,
@@ -588,49 +1259,41 @@ impl<'a> PhysicalPlanner<'a> {
         // Get table stats
         let table_stats = self.catalog.get_stats(table_id);
 
-        // Columnar correctness gate. When the table has registered .zyr
-        // segments, folded rows were physically deleted from the heap, so a
-        // heap-only SeqScan or IndexScan would silently miss them. Only the
-        // hybrid scan reads both stores. A current read and an AS OF VERSION
-        // read both use it: the hybrid scan dates the columnar and heap rows by
-        // commit LSN under AS OF, so a past version sees folded rows too. AS OF
-        // TIMESTAMP and AS OF BRANCH stay on the heap path (their predicate and
-        // branch-overlay handling is heap-only).
-        let as_of_hybrid = matches!(as_of, None | Some(crate::logical::AsOfTarget::Version(_)));
-        if as_of_hybrid
-            && let Ok(te) = self.catalog.get_table_by_id(table_id)
-            && !te.columnar.segments.is_empty()
-        {
-            let mut cost = match &table_stats {
-                Some(s) => self.cost_model.cost_seq_scan(&s.0),
-                None => PlanCost::zero(),
-            };
-            // Wire the zone-map / bloom skip-rate hint to the real columnar
-            // path: a higher provable skip rate lowers the scanned cost.
-            if let Some(hints) = &encoding_hints
-                && hints.any_applicable()
-            {
-                let keep = 1.0 - hints.estimated_skip_rate();
-                cost = PlanCost {
-                    io_cost: cost.io_cost * keep,
-                    cpu_cost: cost.cpu_cost * keep,
-                    row_count: cost.row_count,
-                };
+        // Foreign routing gate, ahead of every local access path. A foreign
+        // table has no rows here at all, so a heap, columnar, lake or index
+        // node would read storage that was never written
+        if let Ok(te) = self.catalog.get_table_by_id(table_id) {
+            if te.foreign.is_foreign() {
+                return self.plan_foreign_scan(&te, columns, predicate, as_of, limit);
             }
-            return Ok(PhysicalPlan::HybridScan {
-                table_id,
-                columns,
-                predicate,
-                as_of,
-                cost,
-            });
         }
 
-        // Get available indexes
+        // Whether this table's rows live in a lake log rather than the heap.
+        // Search routing below is shared by both, the lake gate after it is
+        // what diverges
+        let is_lake = self
+            .catalog
+            .get_table_by_id(table_id)
+            .map(|te| te.lake.is_lake())
+            .unwrap_or(false);
+
+        // Get available indexes. Search predicates (FTS, vector, spatial)
+        // route to their index operators BEFORE the lake gate and before
+        // the hybrid columnar check: the search operators resolve heap,
+        // columnar and lake hits through the document registry, so where a
+        // row is stored never decides whether a search can find it.
+        //
+        // A time-travel read routes by what the store can answer. Lake
+        // postings are only ever added and lake data files are immutable and
+        // versioned, so a hit resolves against the manifest at the requested
+        // version and the answer is exact. On the heap and columnar stores a
+        // delete retires the document, so rows live at a past version are no
+        // longer in the index and the storage scan is what can answer
         let indexes = self.catalog.get_indexes_for_table(table_id);
+        let search_routable = as_of.is_none() || is_lake;
 
         // Check for full-text search predicates (MATCH AGAINST -> match_against function)
-        if let Some(pred) = &predicate {
+        if search_routable && let Some(pred) = &predicate {
             if let Some((fts_expr, remaining)) = extract_match_against(pred) {
                 // Find a Fulltext index covering the referenced columns
                 for index in &indexes {
@@ -646,6 +1309,7 @@ impl<'a> PhysicalPlanner<'a> {
                             columns,
                             match_expr: fts_expr.clone(),
                             remaining_predicate: remaining.cloned(),
+                            as_of: as_of.clone(),
                             cost,
                         });
                     }
@@ -654,7 +1318,7 @@ impl<'a> PhysicalPlanner<'a> {
         }
 
         // Check for vector distance predicates (vector_distance_* function calls)
-        if let Some(pred) = &predicate {
+        if search_routable && let Some(pred) = &predicate {
             if let Some((vec_expr, remaining)) = extract_vector_distance(pred) {
                 for index in &indexes {
                     if index.index_type == zyron_catalog::IndexType::Vector {
@@ -684,6 +1348,7 @@ impl<'a> PhysicalPlanner<'a> {
                             metric,
                             k,
                             remaining_predicate: remaining.cloned(),
+                            as_of: as_of.clone(),
                             cost,
                         });
                     }
@@ -694,7 +1359,7 @@ impl<'a> PhysicalPlanner<'a> {
         // Check for spatial predicates (st_dwithin / st_intersects / st_contains)
         // and route to a SpatialScan when the predicate shape is recognized
         // and a Spatial index is present on the table.
-        if let Some(pred) = &predicate {
+        if search_routable && let Some(pred) = &predicate {
             if let Some((sp_expr, remaining)) = extract_spatial_predicate(pred) {
                 if let Some(kind) = build_spatial_scan_kind(sp_expr) {
                     for index in &indexes {
@@ -723,12 +1388,155 @@ impl<'a> PhysicalPlanner<'a> {
                                 columns,
                                 kind,
                                 remaining_predicate: remaining.cloned(),
+                                as_of: as_of.clone(),
                                 cost,
                             });
                         }
                     }
                 }
             }
+        }
+
+        // No index took the search predicate, so the storage scan evaluates
+        // it row by row. A match call yields a relevance value rather than a
+        // truth value, which is what an index operator consumes but not what
+        // a filter does, so in boolean position it becomes a comparison
+        let predicate = predicate.map(compare_bare_match_to_zero);
+
+        // Lake routing gate. A lake table's rows live in its transaction
+        // log, and past the search operators above no heap, columnar or
+        // index node can see them, so the lake scan is the access path.
+        // Every time-travel qualifier resolves inside the operator. A
+        // version or timestamp resolves against the log, a branch by
+        // opening that head instead of main's
+        if let Ok(te) = self.catalog.get_table_by_id(table_id) {
+            if te.lake.is_lake() {
+                let cost = match &table_stats {
+                    Some(s) => self.cost_model.cost_seq_scan(&s.0),
+                    None => PlanCost {
+                        io_cost: 10.0,
+                        cpu_cost: 10.0,
+                        row_count: 1000.0,
+                    },
+                };
+                // Lower once here so the operator prunes with it instead of
+                // repeating the work, and EXPLAIN can say whether the filter
+                // skips files at all
+                let lowered = predicate.as_ref().and_then(|p| {
+                    crate::lake_predicate::lower_predicate(p, &te.columns, &te.cluster.derived)
+                });
+                let cluster_fit = lake_cluster_fit(&te, lowered.as_ref());
+                let bloom_redundant = lake_redundant_blooms(&te);
+                return Ok(PhysicalPlan::LakeScan {
+                    table_id,
+                    columns,
+                    predicate,
+                    lowered,
+                    cluster_fit,
+                    bloom_redundant,
+                    as_of,
+                    cost,
+                });
+            }
+        }
+
+        // Columnar correctness gate. When the table has registered .zyr
+        // segments, folded rows were physically deleted from the heap, so a
+        // heap-only SeqScan or IndexScan would silently miss them. Only the
+        // hybrid scan reads both stores. A current read and an AS OF VERSION
+        // read both use it: the hybrid scan dates the columnar and heap rows by
+        // commit LSN under AS OF, so a past version sees folded rows too. AS OF
+        // TIMESTAMP and AS OF BRANCH stay on the heap path (their predicate and
+        // branch-overlay handling is heap-only).
+        // A point lookup through a B+tree index beats a full hybrid scan on
+        // a segment-bearing table: entries are locator-keyed, so the index
+        // serves heap and folded rows alike. Only equality shapes route
+        // here, range predicates keep the columnar scan's zone-map pruning.
+        // The executor falls back to the hybrid union when no live tree is
+        // registered, so folded rows are never dropped
+        if as_of.is_none()
+            && let Some(pred) = &predicate
+            && let Ok(te) = self.catalog.get_table_by_id(table_id)
+            && !te.columnar.segments.is_empty()
+        {
+            for index in &indexes {
+                if index.index_type != zyron_catalog::IndexType::BTree {
+                    continue;
+                }
+                if let Some((index_pred, remaining)) = match_index(pred, index)
+                    && matches!(
+                        &index_pred,
+                        BoundExpr::BinaryOp {
+                            op: BinaryOperator::Eq,
+                            ..
+                        }
+                    )
+                {
+                    let cost = PlanCost {
+                        io_cost: 1.0,
+                        cpu_cost: 5.0,
+                        row_count: 10.0,
+                    };
+                    return Ok(PhysicalPlan::IndexScan {
+                        table_id,
+                        index_id: index.id,
+                        index: Arc::clone(index),
+                        columns,
+                        predicate: index_pred,
+                        remaining_predicate: remaining,
+                        scan_direction: ScanDirection::Forward,
+                        // A predicate-driven index scan is not relied on for
+                        // ordering, the Sort above it (if any) still runs
+                        ordered_by: None,
+                        cost,
+                        as_of: as_of.clone(),
+                    });
+                }
+            }
+        }
+
+        // Tables with columnar segments route to the hybrid scan, which
+        // reads both stores under one MVCC view.
+        let as_of_hybrid = matches!(as_of, None | Some(crate::logical::AsOfTarget::Version(_)));
+        if as_of_hybrid
+            && let Ok(te) = self.catalog.get_table_by_id(table_id)
+            && !te.columnar.segments.is_empty()
+        {
+            let mut cost = match &table_stats {
+                Some(s) => self.cost_model.cost_seq_scan(&s.0),
+                None => PlanCost::zero(),
+            };
+            // Wire the zone-map / bloom skip-rate hint to the real columnar
+            // path: a higher provable skip rate lowers the scanned cost.
+            if let Some(hints) = &encoding_hints
+                && hints.any_applicable()
+            {
+                let keep = 1.0 - hints.estimated_skip_rate();
+                cost = PlanCost {
+                    io_cost: cost.io_cost * keep,
+                    cpu_cost: cost.cpu_cost * keep,
+                    row_count: cost.row_count,
+                };
+            }
+            // Segments relocated to a colder tier are read from slower
+            // storage, so the IO half of the scan is weighted by the tier
+            // each segment sits on in proportion to the rows it holds. A
+            // table entirely on hot storage weighs 1.0 and costs as before
+            let tier_weight = columnar_tier_io_weight(&te.columnar.segments);
+            if tier_weight != 1.0 {
+                cost = PlanCost {
+                    io_cost: cost.io_cost * tier_weight,
+                    cpu_cost: cost.cpu_cost,
+                    row_count: cost.row_count,
+                };
+            }
+            return Ok(PhysicalPlan::HybridScan {
+                table_id,
+                columns,
+                predicate,
+                as_of,
+                cost,
+            });
         }
 
         // Try to find a B-tree index scan opportunity. Equality on indexed
@@ -771,6 +1579,9 @@ impl<'a> PhysicalPlanner<'a> {
                                 predicate: index_pred,
                                 remaining_predicate: remaining,
                                 scan_direction: ScanDirection::Forward,
+                                // A predicate-driven index scan is not relied on for
+                                // ordering, the Sort above it (if any) still runs
+                                ordered_by: None,
                                 cost,
                                 as_of: as_of.clone(),
                             });
@@ -1133,7 +1944,7 @@ impl<'a> PhysicalPlanner<'a> {
                         name: s.name.clone(),
                         type_id: s.return_type,
                         nullable: true,
-                        ts_precision: None,
+                        fractional_digits: None,
                     })
                     .collect();
                 return Ok(PhysicalPlan::ColumnarMetadataAggregate {
@@ -1399,11 +2210,10 @@ fn build_spatial_scan_kind(call: &BoundExpr) -> Option<SpatialScanKind> {
     if let BoundExpr::Function { name, args, .. } = call {
         match name.as_str() {
             "st_dwithin" if args.len() == 3 => {
-                // Signature: st_dwithin(geom_col, point_literal_or_geom, radius_meters)
-                // For the optimizer to recognize, point and radius must be literals.
+                // Signature: st_dwithin(geom_col, point, radius_meters). The
+                // radius has to be a literal and the point has to be one the
+                // plan can build without reading a row
                 let radius = extract_f64_literal(&args[2])?;
-                // Best-effort point extraction: support [x, y] literal arrays
-                // or st_makepoint(x_lit, y_lit). Anything else => unrecognized.
                 let qp = extract_point_from_expr(&args[1])?;
                 Some(SpatialScanKind::DWithin {
                     query_point: qp,
@@ -1411,8 +2221,8 @@ fn build_spatial_scan_kind(call: &BoundExpr) -> Option<SpatialScanKind> {
                 })
             }
             "st_intersects" | "st_contains" if args.len() == 2 => {
-                // Use the bounding box of the second argument as the query envelope.
-                // Only supports a literal envelope or st_makepoint pattern for now.
+                // The bounding box of the second argument is the query
+                // envelope, taken from whatever constant geometry it denotes
                 let env = extract_envelope_from_expr(&args[1])?;
                 Some(SpatialScanKind::Range {
                     mbr_min: env.0,
@@ -1426,15 +2236,24 @@ fn build_spatial_scan_kind(call: &BoundExpr) -> Option<SpatialScanKind> {
     }
 }
 
+/// The coordinates of a constant point argument, whether it is written as a
+/// constructor call or as a geometry the plan can build without a row.
 fn extract_point_from_expr(expr: &BoundExpr) -> Option<Vec<f64>> {
-    if let BoundExpr::Function { name, args, .. } = expr {
-        if (name == "st_make_point" || name == "st_makepoint") && args.len() >= 2 {
-            let x = extract_f64_literal(&args[0])?;
-            let y = extract_f64_literal(&args[1])?;
-            return Some(vec![x, y]);
+    match expr {
+        BoundExpr::Nested(inner) => return extract_point_from_expr(inner),
+        BoundExpr::Function { name, args, .. } => {
+            if (name == "st_make_point" || name == "st_makepoint") && args.len() >= 2 {
+                let x = extract_f64_literal(&args[0])?;
+                let y = extract_f64_literal(&args[1])?;
+                return Some(vec![x, y]);
+            }
         }
+        _ => {}
     }
-    None
+    match extract_constant_geometry(expr)?.kind {
+        zyron_types::geospatial::GeometryKind::Point(p) => Some(vec![p.x, p.y]),
+        _ => None,
+    }
 }
 
 /// Extracts the query point from an `ST_Distance(col, point)` ordering
@@ -1462,18 +2281,125 @@ fn extract_st_distance_point(expr: &BoundExpr) -> Option<Vec<f64>> {
     }
 }
 
+/// The bounding box of a constant geometry argument.
+///
+/// The index answers a bounding box, so any argument whose bounds are known
+/// without reading a row can drive it: the envelope constructors, and any
+/// geometry built from constants, including a bare WKT string. A geometry
+/// the plan cannot evaluate here returns None and the scan filters row by
+/// row, which is slower and returns the same rows.
 fn extract_envelope_from_expr(expr: &BoundExpr) -> Option<(Vec<f64>, Vec<f64>)> {
-    // st_makeenvelope(min_x, min_y, max_x, max_y) or st_make_envelope.
-    if let BoundExpr::Function { name, args, .. } = expr {
-        if (name == "st_make_envelope" || name == "st_makeenvelope") && args.len() == 4 {
-            let min_x = extract_f64_literal(&args[0])?;
-            let min_y = extract_f64_literal(&args[1])?;
-            let max_x = extract_f64_literal(&args[2])?;
-            let max_y = extract_f64_literal(&args[3])?;
-            return Some((vec![min_x, min_y], vec![max_x, max_y]));
+    match expr {
+        BoundExpr::Nested(inner) => return extract_envelope_from_expr(inner),
+        BoundExpr::Function { name, args, .. } => {
+            // st_makeenvelope(min_x, min_y, max_x, max_y), which names its
+            // bounds directly rather than through a geometry
+            if (name == "st_make_envelope" || name == "st_makeenvelope") && args.len() == 4 {
+                let min_x = extract_f64_literal(&args[0])?;
+                let min_y = extract_f64_literal(&args[1])?;
+                let max_x = extract_f64_literal(&args[2])?;
+                let max_y = extract_f64_literal(&args[3])?;
+                return Some((
+                    vec![min_x.min(max_x), min_y.min(max_y)],
+                    vec![min_x.max(max_x), min_y.max(max_y)],
+                ));
+            }
         }
+        _ => {}
     }
-    None
+    // A point is a degenerate box, which is exactly what an intersects or
+    // contains test against one asks the index for
+    if let Some(point) = extract_point_from_expr(expr) {
+        return Some((point.clone(), point));
+    }
+    let geometry = extract_constant_geometry(expr)?;
+    let mbr = zyron_types::spatial_index::mbr_from_geometry(&geometry, 2);
+    // An empty geometry has an inverted box, which would prune everything
+    if mbr.mins[0] > mbr.maxs[0] || mbr.mins[1] > mbr.maxs[1] {
+        return None;
+    }
+    Some((
+        vec![mbr.mins[0], mbr.mins[1]],
+        vec![mbr.maxs[0], mbr.maxs[1]],
+    ))
+}
+
+/// Builds the geometry a constant expression denotes, without reading a row.
+///
+/// Covers a bare WKT string, the text and WKB constructors, and the
+/// spatial-reference wrappers that pass their geometry through unchanged,
+/// since none of those move the bounding box.
+fn extract_constant_geometry(expr: &BoundExpr) -> Option<zyron_types::geospatial::Geometry> {
+    match expr {
+        BoundExpr::Nested(inner) => extract_constant_geometry(inner),
+        BoundExpr::Literal {
+            value: zyron_parser::ast::LiteralValue::String(text),
+            ..
+        } => zyron_types::geospatial::st_geom_from_text(text).ok(),
+        BoundExpr::Cast { expr: inner, .. } => extract_constant_geometry(inner),
+        BoundExpr::Function { name, args, .. } => match name.as_str() {
+            "st_geomfromtext" | "st_geom_from_text" | "st_geometryfromtext" | "st_geogfromtext"
+                if !args.is_empty() =>
+            {
+                extract_constant_geometry(&args[0])
+            }
+            // SRID only labels the coordinate system, it does not move the
+            // coordinates, so the box is the inner geometry's
+            "st_setsrid" | "st_set_srid" if !args.is_empty() => extract_constant_geometry(&args[0]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Rewrites a bare `match_against` call in boolean position into a
+/// comparison against zero.
+///
+/// The call returns a relevance value, so `WHERE MATCH(...) AGAINST(...)`
+/// hands a filter a number where it needs a truth value. Walking only the
+/// boolean connectives keeps a call already inside a comparison, or used as a
+/// projected score, exactly as written.
+fn compare_bare_match_to_zero(predicate: BoundExpr) -> BoundExpr {
+    match predicate {
+        BoundExpr::Function {
+            ref name,
+            ref return_type,
+            ..
+        } if name == "match_against" => {
+            let return_type = *return_type;
+            BoundExpr::BinaryOp {
+                left: Box::new(predicate),
+                op: BinaryOperator::Gt,
+                right: Box::new(BoundExpr::Literal {
+                    value: zyron_parser::ast::LiteralValue::Float(0.0),
+                    type_id: return_type,
+                }),
+                type_id: zyron_common::TypeId::Boolean,
+            }
+        }
+        BoundExpr::BinaryOp {
+            left,
+            op,
+            right,
+            type_id,
+        } if matches!(op, BinaryOperator::And | BinaryOperator::Or) => BoundExpr::BinaryOp {
+            left: Box::new(compare_bare_match_to_zero(*left)),
+            op,
+            right: Box::new(compare_bare_match_to_zero(*right)),
+            type_id,
+        },
+        BoundExpr::UnaryOp { op, expr, type_id }
+            if matches!(op, zyron_parser::ast::UnaryOperator::Not) =>
+        {
+            BoundExpr::UnaryOp {
+                op,
+                expr: Box::new(compare_bare_match_to_zero(*expr)),
+                type_id,
+            }
+        }
+        BoundExpr::Nested(inner) => BoundExpr::Nested(Box::new(compare_bare_match_to_zero(*inner))),
+        other => other,
+    }
 }
 
 /// Extracts a vector_distance_* function call from a predicate tree.
@@ -1624,6 +2550,36 @@ fn combine_conjuncts(mut conjuncts: Vec<BoundExpr>) -> BoundExpr {
     result
 }
 
+/// Carries a LIMIT's row cap down to a foreign scan, so a capped query does
+/// not drag a whole remote table across the network to discard most of it.
+///
+/// It descends only through nodes that neither drop nor reorder rows, which
+/// is Project alone. A Filter below the cap would return fewer rows than
+/// asked for; a Sort needs every row before it can say which N come first;
+/// a join or an aggregate changes the row count outright. The scan also has
+/// to have kept nothing to filter locally, for the same reason a Filter
+/// blocks it.
+///
+/// `cap` is offset plus limit, because rows the offset skips still have to
+/// arrive. The enclosing Limit applies unchanged either way, so this only
+/// ever removes work.
+fn push_limit_to_foreign_scan(plan: &mut PhysicalPlan, cap: usize) {
+    match plan {
+        PhysicalPlan::ForeignScan {
+            residual, request, ..
+        } => {
+            if residual.is_none() {
+                request.limit = Some(match request.limit {
+                    Some(existing) => existing.min(cap),
+                    None => cap,
+                });
+            }
+        }
+        PhysicalPlan::Project { child, .. } => push_limit_to_foreign_scan(child, cap),
+        _ => {}
+    }
+}
+
 fn is_column_ref(expr: &BoundExpr) -> bool {
     matches!(expr, BoundExpr::ColumnRef(_))
 }
@@ -1715,7 +2671,7 @@ fn rewrite_window_refs(
                 type_id: *type_id,
                 nullable: true,
                 // Window-output precision finalized in B5.
-                ts_precision: None,
+                fractional_digits: None,
             })
         }
         BE::ColumnRef(_) | BE::Literal { .. } | BE::Parameter { .. } => expr.clone(),
@@ -1820,9 +2776,11 @@ fn rewrite_window_refs(
         BE::Cast {
             expr: inner,
             target_type,
+            fractional_digits,
         } => BE::Cast {
             expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
             target_type: *target_type,
+            fractional_digits: *fractional_digits,
         },
         BE::Case {
             operand,
@@ -1857,11 +2815,219 @@ fn rewrite_window_refs(
     }
 }
 
+/// Row-weighted read-cost multiplier for a table's columnar segments.
+///
+/// Each segment contributes its tier's multiplier in proportion to the rows
+/// it holds, so relocating a tenth of a table to cold storage raises the
+/// scan's IO cost by a tenth of the cold penalty rather than all of it. A
+/// table whose segments are all hot returns exactly 1.0, which leaves its
+/// cost arithmetic untouched.
+fn columnar_tier_io_weight(segments: &[zyron_catalog::schema::ColumnarSegmentEntry]) -> f64 {
+    let mut rows: u64 = 0;
+    let mut weighted = 0.0f64;
+    for seg in segments {
+        let n = seg.row_count.max(1);
+        rows += n;
+        weighted +=
+            n as f64 * zyron_common::StorageTier::from_u8(seg.storage_tier).cost_multiplier();
+    }
+    if rows == 0 {
+        return 1.0;
+    }
+    weighted / rows as f64
+}
+
+/// What a table's layout does for a lowered predicate.
+///
+/// Judged against the keys a clustering pass accepted, not the declared
+/// ones: under Auto a declared key is a request and measurement may run a
+/// different set, and a plan judged against a key no file is sorted by
+/// would claim pruning the data cannot deliver.
+///
+/// None when nothing lowered, because a predicate the lake cannot express
+/// prunes no file whatever the layout is, and `file_pruning: none` already
+/// says so
+fn lake_cluster_fit(
+    te: &zyron_catalog::TableEntry,
+    lowered: Option<&zyron_lake::LakePredicate>,
+) -> Option<crate::physical::ClusterFitDetail> {
+    let lowered = lowered?;
+    let keys: Vec<u32> = te
+        .cluster
+        .effective_keys()
+        .iter()
+        .map(|k| k.column_id)
+        .collect();
+    let estimate = zyron_lake::cluster_fit_estimate(&keys, lowered)?;
+    let column = match estimate.column_id {
+        Some(id) => lake_column_label(te, id),
+        // A predicate constraining no column at all cannot happen, since a
+        // lowered predicate names one in every leaf
+        None => "no column".to_string(),
+    };
+    Some(crate::physical::ClusterFitDetail { estimate, column })
+}
+
+/// Columns a bloom was asked for and not built, named.
+///
+/// The declared filter is dropped where the layout already resolves the
+/// column, and an operator who asked for one has to be able to find out
+/// that it was not built rather than wonder why it is not helping
+fn lake_redundant_blooms(te: &zyron_catalog::TableEntry) -> Vec<String> {
+    te.cluster
+        .redundant_bloom_columns()
+        .into_iter()
+        .map(|id| lake_column_label(te, id))
+        .collect()
+}
+
+/// How a lake column is named in a plan.
+///
+/// A cluster key may be the column an expression is stored in, which the
+/// catalog's column list deliberately does not carry, so the expression
+/// text is what names it
+fn lake_column_label(te: &zyron_catalog::TableEntry, column_id: u32) -> String {
+    if let Some(c) = te.columns.iter().find(|c| c.id.0 as u32 == column_id) {
+        return c.name.clone();
+    }
+    if let Some(d) = te.cluster.derived.iter().find(|d| d.column_id == column_id) {
+        return d.sql.clone();
+    }
+    format!("column {column_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::binder::ColumnRef;
     use zyron_catalog::ColumnId;
+
+    fn segment_on_tier(
+        row_count: u64,
+        storage_tier: u8,
+    ) -> zyron_catalog::schema::ColumnarSegmentEntry {
+        zyron_catalog::schema::ColumnarSegmentEntry {
+            row_count,
+            storage_tier,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_an_all_hot_table_carries_no_tier_penalty() {
+        let segs = vec![segment_on_tier(1000, 0), segment_on_tier(500, 0)];
+        assert_eq!(columnar_tier_io_weight(&segs), 1.0);
+        assert_eq!(columnar_tier_io_weight(&[]), 1.0);
+    }
+
+    /// The penalty follows the share of rows that moved, so one cold segment
+    /// among many does not cost the whole scan the cold multiplier.
+    #[test]
+    fn test_the_tier_penalty_is_weighted_by_rows() {
+        let cold = zyron_common::StorageTier::Cold.cost_multiplier();
+        let half = vec![segment_on_tier(100, 0), segment_on_tier(100, 2)];
+        assert!((columnar_tier_io_weight(&half) - (1.0 + cold) / 2.0).abs() < 1e-9);
+
+        let mostly_hot = vec![segment_on_tier(900, 0), segment_on_tier(100, 2)];
+        let mostly_cold = vec![segment_on_tier(100, 0), segment_on_tier(900, 2)];
+        assert!(columnar_tier_io_weight(&mostly_hot) < columnar_tier_io_weight(&mostly_cold));
+        assert!(columnar_tier_io_weight(&mostly_hot) > 1.0);
+    }
+
+    fn geom_literal(wkt: &str) -> BoundExpr {
+        BoundExpr::Literal {
+            value: zyron_parser::ast::LiteralValue::String(wkt.to_string()),
+            type_id: TypeId::Geometry,
+        }
+    }
+
+    fn call(name: &str, args: Vec<BoundExpr>) -> BoundExpr {
+        BoundExpr::Function {
+            name: name.to_string(),
+            args,
+            return_type: TypeId::Geometry,
+            distinct: false,
+        }
+    }
+
+    fn float(v: f64) -> BoundExpr {
+        BoundExpr::Literal {
+            value: zyron_parser::ast::LiteralValue::Float(v),
+            type_id: TypeId::Float64,
+        }
+    }
+
+    /// The index answers a bounding box, so every constant way of writing a
+    /// geometry has to reach it. A shape that does not route still returns
+    /// the right rows through the row filter, so what this pins is that the
+    /// ordinary spellings do not silently fall off the index.
+    #[test]
+    fn test_a_constant_geometry_yields_its_bounding_box_however_it_is_written() {
+        let expected = (vec![0.0, 0.0], vec![10.0, 20.0]);
+        let forms = [
+            call(
+                "st_makeenvelope",
+                vec![float(0.0), float(0.0), float(10.0), float(20.0)],
+            ),
+            // Reversed corners name the same box
+            call(
+                "st_make_envelope",
+                vec![float(10.0), float(20.0), float(0.0), float(0.0)],
+            ),
+            geom_literal("POLYGON((0 0, 10 0, 10 20, 0 20, 0 0))"),
+            call(
+                "st_geomfromtext",
+                vec![geom_literal("POLYGON((0 0, 10 0, 10 20, 0 20, 0 0))")],
+            ),
+            call(
+                "st_setsrid",
+                vec![
+                    call(
+                        "st_geom_from_text",
+                        vec![geom_literal("LINESTRING(0 0, 10 20)")],
+                    ),
+                    float(4326.0),
+                ],
+            ),
+            BoundExpr::Nested(Box::new(geom_literal("LINESTRING(0 20, 10 0)"))),
+        ];
+        for form in &forms {
+            assert_eq!(
+                extract_envelope_from_expr(form),
+                Some(expected.clone()),
+                "form {form:?}"
+            );
+        }
+
+        // A point is a degenerate box, and reaches the index as one
+        let point = vec![3.0, 4.0];
+        for form in [
+            call("st_makepoint", vec![float(3.0), float(4.0)]),
+            geom_literal("POINT(3 4)"),
+        ] {
+            assert_eq!(extract_point_from_expr(&form), Some(point.clone()));
+            assert_eq!(
+                extract_envelope_from_expr(&form),
+                Some((point.clone(), point.clone()))
+            );
+        }
+
+        // A geometry the plan cannot build yields nothing, so the scan
+        // filters row by row rather than pruning against a wrong box
+        let column = BoundExpr::ColumnRef(ColumnRef {
+            table_idx: 0,
+            column_id: ColumnId(0),
+            type_id: TypeId::Geometry,
+            nullable: false,
+            fractional_digits: None,
+        });
+        assert_eq!(extract_envelope_from_expr(&column), None);
+        assert_eq!(extract_envelope_from_expr(&geom_literal("not wkt")), None);
+        assert_eq!(
+            extract_point_from_expr(&geom_literal("POLYGON((0 0, 1 0, 1 1, 0 0))")),
+            None
+        );
+    }
 
     #[test]
     fn test_extract_equi_keys() {
@@ -1870,14 +3036,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let right_col = BoundExpr::ColumnRef(ColumnRef {
             table_idx: 1,
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let eq = BoundExpr::BinaryOp {
             left: Box::new(left_col.clone()),
@@ -1901,14 +3067,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let right_col = BoundExpr::ColumnRef(ColumnRef {
             table_idx: 1,
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let eq = BoundExpr::BinaryOp {
             left: Box::new(left_col.clone()),
@@ -1948,7 +3114,7 @@ mod tests {
                 column_id: ColumnId(0),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Gt,
             right: Box::new(BoundExpr::Literal {

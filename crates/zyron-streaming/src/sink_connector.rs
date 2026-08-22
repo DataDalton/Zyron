@@ -28,6 +28,9 @@ pub struct ZyronRowSink {
     txn_manager: Arc<zyron_storage::txn::TransactionManager>,
     security_ctx: Arc<parking_lot::Mutex<zyron_auth::SecurityContext>>,
     security_manager: Arc<zyron_auth::SecurityManager>,
+    // The same per-table write counters DML maintains, so stat views count
+    // streamed rows and the background workers' activity gates see them
+    io_stats: Arc<zyron_common::TableIOStatsRegistry>,
 }
 
 impl ZyronRowSink {
@@ -39,6 +42,7 @@ impl ZyronRowSink {
         txn_manager: Arc<zyron_storage::txn::TransactionManager>,
         security_ctx: Arc<parking_lot::Mutex<zyron_auth::SecurityContext>>,
         security_manager: Arc<zyron_auth::SecurityManager>,
+        io_stats: Arc<zyron_common::TableIOStatsRegistry>,
     ) -> Self {
         Self {
             target_table_id,
@@ -48,6 +52,7 @@ impl ZyronRowSink {
             txn_manager,
             security_ctx,
             security_manager,
+            io_stats,
         }
     }
 
@@ -138,6 +143,9 @@ impl ZyronRowSink {
         match insert_result {
             Ok(_) => {
                 self.txn_manager.commit_blocking(&mut txn)?;
+                self.io_stats
+                    .get_or_create(self.target_table_id)
+                    .record_inserts(records.len() as u64);
                 Ok(())
             }
             Err(e) => {

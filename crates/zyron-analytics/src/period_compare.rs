@@ -4,7 +4,7 @@
 
 use crate::value::{AnalyticsValue, MS_PER_DAY};
 use zyron_common::error::{Result, ZyronError};
-use zyron_common::{PreHashMap, fx_finalize, fx_mix};
+use zyron_common::{PreHashMap, fx_mix, mix_finalize_2round};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodUnit {
@@ -61,6 +61,9 @@ fn ms_to_civil(ms: i64) -> (i32, u32, u32) {
     civil_from_days(days)
 }
 
+/// The inverse of `ms_to_civil`. Production converts one way, so this exists
+/// for the round trip that proves the pair agree
+#[cfg(test)]
 fn civil_to_ms(y: i32, m: u32, d: u32) -> i64 {
     days_from_civil(y, m, d) * MS_PER_DAY
 }
@@ -241,7 +244,7 @@ fn shift_compare_unsorted(
     const SEED: u64 = 0x6B0F_A1A2_3D4E_5F60;
     #[inline]
     fn ts_key(ts: i64) -> u64 {
-        fx_finalize(fx_mix(SEED, ts as u64))
+        mix_finalize_2round(fx_mix(SEED, ts as u64))
     }
     let mut idx: PreHashMap<u64, (i64, f64)> = PreHashMap::default();
     idx.reserve(series.len());
@@ -351,7 +354,7 @@ fn cumulative_in_bucket(series: &[(i64, f64)], bucket: impl Fn(i64) -> i64) -> V
     for &i in &order {
         let (ts, v) = series[i];
         let b = bucket(ts);
-        let key = fx_finalize(fx_mix(SEED, b as u64));
+        let key = mix_finalize_2round(fx_mix(SEED, b as u64));
         let acc = running.entry(key).or_insert(0.0);
         *acc += v;
         by_index[i] = *acc;

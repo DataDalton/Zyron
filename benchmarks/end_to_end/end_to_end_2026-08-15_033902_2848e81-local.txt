@@ -1,0 +1,101 @@
+# suite:   end_to_end
+# run:     2026-08-15_033902_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Zyron End-to-End Consumer Deployment ===
+
+  Scenario simulates: cold boot -> schema -> seed -> OLTP -> analytics -> gateway -> shutdown
+
+=== Cold startup ===
+  Listener ready at 127.0.0.1:52794 in 181.28 ms
+
+=== Bootstrap (handshake, schema, seed) ===
+  First ReadyForQuery 1.28 ms, schema DDL 16.53 ms, seed 92126 rows/sec
+
+=== Pre-OLTP analytics probe ===
+  app schema id = Ok(SchemaId(10001))
+  orders_0 heap_file_id=200 num_pages BEFORE OLTP = 30
+  [diag] single-shot per-query timing (20-sample distribution)
+    COUNT(*)            min=  1004 us  med=  1078 us  max=  1285 us
+    status group        min=  4155 us  med=  4332 us  max=  4628 us
+    customer_id sum     min=  4643 us  med=  4814 us  max=  5550 us
+  [diag] 100 sequential COUNT(*) queries, bucketed median latency
+    iter   0-9    med=  1063 us  COUNT(*)=10000
+    iter  10-19   med=  1121 us  COUNT(*)=10000
+    iter  20-29   med=  1042 us  COUNT(*)=10000
+    iter  30-39   med=  1071 us  COUNT(*)=10000
+    iter  40-49   med=  1030 us  COUNT(*)=10000
+    iter  50-59   med=  1115 us  COUNT(*)=10000
+    iter  60-69   med=  1011 us  COUNT(*)=10000
+    iter  70-79   med=  1050 us  COUNT(*)=10000
+    iter  80-89   med=  1031 us  COUNT(*)=10000
+    iter  90-99   med=  1099 us  COUNT(*)=10000
+
+=== OLTP workload (5s at each concurrency) ===
+  c= 1  tps=      3923  ok=   19619  fail=     0 ( 0.0%)  p50= 190 us  p95= 485 us  p99=  599 us  p999=   897 us  max= 71834 us
+  c= 4  tps=     13859  ok=   69300  fail=     0 ( 0.0%)  p50= 244 us  p95= 500 us  p99=  592 us  p999=   747 us  max=  1344 us
+  c=16  tps=     27949  ok=  139761  fail=     0 ( 0.0%)  p50= 552 us  p95= 843 us  p99=  978 us  p999=  1162 us  max=  1948 us
+  c=64  tps=     27702  ok=  138561  fail=     0 ( 0.0%)  p50=2259 us  p95=3344 us  p99= 3896 us  p999=  4842 us  max= 10125 us
+  c=256  tps=     24803  ok=  124192  fail=     0 ( 0.0%)  p50=9581 us  p95=15934 us  p99=18755 us  p999= 22406 us  max= 29449 us
+
+=== Analytical queries (5-run average) ===
+  orders_0 heap_file_id=200 reported_num_pages=316 actual_file_pages=0
+  [diag] single-shot per-query timing (20-sample distribution)
+    COUNT(*)            min=  1549 us  med=  1751 us  max=  2390 us
+    status group        min=  6411 us  med=  8609 us  max= 10065 us
+    customer_id sum     min=  9943 us  med= 11710 us  max= 14590 us
+  [diag] 100 sequential COUNT(*) queries, bucketed median latency
+    iter   0-9    med=  1873 us  COUNT(*)=108068
+    iter  10-19   med=  1627 us  COUNT(*)=108068
+    iter  20-29   med=  1548 us  COUNT(*)=108068
+    iter  30-39   med=  1656 us  COUNT(*)=108068
+    iter  40-49   med=  1572 us  COUNT(*)=108068
+    iter  50-59   med=  1613 us  COUNT(*)=108068
+    iter  60-69   med=  1849 us  COUNT(*)=108068
+    iter  70-79   med=  1888 us  COUNT(*)=108068
+    iter  80-89   med=  1620 us  COUNT(*)=108068
+    iter  90-99   med=  1889 us  COUNT(*)=108068
+  run 1/5  mean=6961.7 us  p50=6758 us  p95=12991 us  p99=15660 us  (n=200)
+  run 2/5  mean=7100.3 us  p50=6898 us  p95=13388 us  p99=14861 us  (n=200)
+  run 3/5  mean=7152.9 us  p50=7100 us  p95=13622 us  p99=16037 us  (n=200)
+  run 4/5  mean=7049.7 us  p50=6790 us  p95=12888 us  p99=15616 us  (n=200)
+  run 5/5  mean=6882.5 us  p50=6603 us  p95=12616 us  p99=14262 us  (n=200)
+  median (5-run) avg 6830 min 6603 max 7100 us
+
+=== Gateway routing and middleware ===
+  pipeline throughput 2263119 ops/sec
+
+=== Shutdown ===
+  teardown complete in 56.83 ms
+
+=== SLO Validation ===
+  cold boot latency (ms) [NOT MEASURED, unoptimized build]: 181 (target <= 500, not applied)
+  first ReadyForQuery (ms) [NOT MEASURED, unoptimized build]: 1 (target <= 50, not applied)
+  schema DDL total (ms) [NOT MEASURED, unoptimized build]: 17 (target <= 200, not applied)
+  seed insert (rows/sec) [NOT MEASURED, unoptimized build]: 92,126 (target >= 50,000, not applied)
+  c1 tps [NOT MEASURED, unoptimized build]: 3,923 (target >= 1, not applied)
+  c1 p99 us [NOT MEASURED, unoptimized build]: 599 (target <= inf, not applied)
+  c4 tps [NOT MEASURED, unoptimized build]: 13,859 (target >= 1, not applied)
+  c4 p99 us [NOT MEASURED, unoptimized build]: 592 (target <= inf, not applied)
+  c16 tps [NOT MEASURED, unoptimized build]: 27,949 (target >= 30,000, not applied)
+  c16 p99 us [NOT MEASURED, unoptimized build]: 978 (target <= 5,000, not applied)
+  c64 tps [NOT MEASURED, unoptimized build]: 27,702 (target >= 1, not applied)
+  c64 p99 us [NOT MEASURED, unoptimized build]: 3,896 (target <= inf, not applied)
+  c256 tps [NOT MEASURED, unoptimized build]: 24,803 (target >= 1, not applied)
+  c256 p99 us [NOT MEASURED, unoptimized build]: 18,755 (target <= inf, not applied)
+  median query us [NOT MEASURED, unoptimized build]: 6,603 (target <= 1,500, not applied)
+  pipeline ops/sec [NOT MEASURED, unoptimized build]: 2,263,119 (target >= 300,000, not applied)
+  teardown (ms) [NOT MEASURED, unoptimized build]: 57 (target <= 250, not applied)
+
+=== End-to-End complete ===
+

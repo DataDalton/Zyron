@@ -12,8 +12,8 @@
 //! cancels on duration expiry via a crossbeam channel select
 //! hedged kicks off a duplicate after the configured p95 elapses
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::RngExt;
@@ -69,11 +69,7 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    pub fn new(
-        failure_threshold: u32,
-        reset_timeout: Duration,
-        half_open_max_calls: u32,
-    ) -> Self {
+    pub fn new(failure_threshold: u32, reset_timeout: Duration, half_open_max_calls: u32) -> Self {
         Self {
             state: AtomicU8::new(CircuitState::Closed as u8),
             failure_count: AtomicU32::new(0),
@@ -183,16 +179,14 @@ impl CircuitBreaker {
                 self.half_open_inflight.fetch_sub(1, Ordering::AcqRel);
                 self.state
                     .store(CircuitState::Open as u8, Ordering::Release);
-                self.last_open_ms
-                    .store(self.now_ms(), Ordering::Release);
+                self.last_open_ms.store(self.now_ms(), Ordering::Release);
             }
             CircuitState::Closed => {
                 let prev = self.failure_count.fetch_add(1, Ordering::AcqRel);
                 if prev + 1 >= self.failure_threshold.load(Ordering::Acquire) {
                     self.state
                         .store(CircuitState::Open as u8, Ordering::Release);
-                    self.last_open_ms
-                        .store(self.now_ms(), Ordering::Release);
+                    self.last_open_ms.store(self.now_ms(), Ordering::Release);
                 }
             }
             CircuitState::Open => {}
@@ -286,12 +280,7 @@ impl EmaCircuitBreaker {
             let new = (alpha * sample_e + (1000 - alpha) * cur) / 1000;
             if self
                 .error_ema_x1000
-                .compare_exchange_weak(
-                    cur as u32,
-                    new as u32,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(cur as u32, new as u32, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -323,8 +312,7 @@ impl EmaCircuitBreaker {
         if err >= err_thresh || lat >= lat_thresh {
             self.state
                 .store(CircuitState::Open as u8, Ordering::Release);
-            self.last_open_ms
-                .store(self.now_ms(), Ordering::Release);
+            self.last_open_ms.store(self.now_ms(), Ordering::Release);
         }
     }
 
@@ -513,9 +501,8 @@ where
     });
     drop(tx);
     let remaining = max_total.saturating_sub(p95);
-    rx.recv_timeout(remaining).map_err(|_| {
-        ZyronError::ExecutionError("hedged operation timed out".to_string())
-    })?
+    rx.recv_timeout(remaining)
+        .map_err(|_| ZyronError::ExecutionError("hedged operation timed out".to_string()))?
 }
 
 #[cfg(test)]
@@ -579,7 +566,8 @@ mod tests {
 
     #[test]
     fn ema_breaker_opens_on_high_error_rate() {
-        let cb = EmaCircuitBreaker::new(500, 200, Duration::from_secs(1), Duration::from_millis(50));
+        let cb =
+            EmaCircuitBreaker::new(500, 200, Duration::from_secs(1), Duration::from_millis(50));
         for _ in 0..10 {
             cb.record(true, Duration::from_millis(1));
         }
@@ -607,11 +595,7 @@ mod tests {
         let r: std::result::Result<i32, &'static str> = retry(
             || {
                 count += 1;
-                if count < 3 {
-                    Err("transient")
-                } else {
-                    Ok(42)
-                }
+                if count < 3 { Err("transient") } else { Ok(42) }
             },
             5,
             Duration::from_micros(1),

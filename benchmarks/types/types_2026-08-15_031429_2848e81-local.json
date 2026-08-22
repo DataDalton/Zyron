@@ -1,0 +1,129 @@
+{
+  "id": "2026-08-15_031429_2848e81-local",
+  "date": "2026-08-15 03:15:03Z",
+  "ts": 1786763703,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Performance": {
+      "NPV 360 cashflows (us)": {
+        "average": 0.879140,
+        "runs": [0.88, 0.88, 0.88, 0.88, 0.88],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "IRR convergence (us)": {
+        "average": 0.166720,
+        "runs": [0.18, 0.17, 0.16, 0.16, 0.16],
+        "target": 30.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "MATRIX_MULTIPLY 4x4 (ns)": {
+        "average": 506.293200,
+        "runs": [511.74, 504.63, 503.84, 508.19, 503.06],
+        "target": 30.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "SVD 100x100 (ms)": {
+        "average": 12.835460,
+        "runs": [12.83, 12.86, 12.81, 12.82, 12.87],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "LTTB 10K -> 100 (us)": {
+        "average": 87.800000,
+        "runs": [90.00, 88.00, 87.00, 87.00, 87.00],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "TIME_BUCKET throughput (rows/sec)": {
+        "average": 165240307.846333,
+        "runs": [169817344.46, 159479967.72, 165287070.58, 167014334.84, 164602821.62],
+        "target": 150000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "LOCF throughput (rows/sec)": {
+        "average": 151583441.032925,
+        "runs": [151433010.58, 150441093.29, 151822938.02, 151934121.36, 152286041.92],
+        "target": 80000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "ST_Distance (ns)": {
+        "average": 46.728000,
+        "runs": [46.72, 46.77, 46.75, 46.69, 46.71],
+        "target": 120.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Levenshtein 10-char (ns)": {
+        "average": 2981.062480,
+        "runs": [2971.70, 3001.25, 2996.75, 2955.21, 2980.40],
+        "target": 300.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Jaro-Winkler 10-char (ns)": {
+        "average": 550.627240,
+        "runs": [554.86, 556.90, 548.16, 548.07, 545.15],
+        "target": 150.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Soundex (ns)": {
+        "average": 392.461740,
+        "runs": [369.12, 397.28, 410.42, 390.30, 395.19],
+        "target": 80.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "UUID v7 throughput (IDs/sec)": {
+        "average": 22221119.920585,
+        "runs": [22396817.86, 21787375.26, 22221916.05, 22536389.51, 22163100.92],
+        "target": 80000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "SLUG 100-char (ns)": {
+        "average": 1390.967000,
+        "runs": [1385.86, 1389.84, 1393.19, 1386.86, 1399.09],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "format_number (ns)": {
+        "average": 589.959340,
+        "runs": [588.49, 593.82, 590.84, 588.46, 588.19],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "DATA_PROFILE 1M rows (s)": {
+        "average": 0.848812,
+        "runs": [0.82, 0.86, 0.85, 0.89, 0.82],
+        "target": 5.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "KNN top-10 of 100K (ms)": {
+        "average": 39.238740,
+        "runs": [39.45, 39.53, 38.91, 39.11, 39.20],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

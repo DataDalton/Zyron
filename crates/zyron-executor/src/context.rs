@@ -92,6 +92,11 @@ pub struct ExecutionContext {
     pub disk_manager: Arc<DiskManager>,
     pub batch_size: usize,
     pub txn_id: u32,
+    /// Transaction id lake commits run under, when it differs from
+    /// `txn_id`. Set for a `BEGIN ZYRONLAKE TRANSACTION`, whose lake writes
+    /// commit through a cross-table intent rather than the database commit
+    /// record, so their pending versions are keyed by the intent instead.
+    pub lake_txn_id: Option<u64>,
     pub snapshot: Snapshot,
     /// When set to true, operators check this flag and bail with a cancellation error.
     cancelled: AtomicBool,
@@ -155,6 +160,17 @@ pub struct ExecutionContext {
     /// operators look up here via get_index, DML operators maintain entries
     /// here on insert/update/delete
     pub btree_indexes: Option<Arc<scc::HashMap<u32, Arc<BTreeIndex>>>>,
+    /// Reads tables that live on another node. Injected rather than built
+    /// here because reaching a peer means the wire protocol, the client
+    /// pool and the peer registry, all of which live above this crate.
+    /// None on a node that holds no client, where a foreign scan reports
+    /// that plainly instead of returning no rows
+    pub foreign_reader: Option<Arc<dyn crate::operator::foreign_scan::ForeignReader>>,
+    /// This node's view of the mesh, needed when a plan is built here
+    /// rather than above: a subquery, a correlated inner plan or a trigger
+    /// body re-plans, and a foreign scan inside one has to be costed
+    /// against the same peer facts the outer plan used
+    pub peers: Option<Arc<parking_lot::RwLock<Arc<zyron_common::PeerRegistry>>>>,
     /// Branch override resolver. Set when a session has a branch active or a
     /// query reads `IN BRANCH`. Heap reads route page ids through this so a
     /// branch sees its copy-on-write pages. None means the main line.
@@ -162,11 +178,36 @@ pub struct ExecutionContext {
     /// Active branch id for this execution (from USE BRANCH). A per-query
     /// `IN BRANCH name` resolves its own id at the scan that carries it.
     pub active_branch_id: Option<u64>,
+    /// The same branch by name. A heap branch is addressed by the id above,
+    /// which is what routes copy-on-write pages, while a lake branch is an
+    /// alternate log head addressed by name. Both come from one USE BRANCH,
+    /// so the session carries both and each store reads the one it uses.
+    pub active_branch_name: Option<String>,
     /// Shared intent-lock table for key-level conflict detection. When present,
     /// unique-index inserts take a key lock on the indexed value so concurrent
     /// transactions inserting the same value serialize (first locker wins, the
     /// loser gets a conflict). None disables key locking (single-threaded paths).
     pub intent_locks: Option<Arc<zyron_storage::IntentLockTable>>,
+    /// Shared row-level lock table. SELECT FOR UPDATE/SHARE locks its result
+    /// rows through this, and DML takes exclusive row locks before writing so
+    /// a held FOR UPDATE lock actually blocks a concurrent write. Keys on
+    /// RowLocator, so heap and columnar resident rows lock uniformly. None
+    /// disables row locking (single-threaded internal paths).
+    pub row_locks: Option<Arc<zyron_storage::LockTable>>,
+    /// Shared per-table document identity for search indexes. DML allocates
+    /// a dense ordinal DocId per indexed row and resolves a row's DocId for
+    /// index deletes; search scans map result DocIds back to row locators.
+    /// Keys on RowLocator, so folded rows keep their documents. None when
+    /// no search index maintenance can occur.
+    pub doc_registry: Option<Arc<zyron_common::DocRegistry>>,
+    /// Per-table IO and tuple counters. Scan operators resolve their table's
+    /// entry once when they are built and record per batch; DML operators
+    /// record the rows they write. The stat views read the registry back.
+    /// None for internal queries that run outside a server.
+    pub table_io_stats: Option<Arc<zyron_common::TableIOStatsRegistry>>,
+    /// Per-index scan counters, recorded by the index scan operators alongside
+    /// the table counters above. None for internal queries.
+    pub index_io_stats: Option<Arc<zyron_common::IndexIOStatsRegistry>>,
     /// Per-session sequence state for currval and lastval. Shared across the
     /// session's queries so currval('s') reads the value the session's last
     /// nextval('s') produced. None for internal queries with no session.
@@ -207,6 +248,7 @@ impl ExecutionContext {
             disk_manager,
             batch_size: BATCH_SIZE,
             txn_id,
+            lake_txn_id: None,
             snapshot,
             cancelled: AtomicBool::new(false),
             deadline: None,
@@ -226,9 +268,16 @@ impl ExecutionContext {
             spatial_manager: None,
             heap_files: None,
             btree_indexes: None,
+            foreign_reader: None,
+            peers: None,
             branch_catalog: None,
             active_branch_id: None,
+            active_branch_name: None,
             intent_locks: None,
+            row_locks: None,
+            doc_registry: None,
+            table_io_stats: None,
+            index_io_stats: None,
             session_sequences: None,
             trigger_depth: 0,
             undo_log: None,
@@ -249,6 +298,7 @@ impl ExecutionContext {
             disk_manager: Arc::clone(&self.disk_manager),
             batch_size: self.batch_size,
             txn_id: self.txn_id,
+            lake_txn_id: self.lake_txn_id,
             snapshot: self.snapshot.clone(),
             cancelled: AtomicBool::new(false),
             deadline: self.deadline,
@@ -268,9 +318,16 @@ impl ExecutionContext {
             spatial_manager: self.spatial_manager.clone(),
             heap_files: self.heap_files.clone(),
             btree_indexes: self.btree_indexes.clone(),
+            foreign_reader: self.foreign_reader.clone(),
+            peers: self.peers.clone(),
             branch_catalog: self.branch_catalog.clone(),
             active_branch_id: self.active_branch_id,
+            active_branch_name: self.active_branch_name.clone(),
             intent_locks: self.intent_locks.clone(),
+            row_locks: self.row_locks.clone(),
+            doc_registry: self.doc_registry.clone(),
+            table_io_stats: self.table_io_stats.clone(),
+            index_io_stats: self.index_io_stats.clone(),
             session_sequences: self.session_sequences.clone(),
             trigger_depth: self.trigger_depth,
             undo_log: self.undo_log.clone(),
@@ -293,6 +350,26 @@ impl ExecutionContext {
         }
     }
 
+    /// Resolves the IO counters for a table, creating the entry on first use.
+    ///
+    /// Operators call this once while they are being built and hold the Arc for
+    /// their lifetime, so the registry hash lookup never lands on a batch path.
+    /// Returns None when no registry is installed, which is what an internal
+    /// query running outside a server sees.
+    pub fn table_io_stats_for(&self, table_id: u32) -> Option<Arc<zyron_common::TableIOStats>> {
+        self.table_io_stats
+            .as_ref()
+            .map(|registry| registry.get_or_create(table_id))
+    }
+
+    /// Resolves the IO counters for an index, creating the entry on first use.
+    /// Held for the operator's lifetime like the table counters above.
+    pub fn index_io_stats_for(&self, index_id: u32) -> Option<Arc<zyron_common::IndexIOStats>> {
+        self.index_io_stats
+            .as_ref()
+            .map(|registry| registry.get_or_create(index_id))
+    }
+
     /// Signals all operators using this context to stop execution.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -310,6 +387,17 @@ impl ExecutionContext {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// The wall-clock deadline for this statement, if the session set one.
+    ///
+    /// A lake commit takes this so its retry loop stops waiting when the
+    /// statement is over time. It governs waiting only: the commit reads it
+    /// between attempts, where nothing is staged and no version exists, and
+    /// never during one
+    #[inline]
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
     /// Returns true once the statement deadline has elapsed. Always false
     /// when no deadline is set.
     #[inline]
@@ -323,6 +411,12 @@ impl ExecutionContext {
     /// Records that a WAL data record was appended during this execution.
     /// DML operators call this when they log inserts, updates, or deletes.
     #[inline]
+    /// The transaction id a lake commit runs under: the cross-table intent
+    /// when one is open, otherwise the database transaction.
+    pub fn lake_txn_id(&self) -> u64 {
+        self.lake_txn_id.unwrap_or(self.txn_id as u64)
+    }
+
     pub fn mark_wrote_wal(&self) {
         self.wrote_wal.store(true, Ordering::Relaxed);
     }
@@ -336,6 +430,28 @@ impl ExecutionContext {
             return Err(ZyronError::ExecutionError(format!(
                 "cannot execute {op} in a read-only transaction"
             )));
+        }
+        Ok(())
+    }
+
+    /// Refuses a heap or columnar write when the session names a branch the
+    /// heap does not carry.
+    ///
+    /// A lake branch can exist on one table alone, so a session can be bound
+    /// to a branch with no database-wide entry. The lake side writes that
+    /// branch's head; the heap side has no overlay to write and would land
+    /// on the main line, which is the isolation the session asked for being
+    /// silently dropped.
+    #[inline]
+    pub fn ensure_heap_branch_resolved(&self, op: &str, table_name: &str) -> Result<()> {
+        if self.active_branch_id.is_none() {
+            if let Some(branch) = &self.active_branch_name {
+                return Err(ZyronError::ExecutionError(format!(
+                    "{op} on \"{}\" while the session is on branch \"{}\", which exists on lake \
+                     tables only. Create the branch database-wide to write heap tables on it",
+                    table_name, branch
+                )));
+            }
         }
         Ok(())
     }
@@ -378,6 +494,54 @@ impl ExecutionContext {
                     heap_file_id,
                     fsm_file_id,
                     tid,
+                });
+            }
+        }
+    }
+
+    /// Records that this transaction superseded a columnar-resident row, so
+    /// ROLLBACK TO SAVEPOINT revokes the supersede and the row reappears.
+    /// No-op unless a savepoint is open.
+    #[inline]
+    pub fn record_columnar_supersede_undo(
+        &self,
+        table_id: u32,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+    ) {
+        if let Some(log) = &self.undo_log {
+            if log.has_active_savepoint() {
+                log.record(zyron_storage::UndoEntry::ColumnarSupersede {
+                    table_id,
+                    branch,
+                    file_id,
+                    sys_rowid,
+                });
+            }
+        }
+    }
+
+    /// Records that this transaction patched one column of a
+    /// columnar-resident row, so ROLLBACK TO SAVEPOINT revokes the patch and
+    /// the prior value is visible again. No-op unless a savepoint is open.
+    #[inline]
+    pub fn record_columnar_patch_undo(
+        &self,
+        table_id: u32,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        column_id: u32,
+    ) {
+        if let Some(log) = &self.undo_log {
+            if log.has_active_savepoint() {
+                log.record(zyron_storage::UndoEntry::ColumnarPatch {
+                    table_id,
+                    branch,
+                    file_id,
+                    sys_rowid,
+                    column_id,
                 });
             }
         }
@@ -512,7 +676,8 @@ impl ExecutionContext {
 
     /// Returns the B+ tree index instance for the given IndexId. Consults
     /// the server-wide btree_indexes registry first (lock-free scc lookup),
-    /// then falls back to the per-context map for legacy registrations
+    /// then falls back to the per-context map, which is what a context
+    /// built without a server registry carries
     pub fn get_index(&self, index_id: IndexId) -> Option<Arc<BTreeIndex>> {
         if let Some(server) = &self.btree_indexes {
             if let Some(hit) = server.read_sync(&index_id.0, |_, v| Arc::clone(v)) {
@@ -665,10 +830,14 @@ impl ExecutionContext {
         snap.spatial.iter().map(|(id, col)| (id.0, *col)).collect()
     }
 
-    /// Returns (index_id, indexed column_id) for B+Tree indexes on the
-    /// table. Lock-free read from the catalog index snapshot.
+    /// Returns (index_id, leading key column_id) for B+Tree indexes on the
+    /// table. Lock-free read from the catalog index snapshot. Index selection
+    /// matches on the leading column, so that is what this reports.
     pub fn btree_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
         let snap = self.index_snapshot_for_table(table_id);
-        snap.btree.iter().map(|(id, col, _)| (id.0, *col)).collect()
+        snap.btree
+            .iter()
+            .map(|spec| (spec.id.0, spec.leading()))
+            .collect()
     }
 }

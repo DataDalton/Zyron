@@ -5,7 +5,9 @@
 //! Predicate evaluation resolves the search term to a code via binary search
 //! on the dictionary, then scans the code array without decoding.
 
-use crate::encoding::{Encoding, EncodingType, Predicate, slice_rows, varlen_pack};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, bitmask_from_rows, range_admits, slice_rows,
+};
 use std::collections::{HashMap, HashSet};
 use zyron_common::{Result, ZyronError};
 
@@ -183,6 +185,69 @@ impl Encoding for DictionaryEncoding {
         Ok(out)
     }
 
+    /// Codes are fixed width, so row i's code sits at bit offset
+    /// `i * code_bits` and a range reads only its own codes. The dictionary
+    /// is shared and stays where it is, so the cost is the range rather
+    /// than the segment. Both widths work this way, the variable-length
+    /// form rebuilding its own offset array over the range's values.
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        if value_size == 0 {
+            return decode_varlen_range(encoded, row_count, start, end);
+        }
+        if encoded.len() < 8 {
+            return Err(ZyronError::DecodingFailed(
+                "dictionary header too short".to_string(),
+            ));
+        }
+        let storedValueSize =
+            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        if storedValueSize != value_size {
+            return Err(ZyronError::DecodingFailed(format!(
+                "dictionary value_size mismatch: stored {}, expected {}",
+                storedValueSize, value_size
+            )));
+        }
+        let dictCount =
+            u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
+        let dictStart = 8;
+        let dictEnd = dictStart + dictCount * value_size;
+        let codeBitWidth = if dictCount <= 1 {
+            1u8
+        } else {
+            (32 - (dictCount as u32 - 1).leading_zeros()) as u8
+        };
+        if encoded.len() < dictEnd {
+            return Err(ZyronError::DecodingFailed(
+                "dictionary data truncated".to_string(),
+            ));
+        }
+        let packed = &encoded[dictEnd..];
+        let mut out = Vec::with_capacity((end - start) * value_size);
+        for i in start..end {
+            let code = unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as usize;
+            if code >= dictCount {
+                return Err(ZyronError::DecodingFailed(format!(
+                    "dictionary code {} out of range (dict_count={})",
+                    code, dictCount
+                )));
+            }
+            let valOffset = dictStart + code * value_size;
+            out.extend_from_slice(&encoded[valOffset..valOffset + value_size]);
+        }
+        Ok(out)
+    }
+
     fn eval_predicate(
         &self,
         encoded: &[u8],
@@ -221,9 +286,7 @@ impl Encoding for DictionaryEncoding {
         };
 
         let packedStart = dictEnd;
-
         let bitmaskLen = row_count.div_ceil(8);
-        let mut bitmask = vec![0u8; bitmaskLen];
 
         // Build a set of matching dictionary codes
         let mut matchingCodes = Vec::new();
@@ -240,15 +303,7 @@ impl Encoding for DictionaryEncoding {
                 for c in 0..dictCount {
                     let offset = dictStart + c * storedValueSize;
                     let entry = &encoded[offset..offset + storedValueSize];
-                    let above = match low {
-                        Some(lo) => entry >= *lo,
-                        None => true,
-                    };
-                    let below = match high {
-                        Some(hi) => entry <= *hi,
-                        None => true,
-                    };
-                    if above && below {
+                    if range_admits(entry, storedValueSize, *low, *high) {
                         matchingCodes.push(c as u32);
                     }
                 }
@@ -265,20 +320,25 @@ impl Encoding for DictionaryEncoding {
         }
 
         if matchingCodes.is_empty() {
-            return Ok(bitmask);
+            return Ok(vec![0u8; bitmaskLen]);
         }
 
-        // Scan code array, checking membership
+        // Scan code array, checking membership. An equality resolves to one
+        // code, and comparing against it directly is what a point lookup on
+        // a dictionary column runs per row
         matchingCodes.sort_unstable();
         let packed = &encoded[packedStart..];
-        for i in 0..row_count {
-            let code = unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as u32;
-            if matchingCodes.binary_search(&code).is_ok() {
-                bitmask[i / 8] |= 1 << (i % 8);
+        let code_at =
+            |i: usize| unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as u32;
+        Ok(match matchingCodes.as_slice() {
+            [only] => {
+                let only = *only;
+                bitmask_from_rows(row_count, |i| code_at(i) == only)
             }
-        }
-
-        Ok(bitmask)
+            _ => bitmask_from_rows(row_count, |i| {
+                matchingCodes.binary_search(&code_at(i)).is_ok()
+            }),
+        })
     }
 }
 
@@ -435,8 +495,27 @@ fn varlen_dict_entry<'a>(blob: &'a [u8], offsets: &[u32], i: usize) -> &'a [u8] 
 /// here the codes are unpacked once to size the output, then again to fill it,
 /// writing the header, offset array, and blob in place.
 fn decode_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
+    decode_varlen_range(encoded, row_count, 0, row_count)
+}
+
+/// Rebuilds the canonical varlen buffer for one row range.
+///
+/// The output offsets are relative to the buffer being built, so a range
+/// has to write its own offset array whatever it reads. That is repacking
+/// the range, not reading the segment: the codes are fixed width, so row i
+/// sits at bit offset `i * code_bits` and the range unpacks only its own,
+/// and the dictionary entries stay where they are, so only the range's
+/// values are copied.
+fn decode_varlen_range(
+    encoded: &[u8],
+    row_count: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
     let (dict_count, offsets, blob, packed) = read_varlen_container(encoded)?;
     let code_bits = code_bit_width(dict_count);
+    let end = end.min(row_count);
+    let start = start.min(end);
 
     let code_at = |i: usize| -> Result<usize> {
         let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as usize;
@@ -449,27 +528,28 @@ fn decode_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
         Ok(code)
     };
 
-    // Pass 1: total decoded blob length (validates every code too).
+    let rows = end - start;
+    // Pass 1: total decoded blob length, which validates the range's codes
     let mut blob_total: usize = 0;
-    for i in 0..row_count {
+    for i in start..end {
         let code = code_at(i)?;
         blob_total += varlen_dict_entry(blob, &offsets, code).len();
     }
 
-    let header = 4 + 4 * (row_count + 1);
+    let header = 4 + 4 * (rows + 1);
     let mut out = Vec::with_capacity(header + blob_total);
-    out.extend_from_slice(&(row_count as u32).to_le_bytes());
+    out.extend_from_slice(&(rows as u32).to_le_bytes());
 
     // Pass 2a: cumulative offset array.
     let mut cursor: u32 = 0;
     out.extend_from_slice(&cursor.to_le_bytes());
-    for i in 0..row_count {
+    for i in start..end {
         let code = code_at(i)?;
         cursor += varlen_dict_entry(blob, &offsets, code).len() as u32;
         out.extend_from_slice(&cursor.to_le_bytes());
     }
     // Pass 2b: values blob.
-    for i in 0..row_count {
+    for i in start..end {
         let code = code_at(i)?;
         out.extend_from_slice(varlen_dict_entry(blob, &offsets, code));
     }
@@ -487,7 +567,6 @@ fn eval_predicate_varlen(
     let (dict_count, offsets, blob, packed) = read_varlen_container(encoded)?;
     let code_bits = code_bit_width(dict_count);
     let bitmask_len = row_count.div_ceil(8);
-    let mut bitmask = vec![0u8; bitmask_len];
 
     // The distinct entries are stored sorted, so equality/IN resolve by
     // binary search and a range scans the contiguous matching prefix.
@@ -515,9 +594,7 @@ fn eval_predicate_varlen(
         Predicate::Range { low, high } => {
             for c in 0..dict_count {
                 let entry = varlen_dict_entry(blob, &offsets, c);
-                let above = low.map_or(true, |lo| entry >= lo);
-                let below = high.map_or(true, |hi| entry <= hi);
-                if above && below {
+                if range_admits(entry, 0, *low, *high) {
                     matching.push(c as u32);
                 }
             }
@@ -532,16 +609,17 @@ fn eval_predicate_varlen(
     }
 
     if matching.is_empty() {
-        return Ok(bitmask);
+        return Ok(vec![0u8; bitmask_len]);
     }
     matching.sort_unstable();
-    for i in 0..row_count {
-        let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as u32;
-        if matching.binary_search(&code).is_ok() {
-            bitmask[i / 8] |= 1 << (i % 8);
+    let code_at = |i: usize| unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as u32;
+    Ok(match matching.as_slice() {
+        [only] => {
+            let only = *only;
+            bitmask_from_rows(row_count, |i| code_at(i) == only)
         }
-    }
-    Ok(bitmask)
+        _ => bitmask_from_rows(row_count, |i| matching.binary_search(&code_at(i)).is_ok()),
+    })
 }
 
 /// Packs a u64 value at the given bit offset.
@@ -597,6 +675,7 @@ fn unpack_bits(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::varlen_pack;
     use crate::encoding::{eval_predicate_on_raw, varlen_slice_rows};
 
     #[test]
@@ -627,6 +706,62 @@ mod tests {
             assert_eq!(rows[i], cats[i % 3]);
         }
         assert_eq!(rows[3000], b"");
+    }
+
+    /// A range of a variable-length dictionary carries its own rows and
+    /// nothing else. The buffer it returns is what proves it: a canonical
+    /// varlen buffer holds one offset per row plus the values behind them,
+    /// so a whole-column decode followed by a slice would still have paid
+    /// for every row's value before the slice threw them away.
+    #[test]
+    fn test_varlen_range_carries_only_its_own_rows() {
+        let enc = DictionaryEncoding;
+        let cats: [&[u8]; 4] = [b"alpha", b"beta", b"gamma-long-value", b"d"];
+        let rows = 4096usize;
+        let vals: Vec<Option<&[u8]>> = (0..rows).map(|i| Some(cats[i % 4])).collect();
+        let raw = varlen_pack(&vals);
+        let encoded = enc.encode(&raw, rows, 0).unwrap();
+
+        let full = enc.decode(&encoded, rows, 0).unwrap();
+        let full_rows = varlen_slice_rows(&full, rows).unwrap();
+
+        // A range at the far end, which a whole-column decode would reach
+        // only after materializing everything before it
+        let (start, end) = (4000usize, 4096usize);
+        let ranged = enc.decode_range(&encoded, rows, 0, start, end).unwrap();
+        let ranged_rows = varlen_slice_rows(&ranged, end - start).unwrap();
+        assert_eq!(ranged_rows.len(), end - start);
+        for (i, row) in ranged_rows.iter().enumerate() {
+            assert_eq!(*row, full_rows[start + i], "row {} of the range", i);
+        }
+
+        let range_values: usize = (start..end).map(|i| full_rows[i].len()).sum();
+        assert_eq!(
+            ranged.len(),
+            4 + 4 * (end - start + 1) + range_values,
+            "the buffer holds the range's offsets and values, not the column's"
+        );
+        assert!(
+            ranged.len() * 8 < full.len(),
+            "a 96 row range of 4096 must be far smaller than the whole: {} vs {}",
+            ranged.len(),
+            full.len()
+        );
+
+        // Boundaries, including the empty and the whole-column range
+        assert!(
+            enc.decode_range(&encoded, rows, 0, 7, 7)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(enc.decode_range(&encoded, rows, 0, 0, rows).unwrap(), full);
+        let clamped = enc
+            .decode_range(&encoded, rows, 0, rows - 1, rows + 50)
+            .unwrap();
+        assert_eq!(
+            varlen_slice_rows(&clamped, 1).unwrap()[0],
+            full_rows[rows - 1]
+        );
     }
 
     #[test]

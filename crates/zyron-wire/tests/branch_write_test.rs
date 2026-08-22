@@ -35,24 +35,13 @@ async fn create_harness() -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
-        .await
-        .expect("disk"),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
+            .await
+            .expect("disk"),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
         Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).expect("storage"));
     let cache = Arc::new(CatalogCache::new(256, 64));
@@ -76,6 +65,10 @@ async fn create_harness() -> Harness {
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -128,6 +121,10 @@ async fn create_harness() -> Harness {
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -176,6 +173,7 @@ async fn exec(h: &mut Harness, sql: &str) -> Vec<DataBatch> {
         DatabaseId(1),
         vec!["public".into()],
         stmt,
+        None,
     )
     .await
     .expect("plan");
@@ -210,6 +208,196 @@ async fn exec(h: &mut Harness, sql: &str) -> Vec<DataBatch> {
 
 fn total_rows(batches: &[DataBatch]) -> usize {
     batches.iter().map(|b| b.num_rows).sum()
+}
+
+/// Runs one statement and returns the message it failed with, for the cases
+/// where the refusal is the behavior under test.
+async fn exec_err(h: &mut Harness, sql: &str) -> String {
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let plan = match zyron_planner::plan(
+        &h.server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(e) => return e.to_string(),
+    };
+    let mut txn = h
+        .server
+        .txn_manager
+        .begin(IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id as u32;
+    let mut ctx = ExecutionContext::new(
+        h.server.catalog.clone(),
+        h.server.wal.clone(),
+        h.server.buffer_pool.clone(),
+        h.server.disk_manager.clone(),
+        txn_id,
+        snapshot,
+    );
+    ctx.heap_files = Some(Arc::clone(&h.server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&h.server.btree_indexes));
+    if let Some(mgr) = &h.server.branch_manager {
+        ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+        if let Some(name) = &h.active_branch {
+            ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
+        }
+    }
+    let ctx = Arc::new(ctx);
+    let result = zyron_executor::execute(plan, &ctx).await;
+    let _ = h.server.txn_manager.abort(&mut txn);
+    match result {
+        Ok(_) => panic!("expected {sql} to fail"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A branch write enforces what a main write enforces. These used to be
+/// skipped outright, so a branch could hold a row no main insert would have
+/// accepted, and the divergence only surfaced at merge.
+#[tokio::test]
+async fn branch_writes_enforce_the_constraints_a_main_write_enforces() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    // Heap uniqueness is enforced through a unique index, so that is what
+    // declares it here
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(
+        &mut h,
+        "CREATE TABLE c (id INT NOT NULL, k INT, FOREIGN KEY (k) REFERENCES p(k))",
+    )
+    .await;
+    exec(&mut h, "INSERT INTO p VALUES (1), (2)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+
+    // A key only the branch holds still collides with itself. The shared
+    // index does not carry branch rows, so this is the check that reads the
+    // branch's own append range
+    exec(&mut h, "INSERT INTO p VALUES (7)").await;
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (7)").await;
+    assert!(
+        err.contains("nique"),
+        "branch duplicate must be refused: {err}"
+    );
+
+    // A key main holds also collides, through the shared index
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (1)").await;
+    assert!(
+        err.contains("nique"),
+        "main duplicate must be refused: {err}"
+    );
+
+    // A foreign key with no parent is refused on the branch too
+    let err = exec_err(&mut h, "INSERT INTO c VALUES (10, 99)").await;
+    assert!(err.contains("foreign key"), "{err}");
+
+    // A parent the branch itself added satisfies the reference
+    exec(&mut h, "INSERT INTO c VALUES (11, 7)").await;
+
+    // NOT NULL holds on the branch as everywhere else
+    let err = exec_err(&mut h, "INSERT INTO c VALUES (12, NULL), (NULL, 1)").await;
+    assert!(err.contains("NOT NULL"), "{err}");
+
+    let rows = exec(&mut h, "SELECT id FROM c").await;
+    assert_eq!(total_rows(&rows), 1, "only the accepted row landed");
+
+    // Main never saw any of it
+    h.active_branch = None;
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(total_rows(&rows), 2, "main keeps its two rows");
+    assert_eq!(total_rows(&exec(&mut h, "SELECT id FROM c").await), 0);
+}
+
+/// A branch DELETE runs the same referential enforcement a main DELETE runs.
+/// The branch fork used to sit above the FK blocks, so a parent row with
+/// dependent children deleted cleanly on a branch and the orphan only
+/// surfaced at merge.
+#[tokio::test]
+async fn branch_delete_enforces_foreign_keys() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(
+        &mut h,
+        "CREATE TABLE c (id INT NOT NULL, k INT, FOREIGN KEY (k) REFERENCES p(k))",
+    )
+    .await;
+    exec(&mut h, "INSERT INTO p VALUES (1), (2)").await;
+    exec(&mut h, "INSERT INTO c VALUES (10, 1)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+
+    // The referenced parent cannot be deleted on the branch either
+    let err = exec_err(&mut h, "DELETE FROM p WHERE k = 1").await;
+    assert!(
+        err.contains("foreign key"),
+        "branch delete of a referenced parent must be refused: {err}"
+    );
+
+    // The unreferenced parent deletes normally
+    exec(&mut h, "DELETE FROM p WHERE k = 2").await;
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(total_rows(&rows), 1, "the branch dropped only row 2");
+
+    // Main keeps both rows
+    h.active_branch = None;
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(total_rows(&rows), 2, "main keeps its two rows");
+}
+
+/// A branch UPDATE runs the FK and unique enforcement a main UPDATE runs.
+/// The branch fork used to sit above those blocks, so duplicate keys and
+/// orphaned children were accepted on branches.
+#[tokio::test]
+async fn branch_update_enforces_uniqueness_and_foreign_keys() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(
+        &mut h,
+        "CREATE TABLE c (id INT NOT NULL, k INT, FOREIGN KEY (k) REFERENCES p(k))",
+    )
+    .await;
+    exec(&mut h, "INSERT INTO p VALUES (1), (2)").await;
+    exec(&mut h, "INSERT INTO c VALUES (10, 1)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+
+    // An update creating a duplicate key is refused on the branch
+    let err = exec_err(&mut h, "UPDATE p SET k = 2 WHERE k = 1").await;
+    assert!(
+        err.contains("nique") || err.contains("foreign key"),
+        "branch update to a duplicate key must be refused: {err}"
+    );
+
+    // An update pointing a child at a missing parent is refused
+    let err = exec_err(&mut h, "UPDATE c SET k = 99 WHERE id = 10").await;
+    assert!(
+        err.contains("foreign key"),
+        "branch update orphaning a child must be refused: {err}"
+    );
+
+    // A legal update still lands, on the branch only
+    exec(&mut h, "UPDATE c SET k = 2 WHERE id = 10").await;
+    let rows = exec(&mut h, "SELECT k FROM c WHERE k = 2").await;
+    assert_eq!(total_rows(&rows), 1, "the branch sees the new reference");
+    h.active_branch = None;
+    let rows = exec(&mut h, "SELECT k FROM c WHERE k = 1").await;
+    assert_eq!(total_rows(&rows), 1, "main keeps the old reference");
 }
 
 /// Collects (id, v) integer pairs from a two-column result, sorted by id.
@@ -267,6 +455,40 @@ async fn branch_insert_update_delete_isolated_from_main() {
         vec![(1, 10), (2, 20), (3, 30)],
         "main line is unaffected by branch writes"
     );
+}
+
+/// A per-query branch qualifier reads a branch without switching the session
+/// onto it, so one statement can compare a branch against the main line.
+#[tokio::test]
+async fn in_branch_qualifier_reads_a_branch_without_switching_session() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE t (id INT, v INT)").await;
+    exec(&mut h, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").await;
+    exec(&mut h, "CREATE BRANCH dev").await;
+
+    exec(&mut h, "USE BRANCH dev").await;
+    exec(&mut h, "INSERT INTO t VALUES (4, 40)").await;
+    exec(&mut h, "UPDATE t SET v = 999 WHERE id = 1").await;
+    h.active_branch = None;
+
+    // The session is back on main, so an unqualified read sees main
+    let main_rows = exec(&mut h, "SELECT id, v FROM t").await;
+    assert_eq!(
+        id_v_pairs(&main_rows),
+        vec![(1, 10), (2, 20), (3, 30)],
+        "the session is on the main line"
+    );
+
+    let branch_rows = exec(&mut h, "SELECT id, v FROM t IN BRANCH 'dev'").await;
+    assert_eq!(
+        id_v_pairs(&branch_rows),
+        vec![(1, 999), (2, 20), (3, 30), (4, 40)],
+        "the qualifier reads the branch overlay while the session stays on main"
+    );
+
+    // The qualifier reads on either side of an alias
+    let aliased = exec(&mut h, "SELECT b.id, b.v FROM t AS b IN BRANCH 'dev'").await;
+    assert_eq!(id_v_pairs(&aliased), id_v_pairs(&branch_rows));
 }
 
 #[tokio::test]

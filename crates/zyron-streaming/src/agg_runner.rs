@@ -63,8 +63,6 @@ pub struct AggregateEngine {
     /// Output-row type layout: group-by columns, then each aggregate's finalized
     /// type, then two timestamp columns for window_start_us and window_end_us.
     output_types: Vec<TypeId>,
-    /// Source-column types used to decode incoming rows.
-    source_types: Vec<TypeId>,
     /// Source column types corresponding to each group-by ordinal, captured
     /// for key encoding without re-reading the full source_types list.
     group_key_types: Vec<TypeId>,
@@ -122,7 +120,6 @@ impl AggregateEngine {
             accumulators,
             spec,
             output_types,
-            source_types,
             group_key_types,
         })
     }

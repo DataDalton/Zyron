@@ -10,12 +10,14 @@ use zyron_analytics::{FeatureGroup, TrainedModel};
 use zyron_common::error::{Result, ZyronError};
 use zyron_wire::connection::ServerState;
 
+/// Both paths come from the wire layer, which owns `ServerState` and is
+/// where the DDL handlers that write these same files already name them
 fn featureSnapshotPath(state: &Arc<ServerState>) -> PathBuf {
-    state.data_dir.join("feature_store.json")
+    zyron_wire::ddl_dispatch::featureStoreSnapshotPath(state)
 }
 
 fn modelsDirPath(state: &Arc<ServerState>) -> PathBuf {
-    state.data_dir.join("models")
+    zyron_wire::ddl_dispatch::modelsDir(state)
 }
 
 /// Restores feature groups and trained models from the data directory
@@ -32,9 +34,8 @@ fn restoreFeatureGroups(state: &Arc<ServerState>) -> Result<()> {
         return Ok(());
     }
     let bytes = std::fs::read(&path).map_err(ZyronError::from)?;
-    let groups: Vec<FeatureGroup> = serde_json::from_slice(&bytes).map_err(|e| {
-        ZyronError::ExecutionError(format!("feature snapshot decode: {}", e))
-    })?;
+    let groups: Vec<FeatureGroup> = serde_json::from_slice(&bytes)
+        .map_err(|e| ZyronError::ExecutionError(format!("feature snapshot decode: {}", e)))?;
     let mut lineageGuard = state.feature_lineage.write();
     for g in groups {
         let groupName = g.name.clone();

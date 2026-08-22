@@ -444,6 +444,26 @@ where
     let slot = slot_mgr.get_slot(&stream.slot_name)?;
     let start_version = slot.confirmed_lsn;
     let changes = feed.query_changes(start_version + 1, u64::MAX)?;
+    drive_stream_changes(stream, changes, start_version, slot_mgr, sink, decode)
+}
+
+/// Delivers change records a caller already has.
+///
+/// A lake table keeps no change file: its transaction log is the change
+/// record, so the pump derives the records from the log and drives the
+/// stream through here. Batching, sink delivery and slot advance are
+/// identical either way, so a stream behaves the same on both formats.
+pub fn drive_stream_changes<F>(
+    stream: &CdcOutputStream,
+    changes: Vec<crate::change_feed::ChangeRecord>,
+    start_version: u64,
+    slot_mgr: &crate::replication_slot::SlotManager,
+    sink: &dyn CdcSink,
+    decode: F,
+) -> Result<u64>
+where
+    F: Fn(&crate::change_feed::ChangeRecord) -> Result<crate::decoder::DecodedChange>,
+{
     if changes.is_empty() {
         return Ok(0);
     }

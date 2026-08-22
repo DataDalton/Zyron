@@ -3,3 +3,12 @@ name = "zyron-bench-harness"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+# A benchmark that configures the engine by hand is measuring an engine
+# nobody ships. These are here so the harness can hand out the production
+# configuration rather than every suite writing its own literal.
+[dependencies]
+zyron-buffer = { path = "../zyron-buffer" }
+zyron-common = { path = "../zyron-common" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-wal = { path = "../zyron-wal" }

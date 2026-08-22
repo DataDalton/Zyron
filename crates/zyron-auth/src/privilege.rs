@@ -74,7 +74,7 @@ pub enum PrivilegeType {
     ManagePublicationCredentials = 47,
     InvokeEndpoint = 48,
     AdminAccess = 49,
-    // Phase 17 data lifecycle privileges.
+    // Data lifecycle privileges.
     ManageLegalHold = 50,
     ManageDataLifecycle = 51,
     ManageRetention = 52,

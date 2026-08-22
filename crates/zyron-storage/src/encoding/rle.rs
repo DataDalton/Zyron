@@ -4,10 +4,28 @@
 //! and supports predicate evaluation directly on the run values
 //! without expansion.
 
-use crate::encoding::{Encoding, EncodingType, Predicate};
+use crate::encoding::{Encoding, EncodingType, Predicate, range_admits};
 use zyron_common::{Result, ZyronError};
 
 pub struct RleEncoding;
+
+/// Refuses a variable-length column.
+///
+/// A run is a value repeated, which needs the value to have a width. With
+/// `value_size` zero every row's value is the empty slice, so the encoder
+/// would fold the whole column into one run of nothing and the decoder
+/// would hand back an empty buffer where the rows were. `select_encoding_varlen`
+/// never picks RLE for that reason, and this is the invariant stated where
+/// it would otherwise be discovered as lost data.
+fn reject_varlen(value_size: usize) -> Result<()> {
+    if value_size == 0 {
+        return Err(ZyronError::DecodingFailed(
+            "RLE encodes fixed-width values, a variable-length column uses Dictionary or FSST"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Encoded format:
 ///   [0..4]    value_size: u32
@@ -28,6 +46,7 @@ impl Encoding for RleEncoding {
             // run_count = 0
             return Ok(out);
         }
+        reject_varlen(value_size)?;
 
         if data.len() < row_count * value_size {
             return Err(ZyronError::EncodingFailed(
@@ -71,10 +90,83 @@ impl Encoding for RleEncoding {
         Ok(out)
     }
 
+    /// Runs carry their own lengths, so reaching a row means adding up run
+    /// lengths rather than expanding the values under them. That walk is
+    /// bounded by the run count, which for data worth run-length encoding
+    /// is far below the row count, and only the requested rows are ever
+    /// written out
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        reject_varlen(value_size)?;
+        if encoded.len() < 8 {
+            return Err(ZyronError::DecodingFailed(
+                "RLE header too short".to_string(),
+            ));
+        }
+        let storedValueSize =
+            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        if storedValueSize != value_size {
+            return Err(ZyronError::DecodingFailed(format!(
+                "RLE value_size mismatch: stored {}, expected {}",
+                storedValueSize, value_size
+            )));
+        }
+        let runCount =
+            u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
+
+        let mut out = Vec::with_capacity((end - start) * value_size);
+        let mut pos = 8usize;
+        // First row of the run being examined
+        let mut runStart = 0usize;
+        for _ in 0..runCount {
+            if runStart >= end {
+                break;
+            }
+            if pos + value_size > encoded.len() {
+                return Err(ZyronError::DecodingFailed("RLE data truncated".to_string()));
+            }
+            let value = &encoded[pos..pos + value_size];
+            pos += value_size;
+            let (runLen, bytesRead) = decode_varint(&encoded[pos..])?;
+            pos += bytesRead;
+            let runEnd = runStart + runLen as usize;
+
+            // Rows of this run that fall inside the requested range, which
+            // is the whole run for an interior one and a slice at each end
+            let take_from = runStart.max(start);
+            let take_to = runEnd.min(end);
+            if take_from < take_to {
+                for _ in take_from..take_to {
+                    out.extend_from_slice(value);
+                }
+            }
+            runStart = runEnd;
+        }
+        if out.len() != (end - start) * value_size {
+            return Err(ZyronError::DecodingFailed(format!(
+                "RLE runs cover {} of the {} rows asked for",
+                out.len() / value_size.max(1),
+                end - start
+            )));
+        }
+        Ok(out)
+    }
+
     fn decode(&self, encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
         }
+        reject_varlen(value_size)?;
 
         if encoded.len() < 8 {
             return Err(ZyronError::DecodingFailed(
@@ -164,7 +256,7 @@ impl Encoding for RleEncoding {
         &self,
         encoded: &[u8],
         row_count: usize,
-        _value_size: usize,
+        value_size: usize,
         predicate: &Predicate,
     ) -> Result<Vec<u8>> {
         if row_count == 0 {
@@ -202,17 +294,11 @@ impl Encoding for RleEncoding {
 
             let matches = match predicate {
                 Predicate::Equality(target) => value == *target,
-                Predicate::Range { low, high } => {
-                    let above = match low {
-                        Some(lo) => value >= *lo,
-                        None => true,
-                    };
-                    let below = match high {
-                        Some(hi) => value <= *hi,
-                        None => true,
-                    };
-                    above && below
-                }
+                // The stored size slices the run's value out, and the
+                // column's value size selects the order the bounds compare
+                // in, which are the same number for a fixed-width column and
+                // different questions
+                Predicate::Range { low, high } => range_admits(value, value_size, *low, *high),
                 Predicate::In(values) => values.contains(&value),
             };
 
@@ -299,6 +385,26 @@ fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run needs its value to have a width, so a variable-length column
+    /// is refused at every entry point rather than folded into one run of
+    /// nothing and handed back as an empty buffer.
+    #[test]
+    fn test_variable_length_columns_are_refused_rather_than_flattened() {
+        let enc = RleEncoding;
+        let vals: Vec<Option<&[u8]>> = vec![Some(b"a".as_slice()), Some(b"bb"), Some(b"a")];
+        let raw = crate::encoding::varlen_pack(&vals);
+        for result in [
+            enc.encode(&raw, vals.len(), 0),
+            enc.decode(&raw, vals.len(), 0),
+            enc.decode_range(&raw, vals.len(), 0, 0, 2),
+        ] {
+            let err = result.expect_err("a variable-length column has no run width");
+            assert!(err.to_string().contains("fixed-width"), "{err}");
+        }
+        // An empty column still describes itself, there is no row to lose
+        assert!(enc.encode(&[], 0, 0).is_ok());
+    }
 
     #[test]
     fn test_roundtrip_i32() {

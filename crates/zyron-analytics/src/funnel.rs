@@ -4,7 +4,7 @@
 
 use crate::value::{AnalyticsValue, VerifiedKeyMap, hash_value_128};
 use zyron_common::error::{Result, ZyronError};
-use zyron_common::fx_finalize;
+use zyron_common::mix_finalize_2round;
 
 #[derive(Debug, Clone)]
 pub struct FunnelStep {
@@ -89,8 +89,8 @@ impl FunnelAnalyser {
         const SEED_LOW: u64 = 0x91A7_B432_558E_DD13;
         const SEED_HIGH: u64 = 0x4B83_A92F_C015_5E27;
         let (lo, hi) = hash_value_128(SEED_LOW, SEED_HIGH, &ev.user_id);
-        let h_low = fx_finalize(lo);
-        let h_high = fx_finalize(hi);
+        let h_low = mix_finalize_2round(lo);
+        let h_high = mix_finalize_2round(hi);
         let n_steps = self.config.steps.len();
         let s = self.state.entry_or_insert(
             h_low,
@@ -147,11 +147,7 @@ impl FunnelAnalyser {
             let users = step_users[s];
             let prev = if s == 0 { users } else { step_users[s - 1] };
             let prev_f = prev.max(1) as f64;
-            let conversion = if s == 0 {
-                1.0
-            } else {
-                users as f64 / prev_f
-            };
+            let conversion = if s == 0 { 1.0 } else { users as f64 / prev_f };
             let drop_off = if s == 0 { 0.0 } else { 1.0 - conversion };
             let avg_time = if self.next_time_n[s] > 0 {
                 Some(self.next_time_sum[s] as f64 / self.next_time_n[s] as f64)

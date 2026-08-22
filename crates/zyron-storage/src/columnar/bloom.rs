@@ -241,6 +241,48 @@ impl BloomFilter {
     }
 }
 
+/// Probes serialized bloom bytes in place, without copying the bit array.
+///
+/// This is the pruning-path probe: a manifest carries a file's bloom bytes
+/// verbatim, and deciding whether to open that file must cost no allocation.
+/// Returns false only when the value is provably absent, so a truncated or
+/// otherwise unreadable buffer answers true and prunes nothing, since a
+/// false negative would silently drop rows.
+#[inline]
+pub fn might_contain_serialized(buf: &[u8], value: &[u8]) -> bool {
+    if buf.len() < HEADER_SIZE {
+        return true;
+    }
+    let hashCount = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let numBlocks = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if numBlocks == 0 || hashCount == 0 || hashCount > BLOOM_HASH_COUNT * 2 {
+        return true;
+    }
+    let bits = &buf[HEADER_SIZE..];
+    if bits.len() != numBlocks as usize * BLOOM_BLOCK_SIZE {
+        return true;
+    }
+
+    let hash = bloom_hash(value);
+    let h1 = hash as u64;
+    let h2 = (hash >> 64) as u64;
+    let blockStart = (h1 % numBlocks as u64) as usize * BLOOM_BLOCK_SIZE;
+
+    for i in 0..hashCount {
+        let bitPos = h1.wrapping_add((i as u64).wrapping_mul(h2)) % BLOCK_BITS as u64;
+        let byteOffset = blockStart + (bitPos >> 3) as usize;
+        let bitMask = 1u8 << (bitPos & 7);
+        match bits.get(byteOffset) {
+            Some(byte) if byte & bitMask != 0 => {}
+            // An out-of-range offset cannot happen for a validated length,
+            // treat it as unknown rather than as proof of absence
+            Some(_) => return false,
+            None => return true,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

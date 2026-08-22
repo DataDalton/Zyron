@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="Zyron">
+  <title>Zyron</title>
+  <rect width="1200" height="360" fill="#0B0B0D"/>
+
+  <g transform="translate(349.6 124) scale(1.75)" fill="#FFFFFF">
+    <path d="M8 8 H53.88 L44.88 17 H8 Z"/>
+    <path d="M8 21 H40.88 L31.88 30 H8 Z"/>
+    <path d="M8 34 H27.88 L18.88 43 H8 Z"/>
+    <path d="M47 19.12 L56 10.12 V56 H47 Z"/>
+    <path d="M34 32.12 L43 23.12 V56 H34 Z"/>
+    <path d="M21 45.12 L30 36.12 V56 H21 Z"/>
+  </g>
+
+  <g transform="translate(495.6 140) scale(0.8)" fill="#FFFFFF" fill-rule="evenodd">
+    <path d="M0 0 H72 V18 L20 84 H72 V100 H0 V82 L52 16 H0 Z"/>
+    <path transform="translate(92 0)" d="M0 0 H18 L36 33 L54 0 H72 L44 52 V100 H28 V52 Z"/>
+    <path transform="translate(176 0)" d="M0 0 H35 A27 27 0 0 1 35 54 L66 100 H47 L16 54 V100 H0 Z M16 16 H35 A11 11 0 0 1 35 38 H16 Z"/>
+    <path transform="translate(260 0)" d="M38 0 A38 50 0 1 0 38 100 A38 50 0 1 0 38 0 Z M38 13 A22 37 0 1 0 38 87 A22 37 0 1 0 38 13 Z"/>
+    <path transform="translate(354 0)" d="M0 0 H16 L56 72 V0 H72 V100 H56 L16 28 V100 H0 Z"/>
+  </g>
+</svg>

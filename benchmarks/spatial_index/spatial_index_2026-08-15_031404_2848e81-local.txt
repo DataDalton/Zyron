@@ -1,0 +1,107 @@
+# suite:   spatial_index
+# run:     2026-08-15_031404_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Bulk load 100K points ===
+  Run 1: 1,125,194 points/sec (88.9 ms build)
+  Run 2: 1,139,978 points/sec (87.7 ms build)
+  Run 3: 1,121,096 points/sec (89.2 ms build)
+  Run 4: 1,123,356 points/sec (89.0 ms build)
+  Run 5: 1,145,450 points/sec (87.3 ms build)
+  bulk_load 100K points/sec [NOT MEASURED, unoptimized build]:
+    Runs: [1,125,194, 1,139,978, 1,121,096, 1,123,356, 1,145,450]
+    Average: 1,131,015 (target >= 1,500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== delete_by_data throughput (10K deletes on 100K tree) ===
+  Run 1: 196,345 deletes/sec (50.93 ms)
+  Run 2: 197,500 deletes/sec (50.63 ms)
+  Run 3: 194,994 deletes/sec (51.28 ms)
+  Run 4: 196,348 deletes/sec (50.93 ms)
+  Run 5: 197,345 deletes/sec (50.67 ms)
+  delete_by_data/sec [NOT MEASURED, unoptimized build]:
+    Runs: [196,345, 197,500, 194,994, 196,348, 197,345]
+    Average: 196,507 (target >= 500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Concurrent 4-reader throughput during 1 writer (50K inserts) ===
+  Reader queries completed during writer: 5,848 in 1.77 s -> 3,301 q/s
+
+=== Bulk load 1M points (parallel STR) ===
+  Run 1: 909,478 points/sec (1.10 s build)
+  Run 2: 916,958 points/sec (1.09 s build)
+  Run 3: 913,475 points/sec (1.09 s build)
+  Run 4: 909,054 points/sec (1.10 s build)
+  Run 5: 900,873 points/sec (1.11 s build)
+  bulk_load 1M points/sec (parallel STR) [NOT MEASURED, unoptimized build]:
+    Runs: [909,478, 916,958, 913,475, 909,054, 900,873]
+    Average: 909,968 (target >= 2,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== DWithin latency on 100K-point tree (radius=500) ===
+  Run 1: 40.92 us/query
+  Run 2: 40.98 us/query
+  Run 3: 41.02 us/query
+  Run 4: 41.02 us/query
+  Run 5: 40.80 us/query
+  dwithin 100K r=500 (us) [NOT MEASURED, unoptimized build]:
+    Runs: [41, 41, 41, 41, 41]
+    Average: 41 (target <= 1,500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Dynamic insert throughput (50K points) ===
+  Run 1: 32,454 points/sec (1.54 s)
+  Run 2: 32,486 points/sec (1.54 s)
+  Run 3: 31,883 points/sec (1.57 s)
+  Run 4: 32,311 points/sec (1.55 s)
+  Run 5: 31,903 points/sec (1.57 s)
+  insert points/sec [NOT MEASURED, unoptimized build]:
+    Runs: [32,454, 32,486, 31,883, 32,311, 31,903]
+    Average: 32,208 (target >= 300,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== KNN latency on 100K-point tree (k=10) ===
+  Run 1: 36.85 us/query
+  Run 2: 37.11 us/query
+  Run 3: 36.73 us/query
+  Run 4: 36.61 us/query
+  Run 5: 36.42 us/query
+  KNN 100K k=10 (us) [NOT MEASURED, unoptimized build]:
+    Runs: [37, 37, 37, 37, 36]
+    Average: 37 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Range query latency on 100K-point tree (1% area) ===
+  Run 1: 37.34 us/query
+  Run 2: 37.31 us/query
+  Run 3: 36.84 us/query
+  Run 4: 36.99 us/query
+  Run 5: 37.16 us/query
+  range 100K 1% area (us) [NOT MEASURED, unoptimized build]:
+    Runs: [37, 37, 37, 37, 37]
+    Average: 37 (target <= 1,500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Small-fanout stress (max_fill=8, 50K inserts) ===
+  50K inserts in 551.9 ms (height=7, splits=10849)
+
+=== Snapshot save+load roundtrip (100K points) ===
+  Run 1: save 28.0 ms, load 50.8 ms, total 78.8 ms
+  Run 2: save 27.7 ms, load 50.3 ms, total 78.0 ms
+  Run 3: save 27.1 ms, load 47.9 ms, total 74.9 ms
+  Run 4: save 27.9 ms, load 47.7 ms, total 75.6 ms
+  Run 5: save 30.1 ms, load 47.8 ms, total 77.9 ms
+  snapshot roundtrip 100K (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [79, 78, 75, 76, 78]
+    Average: 77 (target <= 1,000, not applied)
+    Re-run with --release for a number worth comparing

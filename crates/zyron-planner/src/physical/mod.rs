@@ -8,7 +8,7 @@ pub mod builder;
 
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
 use crate::cost::PlanCost;
-use crate::logical::{AggregateExpr, LogicalColumn};
+use crate::logical::{AggregateExpr, AsOfTarget, LogicalColumn};
 use std::sync::Arc;
 use zyron_catalog::{ColumnId, IndexEntry, IndexId, TableId};
 use zyron_parser::ast::{JoinType, SetOpType};
@@ -36,6 +36,35 @@ pub struct MetaAggSpec {
     pub return_type: zyron_common::types::TypeId,
     /// Output column name.
     pub name: String,
+}
+
+/// A lake scan's layout verdict, with the column it is about already
+/// named.
+///
+/// Named at plan time rather than at render time because the column may be
+/// the one an expression cluster key is stored in, which lives in the lake
+/// schema and not in the scan's projection, so a renderer reading the
+/// projection alone could not name it
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterFitDetail {
+    pub estimate: zyron_lake::ClusterFitEstimate,
+    /// Column name, or the expression when the key is a stored expression
+    pub column: String,
+}
+
+impl ClusterFitDetail {
+    /// The verdict as EXPLAIN prints it
+    pub fn render(&self) -> String {
+        match self.estimate.fit {
+            zyron_lake::ClusterFit::Good => format!("good ({})", self.column),
+            zyron_lake::ClusterFit::Fair => format!(
+                "fair ({} is cluster key {})",
+                self.column,
+                self.estimate.position.unwrap_or(0) + 1
+            ),
+            zyron_lake::ClusterFit::Poor => format!("poor (fell back to {})", self.column),
+        }
+    }
 }
 
 /// Physical execution plan. Each variant maps to a concrete operator
@@ -67,6 +96,88 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// Scan of a lake table, driven by its transaction log manifest. A
+    /// lake table has no heap rows and no MVCC system columns, visibility
+    /// is the manifest at the resolved log version, so no other scan node
+    /// can serve it. Chosen whenever the catalog marks the table lake.
+    LakeScan {
+        table_id: TableId,
+        columns: Vec<LogicalColumn>,
+        predicate: Option<BoundExpr>,
+        /// The predicate lowered to the lake IR, present only when it has an
+        /// exact equivalent. The operator prunes files with it, and its
+        /// absence is why a scan reads every file, so EXPLAIN reports it.
+        lowered: Option<zyron_lake::LakePredicate>,
+        /// What the table's layout does for `lowered`, judged against the
+        /// keys a clustering pass accepted rather than the declared ones.
+        /// None when the table is not laid out or the predicate did not
+        /// lower, because there is then nothing to judge.
+        ///
+        /// Decided here rather than measured, so EXPLAIN can say a plan
+        /// missed the layout without running it
+        cluster_fit: Option<ClusterFitDetail>,
+        /// Columns `bloom_filter_columns` asked for that the layout already
+        /// covers, so no filter was built. Empty when nothing was asked for
+        /// or nothing was skipped.
+        ///
+        /// Carried on the plan because the request was made once, in a DDL
+        /// statement, and a reader looking at a scan that is not using the
+        /// filter they declared has no other place to find out why
+        bloom_redundant: Vec<String>,
+        /// Time-travel target resolved by the operator against the log,
+        /// version directly and timestamp through commit timestamps.
+        as_of: Option<super::logical::AsOfTarget>,
+        cost: PlanCost,
+    },
+
+    /// Scan of a table that lives on a peer. The projection, the filter and
+    /// the row cap travel to the remote inside `request`, because a
+    /// federated scan that fetched everything and filtered here would pay
+    /// the network for work the peer could have skipped.
+    ///
+    /// `residual` is the part of the predicate with no faithful SQL
+    /// rendering, evaluated locally on the rows that come back. A conjunct
+    /// is in exactly one of the two places, so no row is filtered twice and
+    /// none is missed.
+    ForeignScan {
+        table_id: TableId,
+        columns: Vec<LogicalColumn>,
+        residual: Option<BoundExpr>,
+        request: zyron_common::ForeignRequest,
+        cost: PlanCost,
+    },
+
+    /// Predicate delete on a lake table. The predicate is recorded in the
+    /// table's log rather than applied row by row: files it fully covers
+    /// are dropped whole with no data IO, files it may match carry it
+    /// until a later optimize rewrites them. None deletes every row.
+    LakeDelete {
+        table_id: TableId,
+        predicate: Option<zyron_lake::LakePredicate>,
+        /// The same row-selecting predicate in bound form, so referential
+        /// enforcement can gather exactly the rows the delete removes
+        bound_predicate: Option<BoundExpr>,
+        /// The predicate's SQL text, recorded in the manifest
+        sql: String,
+        cost: PlanCost,
+    },
+
+    /// Update of a lake table: the matching rows are read through the
+    /// child scan, the assignments produce their new images, and one
+    /// commit removes the old rows and adds the new ones. The child
+    /// projects every column so the new image is complete.
+    LakeUpdate {
+        table_id: TableId,
+        assignments: Vec<crate::binder::BoundAssignment>,
+        check_constraints: Vec<BoundExpr>,
+        /// Lowered form of the child's predicate, what removes the old
+        /// rows. None updates every row.
+        predicate: Option<zyron_lake::LakePredicate>,
+        sql: String,
+        child: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+
     /// MIN/MAX/COUNT answered from columnar segment headers plus the heap
     /// residual, with no decode of the folded rows. Emitted only when the
     /// table has registered segments, there is no GROUP BY, no predicate, no
@@ -87,7 +198,15 @@ pub enum PhysicalPlan {
         columns: Vec<LogicalColumn>,
         predicate: BoundExpr,
         remaining_predicate: Option<BoundExpr>,
+        /// Which way the index is walked. Backward serves an ORDER BY that
+        /// runs opposite to the index's declared key direction.
         scan_direction: ScanDirection,
+        /// The ordering this scan is relied on to produce, set when a Sort
+        /// above it was removed because the index already yields that order.
+        /// The executor rebuilds the Sort if it has to fall back to a path
+        /// that does not read the index in order, so losing the index at
+        /// runtime costs speed rather than correctness.
+        ordered_by: Option<Vec<crate::binder::BoundOrderBy>>,
         cost: PlanCost,
         /// Time travel target for versioned table scans.
         as_of: Option<super::logical::AsOfTarget>,
@@ -128,7 +247,10 @@ pub enum PhysicalPlan {
     /// Left (NULL-extend); condition is the optional ON predicate.
     LateralJoin {
         left: Box<PhysicalPlan>,
-        subquery: crate::binder::BoundSelect,
+        /// Boxed because a `BoundSelect` is by far the widest thing any plan
+        /// node carries, and inlining it here would set the size of every
+        /// `PhysicalPlan` value in the planner and the executor
+        subquery: Box<crate::binder::BoundSelect>,
         subquery_table_idx: usize,
         join_type: JoinType,
         condition: Option<BoundExpr>,
@@ -204,6 +326,19 @@ pub enum PhysicalPlan {
 
     /// Distinct via hash set.
     HashDistinct {
+        child: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+
+    /// Row locking for SELECT ... FOR UPDATE/SHARE. The executor builds its
+    /// child through the locator-tracking scan path so every row carries a
+    /// storage locator to lock.
+    LockRows {
+        table_id: TableId,
+        mode: crate::binder::RowLockMode,
+        wait: crate::binder::RowLockWait,
+        /// literal LIMIT plus OFFSET, locking stops after this many rows
+        cap: Option<u64>,
         child: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -307,6 +442,9 @@ pub enum PhysicalPlan {
         match_expr: BoundExpr,
         /// Additional predicates to apply after FTS scoring.
         remaining_predicate: Option<BoundExpr>,
+        /// Time travel qualifier. A hit resolves to a row in the store the
+        /// row lives in, and this is the version that fetch reads at.
+        as_of: Option<AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -319,6 +457,8 @@ pub enum PhysicalPlan {
         metric: u8,
         k: usize,
         remaining_predicate: Option<BoundExpr>,
+        /// Time travel qualifier, see FulltextScan
+        as_of: Option<AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -330,6 +470,8 @@ pub enum PhysicalPlan {
         columns: Vec<LogicalColumn>,
         kind: SpatialScanKind,
         remaining_predicate: Option<BoundExpr>,
+        /// Time travel qualifier, see FulltextScan
+        as_of: Option<AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -403,11 +545,54 @@ pub enum ScanDirection {
 }
 
 impl PhysicalPlan {
+    /// Every child plan this node reads from, in execution order.
+    ///
+    /// Total over the enum on purpose. A partial walk that fell through to
+    /// an empty list for a shape nobody thought of would stop at that node
+    /// and report whatever it had found so far, which reads as an answer
+    /// rather than as a gap
+    pub fn children(&self) -> Vec<&PhysicalPlan> {
+        match self {
+            PhysicalPlan::LakeUpdate { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Filter { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Project { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::NestedLoopJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::LateralJoin { left, .. } => vec![left.as_ref()],
+            PhysicalPlan::HashJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::MergeJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::HashAggregate { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::SortAggregate { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::GapFill { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Sort { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Limit { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::HashDistinct { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::LockRows { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::SetOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::Insert { source, .. } => vec![source.as_ref()],
+            PhysicalPlan::Update { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Delete { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::ParallelHashJoin { left, right, .. } => {
+                vec![left.as_ref(), right.as_ref()]
+            }
+            PhysicalPlan::Gather { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Repartition { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Broadcast { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Window { child, .. } => vec![child.as_ref()],
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl PhysicalPlan {
     /// Returns the estimated cost of this plan node.
     pub fn cost(&self) -> &PlanCost {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
             | PhysicalPlan::HybridScan { cost, .. }
+            | PhysicalPlan::LakeScan { cost, .. }
+            | PhysicalPlan::ForeignScan { cost, .. }
+            | PhysicalPlan::LakeDelete { cost, .. }
+            | PhysicalPlan::LakeUpdate { cost, .. }
             | PhysicalPlan::ColumnarMetadataAggregate { cost, .. }
             | PhysicalPlan::IndexScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
@@ -421,6 +606,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Sort { cost, .. }
             | PhysicalPlan::Limit { cost, .. }
             | PhysicalPlan::HashDistinct { cost, .. }
+            | PhysicalPlan::LockRows { cost, .. }
             | PhysicalPlan::SetOp { cost, .. }
             | PhysicalPlan::Insert { cost, .. }
             | PhysicalPlan::Values { cost, .. }
@@ -446,6 +632,8 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::SeqScan { columns, .. }
             | PhysicalPlan::HybridScan { columns, .. }
+            | PhysicalPlan::LakeScan { columns, .. }
+            | PhysicalPlan::ForeignScan { columns, .. }
             | PhysicalPlan::IndexScan { columns, .. }
             | PhysicalPlan::ParallelSeqScan { columns, .. } => columns.clone(),
             PhysicalPlan::ColumnarMetadataAggregate { schema, .. } => schema.clone(),
@@ -469,7 +657,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: None,
+                        fractional_digits: expr.fractional_digits(),
                     }
                 })
                 .collect(),
@@ -508,18 +696,26 @@ impl PhysicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: None,
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
                     let idx = group_by.len() + i;
+                    // A decimal aggregate keeps its argument's scale, so
+                    // the output column compares and renders the value
+                    // rather than the raw scaled integer
+                    let fractional_digits = if agg.return_type == zyron_common::TypeId::Decimal {
+                        agg.args.first().and_then(|a| a.fractional_digits())
+                    } else {
+                        None
+                    };
                     schema.push(LogicalColumn {
                         table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
                         column_id: ColumnId(idx as u16),
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,
                         nullable: true,
-                        ts_precision: None,
+                        fractional_digits,
                     });
                 }
                 schema
@@ -527,6 +723,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { child, .. }
             | PhysicalPlan::Limit { child, .. }
             | PhysicalPlan::HashDistinct { child, .. }
+            | PhysicalPlan::LockRows { child, .. }
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
             | PhysicalPlan::GapFill { child, .. }
@@ -534,7 +731,9 @@ impl PhysicalPlan {
             PhysicalPlan::SetOp { left, .. } => left.output_schema(),
             PhysicalPlan::Insert { .. }
             | PhysicalPlan::Update { .. }
-            | PhysicalPlan::Delete { .. } => Vec::new(),
+            | PhysicalPlan::Delete { .. }
+            | PhysicalPlan::LakeDelete { .. }
+            | PhysicalPlan::LakeUpdate { .. } => Vec::new(),
             PhysicalPlan::Values { schema, .. } => schema.clone(),
             PhysicalPlan::FulltextScan { columns, .. }
             | PhysicalPlan::VectorScan { columns, .. }
@@ -564,7 +763,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: true,
-                        ts_precision: None,
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 schema
@@ -578,6 +777,9 @@ impl PhysicalPlan {
         let children_cost = match self {
             PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::HybridScan { .. }
+            | PhysicalPlan::LakeScan { .. }
+            | PhysicalPlan::ForeignScan { .. }
+            | PhysicalPlan::LakeDelete { .. }
             | PhysicalPlan::ColumnarMetadataAggregate { .. }
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
@@ -594,9 +796,11 @@ impl PhysicalPlan {
             | PhysicalPlan::Sort { child, .. }
             | PhysicalPlan::Limit { child, .. }
             | PhysicalPlan::HashDistinct { child, .. }
+            | PhysicalPlan::LockRows { child, .. }
             | PhysicalPlan::Insert { source: child, .. }
             | PhysicalPlan::Update { child, .. }
             | PhysicalPlan::Delete { child, .. }
+            | PhysicalPlan::LakeUpdate { child, .. }
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
             | PhysicalPlan::Broadcast { child, .. }
@@ -618,5 +822,30 @@ impl PhysicalPlan {
             cpu_cost: own.cpu_cost + children_cost.cpu_cost,
             row_count: own.row_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_width {
+    use super::*;
+
+    /// Every construction, move, match arm and `Vec` element in the planner
+    /// and the executor pays this width, and the operator tree is built by
+    /// recursion, so it is also multiplied by plan depth on the stack. It was
+    /// 928 bytes while `LateralJoin` held a `BoundSelect` inline, which alone
+    /// is 704. Raising this is a real cost, so it is pinned rather than left
+    /// to drift
+    #[test]
+    fn a_physical_plan_node_stays_narrow() {
+        let width = std::mem::size_of::<PhysicalPlan>();
+        assert!(
+            width <= 384,
+            "PhysicalPlan grew to {} bytes, over the 384 byte budget.              Box the widest field of the variant that grew rather than              widening every plan node in the tree",
+            width
+        );
+        assert!(
+            std::mem::size_of::<crate::binder::BoundSelect>() > width,
+            "BoundSelect is no longer wider than a plan node, so the reason              LateralJoin boxes it should be rechecked"
+        );
     }
 }

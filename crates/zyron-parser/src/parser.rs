@@ -11,6 +11,11 @@ pub struct Parser<'a> {
     lexer: Lexer<'a>,
     current: SpannedToken,
     peek: SpannedToken,
+    /// One token past `peek`. The FROM clause needs it: an identifier
+    /// followed by AS is an alias in `<table> <alias> AS OF <expr>` and part
+    /// of the clause after it otherwise, and the two are told apart by the
+    /// token after AS.
+    peek2: SpannedToken,
     /// Original SQL source, retained so handlers can capture the verbatim text
     /// of a sub-expression (e.g. an ABAC policy predicate) via token spans.
     input: &'a str,
@@ -22,10 +27,12 @@ impl<'a> Parser<'a> {
         let mut lexer = Lexer::new(input);
         let current = lexer.next_token()?;
         let peek = lexer.next_token()?;
+        let peek2 = lexer.next_token()?;
         Ok(Self {
             lexer,
             current,
             peek,
+            peek2,
             input,
         })
     }
@@ -122,10 +129,8 @@ impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
 
     fn advance(&mut self) -> Result<SpannedToken> {
-        let prev = std::mem::replace(
-            &mut self.current,
-            std::mem::replace(&mut self.peek, self.lexer.next_token()?),
-        );
+        let next = std::mem::replace(&mut self.peek2, self.lexer.next_token()?);
+        let prev = std::mem::replace(&mut self.current, std::mem::replace(&mut self.peek, next));
         Ok(prev)
     }
 
@@ -701,6 +706,27 @@ impl<'a> Parser<'a> {
             return Err(self.error("Expected SELECT after '(' in FROM clause"));
         }
 
+        // Inline external source: FILE '<uri>' FORMAT CSV ...
+        //
+        // A backend keyword opens one only when a string literal follows.
+        // Every backend name is also usable as an identifier, so requiring
+        // the URI here keeps a table actually named `file` or `http`
+        // parsing as the table it is
+        if matches!(
+            self.current.token,
+            Token::Keyword(
+                Keyword::File
+                    | Keyword::S3
+                    | Keyword::Gcs
+                    | Keyword::Azure
+                    | Keyword::Http
+                    | Keyword::Zyron
+            )
+        ) && matches!(self.peek.token, Token::String(_))
+        {
+            return self.parse_external_inline_ref();
+        }
+
         let name = self.parse_ident()?;
 
         // Table-valued function call: name(args...) [AS alias]
@@ -729,30 +755,23 @@ impl<'a> Parser<'a> {
         }
 
         // Optional pre-as_of alias for the streaming temporal-join form
-        // '<table> <alias> AS OF <expr>'. The base-table identifier here is
-        // followed by an identifier that is itself followed by AS OF. This
-        // keeps the alias attached to the correct base table when AS OF
-        // precedes the clause keyword check below.
-        let pre_as_of_alias = if let Token::Ident(_) = &self.current.token {
-            if self.peek.token == Token::Keyword(Keyword::As) && !self.is_clause_keyword() {
-                // Peek further, but we only have peek-1. We can safely consume
-                // the identifier when the token after it is AS, because the
-                // alias-then-AS-OF path produces AS OF <expr> and the alias
-                // path alone would produce AS <alias_ident>. Distinguish by
-                // looking at whether the token after AS is OF, which requires
-                // speculative advance. Keep a copy of the current token and
-                // restore via the lexer if the decision is wrong.
-                //
-                // A simpler alternative: only trigger this fast path when
-                // the identifier is followed by AS followed immediately by OF.
-                // The parser does not currently expose two-token peek, so we
-                // consume the alias here and then rely on the existing AS OF
-                // detection to pick up the time-travel clause.
-                let saved = self.parse_ident()?;
-                Some(saved)
-            } else {
-                None
-            }
+        // '<table> <alias> AS OF <expr>', and the branch form
+        // '<table> <alias> IN BRANCH <expr>'. Both put the alias between the
+        // table and a qualifier that opens with a keyword, so the alias is
+        // taken here and the qualifier is read by the block below.
+        //
+        // Three tokens decide it: an identifier, then AS or IN, then the
+        // keyword that makes the pair a qualifier rather than the start of
+        // the next clause. Reading the third is what keeps a plain
+        // '<table> <alias>' from having its alias consumed here
+        let pre_qualifier_alias = if matches!(&self.current.token, Token::Ident(_))
+            && !self.is_clause_keyword()
+            && ((self.peek.token == Token::Keyword(Keyword::As)
+                && self.peek2.token == Token::Keyword(Keyword::Of))
+                || (self.peek.token == Token::Keyword(Keyword::In)
+                    && self.peek2.token == Token::Keyword(Keyword::Branch)))
+        {
+            Some(self.parse_ident()?)
         } else {
             None
         };
@@ -775,6 +794,13 @@ impl<'a> Parser<'a> {
             let _ = self.consume_keyword(Keyword::Timestamptz)?;
             let expr = self.parse_expr()?;
             Some(Box::new(AsOf::Timestamp(expr)))
+        } else if self.at_keyword(Keyword::In) && self.peek.token == Token::Keyword(Keyword::Branch)
+        {
+            // FROM <table> IN BRANCH 'name'
+            self.advance()?; // IN
+            self.advance()?; // BRANCH
+            let expr = self.parse_expr()?;
+            Some(Box::new(AsOf::Branch(expr)))
         } else if self.at_keyword(Keyword::For)
             && (self.peek.token == Token::Keyword(Keyword::System)
                 || self.peek.token == Token::Keyword(Keyword::Versioning))
@@ -836,9 +862,22 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // A post-AS-OF alias wins when present, otherwise the alias consumed
-        // before AS OF (the '<table> <alias> AS OF <expr>' form) is the alias.
-        let alias = post_alias.or(pre_as_of_alias);
+        // The branch qualifier also reads after an alias, so both
+        // '<table> IN BRANCH x AS a' and '<table> AS a IN BRANCH x' parse.
+        let as_of = match as_of {
+            Some(existing) => Some(existing),
+            None if self.at_keyword(Keyword::In)
+                && self.peek.token == Token::Keyword(Keyword::Branch) =>
+            {
+                self.advance()?; // IN
+                self.advance()?; // BRANCH
+                Some(Box::new(AsOf::Branch(self.parse_expr()?)))
+            }
+            None => None,
+        };
+        // A post-qualifier alias wins when present, otherwise the one taken
+        // before it, the '<table> <alias> AS OF <expr>' form
+        let alias = post_alias.or(pre_qualifier_alias);
         Ok(TableRef::Table { name, alias, as_of })
     }
 
@@ -1040,6 +1079,8 @@ impl<'a> Parser<'a> {
         }
 
         match &self.current.token {
+            Token::Keyword(Keyword::Peer) => self.parse_create_peer(),
+            Token::Keyword(Keyword::Foreign) => self.parse_create_foreign_table(),
             Token::Keyword(Keyword::Table) => self.parse_create_table(),
             Token::Keyword(Keyword::Index) => self.parse_create_index(false),
             Token::Keyword(Keyword::View) => self.parse_create_view(false),
@@ -1094,6 +1135,34 @@ impl<'a> Parser<'a> {
         };
 
         let name = self.parse_ident()?;
+
+        // `CLONE OF <table> [AT VERSION <n>]` takes the source's shape, so
+        // it stands in place of a column list rather than beside one
+        if self.consume_keyword(Keyword::Clone)? {
+            self.expect_keyword(Keyword::Of)?;
+            let source = self.parse_ident()?;
+            let at_version = if self.consume_keyword(Keyword::At)? {
+                self.expect_keyword(Keyword::Version)?;
+                Some(self.parse_u64_literal("CLONE ... AT VERSION")?)
+            } else {
+                None
+            };
+            return Ok(Statement::CreateTable(Box::new(CreateTableStatement {
+                name,
+                if_not_exists,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                options: Vec::new(),
+                ttl: None,
+                using: None,
+                cluster_by: None,
+                clone_of: Some(CloneSource {
+                    table: source,
+                    at_version,
+                }),
+            })));
+        }
+
         self.expect_token(&Token::LParen)?;
 
         let mut columns = Vec::new();
@@ -1121,6 +1190,19 @@ impl<'a> Parser<'a> {
 
         self.expect_token(&Token::RParen)?;
 
+        // Optional storage format, USING ZYRONLAKE | HEAP
+        let mut using = None;
+        if self.consume_keyword(Keyword::Using)? {
+            using = Some(self.parse_table_format()?);
+        }
+
+        // Optional CLUSTER BY clause
+        let mut cluster_by = None;
+        if self.consume_keyword(Keyword::Cluster)? {
+            self.expect_keyword(Keyword::By)?;
+            cluster_by = Some(self.parse_cluster_by_body()?);
+        }
+
         // Optional inline TTL clause before WITH options
         let mut ttl = None;
         if self.consume_keyword(Keyword::Ttl)? {
@@ -1147,7 +1229,97 @@ impl<'a> Parser<'a> {
             constraints,
             options,
             ttl,
+            using,
+            cluster_by,
+            clone_of: None,
         })))
+    }
+
+    /// A non-negative whole number literal, for the places the grammar
+    /// takes a count or a version rather than an expression
+    fn parse_u64_literal(&mut self, what: &str) -> Result<u64> {
+        match self.current.token.clone() {
+            Token::Integer(v) if v >= 0 => {
+                self.advance()?;
+                Ok(v as u64)
+            }
+            Token::BigInteger(v) => {
+                let parsed = u64::try_from(v).map_err(|_| {
+                    self.error(&format!("{what} needs a whole number, {v} is too large"))
+                })?;
+                self.advance()?;
+                Ok(parsed)
+            }
+            other => Err(self.error(&format!("{what} needs a whole number, found {other}"))),
+        }
+    }
+
+    /// Parses the format name after USING in table DDL
+    fn parse_table_format(&mut self) -> Result<TableFormat> {
+        if self.consume_keyword(Keyword::Zyronlake)? {
+            return Ok(TableFormat::ZyronLake);
+        }
+        if self.consume_keyword(Keyword::Heap)? {
+            return Ok(TableFormat::Heap);
+        }
+        Err(self.error(&format!(
+            "Expected ZYRONLAKE or HEAP after USING, found {}",
+            self.current.token
+        )))
+    }
+
+    /// Parses everything after CLUSTER BY. Forms: `AUTO` with no keys,
+    /// `(a, b [USING <strategy>])` pinned, `(...) AUTO` anchored hybrid,
+    /// `(...) FORCE` explicit pin, `()` FORCE explicit none
+    fn parse_cluster_by_body(&mut self) -> Result<ClusterByClause> {
+        if self.consume_keyword(Keyword::Auto)? {
+            return Ok(ClusterByClause {
+                keys: Vec::new(),
+                mode: ClusterMode::Auto,
+            });
+        }
+        self.expect_token(&Token::LParen)?;
+        let mut keys = Vec::new();
+        if self.current.token != Token::RParen {
+            loop {
+                // A bare identifier names a column, anything else is an
+                // expression clustering gives a column of its own. Parsing
+                // an expression either way lets the two interleave in one
+                // key list
+                let target = match self.parse_expr()? {
+                    Expr::Identifier(name) => ClusterKeyTarget::Column(name),
+                    other => ClusterKeyTarget::Expression(other),
+                };
+                let strategy = if self.consume_keyword(Keyword::Using)? {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                keys.push(ClusterKeyDef { target, strategy });
+                if !self.consume_token(&Token::Comma)? {
+                    break;
+                }
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        let mode = if self.consume_keyword(Keyword::Auto)? {
+            if keys.is_empty() {
+                ClusterMode::Auto
+            } else {
+                ClusterMode::Hybrid
+            }
+        } else if self.consume_keyword(Keyword::Force)? {
+            // FORCE pins the listed keys against measurement. With an empty
+            // key list it pins the absence of a layout, which is how a table
+            // opts out of clustering entirely
+            ClusterMode::Force
+        } else {
+            // A bare key list seeds the layout without pinning it, so
+            // measurement starts from what was declared and may move on when
+            // the workload says something else serves it better
+            ClusterMode::Auto
+        };
+        Ok(ClusterByClause { keys, mode })
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {
@@ -1186,6 +1358,8 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Role) => self.parse_drop_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_drop_pipeline(),
             Token::Keyword(Keyword::Feature) => self.parse_drop_feature_group(),
+            Token::Keyword(Keyword::Peer) => self.parse_drop_peer(),
+            Token::Keyword(Keyword::Foreign) => self.parse_drop_foreign_table(),
             Token::Keyword(Keyword::Model) => self.parse_drop_model(),
             Token::Keyword(Keyword::Graph) => self.parse_drop_graph_schema(),
             Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
@@ -1325,10 +1499,11 @@ impl<'a> Parser<'a> {
         if self.at_keyword(Keyword::Set) && self.peek.token == Token::Keyword(Keyword::Ttl) {
             self.advance()?; // SET
             self.advance()?; // TTL
-            // Legacy form: SET TTL ARCHIVE <duration> ON <col>
-            let legacy_archive = self.consume_keyword(Keyword::Archive)?;
+            // Shorthand: SET TTL ARCHIVE <duration> ON <col> names the
+            // action up front instead of in a trailing ACTION clause
+            let archive_shorthand = self.consume_keyword(Keyword::Archive)?;
             let mut clause = self.parse_ttl_clause_body()?;
-            if legacy_archive {
+            if archive_shorthand {
                 clause.action = TtlAction::Archive;
             }
             return Ok(Statement::AlterTableTtl(Box::new(AlterTableTtlStatement {
@@ -1348,6 +1523,86 @@ impl<'a> Parser<'a> {
                 table: name,
                 operation: TtlOperation::Drop,
             })));
+        }
+
+        // SET USING <format> [WITH (options)] storage format conversion
+        if self.at_keyword(Keyword::Set) && self.peek.token == Token::Keyword(Keyword::Using) {
+            self.advance()?; // SET
+            self.advance()?; // USING
+            let format = self.parse_table_format()?;
+            let mut options = vec![];
+            if self.consume_keyword(Keyword::With)? {
+                self.expect_token(&Token::LParen)?;
+                options = self.parse_comma_separated(|p| p.parse_table_option())?;
+                self.expect_token(&Token::RParen)?;
+            }
+            return Ok(Statement::AlterTableSetUsing(Box::new(
+                AlterTableSetUsingStatement {
+                    table: name,
+                    format,
+                    options,
+                },
+            )));
+        }
+
+        // SET CLUSTERING SCHEDULE = OnDemand | Incremental | Continuous
+        if self.at_keyword(Keyword::Set) && self.peek.token == Token::Keyword(Keyword::Clustering) {
+            self.advance()?; // SET
+            self.advance()?; // CLUSTERING
+            self.expect_keyword(Keyword::Schedule)?;
+            self.expect_token(&Token::Eq)?;
+            let schedule = if self.consume_keyword(Keyword::Ondemand)? {
+                ClusteringSchedule::OnDemand
+            } else if self.consume_keyword(Keyword::Incremental)? {
+                ClusteringSchedule::Incremental
+            } else if self.consume_keyword(Keyword::Continuous)? {
+                ClusteringSchedule::Continuous
+            } else {
+                return Err(self.error(&format!(
+                    "Expected ONDEMAND, INCREMENTAL or CONTINUOUS, found {}",
+                    self.current.token
+                )));
+            };
+            return Ok(Statement::AlterTableClusteringSchedule(Box::new(
+                AlterTableClusteringScheduleStatement {
+                    table: name,
+                    schedule,
+                },
+            )));
+        }
+
+        // FOLLOW <peer>.<table> makes this table a replica of that one,
+        // UNFOLLOW leaves it its own authority holding what it applied
+        if self.consume_keyword(Keyword::Follow)? {
+            let peer = self.parse_ident()?;
+            self.expect_token(&Token::Dot)?;
+            let remote = self.parse_ident()?;
+            return Ok(Statement::AlterTableFollow(Box::new(
+                AlterTableFollowStatement {
+                    table: name,
+                    leader: Some((peer, remote)),
+                },
+            )));
+        }
+        if self.consume_keyword(Keyword::Unfollow)? {
+            return Ok(Statement::AlterTableFollow(Box::new(
+                AlterTableFollowStatement {
+                    table: name,
+                    leader: None,
+                },
+            )));
+        }
+
+        // CLUSTER BY (...) | AUTO | (...) AUTO layout change
+        if self.consume_keyword(Keyword::Cluster)? {
+            self.expect_keyword(Keyword::By)?;
+            let clause = self.parse_cluster_by_body()?;
+            return Ok(Statement::AlterTableClusterBy(Box::new(
+                AlterTableClusterByStatement {
+                    table: name,
+                    clause,
+                },
+            )));
         }
 
         // SET (key = value, ...) table options
@@ -1394,6 +1649,15 @@ impl<'a> Parser<'a> {
                     || self.at_keyword(Keyword::Foreign)
                 {
                     AlterTableOperation::AddConstraint(self.parse_table_constraint()?)
+                } else if self.consume_keyword(Keyword::Derived)? {
+                    // ADD DERIVED COLUMN <name> AS <expr> names an
+                    // expression column, which a bare CLUSTER BY over an
+                    // expression creates without a name
+                    self.consume_keyword(Keyword::Column)?;
+                    let name = self.parse_ident()?;
+                    self.expect_keyword(Keyword::As)?;
+                    let expr = self.parse_expr()?;
+                    AlterTableOperation::AddDerivedColumn { name, expr }
                 } else {
                     self.consume_keyword(Keyword::Column)?;
                     AlterTableOperation::AddColumn(self.parse_column_def()?)
@@ -1532,6 +1796,9 @@ impl<'a> Parser<'a> {
         if !self.consume_keyword(Keyword::Begin)? {
             self.expect_keyword(Keyword::Start)?;
         }
+        // ZYRONLAKE marks a transaction whose lake writes commit through a
+        // cross-table intent instead of the database commit record
+        let lake = self.consume_keyword(Keyword::Zyronlake)?;
         // TRANSACTION and WORK are optional noise words
         if !self.consume_keyword(Keyword::Transaction)? {
             self.consume_keyword(Keyword::Work)?;
@@ -1540,6 +1807,7 @@ impl<'a> Parser<'a> {
         Ok(Statement::Begin(Box::new(BeginStatement {
             isolation,
             read_only,
+            lake,
         })))
     }
 
@@ -1786,7 +2054,9 @@ impl<'a> Parser<'a> {
                 self.expect_token(&Token::LParen)?;
                 let column = self.parse_ident()?;
                 self.expect_token(&Token::RParen)?;
-                let (on_delete, on_update) = self.parse_referential_actions()?;
+                // An inline column reference takes no ON VIOLATION clause,
+                // the table-level form is where a violation mode is declared
+                let (on_delete, on_update, _) = self.parse_referential_actions()?;
                 constraints.push(ColumnConstraint::References {
                     table,
                     column,
@@ -1816,6 +2086,9 @@ impl<'a> Parser<'a> {
             None
         };
 
+        // Set by the foreign key branch, the only kind that takes an
+        // ON VIOLATION clause today
+        let mut fk_violation = ViolationAction::Fail;
         let kind = if self.at_keyword(Keyword::Primary) {
             self.advance()?;
             self.expect_keyword(Keyword::Key)?;
@@ -1846,7 +2119,8 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::LParen)?;
             let ref_columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
-            let (on_delete, on_update) = self.parse_referential_actions()?;
+            let (on_delete, on_update, violation) = self.parse_referential_actions()?;
+            fk_violation = violation;
             TableConstraintKind::ForeignKey {
                 columns,
                 ref_table,
@@ -1861,28 +2135,59 @@ impl<'a> Parser<'a> {
             )));
         };
 
-        Ok(TableConstraint { name, kind })
+        // A declared constraint is enforced unless the statement says
+        // otherwise. NOT ENFORCED keeps the declaration for the planner and
+        // tells the engine not to check it
+        let enforced = if self.at_keyword(Keyword::Not) {
+            self.advance()?;
+            self.expect_keyword(Keyword::Enforced)?;
+            false
+        } else {
+            let _ = self.consume_keyword(Keyword::Enforced)?;
+            true
+        };
+
+        Ok(TableConstraint {
+            name,
+            kind,
+            enforced,
+            on_violation: fk_violation,
+        })
     }
 
     /// Parses optional ON DELETE and ON UPDATE referential action clauses in
     /// either order. Returns (on_delete, on_update), defaulting to NoAction.
-    fn parse_referential_actions(&mut self) -> Result<(ReferentialAction, ReferentialAction)> {
+    fn parse_referential_actions(
+        &mut self,
+    ) -> Result<(ReferentialAction, ReferentialAction, ViolationAction)> {
         let mut on_delete = ReferentialAction::NoAction;
         let mut on_update = ReferentialAction::NoAction;
+        let mut on_violation = ViolationAction::Fail;
         while self.at_keyword(Keyword::On) {
             self.advance()?;
             if self.consume_keyword(Keyword::Delete)? {
                 on_delete = self.parse_referential_action()?;
             } else if self.consume_keyword(Keyword::Update)? {
                 on_update = self.parse_referential_action()?;
+            } else if self.consume_keyword(Keyword::Violation)? {
+                on_violation = if self.consume_keyword(Keyword::Quarantine)? {
+                    ViolationAction::Quarantine
+                } else if self.consume_keyword(Keyword::Fail)? {
+                    ViolationAction::Fail
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected QUARANTINE or FAIL after ON VIOLATION, found {}",
+                        self.current.token
+                    )));
+                };
             } else {
                 return Err(self.error(&format!(
-                    "Expected DELETE or UPDATE after ON in foreign key clause, found {}",
+                    "Expected DELETE, UPDATE or VIOLATION after ON in foreign key clause, found {}",
                     self.current.token
                 )));
             }
         }
-        Ok((on_delete, on_update))
+        Ok((on_delete, on_update, on_violation))
     }
 
     /// Parses a single referential action: CASCADE, RESTRICT, NO ACTION,
@@ -1950,7 +2255,10 @@ impl<'a> Parser<'a> {
             }
             Token::Keyword(Keyword::Double) => {
                 self.advance()?;
-                self.expect_keyword(Keyword::Precision)?;
+                // The standard spells it DOUBLE PRECISION and the word is
+                // optional in every dialect that also accepts a bare DOUBLE,
+                // so both name the same type here
+                self.consume_keyword(Keyword::Precision)?;
                 Ok(DataType::DoublePrecision)
             }
             Token::Keyword(Keyword::Float) => {
@@ -2192,10 +2500,25 @@ impl<'a> Parser<'a> {
     fn parse_optional_precision_scale(&mut self) -> Result<(Option<u8>, Option<u8>)> {
         if self.at_token(&Token::LParen) {
             self.advance()?;
-            let precision = self.parse_integer_value()? as u8;
+            // An i128 holds at most 38 decimal digits, so precision and
+            // scale are bounded here rather than truncated modulo 256 by
+            // the cast below
+            let precision_raw = self.parse_integer_value()?;
+            if !(1..=38).contains(&precision_raw) {
+                return Err(self.error(&format!(
+                    "DECIMAL precision {precision_raw} is out of range, expected 1 to 38"
+                )));
+            }
+            let precision = precision_raw as u8;
             let scale = if self.at_token(&Token::Comma) {
                 self.advance()?;
-                Some(self.parse_integer_value()? as u8)
+                let scale_raw = self.parse_integer_value()?;
+                if scale_raw < 0 || scale_raw > precision_raw {
+                    return Err(self.error(&format!(
+                        "DECIMAL scale {scale_raw} is out of range, expected 0 to the precision {precision_raw}"
+                    )));
+                }
+                Some(scale_raw as u8)
             } else {
                 None
             };
@@ -2335,10 +2658,25 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::Integer(val)))
             }
+            Token::BigInteger(n) => {
+                let magnitude = *n;
+                self.advance()?;
+                let val = i128::try_from(magnitude).map_err(|_| {
+                    self.error(&format!(
+                        "Integer literal '{magnitude}' is too large for any integer type"
+                    ))
+                })?;
+                Ok(Expr::Literal(LiteralValue::Int128(val)))
+            }
             Token::Float(f) => {
                 let val = *f;
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::Float(val)))
+            }
+            Token::Decimal(digits, scale) => {
+                let (digits, scale) = (*digits, *scale);
+                self.advance()?;
+                Ok(Expr::Literal(LiteralValue::Decimal { digits, scale }))
             }
             Token::String(s) => {
                 let val = s.clone();
@@ -2377,6 +2715,37 @@ impl<'a> Parser<'a> {
                 let interval = zyron_common::parse_interval_string(&s)
                     .map_err(|e| self.error(&format!("Invalid INTERVAL '{}': {}", s, e)))?;
                 Ok(Expr::Literal(LiteralValue::Interval(interval)))
+            }
+            // DATE 'x', TIMESTAMP 'x', TIMESTAMPTZ 'x' and TIME 'x' typed
+            // literals, the standard spelling for a temporal constant and
+            // what a client emits when it wants the comparison done in the
+            // column's type rather than as text.
+            //
+            // Desugared to a cast, which is exactly what the syntax means,
+            // so the coercion is the one every other cast goes through
+            // rather than a second path that could disagree with it. The
+            // same keywords stay available as type names, because those
+            // contexts are not followed by a string literal.
+            Token::Keyword(
+                kw @ (Keyword::Date | Keyword::Timestamp | Keyword::Timestamptz | Keyword::Time),
+            ) if matches!(&self.peek.token, Token::String(_)) => {
+                let kw = *kw;
+                self.advance()?; // consume the type keyword
+                let Token::String(s) = &self.current.token else {
+                    return Err(self.error("Expected string literal after a temporal type name"));
+                };
+                let text = s.clone();
+                self.advance()?; // consume the string
+                let data_type = match kw {
+                    Keyword::Date => DataType::Date,
+                    Keyword::Time => DataType::Time,
+                    Keyword::Timestamptz => DataType::TimestampTz(None),
+                    _ => DataType::Timestamp(None),
+                };
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Literal(LiteralValue::String(text))),
+                    data_type,
+                })
             }
             Token::Ident(_) => {
                 let name = self.parse_ident()?;
@@ -2487,6 +2856,31 @@ impl<'a> Parser<'a> {
             }
             Token::Minus => {
                 self.advance()?;
+                // A negated wide literal folds here rather than becoming a
+                // negation of a positive one, because the most negative
+                // i128 has a magnitude the positive range cannot hold
+                if let Token::BigInteger(magnitude) = self.current.token {
+                    self.advance()?;
+                    let val = if magnitude == (i128::MAX as u128) + 1 {
+                        i128::MIN
+                    } else {
+                        -i128::try_from(magnitude).map_err(|_| {
+                            self.error(&format!(
+                                "Integer literal '-{magnitude}' is too large for any integer type"
+                            ))
+                        })?
+                    };
+                    return Ok(Expr::Literal(LiteralValue::Int128(val)));
+                }
+                // A negated wide decimal folds the same way. Its digits fit
+                // 38 places, so the negation always fits i128
+                if let Token::Decimal(digits, scale) = self.current.token {
+                    self.advance()?;
+                    return Ok(Expr::Literal(LiteralValue::Decimal {
+                        digits: -digits,
+                        scale,
+                    }));
+                }
                 let expr = self.parse_expr_bp(15)?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
@@ -2525,6 +2919,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_call(&mut self, name: String) -> Result<Expr> {
+        // Two functions the standard spells with keywords in their argument
+        // list rather than commas. Both desugar to the ordinary call the
+        // executor already dispatches, so the spelling is a parser concern
+        // and nothing downstream has to know about it.
+        if name.eq_ignore_ascii_case("extract") {
+            return self.parse_extract();
+        }
+        if name.eq_ignore_ascii_case("substring") {
+            return self.parse_substring();
+        }
+
         self.expect_token(&Token::LParen)?;
 
         let distinct = self.consume_keyword(Keyword::Distinct)?;
@@ -2573,6 +2978,65 @@ impl<'a> Parser<'a> {
         }
 
         Ok(func_expr)
+    }
+
+    /// `EXTRACT(field FROM source)`, desugared to `extract('field', source)`.
+    ///
+    /// The field is a bare word rather than a string in the standard
+    /// spelling, and several of the field names are keywords in their own
+    /// right, so it is read as either and lowered to a string literal.
+    fn parse_extract(&mut self) -> Result<Expr> {
+        self.expect_token(&Token::LParen)?;
+        let field = match &self.current.token {
+            Token::Ident(name) => name.clone(),
+            Token::Keyword(k) => keyword_to_ident_str(*k)
+                .map(|s| s.to_string())
+                .ok_or_else(|| self.error("Expected a field name after EXTRACT("))?,
+            Token::String(s) => s.clone(),
+            _ => return Err(self.error("Expected a field name after EXTRACT(")),
+        };
+        self.advance()?;
+        self.expect_keyword(Keyword::From)?;
+        let source = self.parse_expr()?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Expr::Function {
+            name: "extract".to_string(),
+            args: vec![
+                FunctionArg::Unnamed(Expr::Literal(LiteralValue::String(field.to_lowercase()))),
+                FunctionArg::Unnamed(source),
+            ],
+            distinct: false,
+        })
+    }
+
+    /// `SUBSTRING(source FROM start [FOR length])` and the equivalent
+    /// `SUBSTRING(source, start [, length])`, both desugared to the same
+    /// positional call.
+    ///
+    /// Which spelling is in use is decided after the first argument rather
+    /// than by looking ahead, because the source can be any expression and a
+    /// lookahead would have to know where it ends.
+    fn parse_substring(&mut self) -> Result<Expr> {
+        self.expect_token(&Token::LParen)?;
+        let source = self.parse_expr()?;
+        let mut args = vec![FunctionArg::Unnamed(source)];
+        if self.consume_keyword(Keyword::From)? {
+            args.push(FunctionArg::Unnamed(self.parse_expr()?));
+            if self.consume_keyword(Keyword::For)? {
+                args.push(FunctionArg::Unnamed(self.parse_expr()?));
+            }
+        } else {
+            while self.at_token(&Token::Comma) {
+                self.advance()?;
+                args.push(FunctionArg::Unnamed(self.parse_expr()?));
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        Ok(Expr::Function {
+            name: "substring".to_string(),
+            args,
+            distinct: false,
+        })
     }
 
     fn parse_function_arg(&mut self) -> Result<FunctionArg> {
@@ -3407,14 +3871,149 @@ impl<'a> Parser<'a> {
         })))
     }
 
+    /// `CREATE PEER <name> ADDRESS '<host:port>' [MODE <mode>]`
+    fn parse_create_peer(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Peer)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Address)?;
+        let address = self.parse_string_literal()?;
+        let mode = if self.consume_keyword(Keyword::Mode)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreatePeer(Box::new(CreatePeerStatement {
+            name,
+            address,
+            mode,
+            if_not_exists,
+        })))
+    }
+
+    /// `CREATE FOREIGN TABLE <name> (<columns>) SERVER <peer> [TABLE <remote>]`
+    ///
+    /// The column list is the local declaration of a remote shape, so it
+    /// carries names and types and nothing else. A constraint here would
+    /// read as enforcement this node cannot perform: the rows are the
+    /// peer's, and the peer enforces its own.
+    fn parse_create_foreign_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Foreign)?;
+        self.expect_keyword(Keyword::Table)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_token(&Token::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            if self.at_token(&Token::RParen) {
+                break;
+            }
+            let column = self.parse_column_def()?;
+            if !column.constraints.is_empty() {
+                return Err(self.error(&format!(
+                    "column \"{}\" of foreign table \"{}\" carries a constraint. A foreign \
+                     table declares the shape of a table on a peer, and the peer enforces \
+                     its own constraints",
+                    column.name, name
+                )));
+            }
+            columns.push(column);
+            if !self.consume_token(&Token::Comma)? {
+                break;
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        if columns.is_empty() {
+            return Err(self.error(&format!(
+                "foreign table \"{}\" declares no column, so nothing could be read from it",
+                name
+            )));
+        }
+        self.expect_keyword(Keyword::Server)?;
+        let server = self.parse_ident()?;
+        // TABLE names the remote when it differs from the local name, which
+        // is the exception rather than the rule
+        let remote_table = if self.consume_keyword(Keyword::Table)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreateForeignTable(Box::new(
+            CreateForeignTableStatement {
+                name,
+                columns,
+                server,
+                remote_table,
+                if_not_exists,
+            },
+        )))
+    }
+
+    /// `DROP FOREIGN TABLE [IF EXISTS] <name>`
+    fn parse_drop_foreign_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Foreign)?;
+        self.expect_keyword(Keyword::Table)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropForeignTable(Box::new(
+            DropForeignTableStatement { name, if_exists },
+        )))
+    }
+
+    /// `DROP PEER [IF EXISTS] <name>`
+    fn parse_drop_peer(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Peer)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropPeer(Box::new(DropPeerStatement {
+            name,
+            if_exists,
+        })))
+    }
+
     fn parse_show(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Show)?;
+        // SHOW CLUSTERING FOR <table> reads state that belongs to a table
+        // rather than to the session, so it names its object
+        if self.consume_keyword(Keyword::Clustering)? {
+            self.expect_keyword(Keyword::For)?;
+            let target = self.parse_ident()?;
+            return Ok(Statement::Show(Box::new(ShowStatement {
+                name: "clustering".to_string(),
+                target: Some(target),
+            })));
+        }
         let name = if self.consume_keyword(Keyword::All)? {
             "all".to_string()
         } else {
             self.parse_ident()?
         };
-        Ok(Statement::Show(Box::new(ShowStatement { name })))
+        Ok(Statement::Show(Box::new(ShowStatement {
+            name,
+            target: None,
+        })))
     }
 
     // -----------------------------------------------------------------------
@@ -4387,8 +4986,33 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Optimize)?;
         self.consume_keyword(Keyword::Table)?;
         let table = self.parse_ident()?;
+        let mut cluster = false;
+        let mut delete = false;
+        if self.at_keyword(Keyword::Cluster) || self.at_keyword(Keyword::Delete) {
+            loop {
+                if self.consume_keyword(Keyword::Cluster)? {
+                    cluster = true;
+                } else if self.consume_keyword(Keyword::Delete)? {
+                    delete = true;
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected CLUSTER or DELETE, found {}",
+                        self.current.token
+                    )));
+                }
+                if !self.consume_token(&Token::Comma)? {
+                    break;
+                }
+            }
+        } else {
+            // Naming no action compacts, which is what the statement has
+            // always meant
+            delete = true;
+        }
         Ok(Statement::OptimizeTable(Box::new(OptimizeTableStatement {
             table,
+            cluster,
+            delete,
         })))
     }
 
@@ -5010,6 +5634,33 @@ impl<'a> Parser<'a> {
 
         if self.consume_keyword(Keyword::Table)? {
             let table = self.parse_ident()?;
+            // RESTORE TABLE t TO VERSION n | TO TIMESTAMP '...'  -> roll the
+            // table's data back to what it showed then. Distinct from the
+            // archive restore below, which reads a flat snapshot from
+            // outside the database and has no version history to move
+            // through
+            if self.consume_keyword(Keyword::To)? {
+                let target = if self.consume_keyword(Keyword::Version)? {
+                    RestoreVersionTarget::Version(self.parse_u64_literal("RESTORE ... TO VERSION")?)
+                } else if self.consume_keyword(Keyword::Timestamp)? {
+                    match self.current.token.clone() {
+                        Token::String(text) => {
+                            self.advance()?;
+                            RestoreVersionTarget::Timestamp(text)
+                        }
+                        other => {
+                            return Err(self.error(&format!(
+                                "RESTORE ... TO TIMESTAMP needs a quoted timestamp, found {other}"
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(self.error("Expected VERSION or TIMESTAMP after RESTORE ... TO"));
+                };
+                return Ok(Statement::RestoreTableVersion(Box::new(
+                    RestoreTableVersionStatement { table, target },
+                )));
+            }
             if !self.consume_keyword(Keyword::From)? {
                 // RESTORE TABLE name  -> undrop
                 return Ok(Statement::UndropTable(Box::new(UndropTableStatement {
@@ -5226,22 +5877,36 @@ impl<'a> Parser<'a> {
     fn parse_create_branch(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Branch)?;
         let name = self.parse_ident()?;
-        let from_branch = if self.consume_keyword(Keyword::From)? {
+        // ON <table> scopes the branch to one table, which is how a lake
+        // table branches. It may come before or after FROM
+        let mut on_table = if self.consume_keyword(Keyword::On)? {
             Some(self.parse_ident()?)
         } else {
             None
         };
-        let at_version = if self.at_keyword(Keyword::At) {
+        // FROM <branch> names a base branch, FROM VERSION <n> a base version
+        let mut at_version = None;
+        let mut from_branch = None;
+        if self.consume_keyword(Keyword::From)? {
+            if self.consume_keyword(Keyword::Version)? {
+                at_version = Some(self.parse_expr()?);
+            } else {
+                from_branch = Some(self.parse_ident()?);
+            }
+        }
+        if at_version.is_none() && self.at_keyword(Keyword::At) {
             self.advance()?; // AT
             self.expect_keyword(Keyword::Version)?;
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+            at_version = Some(self.parse_expr()?);
+        }
+        if on_table.is_none() && self.consume_keyword(Keyword::On)? {
+            on_table = Some(self.parse_ident()?);
+        }
         Ok(Statement::CreateBranch(Box::new(CreateBranchStatement {
             name,
             from_branch,
             at_version,
+            on_table,
         })))
     }
 
@@ -5249,9 +5914,16 @@ impl<'a> Parser<'a> {
         let source = self.parse_ident()?;
         self.expect_keyword(Keyword::Into)?;
         let into_target = self.parse_ident()?;
+        let for_table = if self.consume_keyword(Keyword::For)? {
+            self.expect_keyword(Keyword::Table)?;
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
         Ok(Statement::MergeBranch(Box::new(MergeBranchStatement {
             source,
             into_target,
+            for_table,
         })))
     }
 
@@ -5264,9 +5936,15 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.parse_ident()?;
+        let on_table = if self.consume_keyword(Keyword::On)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
         Ok(Statement::DropBranch(Box::new(DropBranchStatement {
             name,
             if_exists,
+            on_table,
         })))
     }
 
@@ -5456,9 +6134,10 @@ impl<'a> Parser<'a> {
     /// INTO <sink-expr> [WRITE MODE APPEND | UPSERT] [MODE ...]`.
     /// The inner SELECT is parsed by the shared `parse_select_body` path so
     /// it supports every grammar the binder can handle. The binder enforces
-    /// the single-table-FROM restriction. Inline file or cloud URIs in the
-    /// FROM clause are not yet wired into this grammar; named sources only.
-    /// The sink can be either a named table or an inline file or cloud URI.
+    /// the single-table-FROM restriction. Either end can be a named catalog
+    /// object or an inline file or cloud URI: the FROM clause reads one
+    /// through `parse_external_inline_ref` and the INTO clause through
+    /// `parse_streaming_sink_ref`.
     fn streaming_event_time_err(&self) -> ZyronError {
         self.error(
             "streaming temporal JOIN AS OF expression must be a column reference like o.event_time",
@@ -5748,6 +6427,58 @@ impl<'a> Parser<'a> {
             let name = self.parse_ident()?;
             Ok(StreamingSinkRef::Named(name))
         }
+    }
+
+    /// Parses an inline external source in a FROM clause:
+    /// `<BACKEND> '<uri>' FORMAT <fmt> [OPTIONS (...)] [COLUMNS (...)]
+    /// [[AS] alias]`.
+    ///
+    /// OPTIONS and COLUMNS are read in a loop so their order does not matter,
+    /// matching how CREATE EXTERNAL SOURCE reads the same two clauses. The
+    /// ZYRON backend speaks the wire protocol rather than a file format, so
+    /// FORMAT is optional there and required everywhere else.
+    fn parse_external_inline_ref(&mut self) -> Result<TableRef> {
+        let backend = self.parse_external_backend()?;
+        let uri = self.parse_string_literal()?;
+        let format = if backend == ExternalBackendKind::Zyron {
+            if self.consume_keyword(Keyword::Format)? {
+                self.parse_external_format()?
+            } else {
+                ExternalFormatKind::Json
+            }
+        } else {
+            self.expect_keyword(Keyword::Format)?;
+            self.parse_external_format()?
+        };
+
+        let mut options: Vec<(String, String)> = Vec::new();
+        let mut columns: Vec<(String, DataType)> = Vec::new();
+        loop {
+            if self.consume_keyword(Keyword::Options)? {
+                options = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::Columns)? {
+                columns = self.parse_external_columns_clause()?;
+            } else {
+                break;
+            }
+        }
+
+        let alias = if self.consume_keyword(Keyword::As)? {
+            Some(self.parse_ident()?)
+        } else if matches!(&self.current.token, Token::Ident(_)) && !self.is_clause_keyword() {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+
+        Ok(TableRef::ExternalInline(Box::new(ExternalInlineRef {
+            backend,
+            uri,
+            format,
+            options,
+            columns,
+            alias,
+        })))
     }
 
     /// Looks for a backend keyword at the current position and consumes it.
@@ -7802,6 +8533,11 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         // Join keywords
         Keyword::Natural => Some("natural"),
         Keyword::Using => Some("using"),
+        Keyword::Clone => Some("clone"),
+        // Statement keyword that is also the truncate() function's alias.
+        // Statement dispatch reads the leading TRUNCATE before expression
+        // parsing ever sees it, so this only unshadows the function call
+        Keyword::Truncate => Some("truncate"),
         // Schema keywords
         Keyword::Schema => Some("schema"),
         // Sequence keywords
@@ -7885,6 +8621,20 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Storage => Some("storage"),
         Keyword::Columnar => Some("columnar"),
         Keyword::Heap => Some("heap"),
+        // Lakehouse format and clustering
+        Keyword::Zyronlake => Some("zyronlake"),
+        Keyword::Cluster => Some("cluster"),
+        Keyword::Follow => Some("follow"),
+        Keyword::Unfollow => Some("unfollow"),
+        Keyword::Clustering => Some("clustering"),
+        Keyword::Derived => Some("derived"),
+        Keyword::Auto => Some("auto"),
+        Keyword::Force => Some("force"),
+        Keyword::Incremental => Some("incremental"),
+        Keyword::Continuous => Some("continuous"),
+        Keyword::Ondemand => Some("ondemand"),
+        Keyword::Zorder => Some("zorder"),
+        Keyword::Enforced => Some("enforced"),
         // TTL / data retention
         Keyword::Ttl => Some("ttl"),
         Keyword::Days => Some("days"),
@@ -7894,7 +8644,7 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Archive => Some("archive"),
         Keyword::Retain => Some("retain"),
         Keyword::Expire => Some("expire"),
-        // Phase 17 data lifecycle (mid-statement, stay identifier-usable).
+        // Data lifecycle (mid-statement, stay identifier-usable).
         // Legal and Forget are intentionally omitted so they lead statements.
         Keyword::Tier => Some("tier"),
         Keyword::Classification => Some("classification"),
@@ -7995,6 +8745,9 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Vector => Some("vector"),
         // Branching / Versioning
         Keyword::Branch => Some("branch"),
+        Keyword::Peer => Some("peer"),
+        Keyword::Server => Some("server"),
+        Keyword::Address => Some("address"),
         Keyword::Version => Some("version"),
         Keyword::Portion => Some("portion"),
         Keyword::Use => Some("use"),
@@ -8122,6 +8875,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // SELECT tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_constraints_are_enforced_unless_the_statement_says_otherwise() {
+        let stmt = parse_one(
+            "CREATE TABLE t (id INT, a INT, b INT, PRIMARY KEY (id) NOT ENFORCED, UNIQUE (a) ENFORCED, UNIQUE (b))",
+        );
+        match stmt {
+            Statement::CreateTable(ct) => {
+                assert_eq!(ct.constraints.len(), 3);
+                assert!(!ct.constraints[0].enforced, "NOT ENFORCED was asked for");
+                assert!(ct.constraints[1].enforced, "ENFORCED spelled out");
+                assert!(ct.constraints[2].enforced, "enforced is the default");
+            }
+            other => panic!("expected CREATE TABLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_enforced_is_still_usable_as_an_identifier() {
+        assert!(matches!(
+            parse_one("SELECT enforced FROM t"),
+            Statement::Select(_)
+        ));
+    }
 
     #[test]
     fn test_select_star() {
@@ -11758,6 +12535,8 @@ mod tests {
         match stmt {
             Statement::OptimizeTable(o) => {
                 assert_eq!(o.table, "users");
+                assert!(!o.cluster, "a bare OPTIMIZE asks for no layout pass");
+                assert!(o.delete, "a bare OPTIMIZE compacts");
             }
             _ => panic!("Expected OptimizeTable"),
         }
@@ -11769,8 +12548,33 @@ mod tests {
         match stmt {
             Statement::OptimizeTable(o) => {
                 assert_eq!(o.table, "users");
+                assert!(!o.cluster);
+                assert!(o.delete);
             }
             _ => panic!("Expected OptimizeTable"),
+        }
+    }
+
+    /// The action list decides which flag each keyword sets. CLUSTER and
+    /// DELETE landing on each other's field would run the wrong maintenance
+    /// while every downstream layer behaves, so the assignment is pinned
+    /// per form
+    #[test]
+    fn test_optimize_actions_set_their_own_flags() {
+        let forms = [
+            ("OPTIMIZE TABLE t CLUSTER", true, false),
+            ("OPTIMIZE TABLE t DELETE", false, true),
+            ("OPTIMIZE TABLE t CLUSTER, DELETE", true, true),
+            ("OPTIMIZE TABLE t DELETE, CLUSTER", true, true),
+        ];
+        for (sql, cluster, delete) in forms {
+            match parse_one(sql) {
+                Statement::OptimizeTable(o) => {
+                    assert_eq!(o.cluster, cluster, "cluster flag of {sql}");
+                    assert_eq!(o.delete, delete, "delete flag of {sql}");
+                }
+                other => panic!("Expected OptimizeTable for {sql}, got {other:?}"),
+            }
         }
     }
 
@@ -11990,6 +12794,41 @@ mod tests {
                 _ => panic!("Expected Table"),
             },
             _ => panic!("Expected SELECT"),
+        }
+    }
+
+    /// The alias between a table and a qualifier is decided by three tokens,
+    /// so an identifier followed by AS is only taken as an alias when OF
+    /// follows. Every shape below has to keep both its alias and its
+    /// qualifier, and the last two have to keep an alias with no qualifier.
+    #[test]
+    fn test_an_alias_before_a_qualifier_is_decided_by_the_token_after_it() {
+        let cases: [(&str, Option<&str>, bool); 8] = [
+            (
+                "SELECT * FROM t a AS OF TIMESTAMP '2024-01-01'",
+                Some("a"),
+                true,
+            ),
+            ("SELECT * FROM t AS a", Some("a"), false),
+            ("SELECT * FROM t a", Some("a"), false),
+            ("SELECT * FROM t a IN BRANCH 'work'", Some("a"), true),
+            ("SELECT * FROM t IN BRANCH 'work' AS a", Some("a"), true),
+            ("SELECT * FROM t AS a IN BRANCH 'work'", Some("a"), true),
+            ("SELECT * FROM t IN BRANCH 'work'", None, true),
+            ("SELECT * FROM t", None, false),
+        ];
+        for (sql, want_alias, want_qualifier) in cases {
+            match parse_one(sql) {
+                Statement::Select(s) => match &s.from[0] {
+                    TableRef::Table { name, alias, as_of } => {
+                        assert_eq!(name, "t", "{sql}");
+                        assert_eq!(alias.as_deref(), want_alias, "{sql}");
+                        assert_eq!(as_of.is_some(), want_qualifier, "{sql}");
+                    }
+                    other => panic!("expected a table ref from {sql}, got {other:?}"),
+                },
+                other => panic!("expected a select from {sql}, got {other:?}"),
+            }
         }
     }
 

@@ -139,7 +139,7 @@ fn all_table_columns(table_entry: &zyron_catalog::TableEntry) -> Vec<LogicalColu
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect()
 }

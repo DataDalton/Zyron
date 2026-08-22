@@ -1,0 +1,69 @@
+{
+  "id": "2026-08-17_023951_b64ac2a-local",
+  "date": "2026-08-17 02:39:54Z",
+  "ts": 1786934394,
+  "commit": "b64ac2a-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Arrow IPC Write": {
+      "rows/sec at batch=10000": {
+        "average": 17711988.298635,
+        "runs": [17034759.43, 17974781.38, 16549304.52, 18559417.98, 18441678.19],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Avro Write": {
+      "rows/sec at batch=10000": {
+        "average": 1811795.217090,
+        "runs": [1793252.35, 1807736.39, 1803790.85, 1826504.03, 1827692.47],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CSV Write": {
+      "rows/sec at batch=10000": {
+        "average": 6282971.708640,
+        "runs": [6309984.29, 6220994.61, 6340189.19, 6263387.99, 6280302.46],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSON Write": {
+      "rows/sec at batch=10000": {
+        "average": 1967996.569503,
+        "runs": [1719924.12, 1857303.38, 1999148.36, 2023644.26, 2239962.73],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSONL Write": {
+      "rows/sec at batch=10000": {
+        "average": 3556553.067024,
+        "runs": [3508353.39, 3573917.55, 3563499.78, 3568497.31, 3568497.31],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parquet Write": {
+      "rows/sec at batch=10000": {
+        "average": 10095116.487250,
+        "runs": [9555935.67, 9897756.18, 10422094.84, 9824630.35, 10775165.40],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

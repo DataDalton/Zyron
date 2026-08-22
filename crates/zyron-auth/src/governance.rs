@@ -291,7 +291,7 @@ pub enum TwoPersonOperation {
     GrantSuperuser,
     BreakGlassActivate,
     DropAllPrivileges,
-    // Phase 17 irreversible data-lifecycle operations.
+    // Irreversible data-lifecycle operations.
     ReleaseLegalHold,
     ForgetUser,
     RetentionLock,

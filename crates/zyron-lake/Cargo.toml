@@ -1,0 +1,16 @@
+[package]
+name = "zyron-lake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-storage = { path = "../zyron-storage" }
+crc32fast = { workspace = true }
+scc = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+zyron-bench-harness = { path = "../zyron-bench-harness" }

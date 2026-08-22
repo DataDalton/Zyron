@@ -23,11 +23,15 @@ use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use zyron_common::{Result, ZyronError};
 
-use super::constants::{PATCH_KIND_SUPERSEDE, PATCH_KIND_VALUE, ZYRPATCH_MAGIC};
+use super::constants::{
+    PATCH_KIND_BRANCH_CLEAR, PATCH_KIND_BRANCH_COPY, PATCH_KIND_REVOKE_SUPERSEDE,
+    PATCH_KIND_REVOKE_VALUE, PATCH_KIND_SUPERSEDE, PATCH_KIND_VALUE, ZYRPATCH_MAGIC,
+};
 
-/// Fixed record header size: kind(1) file_id(8) sys_rowid(8) epoch(8)
-/// lsn(8) col_id(4) val_len(4). Value bytes then a 4-byte CRC follow.
-const REC_HEADER: usize = 41;
+/// Fixed record header size: kind(1) branch_id(8) file_id(8) sys_rowid(8)
+/// epoch(8) lsn(8) col_id(4) val_len(4). Value bytes then a 4-byte CRC
+/// follow. branch_id 0 is the main line.
+const REC_HEADER: usize = 49;
 
 /// One value patch: a new version of `column_id` for `sys_rowid`, created by
 /// transaction `patch_xid`.
@@ -53,10 +57,20 @@ pub struct RowOverlay {
 /// this file's overlay) O(rows-in-file) instead of O(rows-in-table).
 type OverlayMap = HashMap<u64, HashMap<u64, Arc<RowOverlay>>>;
 
+/// Branch scoped overlay state. Main line rows live in `main` so main line
+/// reads pay no branch cost. A branch write copies the touched row from
+/// main on first touch and shadows it thereafter, mirroring heap page COW
+/// at row granularity, so later main line writes to a branch touched row
+/// stay invisible to the branch exactly like a COW copied heap page.
+struct Overlays {
+    main: OverlayMap,
+    branches: HashMap<u64, OverlayMap>,
+}
+
 /// Per-table append-only patch store.
 pub struct PatchStore {
     file: RwLock<File>,
-    overlay: RwLock<OverlayMap>,
+    overlay: RwLock<Overlays>,
     /// Max WAL LSN of any record durably in the file. Recovery skips a WAL
     /// patch whose LSN is at or below this, so replay never duplicates an
     /// already-persisted record.
@@ -102,7 +116,10 @@ impl PatchStore {
             .map_err(|e| ZyronError::IoError(format!("patch metadata: {}", e)))?
             .len();
 
-        let mut overlay: OverlayMap = HashMap::new();
+        let mut overlay = Overlays {
+            main: HashMap::new(),
+            branches: HashMap::new(),
+        };
         let mut hwm: u64 = 0;
 
         if len == 0 {
@@ -136,13 +153,14 @@ impl PatchStore {
                     break;
                 }
                 let kind = buf[pos];
-                let file_id = u64::from_le_bytes(buf[pos + 1..pos + 9].try_into().unwrap());
-                let sys_rowid = u64::from_le_bytes(buf[pos + 9..pos + 17].try_into().unwrap());
-                let epoch = u64::from_le_bytes(buf[pos + 17..pos + 25].try_into().unwrap());
-                let lsn = u64::from_le_bytes(buf[pos + 25..pos + 33].try_into().unwrap());
-                let col_id = u32::from_le_bytes(buf[pos + 33..pos + 37].try_into().unwrap());
+                let branch = u64::from_le_bytes(buf[pos + 1..pos + 9].try_into().unwrap());
+                let file_id = u64::from_le_bytes(buf[pos + 9..pos + 17].try_into().unwrap());
+                let sys_rowid = u64::from_le_bytes(buf[pos + 17..pos + 25].try_into().unwrap());
+                let epoch = u64::from_le_bytes(buf[pos + 25..pos + 33].try_into().unwrap());
+                let lsn = u64::from_le_bytes(buf[pos + 33..pos + 41].try_into().unwrap());
+                let col_id = u32::from_le_bytes(buf[pos + 41..pos + 45].try_into().unwrap());
                 let val_len =
-                    u32::from_le_bytes(buf[pos + 37..pos + 41].try_into().unwrap()) as usize;
+                    u32::from_le_bytes(buf[pos + 45..pos + 49].try_into().unwrap()) as usize;
                 let rec_end = pos + REC_HEADER + val_len + 4;
                 if rec_end > buf.len() {
                     break; // torn tail, record does not fit the file
@@ -167,7 +185,16 @@ impl PatchStore {
                     break; // torn / corrupt tail
                 }
                 let value = buf[pos + REC_HEADER..pos + REC_HEADER + val_len].to_vec();
-                Self::apply_overlay(&mut overlay, kind, file_id, sys_rowid, epoch, col_id, value);
+                Self::apply_overlay(
+                    &mut overlay,
+                    branch,
+                    kind,
+                    file_id,
+                    sys_rowid,
+                    epoch,
+                    col_id,
+                    value,
+                );
                 if lsn > hwm {
                     hwm = lsn;
                 }
@@ -202,7 +229,7 @@ impl PatchStore {
         let mut scan = from;
         while scan + REC_HEADER + 4 <= buf.len() {
             let val_len =
-                u32::from_le_bytes(buf[scan + 37..scan + 41].try_into().unwrap()) as usize;
+                u32::from_le_bytes(buf[scan + 45..scan + 49].try_into().unwrap()) as usize;
             let rec_end = scan + REC_HEADER + val_len + 4;
             if rec_end <= buf.len() {
                 let stored_crc = u32::from_le_bytes(
@@ -219,8 +246,10 @@ impl PatchStore {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_overlay(
-        overlay: &mut OverlayMap,
+        overlays: &mut Overlays,
+        branch: u64,
         kind: u8,
         file_id: u64,
         sys_rowid: u64,
@@ -228,6 +257,69 @@ impl PatchStore {
         col_id: u32,
         value: Vec<u8>,
     ) {
+        if kind == PATCH_KIND_BRANCH_CLEAR {
+            overlays.branches.remove(&branch);
+            return;
+        }
+        // Explicit copy record written before a branch's first write to a
+        // row. Idempotent, the copy is skipped when the branch already
+        // shadows the row, so concurrent first writers cannot duplicate it
+        if kind == PATCH_KIND_BRANCH_COPY {
+            if branch == 0 {
+                return;
+            }
+            let bmap = overlays.branches.entry(branch).or_default();
+            let present = bmap
+                .get(&file_id)
+                .is_some_and(|rows| rows.contains_key(&sys_rowid));
+            if !present {
+                if let Some(mainRow) = overlays
+                    .main
+                    .get(&file_id)
+                    .and_then(|rows| rows.get(&sys_rowid))
+                {
+                    bmap.entry(file_id)
+                        .or_default()
+                        .insert(sys_rowid, Arc::clone(mainRow));
+                }
+            }
+            return;
+        }
+        let overlay = if branch == 0 {
+            &mut overlays.main
+        } else {
+            overlays.branches.entry(branch).or_default()
+        };
+        // Revokes remove the newest matching entry and never create rows,
+        // so a revoke replayed against an already trimmed log is a no-op
+        if kind == PATCH_KIND_REVOKE_SUPERSEDE || kind == PATCH_KIND_REVOKE_VALUE {
+            let Some(rows) = overlay.get_mut(&file_id) else {
+                return;
+            };
+            let Some(arc_row) = rows.get_mut(&sys_rowid) else {
+                return;
+            };
+            let row = Arc::make_mut(arc_row);
+            if kind == PATCH_KIND_REVOKE_SUPERSEDE {
+                if let Some(p) = row.supersedes.iter().rposition(|&x| x == epoch) {
+                    row.supersedes.remove(p);
+                }
+            } else if let Some(chain) = row.patches.get_mut(&col_id) {
+                if let Some(p) = chain.iter().rposition(|v| v.patch_xid == epoch) {
+                    chain.remove(p);
+                }
+                if chain.is_empty() {
+                    row.patches.remove(&col_id);
+                }
+            }
+            if row.supersedes.is_empty() && row.patches.is_empty() {
+                rows.remove(&sys_rowid);
+                if rows.is_empty() {
+                    overlay.remove(&file_id);
+                }
+            }
+            return;
+        }
         let row = Arc::make_mut(
             overlay
                 .entry(file_id)
@@ -246,8 +338,10 @@ impl PatchStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_record(
         &self,
+        branch: u64,
         kind: u8,
         file_id: u64,
         sys_rowid: u64,
@@ -258,6 +352,7 @@ impl PatchStore {
     ) -> Result<()> {
         let mut rec = Vec::with_capacity(REC_HEADER + value.len() + 4);
         rec.push(kind);
+        rec.extend_from_slice(&branch.to_le_bytes());
         rec.extend_from_slice(&file_id.to_le_bytes());
         rec.extend_from_slice(&sys_rowid.to_le_bytes());
         rec.extend_from_slice(&epoch.to_le_bytes());
@@ -284,6 +379,7 @@ impl PatchStore {
         let mut ov = write_through(&self.overlay);
         Self::apply_overlay(
             &mut ov,
+            branch,
             kind,
             file_id,
             sys_rowid,
@@ -296,10 +392,13 @@ impl PatchStore {
         Ok(())
     }
 
-    /// Appends a value patch for one column of one columnar row. `lsn` is the
-    /// WAL LSN of the matching ColumnarPatch record.
+    /// Appends a value patch for one column of one columnar row on the given
+    /// branch, 0 for the main line. `lsn` is the WAL LSN of the matching
+    /// ColumnarPatch record.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_value_patch(
         &self,
+        branch: u64,
         file_id: u64,
         sys_rowid: u64,
         column_id: u32,
@@ -307,7 +406,9 @@ impl PatchStore {
         lsn: u64,
         value: &[u8],
     ) -> Result<()> {
+        self.copy_branch_row_on_first_touch(branch, file_id, sys_rowid, lsn)?;
         self.append_record(
+            branch,
             PATCH_KIND_VALUE,
             file_id,
             sys_rowid,
@@ -318,16 +419,20 @@ impl PatchStore {
         )
     }
 
-    /// Appends a supersede (delete) marker for one columnar row. `lsn` is the
-    /// WAL LSN of the matching ColumnarSupersede record.
+    /// Appends a supersede (delete) marker for one columnar row on the given
+    /// branch, 0 for the main line. `lsn` is the WAL LSN of the matching
+    /// ColumnarSupersede record.
     pub fn append_supersede(
         &self,
+        branch: u64,
         file_id: u64,
         sys_rowid: u64,
         supersede_xid: u64,
         lsn: u64,
     ) -> Result<()> {
+        self.copy_branch_row_on_first_touch(branch, file_id, sys_rowid, lsn)?;
         self.append_record(
+            branch,
             PATCH_KIND_SUPERSEDE,
             file_id,
             sys_rowid,
@@ -338,52 +443,359 @@ impl PatchStore {
         )
     }
 
+    /// Writes the explicit branch row copy record before a branch's first
+    /// write to a row, so replay reconstructs the same shadowed state with
+    /// no implicit copying
+    fn copy_branch_row_on_first_touch(
+        &self,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        lsn: u64,
+    ) -> Result<()> {
+        if branch == 0 {
+            return Ok(());
+        }
+        let touched = {
+            let ov = read_through(&self.overlay);
+            ov.branches
+                .get(&branch)
+                .and_then(|m| m.get(&file_id))
+                .is_some_and(|rows| rows.contains_key(&sys_rowid))
+        };
+        if touched {
+            return Ok(());
+        }
+        self.append_record(
+            branch,
+            PATCH_KIND_BRANCH_COPY,
+            file_id,
+            sys_rowid,
+            0,
+            lsn,
+            0,
+            &[],
+        )
+    }
+
+    /// Discards every overlay entry of one branch, the columnar side of
+    /// DROP BRANCH, and of MERGE BRANCH after the rows fold into main
+    pub fn clear_branch(&self, branch: u64, lsn: u64) -> Result<()> {
+        self.append_record(branch, PATCH_KIND_BRANCH_CLEAR, 0, 0, 0, lsn, 0, &[])
+    }
+
+    /// Revokes the newest value patch written by `patch_xid` for one column
+    /// of one row, the undo of `append_value_patch` for ROLLBACK TO
+    /// SAVEPOINT. `lsn` is the WAL LSN of the matching revoke record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn revoke_value_patch(
+        &self,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        column_id: u32,
+        patch_xid: u64,
+        lsn: u64,
+    ) -> Result<()> {
+        self.append_record(
+            branch,
+            PATCH_KIND_REVOKE_VALUE,
+            file_id,
+            sys_rowid,
+            patch_xid,
+            lsn,
+            column_id,
+            &[],
+        )
+    }
+
+    /// Revokes the newest supersede written by `supersede_xid` for one row,
+    /// the undo of `append_supersede` for ROLLBACK TO SAVEPOINT. `lsn` is
+    /// the WAL LSN of the matching revoke record.
+    pub fn revoke_supersede(
+        &self,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        supersede_xid: u64,
+        lsn: u64,
+    ) -> Result<()> {
+        self.append_record(
+            branch,
+            PATCH_KIND_REVOKE_SUPERSEDE,
+            file_id,
+            sys_rowid,
+            supersede_xid,
+            lsn,
+            0,
+            &[],
+        )
+    }
+
+    /// WAL-first supersede: logs the ColumnarSupersede record, then appends
+    /// the marker to the durable patch log at the returned LSN. Every
+    /// supersede writer goes through here so the WAL payload layout and the
+    /// log-before-append discipline live in one place. Returns the WAL LSN
+    pub fn supersede_logged(
+        &self,
+        wal: &zyron_wal::WalWriter,
+        table_id: u64,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        xid: u64,
+    ) -> Result<u64> {
+        let pl = super::wal_payload::ColumnarSupersedePayload {
+            table_id,
+            branch,
+            file_id,
+            sys_rowid,
+            xid,
+        }
+        .encode();
+        let lsn = wal.log_columnar_supersede(&pl)?;
+        self.append_supersede(branch, file_id, sys_rowid, xid, lsn.0)?;
+        Ok(lsn.0)
+    }
+
+    /// WAL-first value patch: logs the ColumnarPatch record, then appends the
+    /// patch to the durable log at the returned LSN. Returns the WAL LSN
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_logged(
+        &self,
+        wal: &zyron_wal::WalWriter,
+        table_id: u64,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        column_id: u32,
+        xid: u64,
+        value: &[u8],
+    ) -> Result<u64> {
+        let pl = super::wal_payload::ColumnarValuePatchPayload {
+            table_id,
+            branch,
+            file_id,
+            sys_rowid,
+            column_id,
+            xid,
+        }
+        .encode_with_value(value);
+        let lsn = wal.log_columnar_patch(&pl)?;
+        self.append_value_patch(branch, file_id, sys_rowid, column_id, xid, lsn.0, value)?;
+        Ok(lsn.0)
+    }
+
+    /// WAL-first supersede revoke, the undo of supersede_logged for ROLLBACK
+    /// TO SAVEPOINT. Returns the WAL LSN
+    pub fn revoke_supersede_logged(
+        &self,
+        wal: &zyron_wal::WalWriter,
+        table_id: u64,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        xid: u64,
+    ) -> Result<u64> {
+        let pl = super::wal_payload::ColumnarSupersedePayload {
+            table_id,
+            branch,
+            file_id,
+            sys_rowid,
+            xid,
+        }
+        .encode();
+        let lsn = wal.log_columnar_supersede_revoke(&pl)?;
+        self.revoke_supersede(branch, file_id, sys_rowid, xid, lsn.0)?;
+        Ok(lsn.0)
+    }
+
+    /// WAL-first value patch revoke, the undo of patch_logged for ROLLBACK TO
+    /// SAVEPOINT. Returns the WAL LSN
+    #[allow(clippy::too_many_arguments)]
+    pub fn revoke_patch_logged(
+        &self,
+        wal: &zyron_wal::WalWriter,
+        table_id: u64,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        column_id: u32,
+        xid: u64,
+    ) -> Result<u64> {
+        let pl = super::wal_payload::ColumnarPatchRevokePayload {
+            table_id,
+            branch,
+            file_id,
+            sys_rowid,
+            column_id,
+            xid,
+        }
+        .encode();
+        let lsn = wal.log_columnar_patch_revoke(&pl)?;
+        self.revoke_value_patch(branch, file_id, sys_rowid, column_id, xid, lsn.0)?;
+        Ok(lsn.0)
+    }
+
+    /// WAL-first branch clear, the columnar side of DROP BRANCH and of MERGE
+    /// BRANCH after fold-in. Returns the WAL LSN
+    pub fn clear_branch_logged(
+        &self,
+        wal: &zyron_wal::WalWriter,
+        table_id: u64,
+        branch: u64,
+    ) -> Result<u64> {
+        let pl = super::wal_payload::ColumnarBranchClearPayload { table_id, branch }.encode();
+        let lsn = wal.log_columnar_branch_clear(&pl)?;
+        self.clear_branch(branch, lsn.0)?;
+        Ok(lsn.0)
+    }
+
     /// The max WAL LSN durably recorded in the patch file. Recovery replays a
     /// WAL patch only when its LSN is strictly greater than this.
     pub fn max_persisted_lsn(&self) -> u64 {
         self.persisted_lsn.load(Ordering::Acquire)
     }
 
-    /// Returns the overlay for one row, if any patches exist.
+    /// Returns the main line overlay for one row, if any patches exist.
     pub fn row_overlay(&self, file_id: u64, sys_rowid: u64) -> Option<Arc<RowOverlay>> {
         let ov = read_through(&self.overlay);
-        ov.get(&file_id)?.get(&sys_rowid).cloned()
+        ov.main.get(&file_id)?.get(&sys_rowid).cloned()
+    }
+
+    /// Returns the overlay for one row as seen from a branch. A branch
+    /// touched row resolves to its branch copy, an untouched row falls
+    /// through to the live main line, mirroring heap COW page routing.
+    pub fn row_overlay_on(
+        &self,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+    ) -> Option<Arc<RowOverlay>> {
+        let ov = read_through(&self.overlay);
+        if branch != 0 {
+            if let Some(row) = ov
+                .branches
+                .get(&branch)
+                .and_then(|m| m.get(&file_id))
+                .and_then(|rows| rows.get(&sys_rowid))
+            {
+                return Some(Arc::clone(row));
+            }
+        }
+        ov.main.get(&file_id)?.get(&sys_rowid).cloned()
     }
 
     /// True when the store holds no entries (fast path for clean tables).
     pub fn is_empty(&self) -> bool {
-        read_through(&self.overlay).values().all(|m| m.is_empty())
+        let ov = read_through(&self.overlay);
+        ov.main.values().all(|m| m.is_empty())
+            && ov
+                .branches
+                .values()
+                .all(|b| b.values().all(|m| m.is_empty()))
     }
 
-    /// True when any overlay entry exists for `file_id`. O(1) on the nested
-    /// map. Lets the scan and the metadata-aggregate path decide per segment
-    /// whether the header fast path is valid, instead of disabling it
-    /// table-wide.
+    /// True when any main line overlay entry exists for `file_id`. O(1) on
+    /// the nested map. Lets the scan and the metadata-aggregate path decide
+    /// per segment whether the header fast path is valid, instead of
+    /// disabling it table-wide.
     pub fn file_has_overlay(&self, file_id: u64) -> bool {
         read_through(&self.overlay)
+            .main
             .get(&file_id)
             .map(|m| !m.is_empty())
             .unwrap_or(false)
     }
 
-    /// Snapshots the overlay for one file into a local map under a single
-    /// read-lock acquisition. O(rows-in-file). The scan then resolves per row
-    /// from the local map with no per-row locking.
+    /// True when `file_id` has overlay entries visible from a branch, on
+    /// the branch itself or on the main line it reads through to.
+    pub fn file_has_overlay_on(&self, branch: u64, file_id: u64) -> bool {
+        let ov = read_through(&self.overlay);
+        let on_branch = branch != 0
+            && ov
+                .branches
+                .get(&branch)
+                .and_then(|m| m.get(&file_id))
+                .is_some_and(|rows| !rows.is_empty());
+        on_branch
+            || ov
+                .main
+                .get(&file_id)
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)
+    }
+
+    /// Snapshots the main line overlay for one file into a local map under a
+    /// single read-lock acquisition. O(rows-in-file). The scan then resolves
+    /// per row from the local map with no per-row locking.
     pub fn file_overlay(&self, file_id: u64) -> std::collections::HashMap<u64, Arc<RowOverlay>> {
-        match read_through(&self.overlay).get(&file_id) {
+        match read_through(&self.overlay).main.get(&file_id) {
             Some(m) => m.iter().map(|(r, v)| (*r, Arc::clone(v))).collect(),
             None => std::collections::HashMap::new(),
         }
     }
 
-    /// Returns every (file_id, sys_rowid) that has overlay entries, so the
-    /// merge can decide which segments are worth rewriting.
+    /// Snapshots the overlay for one file as seen from a branch: main line
+    /// rows overlaid by the branch's own copies of touched rows.
+    pub fn file_overlay_on(
+        &self,
+        branch: u64,
+        file_id: u64,
+    ) -> std::collections::HashMap<u64, Arc<RowOverlay>> {
+        let ov = read_through(&self.overlay);
+        let mut out: std::collections::HashMap<u64, Arc<RowOverlay>> = match ov.main.get(&file_id) {
+            Some(m) => m.iter().map(|(r, v)| (*r, Arc::clone(v))).collect(),
+            None => std::collections::HashMap::new(),
+        };
+        if branch != 0 {
+            if let Some(rows) = ov.branches.get(&branch).and_then(|m| m.get(&file_id)) {
+                for (r, v) in rows {
+                    out.insert(*r, Arc::clone(v));
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns every main line (file_id, sys_rowid) that has overlay
+    /// entries, so the merge can decide which segments are worth rewriting.
     pub fn rows_with_overlay(&self) -> Vec<(u64, u64)> {
         let ov = read_through(&self.overlay);
         let mut out = Vec::new();
-        for (fid, rows) in ov.iter() {
+        for (fid, rows) in ov.main.iter() {
             for rid in rows.keys() {
                 out.push((*fid, *rid));
+            }
+        }
+        out
+    }
+
+    /// Every branch overlay row for one file, so a merge can re-append the
+    /// branch state against the file that replaces it.
+    pub fn branch_rows_for_file(&self, file_id: u64) -> Vec<(u64, u64, Arc<RowOverlay>)> {
+        let ov = read_through(&self.overlay);
+        let mut out = Vec::new();
+        for (branch, files) in ov.branches.iter() {
+            if let Some(rows) = files.get(&file_id) {
+                for (rid, row) in rows {
+                    out.push((*branch, *rid, Arc::clone(row)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every overlay row of one branch across all files, so MERGE BRANCH can
+    /// fold the branch state into the main line.
+    pub fn branch_overlay_rows(&self, branch: u64) -> Vec<(u64, u64, Arc<RowOverlay>)> {
+        let ov = read_through(&self.overlay);
+        let mut out = Vec::new();
+        if let Some(files) = ov.branches.get(&branch) {
+            for (fid, rows) in files {
+                for (rid, row) in rows {
+                    out.push((*fid, *rid, Arc::clone(row)));
+                }
             }
         }
         out
@@ -401,7 +813,7 @@ impl PatchStore {
     /// dead row, and the merge clears it once it completes. In-memory only.
     pub fn trim_below(&self, horizon: u64, reclaimable: impl Fn(u64) -> bool) {
         let mut ov = write_through(&self.overlay);
-        for rows in ov.values_mut() {
+        for rows in ov.main.values_mut() {
             for arc in rows.values_mut() {
                 let collapsible =
                     |p: &ValuePatch| p.patch_xid < horizon && reclaimable(p.patch_xid);
@@ -445,21 +857,36 @@ impl PatchStore {
     /// The rewrite is atomic via a temp file plus rename.
     pub fn drop_file(&self, file_id: u64, path: &Path) -> Result<()> {
         let mut ov = write_through(&self.overlay);
-        ov.remove(&file_id);
+        ov.main.remove(&file_id);
+        for files in ov.branches.values_mut() {
+            files.remove(&file_id);
+        }
         let hwm = self.persisted_lsn.load(Ordering::Acquire);
 
-        // Rebuild the on-disk log from the surviving overlay entries.
+        // Rebuild the on-disk log from the surviving overlay entries, main
+        // line first so branch copy-on-touch replays correctly.
         let mut buf = Vec::with_capacity(8);
         buf.extend_from_slice(&ZYRPATCH_MAGIC);
-        for (fid, rows) in ov.iter() {
+        for (fid, rows) in ov.main.iter() {
             for (rid, row) in rows.iter() {
                 for s in &row.supersedes {
-                    Self::push_record(&mut buf, PATCH_KIND_SUPERSEDE, *fid, *rid, *s, hwm, 0, &[]);
+                    Self::push_record(
+                        &mut buf,
+                        0,
+                        PATCH_KIND_SUPERSEDE,
+                        *fid,
+                        *rid,
+                        *s,
+                        hwm,
+                        0,
+                        &[],
+                    );
                 }
                 for (col, chain) in &row.patches {
                     for p in chain {
                         Self::push_record(
                             &mut buf,
+                            0,
                             PATCH_KIND_VALUE,
                             *fid,
                             *rid,
@@ -468,6 +895,43 @@ impl PatchStore {
                             *col,
                             &p.value,
                         );
+                    }
+                }
+            }
+        }
+        // Branch rows serialize as their exact entries. Replay rebuilds the
+        // same shadowed state because copies are explicit records and the
+        // rewrite dumps final state, so no copy records are needed here
+        for (branch, files) in ov.branches.iter() {
+            for (fid, rows) in files.iter() {
+                for (rid, row) in rows.iter() {
+                    for s in &row.supersedes {
+                        Self::push_record(
+                            &mut buf,
+                            *branch,
+                            PATCH_KIND_SUPERSEDE,
+                            *fid,
+                            *rid,
+                            *s,
+                            hwm,
+                            0,
+                            &[],
+                        );
+                    }
+                    for (col, chain) in &row.patches {
+                        for p in chain {
+                            Self::push_record(
+                                &mut buf,
+                                *branch,
+                                PATCH_KIND_VALUE,
+                                *fid,
+                                *rid,
+                                p.patch_xid,
+                                hwm,
+                                *col,
+                                &p.value,
+                            );
+                        }
                     }
                 }
             }
@@ -500,8 +964,10 @@ impl PatchStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn push_record(
         buf: &mut Vec<u8>,
+        branch: u64,
         kind: u8,
         file_id: u64,
         sys_rowid: u64,
@@ -512,6 +978,7 @@ impl PatchStore {
     ) {
         let start = buf.len();
         buf.push(kind);
+        buf.extend_from_slice(&branch.to_le_bytes());
         buf.extend_from_slice(&file_id.to_le_bytes());
         buf.extend_from_slice(&sys_rowid.to_le_bytes());
         buf.extend_from_slice(&epoch.to_le_bytes());
@@ -584,6 +1051,42 @@ impl ColumnarPatchManager {
         let mut w = write_through(&self.stores);
         Ok(Arc::clone(w.entry(table_id).or_insert(store)))
     }
+
+    /// Evicts a dropped table's store from the process-wide registry and
+    /// removes its patch file. The removal can fail while another handle
+    /// still holds the file open, the overlays are already dropped at that
+    /// point so a leftover file carries no row data. A missing file is fine
+    pub fn remove_store(&self, table_id: u64, patch_path: &Path) -> std::io::Result<()> {
+        {
+            let mut w = write_through(&self.stores);
+            w.remove(&table_id);
+        }
+        match std::fs::remove_file(patch_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolves the patch store for a table from any of its segment paths.
+    /// The columnar root of a .zyr segment is the directory shared by scans,
+    /// DML, maintenance and recovery, so every caller converges on the same
+    /// manager and store.
+    ///
+    /// The root is resolved through `columnar_root_for_segment` rather than
+    /// taken as the segment's parent, because a segment relocated to a colder
+    /// tier lives one level down. Reading the parent directly would give a
+    /// table two patch stores once any of its segments moved, and a patch
+    /// written through one would be invisible to a scan resolving the other
+    pub fn store_for_segment(table_id: u64, segment_path: &Path) -> Result<Arc<PatchStore>> {
+        let dir = crate::columnar::columnar_root_for_segment(segment_path).ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "segment path {} has no parent directory",
+                segment_path.display()
+            ))
+        })?;
+        Self::global(dir).store(table_id)
+    }
 }
 
 #[cfg(test)]
@@ -597,9 +1100,9 @@ mod tests {
         let path = dir.path().join("7.zyrpatch");
         {
             let s = PatchStore::open(&path).expect("open");
-            s.append_value_patch(1, 42, 3, 100, 10, b"new-value")
+            s.append_value_patch(0, 1, 42, 3, 100, 10, b"new-value")
                 .expect("patch");
-            s.append_supersede(1, 43, 105, 11).expect("supersede");
+            s.append_supersede(0, 1, 43, 105, 11).expect("supersede");
             let o = s.row_overlay(1, 42).expect("overlay");
             assert_eq!(o.patches[&3][0].value, b"new-value");
             assert_eq!(o.patches[&3][0].patch_xid, 100);
@@ -623,7 +1126,8 @@ mod tests {
         let path = dir.path().join("9.zyrpatch");
         {
             let s = PatchStore::open(&path).expect("open");
-            s.append_value_patch(2, 1, 0, 10, 5, b"abc").expect("patch");
+            s.append_value_patch(0, 2, 1, 0, 10, 5, b"abc")
+                .expect("patch");
         }
         // Append garbage simulating a torn write.
         {
@@ -633,7 +1137,7 @@ mod tests {
         let s = PatchStore::open(&path).expect("reopen");
         assert_eq!(s.row_overlay(2, 1).expect("o").patches[&0][0].value, b"abc");
         // A fresh well-formed append still works after truncation.
-        s.append_supersede(2, 1, 20, 6).expect("supersede");
+        s.append_supersede(0, 2, 1, 20, 6).expect("supersede");
         assert_eq!(s.row_overlay(2, 1).expect("o").supersedes, vec![20]);
     }
 
@@ -646,8 +1150,10 @@ mod tests {
         let path = dir.path().join("11.zyrpatch");
         {
             let s = PatchStore::open(&path).expect("open");
-            s.append_value_patch(1, 1, 0, 10, 5, b"first").expect("p1");
-            s.append_value_patch(1, 2, 0, 11, 6, b"second").expect("p2");
+            s.append_value_patch(0, 1, 1, 0, 10, 5, b"first")
+                .expect("p1");
+            s.append_value_patch(0, 1, 2, 0, 11, 6, b"second")
+                .expect("p2");
         }
         // Flip a byte inside the first record's value, after the magic header.
         // The first value "first" starts at offset 8 + REC_HEADER.
@@ -682,7 +1188,8 @@ mod tests {
         let dir = tempdir().expect("tmp");
         let path = dir.path().join("12.zyrpatch");
         let s = PatchStore::open(&path).expect("open");
-        s.append_value_patch(1, 5, 2, 100, 42, b"x").expect("patch");
+        s.append_value_patch(0, 1, 5, 2, 100, 42, b"x")
+            .expect("patch");
         assert_eq!(s.max_persisted_lsn(), 42);
         let o = s
             .row_overlay(1, 5)
@@ -696,12 +1203,12 @@ mod tests {
         let path = dir.path().join("3.zyrpatch");
         let s = PatchStore::open(&path).expect("open");
         // Three committed versions of one column, all below the horizon.
-        s.append_value_patch(1, 7, 0, 100, 1, b"v1").expect("p1");
-        s.append_value_patch(1, 7, 0, 101, 2, b"v2").expect("p2");
-        s.append_value_patch(1, 7, 0, 102, 3, b"v3").expect("p3");
+        s.append_value_patch(0, 1, 7, 0, 100, 1, b"v1").expect("p1");
+        s.append_value_patch(0, 1, 7, 0, 101, 2, b"v2").expect("p2");
+        s.append_value_patch(0, 1, 7, 0, 102, 3, b"v3").expect("p3");
         // A separate row deleted below the horizon keeps its supersede: the
         // merge still needs that marker to physically drop the dead row.
-        s.append_supersede(1, 8, 50, 4).expect("sup");
+        s.append_supersede(0, 1, 8, 50, 4).expect("sup");
         // All patches reclaimable (no retention): collapse to the newest below.
         s.trim_below(200, |_| true);
         let o = s.row_overlay(1, 7).expect("row 7 kept");
@@ -716,9 +1223,9 @@ mod tests {
         let dir = tempdir().expect("tmp");
         let path = dir.path().join("4.zyrpatch");
         let s = PatchStore::open(&path).expect("open");
-        s.append_value_patch(1, 7, 0, 100, 1, b"v1").expect("p1");
-        s.append_value_patch(1, 7, 0, 101, 2, b"v2").expect("p2");
-        s.append_value_patch(1, 7, 0, 102, 3, b"v3").expect("p3");
+        s.append_value_patch(0, 1, 7, 0, 100, 1, b"v1").expect("p1");
+        s.append_value_patch(0, 1, 7, 0, 101, 2, b"v2").expect("p2");
+        s.append_value_patch(0, 1, 7, 0, 102, 3, b"v3").expect("p3");
         // A retention floor keeps patches with xid >= 101 (still within the
         // window); only the older ones may collapse. The newest reclaimable
         // (100) plus all unreclaimable (101, 102) survive.

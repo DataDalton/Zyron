@@ -99,19 +99,29 @@ pub fn evaluate(
         BoundExpr::Cast {
             expr: inner,
             target_type,
+            fractional_digits,
         } => {
             let col = evaluate(inner, batch, schema, params)?;
+            // A cast naming a decimal carries the scale to land on, which
+            // the generic cast has no way to know
+            if *target_type == TypeId::Decimal {
+                return crate::compute::cast_column_to_decimal(
+                    &col,
+                    fractional_digits.unwrap_or(0),
+                );
+            }
             cast_column(&col, *target_type)
         }
         BoundExpr::Case {
             operand,
             conditions,
             else_result,
-            ..
+            type_id,
         } => evaluate_case(
             operand.as_deref(),
             conditions,
             else_result.as_deref(),
+            *type_id,
             batch,
             schema,
             params,
@@ -285,6 +295,15 @@ fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> R
             ColumnData::Int64(vec![*v; num_rows]),
             TypeId::Int64,
         )),
+        LiteralValue::Int128(v) => Ok(Column::new(
+            ColumnData::Int128(vec![*v; num_rows]),
+            TypeId::Int128,
+        )),
+        LiteralValue::Decimal { digits, scale } => Ok(Column::new_ts(
+            ColumnData::Int128(vec![*digits; num_rows]),
+            TypeId::Decimal,
+            Some(*scale),
+        )),
         LiteralValue::Float(v) => Ok(Column::new(
             ColumnData::Float64(vec![*v; num_rows]),
             TypeId::Float64,
@@ -398,7 +417,7 @@ fn is_ts_col(col: &Column) -> bool {
 
 #[inline]
 fn ts_col_is_ps(col: &Column) -> bool {
-    is_ts_col(col) && col.ts_precision.unwrap_or(6) > 6
+    is_ts_col(col) && col.fractional_digits.unwrap_or(6) > 6
 }
 
 /// When exactly one operand is a picosecond (p>6) timestamp and the other a
@@ -415,9 +434,9 @@ fn normalize_ts_pair(left: &mut Column, right: &mut Column) -> Result<()> {
         return Ok(());
     }
     if lps {
-        *right = crate::compute::scale_us_to_ps(right, left.ts_precision)?;
+        *right = crate::compute::scale_us_to_ps(right, left.fractional_digits)?;
     } else {
-        *left = crate::compute::scale_us_to_ps(left, right.ts_precision)?;
+        *left = crate::compute::scale_us_to_ps(left, right.fractional_digits)?;
     }
     Ok(())
 }
@@ -471,15 +490,25 @@ fn evaluate_binary_op(
             | BinaryOperator::LtEq
             | BinaryOperator::GtEq
     ) {
-        let lt = left_col.type_id;
-        let rt = right_col.type_id;
-        if lt != rt {
-            if let Some(common) = common_numeric_type(lt, rt) {
-                if lt != common {
-                    left_col = compute::cast_column(&left_col, common)?;
-                }
-                if rt != common {
-                    right_col = compute::cast_column(&right_col, common)?;
+        // A decimal aligns by scale rather than by width. Letting the common
+        // numeric type decide would pick a float and read the scaled integer
+        // as a plain number, so `v > 10.00` would compare 1050 against 10
+        if left_col.type_id == TypeId::Decimal || right_col.type_id == TypeId::Decimal {
+            if let Some((l, r)) = compute::align_decimal_operands(&left_col, &right_col)? {
+                left_col = l;
+                right_col = r;
+            }
+        } else {
+            let lt = left_col.type_id;
+            let rt = right_col.type_id;
+            if lt != rt {
+                if let Some(common) = common_numeric_type(lt, rt) {
+                    if lt != common {
+                        left_col = compute::cast_column(&left_col, common)?;
+                    }
+                    if rt != common {
+                        right_col = compute::cast_column(&right_col, common)?;
+                    }
                 }
             }
         }
@@ -800,21 +829,30 @@ fn evaluate_between(
 // CASE expression
 // ---------------------------------------------------------------------------
 
+/// Evaluates a CASE, merging the branches into the single result type the
+/// binder computed for the whole expression.
+///
+/// Every branch is cast to that type before it is merged. Branches routinely
+/// differ in physical type even when they agree logically, as `THEN price
+/// ELSE 0` does, and merging those columns as they came would push a value
+/// of one variant into a buffer of another.
 fn evaluate_case(
     operand: Option<&BoundExpr>,
     conditions: &[BoundWhen],
     else_result: Option<&BoundExpr>,
+    result_type: TypeId,
     batch: &DataBatch,
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
 
-    // Start with else branch or null.
+    // Start with else branch or null, in the type the whole CASE produces
     let mut result = if let Some(else_expr) = else_result {
-        evaluate(else_expr, batch, schema, params)?
+        let col = evaluate(else_expr, batch, schema, params)?;
+        coerce_case_branch(col, result_type)?
     } else {
-        Column::null_column(TypeId::Text, num_rows)
+        Column::null_column(result_type, num_rows)
     };
 
     let operand_col = match operand {
@@ -832,11 +870,31 @@ fn evaluate_case(
         };
 
         let then_col = evaluate(&when.result, batch, schema, params)?;
+        // The branch coerces to the CASE's declared type, not the running
+        // result's physical type. When the declared type is Decimal the
+        // running result can still be an integer column (the conversion to
+        // a decimal needs a scale only a decimal branch carries), and
+        // casting this branch down to that integer would round its value.
+        // The alignment below then puts both sides on the common scale
+        let mut then_col = coerce_case_branch(then_col, result_type)?;
+        // A decimal branch meets the running result on a common scale, the
+        // wider of the two, because the type alone does not say where the
+        // point sits and merging two scales would move it
+        if let Some((aligned_result, aligned_then)) =
+            compute::align_decimal_operands(&result, &then_col)?
+        {
+            result = aligned_result;
+            then_col = aligned_then;
+        }
         let mask = column_to_mask(&condition_bool);
 
-        // Use typed push_from to build result without ScalarValue.
+        // Use typed push_from to build result without ScalarValue. Both
+        // start empty because the loop below appends every row: seeding the
+        // bitmap at `num_rows` left it twice the data's length, and every
+        // read of it landed in the seeded half, so a CASE that produced a
+        // null reported a value instead.
         let mut new_data = ColumnData::with_capacity(result.type_id, num_rows);
-        let mut new_nulls = NullBitmap::none(num_rows);
+        let mut new_nulls = NullBitmap::empty();
 
         for i in 0..num_rows {
             if mask[i] {
@@ -852,6 +910,18 @@ fn evaluate_case(
     }
 
     Ok(result)
+}
+
+/// Puts one CASE branch into the result type, leaving it alone when it
+/// already carries the same physical layout.
+///
+/// A branch whose column already matches skips the cast, so the common case
+/// where every branch agrees costs one comparison.
+fn coerce_case_branch(col: Column, target: TypeId) -> Result<Column> {
+    if col.type_id == target {
+        return Ok(col);
+    }
+    crate::compute::cast_column(&col, target)
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +1032,7 @@ fn evaluate_function(
                 data,
                 ts.nulls.clone(),
                 ts.type_id,
-                ts.ts_precision,
+                ts.fractional_digits,
             ))
         }
         // locf(col): last-observation-carried-forward. Replaces each NULL with
@@ -999,7 +1069,7 @@ fn evaluate_function(
                 data,
                 nulls,
                 col.type_id,
-                col.ts_precision,
+                col.fractional_digits,
             ))
         }
         // interpolate(col): linear interpolation. Each NULL between two
@@ -1093,7 +1163,7 @@ fn evaluate_function(
                 data,
                 nulls,
                 col.type_id,
-                col.ts_precision,
+                col.fractional_digits,
             ))
         }
         "abs" => {
@@ -1118,9 +1188,432 @@ fn evaluate_function(
             let b = evaluate(&args[1], batch, schema, params)?;
             eval_nullif(&a, &b)
         }
+        "char_length" | "character_length" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_char_length(&col)
+        }
+        "octet_length" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_octet_length(&col)
+        }
+        "ceil" | "ceiling" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_float_unary(&col, f64::ceil, f32::ceil)
+        }
+        "floor" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_float_unary(&col, f64::floor, f32::floor)
+        }
+        // round and trunc accept an optional per row digit count, positive
+        // digits keep fractional places, negative digits zero places left of
+        // the decimal point, integer inputs pass through except negative
+        // digits which round the integer itself
+        "round" => eval_round_trunc(args, batch, schema, params, true),
+        "trunc" | "truncate" => eval_round_trunc(args, batch, schema, params, false),
+        "trim" => eval_trim(args, batch, schema, params, TrimSide::Both),
+        "ltrim" => eval_trim(args, batch, schema, params, TrimSide::Leading),
+        "rtrim" => eval_trim(args, batch, schema, params, TrimSide::Trailing),
+        "substring" | "substr" => eval_substring(args, batch, schema, params),
+        "replace" => {
+            if args.len() != 3 {
+                return Err(ZyronError::ExecutionError(
+                    "replace(string, from, to) takes exactly 3 arguments".to_string(),
+                ));
+            }
+            let s = evaluate(&args[0], batch, schema, params)?;
+            let from = evaluate(&args[1], batch, schema, params)?;
+            let to = evaluate(&args[2], batch, schema, params)?;
+            eval_replace(&s, &from, &to)
+        }
+        "concat" => eval_concat(args, batch, schema, params),
+        "greatest" => eval_greatest_least(args, batch, schema, params, true),
+        "least" => eval_greatest_least(args, batch, schema, params, false),
+        // current_date is days since the Unix epoch, current_time is
+        // microseconds since UTC midnight, both broadcast per row so they
+        // compose like literals
+        "current_date" => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let days = secs.div_euclid(86_400) as i32;
+            let n = batch.num_rows.max(1);
+            Ok(Column::new(ColumnData::Int32(vec![days; n]), TypeId::Date))
+        }
+        "current_time" => {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let of_day = micros.rem_euclid(86_400_000_000);
+            let n = batch.num_rows.max(1);
+            Ok(Column::new(
+                ColumnData::Int64(vec![of_day; n]),
+                TypeId::Time,
+            ))
+        }
+        "extract" | "date_part" => eval_extract(args, batch, schema, params),
+        "date_trunc" => eval_date_trunc(args, batch, schema, params),
+        "array" => eval_array(args, batch, schema, params),
+        "array_subscript" => eval_array_subscript(args, batch, schema, params),
+        // Search predicates evaluated row by row. The planner routes these to
+        // an index operator when one covers the table and the read is of the
+        // current state; otherwise the storage scan evaluates them here, so
+        // an unindexed table and a time-travel read answer the same question
+        "match_against" => eval_match_against(args, batch, schema, params),
+        "vector_distance_cosine" | "vector_distance_l2" | "vector_distance_dot" => {
+            eval_vector_distance(name, args, batch, schema, params)
+        }
         n if name_matches_ml(n) => eval_ml_scalar(n, args, batch, schema, params),
         _ => crate::types_bridge::evaluate_types_function(name, args, batch, schema, params),
     }
+}
+
+/// `ARRAY[a, b, c]`.
+///
+/// Every element is evaluated as a column, so an array can be built from
+/// per-row values and not only from literals, then one encoded array is
+/// assembled per row. Elements share a type: the first one that is not null
+/// sets it and the rest are cast to it, which is what makes the encoding
+/// addressable by index.
+fn eval_array(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let rows = batch.num_rows.max(1);
+    if args.is_empty() {
+        let empty = zyron_common::array_value::encode(TypeId::Null, &[]);
+        return Ok(Column::new(
+            ColumnData::Binary(vec![empty; rows]),
+            TypeId::Array,
+        ));
+    }
+
+    let mut columns: Vec<Column> = args
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+
+    // The element type is the first one carrying values. An all-null array
+    // has no type to take, and stays untyped
+    let element_type = columns
+        .iter()
+        .map(|c| c.type_id)
+        .find(|t| *t != TypeId::Null)
+        .unwrap_or(TypeId::Null);
+    for column in &mut columns {
+        if column.type_id != element_type && column.type_id != TypeId::Null {
+            *column = crate::compute::cast_column(column, element_type)?;
+        }
+    }
+
+    let width = element_type.fixed_size().unwrap_or(0);
+    let mut out = Vec::with_capacity(rows);
+    let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns.len());
+    for row in 0..rows {
+        payloads.clear();
+        for column in &columns {
+            let scalar = if row < column.len() {
+                column.get_scalar(row)
+            } else {
+                ScalarValue::Null
+            };
+            payloads.push(match scalar {
+                ScalarValue::Null => None,
+                other => Some(crate::batch::encode_scalar_value(
+                    element_type,
+                    &other,
+                    width,
+                )),
+            });
+        }
+        let borrowed: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.as_deref()).collect();
+        out.push(zyron_common::array_value::encode(element_type, &borrowed));
+    }
+    Ok(Column::new(ColumnData::Binary(out), TypeId::Array))
+}
+
+/// `array[index]`, one-based the way SQL subscripts are.
+///
+/// An index outside the array reads as NULL rather than failing, matching how
+/// a missing element reads everywhere else.
+fn eval_array_subscript(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(
+            "array subscript takes an array and an index".to_string(),
+        ));
+    }
+    let arrays = evaluate(&args[0], batch, schema, params)?;
+    let indexes = evaluate(&args[1], batch, schema, params)?;
+    let rows = batch.num_rows.max(1);
+
+    // The element type comes from the encoded value rather than the plan, so
+    // a column whose element type was not known at bind time still decodes
+    let element_type = (0..rows.min(arrays.len()))
+        .find_map(|row| match arrays.get_scalar(row) {
+            ScalarValue::Binary(bytes) => {
+                zyron_common::ArrayView::parse(&bytes).map(|v| v.element_type())
+            }
+            _ => None,
+        })
+        .unwrap_or(TypeId::Null);
+
+    let mut data = ColumnData::with_capacity(element_type, rows);
+    let mut nulls = crate::column::NullBitmap::empty();
+    for row in 0..rows {
+        let scalar = subscript_one(&arrays, &indexes, row, element_type);
+        nulls.push(scalar.is_null());
+        data.push_scalar(&scalar);
+    }
+    Ok(Column::with_nulls(data, nulls, element_type))
+}
+
+/// Reads one row's subscripted element, or NULL when the array, the index or
+/// the position does not resolve.
+fn subscript_one(
+    arrays: &Column,
+    indexes: &Column,
+    row: usize,
+    element_type: TypeId,
+) -> ScalarValue {
+    if row >= arrays.len() || arrays.nulls.is_null(row) {
+        return ScalarValue::Null;
+    }
+    let ScalarValue::Binary(bytes) = arrays.get_scalar(row) else {
+        return ScalarValue::Null;
+    };
+    let Some(view) = zyron_common::ArrayView::parse(&bytes) else {
+        return ScalarValue::Null;
+    };
+    let index_row = if row < indexes.len() { row } else { 0 };
+    let one_based = match indexes.get_scalar(index_row) {
+        ScalarValue::Int8(v) => v as i64,
+        ScalarValue::Int16(v) => v as i64,
+        ScalarValue::Int32(v) => v as i64,
+        ScalarValue::Int64(v) => v,
+        ScalarValue::UInt8(v) => v as i64,
+        ScalarValue::UInt16(v) => v as i64,
+        ScalarValue::UInt32(v) => v as i64,
+        ScalarValue::UInt64(v) => v as i64,
+        _ => return ScalarValue::Null,
+    };
+    if one_based < 1 {
+        return ScalarValue::Null;
+    }
+    match view.get((one_based - 1) as usize) {
+        Some(Some(payload)) => {
+            if element_type.fixed_size().unwrap_or(0) > 0 {
+                crate::batch::decode_fixed_scalar(element_type, payload)
+            } else {
+                crate::batch::decode_varlen_scalar(element_type, payload)
+            }
+        }
+        _ => ScalarValue::Null,
+    }
+}
+
+/// Row-wise `MATCH (cols) AGAINST ('query')`.
+///
+/// Returns 1.0 for a matching row and 0.0 otherwise. The indexed path returns
+/// a BM25 score, which needs corpus statistics a single row does not carry, so
+/// this reports membership rather than inventing a rank. Row membership is
+/// identical either way, which is what a predicate depends on.
+fn eval_match_against(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let Some((query_arg, column_args)) = args.split_last() else {
+        return Err(ZyronError::ExecutionError(
+            "match_against takes at least one column and a query".to_string(),
+        ));
+    };
+    let query_column = evaluate(query_arg, batch, schema, params)?;
+    let query_text = match query_column.get_scalar(0) {
+        ScalarValue::Utf8(s) => s,
+        other => {
+            return Err(ZyronError::ExecutionError(format!(
+                "match_against expects a string query, got {other:?}"
+            )));
+        }
+    };
+    let query = zyron_search::FtsQueryParser::parse(&query_text)?;
+    let analyzer = zyron_search::SimpleAnalyzer;
+
+    let text_columns: Vec<Column> = column_args
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut scores = Vec::with_capacity(batch.num_rows);
+    let mut document = String::with_capacity(256);
+    for row in 0..batch.num_rows {
+        // One document per row, the matched columns joined the way the index
+        // concatenates them at write time
+        document.clear();
+        for col in &text_columns {
+            if col.nulls.is_null(row) {
+                continue;
+            }
+            if let ColumnData::Utf8(values) = &col.data
+                && let Some(s) = values.get(row)
+            {
+                if !document.is_empty() {
+                    document.push(' ');
+                }
+                document.push_str(s);
+            }
+        }
+        let tokens = zyron_search::Analyzer::analyze(&analyzer, &document);
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        scores.push(if query.matches_terms(&terms, &analyzer) {
+            1.0
+        } else {
+            0.0
+        });
+    }
+    Ok(Column::new(ColumnData::Float64(scores), TypeId::Float64))
+}
+
+/// Row-wise vector distance between a vector column and a query vector.
+/// Same metrics the vector index scores with, so a scan and an index search
+/// order rows identically.
+fn eval_vector_distance(
+    name: &str,
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(format!(
+            "{name} takes exactly two vectors"
+        )));
+    }
+    let left = vector_side(&args[0], batch, schema, params)?;
+    let right = vector_side(&args[1], batch, schema, params)?;
+    let mut out = Vec::with_capacity(batch.num_rows);
+    let mut lhs: Vec<f32> = Vec::new();
+    let mut rhs: Vec<f32> = Vec::new();
+    for row in 0..batch.num_rows {
+        let (Some(a), Some(b)) = (left.at(row, &mut lhs), right.at(row, &mut rhs)) else {
+            out.push(f64::NAN);
+            continue;
+        };
+        if a.len() != b.len() {
+            return Err(ZyronError::ExecutionError(format!(
+                "{name} needs equal dimensions, got {} and {}",
+                a.len(),
+                b.len()
+            )));
+        }
+        let d = match name {
+            "vector_distance_cosine" => {
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt();
+                if na == 0.0 || nb == 0.0 {
+                    1.0
+                } else {
+                    1.0 - (dot / (na * nb)) as f64
+                }
+            }
+            "vector_distance_l2" => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| ((x - y) as f64).powi(2))
+                .sum::<f64>()
+                .sqrt(),
+            // Dot product is a similarity, negated so a smaller value is a
+            // nearer row exactly as the other two metrics read
+            _ => -(a.iter().zip(b).map(|(x, y)| (x * y) as f64).sum::<f64>()),
+        };
+        out.push(d);
+    }
+    Ok(Column::new(ColumnData::Float64(out), TypeId::Float64))
+}
+
+/// One side of a distance call: either the same vector for every row, which
+/// is how a query vector is written, or one vector per row read out of a
+/// vector column's raw f32 bytes.
+enum VectorSide {
+    Constant(Vec<f32>),
+    PerRow(Column),
+}
+
+impl VectorSide {
+    /// The vector for one row. Per-row values are decoded into `scratch`, so
+    /// the loop over rows allocates once rather than per row.
+    fn at<'a>(&'a self, row: usize, scratch: &'a mut Vec<f32>) -> Option<&'a [f32]> {
+        match self {
+            VectorSide::Constant(v) => Some(v.as_slice()),
+            VectorSide::PerRow(col) => {
+                if col.nulls.is_null(row) {
+                    return None;
+                }
+                let ColumnData::Binary(blobs) = &col.data else {
+                    return None;
+                };
+                let bytes = blobs.get(row)?;
+                if bytes.is_empty() || bytes.len() % 4 != 0 {
+                    return None;
+                }
+                scratch.clear();
+                scratch.extend(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+                Some(scratch.as_slice())
+            }
+        }
+    }
+}
+
+/// Reads one argument of a distance call. An array constructor of numeric
+/// literals is the query vector and folds to a constant; anything else is
+/// evaluated as a column.
+fn vector_side(
+    arg: &BoundExpr,
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<VectorSide> {
+    let inner = match arg {
+        BoundExpr::Nested(e) => e.as_ref(),
+        other => other,
+    };
+    if let BoundExpr::Function { name, args, .. } = inner
+        && name == "array"
+        && !args.is_empty()
+    {
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            let column = evaluate(a, batch, schema, params)?;
+            let v = match column.get_scalar(0) {
+                ScalarValue::Float32(f) => f as f64,
+                ScalarValue::Float64(f) => f,
+                ScalarValue::Int32(i) => i as f64,
+                ScalarValue::Int64(i) => i as f64,
+                other => {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "a query vector takes numeric elements, got {other:?}"
+                    )));
+                }
+            };
+            values.push(v as f32);
+        }
+        return Ok(VectorSide::Constant(values));
+    }
+    Ok(VectorSide::PerRow(evaluate(arg, batch, schema, params)?))
 }
 
 fn name_matches_ml(name: &str) -> bool {
@@ -1461,14 +1954,18 @@ fn literal_string(expr: &BoundExpr) -> Option<String> {
 }
 
 fn eval_abs(col: &Column) -> Result<Column> {
+    // The result keeps the argument's fractional digits: a decimal's
+    // magnitude sits on the same scale, and comparison alignment reads the
+    // scale from the column
     // Typed fast paths for common numeric types.
     match &col.data {
         ColumnData::Int64(v) => {
             let result: Vec<i64> = v.iter().map(|x| x.wrapping_abs()).collect();
-            return Ok(Column::with_nulls(
+            return Ok(Column::with_nulls_ts(
                 ColumnData::Int64(result),
                 col.nulls.clone(),
                 col.type_id,
+                col.fractional_digits,
             ));
         }
         ColumnData::Float64(v) => {
@@ -1495,6 +1992,15 @@ fn eval_abs(col: &Column) -> Result<Column> {
                 col.type_id,
             ));
         }
+        ColumnData::Int128(v) => {
+            let result: Vec<i128> = v.iter().map(|x| x.wrapping_abs()).collect();
+            return Ok(Column::with_nulls_ts(
+                ColumnData::Int128(result),
+                col.nulls.clone(),
+                col.type_id,
+                col.fractional_digits,
+            ));
+        }
         _ => {}
     }
 
@@ -1516,12 +2022,18 @@ fn eval_abs(col: &Column) -> Result<Column> {
             ScalarValue::Float64(v) => ScalarValue::Float64(v.abs()),
             ScalarValue::Int32(v) => ScalarValue::Int32(v.wrapping_abs()),
             ScalarValue::Float32(v) => ScalarValue::Float32(v.abs()),
+            ScalarValue::Int128(v) => ScalarValue::Int128(v.wrapping_abs()),
             other => other,
         };
         data.push_scalar(&abs_val);
     }
 
-    Ok(Column::with_nulls(data, nulls, col.type_id))
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        col.type_id,
+        col.fractional_digits,
+    ))
 }
 
 fn eval_string_transform(col: &Column, transform: fn(&str) -> String) -> Result<Column> {
@@ -1563,7 +2075,13 @@ fn eval_length(col: &Column) -> Result<Column> {
     let result: Vec<i64> = strings
         .iter()
         .enumerate()
-        .map(|(i, s)| if col.is_null(i) { 0 } else { s.len() as i64 })
+        .map(|(i, s)| {
+            if col.is_null(i) {
+                0
+            } else {
+                s.chars().count() as i64
+            }
+        })
         .collect();
     Ok(Column::with_nulls(
         ColumnData::Int64(result),
@@ -1579,13 +2097,44 @@ fn eval_coalesce(
     params: &[ScalarValue],
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
-    let last_idx = args.len() - 1;
-    let mut result = evaluate(&args[last_idx], batch, schema, params)?;
+    let mut cols = Vec::with_capacity(args.len());
+    for arg in args {
+        cols.push(evaluate(arg, batch, schema, params)?);
+    }
+    // Decimal operands land on one scale and mixed-precision timestamps
+    // in one unit before rows are picked, so a fallback written in
+    // another representation cannot leak its raw form into the result.
+    // Without either, the digits carry only when every operand agrees,
+    // which is what makes the value they describe unambiguous
+    let digits = match crate::compute::align_decimal_columns(&cols)? {
+        Some((aligned, scale)) => {
+            cols = aligned;
+            Some(scale)
+        }
+        None => match crate::compute::align_timestamp_columns(&cols)? {
+            Some((aligned, precision)) => {
+                cols = aligned;
+                precision
+            }
+            None if cols
+                .iter()
+                .all(|c| c.fractional_digits == cols[0].fractional_digits) =>
+            {
+                cols[0].fractional_digits
+            }
+            None => None,
+        },
+    };
 
-    for arg in args[..last_idx].iter().rev() {
-        let arg_col = evaluate(arg, batch, schema, params)?;
-        let mut new_data = ColumnData::with_capacity(result.type_id, num_rows);
-        let mut new_nulls = NullBitmap::none(num_rows);
+    let mut result = cols.pop().ok_or_else(|| {
+        ZyronError::ExecutionError("coalesce requires at least 1 argument".to_string())
+    })?;
+    // The merge buffer takes the physical form the cells are in, which
+    // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
+    let merge_type = TypeId::timestamp_physical_type_id(result.type_id, digits);
+    for arg_col in cols.iter().rev() {
+        let mut new_data = ColumnData::with_capacity(merge_type, num_rows);
+        let mut new_nulls = NullBitmap::empty();
 
         for i in 0..num_rows {
             if !arg_col.is_null(i) {
@@ -1600,19 +2149,42 @@ fn eval_coalesce(
         result = Column::with_nulls(new_data, new_nulls, result.type_id);
     }
 
+    result.fractional_digits = digits;
     Ok(result)
 }
 
 fn eval_nullif(a: &Column, b: &Column) -> Result<Column> {
+    // The equality reads both sides on one decimal scale, or both
+    // timestamps in one unit, while the returned values keep the first
+    // argument's own representation and digits
+    let aligned = match crate::compute::align_decimal_operands(a, b)? {
+        Some(pair) => Some(pair),
+        None if is_ts_col(a) && is_ts_col(b) && ts_col_is_ps(a) != ts_col_is_ps(b) => {
+            let mut left = a.clone();
+            let mut right = b.clone();
+            normalize_ts_pair(&mut left, &mut right)?;
+            Some((left, right))
+        }
+        None => None,
+    };
+    let (cmp_a, cmp_b) = match &aligned {
+        Some((left, right)) => (left, right),
+        None => (a, b),
+    };
     let len = a.len();
-    let mut data = ColumnData::with_capacity(a.type_id, len);
-    let mut nulls = NullBitmap::none(len);
+    // The result buffer takes the first argument's physical form, which
+    // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
+    let mut data = ColumnData::with_capacity(
+        TypeId::timestamp_physical_type_id(a.type_id, a.fractional_digits),
+        len,
+    );
+    let mut nulls = NullBitmap::empty();
 
     for i in 0..len {
         if a.is_null(i) {
             nulls.push(true);
             data.push_default();
-        } else if !b.is_null(i) && values_equal_at(&a.data, i, &b.data, i) {
+        } else if !b.is_null(i) && values_equal_at(&cmp_a.data, i, &cmp_b.data, i) {
             nulls.push(true);
             data.push_default();
         } else {
@@ -1621,7 +2193,12 @@ fn eval_nullif(a: &Column, b: &Column) -> Result<Column> {
         }
     }
 
-    Ok(Column::with_nulls(data, nulls, a.type_id))
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        a.type_id,
+        a.fractional_digits,
+    ))
 }
 
 /// Typed equality check for two values at given indices across ColumnData instances.
@@ -1648,5 +2225,1499 @@ fn values_equal_at(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx: usize) -
         (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::FixedBinary16(va), ColumnData::FixedBinary16(vb)) => va[a_idx] == vb[b_idx],
         _ => a.get_scalar(a_idx) == b.get_scalar(b_idx),
+    }
+}
+
+/// Typed less-than for two values at given indices, same variant on both
+/// sides, NaN orders greater than every number so folds are total
+#[inline]
+fn values_less_at(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx: usize) -> bool {
+    match (a, b) {
+        (ColumnData::Boolean(va), ColumnData::Boolean(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int8(va), ColumnData::Int8(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int16(va), ColumnData::Int16(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int32(va), ColumnData::Int32(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int64(va), ColumnData::Int64(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int128(va), ColumnData::Int128(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt8(va), ColumnData::UInt8(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt16(va), ColumnData::UInt16(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt32(va), ColumnData::UInt32(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt64(va), ColumnData::UInt64(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Float32(va), ColumnData::Float32(vb)) => {
+            match va[a_idx].partial_cmp(&vb[b_idx]) {
+                Some(o) => o == std::cmp::Ordering::Less,
+                None => !va[a_idx].is_nan() && vb[b_idx].is_nan(),
+            }
+        }
+        (ColumnData::Float64(va), ColumnData::Float64(vb)) => {
+            match va[a_idx].partial_cmp(&vb[b_idx]) {
+                Some(o) => o == std::cmp::Ordering::Less,
+                None => !va[a_idx].is_nan() && vb[b_idx].is_nan(),
+            }
+        }
+        (ColumnData::Utf8(va), ColumnData::Utf8(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::FixedBinary16(va), ColumnData::FixedBinary16(vb)) => va[a_idx] < vb[b_idx],
+        _ => false,
+    }
+}
+
+fn utf8_or_err(col: &Column, fname: &str) -> Result<()> {
+    match &col.data {
+        ColumnData::Utf8(_) => Ok(()),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "{fname}() requires a string argument"
+        ))),
+    }
+}
+
+fn eval_char_length(col: &Column) -> Result<Column> {
+    utf8_or_err(col, "char_length")?;
+    let strings = match &col.data {
+        ColumnData::Utf8(v) => v,
+        _ => unreachable!(),
+    };
+    let result: Vec<i64> = strings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if col.is_null(i) {
+                0
+            } else {
+                s.chars().count() as i64
+            }
+        })
+        .collect();
+    Ok(Column::with_nulls(
+        ColumnData::Int64(result),
+        col.nulls.clone(),
+        TypeId::Int64,
+    ))
+}
+
+fn eval_octet_length(col: &Column) -> Result<Column> {
+    let result: Vec<i64> = match &col.data {
+        ColumnData::Utf8(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if col.is_null(i) { 0 } else { s.len() as i64 })
+            .collect(),
+        ColumnData::Binary(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, b)| if col.is_null(i) { 0 } else { b.len() as i64 })
+            .collect(),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "octet_length() requires a string or binary argument".to_string(),
+            ));
+        }
+    };
+    Ok(Column::with_nulls(
+        ColumnData::Int64(result),
+        col.nulls.clone(),
+        TypeId::Int64,
+    ))
+}
+
+/// ceil and floor, integers pass through, floats apply the op per lane
+fn eval_float_unary(col: &Column, op64: fn(f64) -> f64, op32: fn(f32) -> f32) -> Result<Column> {
+    match &col.data {
+        ColumnData::Float64(v) => Ok(Column::with_nulls(
+            ColumnData::Float64(v.iter().map(|&x| op64(x)).collect()),
+            col.nulls.clone(),
+            col.type_id,
+        )),
+        ColumnData::Float32(v) => Ok(Column::with_nulls(
+            ColumnData::Float32(v.iter().map(|&x| op32(x)).collect()),
+            col.nulls.clone(),
+            col.type_id,
+        )),
+        ColumnData::Int8(_)
+        | ColumnData::Int16(_)
+        | ColumnData::Int32(_)
+        | ColumnData::Int64(_)
+        | ColumnData::Int128(_)
+        | ColumnData::UInt8(_)
+        | ColumnData::UInt16(_)
+        | ColumnData::UInt32(_)
+        | ColumnData::UInt64(_) => Ok(col.clone()),
+        _ => Err(ZyronError::ExecutionError(
+            "ceil/floor requires a numeric argument".to_string(),
+        )),
+    }
+}
+
+/// Per row digit count for round and trunc, None marks a NULL digit row
+fn digits_at(col: &Column, i: usize) -> Result<Option<i32>> {
+    if col.is_null(i) {
+        return Ok(None);
+    }
+    let d = match col.data.get_scalar(i) {
+        ScalarValue::Int8(v) => v as i64,
+        ScalarValue::Int16(v) => v as i64,
+        ScalarValue::Int32(v) => v as i64,
+        ScalarValue::Int64(v) => v,
+        ScalarValue::Int128(v) => v.clamp(i32::MIN as i128, i32::MAX as i128) as i64,
+        other => {
+            return Err(ZyronError::ExecutionError(format!(
+                "round/trunc digit count must be an integer, got {other:?}"
+            )));
+        }
+    };
+    Ok(Some(d.clamp(-400, 400) as i32))
+}
+
+/// Rounds or truncates one i128 to a multiple of 10^(-d) for d < 0,
+/// half away from zero when rounding
+fn int_round_trunc(v: i128, d: i32, round: bool) -> i128 {
+    if d >= 0 {
+        return v;
+    }
+    // Ten to the 39th exceeds i128::MAX and every representable value
+    // sits below half of it, so zero is the exact nearest multiple for
+    // rounding and truncation alike
+    if d <= -39 {
+        return 0;
+    }
+    let p = 10i128.pow((-d) as u32);
+    if round {
+        let half = p / 2;
+        // A value within half a step of i128's edge has no representable
+        // next multiple, and saturating lands it on the nearest one that
+        // exists instead of wrapping
+        let adj = if v >= 0 {
+            v.saturating_add(half)
+        } else {
+            v.saturating_sub(half)
+        };
+        (adj / p) * p
+    } else {
+        (v / p) * p
+    }
+}
+
+fn float_round_trunc(v: f64, d: i32, round: bool) -> f64 {
+    if d == 0 {
+        return if round { v.round() } else { v.trunc() };
+    }
+    let scale = 10f64.powi(d.clamp(-308, 308));
+    let scaled = v * scale;
+    if !scaled.is_finite() {
+        return v;
+    }
+    let r = if round {
+        scaled.round()
+    } else {
+        scaled.trunc()
+    };
+    r / scale
+}
+
+fn eval_round_trunc(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+    round: bool,
+) -> Result<Column> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(ZyronError::ExecutionError(
+            "round/trunc takes 1 or 2 arguments".to_string(),
+        ));
+    }
+    let col = evaluate(&args[0], batch, schema, params)?;
+    // A temporal argument is refused at bind. The same refusal here
+    // covers any path that reaches the evaluator without binding, where
+    // raw microseconds or picoseconds would round as plain integers
+    if matches!(
+        col.type_id,
+        TypeId::Timestamp | TypeId::TimestampTz | TypeId::Date | TypeId::Time | TypeId::Interval
+    ) {
+        return Err(ZyronError::ExecutionError(
+            "round/trunc does not apply to a temporal value, \
+             bucket the instant with time_bucket(width, ts) instead"
+                .to_string(),
+        ));
+    }
+    let dcol = if args.len() == 2 {
+        Some(evaluate(&args[1], batch, schema, params)?)
+    } else {
+        None
+    };
+    let n = col.len();
+    let digit = |i: usize| -> Result<Option<i32>> {
+        match &dcol {
+            Some(d) => digits_at(d, i),
+            None => Ok(Some(0)),
+        }
+    };
+
+    macro_rules! int_lanes {
+        ($v:expr, $variant:ident, $ty:ty) => {{
+            let mut out: Vec<$ty> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in $v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => {
+                        out.push(int_round_trunc(x as i128, d, round) as $ty)
+                    }
+                    _ => {
+                        out.push(0 as $ty);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls(
+                ColumnData::$variant(out),
+                nulls,
+                col.type_id,
+            ))
+        }};
+    }
+
+    match &col.data {
+        ColumnData::Float64(v) => {
+            let mut out: Vec<f64> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => out.push(float_round_trunc(x, d, round)),
+                    _ => {
+                        out.push(0.0);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls(
+                ColumnData::Float64(out),
+                nulls,
+                col.type_id,
+            ))
+        }
+        ColumnData::Float32(v) => {
+            let mut out: Vec<f32> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => {
+                        out.push(float_round_trunc(x as f64, d, round) as f32)
+                    }
+                    _ => {
+                        out.push(0.0);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls(
+                ColumnData::Float32(out),
+                nulls,
+                col.type_id,
+            ))
+        }
+        ColumnData::Int8(v) => int_lanes!(v, Int8, i8),
+        ColumnData::Int16(v) => int_lanes!(v, Int16, i16),
+        ColumnData::Int32(v) => int_lanes!(v, Int32, i32),
+        ColumnData::Int64(v) => int_lanes!(v, Int64, i64),
+        // A decimal is its value times ten to the scale, so rounding the
+        // value to d fractional digits means rounding the integer at the
+        // scale minus d low decimal digits. The result stays on the
+        // column's scale, which comparison alignment reads
+        ColumnData::Int128(v) if col.type_id == TypeId::Decimal => {
+            let scale = i32::from(col.fractional_digits.unwrap_or(0));
+            let mut out: Vec<i128> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => {
+                        out.push(int_round_trunc(x, d.saturating_sub(scale), round))
+                    }
+                    _ => {
+                        out.push(0);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int128(out),
+                nulls,
+                col.type_id,
+                col.fractional_digits,
+            ))
+        }
+        ColumnData::Int128(v) => int_lanes!(v, Int128, i128),
+        _ => Err(ZyronError::ExecutionError(
+            "round/trunc requires a numeric argument".to_string(),
+        )),
+    }
+}
+
+enum TrimSide {
+    Both,
+    Leading,
+    Trailing,
+}
+
+fn eval_trim(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+    side: TrimSide,
+) -> Result<Column> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(ZyronError::ExecutionError(
+            "trim takes 1 or 2 arguments".to_string(),
+        ));
+    }
+    let col = evaluate(&args[0], batch, schema, params)?;
+    utf8_or_err(&col, "trim")?;
+    let charset = if args.len() == 2 {
+        let c = evaluate(&args[1], batch, schema, params)?;
+        utf8_or_err(&c, "trim")?;
+        Some(c)
+    } else {
+        None
+    };
+    let strings = match &col.data {
+        ColumnData::Utf8(v) => v,
+        _ => unreachable!(),
+    };
+    let n = col.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
+    for (i, s) in strings.iter().enumerate() {
+        if col.is_null(i) {
+            out.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        // SQL trim strips spaces by default, an explicit charset strips any
+        // of its characters
+        let trimmed = match &charset {
+            None => match side {
+                TrimSide::Both => s.trim_matches(' '),
+                TrimSide::Leading => s.trim_start_matches(' '),
+                TrimSide::Trailing => s.trim_end_matches(' '),
+            },
+            Some(c) => {
+                if c.is_null(i) {
+                    out.push(String::new());
+                    nulls.set_null(i);
+                    continue;
+                }
+                let set: Vec<char> = match &c.data {
+                    ColumnData::Utf8(v) => v[i].chars().collect(),
+                    _ => unreachable!(),
+                };
+                let pred = |ch: char| set.contains(&ch);
+                match side {
+                    TrimSide::Both => s.trim_matches(pred),
+                    TrimSide::Leading => s.trim_start_matches(pred),
+                    TrimSide::Trailing => s.trim_end_matches(pred),
+                }
+            }
+        };
+        out.push(trimmed.to_string());
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(out),
+        nulls,
+        TypeId::Text,
+    ))
+}
+
+/// One based character addressed substring with SQL overlap semantics, a
+/// start below 1 shortens the window instead of erroring
+fn substring_chars(s: &str, start: i64, len: Option<i64>) -> Result<String> {
+    if let Some(l) = len {
+        if l < 0 {
+            return Err(ZyronError::ExecutionError(
+                "negative substring length not allowed".to_string(),
+            ));
+        }
+    }
+    let end_excl = match len {
+        Some(l) => start.saturating_add(l),
+        None => i64::MAX,
+    };
+    let begin = start.max(1);
+    if end_excl <= begin {
+        return Ok(String::new());
+    }
+    let skip = (begin - 1) as usize;
+    let take = (end_excl - begin) as usize;
+    Ok(s.chars().skip(skip).take(take).collect())
+}
+
+fn eval_substring(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(ZyronError::ExecutionError(
+            "substring(string, start [, length]) takes 2 or 3 arguments".to_string(),
+        ));
+    }
+    let col = evaluate(&args[0], batch, schema, params)?;
+    utf8_or_err(&col, "substring")?;
+    let start_col = evaluate(&args[1], batch, schema, params)?;
+    let len_col = if args.len() == 3 {
+        Some(evaluate(&args[2], batch, schema, params)?)
+    } else {
+        None
+    };
+    let int_at = |c: &Column, i: usize, what: &str| -> Result<Option<i64>> {
+        if c.is_null(i) {
+            return Ok(None);
+        }
+        match c.data.get_scalar(i) {
+            ScalarValue::Int8(v) => Ok(Some(v as i64)),
+            ScalarValue::Int16(v) => Ok(Some(v as i64)),
+            ScalarValue::Int32(v) => Ok(Some(v as i64)),
+            ScalarValue::Int64(v) => Ok(Some(v)),
+            ScalarValue::Int128(v) => Ok(Some(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)),
+            other => Err(ZyronError::ExecutionError(format!(
+                "substring {what} must be an integer, got {other:?}"
+            ))),
+        }
+    };
+    let strings = match &col.data {
+        ColumnData::Utf8(v) => v,
+        _ => unreachable!(),
+    };
+    let n = col.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
+    for (i, s) in strings.iter().enumerate() {
+        if col.is_null(i) {
+            out.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        let start = match int_at(&start_col, i, "start")? {
+            Some(v) => v,
+            None => {
+                out.push(String::new());
+                nulls.set_null(i);
+                continue;
+            }
+        };
+        let len = match &len_col {
+            Some(lc) => match int_at(lc, i, "length")? {
+                Some(v) => Some(v),
+                None => {
+                    out.push(String::new());
+                    nulls.set_null(i);
+                    continue;
+                }
+            },
+            None => None,
+        };
+        out.push(substring_chars(s, start, len)?);
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(out),
+        nulls,
+        TypeId::Text,
+    ))
+}
+
+fn eval_replace(s: &Column, from: &Column, to: &Column) -> Result<Column> {
+    utf8_or_err(s, "replace")?;
+    utf8_or_err(from, "replace")?;
+    utf8_or_err(to, "replace")?;
+    let (sv, fv, tv) = match (&s.data, &from.data, &to.data) {
+        (ColumnData::Utf8(a), ColumnData::Utf8(b), ColumnData::Utf8(c)) => (a, b, c),
+        _ => unreachable!(),
+    };
+    let n = s.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
+    for i in 0..n {
+        if s.is_null(i) || from.is_null(i) || to.is_null(i) {
+            out.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        // an empty search string returns the input unchanged
+        if fv[i].is_empty() {
+            out.push(sv[i].clone());
+        } else {
+            out.push(sv[i].replace(&fv[i], &tv[i]));
+        }
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(out),
+        nulls,
+        TypeId::Text,
+    ))
+}
+
+/// Variadic concat, NULL arguments contribute nothing and the result is
+/// never NULL, non string arguments cast to text
+fn eval_concat(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let n = batch.num_rows.max(1);
+    let mut cols: Vec<Column> = Vec::with_capacity(args.len());
+    for a in args {
+        let c = evaluate(a, batch, schema, params)?;
+        let c = match &c.data {
+            ColumnData::Utf8(_) => c,
+            _ => crate::compute::cast_column(&c, TypeId::Varchar)?,
+        };
+        cols.push(c);
+    }
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut s = String::new();
+        for c in &cols {
+            if i < c.len() && !c.is_null(i) {
+                if let ColumnData::Utf8(v) = &c.data {
+                    s.push_str(&v[i]);
+                }
+            }
+        }
+        out.push(s);
+    }
+    Ok(Column::new(ColumnData::Utf8(out), TypeId::Text))
+}
+
+/// Row wise maximum or minimum across the arguments, NULLs are ignored and
+/// the result is NULL only when every argument is NULL
+/// Splits a day count since the Unix epoch into its calendar year, month and
+/// day, in the proleptic Gregorian calendar.
+fn civil_from_epoch_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `EXTRACT(field FROM source)`, also reachable as `date_part`.
+///
+/// A DATE is stored as days since the epoch and a TIMESTAMP as microseconds,
+/// so the field is read from the calendar split of whichever unit the source
+/// carries. The result is an integer, which is what every comparison and
+/// grouping the field feeds expects.
+fn eval_extract(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(format!(
+            "extract takes a field and a source, got {} argument(s)",
+            args.len()
+        )));
+    }
+    let field_col = evaluate(&args[0], batch, schema, params)?;
+    let field = match field_col.data {
+        ColumnData::Utf8(ref v) if !v.is_empty() => v[0].to_ascii_lowercase(),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "extract needs a constant field name, like EXTRACT(YEAR FROM ts)".to_string(),
+            ));
+        }
+    };
+    let source = evaluate(&args[1], batch, schema, params)?;
+
+    // Every source reduces to microseconds since the epoch, so one split
+    // serves dates, timestamps and times alike. A p>6 timestamp holds
+    // i128 picoseconds, a different unit whose raw count exceeds i64, so
+    // it floors to microseconds before the split
+    let source_is_ps = ts_col_is_ps(&source);
+    let micros_of = |i: usize| -> Option<i64> {
+        if source.is_null(i) {
+            return None;
+        }
+        match (&source.data, source.type_id) {
+            (ColumnData::Int32(v), TypeId::Date) => Some(v[i] as i64 * 86_400_000_000),
+            (ColumnData::Int64(v), _) => Some(v[i]),
+            (ColumnData::Int32(v), _) => Some(v[i] as i64),
+            (ColumnData::Int128(v), _) if source_is_ps => Some(v[i].div_euclid(1_000_000) as i64),
+            (ColumnData::Int128(v), _) => Some(v[i] as i64),
+            _ => None,
+        }
+    };
+
+    let n = source.len();
+    let mut out: Vec<i64> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::empty();
+    for i in 0..n {
+        let Some(micros) = micros_of(i) else {
+            out.push(0);
+            nulls.push(true);
+            continue;
+        };
+        let days = micros.div_euclid(86_400_000_000);
+        let time_of_day = micros.rem_euclid(86_400_000_000);
+        let (year, month, day) = civil_from_epoch_days(days);
+        let value = match field.as_str() {
+            "year" => year,
+            "month" => month,
+            "day" => day,
+            "hour" => time_of_day / 3_600_000_000,
+            "minute" => time_of_day / 60_000_000 % 60,
+            "second" => time_of_day / 1_000_000 % 60,
+            "millisecond" => time_of_day / 1_000 % 60_000,
+            "microsecond" => time_of_day % 60_000_000,
+            "quarter" => (month - 1) / 3 + 1,
+            // The epoch fell on a Thursday, so day zero is weekday four
+            "dow" | "dayofweek" => (days + 4).rem_euclid(7),
+            "doy" | "dayofyear" => days - crate::expr::epoch_days_from_civil(year, 1, 1) + 1,
+            "epoch" => micros / 1_000_000,
+            "decade" => year / 10,
+            "century" => (year - 1) / 100 + 1,
+            "millennium" => (year - 1) / 1000 + 1,
+            other => {
+                return Err(ZyronError::ExecutionError(format!(
+                    "extract does not know the field '{other}'"
+                )));
+            }
+        };
+        out.push(value);
+        nulls.push(false);
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Int64(out),
+        nulls,
+        TypeId::Int64,
+    ))
+}
+
+/// The truncation boundary date_trunc lands an instant on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateTruncUnit {
+    Microsecond,
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+    Decade,
+    Century,
+    Millennium,
+}
+
+impl DateTruncUnit {
+    /// The unit's width in microseconds, for the fixed-width units. The
+    /// calendar units have no fixed width and answer None
+    fn fixed_us(self) -> Option<i64> {
+        match self {
+            DateTruncUnit::Microsecond => Some(1),
+            DateTruncUnit::Millisecond => Some(1_000),
+            DateTruncUnit::Second => Some(1_000_000),
+            DateTruncUnit::Minute => Some(60_000_000),
+            DateTruncUnit::Hour => Some(3_600_000_000),
+            DateTruncUnit::Day => Some(86_400_000_000),
+            _ => None,
+        }
+    }
+}
+
+fn parse_date_trunc_unit(name: &str) -> Result<DateTruncUnit> {
+    Ok(match name {
+        "microsecond" | "microseconds" => DateTruncUnit::Microsecond,
+        "millisecond" | "milliseconds" => DateTruncUnit::Millisecond,
+        "second" | "seconds" => DateTruncUnit::Second,
+        "minute" | "minutes" => DateTruncUnit::Minute,
+        "hour" | "hours" => DateTruncUnit::Hour,
+        "day" | "days" => DateTruncUnit::Day,
+        "week" | "weeks" => DateTruncUnit::Week,
+        "month" | "months" => DateTruncUnit::Month,
+        "quarter" | "quarters" => DateTruncUnit::Quarter,
+        "year" | "years" => DateTruncUnit::Year,
+        "decade" | "decades" => DateTruncUnit::Decade,
+        "century" | "centuries" => DateTruncUnit::Century,
+        "millennium" | "millennia" | "millenniums" => DateTruncUnit::Millennium,
+        other => {
+            return Err(ZyronError::ExecutionError(format!(
+                "date_trunc does not know the unit '{other}', valid units are microseconds, \
+                 milliseconds, second, minute, hour, day, week, month, quarter, year, decade, \
+                 century and millennium"
+            )));
+        }
+    })
+}
+
+const DAY_US: i64 = 86_400_000_000;
+
+/// Floors a microsecond instant to its unit boundary. Fixed-width units
+/// are one flooring remainder. The week lands on Monday, offset three
+/// days from the Thursday the epoch fell on. Calendar units decompose to
+/// a civil date, land on the first day of their period, and recompose.
+/// Century and millennium start on year one of their period, so 2026
+/// lands on 2001, matching the numbering extract reports
+fn trunc_epoch_us(us: i64, unit: DateTruncUnit) -> i64 {
+    if let Some(w) = unit.fixed_us() {
+        return us - us.rem_euclid(w);
+    }
+    let days = us.div_euclid(DAY_US);
+    if unit == DateTruncUnit::Week {
+        return (days - (days + 3).rem_euclid(7)) * DAY_US;
+    }
+    let (year, month, _) = civil_from_epoch_days(days);
+    let (target_year, target_month) = match unit {
+        DateTruncUnit::Month => (year, month),
+        DateTruncUnit::Quarter => (year, (month - 1) / 3 * 3 + 1),
+        DateTruncUnit::Year => (year, 1),
+        DateTruncUnit::Decade => (year - year.rem_euclid(10), 1),
+        DateTruncUnit::Century => ((year - 1).div_euclid(100) * 100 + 1, 1),
+        DateTruncUnit::Millennium => ((year - 1).div_euclid(1000) * 1000 + 1, 1),
+        _ => unreachable!("fixed-width and week units returned above"),
+    };
+    epoch_days_from_civil(target_year, target_month, 1) * DAY_US
+}
+
+/// Floors a picosecond instant to its unit boundary. Fixed-width units
+/// floor directly in picoseconds so the sub-microsecond digits clear in
+/// the same step. Calendar boundaries are whole days, so the microsecond
+/// computation recomposes exactly
+fn trunc_epoch_ps(ps: i128, unit: DateTruncUnit) -> i128 {
+    if let Some(w) = unit.fixed_us() {
+        let w_ps = w as i128 * 1_000_000;
+        return ps - ps.rem_euclid(w_ps);
+    }
+    trunc_epoch_us(ps.div_euclid(1_000_000) as i64, unit) as i128 * 1_000_000
+}
+
+/// Zeroes an interval's fields below the unit and floors the field the
+/// unit lives in. A duration anchors at zero, so a century of months is
+/// a plain multiple of 1200 with no year-one shift
+fn trunc_interval(iv: zyron_common::Interval, unit: DateTruncUnit) -> zyron_common::Interval {
+    use zyron_common::Interval;
+    match unit {
+        DateTruncUnit::Microsecond => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 1_000,
+            ..iv
+        },
+        DateTruncUnit::Millisecond => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 1_000_000,
+            ..iv
+        },
+        DateTruncUnit::Second => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 1_000_000_000,
+            ..iv
+        },
+        DateTruncUnit::Minute => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 60_000_000_000,
+            ..iv
+        },
+        DateTruncUnit::Hour => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 3_600_000_000_000,
+            ..iv
+        },
+        DateTruncUnit::Day => Interval {
+            nanoseconds: 0,
+            ..iv
+        },
+        DateTruncUnit::Month => Interval {
+            months: iv.months,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Quarter => Interval {
+            months: iv.months - iv.months % 3,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Year => Interval {
+            months: iv.months - iv.months % 12,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Decade => Interval {
+            months: iv.months - iv.months % 120,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Century => Interval {
+            months: iv.months - iv.months % 1200,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Millennium => Interval {
+            months: iv.months - iv.months % 12000,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Week => unreachable!("refused before the row loop"),
+    }
+}
+
+/// date_trunc(unit, source) floors an instant to the unit's boundary and
+/// keeps the source's type and precision. A date widens to the timestamp
+/// its boundary lands on, and an interval zeroes its fields below the
+/// unit
+fn eval_date_trunc(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(format!(
+            "date_trunc takes a unit and a source, got {} argument(s)",
+            args.len()
+        )));
+    }
+    let unit_col = evaluate(&args[0], batch, schema, params)?;
+    let unit_name = match unit_col.data {
+        ColumnData::Utf8(ref v) if !v.is_empty() => v[0].to_ascii_lowercase(),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "date_trunc needs a constant unit name, like date_trunc('day', ts)".to_string(),
+            ));
+        }
+    };
+    let unit = parse_date_trunc_unit(&unit_name)?;
+    let source = evaluate(&args[1], batch, schema, params)?;
+
+    match (&source.data, source.type_id) {
+        (ColumnData::Int64(v), TypeId::Timestamp | TypeId::TimestampTz) => {
+            let out: Vec<i64> = v.iter().map(|&us| trunc_epoch_us(us, unit)).collect();
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int64(out),
+                source.nulls.clone(),
+                source.type_id,
+                source.fractional_digits,
+            ))
+        }
+        (ColumnData::Int128(v), TypeId::Timestamp | TypeId::TimestampTz) => {
+            let out: Vec<i128> = v.iter().map(|&ps| trunc_epoch_ps(ps, unit)).collect();
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int128(out),
+                source.nulls.clone(),
+                source.type_id,
+                source.fractional_digits,
+            ))
+        }
+        (ColumnData::Int32(v), TypeId::Date) => {
+            let out: Vec<i64> = v
+                .iter()
+                .map(|&d| trunc_epoch_us(d as i64 * DAY_US, unit))
+                .collect();
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int64(out),
+                source.nulls.clone(),
+                TypeId::Timestamp,
+                None,
+            ))
+        }
+        (ColumnData::Interval(v), _) => {
+            // A week of what an interval holds is not defined, its days
+            // and months do not compose into one seven day field
+            if unit == DateTruncUnit::Week {
+                return Err(ZyronError::ExecutionError(
+                    "date_trunc('week', interval) is not defined, truncate to day instead"
+                        .to_string(),
+                ));
+            }
+            let out: Vec<zyron_common::Interval> =
+                v.iter().map(|&iv| trunc_interval(iv, unit)).collect();
+            Ok(Column::with_nulls(
+                ColumnData::Interval(out),
+                source.nulls.clone(),
+                TypeId::Interval,
+            ))
+        }
+        _ => Err(ZyronError::ExecutionError(
+            "date_trunc truncates a timestamp, a date or an interval".to_string(),
+        )),
+    }
+}
+
+/// The inverse of `civil_from_epoch_days`, for the day-of-year field.
+pub(crate) fn epoch_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn eval_greatest_least(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+    greatest: bool,
+) -> Result<Column> {
+    if args.is_empty() {
+        return Err(ZyronError::ExecutionError(
+            "greatest/least requires at least 1 argument".to_string(),
+        ));
+    }
+    let first = evaluate(&args[0], batch, schema, params)?;
+    let target = first.type_id;
+    let mut fractional_digits = first.fractional_digits;
+    let mut cols: Vec<Column> = Vec::with_capacity(args.len());
+    for (idx, a) in args.iter().enumerate() {
+        let c = if idx == 0 {
+            first.clone()
+        } else {
+            evaluate(a, batch, schema, params)?
+        };
+        let c = if c.type_id == target {
+            c
+        } else {
+            crate::compute::cast_column(&c, target)?
+        };
+        cols.push(c);
+    }
+    // Decimal operands land on the widest scale and mixed-precision
+    // timestamps in one unit before rows are compared, so the winner is
+    // chosen and returned in one representation whichever argument it
+    // came from
+    if target == TypeId::Decimal {
+        if let Some((aligned, scale)) = crate::compute::align_decimal_columns(&cols)? {
+            cols = aligned;
+            fractional_digits = Some(scale);
+        }
+    } else if matches!(target, TypeId::Timestamp | TypeId::TimestampTz) {
+        if let Some((aligned, precision)) = crate::compute::align_timestamp_columns(&cols)? {
+            cols = aligned;
+            fractional_digits = precision;
+        }
+    }
+    let n = cols.iter().map(|c| c.len()).max().unwrap_or(0);
+    // The result buffer takes the physical form the cells are in, which
+    // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
+    let mut data = ColumnData::with_capacity(
+        TypeId::timestamp_physical_type_id(target, fractional_digits),
+        n,
+    );
+    let mut nulls = NullBitmap::none(n);
+    for i in 0..n {
+        // best holds the winning argument index for this row
+        let mut best: Option<usize> = None;
+        for (k, c) in cols.iter().enumerate() {
+            if i >= c.len() || c.is_null(i) {
+                continue;
+            }
+            match best {
+                None => best = Some(k),
+                Some(b) => {
+                    let winner_loses = if greatest {
+                        values_less_at(&cols[b].data, i, &c.data, i)
+                    } else {
+                        values_less_at(&c.data, i, &cols[b].data, i)
+                    };
+                    if winner_loses {
+                        best = Some(k);
+                    }
+                }
+            }
+        }
+        match best {
+            Some(k) => data.push_from(&cols[k].data, i),
+            None => {
+                data.push_default();
+                nulls.set_null(i);
+            }
+        }
+    }
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        target,
+        fractional_digits,
+    ))
+}
+
+#[cfg(test)]
+mod scalar_fn_tests {
+    use super::*;
+
+    fn lit_int(v: i64) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::Integer(v),
+            type_id: TypeId::Int64,
+        }
+    }
+    fn lit_float(v: f64) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::Float(v),
+            type_id: TypeId::Float64,
+        }
+    }
+    fn lit_str(s: &str) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::String(s.to_string()),
+            type_id: TypeId::Text,
+        }
+    }
+    fn lit_null(t: TypeId) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::Null,
+            type_id: t,
+        }
+    }
+    fn one_row_batch() -> DataBatch {
+        DataBatch::new(vec![Column::new(ColumnData::Int64(vec![0]), TypeId::Int64)])
+    }
+    fn call(name: &str, args: &[BoundExpr]) -> Result<Column> {
+        evaluate_function(name, args, &one_row_batch(), &[], &[])
+    }
+    fn f64_at0(c: &Column) -> f64 {
+        match c.data.get_scalar(0) {
+            ScalarValue::Float64(v) => v,
+            other => panic!("expected Float64, got {other:?}"),
+        }
+    }
+    fn i64_at0(c: &Column) -> i64 {
+        match c.data.get_scalar(0) {
+            ScalarValue::Int64(v) => v,
+            other => panic!("expected Int64, got {other:?}"),
+        }
+    }
+    fn str_at0(c: &Column) -> String {
+        match c.data.get_scalar(0) {
+            ScalarValue::Utf8(v) => v,
+            other => panic!("expected Utf8, got {other:?}"),
+        }
+    }
+
+    /// The microsecond instant of a civil date at midnight
+    fn civil_us(year: i64, month: i64, day: i64) -> i64 {
+        epoch_days_from_civil(year, month, day) * DAY_US
+    }
+
+    /// Every unit's boundary from one instant, including the flooring
+    /// direction for a pre-epoch instant and the year-one anchoring of
+    /// century and millennium
+    #[test]
+    fn date_trunc_units_land_on_their_boundaries() {
+        use DateTruncUnit as U;
+        // 2026-05-17 is a Sunday, 14:30:45.123456
+        let t = civil_us(2026, 5, 17) + 14 * 3_600_000_000 + 30 * 60_000_000 + 45_123_456;
+        assert_eq!(
+            trunc_epoch_us(t, U::Second),
+            civil_us(2026, 5, 17) + 14 * 3_600_000_000 + 30 * 60_000_000 + 45_000_000
+        );
+        assert_eq!(
+            trunc_epoch_us(t, U::Minute),
+            civil_us(2026, 5, 17) + 14 * 3_600_000_000 + 30 * 60_000_000
+        );
+        assert_eq!(
+            trunc_epoch_us(t, U::Hour),
+            civil_us(2026, 5, 17) + 14 * 3_600_000_000
+        );
+        assert_eq!(trunc_epoch_us(t, U::Day), civil_us(2026, 5, 17));
+        assert_eq!(
+            trunc_epoch_us(t, U::Week),
+            civil_us(2026, 5, 11),
+            "a Sunday lands on its own week's Monday"
+        );
+        assert_eq!(
+            trunc_epoch_us(civil_us(2026, 5, 11), U::Week),
+            civil_us(2026, 5, 11),
+            "a Monday is its own boundary"
+        );
+        assert_eq!(
+            trunc_epoch_us(0, U::Week),
+            civil_us(1969, 12, 29),
+            "the Thursday epoch lands on the Monday before it"
+        );
+        assert_eq!(trunc_epoch_us(t, U::Month), civil_us(2026, 5, 1));
+        assert_eq!(trunc_epoch_us(t, U::Quarter), civil_us(2026, 4, 1));
+        assert_eq!(trunc_epoch_us(t, U::Year), civil_us(2026, 1, 1));
+        assert_eq!(trunc_epoch_us(t, U::Decade), civil_us(2020, 1, 1));
+        assert_eq!(trunc_epoch_us(t, U::Century), civil_us(2001, 1, 1));
+        assert_eq!(trunc_epoch_us(t, U::Millennium), civil_us(2001, 1, 1));
+        // Year 2000 belongs to the twentieth century and the 1990s decade
+        let y2k = civil_us(2000, 6, 15);
+        assert_eq!(trunc_epoch_us(y2k, U::Century), civil_us(1901, 1, 1));
+        assert_eq!(trunc_epoch_us(y2k, U::Decade), civil_us(2000, 1, 1));
+        assert_eq!(
+            trunc_epoch_us(civil_us(1969, 8, 20), U::Decade),
+            civil_us(1960, 1, 1)
+        );
+        // One microsecond before the epoch floors to the previous day,
+        // not toward zero
+        assert_eq!(trunc_epoch_us(-1, U::Day), civil_us(1969, 12, 31));
+        assert_eq!(trunc_epoch_us(-1, U::Second), -1_000_000);
+    }
+
+    /// The picosecond form clears sub-microsecond digits in the same
+    /// flooring step and recomposes calendar boundaries exactly
+    #[test]
+    fn date_trunc_ps_clears_the_smaller_digits_with_the_unit() {
+        use DateTruncUnit as U;
+        let us = civil_us(2026, 5, 17) + 45_123_456;
+        let ps = us as i128 * 1_000_000 + 789_654;
+        assert_eq!(
+            trunc_epoch_ps(ps, U::Second),
+            (civil_us(2026, 5, 17) + 45_000_000) as i128 * 1_000_000
+        );
+        assert_eq!(
+            trunc_epoch_ps(ps, U::Microsecond),
+            us as i128 * 1_000_000,
+            "the microsecond unit keeps the microsecond and drops the picoseconds"
+        );
+        assert_eq!(
+            trunc_epoch_ps(ps, U::Month),
+            civil_us(2026, 5, 1) as i128 * 1_000_000
+        );
+    }
+
+    /// Interval truncation zeroes the fields below the unit and floors
+    /// the field the unit lives in, toward zero for a negative duration
+    #[test]
+    fn date_trunc_interval_zeroes_the_fields_below_the_unit() {
+        use DateTruncUnit as U;
+        let iv = zyron_common::Interval {
+            months: 14,
+            days: 3,
+            nanoseconds: 3 * 3_600_000_000_000 + 25 * 60_000_000_000 + 7_000_000_000,
+        };
+        let hour = trunc_interval(iv, U::Hour);
+        assert_eq!(
+            (hour.months, hour.days, hour.nanoseconds),
+            (14, 3, 3 * 3_600_000_000_000)
+        );
+        let day = trunc_interval(iv, U::Day);
+        assert_eq!((day.months, day.days, day.nanoseconds), (14, 3, 0));
+        let year = trunc_interval(iv, U::Year);
+        assert_eq!((year.months, year.days, year.nanoseconds), (12, 0, 0));
+        let negative = trunc_interval(
+            zyron_common::Interval {
+                months: -14,
+                days: 0,
+                nanoseconds: 0,
+            },
+            U::Year,
+        );
+        assert_eq!(
+            negative.months, -12,
+            "a negative duration floors toward zero"
+        );
+    }
+
+    /// The unit parser takes both grammatical numbers and refuses an
+    /// unknown unit naming the valid ones
+    #[test]
+    fn date_trunc_unit_names_parse_in_both_numbers() {
+        assert!(matches!(
+            parse_date_trunc_unit("milliseconds"),
+            Ok(DateTruncUnit::Millisecond)
+        ));
+        assert!(matches!(
+            parse_date_trunc_unit("week"),
+            Ok(DateTruncUnit::Week)
+        ));
+        assert!(matches!(
+            parse_date_trunc_unit("centuries"),
+            Ok(DateTruncUnit::Century)
+        ));
+        let err = parse_date_trunc_unit("fortnight").expect_err("unknown unit");
+        assert!(err.to_string().contains("valid units"));
+    }
+
+    /// Row-wise vector distance over a vector column and a query vector.
+    /// A vector column holds raw little-endian f32 bytes, and the query side
+    /// arrives as an array constructor, so both shapes have to read.
+    #[test]
+    fn vector_distance_reads_a_vector_column_against_a_query_vector() {
+        fn vector_bytes(v: &[f32]) -> Vec<u8> {
+            v.iter().flat_map(|f| f.to_le_bytes()).collect()
+        }
+        let batch = DataBatch::new(vec![Column::new(
+            ColumnData::Binary(vec![
+                vector_bytes(&[1.0, 0.0, 0.0]),
+                vector_bytes(&[0.0, 1.0, 0.0]),
+                vector_bytes(&[0.9, 0.1, 0.0]),
+            ]),
+            TypeId::Vector,
+        )]);
+        let schema = vec![LogicalColumn {
+            table_idx: Some(0),
+            column_id: zyron_catalog::ColumnId(1),
+            name: "embedding".to_string(),
+            type_id: TypeId::Vector,
+            nullable: false,
+            fractional_digits: None,
+        }];
+        let column_ref = BoundExpr::ColumnRef(zyron_planner::binder::ColumnRef {
+            table_idx: 0,
+            column_id: zyron_catalog::ColumnId(1),
+            type_id: TypeId::Vector,
+            nullable: false,
+            fractional_digits: None,
+        });
+        let query = BoundExpr::Function {
+            name: "array".to_string(),
+            args: vec![lit_float(1.0), lit_float(0.0), lit_float(0.0)],
+            return_type: TypeId::Array,
+            distinct: false,
+        };
+
+        let cosine = evaluate_function(
+            "vector_distance_cosine",
+            &[column_ref.clone(), query.clone()],
+            &batch,
+            &schema,
+            &[],
+        )
+        .unwrap();
+        let ColumnData::Float64(values) = &cosine.data else {
+            panic!("expected a float column");
+        };
+        assert!(
+            values[0].abs() < 1e-6,
+            "a row equal to the query is at zero"
+        );
+        assert!(
+            (values[1] - 1.0).abs() < 1e-6,
+            "an orthogonal row is at one"
+        );
+        assert!(
+            values[2] > 0.0 && values[2] < 0.01,
+            "a nearly parallel row is close, got {}",
+            values[2]
+        );
+
+        let l2 = evaluate_function(
+            "vector_distance_l2",
+            &[column_ref, query],
+            &batch,
+            &schema,
+            &[],
+        )
+        .unwrap();
+        let ColumnData::Float64(values) = &l2.data else {
+            panic!("expected a float column");
+        };
+        assert!(values[0].abs() < 1e-6);
+        assert!((values[1] - std::f64::consts::SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn round_floats_half_away_from_zero() {
+        assert_eq!(f64_at0(&call("round", &[lit_float(2.5)]).unwrap()), 3.0);
+        assert_eq!(f64_at0(&call("round", &[lit_float(-2.5)]).unwrap()), -3.0);
+        assert_eq!(f64_at0(&call("round", &[lit_float(2.4)]).unwrap()), 2.0);
+        let two_digits = call("round", &[lit_float(3.14159), lit_int(2)]).unwrap();
+        assert!((f64_at0(&two_digits) - 3.14).abs() < 1e-12);
+        let neg_digits = call("round", &[lit_float(1234.5), lit_int(-2)]).unwrap();
+        assert_eq!(f64_at0(&neg_digits), 1200.0);
+    }
+
+    #[test]
+    fn round_integers_pass_through_and_negative_digits_round_the_integer() {
+        assert_eq!(i64_at0(&call("round", &[lit_int(42)]).unwrap()), 42);
+        assert_eq!(
+            i64_at0(&call("round", &[lit_int(1250), lit_int(-2)]).unwrap()),
+            1300
+        );
+        assert_eq!(
+            i64_at0(&call("round", &[lit_int(-1250), lit_int(-2)]).unwrap()),
+            -1300
+        );
+        assert_eq!(
+            i64_at0(&call("trunc", &[lit_int(1299), lit_int(-2)]).unwrap()),
+            1200
+        );
+    }
+
+    #[test]
+    fn trunc_moves_toward_zero() {
+        assert_eq!(f64_at0(&call("trunc", &[lit_float(2.9)]).unwrap()), 2.0);
+        assert_eq!(f64_at0(&call("trunc", &[lit_float(-2.9)]).unwrap()), -2.0);
+        assert_eq!(f64_at0(&call("truncate", &[lit_float(5.5)]).unwrap()), 5.0);
+    }
+
+    #[test]
+    fn round_null_input_and_null_digits_are_null() {
+        let c = call("round", &[lit_null(TypeId::Float64)]).unwrap();
+        assert!(c.is_null(0));
+        let c = call("round", &[lit_float(1.5), lit_null(TypeId::Int64)]).unwrap();
+        assert!(c.is_null(0));
+    }
+
+    #[test]
+    fn ceil_and_floor() {
+        assert_eq!(f64_at0(&call("ceil", &[lit_float(2.1)]).unwrap()), 3.0);
+        assert_eq!(f64_at0(&call("ceiling", &[lit_float(-2.1)]).unwrap()), -2.0);
+        assert_eq!(f64_at0(&call("floor", &[lit_float(2.9)]).unwrap()), 2.0);
+        assert_eq!(f64_at0(&call("floor", &[lit_float(-2.1)]).unwrap()), -3.0);
+        assert_eq!(i64_at0(&call("ceil", &[lit_int(7)]).unwrap()), 7);
+    }
+
+    #[test]
+    fn trim_strips_spaces_only_by_default() {
+        assert_eq!(str_at0(&call("trim", &[lit_str("  x  ")]).unwrap()), "x");
+        assert_eq!(str_at0(&call("ltrim", &[lit_str("  x  ")]).unwrap()), "x  ");
+        assert_eq!(str_at0(&call("rtrim", &[lit_str("  x  ")]).unwrap()), "  x");
+        assert_eq!(
+            str_at0(&call("trim", &[lit_str("\tx\t")]).unwrap()),
+            "\tx\t"
+        );
+    }
+
+    #[test]
+    fn trim_with_explicit_charset() {
+        assert_eq!(
+            str_at0(&call("trim", &[lit_str("xxaxx"), lit_str("x")]).unwrap()),
+            "a"
+        );
+        assert_eq!(
+            str_at0(&call("ltrim", &[lit_str("xyay"), lit_str("xy")]).unwrap()),
+            "ay"
+        );
+    }
+
+    #[test]
+    fn substring_is_one_based_with_overlap_semantics() {
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(2)]).unwrap()),
+            "ello"
+        );
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(2), lit_int(2)]).unwrap()),
+            "el"
+        );
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(0), lit_int(3)]).unwrap()),
+            "he"
+        );
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(-2), lit_int(4)]).unwrap()),
+            "h"
+        );
+        assert_eq!(
+            str_at0(&call("substr", &[lit_str("h\u{e9}llo"), lit_int(2), lit_int(2)]).unwrap()),
+            "\u{e9}l"
+        );
+        assert!(call("substring", &[lit_str("x"), lit_int(1), lit_int(-1)]).is_err());
+    }
+
+    #[test]
+    fn replace_all_occurrences_and_empty_search_is_identity() {
+        assert_eq!(
+            str_at0(&call("replace", &[lit_str("aaa"), lit_str("a"), lit_str("b")]).unwrap()),
+            "bbb"
+        );
+        assert_eq!(
+            str_at0(&call("replace", &[lit_str("abc"), lit_str(""), lit_str("x")]).unwrap()),
+            "abc"
+        );
+        let c = call(
+            "replace",
+            &[lit_str("abc"), lit_null(TypeId::Text), lit_str("x")],
+        )
+        .unwrap();
+        assert!(c.is_null(0));
+    }
+
+    #[test]
+    fn concat_skips_nulls_and_casts_non_strings() {
+        assert_eq!(
+            str_at0(
+                &call(
+                    "concat",
+                    &[lit_str("a"), lit_null(TypeId::Text), lit_str("b")]
+                )
+                .unwrap()
+            ),
+            "ab"
+        );
+        assert_eq!(
+            str_at0(&call("concat", &[lit_int(1), lit_str("x")]).unwrap()),
+            "1x"
+        );
+    }
+
+    #[test]
+    fn greatest_and_least_ignore_nulls() {
+        assert_eq!(
+            i64_at0(&call("greatest", &[lit_int(1), lit_int(3), lit_int(2)]).unwrap()),
+            3
+        );
+        assert_eq!(
+            i64_at0(&call("least", &[lit_null(TypeId::Int64), lit_int(5), lit_int(3)]).unwrap()),
+            3
+        );
+        let c = call(
+            "greatest",
+            &[lit_null(TypeId::Int64), lit_null(TypeId::Int64)],
+        )
+        .unwrap();
+        assert!(c.is_null(0));
+        assert_eq!(
+            str_at0(&call("greatest", &[lit_str("apple"), lit_str("pear")]).unwrap()),
+            "pear"
+        );
+    }
+
+    #[test]
+    fn length_family_counts_chars_and_octets() {
+        assert_eq!(
+            i64_at0(&call("length", &[lit_str("h\u{e9}llo")]).unwrap()),
+            5
+        );
+        assert_eq!(
+            i64_at0(&call("char_length", &[lit_str("h\u{e9}llo")]).unwrap()),
+            5
+        );
+        assert_eq!(
+            i64_at0(&call("octet_length", &[lit_str("h\u{e9}llo")]).unwrap()),
+            6
+        );
+    }
+
+    #[test]
+    fn current_date_and_time_produce_sane_values() {
+        let d = call("current_date", &[]).unwrap();
+        assert_eq!(d.type_id, TypeId::Date);
+        match d.data.get_scalar(0) {
+            ScalarValue::Int32(days) => assert!(days > 20_000),
+            other => panic!("expected Int32 days, got {other:?}"),
+        }
+        let t = call("current_time", &[]).unwrap();
+        assert_eq!(t.type_id, TypeId::Time);
+        match t.data.get_scalar(0) {
+            ScalarValue::Int64(us) => assert!((0..86_400_000_000).contains(&us)),
+            other => panic!("expected Int64 micros, got {other:?}"),
+        }
     }
 }

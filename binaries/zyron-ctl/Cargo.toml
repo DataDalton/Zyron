@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 zyron-server = { path = "../../crates/zyron-server" }
 zyron-common = { path = "../../crates/zyron-common" }
+zyron-tpc = { path = "../../crates/zyron-tpc" }

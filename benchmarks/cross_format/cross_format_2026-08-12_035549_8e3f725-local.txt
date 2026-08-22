@@ -1,0 +1,182 @@
+# suite:   cross_format
+# run:     2026-08-12_035549_8e3f725-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Point Lookup, With And Without An Index ===
+  Rows on each format: 100000
+  Point lookup without an index [heap]:
+    Runs: [2,721us, 2,614us, 2,507us, 2,494us, 2,600us]
+    Average: 2,587us (no target set)
+    Min/Max: 2,494us / 2,721us, StdDev: 82.3377us
+  Point lookup without an index [lake]:
+    Runs: [566.5000us, 437.3000us, 343.1000us, 392.6000us, 303.3000us]
+    Average: 408.5600us (no target set)
+    Min/Max: 303.3000us / 566.5000us, StdDev: 90.9840us
+  Point lookup without an index [lake / heap]: 0.158 (no bound set), from 408.5600 and 2,587
+  Point lookup with an index [heap]:
+    Runs: [303.2000us, 182.2000us, 125.5000us, 96.9000us, 95us]
+    Average: 160.5600us (no target set)
+    Min/Max: 95us / 303.2000us, StdDev: 77.9671us
+  Point lookup with an index [lake]:
+    Runs: [11,919us, 1,076us, 991.3000us, 832us, 864us]
+    Average: 3,137us (no target set)
+    Min/Max: 832us / 11,919us, StdDev: 4,392us
+  Point lookup with an index [lake / heap]: 19.535 (no bound set), from 3,137 and 160.5600
+  Index speedup on point lookup [lake / heap]: 0.008 (no bound set), from 0.1303 and 16.1136
+
+=== Join ===
+  Rows on each format: 100000
+  Join [heap]:
+    Runs: [5,249us, 5,284us, 5,334us, 5,328us, 5,397us]
+    Average: 5,318us (no target set)
+    Min/Max: 5,249us / 5,397us, StdDev: 49.9876us
+  Join [lake]:
+    Runs: [2,933us, 3,017us, 3,248us, 2,892us, 3,181us]
+    Average: 3,054us (no target set)
+    Min/Max: 2,892us / 3,248us, StdDev: 138.6385us
+  Join [lake / heap]: 0.574 (no bound set), from 3,054 and 5,318
+  Bytes read [heap]:
+    Runs: [14,516,224 bytes]
+    Average: 14,516,224 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [655,360 bytes]
+    Average: 655,360 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.045 (bound <= 1), from 655,360 and 14,516,224
+  mixed join us [heap joined to lake, no counterpart to compare]: 4259
+
+=== Aggregate ===
+  Rows on each format: 100000
+  Aggregate over one column [heap]:
+    Runs: [2,321us, 2,254us, 2,386us, 2,191us, 2,494us]
+    Average: 2,329us (no target set)
+    Min/Max: 2,191us / 2,494us, StdDev: 104.8709us
+  Aggregate over one column [lake]:
+    Runs: [1,299us, 1,307us, 1,331us, 1,328us, 1,352us]
+    Average: 1,324us (no target set)
+    Min/Max: 1,299us / 1,352us, StdDev: 18.8513us
+  Aggregate over one column [lake / heap]: 0.568 (no bound set), from 1,324 and 2,329
+  Bytes read [heap]:
+    Runs: [7,258,112 bytes]
+    Average: 7,258,112 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [491,520 bytes]
+    Average: 491,520 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.068 (bound <= 1), from 491,520 and 7,258,112
+
+=== Point Lookup, Full Row ===
+  Rows on each format: 100000
+  Point lookup, full row [heap]:
+    Runs: [4,656us, 4,328us, 4,467us, 4,578us, 4,612us]
+    Average: 4,528us (no target set)
+    Min/Max: 4,328us / 4,656us, StdDev: 117.9385us
+  Point lookup, full row [lake]:
+    Runs: [766.7000us, 608.4000us, 647.8000us, 562.7000us, 706.2000us]
+    Average: 658.3600us (no target set)
+    Min/Max: 562.7000us / 766.7000us, StdDev: 71.8117us
+  Point lookup, full row [lake / heap]: 0.145 (no bound set), from 658.3600 and 4,528
+  Bytes read [heap]:
+    Runs: [7,258,112 bytes]
+    Average: 7,258,112 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [212,992 bytes]
+    Average: 212,992 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.029 (bound <= 1), from 212,992 and 7,258,112
+
+=== Trickle Load To Queryable ===
+trickle_load: 20000 rows on both formats, 100 per statement
+  Trickle load to queryable [heap]:
+    Runs: [46,307us]
+    Average: 46,307us (no target set)
+  Trickle load to queryable [lake]:
+    Runs: [1,295,697us]
+    Average: 1,295,697us (no target set)
+  Trickle load to queryable [lake / heap]: 27.981 (no bound set), from 1,295,697 and 46,307
+
+=== Bulk Load To Queryable ===
+  Rows on each format: 100000
+  Bulk load to queryable [heap]:
+    Runs: [86,825us]
+    Average: 86,825us (no target set)
+  Bulk load to queryable [lake]:
+    Runs: [931,611us]
+    Average: 931,611us (no target set)
+  Bulk load to queryable [lake / heap]: 10.730 (no bound set), from 931,611 and 86,825
+
+=== Point Lookup, Narrow Projection ===
+  Rows on each format: 100000
+  Point lookup, narrow projection [heap]:
+    Runs: [2,474us, 2,501us, 2,686us, 2,374us, 2,411us]
+    Average: 2,489us (no target set)
+    Min/Max: 2,374us / 2,686us, StdDev: 108.1063us
+  Point lookup, narrow projection [lake]:
+    Runs: [317.3000us, 308.6000us, 306.1000us, 235us, 401.5000us]
+    Average: 313.7000us (no target set)
+    Min/Max: 235us / 401.5000us, StdDev: 52.9136us
+  Point lookup, narrow projection [lake / heap]: 0.126 (no bound set), from 313.7000 and 2,489
+  Bytes read [heap]:
+    Runs: [7,258,112 bytes]
+    Average: 7,258,112 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [81,920 bytes]
+    Average: 81,920 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.011 (bound <= 1), from 81,920 and 7,258,112
+
+=== Point Update ===
+  Rows on each format: 100000
+  Point update [heap]:
+    Runs: [4,684us, 4,789us, 4,480us, 4,544us, 4,260us]
+    Average: 4,551us (no target set)
+    Min/Max: 4,260us / 4,789us, StdDev: 181.1831us
+  Point update [lake]:
+    Runs: [2,763us, 2,444us, 2,454us, 2,312us, 2,824us]
+    Average: 2,559us (no target set)
+    Min/Max: 2,312us / 2,824us, StdDev: 198.5682us
+  Point update [lake / heap]: 0.562 (no bound set), from 2,559 and 4,551
+
+=== Range Scan ===
+  Rows on each format: 100000
+  Range scan, selective [heap]:
+    Runs: [2,420us, 2,469us, 2,426us, 2,230us, 2,281us]
+    Average: 2,365us (no target set)
+    Min/Max: 2,230us / 2,469us, StdDev: 92.4150us
+  Range scan, selective [lake]:
+    Runs: [1,406us, 1,427us, 1,450us, 1,319us, 1,297us]
+    Average: 1,380us (no target set)
+    Min/Max: 1,297us / 1,450us, StdDev: 60.6310us
+  Range scan, selective [lake / heap]: 0.583 (no bound set), from 1,380 and 2,365
+  Bytes read [heap]:
+    Runs: [7,258,112 bytes]
+    Average: 7,258,112 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [327,680 bytes]
+    Average: 327,680 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.045 (bound <= 1), from 327,680 and 7,258,112
+  Range scan, wide [heap]:
+    Runs: [2,420us, 2,710us, 2,332us, 2,342us, 2,434us]
+    Average: 2,448us (no target set)
+    Min/Max: 2,332us / 2,710us, StdDev: 137.1557us
+  Range scan, wide [lake]:
+    Runs: [1,720us, 1,557us, 1,773us, 1,632us, 1,792us]
+    Average: 1,695us (no target set)
+    Min/Max: 1,557us / 1,792us, StdDev: 88.4245us
+  Range scan, wide [lake / heap]: 0.692 (no bound set), from 1,695 and 2,448
+  Bytes read [heap]:
+    Runs: [7,258,112 bytes]
+    Average: 7,258,112 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [983,040 bytes]
+    Average: 983,040 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.135 (bound <= 1), from 983,040 and 7,258,112
+
+=== Bulk Delete ===
+  Rows on each format: 100000
+  Bulk delete [heap]:
+    Runs: [5,637us]
+    Average: 5,637us (no target set)
+  Bulk delete [lake]:
+    Runs: [2,492us]
+    Average: 2,492us (no target set)
+  Bulk delete [lake / heap]: 0.442 (no bound set), from 2,492 and 5,637

@@ -1,0 +1,126 @@
+# suite:   lake
+# run:     2026-08-17_022956_b64ac2a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Clustering Pass Skip-Rate Gain ===
+  skip rate after a bucket-ordered pass [PASS]: 0.8750 (bound >= 0.5000)
+  Inputs: 8 files, 32768 rows
+  Outputs: 8 files
+  Skip rate: 0.0000 -> 0.8750
+  Cluster pass:
+    Runs: [38,294us]
+    Average: 38,294us (no target set)
+  Rows rewritten:
+    Runs: [855,684 rows/s]
+    Average: 855,684 rows/s (no target set)
+
+=== Refused Clustering Pass Is Inert ===
+  Candidate: order by bucket, on files already ordered by bucket
+  Expected: refused, since it cannot improve the skip rate
+  Gate decision [PASS]: refused, BelowThreshold { delta: 0.0, required: 0.05 }
+  Active file set [PASS]: unchanged, 4 files, log still at version 5
+
+=== Transaction Log Under Concurrency ===
+  Writers: 8
+  Commits: 160
+  Retries: 113 (0.7063 per commit)
+  Commit rate:
+    Runs: [1,048 commits/s]
+    Average: 1,048 commits/s (no target set)
+  Retries:
+    Runs: [0.7063 per commit]
+    Average: 0.7063 per commit (no target set)
+
+=== Data File Scan Throughput ===
+  Rows per data file: 16384
+  Scan throughput:
+    Runs: [1,092,266,667 rows/s, 1,114,557,823 rows/s, 1,145,734,266 rows/s, 1,129,931,034 rows/s, 1,137,777,778 rows/s]
+    Average: 1,124,053,514 rows/s (no target set)
+    Min/Max: 1,092,266,667 rows/s / 1,145,734,266 rows/s, StdDev: 18,939,522 rows/s
+
+=== File Pruning Effectiveness ===
+  Files in manifest: 100000
+  point predicate files pruned (fraction) [PASS]: 1.0000 (bound >= 0.9999)
+  strided predicate files pruned (fraction) [PASS]: 0.9375 (bound >= 0.9300)
+
+=== Log Head and Manifest Resolution ===
+  Head read:
+    Runs: [0.1850ns, 0.1860ns, 0.1850ns, 0.1850ns, 0.1860ns]
+    Average: 0.1854ns (no target set)
+    Min/Max: 0.1850ns / 0.1860ns, StdDev: 0.0005ns
+  Latest manifest (cached):
+    Runs: [42ns, 41.4000ns, 41.4000ns, 41.4000ns, 41.4000ns]
+    Average: 41.5200ns (no target set)
+    Min/Max: 41.4000ns / 42ns, StdDev: 0.2400ns
+  Prune index build (cold):
+    Runs: [23.9000us]
+    Average: 23.9000us (no target set)
+  Prune index at version (cached):
+    Runs: [43.5000ns, 42ns, 42ns, 42ns, 42ns]
+    Average: 42.3000ns (no target set)
+    Min/Max: 42ns / 43.5000ns, StdDev: 0.6000ns
+
+=== Prune Index Sweep vs Exact Answer ===
+  Files in manifest: 100000
+  Prune index build:
+    Runs: [10,181us, 10,364us, 9,219us, 11,639us, 9,994us]
+    Average: 10,279us (no target set)
+    Min/Max: 9,219us / 11,639us, StdDev: 783.8576us
+  point sweep over 100000 files:
+    Runs: [49.3000us, 22us, 21.5000us, 21.6000us, 21.5000us]
+    Average: 27.1800us (no target set)
+    Min/Max: 21.5000us / 49.3000us, StdDev: 11.0615us
+  range sweep over 100000 files:
+    Runs: [29us, 16.1000us, 15.9000us, 16us, 15.8000us]
+    Average: 18.5600us (no target set)
+    Min/Max: 15.8000us / 29us, StdDev: 5.2210us
+  strided sweep over 100000 files:
+    Runs: [41.1000us, 19.6000us, 19.4000us, 19.4000us, 19.5000us]
+    Average: 23.8000us (no target set)
+    Min/Max: 19.4000us / 41.1000us, StdDev: 8.6503us
+
+=== Secondary Index Probe ===
+  Rows: 65536, data files: 8, index files: 8
+  Probe: index files opened 1 of 8, entries examined 8, rows addressed 8
+  index files opened per point probe [PASS]: 1 (bound <= 1)
+  Point probe through the index:
+    Runs: [47.6000us, 33.6000us, 30.1000us, 28.7000us, 28.9000us]
+    Average: 33.7800us (no target set)
+    Min/Max: 28.7000us / 47.6000us, StdDev: 7.1300us
+  Point lookup by scanning:
+    Runs: [549.7000us, 397.7000us, 384.9000us, 396.5000us, 388.8000us]
+    Average: 423.5200us (no target set)
+    Min/Max: 384.9000us / 549.7000us, StdDev: 63.2695us
+  Range probe: index files opened 1 of 8, rows addressed 512
+  Range probe through the index:
+    Runs: [108.8000us, 76.3000us, 64.3000us, 66.8000us, 57.8000us]
+    Average: 74.8000us (no target set)
+    Min/Max: 57.8000us / 108.8000us, StdDev: 18.0083us
+
+=== Unique Check On Insert ===
+  Rows: 65536, files: 8
+  clustered: files opened 1, decoded 1, bisected 1, rows compared 1
+  Unique check, clustered:
+    Runs: [44.3000us, 32.6000us, 31.7000us, 29.9000us, 30.7000us]
+    Average: 33.8400us (no target set)
+    Min/Max: 29.9000us / 44.3000us, StdDev: 5.3087us
+  unclustered: files opened 1, decoded 1, bisected 0, rows compared 46
+  Unique check, unclustered:
+    Runs: [48.1000us, 40.7000us, 38.7000us, 38.8000us, 39us]
+    Average: 41.0600us (no target set)
+    Min/Max: 38.7000us / 48.1000us, StdDev: 3.5948us
+  rows compared per probed key (clustered) [PASS]: 0.0625 (bound <= 8)
+
+=== Zone Map Row Rejection ===
+  zone map rows rejected (fraction) [PASS]: 1 (bound >= 1)
+  Zone map rejection:
+    Runs: [3.9000us, 2.7000us, 2.6000us, 2.1000us, 2.3000us]
+    Average: 2.7200us (no target set)
+    Min/Max: 2.1000us / 3.9000us, StdDev: 0.6274us
+  Full column decode:
+    Runs: [41.1000us, 25.9000us, 25.2000us, 24.8000us, 24.9000us]
+    Average: 28.3800us (no target set)
+    Min/Max: 24.8000us / 41.1000us, StdDev: 6.3716us

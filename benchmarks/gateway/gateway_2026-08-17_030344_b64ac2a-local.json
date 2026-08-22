@@ -1,0 +1,96 @@
+{
+  "id": "2026-08-17_030344_b64ac2a-local",
+  "date": "2026-08-17 03:03:48Z",
+  "ts": 1786935828,
+  "commit": "b64ac2a-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Param Substitution": {
+      "3-param template substitution (ops/sec)": {
+        "average": 4872123.689372,
+        "runs": [4847530.62, 4846360.67, 4887824.43, 4896080.69, 4882822.04],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Middleware Pipeline": {
+      "run_pipeline throughput (ops/sec)": {
+        "average": 54866772.604595,
+        "runs": [54620930.74, 54960153.89, 55078211.06, 54641822.85, 55032744.48],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "OpenAPI Emission": {
+      "emit_openapi_json(50) per emission (ms)": {
+        "average": 0.012385,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Path Param Extraction": {
+      "CompiledRoute.match_path throughput (ops/sec)": {
+        "average": 8651544.500798,
+        "runs": [8630734.04, 8654726.61, 8701940.27, 8615550.03, 8654771.55],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Router Lookup": {
+      "Router.lookup throughput (ops/sec)": {
+        "average": 8916631.255848,
+        "runs": [8806638.80, 8932575.14, 8944791.85, 9026256.48, 8872894.02],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "SSE Emission": {
+      "encode_event+sink.extend (events/sec)": {
+        "average": 31506102.496055,
+        "runs": [31617254.17, 31701448.44, 31165366.55, 31313507.71, 31732935.61],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "WebSocket Text": {
+      "100-byte text frame roundtrip (ops/sec)": {
+        "average": 149482897.743458,
+        "runs": [152339167.92, 145469356.88, 156318389.30, 150770436.93, 142517137.69],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "WebSocket Binary": {
+      "1 KB binary frame roundtrip (ops/sec)": {
+        "average": 35680062.056970,
+        "runs": [35619131.75, 35645794.87, 35604167.11, 35802128.79, 35729087.76],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "WebSocket Ping": {
+      "Ping+Pong frame roundtrip (ops/sec)": {
+        "average": 409208760.101420,
+        "runs": [408638620.44, 408496732.03, 410660753.15, 409525564.63, 408722130.26],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

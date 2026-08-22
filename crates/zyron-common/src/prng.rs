@@ -30,7 +30,9 @@ impl Xoshiro256pp {
         let s1 = splitMix64(&mut sm);
         let s2 = splitMix64(&mut sm);
         let s3 = splitMix64(&mut sm);
-        let mut g = Self { s: [s0, s1, s2, s3] };
+        let mut g = Self {
+            s: [s0, s1, s2, s3],
+        };
         if g.s == [0, 0, 0, 0] {
             g.s[0] = 1;
         }

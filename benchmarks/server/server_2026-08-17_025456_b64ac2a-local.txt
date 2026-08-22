@@ -1,0 +1,287 @@
+# suite:   server
+# run:     2026-08-17_025456_b64ac2a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Server Startup Test ===
+Validation runs: 5
+
+--- Run 1/5 ---
+  Cold start: 39.99 ms
+  Warm start: 39.14 ms
+
+--- Run 2/5 ---
+  Cold start: 21.07 ms
+  Warm start: 38.68 ms
+
+--- Run 3/5 ---
+  Cold start: 24.36 ms
+  Warm start: 42.37 ms
+
+--- Run 4/5 ---
+  Cold start: 23.24 ms
+  Warm start: 34.20 ms
+
+--- Run 5/5 ---
+  Cold start: 26.21 ms
+  Warm start: 33.41 ms
+
+=== Server Startup Validation ===
+  Cold start latency (ms) [PASS/OK]:
+    Runs: [40, 21, 24, 23, 26]
+    Average: 27 <= 500 (target)
+    Min/Max: 21 / 40, StdDev: 7
+  Warm start latency (ms) [PASS/OK]:
+    Runs: [39, 39, 42, 34, 33]
+    Average: 38 <= 100 (target)
+    Min/Max: 33 / 42, StdDev: 3
+
+=== Configuration Test ===
+  Default config: PASS
+  TOML parsing: PASS
+  Integer size values: PASS
+  Env override: PASS
+  Config mapping: PASS
+
+  All configuration tests: PASS
+
+=== Concurrent Connections Test ===
+  Registered 100 sessions in 45.20µs
+  101st connection rejected: PASS
+  Close-and-reopen: PASS
+  100K registrations in 90.47ms (1,105,328 ops/sec)
+  Max connections capacity [PASS]: 100,000 >= 100,000 (target)
+
+  All concurrent connections tests: PASS
+
+=== Session Timeout Test ===
+  Fresh session not idle: PASS
+  Session detected as idle after timeout: PASS
+  Touch resets idle timer: PASS
+  Active session not reaped: PASS
+
+  All session timeout tests: PASS
+
+=== Transaction Isolation Test ===
+  Snapshot isolation: txn2 sees txn1 as active: PASS
+  New snapshot after commit: txn1 no longer active: PASS
+  Savepoint rollback: PASS
+  Savepoint release: PASS
+  Deadlock detection: 2-way cycle detected, victim=Some(2): PASS
+  Deadlock detection: 3-way cycle, victim=Some(30): PASS
+
+  All transaction isolation tests: PASS
+
+=== Checkpoint Test ===
+
+--- Run 1/5 ---
+  Wrote 10000 WAL records
+  Checkpoint: lsn=1/1840152, segments_deleted=0, wait=684.00µs, total=0.75 ms
+
+--- Run 2/5 ---
+  Wrote 10000 WAL records
+  Checkpoint: lsn=1/1840152, segments_deleted=0, wait=795.60µs, total=0.86 ms
+
+--- Run 3/5 ---
+  Wrote 10000 WAL records
+  Checkpoint: lsn=1/1840152, segments_deleted=0, wait=651.10µs, total=0.70 ms
+
+--- Run 4/5 ---
+  Wrote 10000 WAL records
+  Checkpoint: lsn=1/1840152, segments_deleted=0, wait=658.60µs, total=0.71 ms
+
+--- Run 5/5 ---
+  Wrote 10000 WAL records
+  Checkpoint: lsn=1/1840152, segments_deleted=0, wait=371.70µs, total=0.42 ms
+
+=== Checkpoint Validation ===
+  Checkpoint latency (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 0]
+    Average: 1 <= 3 (target)
+    Min/Max: 0 / 1, StdDev: 0
+
+=== Graceful Shutdown Test ===
+
+--- Run 1/5 ---
+  Shutdown (final checkpoint): 0.77 ms
+
+--- Run 2/5 ---
+  Shutdown (final checkpoint): 0.67 ms
+
+--- Run 3/5 ---
+  Shutdown (final checkpoint): 0.79 ms
+
+--- Run 4/5 ---
+  Shutdown (final checkpoint): 0.49 ms
+
+--- Run 5/5 ---
+  Shutdown (final checkpoint): 0.40 ms
+
+=== Graceful Shutdown Validation ===
+  Shutdown latency (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 0, 0]
+    Average: 1 <= 1,000 (target)
+    Min/Max: 0 / 1, StdDev: 0
+
+=== Crash Recovery Test ===
+
+--- Run 1/5 ---
+  1MB WAL recovery: 5.84 ms (5000 redo records, 0 undo txns)
+  Clean recovery: 0.52 ms (0 redo records)
+
+--- Run 2/5 ---
+  1MB WAL recovery: 5.64 ms (5000 redo records, 0 undo txns)
+  Clean recovery: 0.50 ms (0 redo records)
+
+--- Run 3/5 ---
+  1MB WAL recovery: 6.38 ms (5000 redo records, 0 undo txns)
+  Clean recovery: 0.61 ms (0 redo records)
+
+--- Run 4/5 ---
+  1MB WAL recovery: 4.59 ms (5000 redo records, 0 undo txns)
+  Clean recovery: 0.51 ms (0 redo records)
+
+--- Run 5/5 ---
+  1MB WAL recovery: 5.30 ms (5000 redo records, 0 undo txns)
+  Clean recovery: 0.47 ms (0 redo records)
+
+=== Crash Recovery Validation ===
+  1MB WAL recovery latency (ms) [PASS/OK]:
+    Runs: [6, 6, 6, 5, 5]
+    Average: 6 <= 10 (target)
+    Min/Max: 5 / 6, StdDev: 1
+  Clean recovery latency (ms) [PASS/OK]:
+    Runs: [1, 0, 1, 1, 0]
+    Average: 1 <= 100 (target)
+    Min/Max: 0 / 1, StdDev: 0
+
+=== Adaptive Checkpoint Scaling Test ===
+  WAL bytes threshold: 1048576 bytes
+  Default config: 64MB threshold, 600s max, 5s min: PASS
+  min < max interval: PASS
+  WAL bytes written: 1420000 (1.35 MB)
+  WAL bytes trigger: PASS (1420000B >= 1048576B threshold)
+
+  All adaptive checkpoint tests: PASS
+
+=== Metrics Test ===
+  Prometheus format validation: PASS
+  Output size: 5711 bytes
+
+=== Metrics Scrape Validation ===
+  Metrics scrape latency (us) [PASS/OK]:
+    Runs: [52, 8, 7, 5, 5]
+    Average: 16 <= 1,000 (target)
+    Min/Max: 5 / 52, StdDev: 18
+
+=== Health Check Test ===
+  Pre-startup: startup=false, accepting=false: PASS
+  Post-startup: startup=true: PASS
+  Accepting: ready=true: PASS
+  /health/live: 200 OK: PASS
+  /health/ready: 200 OK: PASS
+  /health/startup: 200 OK: PASS
+  /metrics: 200 OK with Prometheus format: PASS
+  /unknown: 404: PASS
+
+=== Health Check Validation ===
+  Health check latency (us) [FAIL/REGR!]:
+    Runs: [527, 15,884, 158, 110, 99]
+    Average: 3,356 <= 100 (target)
+    Min/Max: 99 / 15,884, StdDev: 6,266
+  Health endpoint round-trip (us) [PASS]: 3,356 <= 10,000 (target)
+
+=== Background Workers Test ===
+  Vacuum worker config: interval=60s: PASS
+  Stats collector config: interval=600s, sample_pages=30: PASS
+  WAL archiver config: retention=50, interval=15s: PASS
+  Checkpoint worker: 64MB threshold, 600s max, 5s min: PASS
+
+  All background worker tests: PASS
+
+=== End-to-End Wire Protocol Test ===
+  Server listening on 127.0.0.1:62358
+
+--- Run 1/5 ---
+  100 handshakes (100 success) in 33.81ms, avg 338.1 us
+
+--- Run 2/5 ---
+  100 handshakes (100 success) in 25.06ms, avg 250.6 us
+
+--- Run 3/5 ---
+  100 handshakes (100 success) in 11.65ms, avg 116.5 us
+
+--- Run 4/5 ---
+  100 handshakes (100 success) in 81.44ms, avg 814.4 us
+
+--- Run 5/5 ---
+  100 handshakes (100 success) in 30.44ms, avg 304.4 us
+
+=== End-to-End Wire Validation ===
+  Handshake latency (us) [PASS/OK]:
+    Runs: [338, 251, 116, 814, 304]
+    Average: 365 <= 500 (target)
+    Min/Max: 116 / 814, StdDev: 237
+
+=== Memory Baseline Test ===
+  SessionManager struct: 72 bytes
+  Registered 1000 sessions
+  ZyronConfig struct: 896 bytes
+  MetricsRegistry struct: 128 bytes
+  HealthState struct: 88 bytes
+  Total core struct overhead: 1184 bytes
+  Core struct overhead (bytes) [PASS]: 1,184 <= 10,000,000 (target)
+
+  Memory baseline: PASS
+
+=== DDL Roundtrip Test ===
+  7 DDL roundtrip operations verified
+  PASS
+
+
+=== Auth Roundtrip Test ===
+  8 auth roundtrip operations verified
+  PASS
+
+
+=== Session Features Test ===
+  14 session feature operations verified
+  PASS
+
+
+=== Stat View Completeness Test ===
+  8 stat views queried without error
+  PASS
+
+
+=== Subsystem DDL Coverage Test ===
+  subsystem DDL operations verified
+  PASS
+
+
+=== CDC DDL Roundtrip Test ===
+  9 CDC roundtrip operations verified
+  PASS
+
+
+=== Trigger and Function DDL Test ===
+  trigger/function DDL operations verified
+  PASS
+
+
+=== Pipeline and Schedule DDL Test ===
+  6 pipeline/schedule DDL operations verified
+  PASS
+
+
+=== Versioning DDL Test ===
+  4 versioning DDL operations verified
+  PASS
+
+
+=== Full Integration Smoke Test ===
+  39 smoke test operations verified
+  PASS
+

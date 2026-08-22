@@ -6,7 +6,9 @@
 //!
 //! Based on ALP (SIGMOD 2024), adapted for Zyron's columnar format.
 
-use crate::encoding::{Encoding, EncodingType, Predicate, eval_predicate_on_raw};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, bitmask_from_rows, eval_predicate_on_raw,
+};
 use zyron_common::{Result, ZyronError};
 
 pub struct AlpEncoding;
@@ -14,17 +16,128 @@ pub struct AlpEncoding;
 /// Maximum number of exceptions before falling back to raw encoding.
 const MAX_EXCEPTION_RATIO: f64 = 0.1;
 
+/// Delta encoding applied to the integer array.
+const FLAG_DELTA: u8 = 0x01;
+/// Periodic restart values ahead of the packed array, letting a range decode of
+/// the delta stream seed at the nearest boundary instead of replaying the whole
+/// prefix.
+const FLAG_RESTART: u8 = 0x02;
+
+/// Restart spacing floor, matching the columnar zone map batch size so every
+/// restart point lands on a zone boundary.
+const RESTART_MIN_SHIFT: u32 = 10;
+
 /// Encoded format:
 ///   [0..8]    factor: f64 (multiply floats by this to get integers)
 ///   [8..12]   exponent: i32 (power of 10 used for factor)
 ///   [12..16]  exception_count: u32
 ///   [16]      int_bit_width: u8 (bits per integer in main array)
 ///   [17]      value_size_marker: u8 (4 = f32, 8 = f64)
-///   [18]      flags: u8 (bit 0 = delta encoding applied)
-///   [19]      reserved: u8
+///   [18]      flags: u8 (FLAG_DELTA / FLAG_RESTART)
+///   [19]      restart shift when FLAG_RESTART is set
 ///   [20..28]  base: i64 (FoR base for unsigned shift)
-///   [28..28+packed_main_size]  bit-packed integer array (delta+FoR if flag set)
-///   [28+packed_main_size..]    exceptions: (row_index: u32 + original_value: value_size) per exception
+///   [28..36]  delta seed: i64, present only when FLAG_DELTA is set. The
+///             running sum starts here, so every packed entry is a delta and
+///             none of them carries an absolute value that would widen the
+///             whole array
+///   after it  restart table when FLAG_RESTART is set, then the bit-packed
+///             integer array (delta+FoR if the delta flag is set)
+///   after it  exceptions: (row_index: u32 + original_value: value_size) per exception
+
+/// Number of restart boundaries for a row count and spacing. Boundary k covers
+/// row `k << shift` counted from 1.
+#[inline]
+fn restart_count(row_count: usize, shift: u32) -> usize {
+    if row_count == 0 || shift >= usize::BITS {
+        0
+    } else {
+        (row_count - 1) >> shift
+    }
+}
+
+/// Widens the restart spacing until the table costs at most a thirty-second of
+/// the packed array, keeping the spacing a power-of-two multiple of the floor.
+fn choose_restart_shift(row_count: usize, packed_bytes: usize) -> u32 {
+    let budget = (packed_bytes / 32).max(8);
+    let mut shift = RESTART_MIN_SHIFT;
+    while shift < 31 && restart_count(row_count, shift) * 8 > budget {
+        shift += 1;
+    }
+    shift
+}
+
+/// Byte offset of the delta seed, which sits directly after the fixed header.
+#[inline]
+fn seed_offset() -> usize {
+    28
+}
+
+/// Byte offset of the restart table, past the seed when there is one.
+#[inline]
+fn restart_table_offset(encoded: &[u8]) -> usize {
+    if encoded[18] & FLAG_DELTA == 0 {
+        28
+    } else {
+        36
+    }
+}
+
+/// The delta seed, or zero when the column is not delta encoded.
+#[inline]
+fn delta_seed(encoded: &[u8]) -> i64 {
+    if encoded[18] & FLAG_DELTA == 0 || encoded.len() < 36 {
+        return 0;
+    }
+    let at = seed_offset();
+    i64::from_le_bytes([
+        encoded[at],
+        encoded[at + 1],
+        encoded[at + 2],
+        encoded[at + 3],
+        encoded[at + 4],
+        encoded[at + 5],
+        encoded[at + 6],
+        encoded[at + 7],
+    ])
+}
+
+/// Byte offset of the packed integer array, past the seed and restart table.
+#[inline]
+fn packed_offset(encoded: &[u8], row_count: usize) -> usize {
+    let base = restart_table_offset(encoded);
+    if encoded[18] & FLAG_RESTART == 0 {
+        return base;
+    }
+    base + restart_count(row_count, encoded[19] as u32) * 8
+}
+
+/// Reads the restart entry covering `start`, returning the seeded running sum
+/// and the row decoding resumes at. Falls back to the head of the stream when
+/// the range starts before the first boundary or the table is absent.
+fn seed_restart(table: &[u8], shift: u32, start: usize, seed: i64) -> (i64, usize) {
+    if table.is_empty() || shift >= usize::BITS {
+        return (seed, 0);
+    }
+    let k = start >> shift;
+    if k == 0 {
+        return (seed, 0);
+    }
+    let at = (k - 1) * 8;
+    if at + 8 > table.len() {
+        return (seed, 0);
+    }
+    let value = i64::from_le_bytes([
+        table[at],
+        table[at + 1],
+        table[at + 2],
+        table[at + 3],
+        table[at + 4],
+        table[at + 5],
+        table[at + 6],
+        table[at + 7],
+    ]);
+    (value, k << shift)
+}
 impl Encoding for AlpEncoding {
     fn encoding_type(&self) -> EncodingType {
         EncodingType::Alp
@@ -119,10 +232,17 @@ impl Encoding for AlpEncoding {
 
         // Apply delta encoding if beneficial (reduces bit width for sequential data)
         let mut workingIntegers = integers.clone();
+        // The seed carries row zero, so every packed entry is a delta. Leaving
+        // row zero as an absolute value would set the bit width for the whole
+        // array from one element, which costs an ascending column more than an
+        // order of magnitude in both size and decode speed
+        let mut deltaSeed: i64 = 0;
         if useDelta {
             for i in (1..workingIntegers.len()).rev() {
                 workingIntegers[i] = workingIntegers[i].wrapping_sub(workingIntegers[i - 1]);
             }
+            deltaSeed = workingIntegers[0];
+            workingIntegers[0] = 0;
         }
 
         // Determine bit width for integer array
@@ -154,12 +274,25 @@ impl Encoding for AlpEncoding {
             );
         }
 
+        // Restart values for the cumulative delta stream. The running sum after
+        // row i is the undifferenced integer at row i, so the entry for
+        // boundary k is the integer at the row before it
+        let restartShift = choose_restart_shift(row_count, packedBytes);
+        let restarts = if useDelta {
+            restart_count(row_count, restartShift)
+        } else {
+            0
+        };
+
         // Build output
         let exceptionEntrySize = 4 + value_size; // row_index + original_value
-        let totalSize = 28 + packedBytes + exceptions.len() * exceptionEntrySize;
+        let totalSize = 28 + restarts * 8 + packedBytes + exceptions.len() * exceptionEntrySize;
         let mut out = Vec::with_capacity(totalSize);
 
-        let flags: u8 = if useDelta { 0x01 } else { 0x00 };
+        let mut flags: u8 = if useDelta { FLAG_DELTA } else { 0x00 };
+        if restarts > 0 {
+            flags |= FLAG_RESTART;
+        }
 
         out.extend_from_slice(&factor.to_le_bytes()); // [0..8]
         out.extend_from_slice(&exponent.to_le_bytes()); // [8..12]
@@ -167,8 +300,14 @@ impl Encoding for AlpEncoding {
         out.push(intBitWidth); // [16]
         out.push(value_size as u8); // [17]
         out.push(flags); // [18]
-        out.push(0u8); // [19] reserved
+        out.push(restartShift as u8); // [19] restart spacing
         out.extend_from_slice(&base.to_le_bytes()); // [20..28] base for unsigned shift
+        if useDelta {
+            out.extend_from_slice(&deltaSeed.to_le_bytes()); // [28..36] delta seed
+        }
+        for k in 1..=restarts {
+            out.extend_from_slice(&integers[(k << restartShift) - 1].to_le_bytes());
+        }
         out.extend_from_slice(&packedMain); // packed integers
 
         // Exceptions
@@ -181,6 +320,139 @@ impl Encoding for AlpEncoding {
             }
         }
 
+        Ok(out)
+    }
+
+    /// Non-delta ALP addresses a row directly: the main array packs every
+    /// integer to the same width, so row i is at bit offset
+    /// `i * int_bit_width`, and the exception list carries its own row
+    /// indices so only the ones inside the range are applied.
+    ///
+    /// Delta ALP is cumulative, row i being defined against row i-1, so it
+    /// seeds its running sum from the restart value at or before `start` and
+    /// replays at most one restart spacing rather than the whole prefix.
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let take_default = |this: &Self| -> Result<Vec<u8>> {
+            let decoded = this.decode(encoded, row_count, value_size)?;
+            crate::encoding::slice_decoded(&decoded, row_count, value_size, start, end)
+        };
+        if encoded.len() < 28 {
+            return take_default(self);
+        }
+        let factor = f64::from_le_bytes([
+            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
+            encoded[7],
+        ]);
+        let int_bit_width = encoded[16];
+        let stored_value_size = encoded[17] as usize;
+        let flags = encoded[18];
+        // A raw fallback carries no packed array
+        if factor == 0.0 || stored_value_size != value_size {
+            return take_default(self);
+        }
+        if int_bit_width == 0 || int_bit_width > 64 {
+            return take_default(self);
+        }
+        let exception_count =
+            u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]]) as usize;
+        let base = i64::from_le_bytes([
+            encoded[20],
+            encoded[21],
+            encoded[22],
+            encoded[23],
+            encoded[24],
+            encoded[25],
+            encoded[26],
+            encoded[27],
+        ]);
+        let packed_start = packed_offset(encoded, row_count);
+        let packed_bytes = ((row_count as u64 * int_bit_width as u64) as usize).div_ceil(8);
+        let packed_end = packed_start + packed_bytes;
+        if encoded.len() < packed_end {
+            return take_default(self);
+        }
+        let packed = &encoded[packed_start..packed_end];
+        let mask: u64 = if int_bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << int_bit_width) - 1
+        };
+        let inv_factor = 1.0 / factor;
+        let taken = end - start;
+        let mut out = vec![0u8; taken * value_size];
+        let write_value = |out: &mut [u8], slot: usize, int_val: i64| {
+            let value = int_val as f64 * inv_factor;
+            let at = &mut out[slot * value_size..(slot + 1) * value_size];
+            if value_size == 4 {
+                at.copy_from_slice(&(value as f32).to_le_bytes());
+            } else {
+                at.copy_from_slice(&value.to_le_bytes());
+            }
+        };
+
+        if flags & FLAG_DELTA != 0 {
+            // The running sum after row i is the undifferenced integer at row
+            // i, so a restart entry seeds it directly
+            let table = &encoded[restart_table_offset(encoded)..packed_start];
+            let shift = encoded[19] as u32;
+            let (mut running, mut row) = seed_restart(table, shift, start, delta_seed(encoded));
+            while row < start {
+                let raw =
+                    unpack_bits(packed, row as u64 * int_bit_width as u64, int_bit_width) & mask;
+                running = running.wrapping_add(raw as i64 + base);
+                row += 1;
+            }
+            while row < end {
+                let raw =
+                    unpack_bits(packed, row as u64 * int_bit_width as u64, int_bit_width) & mask;
+                running = running.wrapping_add(raw as i64 + base);
+                write_value(&mut out, row - start, running);
+                row += 1;
+            }
+            // Delta is only chosen when the column has no exceptions, so the
+            // range is complete once the stream is replayed
+            return Ok(out);
+        }
+
+        for i in 0..taken {
+            let row = start + i;
+            let raw = unpack_bits(packed, row as u64 * int_bit_width as u64, int_bit_width) & mask;
+            write_value(&mut out, i, (raw as i64).wrapping_add(base));
+        }
+
+        // Exceptions carry their own row index, so only the ones landing in
+        // the range are read back and the rest are stepped over
+        let exceptions = &encoded[packed_end..];
+        let entry_size = 4 + value_size;
+        for e in 0..exception_count {
+            let at = e * entry_size;
+            if at + entry_size > exceptions.len() {
+                return take_default(self);
+            }
+            let row = u32::from_le_bytes([
+                exceptions[at],
+                exceptions[at + 1],
+                exceptions[at + 2],
+                exceptions[at + 3],
+            ]) as usize;
+            if row < start || row >= end {
+                continue;
+            }
+            let payload = &exceptions[at + 4..at + 4 + value_size];
+            out[(row - start) * value_size..(row - start + 1) * value_size]
+                .copy_from_slice(payload);
+        }
         Ok(out)
     }
 
@@ -219,7 +491,7 @@ impl Encoding for AlpEncoding {
         }
 
         let flags = encoded[18];
-        let useDelta = flags & 0x01 != 0;
+        let useDelta = flags & FLAG_DELTA != 0;
 
         let base = i64::from_le_bytes([
             encoded[20],
@@ -232,7 +504,7 @@ impl Encoding for AlpEncoding {
             encoded[27],
         ]);
 
-        let packedStart = 28;
+        let packedStart = packed_offset(encoded, row_count);
         let packedBits = row_count as u64 * intBitWidth as u64;
         let packedBytes = (packedBits as usize).div_ceil(8);
         let packedEnd = packedStart + packedBytes;
@@ -271,7 +543,9 @@ impl Encoding for AlpEncoding {
             (1u64 << intBitWidth) - 1
         };
         let bw = intBitWidth as u64;
-        let mut prevInt: i64 = 0;
+        // Row zero is a delta against the seed like every other entry, so no
+        // path here special-cases it
+        let mut prevInt: i64 = delta_seed(encoded);
 
         if value_size == 8 && useDelta && intBitWidth == 1 {
             // bit_width=1 delta f64: extract 8 deltas per packed byte.
@@ -282,13 +556,8 @@ impl Encoding for AlpEncoding {
 
             if row_count > 0 {
                 let byte0 = unsafe { *packedPtr.add(0) };
-                prevInt = (byte0 & 1) as i64 + base;
-                unsafe {
-                    out64f.add(0).write(prevInt as f64 * invFactor);
-                }
-
                 let firstByteTail = 8.min(row_count);
-                for bit in 1..firstByteTail {
+                for bit in 0..firstByteTail {
                     prevInt = prevInt.wrapping_add(((byte0 >> bit) & 1) as i64 + base);
                     unsafe {
                         out64f.add(bit).write(prevInt as f64 * invFactor);
@@ -348,7 +617,7 @@ impl Encoding for AlpEncoding {
 
             if row_count > 0 {
                 let u0 = unpack_alp_inline(packedPtr, packedLen, 0, intBitWidth, mask);
-                prevInt = u0 as i64 + base;
+                prevInt = prevInt.wrapping_add(u0 as i64 + base);
                 unsafe {
                     out64f.add(0).write(prevInt as f64 * invFactor);
                 }
@@ -464,9 +733,7 @@ impl Encoding for AlpEncoding {
                 let mut intVal = unsigned as i64 + base;
 
                 if useDelta {
-                    if i > 0 {
-                        intVal = intVal.wrapping_add(prevInt);
-                    }
+                    intVal = intVal.wrapping_add(prevInt);
                     prevInt = intVal;
                 }
 
@@ -560,12 +827,12 @@ impl Encoding for AlpEncoding {
                     encoded[27],
                 ]);
 
-                let packedStart = 28;
+                let packedStart = packed_offset(encoded, row_count);
                 let packedBits = row_count as u64 * intBitWidth as u64;
                 let packedBytes = (packedBits as usize).div_ceil(8);
                 let packedEnd = packedStart + packedBytes;
 
-                let useDelta = encoded[18] & 0x01 != 0;
+                let useDelta = encoded[18] & FLAG_DELTA != 0;
 
                 // Predicate pushdown only works when no delta and no exceptions
                 if exceptionCount == 0 && !useDelta && packedEnd <= encoded.len() {
@@ -591,29 +858,12 @@ impl Encoding for AlpEncoding {
                     };
 
                     let packed = &encoded[packedStart..packedEnd];
-                    let bitmaskLen = row_count.div_ceil(8);
-                    let mut bitmask = vec![0u8; bitmaskLen];
-
-                    for i in 0..row_count {
+                    return Ok(bitmask_from_rows(row_count, |i| {
                         let unsigned =
                             unpack_bits(packed, i as u64 * intBitWidth as u64, intBitWidth);
                         let intVal = unsigned as i64 + base;
-
-                        let aboveLow = match loInt {
-                            Some(lo) => intVal >= lo,
-                            None => true,
-                        };
-                        let belowHigh = match hiInt {
-                            Some(hi) => intVal <= hi,
-                            None => true,
-                        };
-
-                        if aboveLow && belowHigh {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-
-                    return Ok(bitmask);
+                        loInt.is_none_or(|lo| intVal >= lo) && hiInt.is_none_or(|hi| intVal <= hi)
+                    }));
                 }
             }
         }
@@ -820,6 +1070,47 @@ fn unpack_bits(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A range decode of the delta stream resumes at the restart boundary at
+    /// or before it, so the rows replayed ahead of the first requested one are
+    /// bounded by the restart spacing rather than by the segment length.
+    #[test]
+    fn test_delta_range_replays_at_most_one_restart_spacing() {
+        let enc = AlpEncoding;
+        const ROWS: usize = 40_000;
+        let values: Vec<f64> = (0..ROWS).map(|i| (i as f64) * 0.25 + 1.5).collect();
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let encoded = enc.encode(&data, ROWS, 8).unwrap();
+        assert_eq!(
+            encoded[18] & FLAG_DELTA,
+            FLAG_DELTA,
+            "an ascending float column packs as a delta stream"
+        );
+        assert_eq!(
+            encoded[18] & FLAG_RESTART,
+            FLAG_RESTART,
+            "a delta stream this long carries restart points"
+        );
+
+        let shift = encoded[19] as u32;
+        let table = &encoded[restart_table_offset(&encoded)..packed_offset(&encoded, ROWS)];
+        let start = ROWS - 3;
+        let (_, resume) = seed_restart(table, shift, start, delta_seed(&encoded));
+        assert!(resume > 0, "the tail resumes past the head of the stream");
+        assert!(
+            start - resume < (1usize << shift),
+            "replayed {} rows, more than the {} row spacing",
+            start - resume,
+            1usize << shift
+        );
+
+        let ranged = enc.decode_range(&encoded, ROWS, 8, start, ROWS).unwrap();
+        let got: Vec<f64> = ranged
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, values[start..]);
+    }
 
     #[test]
     fn test_roundtrip_f64_integers() {

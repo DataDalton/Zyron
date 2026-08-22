@@ -3,7 +3,9 @@
 //! reducing bit width. Packs N-bit residuals into contiguous byte arrays,
 //! where N is the minimum bits needed to represent (max - min).
 
-use crate::encoding::{Encoding, EncodingType, Predicate, eval_predicate_on_raw};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, bitmask_from_rows, eval_predicate_on_raw,
+};
 use zyron_common::{Result, ZyronError};
 
 pub struct BitPackEncoding;
@@ -137,6 +139,63 @@ impl Encoding for BitPackEncoding {
         Ok(out)
     }
 
+    /// Every residual is the same width, so row i sits at bit offset
+    /// `i * bit_width` and a range starts there rather than at the segment
+    /// start. Reading one row costs one unpack whatever the segment holds
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        if encoded.len() < 13 {
+            return Err(ZyronError::DecodingFailed(
+                "bitpack header too short".to_string(),
+            ));
+        }
+        let bitWidth = encoded[0];
+        if bitWidth == 0 || bitWidth > 64 {
+            return Err(ZyronError::DecodingFailed(format!(
+                "invalid bit width: {}",
+                bitWidth
+            )));
+        }
+        let storedValueSize =
+            u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        if storedValueSize != value_size {
+            return Err(ZyronError::DecodingFailed(format!(
+                "bitpack value_size mismatch: stored {}, expected {}",
+                storedValueSize, value_size
+            )));
+        }
+        let baseValue = u64::from_le_bytes([
+            encoded[5],
+            encoded[6],
+            encoded[7],
+            encoded[8],
+            encoded[9],
+            encoded[10],
+            encoded[11],
+            encoded[12],
+        ]);
+        let packed = &encoded[13..];
+        let taken = end - start;
+        let mut out = vec![0u8; taken * value_size];
+        let mut bitOffset: u64 = start as u64 * bitWidth as u64;
+        for i in 0..taken {
+            let residual = unpack_value(packed, bitOffset, bitWidth);
+            write_value_from_u64(&mut out, i, value_size, residual + baseValue);
+            bitOffset += bitWidth as u64;
+        }
+        Ok(out)
+    }
+
     fn eval_predicate(
         &self,
         encoded: &[u8],
@@ -203,24 +262,19 @@ impl Encoding for BitPackEncoding {
 
         // Evaluate predicates on packed residuals by transforming bounds
         // into the FoR domain (subtract base_value from search targets).
+        // Residuals are addressed by row rather than walked with a running
+        // offset, so eight rows answer independently into one mask byte
         let bitmaskLen = row_count.div_ceil(8);
-        let mut bitmask = vec![0u8; bitmaskLen];
-        let mut bitOffset: u64 = 0;
+        let residual_at = |i: usize| unpack_value(packed, i as u64 * bitWidth as u64, bitWidth);
 
-        match predicate {
+        Ok(match predicate {
             Predicate::Equality(target) => {
                 let targetVal = read_value_as_u64(target, 0, target.len().min(value_size));
                 if targetVal < baseValue || targetVal > baseValue.saturating_add(maxResidual) {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 }
                 let targetResidual = targetVal - baseValue;
-                for i in 0..row_count {
-                    let residual = unpack_value(packed, bitOffset, bitWidth);
-                    if residual == targetResidual {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                    bitOffset += bitWidth as u64;
-                }
+                bitmask_from_rows(row_count, |i| residual_at(i) == targetResidual)
             }
             Predicate::Range { low, high } => {
                 let loVal = match low {
@@ -236,7 +290,7 @@ impl Encoding for BitPackEncoding {
 
                 // Segment-level skip
                 if loVal > maxRepresentable || hiVal < baseValue {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 }
 
                 // Segment-level accept
@@ -253,16 +307,13 @@ impl Encoding for BitPackEncoding {
                 let hiResidual = if hiVal >= baseValue {
                     (hiVal - baseValue).min(maxResidual)
                 } else {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 };
 
-                for i in 0..row_count {
-                    let residual = unpack_value(packed, bitOffset, bitWidth);
-                    if residual >= loResidual && residual <= hiResidual {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                    bitOffset += bitWidth as u64;
-                }
+                bitmask_from_rows(row_count, |i| {
+                    let residual = residual_at(i);
+                    residual >= loResidual && residual <= hiResidual
+                })
             }
             Predicate::In(values) => {
                 let targetResiduals: Vec<u64> = values
@@ -277,19 +328,11 @@ impl Encoding for BitPackEncoding {
                     })
                     .collect();
                 if targetResiduals.is_empty() {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 }
-                for i in 0..row_count {
-                    let residual = unpack_value(packed, bitOffset, bitWidth);
-                    if targetResiduals.contains(&residual) {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                    bitOffset += bitWidth as u64;
-                }
+                bitmask_from_rows(row_count, |i| targetResiduals.contains(&residual_at(i)))
             }
-        }
-
-        Ok(bitmask)
+        })
     }
 }
 
@@ -341,32 +384,45 @@ fn pack_value(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     }
 }
 
-/// Unpacks a value from the given bit offset in the packed array.
+/// Unpacks a value from the given bit offset in the packed array. Every
+/// row but the last few sits over a full 8 byte window, read as one
+/// unaligned word plus a guarded spill byte. The variable-length copy
+/// only runs on the array's tail bytes
 #[inline]
 fn unpack_value(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
     let byteIdx = (bit_offset / 8) as usize;
     let bitIdx = (bit_offset % 8) as u32;
-
-    let mut buf = [0u8; 9];
-    let available = packed.len().saturating_sub(byteIdx).min(9);
-    buf[..available].copy_from_slice(&packed[byteIdx..byteIdx + available]);
-
-    let lo = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let val = lo >> bitIdx;
-
     let mask = if bit_width >= 64 {
         u64::MAX
     } else {
         (1u64 << bit_width) - 1
     };
+    let needsSpill = bitIdx + bit_width as u32 > 64;
 
-    if bitIdx + bit_width as u32 > 64 {
-        let hiBits = (buf[8] as u64) << (64 - bitIdx);
-        (val | hiBits) & mask
+    if byteIdx + 8 <= packed.len() {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&packed[byteIdx..byteIdx + 8]);
+        let val = u64::from_le_bytes(w) >> bitIdx;
+        if needsSpill {
+            let hi = *packed.get(byteIdx + 8).unwrap_or(&0) as u64;
+            (val | (hi << (64 - bitIdx))) & mask
+        } else {
+            val & mask
+        }
     } else {
-        val & mask
+        let mut buf = [0u8; 9];
+        let available = packed.len().saturating_sub(byteIdx).min(9);
+        buf[..available].copy_from_slice(&packed[byteIdx..byteIdx + available]);
+        let lo = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let val = lo >> bitIdx;
+        if needsSpill {
+            let hiBits = (buf[8] as u64) << (64 - bitIdx);
+            (val | hiBits) & mask
+        } else {
+            val & mask
+        }
     }
 }
 

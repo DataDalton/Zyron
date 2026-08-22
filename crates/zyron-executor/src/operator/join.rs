@@ -9,6 +9,7 @@
 //! accumulating multiple rows before emitting a DataBatch. This
 //! eliminates per-row DataBatch allocation overhead.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use zyron_common::{Result, TypeId};
@@ -412,16 +413,51 @@ fn combine_rows_single(
     DataBatch::new(columns)
 }
 
+/// Merges batches into one contiguous DataBatch, None when no rows exist.
+/// A single batch moves through without copying.
+fn merge_batches(mut batches: Vec<DataBatch>, total_rows: usize) -> Option<DataBatch> {
+    if total_rows == 0 || batches.is_empty() {
+        return None;
+    }
+    if batches.len() == 1 {
+        return batches.pop();
+    }
+    let num_cols = batches[0].num_columns();
+    let mut merged_columns = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let template = &batches[0].columns[col_idx];
+        let type_id = template.type_id;
+        let fractional_digits = template.fractional_digits;
+        let mut data = ColumnData::with_capacity(type_id, total_rows);
+        let mut nulls = NullBitmap::empty();
+        for batch in &batches {
+            data.extend_from(&batch.columns[col_idx].data);
+            nulls.extend_from(&batch.columns[col_idx].nulls);
+        }
+        merged_columns.push(Column::with_nulls_ts(
+            data,
+            nulls,
+            type_id,
+            fractional_digits,
+        ));
+    }
+    Some(DataBatch::new(merged_columns))
+}
+
 // ---------------------------------------------------------------------------
 // HashJoinOperator
 // ---------------------------------------------------------------------------
 
-/// Hash join for equi-joins. Builds a hash table on the left (build) side,
-/// then probes with the right (probe) side.
+/// Hash join for equi-joins. Materializes both inputs, builds a hash
+/// table on whichever side produced fewer rows, and probes with the other.
 ///
-/// Build phase: collects all left batches, merges into a single contiguous
-/// DataBatch, then builds a chained flat array with (row, next) entries.
-/// Merging eliminates binary search during probe (row index = direct offset).
+/// Build phase: collects all batches from both inputs, chooses the build
+/// side by actual row count, merges it into a single contiguous DataBatch,
+/// then builds a chained flat array with (row, next) entries. Merging
+/// eliminates binary search during probe (row index = direct offset).
+/// When the right input is smaller the sides swap internally, mirroring
+/// join direction for the tracking logic while output columns are still
+/// emitted left-then-right, so the swap is invisible outside.
 ///
 /// Probe phase: for each probe batch, collects all (build_row, probe_row)
 /// match pairs into flat index arrays, then uses batch gather_from to
@@ -432,12 +468,12 @@ fn combine_rows_single(
 #[inline]
 fn keys_match_columns(
     build_keys: &[Column],
-    probe_keys: &[Column],
+    probe_keys: &[Cow<'_, Column>],
     build_row: usize,
     probe_row: usize,
 ) -> bool {
     for (bk, pk) in build_keys.iter().zip(probe_keys.iter()) {
-        if !compute::cross_column_value_equal(bk, build_row, pk, probe_row) {
+        if !compute::cross_column_value_equal(bk, build_row, pk.as_ref(), probe_row) {
             return false;
         }
     }
@@ -475,6 +511,27 @@ pub struct HashJoinOperator {
     /// True when build used hash_int (fused single-integer-key path).
     /// Probe must use the same hash function for matching.
     build_used_int_hash: bool,
+    /// Per-key decimal alignment target. When either side of a key is a
+    /// decimal, both sides materialize as Int128 on this scale before
+    /// hashing and comparing, so equal numbers share bytes. None for keys
+    /// with no decimal side
+    key_align_scales: Vec<Option<u8>>,
+    /// True when the original right input is the build side because it
+    /// materialized fewer rows. Tracking logic runs on internal_join and
+    /// output assembly restores left-then-right column order
+    swapped: bool,
+    /// join_type with LEFT and RIGHT mirrored when swapped, so build-side
+    /// and probe-side outer tracking stays direction-agnostic
+    internal_join: JoinType,
+    /// Probe side batches drained during the build phase, probed one at a
+    /// time. They are deliberately not merged, so a join never has to hold
+    /// the whole probe side contiguously and never copies it
+    probe_batches_pending: Vec<DataBatch>,
+    /// Output columns accumulated across probe batches in external
+    /// left-then-right order, flushed once they reach BATCH_SIZE rows so
+    /// per-batch probing does not fragment the output
+    pending_out: Vec<Column>,
+    pending_out_rows: usize,
     built: bool,
     /// Pre-resolved probe key column indices (None = expression, needs evaluate).
     probe_key_col_indices: Vec<Option<usize>>,
@@ -522,6 +579,12 @@ impl HashJoinOperator {
             build_matched: Vec::new(),
             total_build_rows: 0,
             build_used_int_hash: false,
+            key_align_scales: Vec::new(),
+            swapped: false,
+            internal_join: join_type,
+            probe_batches_pending: Vec::new(),
+            pending_out: Vec::new(),
+            pending_out_rows: 0,
             built: false,
             probe_key_col_indices: Vec::new(),
             output_queue: Vec::new(),
@@ -535,55 +598,97 @@ impl HashJoinOperator {
 
     async fn build_hash_table(&mut self) -> Result<()> {
         let mut left = self.left.take().unwrap();
-        let track = matches!(self.join_type, JoinType::Left | JoinType::Full);
 
-        // Phase 1: Collect all build batches.
-        let mut all_batches: Vec<DataBatch> = Vec::new();
-        let mut total_rows = 0usize;
+        // Phase 1: Drain both inputs. Both sides always materialize in
+        // full before probing, so the build side is chosen by actual row
+        // count instead of plan-time estimates, because hashing the smaller
+        // side shrinks the table every probe row walks.
+        let mut left_batches: Vec<DataBatch> = Vec::new();
+        let mut left_rows = 0usize;
         loop {
             match left.next().await? {
                 Some(eb) => {
-                    total_rows += eb.batch.num_rows;
-                    all_batches.push(eb.batch);
+                    left_rows += eb.batch.num_rows;
+                    left_batches.push(eb.batch);
                 }
                 None => break,
             }
         }
-        self.total_build_rows = total_rows;
+        let mut right_batches: Vec<DataBatch> = Vec::new();
+        let mut right_rows = 0usize;
+        loop {
+            match self.right.next().await? {
+                Some(eb) => {
+                    right_rows += eb.batch.num_rows;
+                    right_batches.push(eb.batch);
+                }
+                None => break,
+            }
+        }
 
-        if total_rows == 0 || all_batches.is_empty() {
+        self.swapped = right_rows < left_rows;
+        self.internal_join = if self.swapped {
+            match self.join_type {
+                JoinType::Left => JoinType::Right,
+                JoinType::Right => JoinType::Left,
+                other => other,
+            }
+        } else {
+            self.join_type
+        };
+        let (build_batches, build_rows, probe_batches, probe_rows) = if self.swapped {
+            (right_batches, right_rows, left_batches, left_rows)
+        } else {
+            (left_batches, left_rows, right_batches, right_rows)
+        };
+        self.total_build_rows = build_rows;
+        let _ = probe_rows;
+        self.probe_batches_pending = probe_batches;
+        self.output_buffer = Some(JoinOutputBuffer::new(&self.left_types, &self.right_types));
+
+        let track = matches!(self.internal_join, JoinType::Left | JoinType::Full);
+
+        if build_rows == 0 {
             self.built = true;
             self.build_batch = None;
-            self.output_buffer = Some(JoinOutputBuffer::new(&self.left_types, &self.right_types));
             return Ok(());
         }
 
-        // Phase 2: Merge all batches into a single contiguous DataBatch.
-        // Eliminates binary search (resolve_build_row) during probe.
-        let merged = if all_batches.len() == 1 {
-            all_batches.pop().unwrap()
-        } else {
-            let num_cols = all_batches[0].num_columns();
-            let mut merged_columns = Vec::with_capacity(num_cols);
-            for col_idx in 0..num_cols {
-                let type_id = all_batches[0].columns[col_idx].type_id;
-                let mut data = ColumnData::with_capacity(type_id, total_rows);
-                let mut nulls = NullBitmap::empty();
-                for batch in &all_batches {
-                    data.extend_from(&batch.columns[col_idx].data);
-                    nulls.extend_from(&batch.columns[col_idx].nulls);
-                }
-                merged_columns.push(Column::with_nulls(data, nulls, type_id));
+        // Phase 2: Merge all build batches into a single contiguous
+        // DataBatch. Eliminates binary search (resolve_build_row) during
+        // probe. build_rows > 0 guarantees a merged batch exists.
+        let merged = match merge_batches(build_batches, build_rows) {
+            Some(b) => b,
+            None => {
+                return Err(zyron_common::ZyronError::ExecutionError(
+                    "hash join build side lost its batches before merging".to_string(),
+                ));
             }
-            DataBatch::new(merged_columns)
+        };
+
+        // Key expressions and schema of whichever input is the build side.
+        let build_key_exprs: &[BoundExpr] = if self.swapped {
+            &self.right_keys
+        } else {
+            &self.left_keys
+        };
+        let build_schema: &[LogicalColumn] = if self.swapped {
+            &self.right_schema
+        } else {
+            &self.left_schema
+        };
+        let probe_key_exprs: &[BoundExpr] = if self.swapped {
+            &self.left_keys
+        } else {
+            &self.right_keys
         };
 
         // Phase 3: Hash keys and build chain entries.
         // Resolve key column indices.
-        let mut key_col_indices: Vec<Option<usize>> = Vec::with_capacity(self.left_keys.len());
-        for k in &self.left_keys {
+        let mut key_col_indices: Vec<Option<usize>> = Vec::with_capacity(build_key_exprs.len());
+        for k in build_key_exprs {
             if let BoundExpr::ColumnRef(cr) = k {
-                let idx = resolve_column_index(cr.table_idx, cr.column_id, &self.left_schema)?;
+                let idx = resolve_column_index(cr.table_idx, cr.column_id, build_schema)?;
                 key_col_indices.push(Some(idx));
             } else {
                 key_col_indices.push(None);
@@ -598,9 +703,41 @@ impl HashJoinOperator {
             match src {
                 Some(idx) => build_key_columns.push(merged.columns[*idx].clone()),
                 None => {
-                    let col = evaluate(&self.left_keys[ki], &merged, &self.left_schema, &[])?;
+                    let col = evaluate(&build_key_exprs[ki], &merged, build_schema, &[])?;
                     build_key_columns.push(col);
                 }
+            }
+        }
+
+        // When either side of a key is a decimal, both sides hash and
+        // compare as Int128 on the wider scale so equal numbers share
+        // bytes. The build side's scale comes from the column just
+        // materialized, the probe side's from its bound expression
+        self.key_align_scales = build_key_columns
+            .iter()
+            .zip(probe_key_exprs.iter())
+            .map(|(bc, rk)| {
+                let build_dec = bc.type_id == TypeId::Decimal;
+                let probe_dec = rk.type_id() == TypeId::Decimal;
+                if !build_dec && !probe_dec {
+                    return None;
+                }
+                let bs = if build_dec {
+                    bc.fractional_digits.unwrap_or(0)
+                } else {
+                    0
+                };
+                let ps = if probe_dec {
+                    rk.fractional_digits().unwrap_or(0)
+                } else {
+                    0
+                };
+                Some(bs.max(ps))
+            })
+            .collect();
+        for (col, target) in build_key_columns.iter_mut().zip(&self.key_align_scales) {
+            if let Some(scale) = target {
+                *col = compute::cast_column_to_decimal(col, *scale)?;
             }
         }
 
@@ -612,11 +749,12 @@ impl HashJoinOperator {
         // For single integer keys without nulls, uses fused hash+insert with
         // group-prefetch (PF=16) to hide L3 latency on hash table bucket access.
         // Multi-key or non-integer keys fall back to hash_column_batch.
-        self.build_entries.reserve(total_rows);
-        self.build_index = FlatHashTable::with_capacity(total_rows);
+        self.build_entries.reserve(build_rows);
+        self.build_index = FlatHashTable::with_capacity(build_rows);
 
         let mut fused = false;
-        if key_col_indices.len() == 1 && !any_key_has_nulls {
+        let key_needs_align = self.key_align_scales.iter().any(|s| s.is_some());
+        if key_col_indices.len() == 1 && !any_key_has_nulls && !key_needs_align {
             if let Some(key_idx) = key_col_indices[0] {
                 let col = &merged.columns[key_idx];
                 const PF: usize = 16;
@@ -662,9 +800,9 @@ impl HashJoinOperator {
         // Fallback: multi-key, non-integer key types, or NULL-bearing keys.
         if !fused {
             let key_refs: Vec<&Column> = build_key_columns.iter().collect();
-            let all_hashes = compute::hash_column_batch(&key_refs, total_rows);
+            let all_hashes = compute::hash_column_batch(&key_refs, build_rows);
 
-            for row in 0..total_rows {
+            for row in 0..build_rows {
                 // Skip rows with any NULL key so NULL never matches NULL.
                 if any_key_has_nulls && build_key_columns.iter().any(|c| c.is_null(row)) {
                     // Push a placeholder entry so build_entries stays row-indexed,
@@ -686,41 +824,158 @@ impl HashJoinOperator {
         }
 
         // Pre-resolve probe key indices to avoid per-batch resolution.
-        for k in &self.right_keys {
+        let probe_schema: &[LogicalColumn] = if self.swapped {
+            &self.left_schema
+        } else {
+            &self.right_schema
+        };
+        let mut probe_key_col_indices = Vec::with_capacity(probe_key_exprs.len());
+        for k in probe_key_exprs {
             if let BoundExpr::ColumnRef(cr) = k {
-                let idx = resolve_column_index(cr.table_idx, cr.column_id, &self.right_schema)?;
-                self.probe_key_col_indices.push(Some(idx));
+                let idx = resolve_column_index(cr.table_idx, cr.column_id, probe_schema)?;
+                probe_key_col_indices.push(Some(idx));
             } else {
-                self.probe_key_col_indices.push(None);
+                probe_key_col_indices.push(None);
             }
         }
+        self.probe_key_col_indices = probe_key_col_indices;
 
         self.built = true;
-        self.output_buffer = Some(JoinOutputBuffer::new(&self.left_types, &self.right_types));
         Ok(())
     }
 
     /// Materializes the probe key columns for a probe batch in the same order
     /// as build_key_columns so values can be compared after the hi32 match.
-    fn materialize_probe_keys(&self, probe_batch: &DataBatch) -> Result<Vec<Column>> {
+    /// A plain column-reference key borrows the batch's column outright. Only
+    /// an expression key or a decimal alignment produces an owned column, so
+    /// the common case copies nothing however wide the probe side is.
+    /// Keys with a decimal side convert to the same Int128 scale the build
+    /// side hashed on
+    fn materialize_probe_keys<'a>(
+        &self,
+        probe_batch: &'a DataBatch,
+    ) -> Result<Vec<Cow<'a, Column>>> {
+        let (probe_key_exprs, probe_schema) = if self.swapped {
+            (&self.left_keys, &self.left_schema)
+        } else {
+            (&self.right_keys, &self.right_schema)
+        };
         let mut cols = Vec::with_capacity(self.probe_key_col_indices.len());
         for (ki, src) in self.probe_key_col_indices.iter().enumerate() {
-            match src {
-                Some(idx) => cols.push(probe_batch.columns[*idx].clone()),
-                None => {
-                    let col = evaluate(&self.right_keys[ki], probe_batch, &self.right_schema, &[])?;
-                    cols.push(col);
-                }
-            }
+            let col: Cow<'a, Column> = match src {
+                Some(idx) => Cow::Borrowed(&probe_batch.columns[*idx]),
+                None => Cow::Owned(evaluate(
+                    &probe_key_exprs[ki],
+                    probe_batch,
+                    probe_schema,
+                    &[],
+                )?),
+            };
+            let col = match self.key_align_scales.get(ki).copied().flatten() {
+                Some(scale) => Cow::Owned(compute::cast_column_to_decimal(col.as_ref(), scale)?),
+                None => col,
+            };
+            cols.push(col);
         }
         Ok(cols)
+    }
+
+    /// Appends matched rows to the pending output, emitting a batch every
+    /// time BATCH_SIZE rows accumulate. Matches are gathered in bulk per
+    /// column, so probing one batch at a time costs no more per row than
+    /// probing a merged probe side did, and the emitted batches stay the
+    /// same size regardless of how the probe input was chunked.
+    fn append_matches(&mut self, build_rows: &[u32], probe_batch: &DataBatch, probe_rows: &[u32]) {
+        debug_assert_eq!(build_rows.len(), probe_rows.len());
+        if self.pending_out.is_empty() {
+            let build = self
+                .build_batch
+                .as_ref()
+                .expect("append_matches requires a build batch");
+            let (first, second) = if self.swapped {
+                (&probe_batch.columns, &build.columns)
+            } else {
+                (&build.columns, &probe_batch.columns)
+            };
+            self.pending_out = first
+                .iter()
+                .chain(second.iter())
+                .map(|c| {
+                    Column::with_nulls_ts(
+                        ColumnData::with_capacity(c.type_id, BATCH_SIZE),
+                        NullBitmap::empty(),
+                        c.type_id,
+                        c.fractional_digits,
+                    )
+                })
+                .collect();
+        }
+
+        let mut offset = 0usize;
+        while offset < build_rows.len() {
+            let take = (BATCH_SIZE - self.pending_out_rows).min(build_rows.len() - offset);
+            let bi = &build_rows[offset..offset + take];
+            let pi = &probe_rows[offset..offset + take];
+            {
+                let build = self
+                    .build_batch
+                    .as_ref()
+                    .expect("append_matches requires a build batch");
+                let (first_src, first_idx, second_src, second_idx) = if self.swapped {
+                    (&probe_batch.columns, pi, &build.columns, bi)
+                } else {
+                    (&build.columns, bi, &probe_batch.columns, pi)
+                };
+                let split = first_src.len();
+                for (out, src) in self.pending_out[..split].iter_mut().zip(first_src.iter()) {
+                    out.data.gather_from(&src.data, first_idx);
+                    out.nulls.gather_from(&src.nulls, first_idx);
+                }
+                for (out, src) in self.pending_out[split..].iter_mut().zip(second_src.iter()) {
+                    out.data.gather_from(&src.data, second_idx);
+                    out.nulls.gather_from(&src.nulls, second_idx);
+                }
+            }
+            self.pending_out_rows += take;
+            offset += take;
+            if self.pending_out_rows >= BATCH_SIZE {
+                self.flush_pending_out();
+            }
+        }
+    }
+
+    /// Emits whatever matched rows have accumulated, if any.
+    fn flush_pending_out(&mut self) {
+        if self.pending_out_rows == 0 {
+            return;
+        }
+        let fresh: Vec<Column> = self
+            .pending_out
+            .iter()
+            .map(|c| {
+                Column::with_nulls_ts(
+                    ColumnData::with_capacity(c.type_id, BATCH_SIZE),
+                    NullBitmap::empty(),
+                    c.type_id,
+                    c.fractional_digits,
+                )
+            })
+            .collect();
+        let done = std::mem::replace(&mut self.pending_out, fresh);
+        self.pending_out_rows = 0;
+        self.output_queue.push(DataBatch::new(done));
     }
 
     /// Compares a build row's key values against a probe row's key values.
     /// Returns true only when every key column is equal and non-NULL on both
     /// sides, so a 64-bit hash collision cannot false-join.
     #[inline]
-    fn keys_match(&self, probe_keys: &[Column], build_row: usize, probe_row: usize) -> bool {
+    fn keys_match(
+        &self,
+        probe_keys: &[Cow<'_, Column>],
+        build_row: usize,
+        probe_row: usize,
+    ) -> bool {
         keys_match_columns(&self.build_key_columns, probe_keys, build_row, probe_row)
     }
 
@@ -731,9 +986,9 @@ impl HashJoinOperator {
         &mut self,
         probe_batch: &DataBatch,
         probe_hashes: &[u64],
-        probe_keys: &[Column],
+        probe_keys: &[Cow<'_, Column>],
     ) -> Vec<DataBatch> {
-        let track_right = matches!(self.join_type, JoinType::Right | JoinType::Full);
+        let track_right = matches!(self.internal_join, JoinType::Right | JoinType::Full);
         let build = self.build_batch.as_ref().unwrap();
 
         // Phase 1: Collect all match pairs as flat index arrays.
@@ -768,43 +1023,25 @@ impl HashJoinOperator {
             }
         }
 
-        // Phase 2: Gather output in BATCH_SIZE chunks.
+        // Phase 2: accumulate matches into full-size output batches,
+        // external left columns before right columns regardless of which
+        // side built.
+        let _ = build;
+        self.append_matches(&build_idx, probe_batch, &probe_idx);
+
+        // Phase 3: Emit unmatched probe rows for probe-outer joins,
+        // null-padding the build side in external column order.
         let mut results = Vec::new();
-        let total_matched = build_idx.len();
-        let mut offset = 0;
-
-        while offset < total_matched {
-            let end = (offset + BATCH_SIZE).min(total_matched);
-            let bi = &build_idx[offset..end];
-            let pi = &probe_idx[offset..end];
-            let n = end - offset;
-
-            let mut cols = Vec::with_capacity(build.num_columns() + probe_batch.num_columns());
-
-            for col in &build.columns {
-                let mut d = ColumnData::with_capacity(col.type_id, n);
-                d.gather_from(&col.data, bi);
-                let mut nulls = NullBitmap::empty();
-                nulls.gather_from(&col.nulls, bi);
-                cols.push(Column::with_nulls(d, nulls, col.type_id));
-            }
-            for col in &probe_batch.columns {
-                let mut d = ColumnData::with_capacity(col.type_id, n);
-                d.gather_from(&col.data, pi);
-                let mut nulls = NullBitmap::empty();
-                nulls.gather_from(&col.nulls, pi);
-                cols.push(Column::with_nulls(d, nulls, col.type_id));
-            }
-
-            results.push(DataBatch::new(cols));
-            offset = end;
-        }
-
-        // Phase 3: Emit unmatched probe rows for RIGHT/FULL join.
         if !unmatched_probe.is_empty() {
+            self.flush_pending_out();
+            let swapped = self.swapped;
             let buf = self.output_buffer.as_mut().unwrap();
             for &pr in &unmatched_probe {
-                buf.push_null_left_right(probe_batch, pr as usize);
+                if swapped {
+                    buf.push_left_null_right(probe_batch, pr as usize);
+                } else {
+                    buf.push_null_left_right(probe_batch, pr as usize);
+                }
                 if buf.is_full() {
                     results.push(buf.flush(&self.left_types, &self.right_types));
                 }
@@ -840,15 +1077,21 @@ impl Operator for HashJoinOperator {
                 self.build_hash_table().await?;
             }
 
-            // Emit unmatched build rows for LEFT/FULL join.
+            // Emit unmatched build rows for a build-outer join, padded on
+            // the probe side in external column order.
             if self.emitting_unmatched_build {
+                let swapped = self.swapped;
                 let buf = self.output_buffer.as_mut().unwrap();
                 let build = self.build_batch.as_ref().unwrap();
                 while self.unmatched_cursor < self.total_build_rows {
                     let row = self.unmatched_cursor;
                     self.unmatched_cursor += 1;
                     if !self.build_matched[row] {
-                        buf.push_left_null_right(build, row);
+                        if swapped {
+                            buf.push_null_left_right(build, row);
+                        } else {
+                            buf.push_left_null_right(build, row);
+                        }
                         if buf.is_full() {
                             return Ok(Some(ExecutionBatch::new(
                                 buf.flush(&self.left_types, &self.right_types),
@@ -865,24 +1108,14 @@ impl Operator for HashJoinOperator {
                 return Ok(None);
             }
 
-            // Materialize entire probe side, then process all at once.
-            // This eliminates per-batch overhead (key resolution, hashing,
-            // allocation) that dominates when probe batches are small.
-            let mut probe_batches: Vec<DataBatch> = Vec::new();
-            let mut total_probe_rows = 0usize;
-            loop {
-                match self.right.next().await? {
-                    Some(eb) => {
-                        total_probe_rows += eb.batch.num_rows;
-                        probe_batches.push(eb.batch);
-                    }
-                    None => break,
-                }
-            }
-
-            if total_probe_rows == 0 || self.build_batch.is_none() {
-                // No probe rows or no build rows. Handle unmatched build.
-                if matches!(self.join_type, JoinType::Left | JoinType::Full)
+            // Probe batches were drained during the build phase, when the
+            // build side was chosen by actual row count. They stay separate,
+            // so the probe side is never copied into one contiguous block.
+            let probe_batches = std::mem::take(&mut self.probe_batches_pending);
+            if probe_batches.is_empty() {
+                // Probe side produced no rows. A build-outer join still
+                // owes every build row, null-padded on the probe side.
+                if matches!(self.internal_join, JoinType::Left | JoinType::Full)
                     && self.build_batch.is_some()
                 {
                     self.emitting_unmatched_build = true;
@@ -892,125 +1125,251 @@ impl Operator for HashJoinOperator {
                 return Ok(None);
             }
 
-            // Merge probe batches into a single batch.
-            let merged_probe = if probe_batches.len() == 1 {
-                probe_batches.pop().unwrap()
-            } else {
-                let num_cols = probe_batches[0].num_columns();
-                let mut merged_cols = Vec::with_capacity(num_cols);
-                for col_idx in 0..num_cols {
-                    let type_id = probe_batches[0].columns[col_idx].type_id;
-                    let mut data = ColumnData::with_capacity(type_id, total_probe_rows);
-                    let mut nulls = NullBitmap::empty();
-                    for batch in &probe_batches {
-                        data.extend_from(&batch.columns[col_idx].data);
-                        nulls.extend_from(&batch.columns[col_idx].nulls);
+            if self.build_batch.is_none() {
+                // An empty build side can match nothing. A probe-outer join
+                // still owes every probe row, null-padded on the build side.
+                if matches!(self.internal_join, JoinType::Right | JoinType::Full) {
+                    let swapped = self.swapped;
+                    for probe_batch in &probe_batches {
+                        let buf = self.output_buffer.as_mut().unwrap();
+                        for probe_row in 0..probe_batch.num_rows {
+                            if swapped {
+                                buf.push_left_null_right(probe_batch, probe_row);
+                            } else {
+                                buf.push_null_left_right(probe_batch, probe_row);
+                            }
+                            if buf.is_full() {
+                                let b = buf.flush(&self.left_types, &self.right_types);
+                                self.output_queue.push(b);
+                            }
+                        }
                     }
-                    merged_cols.push(Column::with_nulls(data, nulls, type_id));
+                    let buf = self.output_buffer.as_mut().unwrap();
+                    if !buf.is_empty() {
+                        let b = buf.flush(&self.left_types, &self.right_types);
+                        self.output_queue.push(b);
+                    }
                 }
-                DataBatch::new(merged_cols)
-            };
-            drop(probe_batches);
-            // Determine if we can use the fused probe path: single ColumnRef
-            // integer key, no nulls, no remaining condition. This computes
-            // hashes inline and probes the hash table in one pass with
-            // group-prefetch to hide L3 latency, eliminating the separate
-            // hash buffer allocation and extra passes.
-            let use_fused = self.remaining_condition.is_none()
-                && self.probe_key_col_indices.len() == 1
-                && self.probe_key_col_indices[0].is_some();
-
-            let fused_key_idx = if use_fused {
-                self.probe_key_col_indices[0]
-            } else {
-                None
-            };
-
-            let fused_col_no_nulls = fused_key_idx
-                .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
-                .unwrap_or(false);
-
-            // Materialize probe key columns once for value comparison after the
-            // hi32 hash match across every probe path.
-            let probe_keys = self.materialize_probe_keys(&merged_probe)?;
-
-            if fused_col_no_nulls {
-                let key_idx = fused_key_idx.unwrap();
-                let track_right = matches!(self.join_type, JoinType::Right | JoinType::Full);
-                let track_build = !self.build_matched.is_empty();
-
-                let mut build_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
-                let mut probe_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
-                let mut unmatched_probe: Vec<u32> =
-                    if track_right { Vec::new() } else { Vec::new() };
-
-                // Fused hash + probe with group-prefetch.
-                // Prefetch distance of 16 hides L3 latency for bucket lookups.
-                const PF: usize = 16;
-
-                macro_rules! fused_probe_prefetch {
-                    ($v:expr) => {{
-                        let n = $v.len();
-                        let mut pf_buf = [0u64; PF];
-                        let prime = PF.min(n);
-                        for i in 0..prime {
-                            pf_buf[i] = compute::hash_int($v[i] as u64);
-                            self.build_index.prefetch(pf_buf[i]);
-                        }
-
-                        for probe_row in 0..n {
-                            let hash = pf_buf[probe_row % PF];
-
-                            let ahead = probe_row + PF;
-                            if ahead < n {
-                                let h = compute::hash_int($v[ahead] as u64);
-                                pf_buf[ahead % PF] = h;
-                                self.build_index.prefetch(h);
-                            }
-
-                            let mut cursor = self.build_index.get(hash);
-                            let hash_hi32 = (hash >> 32) as u32;
-                            let mut matched = false;
-                            while cursor != u32::MAX {
-                                let (next, stored_hi32) = self.build_entries[cursor as usize];
-                                let build_row = cursor;
-                                cursor = next;
-                                if stored_hi32 != hash_hi32 {
-                                    continue;
-                                }
-                                if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
-                                    continue;
-                                }
-                                build_idx.push(build_row);
-                                probe_idx.push(probe_row as u32);
-                                matched = true;
-                                if track_build {
-                                    self.build_matched[build_row as usize] = true;
-                                }
-                            }
-                            if !matched && track_right {
-                                unmatched_probe.push(probe_row as u32);
-                            }
-                        }
-                    }};
+                self.finished = true;
+                if !self.output_queue.is_empty() {
+                    self.output_queue_idx = 1;
+                    let batch =
+                        std::mem::replace(&mut self.output_queue[0], DataBatch::new(Vec::new()));
+                    if self.output_queue_idx >= self.output_queue.len() {
+                        self.output_queue.clear();
+                        self.output_queue_idx = 0;
+                    }
+                    return Ok(Some(ExecutionBatch::new(batch)));
                 }
+                return Ok(None);
+            }
 
-                let col = &merged_probe.columns[key_idx];
-                match &col.data {
-                    ColumnData::Int64(v) => fused_probe_prefetch!(v),
-                    ColumnData::Int32(v) => fused_probe_prefetch!(v),
-                    ColumnData::Int16(v) => fused_probe_prefetch!(v),
-                    ColumnData::Int8(v) => fused_probe_prefetch!(v),
-                    ColumnData::UInt64(v) => fused_probe_prefetch!(v),
-                    ColumnData::UInt32(v) => fused_probe_prefetch!(v),
-                    ColumnData::UInt16(v) => fused_probe_prefetch!(v),
-                    ColumnData::UInt8(v) => fused_probe_prefetch!(v),
-                    _ => {
-                        // Non-integer fused path without prefetch (strings, etc).
-                        let probe_hashes = compute::hash_column_batch(
-                            &[&merged_probe.columns[key_idx]],
-                            total_probe_rows,
-                        );
+            for merged_probe in &probe_batches {
+                let total_probe_rows = merged_probe.num_rows;
+                // Determine if we can use the fused probe path: single ColumnRef
+                // integer key, no nulls, no remaining condition. This computes
+                // hashes inline and probes the hash table in one pass with
+                // group-prefetch to hide L3 latency, eliminating the separate
+                // hash buffer allocation and extra passes.
+                let use_fused = self.remaining_condition.is_none()
+                    && self.probe_key_col_indices.len() == 1
+                    && self.probe_key_col_indices[0].is_some();
+
+                let fused_key_idx = if use_fused {
+                    self.probe_key_col_indices[0]
+                } else {
+                    None
+                };
+
+                let fused_col_no_nulls = fused_key_idx
+                    .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
+                    .unwrap_or(false);
+
+                // Materialize probe key columns once for value comparison after the
+                // hi32 hash match across every probe path.
+                let probe_keys = self.materialize_probe_keys(merged_probe)?;
+
+                if fused_col_no_nulls {
+                    let key_idx = fused_key_idx.unwrap();
+                    let track_right =
+                        matches!(self.internal_join, JoinType::Right | JoinType::Full);
+                    let track_build = !self.build_matched.is_empty();
+
+                    let mut build_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
+                    let mut probe_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
+                    let mut unmatched_probe: Vec<u32> =
+                        if track_right { Vec::new() } else { Vec::new() };
+
+                    // Fused hash + probe with group-prefetch.
+                    // Prefetch distance of 16 hides L3 latency for bucket lookups.
+                    const PF: usize = 16;
+
+                    macro_rules! fused_probe_prefetch {
+                        ($v:expr) => {{
+                            let n = $v.len();
+                            let mut pf_buf = [0u64; PF];
+                            let prime = PF.min(n);
+                            for i in 0..prime {
+                                pf_buf[i] = compute::hash_int($v[i] as u64);
+                                self.build_index.prefetch(pf_buf[i]);
+                            }
+
+                            for probe_row in 0..n {
+                                let hash = pf_buf[probe_row % PF];
+
+                                let ahead = probe_row + PF;
+                                if ahead < n {
+                                    let h = compute::hash_int($v[ahead] as u64);
+                                    pf_buf[ahead % PF] = h;
+                                    self.build_index.prefetch(h);
+                                }
+
+                                let mut cursor = self.build_index.get(hash);
+                                let hash_hi32 = (hash >> 32) as u32;
+                                let mut matched = false;
+                                while cursor != u32::MAX {
+                                    let (next, stored_hi32) = self.build_entries[cursor as usize];
+                                    let build_row = cursor;
+                                    cursor = next;
+                                    if stored_hi32 != hash_hi32 {
+                                        continue;
+                                    }
+                                    if !self.keys_match(&probe_keys, build_row as usize, probe_row)
+                                    {
+                                        continue;
+                                    }
+                                    build_idx.push(build_row);
+                                    probe_idx.push(probe_row as u32);
+                                    matched = true;
+                                    if track_build {
+                                        self.build_matched[build_row as usize] = true;
+                                    }
+                                }
+                                if !matched && track_right {
+                                    unmatched_probe.push(probe_row as u32);
+                                }
+                            }
+                        }};
+                    }
+
+                    // The integer-hash probe is only valid when the build side
+                    // filled its buckets with the same integer hash. A build key
+                    // with NULLs or an expression key hashed generically, and a
+                    // probe hashing the same values differently would look up
+                    // buckets that were never filled, dropping every match
+                    let col = &merged_probe.columns[key_idx];
+                    match (&col.data, self.build_used_int_hash) {
+                        (ColumnData::Int64(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::Int32(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::Int16(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::Int8(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt64(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt32(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt16(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt8(v), true) => fused_probe_prefetch!(v),
+                        _ => {
+                            // Non-integer fused path without prefetch (strings,
+                            // decimals, and any probe whose build side hashed
+                            // generically). Hashes the materialized key column,
+                            // which carries any decimal alignment
+                            let probe_hashes = compute::hash_column_batch(
+                                &[probe_keys[0].as_ref()],
+                                total_probe_rows,
+                            );
+                            for probe_row in 0..total_probe_rows {
+                                let hash = probe_hashes[probe_row];
+                                let mut cursor = self.build_index.get(hash);
+                                let hash_hi32 = (hash >> 32) as u32;
+                                let mut matched = false;
+                                while cursor != u32::MAX {
+                                    let (next, stored_hi32) = self.build_entries[cursor as usize];
+                                    let build_row = cursor;
+                                    cursor = next;
+                                    if stored_hi32 != hash_hi32 {
+                                        continue;
+                                    }
+                                    if !self.keys_match(&probe_keys, build_row as usize, probe_row)
+                                    {
+                                        continue;
+                                    }
+                                    build_idx.push(build_row);
+                                    probe_idx.push(probe_row as u32);
+                                    matched = true;
+                                    if track_build {
+                                        self.build_matched[build_row as usize] = true;
+                                    }
+                                }
+                                if !matched && track_right {
+                                    unmatched_probe.push(probe_row as u32);
+                                }
+                            }
+                        }
+                    }
+
+                    // Accumulate matches into full-size output batches.
+                    self.append_matches(&build_idx, merged_probe, &probe_idx);
+
+                    // Emit unmatched probe rows for probe-outer joins. Pending
+                    // matches flush first so a row's position never depends on
+                    // which probe batch it came from.
+                    if !unmatched_probe.is_empty() {
+                        self.flush_pending_out();
+                        let swapped = self.swapped;
+                        let buf = self.output_buffer.as_mut().unwrap();
+                        for &pr in &unmatched_probe {
+                            if swapped {
+                                buf.push_left_null_right(merged_probe, pr as usize);
+                            } else {
+                                buf.push_null_left_right(merged_probe, pr as usize);
+                            }
+                            if buf.is_full() {
+                                self.output_queue
+                                    .push(buf.flush(&self.left_types, &self.right_types));
+                            }
+                        }
+                    }
+                } else {
+                    // Generic path: hash all probe keys, then probe. The
+                    // materialized probe key columns carry any decimal
+                    // alignment, so hashing them matches the build side
+                    let key_refs: Vec<&Column> = probe_keys.iter().map(|c| c.as_ref()).collect();
+                    let probe_hashes = if self.build_used_int_hash {
+                        // Build used hash_int for single integer key. Compute
+                        // matching hashes from the single probe key column.
+                        let col = key_refs[0];
+                        let mut hashes = Vec::with_capacity(total_probe_rows);
+                        macro_rules! hash_int_col {
+                            ($v:expr) => {
+                                for val in $v.iter() {
+                                    hashes.push(compute::hash_int(*val as u64));
+                                }
+                            };
+                        }
+                        match &col.data {
+                            ColumnData::Int64(v) => hash_int_col!(v),
+                            ColumnData::Int32(v) => hash_int_col!(v),
+                            ColumnData::Int16(v) => hash_int_col!(v),
+                            ColumnData::Int8(v) => hash_int_col!(v),
+                            ColumnData::UInt64(v) => hash_int_col!(v),
+                            ColumnData::UInt32(v) => hash_int_col!(v),
+                            ColumnData::UInt16(v) => hash_int_col!(v),
+                            ColumnData::UInt8(v) => hash_int_col!(v),
+                            _ => {
+                                hashes = compute::hash_column_batch(&key_refs, total_probe_rows);
+                            }
+                        }
+                        hashes
+                    } else {
+                        compute::hash_column_batch(&key_refs, total_probe_rows)
+                    };
+
+                    if self.remaining_condition.is_some() {
+                        let swapped = self.swapped;
+                        let track_right =
+                            matches!(self.internal_join, JoinType::Right | JoinType::Full);
+                        let build_key_columns = &self.build_key_columns;
+                        let buf = self.output_buffer.as_mut().unwrap();
+                        let build = self.build_batch.as_ref().unwrap();
                         for probe_row in 0..total_probe_rows {
                             let hash = probe_hashes[probe_row];
                             let mut cursor = self.build_index.get(hash);
@@ -1023,192 +1382,85 @@ impl Operator for HashJoinOperator {
                                 if stored_hi32 != hash_hi32 {
                                     continue;
                                 }
-                                if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
+                                if !keys_match_columns(
+                                    build_key_columns,
+                                    &probe_keys,
+                                    build_row as usize,
+                                    probe_row,
+                                ) {
                                     continue;
                                 }
-                                build_idx.push(build_row);
-                                probe_idx.push(probe_row as u32);
-                                matched = true;
-                                if track_build {
-                                    self.build_matched[build_row as usize] = true;
+                                // The condition schema is external left then
+                                // right, so the combined row follows that order
+                                let combined = if swapped {
+                                    combine_rows_single(
+                                        merged_probe,
+                                        probe_row,
+                                        build,
+                                        build_row as usize,
+                                    )
+                                } else {
+                                    combine_rows_single(
+                                        build,
+                                        build_row as usize,
+                                        merged_probe,
+                                        probe_row,
+                                    )
+                                };
+                                let mask = evaluate(
+                                    self.remaining_condition.as_ref().unwrap(),
+                                    &combined,
+                                    &self.input_schema,
+                                    &[],
+                                )?;
+                                if !mask.is_null(0) && mask.get_bool(0) {
+                                    matched = true;
+                                    if !self.build_matched.is_empty() {
+                                        self.build_matched[build_row as usize] = true;
+                                    }
+                                    if swapped {
+                                        buf.push_matched(
+                                            merged_probe,
+                                            probe_row,
+                                            build,
+                                            build_row as usize,
+                                        );
+                                    } else {
+                                        buf.push_matched(
+                                            build,
+                                            build_row as usize,
+                                            merged_probe,
+                                            probe_row,
+                                        );
+                                    }
+                                    if buf.is_full() {
+                                        self.output_queue
+                                            .push(buf.flush(&self.left_types, &self.right_types));
+                                    }
                                 }
                             }
                             if !matched && track_right {
-                                unmatched_probe.push(probe_row as u32);
-                            }
-                        }
-                    }
-                }
-
-                // Gather output into large batches (avoids 49x per-batch overhead).
-                let build = self.build_batch.as_ref().unwrap();
-                let total_matched = build_idx.len();
-                let mut offset = 0;
-                while offset < total_matched {
-                    let end = (offset + BATCH_SIZE).min(total_matched);
-                    let bi = &build_idx[offset..end];
-                    let pi = &probe_idx[offset..end];
-                    let n = end - offset;
-
-                    let mut cols =
-                        Vec::with_capacity(build.num_columns() + merged_probe.num_columns());
-                    for col in &build.columns {
-                        let mut d = ColumnData::with_capacity(col.type_id, n);
-                        d.gather_from(&col.data, bi);
-                        if col.nulls.has_nulls() {
-                            let mut nulls = NullBitmap::empty();
-                            nulls.gather_from(&col.nulls, bi);
-                            cols.push(Column::with_nulls(d, nulls, col.type_id));
-                        } else {
-                            cols.push(Column::new(d, col.type_id));
-                        }
-                    }
-                    for col in &merged_probe.columns {
-                        let mut d = ColumnData::with_capacity(col.type_id, n);
-                        d.gather_from(&col.data, pi);
-                        if col.nulls.has_nulls() {
-                            let mut nulls = NullBitmap::empty();
-                            nulls.gather_from(&col.nulls, pi);
-                            cols.push(Column::with_nulls(d, nulls, col.type_id));
-                        } else {
-                            cols.push(Column::new(d, col.type_id));
-                        }
-                    }
-                    self.output_queue.push(DataBatch::new(cols));
-                    offset = end;
-                }
-
-                // Emit unmatched probe rows for RIGHT/FULL join.
-                if !unmatched_probe.is_empty() {
-                    let buf = self.output_buffer.as_mut().unwrap();
-                    for &pr in &unmatched_probe {
-                        buf.push_null_left_right(&merged_probe, pr as usize);
-                        if buf.is_full() {
-                            self.output_queue
-                                .push(buf.flush(&self.left_types, &self.right_types));
-                        }
-                    }
-                }
-            } else {
-                // Generic path: hash all probe keys, then probe.
-                let mut owned_probe_keys: Vec<Column> = Vec::new();
-                for (ki, src) in self.probe_key_col_indices.iter().enumerate() {
-                    if src.is_none() {
-                        let col =
-                            evaluate(&self.right_keys[ki], &merged_probe, &self.right_schema, &[])?;
-                        owned_probe_keys.push(col);
-                    }
-                }
-                let mut owned_idx = 0;
-                let key_refs: Vec<&Column> = self
-                    .probe_key_col_indices
-                    .iter()
-                    .map(|src| match src {
-                        Some(idx) => &merged_probe.columns[*idx],
-                        None => {
-                            let col = &owned_probe_keys[owned_idx];
-                            owned_idx += 1;
-                            col
-                        }
-                    })
-                    .collect();
-                let probe_hashes = if self.build_used_int_hash {
-                    // Build used hash_int for single integer key. Compute
-                    // matching hashes from the single probe key column.
-                    let col = key_refs[0];
-                    let mut hashes = Vec::with_capacity(total_probe_rows);
-                    macro_rules! hash_int_col {
-                        ($v:expr) => {
-                            for val in $v.iter() {
-                                hashes.push(compute::hash_int(*val as u64));
-                            }
-                        };
-                    }
-                    match &col.data {
-                        ColumnData::Int64(v) => hash_int_col!(v),
-                        ColumnData::Int32(v) => hash_int_col!(v),
-                        ColumnData::Int16(v) => hash_int_col!(v),
-                        ColumnData::Int8(v) => hash_int_col!(v),
-                        ColumnData::UInt64(v) => hash_int_col!(v),
-                        ColumnData::UInt32(v) => hash_int_col!(v),
-                        ColumnData::UInt16(v) => hash_int_col!(v),
-                        ColumnData::UInt8(v) => hash_int_col!(v),
-                        _ => {
-                            hashes = compute::hash_column_batch(&key_refs, total_probe_rows);
-                        }
-                    }
-                    hashes
-                } else {
-                    compute::hash_column_batch(&key_refs, total_probe_rows)
-                };
-
-                if self.remaining_condition.is_some() {
-                    let build_key_columns = &self.build_key_columns;
-                    let buf = self.output_buffer.as_mut().unwrap();
-                    let build = self.build_batch.as_ref().unwrap();
-                    for probe_row in 0..total_probe_rows {
-                        let hash = probe_hashes[probe_row];
-                        let mut cursor = self.build_index.get(hash);
-                        let hash_hi32 = (hash >> 32) as u32;
-                        let mut matched = false;
-                        while cursor != u32::MAX {
-                            let (next, stored_hi32) = self.build_entries[cursor as usize];
-                            let build_row = cursor;
-                            cursor = next;
-                            if stored_hi32 != hash_hi32 {
-                                continue;
-                            }
-                            if !keys_match_columns(
-                                build_key_columns,
-                                &probe_keys,
-                                build_row as usize,
-                                probe_row,
-                            ) {
-                                continue;
-                            }
-                            let combined = combine_rows_single(
-                                build,
-                                build_row as usize,
-                                &merged_probe,
-                                probe_row,
-                            );
-                            let mask = evaluate(
-                                self.remaining_condition.as_ref().unwrap(),
-                                &combined,
-                                &self.input_schema,
-                                &[],
-                            )?;
-                            if !mask.is_null(0) && mask.get_bool(0) {
-                                matched = true;
-                                if !self.build_matched.is_empty() {
-                                    self.build_matched[build_row as usize] = true;
+                                if swapped {
+                                    buf.push_left_null_right(merged_probe, probe_row);
+                                } else {
+                                    buf.push_null_left_right(merged_probe, probe_row);
                                 }
-                                buf.push_matched(
-                                    build,
-                                    build_row as usize,
-                                    &merged_probe,
-                                    probe_row,
-                                );
                                 if buf.is_full() {
                                     self.output_queue
                                         .push(buf.flush(&self.left_types, &self.right_types));
                                 }
                             }
                         }
-                        if !matched && matches!(self.join_type, JoinType::Right | JoinType::Full) {
-                            buf.push_null_left_right(&merged_probe, probe_row);
-                            if buf.is_full() {
-                                self.output_queue
-                                    .push(buf.flush(&self.left_types, &self.right_types));
-                            }
-                        }
+                    } else {
+                        let batches =
+                            self.probe_batch_vectorized(merged_probe, &probe_hashes, &probe_keys);
+                        self.output_queue.extend(batches);
                     }
-                } else {
-                    let batches =
-                        self.probe_batch_vectorized(&merged_probe, &probe_hashes, &probe_keys);
-                    self.output_queue.extend(batches);
                 }
             }
+
+            // Emit whatever matched rows are still accumulating.
+            self.flush_pending_out();
 
             // Flush remaining buffered rows.
             let buf = self.output_buffer.as_mut().unwrap();
@@ -1217,7 +1469,7 @@ impl Operator for HashJoinOperator {
                     .push(buf.flush(&self.left_types, &self.right_types));
             }
 
-            if matches!(self.join_type, JoinType::Left | JoinType::Full) {
+            if matches!(self.internal_join, JoinType::Left | JoinType::Full) {
                 self.emitting_unmatched_build = true;
             } else {
                 self.finished = true;
@@ -1447,6 +1699,35 @@ impl ParallelHashJoinOperator {
         Ok(())
     }
 
+    /// Per-key decimal alignment target derived from the bound key
+    /// expressions alone, so both sides of the partitioner compute the same
+    /// scale and equal numbers land in the same partition. The serial join
+    /// inside each partition aligns again for its own hashing
+    fn static_key_align_scales(&self) -> Vec<Option<u8>> {
+        self.left_keys
+            .iter()
+            .zip(self.right_keys.iter())
+            .map(|(l, r)| {
+                let ld = l.type_id() == TypeId::Decimal;
+                let rd = r.type_id() == TypeId::Decimal;
+                if !ld && !rd {
+                    return None;
+                }
+                let ls = if ld {
+                    l.fractional_digits().unwrap_or(0)
+                } else {
+                    0
+                };
+                let rs = if rd {
+                    r.fractional_digits().unwrap_or(0)
+                } else {
+                    0
+                };
+                Some(ls.max(rs))
+            })
+            .collect()
+    }
+
     /// Partition index per build row, casting each key to the common type it
     /// shares with the matching probe key so equal values hash identically.
     fn partition_rows(
@@ -1458,7 +1739,8 @@ impl ParallelHashJoinOperator {
         part_count: usize,
     ) -> Result<Vec<Vec<u32>>> {
         let common_types = self.key_common_types(build, keys, schema, probe)?;
-        let hashes = hash_keys(build, keys, schema, &common_types)?;
+        let align = self.static_key_align_scales();
+        let hashes = hash_keys(build, keys, schema, &common_types, &align)?;
         Ok(bucket_indices(&hashes, part_count))
     }
 
@@ -1471,7 +1753,8 @@ impl ParallelHashJoinOperator {
         part_count: usize,
     ) -> Result<Vec<Vec<u32>>> {
         let common_types = self.probe_common_types(probe, keys, schema)?;
-        let hashes = hash_keys(probe, keys, schema, &common_types)?;
+        let align = self.static_key_align_scales();
+        let hashes = hash_keys(probe, keys, schema, &common_types, &align)?;
         Ok(bucket_indices(&hashes, part_count))
     }
 
@@ -1561,14 +1844,21 @@ async fn merge_drained(mut op: Box<dyn Operator>) -> Result<Option<DataBatch>> {
     let num_cols = batches[0].num_columns();
     let mut cols = Vec::with_capacity(num_cols);
     for c in 0..num_cols {
-        let type_id = batches[0].columns[c].type_id;
+        let template = &batches[0].columns[c];
+        let type_id = template.type_id;
+        let fractional_digits = template.fractional_digits;
         let mut data = ColumnData::with_capacity(type_id, total);
         let mut nulls = NullBitmap::empty();
         for b in &batches {
             data.extend_from(&b.columns[c].data);
             nulls.extend_from(&b.columns[c].nulls);
         }
-        cols.push(Column::with_nulls(data, nulls, type_id));
+        cols.push(Column::with_nulls_ts(
+            data,
+            nulls,
+            type_id,
+            fractional_digits,
+        ));
     }
     Ok(Some(DataBatch::new(cols)))
 }
@@ -1586,11 +1876,17 @@ fn hash_keys(
     keys: &[BoundExpr],
     schema: &[LogicalColumn],
     common_types: &[TypeId],
+    align_scales: &[Option<u8>],
 ) -> Result<Vec<u64>> {
     let mut key_cols: Vec<Column> = Vec::with_capacity(keys.len());
     for (i, k) in keys.iter().enumerate() {
         let col = evaluate(k, batch, schema, &[])?;
-        let col = if col.type_id != common_types[i] {
+        // A key with a decimal side hashes as Int128 on the aligned scale,
+        // the same layout both sides convert to, so equal numbers share a
+        // partition regardless of declared scale or integer width
+        let col = if let Some(scale) = align_scales.get(i).copied().flatten() {
+            compute::cast_column_to_decimal(&col, scale)?
+        } else if col.type_id != common_types[i] {
             compute::cast_column(&col, common_types[i])?
         } else {
             col
@@ -1669,7 +1965,7 @@ mod parallel_join_tests {
             name: name.to_string(),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -1679,7 +1975,7 @@ mod parallel_join_tests {
             column_id: ColumnId(col),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 

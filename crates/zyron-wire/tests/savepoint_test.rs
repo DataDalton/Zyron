@@ -32,24 +32,13 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
-        .await
-        .expect("disk"),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .expect("disk"),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
         Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).expect("storage"));
     let cache = Arc::new(CatalogCache::new(256, 64));
@@ -71,6 +60,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -123,6 +116,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -162,9 +159,15 @@ async fn exec_autocommit(server: &Arc<ServerState>, session: &mut Option<Session
         return;
     }
 
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .expect("plan");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .expect("plan");
     let mut txn = server
         .txn_manager
         .begin(IsolationLevel::ReadCommitted)
@@ -188,6 +191,7 @@ fn build_ctx(server: &Arc<ServerState>, txn: &Transaction) -> Arc<ExecutionConte
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
     ctx.undo_log = Some(txn.undo_log());
     ctx.read_only = txn.read_only();
     Arc::new(ctx)
@@ -205,9 +209,15 @@ async fn try_exec_in_txn(
         .into_iter()
         .next()
         .expect("one statement");
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .expect("plan");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .expect("plan");
     let ctx = build_ctx(server, txn);
     zyron_executor::execute(plan, &ctx).await
 }
@@ -220,9 +230,15 @@ async fn exec_in_txn(server: &Arc<ServerState>, txn: &Transaction, sql: &str) ->
         .into_iter()
         .next()
         .expect("one statement");
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .expect("plan");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .expect("plan");
     let ctx = build_ctx(server, txn);
     zyron_executor::execute(plan, &ctx).await.expect("execute")
 }
@@ -248,6 +264,11 @@ async fn rollback_to_savepoint(server: &Arc<ServerState>, txn: &mut Transaction,
                 fsm_file_id,
                 tid,
             } => (*heap_file_id, *fsm_file_id, *tid, false),
+            // this suite drives heap tables only, columnar undo is covered by
+            // columnar_dml_parity_test in zyron-server
+            UndoEntry::ColumnarSupersede { .. } | UndoEntry::ColumnarPatch { .. } => {
+                panic!("heap only suite recorded a columnar undo entry")
+            }
         };
         let heap = HeapFile::new(
             Arc::clone(&server.disk_manager),
@@ -547,8 +568,13 @@ async fn locks_after_savepoint_are_released_on_rollback() {
     let lt = server.txn_manager.lock_table();
     let table = server.catalog.get_table(_schema, "t").expect("table");
     let pre_rid = zyron_storage::TupleId::new(zyron_common::page::PageId::new(0, 0), 0);
-    lt.lock_row(txn.txn_id(), table.id.0, pre_rid)
-        .expect("pre lock");
+    lt.lock_row(
+        txn.txn_id(),
+        table.id.0,
+        pre_rid.locator(),
+        zyron_storage::LockMode::Exclusive,
+    )
+    .expect("pre lock");
     let before = lt.current_count(txn.txn_id());
 
     savepoint(&server, &mut txn, "sp1");
@@ -557,13 +583,15 @@ async fn locks_after_savepoint_are_released_on_rollback() {
     lt.lock_row(
         txn.txn_id(),
         table.id.0,
-        zyron_storage::TupleId::new(zyron_common::page::PageId::new(0, 0), 5),
+        zyron_storage::TupleId::new(zyron_common::page::PageId::new(0, 0), 5).locator(),
+        zyron_storage::LockMode::Exclusive,
     )
     .expect("lock 5");
     lt.lock_row(
         txn.txn_id(),
         table.id.0,
-        zyron_storage::TupleId::new(zyron_common::page::PageId::new(0, 0), 6),
+        zyron_storage::TupleId::new(zyron_common::page::PageId::new(0, 0), 6).locator(),
+        zyron_storage::LockMode::Exclusive,
     )
     .expect("lock 6");
     assert_eq!(lt.current_count(txn.txn_id()), before + 2);

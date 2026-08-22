@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -40,6 +40,31 @@ pub enum VaultAuth {
 struct VaultToken {
     token: String,
     ttl: Duration,
+    /// When the lease started. Vault reports a duration rather than an
+    /// instant, so the clock reading has to be taken here to know when the
+    /// token stops working
+    acquired: Instant,
+}
+
+/// How much of a lease to leave unused before re-authenticating.
+///
+/// A token handed to a request that expires while the request is in flight
+/// fails just as surely as an expired one, so renewal happens early. The
+/// larger of a tenth of the lease and this floor gives short leases a usable
+/// margin without renewing constantly on long ones.
+const VAULT_RENEW_FLOOR: Duration = Duration::from_secs(30);
+
+impl VaultToken {
+    /// Whether this token has enough lease left to be worth handing out.
+    fn is_usable(&self) -> bool {
+        let margin = (self.ttl / 10).max(VAULT_RENEW_FLOOR);
+        // A lease shorter than the margin is renewed on every use, which is
+        // the correct behaviour for one that brief
+        match self.ttl.checked_sub(margin) {
+            Some(usable) => self.acquired.elapsed() < usable,
+            None => false,
+        }
+    }
 }
 
 /// Fetches a secret from HashiCorp Vault. For KV v2 the caller sets `path` to
@@ -86,14 +111,25 @@ impl VaultProvider {
         self
     }
 
+    /// Returns a usable Vault token, re-authenticating when the cached
+    /// lease is spent.
+    ///
+    /// Vault leases expire. Holding the first token forever means every
+    /// secret read starts failing once the lease runs out and keeps failing
+    /// until the process restarts, so the cache is only a cache while the
+    /// lease it holds is still good.
     async fn acquire_token(&self) -> Result<VaultToken> {
-        if let Some(ref t) = *self.token_cache.read() {
+        if let Some(t) = self.token_cache.read().as_ref().filter(|t| t.is_usable()) {
             return Ok(t.clone());
         }
         let token = match &self.auth_method {
+            // An operator-supplied token is whatever they configured. Its
+            // lease is not this process's to know, so the configured default
+            // decides how often it is re-read rather than renewed
             VaultAuth::Token(t) => VaultToken {
                 token: t.clone(),
                 ttl: self.default_ttl,
+                acquired: Instant::now(),
             },
             VaultAuth::AppRole { role_id, secret_id } => {
                 let url = format!(
@@ -177,6 +213,7 @@ async fn parse_vault_login(resp: reqwest::Response) -> Result<VaultToken> {
     Ok(VaultToken {
         token,
         ttl: Duration::from_secs(ttl_secs.max(1)),
+        acquired: Instant::now(),
     })
 }
 
@@ -829,5 +866,48 @@ mod tests {
         let map = extract_object_fields(body, &["data", "data"]);
         assert_eq!(map.get("a").map(|s| s.as_str()), Some("1"));
         assert_eq!(map.get("b").map(|s| s.as_str()), Some("2"));
+    }
+}
+
+#[cfg(test)]
+mod vault_token_tests {
+    use super::*;
+
+    fn token(ttl_secs: u64, age_secs: u64) -> VaultToken {
+        VaultToken {
+            token: "s.abc".into(),
+            ttl: Duration::from_secs(ttl_secs),
+            acquired: Instant::now() - Duration::from_secs(age_secs),
+        }
+    }
+
+    /// A cached token is reused while its lease has room left, and dropped
+    /// before the lease runs out rather than after, because a token that
+    /// expires mid-request fails the request
+    #[test]
+    fn test_a_token_is_renewed_before_its_lease_runs_out() {
+        // Hour-long lease, six minute margin: fresh is fine, 53 minutes in is
+        // fine, 55 minutes in is inside the margin
+        assert!(token(3600, 0).is_usable());
+        assert!(token(3600, 53 * 60).is_usable());
+        assert!(!token(3600, 55 * 60).is_usable(), "renew before expiry");
+        assert!(
+            !token(3600, 3600).is_usable(),
+            "an expired lease is not usable"
+        );
+        assert!(
+            !token(3600, 7200).is_usable(),
+            "a lease long past its end is not usable"
+        );
+
+        // The floor governs short leases: a 60 second lease has a 30 second
+        // margin, so it is good for the first half only
+        assert!(token(60, 0).is_usable());
+        assert!(!token(60, 45).is_usable());
+
+        // A lease no longer than the margin is re-acquired every time, which
+        // is the only safe reading of a lease that brief
+        assert!(!token(30, 0).is_usable());
+        assert!(!token(1, 0).is_usable());
     }
 }

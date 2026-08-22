@@ -1,0 +1,106 @@
+{
+  "id": "2026-08-15_025439_2848e81-local",
+  "date": "2026-08-15 02:55:21Z",
+  "ts": 1786762521,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Server Startup": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 10.69 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 11.10 },
+      "Cold start latency (ms)": {
+        "average": 193.774960,
+        "runs": [197.72, 190.79, 186.66, 200.01, 193.70],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Warm start latency (ms)": {
+        "average": 183.868600,
+        "runs": [187.95, 182.13, 187.45, 180.60, 181.20],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 10.93 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 11.25 },
+      "Checkpoint latency (ms)": {
+        "average": 0.289600,
+        "runs": [0.30, 0.26, 0.34, 0.26, 0.29],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 11.16 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 11.16 },
+      "Metrics scrape latency (us)": {
+        "average": 42.760000,
+        "runs": [112.30, 27.80, 25.60, 24.20, 23.90],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Health Checks": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 11.16 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 11.16 },
+      "Health check latency (us)": {
+        "average": 3451.460000,
+        "runs": [16322.90, 261.00, 227.90, 221.70, 223.80],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Crash Recovery": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 11.15 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 11.16 },
+      "1MB WAL recovery latency (ms)": {
+        "average": 12.201720,
+        "runs": [13.24, 11.49, 12.29, 12.40, 11.59],
+        "target": 10.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Clean recovery latency (ms)": {
+        "average": 1.781460,
+        "runs": [5.94, 0.62, 0.88, 0.63, 0.84],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "End-to-End Wire": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 11.17 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 11.32 },
+      "Handshake latency (us)": {
+        "average": 3483.213600,
+        "runs": [3105.24, 7144.44, 3514.54, 1463.91, 2187.93],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Graceful Shutdown": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 11.31 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 11.52 },
+      "Shutdown latency (ms)": {
+        "average": 0.256900,
+        "runs": [0.26, 0.26, 0.25, 0.26, 0.26],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

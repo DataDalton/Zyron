@@ -283,6 +283,7 @@ mod tests {
 
     #[test]
     fn missing_jwt_emits_endpoint_auth_failed_audit() {
+        let _tracing_guard = crate::test_sync::TRACING_TESTS.lock();
         let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(SharedBuf(buf.clone()))

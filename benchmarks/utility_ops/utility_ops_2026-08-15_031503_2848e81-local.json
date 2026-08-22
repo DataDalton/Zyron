@@ -1,0 +1,87 @@
+{
+  "id": "2026-08-15_031503_2848e81-local",
+  "date": "2026-08-15 03:15:31Z",
+  "ts": 1786763731,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Performance": {
+      "CRC32C 1 GB (GB/sec)": {
+        "average": 2.498765,
+        "runs": [2.75, 2.54, 2.54, 2.25, 2.42],
+        "target": 12.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "xxHash64 1 GB (GB/sec)": {
+        "average": 0.391919,
+        "runs": [0.39, 0.39, 0.39, 0.39, 0.39],
+        "target": 16.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "DETECT_MIME_TYPE (ns)": {
+        "average": 65.309400,
+        "runs": [64.78, 66.98, 65.25, 64.59, 64.94],
+        "target": 400.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "JSON Diff 1 KB (us)": {
+        "average": 73.672102,
+        "runs": [73.68, 73.73, 73.63, 73.63, 73.68],
+        "target": 12.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "JSON Patch 1 KB (us)": {
+        "average": 41.791288,
+        "runs": [41.82, 41.91, 41.60, 41.65, 41.98],
+        "target": 6.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "MARKDOWN_TO_HTML 10 KB (us)": {
+        "average": 695.793600,
+        "runs": [699.60, 695.22, 693.98, 693.38, 696.78],
+        "target": 300.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "natural_sort_key (ns)": {
+        "average": 305.700000,
+        "runs": [301.10, 302.00, 305.40, 309.80, 310.20],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "QR encode (ms)": {
+        "average": 0.556060,
+        "runs": [0.55, 0.56, 0.55, 0.56, 0.56],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Rate limit check (ns)": {
+        "average": 633.495800,
+        "runs": [628.39, 658.80, 628.04, 621.05, 631.19],
+        "target": 50.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Text Diff 10K lines (ms)": {
+        "average": 2.035020,
+        "runs": [2.14, 2.03, 1.99, 2.00, 2.01],
+        "target": 50.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

@@ -230,12 +230,14 @@ mod tests {
     #[tokio::test]
     async fn mock_success() {
         let server = MockServer::start_async().await;
-        let m = server.mock_async(|when, then| {
-            when.method(POST).path("/token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .body(r#"{"access_token":"tok1","token_type":"Bearer","expires_in":120}"#);
-        }).await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/token");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"access_token":"tok1","token_type":"Bearer","expires_in":120}"#);
+            })
+            .await;
 
         let provider = OAuth2ClientCredentialsProvider::new(
             server.url("/token"),
@@ -254,10 +256,12 @@ mod tests {
     #[tokio::test]
     async fn mock_401_returns_auth_error() {
         let server = MockServer::start_async().await;
-        let _m = server.mock_async(|when, then| {
-            when.method(POST).path("/token");
-            then.status(401).body(r#"{"error":"invalid_client"}"#);
-        }).await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/token");
+                then.status(401).body(r#"{"error":"invalid_client"}"#);
+            })
+            .await;
         let provider = OAuth2ClientCredentialsProvider::new(
             server.url("/token"),
             "cid".to_string(),
@@ -273,10 +277,12 @@ mod tests {
     #[tokio::test]
     async fn mock_500_returns_auth_error() {
         let server = MockServer::start_async().await;
-        let _m = server.mock_async(|when, then| {
-            when.method(POST).path("/token");
-            then.status(500).body("boom");
-        }).await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/token");
+                then.status(500).body("boom");
+            })
+            .await;
         let provider = OAuth2ClientCredentialsProvider::new(
             server.url("/token"),
             "cid".to_string(),
@@ -291,10 +297,12 @@ mod tests {
     #[tokio::test]
     async fn mock_bad_json_errors() {
         let server = MockServer::start_async().await;
-        let _m = server.mock_async(|when, then| {
-            when.method(POST).path("/token");
-            then.status(200).body("not json");
-        }).await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/token");
+                then.status(200).body("not json");
+            })
+            .await;
         let provider = OAuth2ClientCredentialsProvider::new(
             server.url("/token"),
             "cid".to_string(),

@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" width="100%" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-label="Zyron mesh deployment topology">
+  <title>Zyron mesh deployment topology</title>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="620" fill="#0d1117" rx="6"/>
+
+  <!-- Title -->
+  <text x="480" y="32" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="600">Zyron mesh · Nodes peer over the wire · Any client can hit any node</text>
+
+  <!-- Client boxes -->
+  <rect x="180" y="60" width="240" height="50" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="300" y="90" text-anchor="middle" fill="#e6edf3" font-size="13">App · Browser</text>
+
+  <rect x="540" y="60" width="240" height="50" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="660" y="90" text-anchor="middle" fill="#e6edf3" font-size="13">psql · Drivers · SDKs</text>
+
+  <!-- Client-to-node arrows (solid) -->
+  <g stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arrow)">
+    <line x1="300" y1="112" x2="300" y2="196"/>
+    <line x1="660" y1="112" x2="660" y2="196"/>
+    <line x1="380" y1="112" x2="580" y2="196" opacity="0.45"/>
+    <line x1="580" y1="112" x2="380" y2="196" opacity="0.45"/>
+  </g>
+
+  <!-- Mesh boundary label -->
+  <rect x="140" y="180" width="680" height="290" rx="8" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="150" y="196" fill="#8b949e" font-size="11">Zyron mesh</text>
+
+  <!-- Peer edges (drawn first, nodes cover their endpoints) -->
+  <g stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,4" fill="none">
+    <!-- top horizontal: TL <-> TR -->
+    <line x1="300" y1="235" x2="660" y2="235"/>
+    <!-- bottom horizontal: BL <-> BR -->
+    <line x1="300" y1="415" x2="660" y2="415"/>
+    <!-- left vertical: TL <-> BL -->
+    <line x1="300" y1="235" x2="300" y2="415"/>
+    <!-- right vertical: TR <-> BR -->
+    <line x1="660" y1="235" x2="660" y2="415"/>
+    <!-- diagonal: TL <-> BR -->
+    <line x1="300" y1="235" x2="660" y2="415"/>
+    <!-- anti-diagonal: TR <-> BL -->
+    <line x1="660" y1="235" x2="300" y2="415"/>
+  </g>
+
+  <!-- Peer edge label (one, centered, to explain the dashed lines) -->
+  <rect x="440" y="315" width="80" height="20" fill="#0d1117" rx="3"/>
+  <text x="480" y="329" text-anchor="middle" fill="#8b949e" font-size="10">Peer</text>
+
+  <!-- Nodes (drawn after edges so they mask the line endpoints) -->
+  <!-- Top-left: DB only -->
+  <rect x="210" y="200" width="180" height="70" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="300" y="228" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Database node</text>
+  <text x="300" y="250" text-anchor="middle" fill="#a371f7" font-size="12">Row heap · .zyr</text>
+
+  <!-- Top-right: Embedded -->
+  <rect x="570" y="200" width="180" height="70" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="660" y="228" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Embedded node</text>
+  <text x="660" y="250" text-anchor="middle" fill="#a371f7" font-size="12">Zyron inside an app</text>
+
+  <!-- Bottom-left: DB + Lake -->
+  <rect x="210" y="380" width="180" height="70" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="300" y="408" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Database + lake</text>
+  <text x="300" y="430" text-anchor="middle" fill="#a371f7" font-size="12">Heap + lake tables</text>
+
+  <!-- Bottom-right: Lake reader -->
+  <rect x="570" y="380" width="180" height="70" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="660" y="408" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Lake reader</text>
+  <text x="660" y="430" text-anchor="middle" fill="#a371f7" font-size="12">Query-only, no writes</text>
+
+  <!-- Storage links: bottom-left and bottom-right nodes → object store -->
+  <g stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,4" fill="none">
+    <line x1="300" y1="452" x2="440" y2="530"/>
+    <line x1="660" y1="452" x2="520" y2="530"/>
+  </g>
+
+  <!-- Object-store cylinder -->
+  <g>
+    <ellipse cx="480" cy="530" rx="140" ry="14" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+    <path d="M 340,530 L 340,570 A 140,14 0 0 0 620,570 L 620,530" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+    <text x="480" y="556" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="600">Shared object store</text>
+    <text x="480" y="572" text-anchor="middle" fill="#8b949e" font-size="11">.zyr files · Transaction log</text>
+  </g>
+</svg>

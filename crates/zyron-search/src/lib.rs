@@ -14,9 +14,7 @@ pub use text::analyzer::{
 };
 pub use text::autocomplete::PrefixIndex;
 pub use text::highlight::{HighlightConfig, highlight};
-pub use text::inverted_index::{
-    DocId, InvertedIndex, Posting, PostingsList, TermInfo, decode_doc_id, encode_doc_id,
-};
+pub use text::inverted_index::{DocId, InvertedIndex, Posting, PostingsList, TermInfo};
 pub use text::manager::FtsManager;
 pub use text::query::{FtsQuery, FtsQueryParser};
 pub use text::scoring::{Bm25Scorer, FieldBoost, RelevanceScorer};

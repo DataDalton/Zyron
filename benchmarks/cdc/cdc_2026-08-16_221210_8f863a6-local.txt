@@ -1,0 +1,12 @@
+# suite:   cdc
+# run:     2026-08-16_221210_8f863a6-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Benchmark: CDF Insert Overhead ===
+  Insert overhead (ns/row) [PASS/OK]:
+    Runs: [44, 54, 46, 44, 46]
+    Average: 47 <= 100 (target)
+    Min/Max: 44 / 54, StdDev: 4

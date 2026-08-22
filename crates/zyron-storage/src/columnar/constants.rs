@@ -84,8 +84,23 @@ pub const SYS_COL_VALUE_SIZE: usize = 8;
 pub const ZYRPATCH_EXTENSION: &str = "zyrpatch";
 
 /// Magic bytes identifying a .zyrpatch log file.
-pub const ZYRPATCH_MAGIC: [u8; 8] = *b"ZYRPAT\0\0";
+pub const ZYRPATCH_MAGIC: [u8; 8] = *b"ZYRPT2\0\0";
 
 /// Patch log record kinds.
 pub const PATCH_KIND_VALUE: u8 = 1;
 pub const PATCH_KIND_SUPERSEDE: u8 = 2;
+
+/// Revokes one earlier value patch, written by ROLLBACK TO SAVEPOINT
+pub const PATCH_KIND_REVOKE_VALUE: u8 = 3;
+
+/// Revokes one earlier supersede, written by ROLLBACK TO SAVEPOINT
+pub const PATCH_KIND_REVOKE_SUPERSEDE: u8 = 4;
+
+/// Discards every overlay entry of one branch, written on DROP BRANCH and
+/// after MERGE BRANCH folds the branch rows into the main line
+pub const PATCH_KIND_BRANCH_CLEAR: u8 = 5;
+
+/// Copies one row's main line overlay into a branch, written before the
+/// branch's first write to that row so pre fork patches stay visible on
+/// the branch while later main line writes to the row do not
+pub const PATCH_KIND_BRANCH_COPY: u8 = 6;

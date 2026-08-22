@@ -1,0 +1,24 @@
+{
+  "id": "2026-08-16_220048_c4f1c07-local",
+  "date": "2026-08-16 22:00:50Z",
+  "ts": 1786917650,
+  "commit": "c4f1c07-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Connection Handshake": {
+      "Handshake latency (us)": {
+        "average": 428.864720,
+        "runs": [424.61, 450.77, 512.68, 401.65, 354.62],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    }
+  }
+}

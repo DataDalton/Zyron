@@ -1,0 +1,42 @@
+# suite:   temporal
+# run:     2026-08-17_022858_b64ac2a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Decode throughput: ps vs us full materialization ===
+  us decode rows/sec [PASS/OK]:
+    Runs: [798,084,597, 921,658,986, 785,854,617, 869,565,217, 899,685,110]
+    Average: 854,969,706 >= 1 (target)
+    Min/Max: 785,854,617 / 921,658,986, StdDev: 54,171,519
+  ps decode rows/sec [PASS/OK]:
+    Runs: [302,526,093, 305,903,946, 312,012,480, 302,663,438, 251,004,016]
+    Average: 294,821,995 >= 284,989,902 (target)
+    Min/Max: 251,004,016 / 312,012,480, StdDev: 22,177,372
+
+=== Irregular ps vs irregular us (matched shape) ===
+  us irregular ratio (raw:encoded) [PASS/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 >= 1 (target)
+    Min/Max: 3 / 3, StdDev: 0
+  ps irregular ratio (raw:encoded) [PASS/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 >= 1 (target)
+    Min/Max: 3 / 3, StdDev: 0
+
+=== sys_end ps sentinel column density ===
+  sentinel ps ratio (raw:encoded) [PASS/OK]:
+    Runs: [16, 16, 16, 16, 16]
+    Average: 16 >= 10 (target)
+    Min/Max: 16 / 16, StdDev: 0
+
+=== Regular series: ps vs us encoding ratio ===
+  us regular ratio (raw:encoded) [PASS/OK]:
+    Runs: [80,000, 80,000, 80,000, 80,000, 80,000]
+    Average: 80,000 >= 100 (target)
+    Min/Max: 80,000 / 80,000, StdDev: 0
+  ps regular ratio (raw:encoded) [PASS/OK]:
+    Runs: [80,000, 80,000, 80,000, 80,000, 80,000]
+    Average: 80,000 >= 40,000 (target)
+    Min/Max: 80,000 / 80,000, StdDev: 0

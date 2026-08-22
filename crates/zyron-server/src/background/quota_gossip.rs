@@ -116,6 +116,41 @@ impl HttpInboundQueue {
     }
 }
 
+/// Binds the inbound listener with the largest accept queue the platform
+/// allows. The queue holds connections the kernel has completed but the
+/// accept loop has not taken yet, and once it is full the kernel drops
+/// further handshakes instead of refusing them, so those peers stall for a
+/// retransmit timeout rather than failing fast. Passing the maximum lets the
+/// kernel apply its own limit rather than a number chosen here
+fn bind_listener(bind_addr: &str) -> Result<std::net::TcpListener, std::io::Error> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::ToSocketAddrs;
+
+    let addr = bind_addr.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("quota gossip bind address resolved to no socket address, {bind_addr}"),
+        )
+    })?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(i32::MAX)?;
+    Ok(socket.into())
+}
+
+/// Reads one gossip POST and answers it. Runs on a handler thread so the
+/// accept loop is never blocked by a peer that is slow to send its body.
+/// Read and write timeouts are already set on the socket by the accept loop
+fn serve_connection(mut stream: std::net::TcpStream, inbound: &Arc<HttpInboundQueue>) {
+    if let Some(frame) = read_http_post_json::<QuotaGossipFrameWire>(&mut stream) {
+        inbound.push(frame.into());
+        let _ = write_http_response(&mut stream, 200, "OK", b"");
+    } else {
+        let _ = write_http_response(&mut stream, 400, "Bad Request", b"");
+    }
+}
+
 /// HTTP/1.1 transport: POSTs JSON frames to each peer, accepts inbound POSTs
 /// on a configured bind address. Hand-rolled to avoid pulling in a full HTTP
 /// stack just for gossip
@@ -126,6 +161,10 @@ pub struct HttpQuotaGossipTransport {
     /// Listener thread handle so we can shut it down cleanly. Stored as Option
     /// because Drop takes ownership and join() consumes the JoinHandle
     listener: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Handler threads that serve accepted connections. The accept loop hands
+    /// each socket to one of these, so a peer that connects and then stalls
+    /// cannot hold up the peers queued behind it
+    handlers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
     listener_shutdown: Arc<AtomicBool>,
     /// Bound address (after binding "0.0.0.0:0" we discover the real port)
     pub bound_addr: std::net::SocketAddr,
@@ -136,8 +175,7 @@ impl HttpQuotaGossipTransport {
     /// The listener accepts POST requests at any path with a JSON body shaped
     /// like `{"source_replica_id":N, "generation":G, "entries":[["key",N], ...]}`
     pub fn start(config: HttpTransportConfig) -> Result<Self, std::io::Error> {
-        use std::net::TcpListener;
-        let listener = TcpListener::bind(&config.bind_addr)?;
+        let listener = bind_listener(&config.bind_addr)?;
         // Blocking accept, the thread sleeps in the kernel until a peer
         // connects rather than busy-polling at a fixed cadence. Shutdown
         // is signalled by connecting to the bound address from shutdown(),
@@ -146,15 +184,51 @@ impl HttpQuotaGossipTransport {
 
         let inbound = Arc::new(HttpInboundQueue::new());
         let shutdown = Arc::new(AtomicBool::new(false));
-
-        let inbound_for_thread = Arc::clone(&inbound);
-        let shutdown_for_thread = Arc::clone(&shutdown);
         let timeout = Duration::from_millis(config.timeout_ms);
 
+        // One handler per peer, so every peer can be served at once and none
+        // waits on another, bounded by the machine so a large peer list does
+        // not spawn more threads than there are cores to run them. The floor
+        // of two keeps a spare handler when the peer list is empty or unset,
+        // which is the case while a node is still discovering its peers
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let handler_count = config.peers.len().clamp(2, cores.max(2));
+
+        // Bounded hand-off. A burst deeper than the handlers can take is
+        // answered immediately rather than queued, because a gossip frame
+        // that waits behind a full queue is staler than one resent next round
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::net::TcpStream>(handler_count);
+        let rx = Arc::new(parking_lot::Mutex::new(rx));
+
+        let mut handlers = Vec::with_capacity(handler_count);
+        for i in 0..handler_count {
+            let rx = Arc::clone(&rx);
+            let inbound_for_handler = Arc::clone(&inbound);
+            let handle = std::thread::Builder::new()
+                .name(format!("zyron-quota-gossip-handler-{i}"))
+                .spawn(move || {
+                    loop {
+                        // The receiver lock is held only long enough to take a
+                        // socket, never across serving one
+                        let next = rx.lock().recv();
+                        match next {
+                            Ok(stream) => serve_connection(stream, &inbound_for_handler),
+                            // The sender dropped when the accept loop exited
+                            Err(_) => return,
+                        }
+                    }
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            handlers.push(handle);
+        }
+
+        let shutdown_for_thread = Arc::clone(&shutdown);
         let handle = std::thread::Builder::new()
             .name("zyron-quota-gossip-http".into())
             .spawn(move || {
-                Self::listener_loop(listener, inbound_for_thread, shutdown_for_thread, timeout);
+                Self::listener_loop(listener, tx, shutdown_for_thread, timeout);
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
@@ -163,6 +237,7 @@ impl HttpQuotaGossipTransport {
             timeout,
             inbound,
             listener: parking_lot::Mutex::new(Some(handle)),
+            handlers: parking_lot::Mutex::new(handlers),
             listener_shutdown: shutdown,
             bound_addr,
         })
@@ -170,14 +245,14 @@ impl HttpQuotaGossipTransport {
 
     fn listener_loop(
         listener: std::net::TcpListener,
-        inbound: Arc<HttpInboundQueue>,
+        handoff: std::sync::mpsc::SyncSender<std::net::TcpStream>,
         shutdown: Arc<AtomicBool>,
         timeout: Duration,
     ) {
         loop {
             // accept() blocks in the kernel, no CPU polling. shutdown()
             // wakes us by opening a connection to the bound address
-            let (mut stream, _peer) = match listener.accept() {
+            let (stream, _peer) = match listener.accept() {
                 Ok(pair) => pair,
                 Err(_) => return,
             };
@@ -186,11 +261,17 @@ impl HttpQuotaGossipTransport {
             }
             let _ = stream.set_read_timeout(Some(timeout));
             let _ = stream.set_write_timeout(Some(timeout));
-            if let Some(frame) = read_http_post_json::<QuotaGossipFrameWire>(&mut stream) {
-                inbound.push(frame.into());
-                let _ = write_http_response(&mut stream, 200, "OK", b"");
-            } else {
-                let _ = write_http_response(&mut stream, 400, "Bad Request", b"");
+            // Hand the socket to a handler and go straight back to accepting.
+            // Reading the request here instead would let one slow peer hold
+            // the accept queue for the whole read timeout
+            match handoff.try_send(stream) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(mut stream)) => {
+                    // Every handler is busy. Answering now keeps the accept
+                    // queue draining, and the peer resends on its next round
+                    let _ = write_http_response(&mut stream, 503, "Service Unavailable", b"");
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
             }
         }
     }
@@ -212,6 +293,11 @@ impl HttpQuotaGossipTransport {
             drop(stream);
         }
         if let Some(handle) = self.listener.lock().take() {
+            let _ = handle.join();
+        }
+        // The accept loop dropped the sender on its way out, so each handler
+        // sees the channel close and returns once it finishes its connection
+        for handle in self.handlers.lock().drain(..) {
             let _ = handle.join();
         }
     }

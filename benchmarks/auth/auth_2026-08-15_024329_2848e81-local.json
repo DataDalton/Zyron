@@ -1,0 +1,328 @@
+{
+  "id": "2026-08-15_024329_2848e81-local",
+  "date": "2026-08-15 02:44:23Z",
+  "ts": 1786761863,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "mtls_fingerprint_verify": {
+      "ops_per_sec": {
+        "average": 42321.075697,
+        "runs": [42321.08],
+        "target": 500000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "credential_cache_lookup": {
+      "ops_per_sec": {
+        "average": 1362986.095361,
+        "runs": [1362986.10],
+        "target": 3000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "api_key_throughput": {
+      "combined_ops_sec": {
+        "average": 386525.713623,
+        "runs": [386525.71],
+        "target": 100000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "security_map_resolve": {
+      "ops_per_sec": {
+        "average": 1693057.768993,
+        "runs": [1693057.77],
+        "target": 5000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "balloon_hash_timing": {
+      "hash_time_us": {
+        "average": 2445.000000,
+        "runs": [2445.00],
+        "target": 10.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "abac_evaluate": {
+      "latency_ns": {
+        "average": 273.056900,
+        "runs": [273.06],
+        "target": 2000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "jwt_encode_verify": {
+      "ops_per_sec": {
+        "average": 51530.812978,
+        "runs": [51530.81],
+        "target": 100000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "credential_seal": {
+      "ops_per_sec": {
+        "average": 94895.549418,
+        "runs": [94895.55],
+        "target": 300000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "credential_open": {
+      "ops_per_sec": {
+        "average": 142258.863047,
+        "runs": [142258.86],
+        "target": 300000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "challenge_response": {
+      "verify_latency_ms": {
+        "average": 2.427400,
+        "runs": [2.43],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "classification_check": {
+      "ops_sec": {
+        "average": 7346199.957686,
+        "runs": [7346199.96],
+        "target": 10000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "api_key_correctness": {
+      "lookup_ns": {
+        "average": 2062.936200,
+        "runs": [2062.94],
+        "target": 50000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "privilege_latency": {
+      "per_check_ns": {
+        "average": 157.817100,
+        "runs": [157.82],
+        "target": 80.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "column_mask_partial": {
+      "ops_per_sec": {
+        "average": 3343603.769579,
+        "runs": [3343603.77],
+        "target": 30000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "column_mask_hash": {
+      "ops_per_sec": {
+        "average": 1399041.656465,
+        "runs": [1399041.66],
+        "target": 15000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "concurrent_auth": {
+      "auth_per_sec": {
+        "average": 6861.741400,
+        "runs": [6861.74],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "concurrent_privilege": {
+      "scaling_factor": {
+        "average": 7.322733,
+        "runs": [7.32],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "data_mask": {
+      "email_ops_sec": {
+        "average": 3839596.995899,
+        "runs": [3839597.00],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "authenticated_encrypt": {
+      "gb_per_sec": {
+        "average": 0.113111,
+        "runs": [0.11],
+        "target": 4.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "authenticated_decrypt": {
+      "gb_per_sec": {
+        "average": 0.107792,
+        "runs": [0.11],
+        "target": 4.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "jwt_correctness": {
+      "verify_latency_us": {
+        "average": 8.657003,
+        "runs": [8.66],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "jwt_throughput": {
+      "combined_ops_sec": {
+        "average": 126875.376661,
+        "runs": [126875.38],
+        "target": 50000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "password_auth": {
+      "hash_time_ms": {
+        "average": 5012.190800,
+        "runs": [5012.19],
+        "target": 80.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "verify_time_ms": {
+        "average": 5041.814900,
+        "runs": [5041.81],
+        "target": 80.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "privilege_check": {
+      "ops_sec": {
+        "average": 6564212.438920,
+        "runs": [6564212.44],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "privilege_deny_wins": {
+      "deny_ops_sec": {
+        "average": 6518679.602334,
+        "runs": [6518679.60],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "rls_predicate_inject": {
+      "latency_ns": {
+        "average": 1668.302400,
+        "runs": [1668.30],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "role_hierarchy_correctness": {
+      "traversal_ns": {
+        "average": 1532.335000,
+        "runs": [1532.34],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "role_hierarchy": {
+      "traversal_us": {
+        "average": 4.011198,
+        "runs": [4.01],
+        "target": 10.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "security_label_check": {
+      "latency_ns": {
+        "average": 296.900700,
+        "runs": [296.90],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "governance_usage": {
+      "record_ops_sec": {
+        "average": 2454899.205521,
+        "runs": [2454899.21],
+        "target": 5000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "time_window": {
+      "eval_ops_sec": {
+        "average": 106847880.672287,
+        "runs": [106847880.67],
+        "target": 10000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "totp_correctness": {
+      "verify_ns": {
+        "average": 4614.606700,
+        "runs": [4614.61],
+        "target": 500000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "totp_throughput": {
+      "combined_ops_sec": {
+        "average": 288826.723750,
+        "runs": [288826.72],
+        "target": 500000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "webhook_signature_verify": {
+      "latency_us": {
+        "average": 6.918001,
+        "runs": [6.92],
+        "target": 20.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

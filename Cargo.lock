@@ -106,6 +106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "arrow"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -711,23 +723,17 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "h2 0.3.27",
- "h2 0.4.13",
- "http 0.2.12",
+ "h2",
  "http 1.4.0",
- "http-body 0.4.6",
- "hyper 0.14.32",
  "hyper 1.8.1",
- "hyper-rustls 0.24.2",
- "hyper-rustls 0.27.9",
+ "hyper-rustls",
  "hyper-util",
  "pin-project-lite",
- "rustls 0.21.12",
- "rustls 0.23.38",
+ "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tower",
  "tracing",
 ]
@@ -993,6 +999,20 @@ name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+
+[[package]]
+name = "blake3"
+version = "1.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
 
 [[package]]
 name = "block-buffer"
@@ -1341,6 +1361,12 @@ dependencies = [
  "once_cell",
  "tiny-keccak",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation"
@@ -2482,25 +2508,6 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.3.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0beca50380b1fc32983fc1cb4587bfa4bb9e78fc259aad4a0032d2080309222d"
-dependencies = [
- "bytes",
- "fnv",
- "futures-core",
- "futures-sink",
- "futures-util",
- "http 0.2.12",
- "indexmap 2.13.0",
- "slab",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
@@ -2738,7 +2745,6 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.3.27",
  "http 0.2.12",
  "http-body 0.4.6",
  "httparse",
@@ -2762,7 +2768,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
- "h2 0.4.13",
+ "h2",
  "http 1.4.0",
  "http-body 1.0.1",
  "httparse",
@@ -2776,21 +2782,6 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.24.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec3efd23720e2049821a693cbc7e65ea87c72f1c58ff2f9522ff332b1491e590"
-dependencies = [
- "futures-util",
- "http 0.2.12",
- "hyper 0.14.32",
- "log",
- "rustls 0.21.12",
- "tokio",
- "tokio-rustls 0.24.1",
-]
-
-[[package]]
-name = "hyper-rustls"
 version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
@@ -2798,10 +2789,10 @@ dependencies = [
  "http 1.4.0",
  "hyper 1.8.1",
  "hyper-util",
- "rustls 0.23.38",
+ "rustls",
  "rustls-native-certs",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tower-service",
  "webpki-roots",
 ]
@@ -4450,7 +4441,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.38",
+ "rustls",
  "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
@@ -4470,7 +4461,7 @@ dependencies = [
  "rand 0.9.2",
  "ring",
  "rustc-hash",
- "rustls 0.23.38",
+ "rustls",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -4751,21 +4742,21 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.8.1",
- "hyper-rustls 0.27.9",
+ "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.38",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -4917,18 +4908,6 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.21.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
-dependencies = [
- "log",
- "ring",
- "rustls-webpki 0.101.7",
- "sct",
-]
-
-[[package]]
-name = "rustls"
 version = "0.23.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
@@ -4937,7 +4916,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.12",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -4962,16 +4941,6 @@ checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
  "web-time",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.101.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
-dependencies = [
- "ring",
- "untrusted",
 ]
 
 [[package]]
@@ -5101,16 +5070,6 @@ dependencies = [
  "pbkdf2",
  "salsa20",
  "sha2 0.10.9",
-]
-
-[[package]]
-name = "sct"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
-dependencies = [
- "ring",
- "untrusted",
 ]
 
 [[package]]
@@ -5929,21 +5888,11 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
-dependencies = [
- "rustls 0.21.12",
- "tokio",
-]
-
-[[package]]
-name = "tokio-rustls"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.38",
+ "rustls",
  "tokio",
 ]
 
@@ -7036,6 +6985,7 @@ dependencies = [
  "mimalloc",
  "p256 0.13.2",
  "parking_lot",
+ "pbkdf2",
  "rand 0.10.0",
  "regex",
  "reqwest",
@@ -7060,6 +7010,12 @@ dependencies = [
 [[package]]
 name = "zyron-bench-harness"
 version = "0.3.0"
+dependencies = [
+ "zyron-buffer",
+ "zyron-common",
+ "zyron-storage",
+ "zyron-wal",
+]
 
 [[package]]
 name = "zyron-buffer"
@@ -7099,7 +7055,6 @@ dependencies = [
  "bytes",
  "chrono",
  "hex",
- "hmac 0.12.1",
  "parking_lot",
  "reqwest",
  "rskafka",
@@ -7110,6 +7065,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zyron-auth",
  "zyron-bench-harness",
  "zyron-buffer",
  "zyron-catalog",
@@ -7138,6 +7094,7 @@ dependencies = [
  "scc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "zyron-bench-harness",
 ]
@@ -7148,6 +7105,7 @@ version = "0.3.0"
 dependencies = [
  "zyron-common",
  "zyron-server",
+ "zyron-tpc",
 ]
 
 [[package]]
@@ -7160,18 +7118,33 @@ dependencies = [
  "scc",
  "serde_json",
  "tokio",
+ "tracing",
  "zyron-analytics",
  "zyron-auth",
  "zyron-bench-harness",
  "zyron-buffer",
  "zyron-catalog",
  "zyron-common",
+ "zyron-lake",
  "zyron-parser",
  "zyron-planner",
  "zyron-search",
  "zyron-storage",
  "zyron-types",
  "zyron-wal",
+]
+
+[[package]]
+name = "zyron-lake"
+version = "0.3.0"
+dependencies = [
+ "crc32fast",
+ "scc",
+ "tempfile",
+ "tracing",
+ "zyron-bench-harness",
+ "zyron-common",
+ "zyron-storage",
 ]
 
 [[package]]
@@ -7237,6 +7210,7 @@ dependencies = [
  "zyron-buffer",
  "zyron-catalog",
  "zyron-common",
+ "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
  "zyron-storage",
@@ -7282,6 +7256,7 @@ dependencies = [
  "zyron-cdc",
  "zyron-common",
  "zyron-executor",
+ "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
  "zyron-pipeline",
@@ -7354,12 +7329,18 @@ dependencies = [
  "zyron-cdc",
  "zyron-common",
  "zyron-storage",
+ "zyron-wal",
 ]
+
+[[package]]
+name = "zyron-tpc"
+version = "0.3.0"
 
 [[package]]
 name = "zyron-types"
 version = "0.3.0"
 dependencies = [
+ "blake3",
  "crc32fast",
  "crossbeam",
  "parking_lot",
@@ -7421,7 +7402,7 @@ dependencies = [
  "pbkdf2",
  "rand 0.10.0",
  "rcgen",
- "rustls 0.23.38",
+ "rustls",
  "ryu",
  "scc",
  "serde",
@@ -7432,7 +7413,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-quiche",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -7444,6 +7425,7 @@ dependencies = [
  "zyron-cdc",
  "zyron-common",
  "zyron-executor",
+ "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
  "zyron-pipeline",
@@ -7451,6 +7433,7 @@ dependencies = [
  "zyron-search",
  "zyron-storage",
  "zyron-streaming",
+ "zyron-tpc",
  "zyron-types",
  "zyron-versioning",
  "zyron-wal",

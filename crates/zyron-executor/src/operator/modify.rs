@@ -20,16 +20,15 @@ use zyron_storage::columnar::{ColumnarPatchManager, PatchStore};
 
 /// Returns the per-table columnar patch store. Used by UPDATE and DELETE to
 /// route mutations of columnar-resident rows to the append-only patch log
-/// instead of the heap, with no .zyr rewrite and no heap round trip.
-fn columnar_patch_store(te: &zyron_catalog::TableEntry) -> zyron_common::Result<Arc<PatchStore>> {
+/// instead of the heap, with no .zyr rewrite and no heap round trip. Also
+/// used by the row-locking operator's post-wait staleness recheck.
+pub(crate) fn columnar_patch_store(
+    te: &zyron_catalog::TableEntry,
+) -> zyron_common::Result<Arc<PatchStore>> {
     let seg = te.columnar.segments.first().ok_or_else(|| {
         ZyronError::Internal("columnar locators present but no registered segments".into())
     })?;
-    let dir = std::path::Path::new(&seg.path)
-        .parent()
-        .map(|d| d.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    ColumnarPatchManager::global(&dir).store(te.id.0 as u64)
+    ColumnarPatchManager::store_for_segment(te.id.0 as u64, std::path::Path::new(&seg.path))
 }
 use crate::context::ExecutionContext;
 use crate::expr::{evaluate, literal_to_scalar};
@@ -57,24 +56,29 @@ pub(crate) fn encode_btree_key_into(
     }
     buf.clear();
     match (&col.data, type_id) {
+        // Signed integers flip the sign bit after widening so the tree's
+        // unsigned bytewise comparison orders negatives below positives
         (ColumnData::Int8(v), _) => {
-            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+            buf.extend_from_slice(&((v[row_idx] as i64 as u64) ^ (1u64 << 63)).to_be_bytes())
         }
         (ColumnData::Int16(v), _) => {
-            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+            buf.extend_from_slice(&((v[row_idx] as i64 as u64) ^ (1u64 << 63)).to_be_bytes())
         }
         (ColumnData::Int32(v), _) => {
-            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+            buf.extend_from_slice(&((v[row_idx] as i64 as u64) ^ (1u64 << 63)).to_be_bytes())
         }
-        (ColumnData::Int64(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        (ColumnData::Int64(v), _) => {
+            buf.extend_from_slice(&((v[row_idx] as u64) ^ (1u64 << 63)).to_be_bytes())
+        }
         // 16-byte order-preserving key for Int128 (incl. i128 picosecond
-        // timestamps). The explicit sign-bit flip keeps negative values
-        // (pre-1970 timestamps) ordered before positive ones, unlike the
-        // legacy bare i64 cast above which is only correct for non-negatives.
+        // timestamps), same sign-bit flip at the wider width
         (ColumnData::Int128(v), _) => {
             let key = (v[row_idx] as u128) ^ (1u128 << 127);
             buf.extend_from_slice(&key.to_be_bytes());
         }
+        (ColumnData::Boolean(v), _) => buf.push(v[row_idx] as u8),
+        // A UUID's 16 raw bytes already compare in value order
+        (ColumnData::FixedBinary16(v), _) => buf.extend_from_slice(&v[row_idx]),
         (ColumnData::UInt8(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
         (ColumnData::UInt16(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
         (ColumnData::UInt32(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
@@ -104,29 +108,432 @@ pub(crate) fn encode_btree_key_into(
     true
 }
 
-/// Length of the tuple-id suffix appended to every B+tree index key. Distinct
-/// rows that share an indexed value get distinct, ordered composite keys
-/// (value bytes followed by the row's page number and slot), so the unique-key
-/// B+tree stores a non-unique secondary index without collisions. 8 bytes
-/// big-endian page number + 2 bytes big-endian slot keeps the suffix
-/// order-preserving and fixed width so a value's entries form a contiguous range.
-pub(crate) const INDEX_TID_SUFFIX_LEN: usize = 10;
+/// Terminator closing a variable-length component that another component
+/// follows. `0x00` inside the value is escaped to `0x00 0xFF`, which sorts
+/// above this terminator, so a value that is a prefix of another still
+/// orders below it and byte order keeps matching value order.
+const VARLEN_COMPONENT_TERMINATOR: [u8; 2] = [0x00, 0x00];
 
-/// Appends the order-preserving tuple-id suffix to a value-key buffer.
+/// True when a batch column stores variable-length values, so a key
+/// component built from it needs delimiting when another component follows.
 #[inline]
-fn append_index_tid_suffix(buf: &mut Vec<u8>, page_num: u64, slot: u16) {
-    buf.extend_from_slice(&page_num.to_be_bytes());
-    buf.extend_from_slice(&slot.to_be_bytes());
+fn column_is_varlen(batch: &DataBatch, col_pos: usize) -> bool {
+    matches!(
+        batch.columns.get(col_pos).map(|c| &c.data),
+        Some(ColumnData::Utf8(_)) | Some(ColumnData::Binary(_))
+    )
 }
 
-/// Builds a unique-constraint violation error for a table column.
+/// Delimits the variable-length component occupying `buf[start..]`, escaping
+/// any `0x00` it contains and appending the terminator.
+///
+/// A value holding no `0x00` byte, which is every ordinary string, appends
+/// the two terminator bytes and rewrites nothing.
+fn close_varlen_component(buf: &mut Vec<u8>, start: usize) {
+    if buf[start..].contains(&0x00) {
+        let raw: Vec<u8> = buf[start..].to_vec();
+        buf.truncate(start);
+        for &b in &raw {
+            if b == 0x00 {
+                buf.extend_from_slice(&[0x00, 0xFF]);
+            } else {
+                buf.push(b);
+            }
+        }
+    }
+    buf.extend_from_slice(&VARLEN_COMPONENT_TERMINATOR);
+}
+
+/// Builds the full key of a B+tree index, concatenating every key column in
+/// key order.
+///
+/// Returns false when any component is null, which leaves the row out of the
+/// index entirely. That is what makes a unique constraint over a nullable
+/// column behave as SQL requires: rows with a null in the key never conflict
+/// with each other.
+///
+/// A single-column index produces exactly the bytes `encode_btree_key_into`
+/// produces on its own, so the common key shape is unchanged.
+pub(crate) fn encode_btree_index_key_into(
+    batch: &DataBatch,
+    row_idx: usize,
+    key_cols: &[(usize, TypeId)],
+    buf: &mut Vec<u8>,
+) -> bool {
+    buf.clear();
+    let last = key_cols.len().saturating_sub(1);
+    let mut component = Vec::new();
+    for (i, &(col_pos, type_id)) in key_cols.iter().enumerate() {
+        // encode_btree_key_into clears the buffer it writes, so the first
+        // component writes straight into the key and later ones stage
+        // through a buffer that is reused across the whole key
+        let start = buf.len();
+        if i == 0 {
+            if !encode_btree_key_into(batch, row_idx, col_pos, type_id, buf) {
+                return false;
+            }
+        } else {
+            if !encode_btree_key_into(batch, row_idx, col_pos, type_id, &mut component) {
+                return false;
+            }
+            buf.extend_from_slice(&component);
+        }
+        // The final component runs to the locator suffix, so its extent is
+        // known from the key length and it needs no delimiter
+        if i != last && column_is_varlen(batch, col_pos) {
+            close_varlen_component(buf, start);
+        }
+    }
+    true
+}
+
+/// Inclusive upper bound covering every index entry whose key starts with
+/// `prefix`, for a range scan that knows a leading part of the key.
+///
+/// Returns the prefix's successor, incrementing its last byte below 0xFF and
+/// dropping the rest. No stored key can equal that successor, because every
+/// stored key carries a locator suffix and so runs past the prefix, and any
+/// key starting with the successor sorts above it. So an inclusive bound
+/// here behaves as an exclusive bound on the prefix.
+///
+/// None when the prefix is all 0xFF and has no successor, which asks the
+/// caller to leave the scan open at the top. Padding the bound with a fixed
+/// number of 0xFF bytes instead would cut a composite key short, because the
+/// components after the prefix make the stored key longer than the pad.
+pub(crate) fn index_key_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|&b| b != 0xFF)?;
+    let mut bound = prefix[..=last].to_vec();
+    bound[last] += 1;
+    Some(bound)
+}
+
+/// Resolves an index's key columns to their positions in the table's column
+/// list, paired with each column's type. Returns None when the index names a
+/// column the table does not have, which leaves that index untouched rather
+/// than half-maintained under a shifted key.
+pub(crate) fn index_key_columns(
+    table_entry: &zyron_catalog::TableEntry,
+    columns: &[zyron_catalog::ColumnId],
+) -> Option<Vec<(usize, TypeId)>> {
+    let mut resolved = Vec::with_capacity(columns.len());
+    for col_id in columns {
+        let pos = table_entry.columns.iter().position(|c| c.id == *col_id)?;
+        resolved.push((pos, table_entry.columns[pos].type_id));
+    }
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    }
+}
+
+/// Length of the locator suffix appended to every B+tree index key. Distinct
+/// rows that share an indexed value get distinct, ordered composite keys
+/// (value bytes followed by the row locator's order-preserving encoding), so
+/// the unique-key B+tree stores a non-unique secondary index without
+/// collisions. The encoding is fixed width, so range bounds pad with all-0x00
+/// and all-0xFF suffixes and exact-value checks work from the length alone
+pub(crate) const INDEX_LOCATOR_SUFFIX_LEN: usize = zyron_common::RowLocator::KEY_SUFFIX_LEN;
+
+/// The btree-normalized locator of a heap row: the heap file_id is implicit
+/// from the index, so keys and payloads carry page number and slot only
+#[inline]
+fn btree_heap_locator(page_num: u64, slot: u16) -> zyron_common::RowLocator {
+    zyron_common::RowLocator::Heap {
+        page: zyron_common::page::PageId::new(0, page_num),
+        slot,
+    }
+}
+
+/// Normalizes any locator for btree storage, stripping the heap file_id
+#[inline]
+pub(crate) fn btree_normalize_locator(loc: zyron_common::RowLocator) -> zyron_common::RowLocator {
+    match loc {
+        zyron_common::RowLocator::Heap { page, slot } => btree_heap_locator(page.page_num, slot),
+        other => other,
+    }
+}
+
+/// Encodes a raw storage cell (little-endian fixed value or bare varlen
+/// bytes, the NSM and .zyr cell form) into the same order-preserving key
+/// bytes `encode_btree_key_into` produces for the equivalent batch column.
+/// Dispatches on the column's physical type, which is what the cell layout
+/// follows. The parity is enforced by a unit test, a drifted encoding would
+/// make key rebuilds silently miss their entries
+pub fn encode_btree_key_from_cell(phys: TypeId, cell: &[u8], buf: &mut Vec<u8>) -> bool {
+    buf.clear();
+    let sortable_f64 = |f: f64, buf: &mut Vec<u8>| {
+        let bits = f.to_bits();
+        let sortable = if bits >> 63 == 1 {
+            !bits
+        } else {
+            bits ^ (1u64 << 63)
+        };
+        buf.extend_from_slice(&sortable.to_be_bytes());
+    };
+    // The temporal and decimal ids share an integer cell layout, and the
+    // batch path indexes them through the matching integer column data, so
+    // the cell path dispatches on the same layout
+    let phys = match phys {
+        TypeId::Date => TypeId::Int32,
+        TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz => TypeId::Int64,
+        TypeId::Decimal | TypeId::Hlc => TypeId::Int128,
+        other => other,
+    };
+    match phys {
+        TypeId::Boolean if cell.len() == 1 => {
+            buf.push(if cell[0] != 0 { 1 } else { 0 });
+        }
+        TypeId::Uuid if cell.len() == 16 => {
+            buf.extend_from_slice(cell);
+        }
+        TypeId::Int8 if cell.len() == 1 => {
+            buf.extend_from_slice(&((cell[0] as i8 as i64 as u64) ^ (1u64 << 63)).to_be_bytes());
+        }
+        TypeId::Int16 if cell.len() == 2 => {
+            let v = i16::from_le_bytes([cell[0], cell[1]]);
+            buf.extend_from_slice(&((v as i64 as u64) ^ (1u64 << 63)).to_be_bytes());
+        }
+        TypeId::Int32 if cell.len() == 4 => {
+            let v = i32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]);
+            buf.extend_from_slice(&((v as i64 as u64) ^ (1u64 << 63)).to_be_bytes());
+        }
+        TypeId::Int64 if cell.len() == 8 => {
+            let Ok(b) = <[u8; 8]>::try_from(cell) else {
+                return false;
+            };
+            buf.extend_from_slice(&((i64::from_le_bytes(b) as u64) ^ (1u64 << 63)).to_be_bytes());
+        }
+        TypeId::Int128 if cell.len() == 16 => {
+            let Ok(b) = <[u8; 16]>::try_from(cell) else {
+                return false;
+            };
+            let key = (i128::from_le_bytes(b) as u128) ^ (1u128 << 127);
+            buf.extend_from_slice(&key.to_be_bytes());
+        }
+        TypeId::UInt8 if cell.len() == 1 => {
+            buf.extend_from_slice(&(cell[0] as u64).to_be_bytes());
+        }
+        TypeId::UInt16 if cell.len() == 2 => {
+            let v = u16::from_le_bytes([cell[0], cell[1]]);
+            buf.extend_from_slice(&(v as u64).to_be_bytes());
+        }
+        TypeId::UInt32 if cell.len() == 4 => {
+            let v = u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]);
+            buf.extend_from_slice(&(v as u64).to_be_bytes());
+        }
+        TypeId::UInt64 if cell.len() == 8 => {
+            let Ok(b) = <[u8; 8]>::try_from(cell) else {
+                return false;
+            };
+            buf.extend_from_slice(&u64::from_le_bytes(b).to_be_bytes());
+        }
+        TypeId::Float64 if cell.len() == 8 => {
+            let Ok(b) = <[u8; 8]>::try_from(cell) else {
+                return false;
+            };
+            sortable_f64(f64::from_le_bytes(b), buf);
+        }
+        TypeId::Float32 if cell.len() == 4 => {
+            let v = f32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]);
+            sortable_f64(v as f64, buf);
+        }
+        _ if phys.fixed_size().is_none() => {
+            // varlen cells carry the raw bytes, exactly the Utf8/Binary key form
+            buf.extend_from_slice(cell);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Builds an index's full key for one folded row from the raw cell bytes the
+/// fold captured, applying the same component delimiting the batch path uses
+/// so a re-keyed entry matches the key the insert path would have written.
+///
+/// Returns false when any key column is missing from `indexed_cells` or is
+/// null in this row, which leaves the row out of that index exactly as the
+/// batch path does.
+fn encode_btree_index_key_from_cells(
+    key_columns: &[zyron_catalog::ColumnId],
+    indexed_cells: &[(zyron_catalog::ColumnId, TypeId, Vec<Option<&[u8]>>)],
+    row: usize,
+    buf: &mut Vec<u8>,
+) -> bool {
+    buf.clear();
+    let last = key_columns.len().saturating_sub(1);
+    let mut component = Vec::new();
+    for (i, col_id) in key_columns.iter().enumerate() {
+        let Some((_, phys, cells)) = indexed_cells.iter().find(|(cid, _, _)| cid == col_id) else {
+            return false;
+        };
+        let Some(Some(cell)) = cells.get(row) else {
+            return false;
+        };
+        let start = buf.len();
+        if i == 0 {
+            if !encode_btree_key_from_cell(*phys, cell, buf) {
+                return false;
+            }
+        } else {
+            if !encode_btree_key_from_cell(*phys, cell, &mut component) {
+                return false;
+            }
+            buf.extend_from_slice(&component);
+        }
+        if i != last && phys.fixed_size().is_none() {
+            close_varlen_component(buf, start);
+        }
+    }
+    true
+}
+
+/// Re-keys every B+tree entry for rows a fold moved from the heap into a
+/// columnar segment: the heap-suffixed key is deleted and the columnar
+/// suffixed twin inserted, so index scans keep serving the rows after their
+/// heap slots are zeroed. `indexed_cells` carries each indexed column's raw
+/// cell bytes per folded row, aligned with `folded`, whose position i holds
+/// sys_rowid `base_rowid + i` by construction
+pub fn fold_rekey_btree_entries(
+    folded: &[(zyron_common::page::PageId, u16, u32)],
+    indexed_cells: &[(zyron_catalog::ColumnId, TypeId, Vec<Option<&[u8]>>)],
+    file_id: u64,
+    base_rowid: u64,
+    btree: &[zyron_catalog::BTreeIndexSpec],
+    registry: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
+) {
+    if folded.is_empty() || btree.is_empty() {
+        return;
+    }
+    let mut scratch: Vec<u8> = Vec::with_capacity(48);
+    for spec in btree {
+        let idx_id = spec.id;
+        let Some(tree) = registry.read_sync(&idx_id.0, |_, v| Arc::clone(v)) else {
+            continue;
+        };
+        for (i, (page_id, slot, _xmin)) in folded.iter().enumerate() {
+            if !encode_btree_index_key_from_cells(&spec.columns, indexed_cells, i, &mut scratch) {
+                continue;
+            }
+            let value_len = scratch.len();
+            btree_heap_locator(page_id.page_num, *slot).append_key_suffix(&mut scratch);
+            tree.delete_sync(&scratch);
+            scratch.truncate(value_len);
+            let loc = zyron_common::RowLocator::Columnar {
+                file_id,
+                sys_rowid: base_rowid + i as u64,
+            };
+            loc.append_key_suffix(&mut scratch);
+            if let Err(e) = tree.insert_sync(&scratch, loc) {
+                // a duplicate is a benign redo, anything else is data loss
+                if !matches!(e, zyron_common::ZyronError::DuplicateKey) {
+                    eprintln!("fold btree re-key insert failed on index {}: {e}", idx_id.0);
+                }
+            }
+        }
+    }
+}
+
+/// True when the columnar row's current visible values for the index's key
+/// columns still encode to `value_key`. Old-value index entries survive an
+/// update (the locator does not change), so they must never prove a conflict
+async fn columnar_row_currently_holds_value(
+    ctx: &Arc<ExecutionContext>,
+    te: &zyron_catalog::TableEntry,
+    key_cols: &[(usize, TypeId)],
+    file_id: u64,
+    sys_rowid: u64,
+    value_key: &[u8],
+) -> zyron_common::Result<bool> {
+    let logical: Vec<LogicalColumn> = key_cols
+        .iter()
+        .map(|&(col_pos, _)| {
+            let c = &te.columns[col_pos];
+            LogicalColumn {
+                table_idx: Some(0),
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                fractional_digits: c.fractional_digits,
+            }
+        })
+        .collect();
+    let loc = [zyron_common::RowLocator::Columnar { file_id, sys_rowid }];
+    let fetcher = crate::operator::doc_fetch::DocRowFetcher::prepare_columnar_only(
+        ctx, te.id, &logical, &loc, None,
+    )
+    .await?;
+    let Some(vals) = fetcher.columnar_row(file_id, sys_rowid) else {
+        return Ok(false);
+    };
+    if vals.len() < logical.len() {
+        return Ok(false);
+    }
+    let mut builders = create_builders(&logical, 1);
+    for (i, builder) in builders.iter_mut().enumerate() {
+        builder.push(&vals[i]);
+    }
+    let row = finalize_builders(builders);
+    // The fetched row carries the key columns alone, in key order, so the
+    // key is rebuilt over positions 0..n rather than the table's positions
+    let fetched_cols: Vec<(usize, TypeId)> = key_cols
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, type_id))| (i, type_id))
+        .collect();
+    let mut buf = Vec::with_capacity(32);
+    Ok(encode_btree_index_key_into(&row, 0, &fetched_cols, &mut buf) && buf == value_key)
+}
+
+/// Latest-committed liveness of a columnar row for constraint probes: the
+/// folded base version is committed by construction, so the row is dead once
+/// a supersede on the branch this statement writes has committed.
+///
+/// A supersede this transaction wrote counts too. It is not committed yet but
+/// is certain to the statement asking, so the key it freed is reusable in the
+/// same transaction, matching the heap probe.
+pub(crate) fn columnar_row_live_latest(
+    ctx: &ExecutionContext,
+    te: &zyron_catalog::TableEntry,
+    file_id: u64,
+    sys_rowid: u64,
+) -> zyron_common::Result<bool> {
+    let store = columnar_patch_store(te)?;
+    let overlay = match ctx.active_branch_id {
+        Some(branch) => store.row_overlay_on(branch, file_id, sys_rowid),
+        None => store.row_overlay(file_id, sys_rowid),
+    };
+    let Some(overlay) = overlay else {
+        return Ok(true);
+    };
+    let status = ctx.snapshot.status_map();
+    let self_txn = ctx.txn_id as u64;
+    Ok(!overlay
+        .supersedes
+        .iter()
+        .any(|&x| x == self_txn || status.is_committed(x)))
+}
+
+/// Builds a unique-constraint violation error naming every key column, so a
+/// multi-column constraint reports the key that collided rather than one
+/// column of it.
 fn unique_violation(
     table_entry: &zyron_catalog::TableEntry,
-    col_pos: usize,
+    key_cols: &[(usize, TypeId)],
 ) -> zyron_common::ZyronError {
+    let names: Vec<&str> = key_cols
+        .iter()
+        .map(|&(col_pos, _)| table_entry.columns[col_pos].name.as_str())
+        .collect();
     zyron_common::ZyronError::UniqueViolation(format!(
-        "duplicate key value violates unique constraint on \"{}\".\"{}\"",
-        table_entry.name, table_entry.columns[col_pos].name
+        "duplicate key value violates unique constraint on \"{}\".({})",
+        table_entry.name,
+        names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
@@ -138,41 +545,42 @@ fn unique_violation(
 /// Index entries of MVCC-deleted rows are skipped by fetching each candidate and
 /// testing latest-committed liveness. Null values are unconstrained.
 pub(crate) async fn check_unique_constraints(
-    ctx: &ExecutionContext,
+    ctx: &Arc<ExecutionContext>,
     table_entry: &zyron_catalog::TableEntry,
     batch: &DataBatch,
     index_snap: &zyron_catalog::TableIndexSnapshot,
-    exclude_tids: &[TupleId],
+    exclude_locators: &[zyron_common::RowLocator],
 ) -> zyron_common::Result<()> {
     if index_snap.btree.is_empty() {
         return Ok(());
     }
-    let has_unique = index_snap.btree.iter().any(|(_, _, u)| *u);
+    let has_unique = index_snap.btree.iter().any(|spec| spec.unique);
     if !has_unique {
         return Ok(());
     }
-    let exclude: std::collections::HashSet<(u64, u16)> = exclude_tids
+    // Stored entries carry btree-normalized locators, so the exclusion set
+    // must too or an updated row would conflict with its own old entry
+    let exclude: std::collections::HashSet<zyron_common::RowLocator> = exclude_locators
         .iter()
-        .map(|t| (t.page_id.page_num, t.slot_id))
+        .map(|l| btree_normalize_locator(*l))
         .collect();
     let heap_file_id = table_entry.heap_file_id;
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (idx_id, col_id, unique) in &index_snap.btree {
-        if !*unique {
+    for spec in &index_snap.btree {
+        if !spec.unique {
             continue;
         }
-        let Some(btree) = ctx.get_index(*idx_id) else {
+        let Some(btree) = ctx.get_index(spec.id) else {
             continue;
         };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
+        let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let col_type = table_entry.columns[col_pos].type_id;
+        let idx_id = spec.id;
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row_idx in 0..batch.num_rows {
-            scratch.clear();
-            if !encode_btree_key_into(batch, row_idx, col_pos, col_type, &mut scratch) {
-                continue; // null is unconstrained
+            if !encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
+                continue; // a null in the key is unconstrained
             }
             // Serialize concurrent inserters of the same value: take a key lock
             // (namespaced by index id) held until commit/abort. A concurrent
@@ -185,58 +593,221 @@ pub(crate) async fn check_unique_constraints(
                 locks.lock_key(ctx.txn_id as u64, table_entry.id.0, &lock_key)?;
             }
             if !seen.insert(scratch.clone()) {
-                return Err(unique_violation(table_entry, col_pos));
+                return Err(unique_violation(table_entry, &key_cols));
             }
-            // Collect index candidates for this value, excluding the rows being
+            // Collect index candidates for this key, excluding the rows being
             // updated, then confirm each points at a LIVE committed row (an
             // MVCC-deleted row's stale entry is not a conflict).
-            let mut lo = scratch.clone();
-            lo.extend_from_slice(&[0u8; INDEX_TID_SUFFIX_LEN]);
-            let mut hi = scratch.clone();
-            hi.extend_from_slice(&[0xFFu8; INDEX_TID_SUFFIX_LEN]);
+            let lo = scratch.clone();
+            let hi = index_key_upper_bound(&scratch);
             let value_len = scratch.len();
-            let mut candidates: Vec<TupleId> = Vec::new();
-            btree.range_scan_for_each(Some(&lo), Some(&hi), |k, existing| {
-                // A composite key is value||tid_suffix. For a variable-length
-                // value, the range can also catch a longer value sharing this
-                // prefix, so require an exact value match (key length and bytes).
-                let exact_value =
-                    k.len() == value_len + INDEX_TID_SUFFIX_LEN && k[..value_len] == scratch[..];
-                if exact_value && !exclude.contains(&(existing.page_id.page_num, existing.slot_id))
-                {
+            let mut candidates: Vec<zyron_common::RowLocator> = Vec::new();
+            btree.range_scan_for_each(Some(&lo), hi.as_deref(), |k, existing| {
+                // A stored key is index_key||locator_suffix. For a variable
+                // length final component, the range can also catch a longer
+                // value sharing this prefix, so require an exact key match
+                // (length + bytes)
+                let exact_value = k.len() == value_len + INDEX_LOCATOR_SUFFIX_LEN
+                    && k[..value_len] == scratch[..];
+                if exact_value && !exclude.contains(&existing) {
                     candidates.push(existing);
                 }
                 true
             });
             for cand in candidates {
-                let page_id = zyron_common::page::PageId::new(heap_file_id, cand.page_id.page_num);
-                let data = crate::operator::scan::read_page_through_pool(
-                    &ctx.buffer_pool,
-                    &ctx.disk_manager,
-                    page_id,
-                )
-                .await?;
-                if let Some(view) = zyron_storage::HeapPage::get_tuple_view_from_slice(
-                    &data,
-                    zyron_storage::SlotId(cand.slot_id),
-                ) {
-                    if ctx
-                        .snapshot
-                        .is_live_latest(view.header.xmin as u64, view.header.xmax as u64)
-                    {
-                        return Err(unique_violation(table_entry, col_pos));
+                let live = match cand {
+                    zyron_common::RowLocator::Heap { page, slot } => {
+                        // Read through the active branch. A row this branch
+                        // deleted is tombstoned in the branch's copy of the
+                        // page while the main page still shows it live, and
+                        // reading main would refuse an insert of a value the
+                        // branch no longer holds. A no-op on the main line
+                        let page_id = ctx.resolve_branch_page(
+                            ctx.active_branch_id,
+                            zyron_common::page::PageId::new(heap_file_id, page.page_num),
+                        );
+                        let data = crate::operator::scan::read_page_through_pool(
+                            &ctx.buffer_pool,
+                            &ctx.disk_manager,
+                            page_id,
+                        )
+                        .await?;
+                        match zyron_storage::HeapPage::get_tuple_view_from_slice(
+                            &data,
+                            zyron_storage::SlotId(slot),
+                        ) {
+                            Some(view) => ctx.snapshot.is_live_latest(
+                                view.header.xmin as u64,
+                                view.header.xmax as u64,
+                                ctx.txn_id as u64,
+                            ),
+                            None => false,
+                        }
                     }
+                    zyron_common::RowLocator::Columnar { file_id, sys_rowid } => {
+                        // an updated columnar row keeps its locator, so a
+                        // live candidate found under a stale value must be
+                        // refuted by the row's current visible value
+                        columnar_row_live_latest(ctx, table_entry, file_id, sys_rowid)?
+                            && columnar_row_currently_holds_value(
+                                ctx,
+                                table_entry,
+                                &key_cols,
+                                file_id,
+                                sys_rowid,
+                                &scratch[..value_len],
+                            )
+                            .await?
+                    }
+                    zyron_common::RowLocator::Lake { .. } => false,
+                };
+                if live {
+                    return Err(unique_violation(table_entry, &key_cols));
                 }
+            }
+
+            // The shared index does not carry rows this branch appended,
+            // because their locators name the branch's own file. Those rows
+            // are as real as any other to a branch reader, so a uniqueness
+            // check that skipped them would let one branch hold the value
+            // twice. Bounded by what the branch itself wrote
+            if branch_append_holds_value(ctx, table_entry, &key_cols, &scratch[..value_len]).await?
+            {
+                return Err(unique_violation(table_entry, &key_cols));
             }
         }
     }
     Ok(())
 }
 
+/// Runs the insert path for one batch of a branch write.
+///
+/// A branch write lands in the branch's append file rather than the main
+/// heap, and everything a main insert enforces is enforced here too. The
+/// reads these checks make resolve through the branch, so the foreign key
+/// probe and the uniqueness probe both see the branch's view rather than
+/// the main line's.
+///
+/// Kept out of the insert operator's own future deliberately. That future
+/// is already large, and the branch merge nests it under the DDL dispatch
+/// and a scan, where inlining these locals is what exhausts the stack in an
+/// unoptimized build.
+///
+/// No shared-index maintenance happens here. The shared index drops a heap
+/// locator's file id and the index scan re-stamps the table's heap file
+/// onto it, so an entry for a row in the branch's append file would resolve
+/// to a main page. A branch index scan reads the append range as a
+/// predicate-filtered delta instead, which is what makes these rows
+/// findable without putting them in an index the main line shares.
+#[allow(clippy::too_many_arguments)]
+async fn insert_branch_batch(
+    ctx: &Arc<ExecutionContext>,
+    table_id: zyron_catalog::TableId,
+    table_entry: &zyron_catalog::TableEntry,
+    index_snap: &zyron_catalog::TableIndexSnapshot,
+    branch_id: u64,
+    heap_file_id: u32,
+    txn_id: u32,
+    mut batch: DataBatch,
+) -> zyron_common::Result<i64> {
+    crate::trigger::fire_row_triggers(
+        ctx,
+        table_id,
+        zyron_catalog::TriggerEntry::TIMING_BEFORE,
+        zyron_catalog::TriggerEntry::EVENT_INSERT,
+        &batch,
+        &table_entry.columns,
+    )
+    .await?;
+
+    let fk_violations = crate::operator::fk::check_child_fks(ctx, table_entry, &batch).await?;
+    if !fk_violations.is_empty() {
+        batch = divert_quarantined(ctx, &batch, &fk_violations, txn_id).await?;
+        if batch.num_rows == 0 {
+            return Ok(0);
+        }
+    }
+
+    check_unique_constraints(ctx, table_entry, &batch, index_snap, &[]).await?;
+
+    let tuples = batch_to_tuples(&batch, &table_entry.columns, txn_id);
+    let ids =
+        crate::operator::branch_write::branch_insert(ctx, branch_id, heap_file_id, &tuples).await?;
+
+    crate::trigger::fire_row_triggers(
+        ctx,
+        table_id,
+        zyron_catalog::TriggerEntry::TIMING_AFTER,
+        zyron_catalog::TriggerEntry::EVENT_INSERT,
+        &batch,
+        &table_entry.columns,
+    )
+    .await?;
+
+    Ok(ids.len() as i64)
+}
+
+/// True when a row the active branch appended already carries this indexed
+/// value.
+///
+/// Reads only the branch's append range, which holds what this branch
+/// inserted and nothing else, so the cost is the branch's own write volume
+/// rather than the table's size. Returns false immediately on the main line.
+async fn branch_append_holds_value(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    key_cols: &[(usize, TypeId)],
+    value: &[u8],
+) -> zyron_common::Result<bool> {
+    let (Some(branch_id), Some(catalog)) = (ctx.active_branch_id, ctx.branch_catalog.as_ref())
+    else {
+        return Ok(false);
+    };
+    let files = catalog.branch_files_for(branch_id, table_entry.heap_file_id);
+    let pages = catalog.append_page_count(branch_id, table_entry.heap_file_id);
+    let mut scratch: Vec<u8> = Vec::with_capacity(48);
+    for page_num in 0..pages {
+        ctx.check_cancelled()?;
+        let page_id = zyron_common::page::PageId::new(files.append_file_id, page_num);
+        let data = crate::operator::scan::read_page_through_pool(
+            &ctx.buffer_pool,
+            &ctx.disk_manager,
+            page_id,
+        )
+        .await?;
+        let header = zyron_storage::HeapPage::heap_header_from_slice(&data);
+        for slot in 0..header.slot_count {
+            let Some(view) = zyron_storage::HeapPage::get_tuple_view_from_slice(
+                &data,
+                zyron_storage::SlotId(slot),
+            ) else {
+                continue;
+            };
+            if view.is_deleted()
+                || !ctx.snapshot.is_live_latest(
+                    view.header.xmin as u64,
+                    view.header.xmax as u64,
+                    ctx.txn_id as u64,
+                )
+            {
+                continue;
+            }
+            let row = crate::operator::fk::decode_tuple_to_batch(view.data, table_entry);
+            if !encode_btree_index_key_into(&row, 0, key_cols, &mut scratch) {
+                continue;
+            }
+            if scratch == value {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Adds B+tree index entries for a batch of newly stored rows. Each entry's key
-/// is the indexed value followed by the row's tuple-id suffix, so two rows with
+/// is the indexed value followed by the row's locator suffix, so two rows with
 /// the same value coexist (non-unique index support); composite keys are globally
-/// unique by tuple id. Unique constraints are enforced separately by
+/// unique by locator. Unique constraints are enforced separately by
 /// `check_unique_constraints` before the rows are written.
 ///
 /// `batch` must have its columns in table-column order (the INSERT source and the
@@ -246,88 +817,45 @@ pub(crate) fn maintain_btree_insert(
     ctx: &ExecutionContext,
     table_entry: &zyron_catalog::TableEntry,
     batch: &DataBatch,
-    tuple_ids: &[TupleId],
+    locators: &[zyron_common::RowLocator],
     index_snap: &zyron_catalog::TableIndexSnapshot,
 ) {
     if index_snap.btree.is_empty() {
         return;
     }
-    let mut key_bytes: Vec<u8> = Vec::with_capacity(tuple_ids.len() * 24);
-    let mut key_spans: Vec<(usize, usize, TupleId)> = Vec::with_capacity(tuple_ids.len());
-    let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (idx_id, col_id, _unique) in &index_snap.btree {
-        let Some(btree) = ctx.get_index(*idx_id) else {
+    let mut key_bytes: Vec<u8> = Vec::with_capacity(locators.len() * 32);
+    let mut key_spans: Vec<(usize, usize, zyron_common::RowLocator)> =
+        Vec::with_capacity(locators.len());
+    let mut scratch: Vec<u8> = Vec::with_capacity(48);
+    for spec in &index_snap.btree {
+        let Some(btree) = ctx.get_index(spec.id) else {
             continue;
         };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
+        let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let col_type = table_entry.columns[col_pos].type_id;
         key_bytes.clear();
         key_spans.clear();
-        for (row_idx, tid) in tuple_ids.iter().enumerate() {
-            scratch.clear();
-            if encode_btree_key_into(batch, row_idx, col_pos, col_type, &mut scratch) {
-                let normalized = TupleId::new(
-                    zyron_common::page::PageId::new(0, tid.page_id.page_num),
-                    tid.slot_id,
-                );
-                append_index_tid_suffix(
-                    &mut scratch,
-                    normalized.page_id.page_num,
-                    normalized.slot_id,
-                );
+        for (row_idx, loc) in locators.iter().enumerate() {
+            if encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
+                let normalized = btree_normalize_locator(*loc);
+                normalized.append_key_suffix(&mut scratch);
                 let off = key_bytes.len();
                 key_bytes.extend_from_slice(&scratch);
                 key_spans.push((off, scratch.len(), normalized));
             }
         }
         if !key_spans.is_empty() {
-            let mut items: Vec<(&[u8], TupleId)> = key_spans
+            let mut items: Vec<(&[u8], zyron_common::RowLocator)> = key_spans
                 .iter()
-                .map(|&(off, len, tid)| (&key_bytes[off..off + len], tid))
+                .map(|&(off, len, loc)| (&key_bytes[off..off + len], loc))
                 .collect();
             // Composite keys are globally unique, so the batch never collides for
             // distinct rows; the per-key fallback covers a benign re-insert.
             if btree.insert_many(&mut items).is_err() {
-                for &(off, len, tid) in &key_spans {
-                    let _ = btree.insert_sync(&key_bytes[off..off + len], tid);
+                for &(off, len, loc) in &key_spans {
+                    let _ = btree.insert_sync(&key_bytes[off..off + len], loc);
                 }
-            }
-        }
-    }
-}
-
-/// Removes B+tree index entries for a batch of rows being deleted, or the old
-/// image of updated rows. The composite key (value followed by the row's tuple-id
-/// suffix) identifies exactly this row's entry, so a different live row that
-/// shares the indexed value keeps its own entry. Without this, an UPDATE leaves
-/// the updated row unreachable by index and a DELETE leaves a stale entry that,
-/// once its heap slot is reused, would return the wrong row.
-pub(crate) fn maintain_btree_delete(
-    ctx: &ExecutionContext,
-    table_entry: &zyron_catalog::TableEntry,
-    batch: &DataBatch,
-    tuple_ids: &[TupleId],
-    index_snap: &zyron_catalog::TableIndexSnapshot,
-) {
-    if index_snap.btree.is_empty() {
-        return;
-    }
-    let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (idx_id, col_id, _unique) in &index_snap.btree {
-        let Some(btree) = ctx.get_index(*idx_id) else {
-            continue;
-        };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
-            continue;
-        };
-        let col_type = table_entry.columns[col_pos].type_id;
-        for (row_idx, tid) in tuple_ids.iter().enumerate() {
-            scratch.clear();
-            if encode_btree_key_into(batch, row_idx, col_pos, col_type, &mut scratch) {
-                append_index_tid_suffix(&mut scratch, tid.page_id.page_num, tid.slot_id);
-                btree.delete_sync(&scratch);
             }
         }
     }
@@ -375,7 +903,7 @@ pub fn vacuum_index_cleanup(
     table_entry: &zyron_catalog::TableEntry,
     page_id: zyron_common::page::PageId,
     dead: &[(u16, Vec<u8>)],
-    btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+    btree: &[zyron_catalog::BTreeIndexSpec],
     registry: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) {
     if dead.is_empty() || btree.is_empty() {
@@ -392,7 +920,7 @@ pub fn vacuum_index_cleanup(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
@@ -409,18 +937,16 @@ pub fn vacuum_index_cleanup(
     let batch = finalize_builders(builders);
 
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (idx_id, col_id, _unique) in btree {
-        let Some(tree) = registry.read_sync(&idx_id.0, |_, v| Arc::clone(v)) else {
+    for spec in btree {
+        let Some(tree) = registry.read_sync(&spec.id.0, |_, v| Arc::clone(v)) else {
             continue;
         };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
+        let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let col_type = table_entry.columns[col_pos].type_id;
         for (row_idx, (slot, _)) in dead.iter().enumerate() {
-            scratch.clear();
-            if encode_btree_key_into(&batch, row_idx, col_pos, col_type, &mut scratch) {
-                append_index_tid_suffix(&mut scratch, page_id.page_num, *slot);
+            if encode_btree_index_key_into(&batch, row_idx, &key_cols, &mut scratch) {
+                btree_heap_locator(page_id.page_num, *slot).append_key_suffix(&mut scratch);
                 tree.delete_sync(&scratch);
             }
         }
@@ -437,16 +963,15 @@ pub fn rebuild_btree_index_from_rows(
     table_entry: &zyron_catalog::TableEntry,
     page_id: zyron_common::page::PageId,
     live: &[(u16, Vec<u8>)],
-    col_id: zyron_catalog::ColumnId,
+    key_columns: &[zyron_catalog::ColumnId],
     btree: &Arc<zyron_storage::BTreeIndex>,
 ) -> usize {
     if live.is_empty() {
         return 0;
     }
-    let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == col_id) else {
+    let Some(key_cols) = index_key_columns(table_entry, key_columns) else {
         return 0;
     };
-    let col_type = table_entry.columns[col_pos].type_id;
 
     // Decode the live rows into a batch with every table column in order, so a
     // column position indexes both the table and the batch.
@@ -459,7 +984,7 @@ pub fn rebuild_btree_index_from_rows(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
@@ -478,11 +1003,38 @@ pub fn rebuild_btree_index_from_rows(
     let mut inserted = 0usize;
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
     for (row_idx, (slot, _)) in live.iter().enumerate() {
-        scratch.clear();
-        if encode_btree_key_into(&batch, row_idx, col_pos, col_type, &mut scratch) {
-            let tid = TupleId::new(zyron_common::page::PageId::new(0, page_id.page_num), *slot);
-            append_index_tid_suffix(&mut scratch, tid.page_id.page_num, tid.slot_id);
-            if btree.insert_sync(&scratch, tid).is_ok() {
+        if encode_btree_index_key_into(&batch, row_idx, &key_cols, &mut scratch) {
+            let loc = btree_heap_locator(page_id.page_num, *slot);
+            loc.append_key_suffix(&mut scratch);
+            if btree.insert_sync(&scratch, loc).is_ok() {
+                inserted += 1;
+            }
+        }
+    }
+    inserted
+}
+
+/// Rebuilds one B+tree index's entries from an already-materialized batch of
+/// rows during REINDEX, used for columnar-resident rows whose values come
+/// from the columnar scan. Batch columns are in table-column order and
+/// `locators` is row-aligned. Returns the number of entries inserted.
+pub fn rebuild_btree_index_from_batch(
+    table_entry: &zyron_catalog::TableEntry,
+    batch: &DataBatch,
+    locators: &[zyron_common::RowLocator],
+    key_columns: &[zyron_catalog::ColumnId],
+    btree: &Arc<zyron_storage::BTreeIndex>,
+) -> usize {
+    let Some(key_cols) = index_key_columns(table_entry, key_columns) else {
+        return 0;
+    };
+    let mut inserted = 0usize;
+    let mut scratch: Vec<u8> = Vec::with_capacity(48);
+    for (row_idx, loc) in locators.iter().enumerate() {
+        if encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
+            let normalized = btree_normalize_locator(*loc);
+            normalized.append_key_suffix(&mut scratch);
+            if btree.insert_sync(&scratch, normalized).is_ok() {
                 inserted += 1;
             }
         }
@@ -572,7 +1124,7 @@ fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
 /// Extracts a column's raw byte payload regardless of its declared type.
 /// Used for spatial index maintenance to read the WKB-encoded geometry
 /// payload out of either a Binary or Geometry-typed column.
-fn extract_column_bytes<'a>(
+pub fn extract_column_bytes<'a>(
     batch: &'a DataBatch,
     row_idx: usize,
     columns: &[zyron_catalog::ColumnEntry],
@@ -609,7 +1161,7 @@ fn tuple_id_payload(tid: &TupleId) -> Vec<u8> {
 // Helper: build a single-row batch with the affected row count
 // ---------------------------------------------------------------------------
 
-fn count_batch(count: i64) -> DataBatch {
+pub(crate) fn count_batch(count: i64) -> DataBatch {
     let data = ColumnData::Int64(vec![count]);
     let nulls = NullBitmap::none(1);
     let col = Column::with_nulls(data, nulls, TypeId::Int64);
@@ -699,7 +1251,7 @@ impl Operator for ValuesOperator {
                     ColumnData::with_capacity(
                         zyron_common::types::TypeId::timestamp_physical_type_id(
                             c.type_id,
-                            c.ts_precision,
+                            c.fractional_digits,
                         ),
                         num_rows,
                     )
@@ -785,15 +1337,31 @@ impl Operator for ValuesOperator {
                         }
                         _ => None,
                     };
+                    // A fast-path literal never arrives pre-scaled, so the
+                    // flag defaults to false and only the evaluated path
+                    // reports otherwise
+                    let mut source_is_decimal = false;
                     let scalar = if let Some(s) = fast {
                         s
                     } else {
                         let col = evaluate(expr, &row_eval_ctx, &self.schema, &self.params)?;
-                        let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
+                        // A decimal target is left to the scaling step below.
+                        // The generic cast has no scale to cast onto, so it
+                        // would hand an i128 buffer a value of another
+                        // variant and store a zero
+                        let col = if col.len() > 0
+                            && col.type_id != target
+                            && target != TypeId::Decimal
+                            && !col.is_null(0)
+                        {
                             crate::compute::cast_column(&col, target)?
                         } else {
                             col
                         };
+                        // Whether the value already sits on a decimal scale
+                        // is a property of the column it came from, and the
+                        // scalar alone no longer says
+                        source_is_decimal = col.type_id == TypeId::Decimal;
                         if col.len() > 0 {
                             col.get_scalar(0)
                         } else {
@@ -804,7 +1372,7 @@ impl Operator for ValuesOperator {
                     // TIMESTAMP(p>6) columns store i128 picoseconds. A
                     // timestamp literal evaluates to i64 microseconds, scale
                     // it up exactly into the i128 buffer.
-                    let scalar = if entry.ts_precision.unwrap_or(6) > 6
+                    let scalar = if entry.fractional_digits.unwrap_or(6) > 6
                         && matches!(target, TypeId::Timestamp | TypeId::TimestampTz)
                     {
                         match scalar {
@@ -812,6 +1380,19 @@ impl Operator for ValuesOperator {
                             ScalarValue::Int128(ps) => ScalarValue::Int128(ps),
                             other => other,
                         }
+                    } else if target == TypeId::Decimal {
+                        // A DECIMAL column stores an i128 holding the value
+                        // times ten to its scale. Whatever the expression
+                        // produced is put on that scale here, and checked
+                        // against the declared precision, so the column holds
+                        // the number the statement wrote rather than a
+                        // reinterpretation of some other type's bytes
+                        scale_to_decimal_column(
+                            &scalar,
+                            entry.fractional_digits.unwrap_or(0),
+                            &entry.name,
+                            source_is_decimal,
+                        )?
                     } else {
                         scalar
                     };
@@ -825,7 +1406,7 @@ impl Operator for ValuesOperator {
                 .zip(col_nulls)
                 .zip(self.schema.iter())
                 .map(|((data, nulls), lc)| {
-                    Column::with_nulls_ts(data, nulls, lc.type_id, lc.ts_precision)
+                    Column::with_nulls_ts(data, nulls, lc.type_id, lc.fractional_digits)
                 })
                 .collect();
 
@@ -936,6 +1517,29 @@ async fn write_quarantine(
     Ok(())
 }
 
+/// Writes a batch's foreign-key rejects into their quarantine tables and
+/// returns the batch without them.
+///
+/// The rejected rows are preserved with the constraint that rejected them,
+/// which is the point of quarantining rather than dropping: a bulk load
+/// finishes and the rows it could not place are still there to fix.
+async fn divert_quarantined(
+    ctx: &Arc<ExecutionContext>,
+    batch: &DataBatch,
+    violations: &crate::operator::fk::FkViolations,
+    txn_id: u32,
+) -> zyron_common::Result<DataBatch> {
+    for (quarantine_id, rows, names) in violations.by_table() {
+        write_quarantine(ctx, quarantine_id, batch, &rows, &names, txn_id).await?;
+    }
+    let rejected = violations.rows();
+    let keep: Vec<u32> = (0..batch.num_rows)
+        .filter(|row| rejected.binary_search(row).is_err())
+        .map(|row| row as u32)
+        .collect();
+    Ok(batch.take(&keep))
+}
+
 /// Per-batch disposition computed from a table's data-quality expectations.
 struct ExpectationResult {
     /// Row kept in the main insert when true. Rows quarantined or dropped are
@@ -970,7 +1574,7 @@ fn evaluate_expectations(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -1060,16 +1664,386 @@ fn evaluate_expectations(
     })
 }
 
+/// Rejects a vector whose length is not the column's declared dimension.
+///
+/// A vector column's dimension is what the index is built for and what every
+/// distance is computed over, so a row of the wrong length would score
+/// against unrelated components rather than fail. The check reads the packed
+/// byte length, which is four bytes per component, so it costs nothing per
+/// row beyond a comparison.
+pub(crate) fn enforce_vector_dimensions(
+    batch: &DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        if column.type_id != zyron_common::TypeId::Vector {
+            continue;
+        }
+        let Some(dimensions) = column.max_length.filter(|n| *n > 0) else {
+            continue;
+        };
+        let Some(data) = batch.columns.get(idx) else {
+            continue;
+        };
+        let expected = dimensions * 4;
+        for row in 0..batch.num_rows.min(data.len()) {
+            if data.is_null(row) {
+                continue;
+            }
+            let crate::column::ScalarValue::Binary(bytes) = data.get_scalar(row) else {
+                continue;
+            };
+            if bytes.len() != expected {
+                return Err(zyron_common::ZyronError::ExecutionError(format!(
+                    "column \"{}\" holds vectors of {} components, row {} has {}",
+                    column.name,
+                    dimensions,
+                    row,
+                    bytes.len() / 4
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a value longer than the length its column declares.
+///
+/// `VARCHAR(n)`, `CHAR(n)`, `BINARY(n)` and `VARBINARY(n)` record their limit
+/// in the catalog and report it over the wire, so a write that ignored it
+/// would store a value the schema says cannot exist and hand the next reader
+/// a row wider than the type it asked for. Text lengths count characters, as
+/// SQL defines them, and binary lengths count bytes.
+///
+/// The declaration is a limit, not a target: a shorter value is stored as
+/// written, and `CHAR(n)` is not padded out to its width here.
+pub(crate) fn enforce_declared_lengths(
+    batch: &DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    use zyron_common::TypeId;
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        // A decimal's declared size is its digit count, which is checked
+        // against the scaled value rather than against a byte length
+        if column.type_id == TypeId::Decimal {
+            let precision = column.max_length.and_then(|p| u8::try_from(p).ok());
+            if precision.is_none() {
+                continue;
+            }
+            let scale = column.fractional_digits.unwrap_or(0);
+            let Some(data) = batch.columns.get(idx) else {
+                continue;
+            };
+            for row in 0..batch.num_rows.min(data.len()) {
+                if data.is_null(row) {
+                    continue;
+                }
+                if let crate::column::ScalarValue::Int128(v) = data.get_scalar(row) {
+                    zyron_common::check_precision(v, precision, scale)?;
+                }
+            }
+            continue;
+        }
+        // Vector reuses max_length for its dimension count, which
+        // enforce_vector_dimensions reads with its own rule
+        let counts_characters = match column.type_id {
+            TypeId::Varchar | TypeId::Char => true,
+            TypeId::Binary | TypeId::Varbinary => false,
+            _ => continue,
+        };
+        let Some(limit) = column.max_length.filter(|n| *n > 0) else {
+            continue;
+        };
+        let Some(data) = batch.columns.get(idx) else {
+            continue;
+        };
+        for row in 0..batch.num_rows.min(data.len()) {
+            if data.is_null(row) {
+                continue;
+            }
+            let length = match data.get_scalar(row) {
+                crate::column::ScalarValue::Utf8(s) if counts_characters => s.chars().count(),
+                crate::column::ScalarValue::Binary(b) if !counts_characters => b.len(),
+                _ => continue,
+            };
+            if length > limit {
+                let unit = if counts_characters {
+                    "characters"
+                } else {
+                    "bytes"
+                };
+                return Err(zyron_common::ZyronError::CheckViolation(format!(
+                    "value too long for column \"{}\", which holds at most {} {}, row {} has {}",
+                    column.name, limit, unit, row, length
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Puts every DECIMAL column of a batch on the scale its column declares.
+///
+/// A decimal is stored as an i128 holding the value times ten to the scale,
+/// and the expression that produced the value knows nothing about that. A
+/// literal arrives as a float or text, and an integer arrives with no
+/// fractional digits at all. Left alone, the column buffer takes a scalar of the wrong
+/// variant and `push_scalar` writes a zero, which is how a declared decimal
+/// column came to discard everything written to it.
+///
+/// Runs on the full-width row image every write path builds, so INSERT with
+/// inline values, INSERT from a SELECT and UPDATE all converge here rather
+/// than each carrying their own conversion.
+///
+/// A column already holding i128 values is left untouched, so a row read from
+/// a decimal column and written back costs one type check.
+pub(crate) fn normalize_decimal_columns(
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        if column.type_id != TypeId::Decimal {
+            continue;
+        }
+        let Some(data) = batch.columns.get_mut(idx) else {
+            continue;
+        };
+        // A column already typed decimal carries values on its own scale.
+        // When that scale differs from the declaration, the values move
+        // onto the declared one, otherwise a scale-3 source written into a
+        // scale-2 column would read back ten times too large. An i128
+        // buffer that is not typed decimal holds whole numbers, so it
+        // still has to be scaled
+        if data.type_id == TypeId::Decimal {
+            let declared = column.fractional_digits.unwrap_or(0);
+            if data.fractional_digits.unwrap_or(0) != declared {
+                *data = crate::compute::cast_column_to_decimal(data, declared)?;
+            }
+            continue;
+        }
+        let scale = column.fractional_digits.unwrap_or(0);
+        let rows = batch.num_rows.min(data.len());
+        let mut scaled: Vec<i128> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            if data.is_null(row) {
+                scaled.push(0);
+                continue;
+            }
+            match scale_to_decimal_column(&data.get_scalar(row), scale, &column.name, false)? {
+                crate::column::ScalarValue::Int128(v) => scaled.push(v),
+                _ => scaled.push(0),
+            }
+        }
+        *data = Column::with_nulls_ts(
+            ColumnData::Int128(scaled),
+            data.nulls.clone(),
+            TypeId::Decimal,
+            Some(scale),
+        );
+    }
+    Ok(())
+}
+
+/// Re-encodes array values to the element type their column declares.
+///
+/// An array constructor takes its element type from the expressions in it,
+/// so `ARRAY[10, 20]` carries whatever an integer literal binds to. Writing
+/// that into an `INT[]` column unchanged would store elements twice as wide
+/// as the declaration asks for. A value already at the declared type is left
+/// alone, so the pass costs one header read per array value in the common
+/// case and touches no other column.
+pub(crate) fn normalize_array_elements(
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        let Some(declared) = column.element_type else {
+            continue;
+        };
+        if column.type_id != zyron_common::TypeId::Array {
+            continue;
+        }
+        let Some(data) = batch.columns.get_mut(idx) else {
+            continue;
+        };
+        let ColumnData::Binary(values) = &mut data.data else {
+            continue;
+        };
+        let width = declared.fixed_size().unwrap_or(0);
+        for row in 0..values.len() {
+            let Some(view) = zyron_common::ArrayView::parse(&values[row]) else {
+                continue;
+            };
+            if view.element_type() == declared {
+                continue;
+            }
+            let source_type = view.element_type();
+            let source_width = source_type.fixed_size().unwrap_or(0);
+            let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(view.len());
+            for element in view.iter() {
+                let Some(bytes) = element else {
+                    payloads.push(None);
+                    continue;
+                };
+                let scalar = if source_width > 0 {
+                    crate::batch::decode_fixed_scalar(source_type, bytes)
+                } else {
+                    crate::batch::decode_varlen_scalar(source_type, bytes)
+                };
+                let converted = crate::compute::cast_scalar(&scalar, declared)?;
+                payloads.push(Some(crate::batch::encode_scalar_value(
+                    declared, &converted, width,
+                )));
+            }
+            let borrowed: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.as_deref()).collect();
+            values[row] = zyron_common::array_value::encode(declared, &borrowed);
+        }
+    }
+    Ok(())
+}
+
+/// Puts a value on a DECIMAL column's declared scale.
+///
+/// The scalar reaching here is whatever the expression produced: a literal
+/// still carries the digits it was written with, an integer carries none, and
+/// a value read from another decimal column carries that column's scale. Each
+/// is converted by its own rule rather than by reinterpreting its bytes,
+/// which is what made a decimal column read back as zero.
+///
+/// Text and integers convert exactly. A float cannot, so it rounds at the
+/// target scale, and that is the only path here that loses anything.
+///
+/// The declared precision is checked separately, beside the other declared
+/// size limits, because that is where the catalog entry carrying it is in
+/// scope.
+pub(crate) fn scale_to_decimal_column(
+    scalar: &ScalarValue,
+    scale: u8,
+    column_name: &str,
+    // True when the value came from a decimal already on this scale, which
+    // is the only case where its i128 is a scaled value rather than a whole
+    // number. A wide integer literal is an i128 too, and multiplying it is
+    // exactly what the column's scale means
+    already_scaled: bool,
+) -> zyron_common::Result<ScalarValue> {
+    let scaled = match scalar {
+        ScalarValue::Null => return Ok(ScalarValue::Null),
+        // Already on some decimal scale. Nothing records which, so a value
+        // arriving as a bare i128 is taken to be on this column's scale,
+        // which is what a read from a same-scale column produces
+        ScalarValue::Int128(v) if already_scaled => *v,
+        ScalarValue::Int128(v) => decimal_from_integer(*v, scale)?,
+        ScalarValue::Int8(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Int16(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Int32(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Int64(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt8(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt16(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt32(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt64(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Utf8(s) => zyron_common::parse_decimal(s, scale)?,
+        // A decimal literal reaches here as the f64 the lexer read it into.
+        // Rendering that f64 gives back the shortest decimal string that
+        // round-trips to it, which for a literal anyone wrote is the digits
+        // they wrote, so parsing that text recovers the value exactly.
+        // Going straight through the float would land `1.005` on the binary
+        // value just below it and round the wrong way.
+        ScalarValue::Float32(v) => decimal_from_float(*v as f64, scale)?,
+        ScalarValue::Float64(v) => decimal_from_float(*v, scale)?,
+        ScalarValue::Boolean(b) => decimal_from_integer(i128::from(*b), scale)?,
+        other => {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "cannot store {other} in DECIMAL column \"{column_name}\""
+            )));
+        }
+    };
+    Ok(ScalarValue::Int128(scaled))
+}
+
+/// Puts a float on a decimal scale by way of its shortest round-tripping
+/// decimal rendering, so a literal keeps the digits it was written with.
+///
+/// A value that is not finite has no decimal form and is refused there.
+pub(crate) fn decimal_from_float(value: f64, scale: u8) -> zyron_common::Result<i128> {
+    if !value.is_finite() {
+        return Err(zyron_common::ZyronError::ExecutionError(format!(
+            "cannot store {value} in a decimal column"
+        )));
+    }
+    zyron_common::parse_decimal(&format!("{value}"), scale)
+}
+
+/// Puts a whole number on a decimal scale, exactly.
+fn decimal_from_integer(value: i128, scale: u8) -> zyron_common::Result<i128> {
+    let factor = zyron_common::decimal::scale_factor(scale)?;
+    value.checked_mul(factor).ok_or_else(|| {
+        zyron_common::ZyronError::ExecutionError(format!(
+            "value {value} overflows a decimal at scale {scale}"
+        ))
+    })
+}
+
+/// Rejects a null in a column declared NOT NULL.
+///
+/// A declared constraint that does nothing is a lie, and NOT NULL is the one
+/// every column carries, so it is checked on the full-width row image that
+/// every write path builds. The cost is a bitmap test per non-nullable
+/// column: a batch with no nulls answers without reading a row.
+pub(crate) fn enforce_not_null(
+    batch: &DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    for (ci, col_entry) in table_columns.iter().enumerate() {
+        if col_entry.nullable {
+            continue;
+        }
+        let Some(column) = batch.columns.get(ci) else {
+            continue;
+        };
+        if !column.nulls.has_nulls() {
+            continue;
+        }
+        for row in 0..batch.num_rows {
+            if column.is_null(row) {
+                return Err(zyron_common::ZyronError::CheckViolation(format!(
+                    "null value in column \"{}\" violates NOT NULL",
+                    col_entry.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Evaluates each CHECK predicate over a table-column-order batch and rejects
 /// the statement if any row makes a predicate false. A predicate that is NULL
 /// (unknown) passes, matching SQL semantics. The predicates were bound against
 /// the table at table_idx 0, so the schema is rebuilt at that index here.
-fn enforce_check_constraints(
+///
+/// The declarations a column carries in its own right run first, because a
+/// row that violates the type it was declared with should be named by that
+/// rule rather than by whichever CHECK happens to trip on it.
+pub(crate) fn enforce_check_constraints(
     checks: &[zyron_planner::binder::BoundExpr],
     batch: &DataBatch,
     table_columns: &[zyron_catalog::ColumnEntry],
     params: &[crate::column::ScalarValue],
 ) -> zyron_common::Result<()> {
+    enforce_not_null(batch, table_columns)?;
+    enforce_vector_dimensions(batch, table_columns)?;
+    enforce_declared_lengths(batch, table_columns)?;
     if checks.is_empty() || batch.num_rows == 0 {
         return Ok(());
     }
@@ -1081,7 +2055,7 @@ fn enforce_check_constraints(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     for expr in checks {
@@ -1177,8 +2151,18 @@ impl Operator for InsertOperator {
             self.ctx.ensure_writable("INSERT")?;
 
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
-            let heap_file = self.ctx.get_heap_file(self.table_id).await?;
+            let is_lake = table_entry.lake.is_lake();
+            // A lake table never opens its allocated heap file, resolving
+            // the handle would materialize an empty heap file on disk
+            let heap_file = if is_lake {
+                None
+            } else {
+                self.ctx
+                    .ensure_heap_branch_resolved("INSERT", &table_entry.name)?;
+                Some(self.ctx.get_heap_file(self.table_id).await?)
+            };
             let mut total_inserted: i64 = 0;
+            let mut lake_batches: Vec<DataBatch> = Vec::new();
             let txn_id = self.ctx.txn_id;
 
             // Map each table column to the source-batch position that supplies
@@ -1332,6 +2316,11 @@ impl Operator for InsertOperator {
                     }
                 }
 
+                // Arrays take the element width their column declares before
+                // any check reads the row, so a CHECK sees the stored image
+                normalize_array_elements(&mut exec_batch.batch, &table_entry.columns)?;
+                normalize_decimal_columns(&mut exec_batch.batch, &table_entry.columns)?;
+
                 // Enforce CHECK constraints on the full-width row image before
                 // any write so a violation aborts the statement with no effect.
                 enforce_check_constraints(
@@ -1341,26 +2330,97 @@ impl Operator for InsertOperator {
                     &params,
                 )?;
 
-                // Branch writes go to the branch append overlay and stay
-                // isolated from the main line. Index, CDC, and trigger
-                // maintenance for branches arrives in a later stage.
-                if let Some(bid) = self.ctx.active_branch_id {
-                    let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
-                    let ids = crate::operator::branch_write::branch_insert(
+                // A lake table's rows go to its transaction log, never to
+                // heap pages. The reshaped, defaulted, checked batch is
+                // accumulated and committed as one data file per statement
+                // after the source drains
+                if table_entry.lake.is_lake() {
+                    // BEFORE INSERT fires on the reshaped, defaulted image,
+                    // the same one the heap path shows its triggers, and
+                    // before any constraint reads it so a trigger that
+                    // rejects a row stops it reaching storage
+                    crate::trigger::fire_row_triggers(
                         &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &tuples,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_BEFORE,
+                        zyron_catalog::TriggerEntry::EVENT_INSERT,
+                        &exec_batch.batch,
+                        &table_entry.columns,
                     )
                     .await?;
-                    total_inserted += ids.len() as i64;
+
+                    // Referential integrity runs per batch, against a heap
+                    // or a lake parent, before the rows are accumulated. A
+                    // constraint that quarantines diverts its rejected rows
+                    // and the rest of the batch still lands
+                    let violations = crate::operator::fk::check_child_fks(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                    )
+                    .await?;
+                    let batch = if violations.is_empty() {
+                        exec_batch.batch
+                    } else {
+                        divert_quarantined(&self.ctx, &exec_batch.batch, &violations, txn_id as u32)
+                            .await?
+                    };
+                    if batch.num_rows == 0 {
+                        continue;
+                    }
+                    total_inserted += batch.num_rows as i64;
+                    lake_batches.push(batch);
+                    continue;
+                }
+                let heap_file = heap_file.as_ref().ok_or_else(|| {
+                    zyron_common::ZyronError::ExecutionError(
+                        "heap insert path reached without a heap file".into(),
+                    )
+                })?;
+
+                // A branch write lands in the branch's append file rather
+                // than the main heap, and everything a main insert enforces
+                // is enforced here too. The rows are the branch's, so the
+                // reads these checks make resolve through the branch: the
+                // foreign key probe and the uniqueness probe both read the
+                // branch's view of the parent and of the table
+                if let Some(bid) = self.ctx.active_branch_id {
+                    total_inserted += Box::pin(insert_branch_batch(
+                        &self.ctx,
+                        self.table_id,
+                        &table_entry,
+                        &index_snap,
+                        bid,
+                        heap_file.heap_file_id(),
+                        txn_id,
+                        exec_batch.batch,
+                    ))
+                    .await?;
                     continue;
                 }
 
                 // Enforce child-side foreign keys before any write so a
-                // violation aborts the statement without partial effects.
-                crate::operator::fk::check_child_fks(&self.ctx, &table_entry, &exec_batch.batch)
+                // violation aborts the statement without partial effects. A
+                // constraint that quarantines diverts its rejected rows here
+                // instead, leaving the rest of the batch to insert
+                let fk_violations = crate::operator::fk::check_child_fks(
+                    &self.ctx,
+                    &table_entry,
+                    &exec_batch.batch,
+                )
+                .await?;
+                if !fk_violations.is_empty() {
+                    exec_batch.batch = divert_quarantined(
+                        &self.ctx,
+                        &exec_batch.batch,
+                        &fk_violations,
+                        txn_id as u32,
+                    )
                     .await?;
+                    if exec_batch.batch.num_rows == 0 {
+                        continue;
+                    }
+                }
 
                 // Enforce unique constraints before any write. Abort does not
                 // undo heap rows here, so the check must precede the mutation.
@@ -1466,6 +2526,26 @@ impl Operator for InsertOperator {
                     }
                 }
 
+                // One registry ordinal per inserted row, shared by FTS,
+                // vector and spatial maintenance below. Allocated only when
+                // a search index exists, ordinary tables pay nothing.
+                let needs_docs = !fts_resolved.is_empty()
+                    || !vec_resolved.is_empty()
+                    || !index_snap.spatial.is_empty();
+                let doc_ids: Vec<u64> = if needs_docs {
+                    let Some(reg) = &self.ctx.doc_registry else {
+                        return Err(ZyronError::Internal(
+                            "search index maintenance requires the document registry".into(),
+                        ));
+                    };
+                    tuple_ids
+                        .iter()
+                        .map(|tid| reg.allocate(table_entry.id.0, tid.locator()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
                 // Maintain FTS indexes: add each inserted document.
                 let fts_indexes: &[(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)] =
                     fts_resolved.as_slice();
@@ -1473,9 +2553,8 @@ impl Operator for InsertOperator {
                     let analyzer = zyron_search::SimpleAnalyzer;
                     let mut fts_buf = zyron_search::AnalysisBuffer::new();
                     let mut text_buf = String::with_capacity(256);
-                    for (row_idx, tid) in tuple_ids.iter().enumerate() {
-                        let doc_id =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                    for (row_idx, _tid) in tuple_ids.iter().enumerate() {
+                        let doc_id = doc_ids[row_idx];
                         text_buf.clear();
                         extract_fts_text_into(
                             &exec_batch.batch,
@@ -1499,9 +2578,8 @@ impl Operator for InsertOperator {
                 // Maintain vector indexes: insert each new vector into every
                 // vector index on the table, sourced from that index's column.
                 if !vec_resolved.is_empty() {
-                    for (row_idx, tid) in tuple_ids.iter().enumerate() {
-                        let vec_id =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                    for (row_idx, _tid) in tuple_ids.iter().enumerate() {
+                        let vec_id = doc_ids[row_idx];
                         for (idx_id, vec_idx) in &vec_resolved {
                             let col_id = vec_idx.column_id();
                             if let Some(vec_bytes) = extract_vector_bytes(
@@ -1528,9 +2606,8 @@ impl Operator for InsertOperator {
                 // and insert (mbr, rowid) into the live R-tree.
                 if !index_snap.spatial.is_empty() {
                     if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
-                        for (row_idx, tid) in tuple_ids.iter().enumerate() {
-                            let rowid =
-                                zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                        for (row_idx, _tid) in tuple_ids.iter().enumerate() {
+                            let rowid = doc_ids[row_idx];
                             for (idx_id, col_id) in &index_snap.spatial {
                                 let Some(tree) = spatial_mgr.get(idx_id.0) else {
                                     continue;
@@ -1565,11 +2642,13 @@ impl Operator for InsertOperator {
                 #[cfg(feature = "profile")]
                 let _idx_span =
                     zyron_common::profile::scope(zyron_common::profile::Phase::ExecIndexInsert);
+                let index_locators: Vec<zyron_common::RowLocator> =
+                    tuple_ids.iter().map(|t| t.locator()).collect();
                 maintain_btree_insert(
                     &self.ctx,
                     &table_entry,
                     &exec_batch.batch,
-                    &tuple_ids,
+                    &index_locators,
                     &index_snap,
                 );
                 #[cfg(feature = "profile")]
@@ -1601,14 +2680,577 @@ impl Operator for InsertOperator {
                 .await?;
             }
 
+            // One data file and one log commit per statement, pending under
+            // this transaction until its commit record is durable
+            if is_lake && !lake_batches.is_empty() {
+                let derived = crate::derived_columns::derived_column_data(
+                    &self.ctx.catalog,
+                    &table_entry,
+                    &lake_batches,
+                )
+                .await?;
+                // Off the worker thread. Writing the data file, fsyncing it,
+                // writing the version file and fsyncing that is milliseconds
+                // of blocking work, and a commit that loses races to other
+                // writers waits between attempts on top of that. Held on a
+                // runtime worker it stalls every other connection that
+                // thread was going to serve, and the handoff costs a few
+                // microseconds against an append measured in milliseconds.
+                //
+                // The batches move in and come back out rather than being
+                // cloned, because they are the rows themselves and three
+                // later steps still read them
+                let blocking_ctx = Arc::clone(&self.ctx);
+                let blocking_entry = Arc::clone(&table_entry);
+                let (appended, returned) = tokio::task::spawn_blocking(move || {
+                    let appended =
+                        append_lake_batches(&blocking_ctx, &blocking_entry, &lake_batches, derived);
+                    (appended, lake_batches)
+                })
+                .await
+                .map_err(|e| {
+                    zyron_common::ZyronError::Internal(format!(
+                        "lake append task failed to run to completion: {e}"
+                    ))
+                })?;
+                lake_batches = returned;
+                let outcome = appended?;
+                self.ctx.mark_wrote_wal();
+                // The rows only have addresses once the commit assigned
+                // them, so search index maintenance runs after the append
+                // rather than per batch the way the heap path does
+                if let Some(outcome) = outcome {
+                    maintain_lake_search_indexes(
+                        &self.ctx,
+                        &table_entry,
+                        &lake_batches,
+                        outcome.partition_id,
+                        &outcome.order,
+                    )?;
+                    // The heap path notifies per batch under the WAL LSN it
+                    // wrote. A lake append is one commit for the whole
+                    // statement, so the feed gets one notification carrying
+                    // the log version the rows landed under
+                    if let Some(ref hook) = self.ctx.cdc_hook {
+                        let mut encoded: Vec<Vec<u8>> = Vec::new();
+                        for batch in &lake_batches {
+                            for r in 0..batch.num_rows {
+                                encoded.push(crate::batch::encode_row(
+                                    batch,
+                                    r,
+                                    &table_entry.columns,
+                                ));
+                            }
+                        }
+                        let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as i64;
+                        if let Err(e) = hook.on_insert(
+                            self.table_id.0,
+                            &refs,
+                            outcome.version,
+                            now,
+                            txn_id,
+                            true,
+                        ) {
+                            eprintln!("CDC insert hook failed: {e}");
+                        }
+                    }
+                }
+                // AFTER INSERT fires once the rows are committed, because a
+                // trigger body that reads the table has to see them. One
+                // firing per accumulated batch, so a trigger observes the
+                // same batches its BEFORE counterpart did
+                for batch in &lake_batches {
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_AFTER,
+                        zyron_catalog::TriggerEntry::EVENT_INSERT,
+                        batch,
+                        &table_entry.columns,
+                    )
+                    .await?;
+                }
+            }
+
+            if let Some(stats) = self.ctx.table_io_stats_for(self.table_id.0) {
+                stats.record_inserts(total_inserted.max(0) as u64);
+            }
+
             Ok(Some(ExecutionBatch::new(count_batch(total_inserted))))
         })
     }
 }
 
+/// The manifest at the log's created head together with that head, which
+/// includes this transaction's own pending versions and any foreign pending
+/// version a commit would wait on anyway. Retried when a concurrent abandon
+/// retracts the head between the sample and the read
+fn pending_inclusive_manifest(
+    log: &zyron_lake::TransactionLog,
+) -> zyron_common::Result<(std::sync::Arc<zyron_lake::ManifestFile>, u64)> {
+    let mut tries = 0u32;
+    loop {
+        let head = log.head_version();
+        match log.manifest_at(head) {
+            Ok(m) => return Ok((m, head)),
+            Err(e) => {
+                tries += 1;
+                if log.head_version() == head || tries >= 64 {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Enforces every declared PRIMARY KEY and UNIQUE constraint against the
+/// incoming batch and the table's live rows at the pending-inclusive head,
+/// so a key this transaction already appended collides with a second use.
+///
+/// A declared constraint that does nothing is a lie, so these run by
+/// default. The cost stays off the write path because the check reads the
+/// manifest's per-file bounds and value blooms first: a monotonic key opens
+/// one file and a key outside every stored range opens none.
+///
+/// Returns the probe's read footprint, the batch's key ranges pinned to the
+/// probed head version, for the caller to carry on its commit attempt. The
+/// commit then conflicts with any concurrent commit that added a file in a
+/// probed range after the probe, which is the duplicate the probe itself
+/// could not see
+pub(crate) fn enforce_lake_unique(
+    log: &zyron_lake::TransactionLog,
+    table_entry: &zyron_catalog::TableEntry,
+    columns: &[zyron_lake::ColumnData],
+    // Rows this statement removes, so an update keeping a key does not
+    // collide with the copy it is rewriting. None for an insert, which
+    // supersedes nothing
+    superseded: Option<&zyron_lake::LakePredicate>,
+) -> zyron_common::Result<Option<(zyron_lake::LakePredicate, u64)>> {
+    let mut specs: Vec<zyron_lake::UniqueSpec> = table_entry
+        .constraints
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.constraint_type,
+                zyron_catalog::schema::ConstraintType::PrimaryKey
+                    | zyron_catalog::schema::ConstraintType::Unique
+            ) && !c.columns.is_empty()
+                // NOT ENFORCED keeps the declaration for the planner and
+                // asks the write path to skip it
+                && c.enforced
+        })
+        .map(|c| zyron_lake::UniqueSpec {
+            name: c.name.clone(),
+            column_ids: c.columns.iter().map(|id| id.0 as u32).collect(),
+        })
+        .collect();
+    let (manifest, probed_version) = pending_inclusive_manifest(log)?;
+    // A unique index is a declaration too, and one that admits duplicates
+    // is the same lie a constraint that does nothing would be. The lake's
+    // own index specs carry the flag and the key columns, so they enforce
+    // beside the constraints rather than through a second mechanism
+    for index in &manifest.indexes {
+        if !index.unique {
+            continue;
+        }
+        if specs.iter().any(|s| s.column_ids == index.column_ids) {
+            continue;
+        }
+        specs.push(zyron_lake::UniqueSpec {
+            name: index.name.clone(),
+            column_ids: index.column_ids.clone(),
+        });
+    }
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut footprint: Vec<zyron_lake::LakePredicate> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let (outcome, _) =
+            zyron_lake::check_unique_replacing(log.paths(), &manifest, spec, columns, superseded)?;
+        match outcome {
+            zyron_lake::UniqueOutcome::Ok => {}
+            zyron_lake::UniqueOutcome::DuplicateInBatch {
+                first_row,
+                second_row,
+            } => {
+                return Err(zyron_common::ZyronError::ExecutionError(format!(
+                    "duplicate key value violates unique constraint \"{}\" on \"{}\": \
+                     inserted rows {} and {} carry the same key",
+                    spec.name, table_entry.name, first_row, second_row
+                )));
+            }
+            zyron_lake::UniqueOutcome::DuplicateWithStored { .. } => {
+                return Err(zyron_common::ZyronError::ExecutionError(format!(
+                    "duplicate key value violates unique constraint \"{}\" on \"{}\"",
+                    spec.name, table_entry.name
+                )));
+            }
+        }
+        if let Some(range) = zyron_lake::unique_probe_range(&manifest, spec, columns)? {
+            footprint.push(range);
+        }
+    }
+    Ok(match footprint.len() {
+        0 => None,
+        1 => footprint.pop().map(|p| (p, probed_version)),
+        _ => Some((zyron_lake::LakePredicate::Or(footprint), probed_version)),
+    })
+}
+
+/// Turns accumulated full-width insert batches into one lake data file
+/// plus one Append commit, registered pending under the statement's
+/// transaction. Cells use the storage representation, fixed little endian
+/// padded to the physical width, variable length as bare bytes
+fn append_lake_batches(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    batches: &[DataBatch],
+    derived: Vec<zyron_lake::ColumnData>,
+) -> zyron_common::Result<Option<zyron_lake::AppendOutcome>> {
+    // Sized at the column's own width so the cells land in one packed
+    // buffer that the segment build reads rather than repacks, and filled
+    // through a scratch buffer reused across every cell instead of one
+    // allocation per cell
+    let rows: usize = batches.iter().map(|b| b.num_rows).sum();
+    let mut columns: Vec<zyron_lake::ColumnData> = table_entry
+        .columns
+        .iter()
+        .map(|c| {
+            zyron_lake::ColumnData::with_capacity(
+                c.id.0 as u32,
+                c.physical_type_id().fixed_size().unwrap_or(0),
+                rows,
+            )
+        })
+        .collect();
+    let mut scratch: Vec<u8> = Vec::new();
+    for batch in batches {
+        for (ci, col_entry) in table_entry.columns.iter().enumerate() {
+            let value_size = col_entry.physical_type_id().fixed_size().unwrap_or(0);
+            let column = &batch.columns[ci];
+            for r in 0..batch.num_rows {
+                match column.get_scalar(r) {
+                    ScalarValue::Null => columns[ci].push(None),
+                    ref v => {
+                        scratch.clear();
+                        crate::batch::encode_scalar_value_into(
+                            &mut scratch,
+                            col_entry.type_id,
+                            v,
+                            value_size,
+                        );
+                        columns[ci].push(Some(&scratch));
+                    }
+                }
+            }
+        }
+    }
+    if columns.first().map(|c| c.is_empty()).unwrap_or(true) {
+        return Ok(None);
+    }
+    // A clustering expression is stored in a column of its own, so the batch
+    // covers the lake schema only once its values are appended. A derived
+    // column already present in the catalog is replaced rather than doubled
+    for computed in derived {
+        match columns
+            .iter_mut()
+            .find(|c| c.column_id == computed.column_id)
+        {
+            Some(existing) => *existing = computed,
+            None => columns.push(computed),
+        }
+    }
+    let paths = zyron_lake::LakePaths::new(ctx.disk_manager.data_dir(), table_entry.id.0);
+    // The branch this session writes, forked here if it has not touched
+    // this table yet. Uniqueness reads the same head, so a key the branch
+    // holds collides and a key only main holds does not
+    let head = crate::operator::lake_scan::effective_head(ctx, None);
+    let log = crate::operator::lake_scan::open_lake_write_head(&paths, &table_entry.name, head)?;
+    let root = log.registry_key();
+    let probe = enforce_lake_unique(&log, table_entry, &columns, None)?;
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let attempt = zyron_lake::CommitAttempt {
+        operation: zyron_lake::OperationKind::Append,
+        db_txn_id: ctx.lake_txn_id(),
+        commit_lsn: 0,
+        timestamp_us,
+        // The probe's key ranges pinned at the probed head, so a
+        // concurrent commit that lands a probed key after the probe
+        // conflicts instead of committing a duplicate
+        read_predicate: probe.as_ref().map(|(p, _)| p),
+        read_version: probe.as_ref().map(|(_, v)| *v).unwrap_or(0),
+        audit: None,
+        // The statement's own deadline, so a commit losing races to other
+        // writers stops waiting when the statement is over time instead of
+        // holding this thread indefinitely. Unset when the session has no
+        // statement timeout, which waits as before
+        deadline: ctx.deadline(),
+    };
+    let out = zyron_lake::append_rows(&log, attempt, table_entry.id.0 as u64, &columns)?;
+    zyron_lake::register_txn_pending(
+        ctx.disk_manager.data_dir(),
+        ctx.lake_txn_id(),
+        root,
+        out.version,
+    );
+    Ok(Some(out))
+}
+
+/// Adds the rows one lake append wrote to the table's search indexes.
+///
+/// A lake row is addressed by data file and ordinal, and the writer sorts
+/// the batch, so an input row's position is not its address. The append
+/// returns the permutation and this inverts it, then allocates one registry
+/// ordinal per row exactly as the heap path does, so FTS, vector and
+/// spatial address a lake row through the same document identity they use
+/// for every other store
+pub(crate) fn maintain_lake_search_indexes(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    batches: &[DataBatch],
+    partition_id: u64,
+    order: &[usize],
+) -> zyron_common::Result<()> {
+    let index_snap = ctx.index_snapshot_for_table(table_entry.id.0);
+    let fts_resolved: Vec<(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)> =
+        if index_snap.fts.is_empty() {
+            Vec::new()
+        } else if let Some(mgr) = ctx.fts_manager.as_ref() {
+            index_snap
+                .fts
+                .iter()
+                .filter_map(|id| mgr.get_index(id.0).map(|idx| (*id, idx)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let vec_resolved: Vec<(u32, Arc<zyron_search::vector::VectorIndex>)> =
+        if index_snap.vector.is_empty() {
+            Vec::new()
+        } else {
+            index_snap
+                .vector
+                .iter()
+                .filter_map(|id| ctx.get_vector_index(id.0).map(|idx| (id.0, idx)))
+                .collect()
+        };
+    if fts_resolved.is_empty() && vec_resolved.is_empty() && index_snap.spatial.is_empty() {
+        return Ok(());
+    }
+    let Some(reg) = &ctx.doc_registry else {
+        return Err(ZyronError::Internal(
+            "search index maintenance requires the document registry".into(),
+        ));
+    };
+
+    // The ordinal each input row landed at, inverting the write order
+    let mut ordinal_of = vec![0u64; order.len()];
+    for (ordinal, input_row) in order.iter().enumerate() {
+        ordinal_of[*input_row] = ordinal as u64;
+    }
+
+    let analyzer = zyron_search::SimpleAnalyzer;
+    let mut fts_buf = zyron_search::AnalysisBuffer::new();
+    let mut text_buf = String::with_capacity(256);
+    let mut input_row = 0usize;
+    for batch in batches {
+        for row in 0..batch.num_rows {
+            let Some(ordinal) = ordinal_of.get(input_row).copied() else {
+                break;
+            };
+            input_row += 1;
+            let doc_id = reg.allocate(
+                table_entry.id.0,
+                zyron_common::RowLocator::Lake {
+                    file_id: partition_id,
+                    ordinal,
+                },
+            );
+
+            if !fts_resolved.is_empty() {
+                text_buf.clear();
+                extract_fts_text_into(batch, row, &table_entry.columns, &mut text_buf);
+                for (idx_id, fts_idx) in &fts_resolved {
+                    if let Err(e) =
+                        fts_idx.add_document_with_buf(doc_id, &text_buf, &analyzer, &mut fts_buf)
+                    {
+                        return Err(ZyronError::ExecutionError(format!(
+                            "full text index {} insert failed on a lake row: {e}",
+                            idx_id.0
+                        )));
+                    }
+                }
+            }
+
+            for (idx_id, vec_idx) in &vec_resolved {
+                let col_id = vec_idx.column_id();
+                let Some(vec_bytes) =
+                    extract_vector_bytes(batch, row, &table_entry.columns, col_id)
+                else {
+                    continue;
+                };
+                let vec_data = bytes_to_f32_slice(vec_bytes);
+                if let Err(e) =
+                    zyron_search::vector::VectorSearch::insert(vec_idx.as_ref(), doc_id, vec_data)
+                {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "vector index {} insert failed on a lake row: {e}",
+                        idx_id
+                    )));
+                }
+            }
+
+            if !index_snap.spatial.is_empty()
+                && let Some(spatial_mgr) = &ctx.spatial_manager
+            {
+                for (idx_id, col_id) in &index_snap.spatial {
+                    let Some(tree) = spatial_mgr.get(idx_id.0) else {
+                        continue;
+                    };
+                    let Some(geom_bytes) =
+                        extract_column_bytes(batch, row, &table_entry.columns, *col_id)
+                    else {
+                        continue;
+                    };
+                    let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes) else {
+                        continue;
+                    };
+                    let mbr = zyron_types::spatial_index::mbr_from_geometry(&geom, tree.dims());
+                    tree.insert(zyron_types::spatial_index::LeafEntry {
+                        mbr,
+                        data: doc_id,
+                        deleted: false,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // DeleteOperator
 // ---------------------------------------------------------------------------
+
+/// After exclusive row locks are acquired for an UPDATE or DELETE, verifies
+/// the latest committed state of each locked row still matches the image
+/// this statement's snapshot produced. A foreign committed xmax on a heap
+/// tuple, a pruned slot, or a committed but snapshot-invisible columnar
+/// patch or supersede means a first committer already changed the row.
+/// Re-stamping it would overwrite that transaction's xmax and leave two
+/// live versions, so the statement fails with a conflict the client can
+/// retry. Heap locators are grouped so each page is inspected once, in
+/// place under the frame's read guard when the page is resident
+async fn ensure_locked_rows_unchanged(
+    ctx: &Arc<ExecutionContext>,
+    table_id: zyron_catalog::TableId,
+    locators: &[zyron_common::RowLocator],
+) -> zyron_common::Result<()> {
+    use zyron_common::RowLocator;
+
+    let own_txn = ctx.txn_id as u64;
+    let status_map = ctx.snapshot.status_map();
+    let conflict = |loc: RowLocator| ZyronError::TransactionConflict {
+        txn_id: own_txn,
+        reason: format!(
+            "row {loc} in table {} was changed by a concurrently committed \
+             transaction, retry the transaction",
+            table_id.0
+        ),
+    };
+
+    let mut heap_pages: std::collections::HashMap<zyron_common::PageId, Vec<u16>> =
+        std::collections::HashMap::new();
+    let mut columnar_rows: Vec<(u64, u64)> = Vec::new();
+    for loc in locators {
+        match *loc {
+            RowLocator::Heap { page, slot } => heap_pages.entry(page).or_default().push(slot),
+            RowLocator::Columnar { file_id, sys_rowid } => {
+                columnar_rows.push((file_id, sys_rowid));
+            }
+            RowLocator::Lake { .. } => {}
+        }
+    }
+
+    for (page_id, slots) in &heap_pages {
+        let stale_slot = |data: &[u8]| -> Option<u16> {
+            slots.iter().copied().find(|&slot| {
+                match zyron_storage::HeapPage::get_tuple_view_from_slice(
+                    data,
+                    zyron_storage::SlotId(slot),
+                ) {
+                    // the slot was pruned or reused, the scanned image is gone
+                    None => true,
+                    Some(view) => {
+                        let xmax = view.header.xmax as u64;
+                        xmax != 0 && xmax != own_txn && status_map.is_committed(xmax)
+                    }
+                }
+            })
+        };
+        let found = match ctx.buffer_pool.fetch_page(*page_id) {
+            Some(frame) => {
+                let guard = frame.read_data();
+                let found = stale_slot(&**guard);
+                drop(guard);
+                ctx.buffer_pool.unpin_page(*page_id, false);
+                found
+            }
+            None => {
+                let data = crate::operator::scan::read_page_through_pool(
+                    &ctx.buffer_pool,
+                    &ctx.disk_manager,
+                    *page_id,
+                )
+                .await?;
+                stale_slot(&data)
+            }
+        };
+        if let Some(slot) = found {
+            return Err(conflict(RowLocator::Heap {
+                page: *page_id,
+                slot,
+            }));
+        }
+    }
+
+    if !columnar_rows.is_empty() {
+        let te = ctx.get_table_entry(table_id)?;
+        let store = columnar_patch_store(&te)?;
+        // a patch or supersede from a transaction that committed but is not
+        // visible to this snapshot is a concurrent change
+        let concurrent = |xid: u64| {
+            xid != own_txn && status_map.is_committed(xid) && !ctx.snapshot.is_visible(xid, 0)
+        };
+        for (file_id, sys_rowid) in columnar_rows {
+            let overlay = match ctx.active_branch_id {
+                Some(branch) => store.row_overlay_on(branch, file_id, sys_rowid),
+                None => store.row_overlay(file_id, sys_rowid),
+            };
+            let Some(overlay) = overlay else {
+                continue;
+            };
+            if overlay.supersedes.iter().any(|&x| concurrent(x))
+                || overlay
+                    .patches
+                    .values()
+                    .any(|chain| chain.iter().any(|p| concurrent(p.patch_xid)))
+            {
+                return Err(conflict(RowLocator::Columnar { file_id, sys_rowid }));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Pulls rows with tuple IDs from a child scan, logs deletions to WAL,
 /// deletes from the heap, and returns the row count.
@@ -1643,6 +3285,10 @@ impl Operator for DeleteOperator {
             self.finished = true;
 
             self.ctx.ensure_writable("DELETE")?;
+            self.ctx.ensure_heap_branch_resolved(
+                "DELETE",
+                &self.ctx.get_table_entry(self.table_id)?.name,
+            )?;
 
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_deleted: i64 = 0;
@@ -1655,53 +3301,231 @@ impl Operator for DeleteOperator {
                     break;
                 };
 
+                // Take exclusive row locks before any mutation so a held
+                // FOR UPDATE/SHARE lock blocks this delete and two writers
+                // of the same row conflict deterministically instead of
+                // both stamping. Keys on RowLocator, so heap and columnar
+                // resident rows lock uniformly. Released at commit/abort
+                if let Some(locks) = &self.ctx.row_locks
+                    && let Some(locs) = exec_batch.locators.as_ref()
+                {
+                    for loc in locs {
+                        locks.lock_row(
+                            txn_id as u64,
+                            self.table_id.0,
+                            *loc,
+                            zyron_storage::LockMode::Exclusive,
+                        )?;
+                    }
+                }
+
+                // First committer wins: a transaction may have committed a
+                // change to these rows between this statement's snapshot and
+                // the lock acquisition above. Stamping over its xmax would
+                // silently lose the delete and keep the superseded image
+                // alive, so the statement conflicts instead
+                if let Some(locs) = exec_batch.locators.as_ref() {
+                    ensure_locked_rows_unchanged(&self.ctx, self.table_id, locs).await?;
+                }
+
+                // Exhaustive tier gate: a new RowLocator variant fails to
+                // compile here until the delete path handles it
+                match exec_batch.tier() {
+                    None => {
+                        return Err(ZyronError::Internal(
+                            "DeleteOperator requires row locators from scan".to_string(),
+                        ));
+                    }
+                    Some(crate::operator::BatchTier::Lake) => {
+                        return Err(ZyronError::Internal(
+                            "lake resident rows have no DELETE path".to_string(),
+                        ));
+                    }
+                    Some(crate::operator::BatchTier::Columnar)
+                    | Some(crate::operator::BatchTier::Heap) => {}
+                }
+
                 // Columnar-resident rows: append a supersede to the patch
                 // log. No heap delete, no .zyr rewrite. WAL-logged first so
                 // the delete and the supersede commit together.
-                if let Some(locs) = exec_batch.columnar_locators.clone() {
+                if let Some(locs) = exec_batch.columnar_pairs() {
+                    // A branch delete supersedes on the branch overlay, the
+                    // main line keeps the row, mirroring heap page COW at
+                    // row granularity
+                    let branch = self.ctx.active_branch_id.unwrap_or(0);
                     let te = self.ctx.get_table_entry(self.table_id)?;
-                    let store = columnar_patch_store(&te)?;
-                    for &(file_id, rowid) in &locs {
-                        let mut pl = Vec::with_capacity(32);
-                        pl.extend_from_slice(&(self.table_id.0 as u64).to_le_bytes());
-                        pl.extend_from_slice(&file_id.to_le_bytes());
-                        pl.extend_from_slice(&rowid.to_le_bytes());
-                        pl.extend_from_slice(&(txn_id as u64).to_le_bytes());
-                        let lsn = self.ctx.wal.log_columnar_supersede(&pl)?;
-                        self.ctx.mark_wrote_wal();
-                        store.append_supersede(file_id, rowid, txn_id as u64, lsn.0)?;
-                    }
-                    total_deleted += locs.len() as i64;
-                    continue;
-                }
 
-                let tuple_ids = exec_batch.tuple_ids.ok_or_else(|| {
-                    ZyronError::Internal("DeleteOperator requires tuple IDs from scan".into())
-                })?;
+                    // Same subsystem sequence as the heap path below. These
+                    // operate on the row values the scan materialized, so a
+                    // folded row behaves exactly like a heap row.
 
-                // Branch deletes copy the target page into the branch overlay
-                // and tombstone it there, leaving the main line untouched.
-                if let Some(bid) = self.ctx.active_branch_id {
-                    let deleted = crate::operator::branch_write::branch_delete(
+                    // Apply the ON DELETE referential actions that do not need
+                    // the parent's final state, before removing its rows.
+                    crate::operator::fk::enforce_parent_delete(
                         &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &tuple_ids,
+                        &te,
+                        &exec_batch.batch,
+                        crate::operator::fk::FkPhase::BeforeWrite,
                     )
                     .await?;
-                    total_deleted += deleted as i64;
+
+                    // Fire BEFORE DELETE triggers if present.
+                    if let Some(ref hook) = self.ctx.dml_hook {
+                        let old_tuples = batch_to_tuples(&exec_batch.batch, &te.columns, txn_id);
+                        let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                        if !hook.before_delete(self.table_id.0, &refs, txn_id)? {
+                            continue; // Trigger cancelled the delete
+                        }
+                    }
+
+                    // Fire BEFORE DELETE row/statement triggers in the same txn.
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_BEFORE,
+                        zyron_catalog::TriggerEntry::EVENT_DELETE,
+                        &exec_batch.batch,
+                        &te.columns,
+                    )
+                    .await?;
+
+                    // Capture old tuples for the CDC hook before the rows are
+                    // superseded.
+                    let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
+                        Some(batch_to_tuples(&exec_batch.batch, &te.columns, txn_id))
+                    } else {
+                        None
+                    };
+
+                    let store = columnar_patch_store(&te)?;
+                    let mut last_lsn: u64 = 0;
+                    for &(file_id, rowid) in &locs {
+                        last_lsn = store.supersede_logged(
+                            &self.ctx.wal,
+                            self.table_id.0 as u64,
+                            branch,
+                            file_id,
+                            rowid,
+                            txn_id as u64,
+                        )?;
+                        self.ctx.mark_wrote_wal();
+                        if self.ctx.recording_undo() {
+                            self.ctx.record_columnar_supersede_undo(
+                                self.table_id.0,
+                                branch,
+                                file_id,
+                                rowid,
+                            );
+                        }
+                    }
+                    total_deleted += locs.len() as i64;
+
+                    // Retire each deleted row's document and remove it from
+                    // every search index, keyed by the columnar locator. A row
+                    // with no live document has nothing to remove
+                    let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+                    let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+                    let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                    if !fts_indexes.is_empty()
+                        || !vec_index_ids.is_empty()
+                        || !spatial_indexes.is_empty()
+                    {
+                        let Some(reg) = &self.ctx.doc_registry else {
+                            return Err(ZyronError::Internal(
+                                "search index maintenance requires the document registry".into(),
+                            ));
+                        };
+                        for &(file_id, rowid) in &locs {
+                            let loc = zyron_common::RowLocator::Columnar {
+                                file_id,
+                                sys_rowid: rowid,
+                            };
+                            let Some(doc_id) = reg.take(self.table_id.0, loc) else {
+                                continue;
+                            };
+                            for (idx_id, fts_idx) in &fts_indexes {
+                                if let Err(e) = fts_idx.delete_document(doc_id) {
+                                    eprintln!("FTS index {} delete failed: {e}", idx_id.0);
+                                }
+                            }
+                            for &idx_id in &vec_index_ids {
+                                if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
+                                    if let Err(e) = zyron_search::vector::VectorSearch::delete(
+                                        vec_idx.as_ref(),
+                                        doc_id,
+                                    ) {
+                                        eprintln!("vector index {} delete failed: {e}", idx_id);
+                                    }
+                                }
+                            }
+                            if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
+                                for (idx_id, _col_id) in &spatial_indexes {
+                                    if let Some(tree) = spatial_mgr.get(*idx_id) {
+                                        let _ = tree.delete_by_data(&doc_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(gm) = &self.ctx.graph_manager {
+                        gm.invalidate_for_table(self.table_id.0);
+                    }
+
+                    // ON DELETE SET DEFAULT leaves the child referencing the
+                    // default key, so it is checked against the parent with
+                    // these rows already gone.
+                    crate::operator::fk::enforce_parent_delete(
+                        &self.ctx,
+                        &te,
+                        &exec_batch.batch,
+                        crate::operator::fk::FkPhase::AfterWrite,
+                    )
+                    .await?;
+
+                    // Notify CDC hook if present.
+                    if let Some(ref hook) = self.ctx.cdc_hook {
+                        if let Some(ref old_tuples) = old_tuples_for_cdc {
+                            let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_micros() as i64;
+                            if let Err(e) =
+                                hook.on_delete(self.table_id.0, &refs, last_lsn, now, txn_id, true)
+                            {
+                                eprintln!("CDC delete hook failed: {e}");
+                            }
+                        }
+                    }
+
+                    // Fire AFTER DELETE row/statement triggers in the same txn.
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_AFTER,
+                        zyron_catalog::TriggerEntry::EVENT_DELETE,
+                        &exec_batch.batch,
+                        &te.columns,
+                    )
+                    .await?;
                     continue;
                 }
 
-                // Apply ON DELETE referential actions to referencing children
-                // before removing the parent rows. Restrict aborts here, cascade
-                // and set-null mutate the children first.
+                let tuple_ids = exec_batch.heap_ids().ok_or_else(|| {
+                    ZyronError::Internal("DeleteOperator requires row locators from scan".into())
+                })?;
+
+                // Apply the ON DELETE referential actions that do not need the
+                // parent's final state, before removing its rows. Restrict
+                // aborts here, cascade and set-null mutate the children first.
                 {
                     let table_entry = self.ctx.get_table_entry(self.table_id)?;
                     crate::operator::fk::enforce_parent_delete(
                         &self.ctx,
                         &table_entry,
                         &exec_batch.batch,
+                        crate::operator::fk::FkPhase::BeforeWrite,
                     )
                     .await?;
                 }
@@ -1729,6 +3553,42 @@ impl Operator for DeleteOperator {
                         &table_entry.columns,
                     )
                     .await?;
+                }
+
+                // Branch deletes copy the target page into the branch overlay
+                // and tombstone it there, leaving the main line untouched.
+                // The fork sits below the referential and trigger checks so a
+                // branch delete refuses exactly what a main delete refuses,
+                // with cascades and probes resolving through the branch
+                if let Some(bid) = self.ctx.active_branch_id {
+                    let deleted = crate::operator::branch_write::branch_delete(
+                        &self.ctx,
+                        bid,
+                        heap_file.heap_file_id(),
+                        &tuple_ids,
+                    )
+                    .await?;
+                    {
+                        let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                        crate::operator::fk::enforce_parent_delete(
+                            &self.ctx,
+                            &table_entry,
+                            &exec_batch.batch,
+                            crate::operator::fk::FkPhase::AfterWrite,
+                        )
+                        .await?;
+                        crate::trigger::fire_row_triggers(
+                            &self.ctx,
+                            self.table_id,
+                            zyron_catalog::TriggerEntry::TIMING_AFTER,
+                            zyron_catalog::TriggerEntry::EVENT_DELETE,
+                            &exec_batch.batch,
+                            &table_entry.columns,
+                        )
+                        .await?;
+                    }
+                    total_deleted += deleted as i64;
+                    continue;
                 }
 
                 // Capture old tuples for CDC hook (batch data is from the scan).
@@ -1777,6 +3637,20 @@ impl Operator for DeleteOperator {
                     gm.invalidate_for_table(self.table_id.0);
                 }
 
+                // ON DELETE SET DEFAULT leaves the child referencing the
+                // default key, so it is checked against the parent with these
+                // rows already gone.
+                {
+                    let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                    crate::operator::fk::enforce_parent_delete(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                        crate::operator::fk::FkPhase::AfterWrite,
+                    )
+                    .await?;
+                }
+
                 // Stamp dirty pages with WAL LSN for checkpoint ordering.
                 // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0.
                 for tid in &tuple_ids {
@@ -1798,55 +3672,46 @@ impl Operator for DeleteOperator {
                     }
                 }
 
-                // Maintain FTS indexes: remove deleted documents.
+                // Retire each deleted row's document and remove it from every
+                // search index. A row with no live document (indexed never or
+                // index created after insert) has nothing to remove. The
+                // ordinal is never reused, so a reused heap slot cannot alias
+                // an old document.
                 let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
-                if !fts_indexes.is_empty() {
-                    for tid in &tuple_ids {
-                        if let Ok(doc_id) =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
-                        {
-                            for (idx_id, fts_idx) in &fts_indexes {
-                                if let Err(e) = fts_idx.delete_document(doc_id) {
-                                    eprintln!("FTS index {} delete failed: {e}", idx_id.0);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Maintain vector indexes: delete vectors for removed rows.
                 let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
-                if !vec_index_ids.is_empty() {
+                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                if !fts_indexes.is_empty()
+                    || !vec_index_ids.is_empty()
+                    || !spatial_indexes.is_empty()
+                {
+                    let Some(reg) = &self.ctx.doc_registry else {
+                        return Err(ZyronError::Internal(
+                            "search index maintenance requires the document registry".into(),
+                        ));
+                    };
                     for tid in &tuple_ids {
-                        if let Ok(vec_id) =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
-                        {
-                            for &idx_id in &vec_index_ids {
-                                if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
-                                    if let Err(e) = zyron_search::vector::VectorSearch::delete(
-                                        vec_idx.as_ref(),
-                                        vec_id,
-                                    ) {
-                                        eprintln!("vector index {} delete failed: {e}", idx_id);
-                                    }
+                        let Some(doc_id) = reg.take(self.table_id.0, tid.locator()) else {
+                            continue;
+                        };
+                        for (idx_id, fts_idx) in &fts_indexes {
+                            if let Err(e) = fts_idx.delete_document(doc_id) {
+                                eprintln!("FTS index {} delete failed: {e}", idx_id.0);
+                            }
+                        }
+                        for &idx_id in &vec_index_ids {
+                            if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
+                                if let Err(e) = zyron_search::vector::VectorSearch::delete(
+                                    vec_idx.as_ref(),
+                                    doc_id,
+                                ) {
+                                    eprintln!("vector index {} delete failed: {e}", idx_id);
                                 }
                             }
                         }
-                    }
-                }
-
-                // Maintain spatial indexes: remove entries by rowid.
-                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
-                if !spatial_indexes.is_empty() {
-                    if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
-                        for tid in &tuple_ids {
-                            if let Ok(rowid) =
-                                zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
-                            {
-                                for (idx_id, _col_id) in &spatial_indexes {
-                                    if let Some(tree) = spatial_mgr.get(*idx_id) {
-                                        let _ = tree.delete_by_data(&rowid);
-                                    }
+                        if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
+                            for (idx_id, _col_id) in &spatial_indexes {
+                                if let Some(tree) = spatial_mgr.get(*idx_id) {
+                                    let _ = tree.delete_by_data(&doc_id);
                                 }
                             }
                         }
@@ -1884,6 +3749,10 @@ impl Operator for DeleteOperator {
                 }
             }
 
+            if let Some(stats) = self.ctx.table_io_stats_for(self.table_id.0) {
+                stats.record_deletes(total_deleted.max(0) as u64);
+            }
+
             Ok(Some(ExecutionBatch::new(count_batch(total_deleted))))
         })
     }
@@ -1905,6 +3774,15 @@ pub struct UpdateOperator {
     /// CHECK constraint predicates (bound at table_idx 0) enforced on the
     /// updated row image before it is written.
     check_constraints: Vec<zyron_planner::binder::BoundExpr>,
+    /// Set when any assignment value holds a correlated subquery, evaluates
+    /// every assignment value per batch with per row subquery execution.
+    correlated_values: Option<crate::correlated::CorrelatedValues>,
+    /// Parameter values the assignments read instead of the context's. The
+    /// foreign-key cascade sets this: it writes a parent key it read out of
+    /// a batch, and a UUID, a sixteen-byte integer or a binary key has no
+    /// literal that carries it exactly, while a parameter carries the
+    /// scalar itself.
+    params: Option<Vec<ScalarValue>>,
     finished: bool,
 }
 
@@ -1924,8 +3802,33 @@ impl UpdateOperator {
             assignments,
             input_schema,
             check_constraints,
+            correlated_values: None,
+            params: None,
             finished: false,
         }
+    }
+
+    /// Supplies the parameter values assignment and CHECK evaluation read,
+    /// for a write the executor drives itself rather than one a statement
+    /// bound.
+    pub fn with_params(mut self, params: Vec<ScalarValue>) -> Self {
+        self.params = Some(params);
+        self
+    }
+
+    #[inline]
+    fn params(&self) -> &[ScalarValue] {
+        match &self.params {
+            Some(params) => params,
+            None => &self.ctx.params,
+        }
+    }
+
+    /// Routes assignment evaluation through per row correlated subquery
+    /// execution, used when a SET value references the updated table
+    pub fn with_correlated_values(mut self, cv: crate::correlated::CorrelatedValues) -> Self {
+        self.correlated_values = Some(cv);
+        self
     }
 }
 
@@ -1940,20 +3843,25 @@ impl Operator for UpdateOperator {
             self.ctx.ensure_writable("UPDATE")?;
 
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
+            self.ctx
+                .ensure_heap_branch_resolved("UPDATE", &table_entry.name)?;
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_updated: i64 = 0;
             let txn_id = self.ctx.txn_id;
 
-            // FTS and vector indexes have no MVCC visibility recheck, so their
+            // Search indexes have no MVCC visibility recheck, so their
             // maintenance is deferred into these buffers and applied only after
             // the whole statement's batch loop completes. A mid-statement error
             // returns early and drops the buffers, leaving no orphaned entries.
-            // Deletes are applied before inserts so a reused heap slot's new
-            // document is not clobbered by a queued delete of the old one.
+            // Old and new documents carry distinct registry ordinals, so the
+            // apply order cannot alias.
             let mut deferred_fts_deletes: Vec<u64> = Vec::new();
             let mut deferred_fts_inserts: Vec<(u64, String)> = Vec::new();
             let mut deferred_vec_deletes: Vec<u64> = Vec::new();
             let mut deferred_vec_inserts: Vec<(u32, u64, Vec<f32>)> = Vec::new();
+            let mut deferred_spatial_deletes: Vec<u64> = Vec::new();
+            let mut deferred_spatial_inserts: Vec<(u32, zyron_types::spatial_index::Mbr, u64)> =
+                Vec::new();
 
             loop {
                 self.ctx.check_cancelled()?;
@@ -1962,12 +3870,59 @@ impl Operator for UpdateOperator {
                     break;
                 };
 
+                // Take exclusive row locks before any mutation so a held
+                // FOR UPDATE/SHARE lock blocks this update and two writers
+                // of the same row conflict deterministically instead of
+                // both stamping. Keys on RowLocator, so heap and columnar
+                // resident rows lock uniformly. Released at commit/abort
+                if let Some(locks) = &self.ctx.row_locks
+                    && let Some(locs) = exec_batch.locators.as_ref()
+                {
+                    for loc in locs {
+                        locks.lock_row(
+                            txn_id as u64,
+                            self.table_id.0,
+                            *loc,
+                            zyron_storage::LockMode::Exclusive,
+                        )?;
+                    }
+                }
+
+                // First committer wins: a transaction may have committed a
+                // change to these rows between this statement's snapshot and
+                // the lock acquisition above. Re-stamping the superseded
+                // image would leave both new versions live, duplicating the
+                // row, so the statement conflicts instead
+                if let Some(locs) = exec_batch.locators.as_ref() {
+                    ensure_locked_rows_unchanged(&self.ctx, self.table_id, locs).await?;
+                }
+
+                // Exhaustive tier gate: a new RowLocator variant fails to
+                // compile here until the update path handles it
+                match exec_batch.tier() {
+                    None => {
+                        return Err(ZyronError::Internal(
+                            "UpdateOperator requires row locators from scan".to_string(),
+                        ));
+                    }
+                    Some(crate::operator::BatchTier::Lake) => {
+                        return Err(ZyronError::Internal(
+                            "lake resident rows have no UPDATE path".to_string(),
+                        ));
+                    }
+                    Some(crate::operator::BatchTier::Columnar)
+                    | Some(crate::operator::BatchTier::Heap) => {}
+                }
+
                 // Columnar-resident rows: write one epoch-tagged value patch
                 // per assigned column to the patch log. The old columnar
                 // value remains the version for snapshots that predate this
                 // transaction; this patch is the version for later ones. No
                 // heap round trip, no .zyr rewrite.
-                if let Some(locs) = exec_batch.columnar_locators.clone() {
+                if let Some(locs) = exec_batch.columnar_pairs() {
+                    // A branch update patches the branch overlay, the main
+                    // line keeps its values
+                    let branch = self.ctx.active_branch_id.unwrap_or(0);
                     let store = columnar_patch_store(&table_entry)?;
 
                     // Evaluate every assignment, cast to the column type, and
@@ -1979,13 +3934,20 @@ impl Operator for UpdateOperator {
                     let mut updated_columns = exec_batch.batch.columns.clone();
                     let mut patches: Vec<(u32, TypeId, usize, crate::column::Column)> =
                         Vec::with_capacity(self.assignments.len());
-                    for assignment in &self.assignments {
-                        let new_col = evaluate(
-                            &assignment.value,
-                            &exec_batch.batch,
-                            &self.input_schema,
-                            &self.ctx.params,
-                        )?;
+                    let precomputed = match &self.correlated_values {
+                        Some(cv) => Some(cv.eval(&self.ctx, &exec_batch.batch).await?),
+                        None => None,
+                    };
+                    for (assign_idx, assignment) in self.assignments.iter().enumerate() {
+                        let new_col = match &precomputed {
+                            Some(cols) => cols[assign_idx].clone(),
+                            None => evaluate(
+                                &assignment.value,
+                                &exec_batch.batch,
+                                &self.input_schema,
+                                self.params(),
+                            )?,
+                        };
                         let ce = table_entry
                             .columns
                             .iter()
@@ -1996,7 +3958,16 @@ impl Operator for UpdateOperator {
                                     assignment.column_id
                                 ))
                             })?;
-                        let new_col = if new_col.type_id != ce.type_id {
+                        // A decimal assignment converts onto the column's
+                        // declared scale here, because the patch below
+                        // encodes this column directly and a float or
+                        // wrong-scale value would encode as zero
+                        let new_col = if ce.type_id == TypeId::Decimal {
+                            crate::compute::cast_column_to_decimal(
+                                &new_col,
+                                ce.fractional_digits.unwrap_or(0),
+                            )?
+                        } else if new_col.type_id != ce.type_id {
                             crate::compute::cast_column(&new_col, ce.type_id)?
                         } else {
                             new_col
@@ -2017,56 +3988,299 @@ impl Operator for UpdateOperator {
                         ));
                     }
 
+                    let mut updated_batch = DataBatch::new(updated_columns);
+                    normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
+                    normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
                     enforce_check_constraints(
                         &self.check_constraints,
-                        &DataBatch::new(updated_columns),
+                        &updated_batch,
                         &table_entry.columns,
-                        &self.ctx.params,
+                        self.params(),
                     )?;
 
+                    // Same subsystem sequence as the heap path below, all of
+                    // it value based so a folded row behaves exactly like a
+                    // heap row.
+
+                    // Enforce child side foreign keys on the post update image
+                    // before any write.
+                    crate::operator::fk::check_child_fks(&self.ctx, &table_entry, &updated_batch)
+                        .await?
+                        .deny_diversion(&table_entry.name)?;
+
+                    // Enforce unique constraints on the post update image.
+                    // The rows being updated are excluded by their columnar
+                    // locators so a row never conflicts with its own entries.
+                    {
+                        let index_snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+                        let exclude_locators: Vec<zyron_common::RowLocator> = locs
+                            .iter()
+                            .map(|&(file_id, rowid)| zyron_common::RowLocator::Columnar {
+                                file_id,
+                                sys_rowid: rowid,
+                            })
+                            .collect();
+                        check_unique_constraints(
+                            &self.ctx,
+                            &table_entry,
+                            &updated_batch,
+                            &index_snap,
+                            &exclude_locators,
+                        )
+                        .await?;
+                    }
+
+                    // Apply the ON UPDATE referential actions that do not need
+                    // the new key to exist, so a rejection lands before any
+                    // row is written.
+                    crate::operator::fk::enforce_parent_update(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                        &updated_batch,
+                        crate::operator::fk::FkPhase::BeforeWrite,
+                    )
+                    .await?;
+
+                    // Fire BEFORE UPDATE triggers if present.
+                    if let Some(ref hook) = self.ctx.dml_hook {
+                        let old_tuples =
+                            batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                        let new_tuples =
+                            batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
+                        let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                        let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
+                        if !hook.before_update(self.table_id.0, &old_refs, &new_refs, txn_id)? {
+                            continue; // Trigger cancelled the update
+                        }
+                    }
+
+                    // Fire BEFORE UPDATE row/statement triggers (NEW image).
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_BEFORE,
+                        zyron_catalog::TriggerEntry::EVENT_UPDATE,
+                        &updated_batch,
+                        &table_entry.columns,
+                    )
+                    .await?;
+
+                    let mut last_lsn: u64 = 0;
                     for (col_id, phys, vsize, new_col) in &patches {
                         for (r, &(file_id, rowid)) in locs.iter().enumerate() {
                             let sv = new_col.data.get_scalar(r);
                             let bytes = encode_scalar_value(*phys, &sv, *vsize);
-                            let mut pl = Vec::with_capacity(40 + bytes.len());
-                            pl.extend_from_slice(&(self.table_id.0 as u64).to_le_bytes());
-                            pl.extend_from_slice(&file_id.to_le_bytes());
-                            pl.extend_from_slice(&rowid.to_le_bytes());
-                            pl.extend_from_slice(&col_id.to_le_bytes());
-                            pl.extend_from_slice(&(txn_id as u64).to_le_bytes());
-                            pl.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                            pl.extend_from_slice(&bytes);
-                            let lsn = self.ctx.wal.log_columnar_patch(&pl)?;
-                            self.ctx.mark_wrote_wal();
-                            store.append_value_patch(
+                            last_lsn = store.patch_logged(
+                                &self.ctx.wal,
+                                self.table_id.0 as u64,
+                                branch,
                                 file_id,
                                 rowid,
                                 *col_id,
                                 txn_id as u64,
-                                lsn.0,
                                 &bytes,
                             )?;
+                            self.ctx.mark_wrote_wal();
+                            if self.ctx.recording_undo() {
+                                self.ctx.record_columnar_patch_undo(
+                                    self.table_id.0,
+                                    branch,
+                                    file_id,
+                                    rowid,
+                                    *col_id,
+                                );
+                            }
                         }
                     }
                     total_updated += locs.len() as i64;
+
+                    // Maintain B+tree indexes: add the new image's keys under
+                    // the rows' columnar locators. Old-value entries are
+                    // intentionally kept, the probes recheck overlay liveness
+                    // and the current value on fetch, mirroring the heap
+                    // MVCC-retention contract
+                    {
+                        let index_snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+                        let update_locators: Vec<zyron_common::RowLocator> = locs
+                            .iter()
+                            .map(|&(file_id, rowid)| zyron_common::RowLocator::Columnar {
+                                file_id,
+                                sys_rowid: rowid,
+                            })
+                            .collect();
+                        maintain_btree_insert(
+                            &self.ctx,
+                            &table_entry,
+                            &updated_batch,
+                            &update_locators,
+                            &index_snap,
+                        );
+                    }
+
+                    // Queue search index maintenance keyed by the columnar
+                    // locator: the old row version's document retires and the
+                    // patched version gets a fresh ordinal at the same locator,
+                    // buffered and applied after the statement succeeds
+                    let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+                    let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+                    let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                    if !fts_indexes.is_empty()
+                        || !vec_index_ids.is_empty()
+                        || !spatial_indexes.is_empty()
+                    {
+                        let Some(reg) = &self.ctx.doc_registry else {
+                            return Err(ZyronError::Internal(
+                                "search index maintenance requires the document registry".into(),
+                            ));
+                        };
+                        let mut text_buf = String::with_capacity(256);
+                        for (row_idx, &(file_id, rowid)) in locs.iter().enumerate() {
+                            let loc = zyron_common::RowLocator::Columnar {
+                                file_id,
+                                sys_rowid: rowid,
+                            };
+                            if let Some(doc_id) = reg.take(self.table_id.0, loc) {
+                                if !fts_indexes.is_empty() {
+                                    deferred_fts_deletes.push(doc_id);
+                                }
+                                if !vec_index_ids.is_empty() {
+                                    deferred_vec_deletes.push(doc_id);
+                                }
+                                if !spatial_indexes.is_empty() {
+                                    deferred_spatial_deletes.push(doc_id);
+                                }
+                            }
+                            let doc_id = reg.allocate(self.table_id.0, loc);
+                            if !fts_indexes.is_empty() {
+                                text_buf.clear();
+                                extract_fts_text_into(
+                                    &updated_batch,
+                                    row_idx,
+                                    &table_entry.columns,
+                                    &mut text_buf,
+                                );
+                                deferred_fts_inserts.push((doc_id, text_buf.clone()));
+                            }
+                            for &idx_id in &vec_index_ids {
+                                let Some(vec_idx) = self.ctx.get_vector_index(idx_id) else {
+                                    continue;
+                                };
+                                let col_id = vec_idx.column_id();
+                                if let Some(vec_bytes) = extract_vector_bytes(
+                                    &updated_batch,
+                                    row_idx,
+                                    &table_entry.columns,
+                                    col_id,
+                                ) {
+                                    let vec_data = bytes_to_f32_slice(vec_bytes).to_vec();
+                                    deferred_vec_inserts.push((idx_id, doc_id, vec_data));
+                                }
+                            }
+                            for (idx_id, col_id) in &spatial_indexes {
+                                let Some(spatial_mgr) = &self.ctx.spatial_manager else {
+                                    continue;
+                                };
+                                let Some(tree) = spatial_mgr.get(*idx_id) else {
+                                    continue;
+                                };
+                                let Some(geom_bytes) = extract_column_bytes(
+                                    &updated_batch,
+                                    row_idx,
+                                    &table_entry.columns,
+                                    *col_id,
+                                ) else {
+                                    continue;
+                                };
+                                let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes)
+                                else {
+                                    continue;
+                                };
+                                let mbr = zyron_types::spatial_index::mbr_from_geometry(
+                                    &geom,
+                                    tree.dims(),
+                                );
+                                deferred_spatial_inserts.push((*idx_id, mbr, doc_id));
+                            }
+                        }
+                    }
+
+                    if let Some(gm) = &self.ctx.graph_manager {
+                        gm.invalidate_for_table(self.table_id.0);
+                    }
+
+                    // ON UPDATE CASCADE points children at the new key, which
+                    // their own foreign keys read, so it runs once the parent
+                    // rows carry it.
+                    crate::operator::fk::enforce_parent_update(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                        &updated_batch,
+                        crate::operator::fk::FkPhase::AfterWrite,
+                    )
+                    .await?;
+
+                    // Notify CDC hook if present.
+                    if let Some(ref hook) = self.ctx.cdc_hook {
+                        let old_tuples =
+                            batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                        let new_tuples =
+                            batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
+                        let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                        let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as i64;
+                        if let Err(e) = hook.on_update(
+                            self.table_id.0,
+                            &old_refs,
+                            &new_refs,
+                            last_lsn,
+                            now,
+                            txn_id,
+                            true,
+                        ) {
+                            eprintln!("CDC update hook failed: {e}");
+                        }
+                    }
+
+                    // Fire AFTER UPDATE row/statement triggers (NEW image).
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_AFTER,
+                        zyron_catalog::TriggerEntry::EVENT_UPDATE,
+                        &updated_batch,
+                        &table_entry.columns,
+                    )
+                    .await?;
                     continue;
                 }
 
-                let tuple_ids = exec_batch.tuple_ids.ok_or_else(|| {
-                    ZyronError::Internal("UpdateOperator requires tuple IDs from scan".into())
+                let tuple_ids = exec_batch.heap_ids().ok_or_else(|| {
+                    ZyronError::Internal("UpdateOperator requires row locators from scan".into())
                 })?;
 
                 // Build the updated batch by cloning original columns
                 // and replacing assigned columns with new values.
                 let mut updated_columns = exec_batch.batch.columns.clone();
 
-                for assignment in &self.assignments {
-                    let new_col = evaluate(
-                        &assignment.value,
-                        &exec_batch.batch,
-                        &self.input_schema,
-                        &self.ctx.params,
-                    )?;
+                let precomputed = match &self.correlated_values {
+                    Some(cv) => Some(cv.eval(&self.ctx, &exec_batch.batch).await?),
+                    None => None,
+                };
+                for (assign_idx, assignment) in self.assignments.iter().enumerate() {
+                    let new_col = match &precomputed {
+                        Some(cols) => cols[assign_idx].clone(),
+                        None => evaluate(
+                            &assignment.value,
+                            &exec_batch.batch,
+                            &self.input_schema,
+                            self.params(),
+                        )?,
+                    };
 
                     // Coerce the assigned value to the target column's type. The
                     // binder does not cast assignment expressions, so an integer
@@ -2100,7 +4314,9 @@ impl Operator for UpdateOperator {
                     updated_columns[col_idx] = new_col;
                 }
 
-                let updated_batch = DataBatch::new(updated_columns);
+                let mut updated_batch = DataBatch::new(updated_columns);
+                normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
+                normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
 
                 // Enforce CHECK constraints on the updated row image before any
                 // write so a violating update aborts with no effect.
@@ -2108,36 +4324,14 @@ impl Operator for UpdateOperator {
                     &self.check_constraints,
                     &updated_batch,
                     &table_entry.columns,
-                    &self.ctx.params,
+                    self.params(),
                 )?;
-
-                // Branch updates tombstone the old image in the branch overlay
-                // (copying the source page first) and append the new image to
-                // the branch, keeping the main line untouched.
-                if let Some(bid) = self.ctx.active_branch_id {
-                    let new_tuples = batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
-                    crate::operator::branch_write::branch_delete(
-                        &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &tuple_ids,
-                    )
-                    .await?;
-                    crate::operator::branch_write::branch_insert(
-                        &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &new_tuples,
-                    )
-                    .await?;
-                    total_updated += tuple_ids.len() as i64;
-                    continue;
-                }
 
                 // Enforce child-side foreign keys on the post-update image
                 // before any write so a violation aborts cleanly.
                 crate::operator::fk::check_child_fks(&self.ctx, &table_entry, &updated_batch)
-                    .await?;
+                    .await?
+                    .deny_diversion(&table_entry.name)?;
 
                 // Enforce unique constraints on the post-update image before any
                 // write, excluding the rows being updated (a row keeping its own
@@ -2147,23 +4341,27 @@ impl Operator for UpdateOperator {
                     #[cfg(feature = "profile")]
                     let _uc_span =
                         zyron_common::profile::scope(zyron_common::profile::Phase::ExecUniqueCheck);
+                    let exclude_locators: Vec<zyron_common::RowLocator> =
+                        tuple_ids.iter().map(|t| t.locator()).collect();
                     check_unique_constraints(
                         &self.ctx,
                         &table_entry,
                         &updated_batch,
                         &index_snap,
-                        &tuple_ids,
+                        &exclude_locators,
                     )
                     .await?;
                 }
 
-                // Apply ON UPDATE referential actions to referencing children
-                // when this table's referenced key changed.
+                // Apply the ON UPDATE referential actions that do not need the
+                // new key to exist, so a rejection lands before any row is
+                // written.
                 crate::operator::fk::enforce_parent_update(
                     &self.ctx,
                     &table_entry,
                     &exec_batch.batch,
                     &updated_batch,
+                    crate::operator::fk::FkPhase::BeforeWrite,
                 )
                 .await?;
 
@@ -2190,6 +4388,47 @@ impl Operator for UpdateOperator {
                     &table_entry.columns,
                 )
                 .await?;
+
+                // Branch updates tombstone the old image in the branch overlay
+                // (copying the source page first) and append the new image to
+                // the branch, keeping the main line untouched. The fork sits
+                // below the FK, unique and trigger checks so a branch update
+                // refuses exactly what a main update refuses
+                if let Some(bid) = self.ctx.active_branch_id {
+                    crate::operator::branch_write::branch_delete(
+                        &self.ctx,
+                        bid,
+                        heap_file.heap_file_id(),
+                        &tuple_ids,
+                    )
+                    .await?;
+                    crate::operator::branch_write::branch_insert(
+                        &self.ctx,
+                        bid,
+                        heap_file.heap_file_id(),
+                        &new_tuples,
+                    )
+                    .await?;
+                    crate::operator::fk::enforce_parent_update(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                        &updated_batch,
+                        crate::operator::fk::FkPhase::AfterWrite,
+                    )
+                    .await?;
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_AFTER,
+                        zyron_catalog::TriggerEntry::EVENT_UPDATE,
+                        &updated_batch,
+                        &table_entry.columns,
+                    )
+                    .await?;
+                    total_updated += tuple_ids.len() as i64;
+                    continue;
+                }
 
                 // Batch WAL log deletes: one CAS + commit for all.
                 let delete_payloads: Vec<Vec<u8>> =
@@ -2283,55 +4522,59 @@ impl Operator for UpdateOperator {
                     #[cfg(feature = "profile")]
                     let _idx_span =
                         zyron_common::profile::scope(zyron_common::profile::Phase::ExecIndexInsert);
+                    let index_locators: Vec<zyron_common::RowLocator> =
+                        new_tuple_ids.iter().map(|t| t.locator()).collect();
                     maintain_btree_insert(
                         &self.ctx,
                         &table_entry,
                         &updated_batch,
-                        &new_tuple_ids,
+                        &index_locators,
                         &index_snap,
                     );
                 }
 
-                // Queue FTS maintenance: old doc deletes and new doc inserts are
-                // buffered and applied after the statement succeeds.
+                // Queue search index maintenance: the old row version's
+                // document retires and the new version gets a fresh ordinal,
+                // buffered and applied after the statement succeeds. A row
+                // with no live document was never indexed and queues nothing.
                 let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
-                if !fts_indexes.is_empty() {
+                let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                let has_search_indexes = !fts_indexes.is_empty()
+                    || !vec_index_ids.is_empty()
+                    || !spatial_indexes.is_empty();
+                if has_search_indexes {
+                    let Some(reg) = &self.ctx.doc_registry else {
+                        return Err(ZyronError::Internal(
+                            "search index maintenance requires the document registry".into(),
+                        ));
+                    };
                     for tid in &tuple_ids {
-                        if let Ok(doc_id) =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
-                        {
-                            deferred_fts_deletes.push(doc_id);
+                        if let Some(doc_id) = reg.take(self.table_id.0, tid.locator()) {
+                            if !fts_indexes.is_empty() {
+                                deferred_fts_deletes.push(doc_id);
+                            }
+                            if !vec_index_ids.is_empty() {
+                                deferred_vec_deletes.push(doc_id);
+                            }
+                            if !spatial_indexes.is_empty() {
+                                deferred_spatial_deletes.push(doc_id);
+                            }
                         }
                     }
                     let mut text_buf = String::with_capacity(256);
                     for (row_idx, tid) in new_tuple_ids.iter().enumerate() {
-                        let doc_id =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
-                        text_buf.clear();
-                        extract_fts_text_into(
-                            &updated_batch,
-                            row_idx,
-                            &table_entry.columns,
-                            &mut text_buf,
-                        );
-                        deferred_fts_inserts.push((doc_id, text_buf.clone()));
-                    }
-                }
-
-                // Queue vector maintenance: old vector deletes and new vector
-                // inserts are buffered per index and applied after success.
-                let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
-                if !vec_index_ids.is_empty() {
-                    for tid in &tuple_ids {
-                        if let Ok(vec_id) =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
-                        {
-                            deferred_vec_deletes.push(vec_id);
+                        let doc_id = reg.allocate(table_entry.id.0, tid.locator());
+                        if !fts_indexes.is_empty() {
+                            text_buf.clear();
+                            extract_fts_text_into(
+                                &updated_batch,
+                                row_idx,
+                                &table_entry.columns,
+                                &mut text_buf,
+                            );
+                            deferred_fts_inserts.push((doc_id, text_buf.clone()));
                         }
-                    }
-                    for (row_idx, tid) in new_tuple_ids.iter().enumerate() {
-                        let vec_id =
-                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
                         for &idx_id in &vec_index_ids {
                             let Some(vec_idx) = self.ctx.get_vector_index(idx_id) else {
                                 continue;
@@ -2344,11 +4587,48 @@ impl Operator for UpdateOperator {
                                 col_id,
                             ) {
                                 let vec_data = bytes_to_f32_slice(vec_bytes).to_vec();
-                                deferred_vec_inserts.push((idx_id, vec_id, vec_data));
+                                deferred_vec_inserts.push((idx_id, doc_id, vec_data));
                             }
+                        }
+                        // spatial entries queue the new geometry's MBR so the
+                        // R-tree tracks moved geometries instead of keeping a
+                        // dead entry per update
+                        for (idx_id, col_id) in &spatial_indexes {
+                            let Some(spatial_mgr) = &self.ctx.spatial_manager else {
+                                continue;
+                            };
+                            let Some(tree) = spatial_mgr.get(*idx_id) else {
+                                continue;
+                            };
+                            let Some(geom_bytes) = extract_column_bytes(
+                                &updated_batch,
+                                row_idx,
+                                &table_entry.columns,
+                                *col_id,
+                            ) else {
+                                continue;
+                            };
+                            let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes) else {
+                                continue;
+                            };
+                            let mbr =
+                                zyron_types::spatial_index::mbr_from_geometry(&geom, tree.dims());
+                            deferred_spatial_inserts.push((*idx_id, mbr, doc_id));
                         }
                     }
                 }
+
+                // ON UPDATE CASCADE points children at the new key, which their
+                // own foreign keys read, so it runs once the parent rows carry
+                // it.
+                crate::operator::fk::enforce_parent_update(
+                    &self.ctx,
+                    &table_entry,
+                    &exec_batch.batch,
+                    &updated_batch,
+                    crate::operator::fk::FkPhase::AfterWrite,
+                )
+                .await?;
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
@@ -2436,6 +4716,30 @@ impl Operator for UpdateOperator {
                 }
             }
 
+            if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
+                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                for &doc_id in &deferred_spatial_deletes {
+                    for (idx_id, _col_id) in &spatial_indexes {
+                        if let Some(tree) = spatial_mgr.get(*idx_id) {
+                            let _ = tree.delete_by_data(&doc_id);
+                        }
+                    }
+                }
+                for (idx_id, mbr, doc_id) in &deferred_spatial_inserts {
+                    if let Some(tree) = spatial_mgr.get(*idx_id) {
+                        tree.insert(zyron_types::spatial_index::LeafEntry {
+                            mbr: *mbr,
+                            data: *doc_id,
+                            deleted: false,
+                        });
+                    }
+                }
+            }
+
+            if let Some(stats) = self.ctx.table_io_stats_for(self.table_id.0) {
+                stats.record_updates(total_updated.max(0) as u64);
+            }
+
             Ok(Some(ExecutionBatch::new(count_batch(total_updated))))
         })
     }
@@ -2446,6 +4750,144 @@ mod b6_key_tests {
     use super::*;
     use crate::column::{Column, ColumnData};
     use zyron_common::TypeId;
+
+    #[test]
+    fn test_cell_key_encoding_matches_batch_key_encoding() {
+        // every (column data, physical type, raw cell bytes) triple must key
+        // identically through both encoders or fold re-keys silently miss
+        let cases: Vec<(ColumnData, TypeId, Vec<u8>)> = vec![
+            (ColumnData::Int8(vec![-5]), TypeId::Int8, vec![(-5i8) as u8]),
+            (
+                ColumnData::Int16(vec![-300]),
+                TypeId::Int16,
+                (-300i16).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int32(vec![-70_000]),
+                TypeId::Int32,
+                (-70_000i32).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int64(vec![-1]),
+                TypeId::Int64,
+                (-1i64).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int64(vec![7_777_777]),
+                TypeId::Int64,
+                7_777_777i64.to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int128(vec![-1_000_000_000_000]),
+                TypeId::Int128,
+                (-1_000_000_000_000i128).to_le_bytes().to_vec(),
+            ),
+            (ColumnData::UInt8(vec![200]), TypeId::UInt8, vec![200u8]),
+            (
+                ColumnData::UInt16(vec![50_000]),
+                TypeId::UInt16,
+                50_000u16.to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::UInt32(vec![4_000_000_000]),
+                TypeId::UInt32,
+                4_000_000_000u32.to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::UInt64(vec![u64::MAX]),
+                TypeId::UInt64,
+                u64::MAX.to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Float64(vec![-3.5]),
+                TypeId::Float64,
+                (-3.5f64).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Float64(vec![2.25]),
+                TypeId::Float64,
+                2.25f64.to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Float32(vec![-1.5]),
+                TypeId::Float32,
+                (-1.5f32).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Utf8(vec!["hello".to_string()]),
+                TypeId::Text,
+                b"hello".to_vec(),
+            ),
+            (
+                ColumnData::Binary(vec![vec![1, 2, 3]]),
+                TypeId::Binary,
+                vec![1, 2, 3],
+            ),
+            (ColumnData::Boolean(vec![true]), TypeId::Boolean, vec![1]),
+            (ColumnData::Boolean(vec![false]), TypeId::Boolean, vec![0]),
+            (
+                ColumnData::FixedBinary16(vec![[7u8; 16]]),
+                TypeId::Uuid,
+                vec![7u8; 16],
+            ),
+            // The temporal and decimal logical ids ride their integer cell
+            // layouts through both encoders
+            (
+                ColumnData::Int32(vec![-31]),
+                TypeId::Date,
+                (-31i32).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int64(vec![-86_400_000_000]),
+                TypeId::Timestamp,
+                (-86_400_000_000i64).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int128(vec![-1050]),
+                TypeId::Decimal,
+                (-1050i128).to_le_bytes().to_vec(),
+            ),
+        ];
+        for (data, type_id, cell) in cases {
+            let col = Column::new(data, type_id);
+            let batch = DataBatch::new(vec![col]);
+            let mut from_batch = Vec::new();
+            assert!(
+                encode_btree_key_into(&batch, 0, 0, type_id, &mut from_batch),
+                "batch encoder rejected {type_id:?}"
+            );
+            let mut from_cell = Vec::new();
+            assert!(
+                encode_btree_key_from_cell(type_id, &cell, &mut from_cell),
+                "cell encoder rejected {type_id:?}"
+            );
+            assert_eq!(from_batch, from_cell, "key drift for {type_id:?}");
+        }
+    }
+
+    #[test]
+    fn test_i64_index_key_order_preserving_with_negatives() {
+        // Signed 64-bit keys must produce big-endian bytes whose unsigned
+        // order matches numeric order, negatives strictly below positives
+        let vals: Vec<i64> = vec![i64::MIN, -1_000_000, -3, -1, 0, 1, 5, 1_000_000, i64::MAX];
+        let col = Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64);
+        let batch = DataBatch::new(vec![col]);
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for r in 0..vals.len() {
+            let mut buf = Vec::new();
+            assert!(encode_btree_key_into(&batch, r, 0, TypeId::Int64, &mut buf));
+            assert_eq!(buf.len(), 8);
+            keys.push(buf);
+        }
+        for i in 1..keys.len() {
+            assert!(
+                keys[i - 1] < keys[i],
+                "key order broken at {i}: {:?} vs {:?}",
+                vals[i - 1],
+                vals[i]
+            );
+        }
+    }
 
     #[test]
     fn test_i128_index_key_order_preserving_with_negatives() {

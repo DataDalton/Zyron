@@ -83,7 +83,7 @@ fn make_schema(cols: &[(&str, TypeId)]) -> Vec<LogicalColumn> {
             name: name.to_string(),
             type_id: *tid,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
         })
         .collect()
 }
@@ -196,7 +196,7 @@ fn col_ref(table_idx: usize, col_id: u16, type_id: TypeId) -> BoundExpr {
         column_id: ColumnId(col_id),
         type_id,
         nullable: true,
-        ts_precision: None,
+        fractional_digits: None,
     })
 }
 

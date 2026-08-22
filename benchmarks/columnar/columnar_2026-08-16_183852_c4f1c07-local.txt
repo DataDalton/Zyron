@@ -1,0 +1,157 @@
+# suite:   columnar
+# run:     2026-08-16_183852_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Bloom Filter ===
+  Zero false negatives (10K probes): PASS
+  False positive rate: 0.0347 (3468/100000)
+  FP rate < 8%: PASS
+  Serialization round-trip: PASS
+  Bloom skip rate: 100.0% (99/99 files skipped)
+  Low-cardinality segment: no bloom filter (cardinality=10): PASS
+  High-cardinality segment: bloom filter present (cardinality=65): PASS
+  Bloom probe latency (ns) [PASS/OK]:
+    Runs: [12, 8, 6, 6, 6]
+    Average: 8 <= 30 (target)
+    Min/Max: 6 / 12, StdDev: 2
+  Bloom skip rate (%) [PASS]: 100 >= 99 (target)
+
+  Bloom filter: ALL PASS
+
+=== Column Segment Format ===
+Rows: 10000, Columns: 5
+  Compaction result: 10000 rows, 5 cols, 114808 bytes
+  File header: PASS
+  Column 0 (Int32): encoding=FastLanes, encoded_bytes=20, sorted=true
+  Column 1 (Float64): encoding=Alp, encoded_bytes=17600, sorted=true
+  Column 2 (Int32): encoding=Dictionary, encoded_bytes=6338, sorted=false
+  Column 3 (Boolean): encoding=BitPack, encoded_bytes=1263, sorted=false
+  Column 4 (Int32): encoding=Constant, encoded_bytes=8, sorted=true
+  .zyr scan throughput (GB/sec) [PASS/OK]:
+    Runs: [6, 6, 7, 7, 7]
+    Average: 7 >= 1 (target)
+    Min/Max: 6 / 7, StdDev: 1
+
+  Column segment format: ALL PASS
+
+=== Compaction Pipeline ===
+Rows: 100000
+  First compaction: 100000 rows, 393296 bytes
+  Compaction throughput (rows/sec) [PASS/OK]:
+    Runs: [4,325,203, 4,411,953, 3,918,495, 3,425,256, 3,476,580]
+    Average: 3,911,497 >= 1,000,000 (target)
+    Min/Max: 3,425,256 / 4,411,953, StdDev: 411,641
+  Incremental compaction: 50000 rows, 229456 bytes
+
+  Compaction pipeline: ALL PASS
+
+=== Encoded Bits/Value: Regular vs Irregular ===
+Rows: 100000
+  Regular series:   0.0016 bits/value (encoded 20 bytes)
+  Irregular series: 64.0000 bits/value (encoded 800000 bytes)
+  Regular/irregular ratio: 0.00003
+  Irregular series (bits/value) [PASS/OK]:
+    Runs: [64, 64, 64, 64, 64]
+    Average: 64 <= 64 (target)
+    Min/Max: 64 / 64, StdDev: 0
+
+  Encoded bits/value: ALL PASS
+
+=== HTAP Hybrid Scan ===
+Columnar: 50000 rows, Heap: 10000 rows, Total: 60000
+  Hybrid scan correctness (60000 rows, sorted, no duplicates): PASS
+  Value correctness: PASS
+  Hybrid scan overhead (%) [PASS/OK]:
+    Runs: [-20, 3, -2, -13, -2]
+    Average: -7 <= 5 (target)
+    Min/Max: -20 / 3, StdDev: 8
+
+  HTAP hybrid scan: ALL PASS
+
+=== Metadata Aggregate vs Scan Aggregate ===
+Rows: 100000
+  Scan-aggregate avg: 69886 ns, Metadata-aggregate avg: 1166 ns (50 iters)
+  Metadata vs scan speedup (x) [PASS/OK]:
+    Runs: [60]
+    Average: 60 >= 1 (target)
+    Min/Max: 60 / 60, StdDev: 0
+
+  Metadata aggregate vs scan: ALL PASS
+
+=== Micro-Batch Zone Map ===
+  Zone map count: 100 (expected 100): PASS
+  Narrow range [5000,5999]: 1 matching zones, skip rate 99.0%
+  Wide range [5000,15999]: 11 matching zones, skip rate 89.0%
+  Out-of-range [200K,300K]: 0 matching zones, skip rate 100%: PASS
+  Zone map serialization round-trip: PASS
+  Narrow range batch skip rate (%) [PASS]: 99 >= 95 (target)
+  Zone map overhead: 48.47% of encoded data (6400 / 13204 bytes)
+
+  Micro-batch zone map: ALL PASS
+
+=== Parallel Column Encoding ===
+Rows: 100000, Columns: 8
+  Sequential: 100000 rows, 8 cols, 1638580 bytes
+  Parallel: 100000 rows, 8 cols, 1638580 bytes
+  Parallel correctness (all columns decodable): PASS
+  Avg sequential: 0.082s, avg at the shipped 4 threads: 0.034s, avg parallel: 0.033s
+  Parallel speedup (x) [FAIL/OK]:
+    Runs: [2, 2, 2, 3, 2]
+    Average: 3 >= 3 (target)
+    Min/Max: 2 / 3, StdDev: 0
+  Shipped thread count speedup (x) [FAIL/OK]:
+    Runs: [2, 2, 2, 3, 2]
+    Average: 2 >= 3 (target)
+    Min/Max: 2 / 3, StdDev: 0
+  Sequential compaction (rows/sec) [PASS/OK]:
+    Runs: [1,313,284, 1,310,948, 1,279,266, 982,941, 1,292,432]
+    Average: 1,235,774 >= 1,000,000 (target)
+    Min/Max: 982,941 / 1,313,284, StdDev: 127,032
+
+  Parallel column encoding: ALL PASS
+
+=== Segment Cache ===
+  Cache insert + get (5 keys): PASS
+  Stats (hit_count=5, used=51200): PASS
+  Eviction on overflow: PASS
+  Eviction count: 1 (expected >= 1): PASS
+  Invalidate: PASS
+  Clear (used_bytes=0): PASS
+  Cache get (ns/lookup) [PASS]: 38 <= 100 (target)
+
+  Segment cache: ALL PASS
+
+=== Sorted Segment ===
+Files: 3, Rows per file: 10000
+  SortedSegmentIndex: 3 files, 30000 total rows: PASS
+  find_point(5000): 1 file: PASS
+  find_point(15000): 1 file: PASS
+  find_point(99999): 0 files: PASS
+  binary_search(5000): found at index 5000: PASS
+  binary_search(99999): None: PASS
+  find_range(5000,15000): 2 files: PASS
+  Merge scan: 30000 rows in sorted order: PASS
+  Sorted PK lookup (ns) [PASS/OK]:
+    Runs: [27, 27, 27, 27, 27]
+    Average: 27 <= 500 (target)
+    Min/Max: 27 / 27, StdDev: 0
+  Sorted PK range (keys/sec) [PASS/OK]:
+    Runs: [230,769,231, 405,953,992, 410,396,717, 412,654,746, 422,535,211]
+    Average: 376,461,979 >= 80,000,000 (target)
+    Min/Max: 230,769,231 / 422,535,211, StdDev: 73,048,451
+
+  Sorted segment: ALL PASS
+
+=== Transaction-Aware Pruning ===
+  Snapshot txn_id=350
+  Fully visible files: [0, 1] (expected [0, 1])
+  Partially visible: [2] (expected [2])
+  Pruned: [3, 4] (expected [3, 4])
+  Pruning correctness: PASS
+  xmin range round-trip: PASS
+  Pruning decision (ns/file) [PASS]: 1 <= 10 (target)
+
+  Transaction-aware pruning: ALL PASS

@@ -1,0 +1,158 @@
+# suite:   utility_ops
+# run:     2026-08-20_030156_daa5c98-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Checksums and Hashes ===
+  CRC32('hello world') = 0x0D4A1185 PASS
+  XXHASH64('hello world') = 0xd447b1ea40e6988b PASS
+  Family determinism (10 hashes x 3 inputs) PASS
+  Distinct-input distinct-output PASS
+  Streaming hashers match one-shot PASS
+  hash_column_xxh64 matches row-by-row PASS
+  Run 1: CRC32C 12.22 GB/sec
+  Run 2: CRC32C 12.21 GB/sec
+  Run 3: CRC32C 12.26 GB/sec
+  Run 4: CRC32C 12.30 GB/sec
+  Run 5: CRC32C 12.32 GB/sec
+  CRC32C 1 GB (GB/sec) [PASS/OK]:
+    Runs: [12.2190, 12.2050, 12.2567, 12.2958, 12.3152]
+    Average: 12.2583 >= 12 (target)
+    Min/Max: 12.2050 / 12.3152, StdDev: 0.0425
+  Run 1: xxHash64 21.58 GB/sec
+  Run 2: xxHash64 21.27 GB/sec
+  Run 3: xxHash64 20.66 GB/sec
+  Run 4: xxHash64 21.48 GB/sec
+  Run 5: xxHash64 21.65 GB/sec
+  xxHash64 1 GB (GB/sec) [PASS/OK]:
+    Runs: [21.5803, 21.2659, 20.6577, 21.4807, 21.6518]
+    Average: 21.3273 >= 16 (target)
+    Min/Max: 20.6577 / 21.6518, StdDev: 0.3592
+
+=== File and Encoding Detection ===
+  DETECT_MIME_TYPE png + pdf PASS
+  DETECT_ENCODING ascii + utf-8 BOM + raw multi-byte UTF-8 PASS
+  IS_BINARY png=true, text=false PASS
+  FILE_EXTENSION mime->ext PASS
+  Run 1: DETECT_MIME_TYPE 5.7 ns
+  Run 2: DETECT_MIME_TYPE 5.6 ns
+  Run 3: DETECT_MIME_TYPE 5.6 ns
+  Run 4: DETECT_MIME_TYPE 5.6 ns
+  Run 5: DETECT_MIME_TYPE 5.6 ns
+  DETECT_MIME_TYPE (ns) [PASS/OK]:
+    Runs: [5.7140, 5.5960, 5.6110, 5.5640, 5.5540]
+    Average: 5.6078 <= 400 (target)
+    Min/Max: 5.5540 / 5.7140, StdDev: 0.0570
+
+=== JSON Diff and Patch ===
+  JSON_DIFF + JSON_PATCH round-trip on small object PASS
+  JSON_DIFF_TABLE returns relation with replace+add PASS
+  JSON_MERGE_PATCH RFC 7396 PASS
+  Run 1: diff 9.46 us/op, patch 4.82 us/op (10K ops each)
+  Run 2: diff 9.36 us/op, patch 4.82 us/op (10K ops each)
+  Run 3: diff 9.36 us/op, patch 4.82 us/op (10K ops each)
+  Run 4: diff 9.39 us/op, patch 4.86 us/op (10K ops each)
+  Run 5: diff 9.39 us/op, patch 4.82 us/op (10K ops each)
+  JSON Diff 1 KB (us) [PASS/OK]:
+    Runs: [9.4612, 9.3591, 9.3598, 9.3900, 9.3948]
+    Average: 9.3930 <= 12 (target)
+    Min/Max: 9.3591 / 9.4612, StdDev: 0.0372
+  JSON Patch 1 KB (us) [PASS/OK]:
+    Runs: [4.8176, 4.8167, 4.8179, 4.8575, 4.8191]
+    Average: 4.8258 <= 6 (target)
+    Min/Max: 4.8167 / 4.8575, StdDev: 0.0159
+
+=== Text Diff and Patch ===
+  TEXT_DIFF emits delete(line2)+insert(modified)+add(line4) PASS
+  TEXT_PATCH round-trip removes line2 and adds modified+line4 PASS
+  COLLAPSE_ADJACENT_NOOPS folds insert+delete pairs PASS
+  Run 1: 0.71 ms
+  Run 2: 0.90 ms
+  Run 3: 0.83 ms
+  Run 4: 0.85 ms
+  Run 5: 0.90 ms
+  Text Diff 10K lines (ms) [PASS/OK]:
+    Runs: [0.7072, 0.9040, 0.8336, 0.8535, 0.9002]
+    Average: 0.8397 <= 50 (target)
+    Min/Max: 0.7072 / 0.9040, StdDev: 0.0715
+
+=== Natural Sort, Version, IP, Path ===
+  natural_compare orders [file1, file2, file10, file20] PASS
+  natural_sort_key produces matching order PASS
+  version_compare semver ordering PASS
+  ip_compare orders v4 numerically PASS
+  path_compare component-wise natural PASS
+  custom_order_rank known + unknown PASS
+  Run 1: 59.2 ns/key
+  Run 2: 57.6 ns/key
+  Run 3: 56.4 ns/key
+  Run 4: 53.0 ns/key
+  Run 5: 52.8 ns/key
+  natural_sort_key (ns) [PASS/OK]:
+    Runs: [59.2000, 57.6000, 56.4000, 53, 52.8000]
+    Average: 55.8000 <= 200 (target)
+    Min/Max: 52.8000 / 59.2000, StdDev: 2.5298
+  Sort 1M natural strings: 8 ms
+
+=== Rate Limiting and Quotas ===
+  RATE_LIMIT_CHECK: 10 allowed, 11th rejected PASS
+  RATE_LIMIT_CHECK recovers after window elapses PASS
+  QUOTA_CHECK + QUOTA_INCREMENT 100+200, 800 rejected PASS
+  BURST_TOKEN_BUCKET 12-token burst from 10-cap PASS
+  CRON parse, next, matches, list PASS
+  Run 1: 63.5 ns/check
+  Run 2: 63.2 ns/check
+  Run 3: 63.2 ns/check
+  Run 4: 63.3 ns/check
+  Run 5: 62.8 ns/check
+  Rate limit check (ns) [FAIL/OK]:
+    Runs: [63.4660, 63.2310, 63.2400, 63.2840, 62.8160]
+    Average: 63.2074 <= 50 (target)
+    Min/Max: 62.8160 / 63.4660, StdDev: 0.2133
+
+=== QR Code + Barcodes ===
+  QR_ENCODE+QR_DECODE round-trip on URL PASS
+  QR round-trip for L, M, Q, H ec levels PASS
+  Code128, Code39, EAN-13, EAN-8, UPC-A round-trips PASS
+  DataMatrix round-trip across 4 sizes (10x10 to 26x26) PASS
+  Run 1: QR encode 0.13 ms
+  Run 2: QR encode 0.12 ms
+  Run 3: QR encode 0.23 ms
+  Run 4: QR encode 0.15 ms
+  Run 5: QR encode 0.14 ms
+  QR encode (ms) [PASS/OK]:
+    Runs: [0.1278, 0.1219, 0.2254, 0.1497, 0.1354]
+    Average: 0.1520 <= 3 (target)
+    Min/Max: 0.1219 / 0.2254, StdDev: 0.0378
+
+=== Resilience ===
+  3 failures opens, fast-fail while open PASS
+  Reset timeout -> HalfOpen, success closes PASS
+  HalfOpen failure reopens PASS
+  EMA breaker opens on sustained errors PASS
+  CircuitBreakerRegistry shares instances by name PASS
+  retry recovers after 2 transient errors PASS
+  timeout_blocking aborts overrun PASS
+  hedged returns first completion PASS
+
+=== Row Diff, Schema Diff, Change Log ===
+  ROW_DIFF emits only changed columns PASS
+  ROW_DIFF_ORDINAL fast path skips name lookup PASS
+  SCHEMA_DIFF + GENERATE_MIGRATION emits ADD/DROP/ALTER PASS
+
+=== Markdown and HTML ===
+  MARKDOWN_TO_HTML('# Hello\n\nParagraph') = '<h1>Hello</h1>\n<p>Paragraph</p>' PASS
+  MARKDOWN_EXTRACT_HEADERS yields [(1, H1), (2, H2)] PASS
+  HTML_TO_TEXT strips tags PASS
+  Links, code blocks, html_to_markdown, sanitize_html PASS
+  Run 1: MARKDOWN_TO_HTML 10 KB 45.98 us
+  Run 2: MARKDOWN_TO_HTML 10 KB 45.62 us
+  Run 3: MARKDOWN_TO_HTML 10 KB 45.58 us
+  Run 4: MARKDOWN_TO_HTML 10 KB 46.30 us
+  Run 5: MARKDOWN_TO_HTML 10 KB 46.28 us
+  MARKDOWN_TO_HTML 10 KB (us) [PASS/OK]:
+    Runs: [45.9770, 45.6160, 45.5830, 46.2980, 46.2850]
+    Average: 45.9518 <= 300 (target)
+    Min/Max: 45.5830 / 46.2980, StdDev: 0.3099

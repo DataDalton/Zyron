@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use zyron_common::{Result, ZyronError};
 
 use super::distance::{
-    computeDistance, distWithFn, euclideanSmall4, resolveDistFn, vectorAddInplace,
-    vectorScaleInplace, vectorSubtract, vectorSubtractInplace,
+    distWithFn, euclideanSmall4, resolveDistFn, vectorAddInplace, vectorScaleInplace,
+    vectorSubtract, vectorSubtractInplace,
 };
 use super::memory::{try_alloc_default, try_alloc_filled, try_alloc_vec, validate_file_size};
 use super::profile::DataProfile;
@@ -42,7 +42,8 @@ fn subvectorDistance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
 // File format magic bytes
 // ---------------------------------------------------------------------------
 
-const MAGIC: &[u8; 6] = b"ZYPQ\x01\x00";
+// version 2: inverted-list ids are registry ordinals, not heap page and slot
+const MAGIC: &[u8; 6] = b"ZYPQ\x02\x00";
 
 // ---------------------------------------------------------------------------
 // Deterministic xorshift64 RNG (no external rand crate)

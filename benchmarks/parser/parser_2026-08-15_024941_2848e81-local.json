@@ -1,0 +1,70 @@
+{
+  "id": "2026-08-15_024941_2848e81-local",
+  "date": "2026-08-15 02:50:25Z",
+  "ts": 1786762225,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Error Recovery": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 10.69 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 10.68 },
+      "Latency (us/error)": {
+        "average": 1.407146,
+        "runs": [1.41, 1.41, 1.41, 1.40, 1.40],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Parser Batch": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 10.67 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.60 },
+      "Throughput (stmts/sec)": {
+        "average": 252171.799190,
+        "runs": [253667.69, 253169.13, 252800.68, 249831.01, 251390.48],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Parser Complex": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 10.60 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 10.68 },
+      "Latency (us/parse)": {
+        "average": 91.116488,
+        "runs": [82.49, 84.33, 82.86, 100.37, 105.53],
+        "target": 20.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Parser Simple": {
+      "util_before": { "cpu_pct": 16.0, "ram_used_gb": 10.63 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 10.64 },
+      "Latency (ns/parse)": {
+        "average": 10007.094600,
+        "runs": [9978.79, 10016.50, 10026.51, 9979.54, 10034.14],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Lexer Throughput": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 10.63 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.62 },
+      "Throughput (MB/sec)": {
+        "average": 9.119370,
+        "runs": [9.13, 9.11, 9.13, 9.10, 9.13],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    }
+  }
+}

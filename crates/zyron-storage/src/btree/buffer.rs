@@ -360,10 +360,11 @@ impl BufferedBTreeIndex {
 mod tests {
     use super::super::page::{BTreeInternalPage, BTreeLeafPage};
     use super::super::types::{
-        DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader,
+        DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader, compare_keys,
     };
     use super::*;
     use bytes::Bytes;
+    use zyron_common::RowLocator;
     use zyron_common::ZyronError;
     use zyron_common::page::{PAGE_SIZE, PageId};
 
@@ -388,7 +389,7 @@ mod tests {
     fn test_internal_header_roundtrip() {
         let header = InternalPageHeader {
             num_keys: 10,
-            free_space_offset: 200,
+            key_region_start: 200,
             level: 2,
             reserved: [0; 10],
         };
@@ -397,7 +398,7 @@ mod tests {
         let recovered = InternalPageHeader::from_bytes(&bytes);
 
         assert_eq!(recovered.num_keys, 10);
-        assert_eq!(recovered.free_space_offset, 200);
+        assert_eq!(recovered.key_region_start, 200);
         assert_eq!(recovered.level, 2);
     }
 
@@ -405,35 +406,41 @@ mod tests {
     fn test_leaf_entry_roundtrip() {
         let entry = LeafEntry {
             key: Bytes::from_static(b"test_key"),
-            tuple_id: TupleId::new(PageId::new(1, 42), 5),
+            locator: RowLocator::Heap {
+                page: PageId::new(1, 42),
+                slot: 5,
+            },
         };
 
         let bytes = entry.to_bytes();
         let (recovered, consumed) = LeafEntry::from_bytes(&bytes).unwrap();
 
         assert_eq!(recovered.key, entry.key);
-        // file_id is not stored on disk, reconstructed as 0
-        assert_eq!(recovered.tuple_id.page_id.file_id, 0);
-        assert_eq!(recovered.tuple_id.page_id.page_num, 42);
-        assert_eq!(recovered.tuple_id.slot_id, 5);
+        // heap file_id is not stored on disk, reconstructed as 0
+        assert_eq!(
+            recovered.locator,
+            RowLocator::Heap {
+                page: PageId::new(0, 42),
+                slot: 5,
+            }
+        );
         assert_eq!(consumed, bytes.len());
     }
 
     #[test]
     fn test_internal_entry_roundtrip() {
-        let entry = InternalEntry {
-            key: Bytes::from_static(b"separator"),
-            child_page_id: PageId::new(2, 100),
-        };
+        let mut page = BTreeInternalPage::new(PageId::new(2, 7), 0);
+        page.set_leftmost_child(PageId::new(2, 100));
+        page.insert(Bytes::from_static(b"separator"), PageId::new(2, 101))
+            .unwrap();
 
-        let bytes = entry.to_bytes();
-        let (recovered, consumed) = InternalEntry::from_bytes(&bytes).unwrap();
-
-        assert_eq!(recovered.key, entry.key);
+        let entries = page.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, Bytes::from_static(b"separator"));
         // file_id is not stored on disk, reconstructed as 0
-        assert_eq!(recovered.child_page_id.file_id, 0);
-        assert_eq!(recovered.child_page_id.page_num, 100);
-        assert_eq!(consumed, bytes.len());
+        assert_eq!(entries[0].child_page_id.file_id, 0);
+        assert_eq!(entries[0].child_page_id.page_num, 101);
+        assert_eq!(page.leftmost_child().page_num, 100);
     }
 
     #[test]
@@ -450,13 +457,19 @@ mod tests {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
 
         let key = Bytes::from_static(b"hello");
-        let tuple_id = TupleId::new(PageId::new(1, 10), 5);
+        let tuple_id = RowLocator::Heap {
+            page: PageId::new(1, 10),
+            slot: 5,
+        };
 
         page.insert(key.clone(), tuple_id).unwrap();
 
         assert_eq!(page.num_entries(), 1);
         // file_id is not stored per entry, reads back as 0
-        let expected = TupleId::new(PageId::new(0, 10), 5);
+        let expected = RowLocator::Heap {
+            page: PageId::new(0, 10),
+            slot: 5,
+        };
         assert_eq!(page.get(&key), Some(expected));
     }
 
@@ -467,17 +480,26 @@ mod tests {
         // Insert in random order
         page.insert(
             Bytes::from_static(b"charlie"),
-            TupleId::new(PageId::new(0, 0), 3),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 3,
+            },
         )
         .unwrap();
         page.insert(
             Bytes::from_static(b"alpha"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
         page.insert(
             Bytes::from_static(b"bravo"),
-            TupleId::new(PageId::new(0, 0), 2),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 2,
+            },
         )
         .unwrap();
 
@@ -496,13 +518,19 @@ mod tests {
 
         page.insert(
             Bytes::from_static(b"key"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
 
         let result = page.insert(
             Bytes::from_static(b"key"),
-            TupleId::new(PageId::new(0, 0), 2),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 2,
+            },
         );
         assert!(matches!(result, Err(ZyronError::DuplicateKey)));
     }
@@ -513,12 +541,18 @@ mod tests {
 
         page.insert(
             Bytes::from_static(b"key1"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
         page.insert(
             Bytes::from_static(b"key2"),
-            TupleId::new(PageId::new(0, 0), 2),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 2,
+            },
         )
         .unwrap();
 
@@ -542,7 +576,10 @@ mod tests {
         // Insert a single small entry
         page.insert(
             Bytes::from_static(b"key"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
 
@@ -556,15 +593,33 @@ mod tests {
         let mut right = BTreeLeafPage::new(PageId::new(0, 1));
 
         // Set up left page with one entry
-        left.insert(Bytes::from_static(b"a"), TupleId::new(PageId::new(0, 0), 1))
-            .unwrap();
+        left.insert(
+            Bytes::from_static(b"a"),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
+        )
+        .unwrap();
 
         // Set up right page with multiple entries
         right
-            .insert(Bytes::from_static(b"b"), TupleId::new(PageId::new(0, 0), 2))
+            .insert(
+                Bytes::from_static(b"b"),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 2,
+                },
+            )
             .unwrap();
         right
-            .insert(Bytes::from_static(b"c"), TupleId::new(PageId::new(0, 0), 3))
+            .insert(
+                Bytes::from_static(b"c"),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 3,
+                },
+            )
             .unwrap();
 
         // Borrow from right
@@ -583,10 +638,22 @@ mod tests {
         let mut left = BTreeLeafPage::new(PageId::new(0, 0));
         let mut right = BTreeLeafPage::new(PageId::new(0, 1));
 
-        left.insert(Bytes::from_static(b"a"), TupleId::new(PageId::new(0, 0), 1))
-            .unwrap();
+        left.insert(
+            Bytes::from_static(b"a"),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
+        )
+        .unwrap();
         right
-            .insert(Bytes::from_static(b"b"), TupleId::new(PageId::new(0, 0), 2))
+            .insert(
+                Bytes::from_static(b"b"),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 2,
+                },
+            )
             .unwrap();
 
         // Link pages
@@ -646,7 +713,13 @@ mod tests {
         // Insert many entries
         for i in 0..100 {
             let key = Bytes::from(format!("key_{:03}", i));
-            let _ = page.insert(key, TupleId::new(PageId::new(0, 0), i as u16));
+            let _ = page.insert(
+                key,
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: i as u16,
+                },
+            );
         }
 
         let entries_before = page.num_entries();
@@ -672,7 +745,10 @@ mod tests {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
         page.insert(
             Bytes::from_static(b"test"),
-            TupleId::new(PageId::new(1, 2), 3),
+            RowLocator::Heap {
+                page: PageId::new(1, 2),
+                slot: 3,
+            },
         )
         .unwrap();
 
@@ -683,7 +759,10 @@ mod tests {
         // file_id is not stored per entry, reads back as 0
         assert_eq!(
             recovered.get(b"test"),
-            Some(TupleId::new(PageId::new(0, 2), 3))
+            Some(RowLocator::Heap {
+                page: PageId::new(0, 2),
+                slot: 3
+            })
         );
     }
 
@@ -765,22 +844,262 @@ mod tests {
     fn test_leaf_entry_size_on_disk() {
         let entry = LeafEntry {
             key: Bytes::from_static(b"hello"),
-            tuple_id: TupleId::new(PageId::new(0, 0), 0),
+            locator: RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 0,
+            },
         };
 
-        // 2 (key_len) + 5 (key) + 4 (page_num) + 2 (slot_id) = 13
-        assert_eq!(entry.size_on_disk(), 13);
+        // 2 (key_len) + 5 (key) + 7 (narrow heap payload) = 14
+        assert_eq!(entry.size_on_disk(), 2 + 5 + RowLocator::NARROW_PAYLOAD_LEN);
+    }
+
+    /// The child an ordered separator list routes `probe` to, derived
+    /// straight from the definition rather than from the page layout.
+    fn expected_child(seps: &[(Vec<u8>, u64)], leftmost: u64, probe: &[u8]) -> u64 {
+        let mut child = leftmost;
+        for (key, page) in seps {
+            if compare_keys(probe, key).is_lt() {
+                break;
+            }
+            child = *page;
+        }
+        child
+    }
+
+    fn build_internal(seps: &[(Vec<u8>, u64)], leftmost: u64) -> BTreeInternalPage {
+        let mut page = BTreeInternalPage::new(PageId::new(0, 1), 0);
+        page.set_leftmost_child(PageId::new(0, leftmost));
+        for (key, child) in seps {
+            page.insert(Bytes::copy_from_slice(key), PageId::new(0, *child))
+                .expect("separator fits");
+        }
+        page
+    }
+
+    fn assert_routes(seps: &[(Vec<u8>, u64)], leftmost: u64, probes: &[Vec<u8>]) {
+        let page = build_internal(seps, leftmost);
+        assert_eq!(page.num_keys() as usize, seps.len());
+        for probe in probes {
+            assert_eq!(
+                page.find_child(probe).page_num,
+                expected_child(seps, leftmost, probe),
+                "routing diverged for probe {:?}",
+                probe
+            );
+        }
+        // Every separator is readable back in order
+        let entries = page.entries();
+        assert_eq!(entries.len(), seps.len());
+        for (entry, (key, child)) in entries.iter().zip(seps.iter()) {
+            assert_eq!(entry.key.as_ref(), key.as_slice());
+            assert_eq!(entry.child_page_id.page_num, *child);
+        }
+    }
+
+    #[test]
+    fn internal_routes_keys_sharing_an_eight_byte_head() {
+        // Every key has the same first eight bytes, so routing cannot be
+        // settled from the head alone
+        let seps: Vec<(Vec<u8>, u64)> = (1u8..=6)
+            .map(|i| (format!("prefix__suffix{i}").into_bytes(), i as u64 + 10))
+            .collect();
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        for (key, _) in &seps {
+            probes.push(key.clone());
+            let mut before = key.clone();
+            before.pop();
+            probes.push(before);
+            let mut after = key.clone();
+            after.push(0xFF);
+            probes.push(after);
+        }
+        probes.push(b"prefix_".to_vec());
+        probes.push(b"prefix__".to_vec());
+        probes.push(b"zzzzzzzzzz".to_vec());
+        assert_routes(&seps, 7, &probes);
+    }
+
+    #[test]
+    fn internal_routes_short_keys_that_zero_padding_would_confuse() {
+        // A key and the same key extended with zero bytes pad to the same
+        // eight-byte head, so only the length separates them
+        let seps: Vec<(Vec<u8>, u64)> = vec![
+            (vec![0x01], 20),
+            (vec![0x01, 0x00], 21),
+            (vec![0x01, 0x00, 0x00], 22),
+            (vec![0x01, 0x00, 0x00, 0x01], 23),
+            (vec![0x02], 24),
+        ];
+        let probes: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x00],
+            vec![0x01],
+            vec![0x01, 0x00],
+            vec![0x01, 0x00, 0x00],
+            vec![0x01, 0x00, 0x00, 0x00],
+            vec![0x01, 0x00, 0x00, 0x01],
+            vec![0x01, 0x00, 0x00, 0x02],
+            vec![0x02],
+            vec![0x03],
+        ];
+        assert_routes(&seps, 19, &probes);
+    }
+
+    #[test]
+    fn internal_routes_mixed_short_and_long_keys() {
+        let seps: Vec<(Vec<u8>, u64)> = vec![
+            (b"aa".to_vec(), 30),
+            (b"bbbbbbbb".to_vec(), 31),
+            (b"bbbbbbbbbbbbbbbbbbbbbbbb".to_vec(), 32),
+            (b"cc".to_vec(), 33),
+            (b"dddddddddddddddddddddddddddddddd".to_vec(), 34),
+        ];
+        let mut probes: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"aa".to_vec(),
+            b"aaa".to_vec(),
+            b"bbbbbbb".to_vec(),
+            b"bbbbbbbb".to_vec(),
+            b"bbbbbbbbb".to_vec(),
+            b"bbbbbbbbbbbbbbbbbbbbbbb".to_vec(),
+            b"bbbbbbbbbbbbbbbbbbbbbbbb".to_vec(),
+            b"bbbbbbbbbbbbbbbbbbbbbbbbb".to_vec(),
+            b"zz".to_vec(),
+        ];
+        for (key, _) in &seps {
+            probes.push(key.clone());
+        }
+        assert_routes(&seps, 29, &probes);
+    }
+
+    #[test]
+    fn internal_routes_every_key_of_a_full_page() {
+        // Fill the page to capacity with short keys, which packs in far more
+        // separators than any bounded scratch buffer would cover
+        let mut page = BTreeInternalPage::new(PageId::new(0, 1), 0);
+        page.set_leftmost_child(PageId::new(0, 0));
+        let mut seps: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut n = 0u64;
+        loop {
+            let key = (n * 2 + 2).to_be_bytes().to_vec();
+            if page
+                .insert(Bytes::copy_from_slice(&key), PageId::new(0, n + 1))
+                .is_err()
+            {
+                break;
+            }
+            seps.push((key, n + 1));
+            n += 1;
+        }
+        assert!(
+            seps.len() > 900,
+            "expected a densely packed page, got {} separators",
+            seps.len()
+        );
+
+        for (i, (key, child)) in seps.iter().enumerate() {
+            assert_eq!(page.find_child(key).page_num, *child, "exact key {i}");
+            // The odd value just below this separator routes to the child on
+            // its left
+            let below = ((i as u64) * 2 + 1).to_be_bytes().to_vec();
+            let expected_below = if i == 0 { 0 } else { seps[i - 1].1 };
+            assert_eq!(page.find_child(&below).page_num, expected_below, "gap {i}");
+        }
+    }
+
+    #[test]
+    fn internal_split_preserves_routing_for_long_keys() {
+        let seps: Vec<(Vec<u8>, u64)> = (0u64..40)
+            .map(|i| (format!("long_separator_key_{i:04}").into_bytes(), i + 100))
+            .collect();
+        let mut page = build_internal(&seps, 99);
+
+        let (promoted, right) = page.split(PageId::new(0, 500));
+        let left_keys = page.num_keys() as usize;
+        let right_keys = right.num_keys() as usize;
+        assert_eq!(left_keys + right_keys + 1, seps.len());
+        assert_eq!(promoted.as_ref(), seps[left_keys].0.as_slice());
+
+        // Both halves keep their separators intact and in order
+        for (entry, (key, child)) in page.entries().iter().zip(seps.iter()) {
+            assert_eq!(entry.key.as_ref(), key.as_slice());
+            assert_eq!(entry.child_page_id.page_num, *child);
+        }
+        for (entry, (key, child)) in right.entries().iter().zip(seps[left_keys + 1..].iter()) {
+            assert_eq!(entry.key.as_ref(), key.as_slice());
+            assert_eq!(entry.child_page_id.page_num, *child);
+        }
+        assert_eq!(right.leftmost_child().page_num, seps[left_keys].1);
+
+        // Routing within each half still matches the definition
+        for (key, _) in &seps[..left_keys] {
+            assert_eq!(
+                page.find_child(key).page_num,
+                expected_child(&seps[..left_keys], 99, key)
+            );
+        }
+    }
+
+    #[test]
+    fn internal_replaced_separator_reclaims_its_key_bytes() {
+        let long = vec![b'x'; 200];
+        let mut page = BTreeInternalPage::new(PageId::new(0, 1), 0);
+        page.set_leftmost_child(PageId::new(0, 0));
+        page.insert(Bytes::copy_from_slice(&long), PageId::new(0, 1))
+            .expect("first separator fits");
+        let after_first = page.free_space();
+
+        // Replacing a long key with another of the same length must not leak
+        // the old bytes, however many times it happens
+        for i in 0..64 {
+            let replacement = vec![b'a' + (i % 26) as u8; 200];
+            assert!(page.set_separator_key(0, Bytes::copy_from_slice(&replacement)));
+            assert_eq!(page.free_space(), after_first, "leaked on replacement {i}");
+            assert_eq!(page.entries()[0].key.as_ref(), replacement.as_slice());
+        }
+
+        // Shrinking to an inline key gives the whole region back
+        assert!(page.set_separator_key(0, Bytes::from_static(b"short")));
+        assert_eq!(page.entries()[0].key.as_ref(), b"short");
+        assert!(page.free_space() > after_first);
+    }
+
+    #[test]
+    fn internal_remove_entry_keeps_remaining_long_keys_readable() {
+        let seps: Vec<(Vec<u8>, u64)> = (0u64..12)
+            .map(|i| (format!("separator_key_number_{i:03}").into_bytes(), i + 1))
+            .collect();
+        let mut page = build_internal(&seps, 0);
+
+        let mut live: Vec<(Vec<u8>, u64)> = seps.clone();
+        while live.len() > 1 {
+            page.remove_entry(0);
+            live.remove(0);
+            let entries = page.entries();
+            assert_eq!(entries.len(), live.len());
+            for (entry, (key, child)) in entries.iter().zip(live.iter()) {
+                assert_eq!(entry.key.as_ref(), key.as_slice());
+                assert_eq!(entry.child_page_id.page_num, *child);
+            }
+        }
     }
 
     #[test]
     fn test_internal_entry_size_on_disk() {
-        let entry = InternalEntry {
+        let short = InternalEntry {
             key: Bytes::from_static(b"hello"),
             child_page_id: PageId::new(0, 0),
         };
+        // A key of at most 8 bytes is held inside the 16-byte slot
+        assert_eq!(short.size_on_disk(), 16);
 
-        // 2 (key_len) + 5 (key) + 4 (page_num) = 11
-        assert_eq!(entry.size_on_disk(), 11);
+        let long = InternalEntry {
+            key: Bytes::from_static(b"a much longer separator key"),
+            child_page_id: PageId::new(0, 0),
+        };
+        // A longer key costs the slot plus its own bytes
+        assert_eq!(long.size_on_disk(), 16 + 27);
     }
 
     #[test]

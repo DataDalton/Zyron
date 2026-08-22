@@ -1,0 +1,73 @@
+{
+  "id": "2026-08-20_030144_daa5c98-local",
+  "date": "2026-08-20 03:01:50Z",
+  "ts": 1787194910,
+  "commit": "daa5c98-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Performance": {
+      "bulk_load 100K points/sec": {
+        "average": 4706494.549462,
+        "runs": [4394580.60, 4792990.73, 4826720.73, 4729160.95, 4789019.74],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "bulk_load 1M points/sec (parallel STR)": {
+        "average": 3539853.877081,
+        "runs": [3553632.49, 3302916.77, 3709337.78, 3658451.37, 3474930.98],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "snapshot roundtrip 100K (ms)": {
+        "average": 26.153940,
+        "runs": [25.61, 25.02, 27.02, 26.11, 27.01],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "insert points/sec": {
+        "average": 180392.865904,
+        "runs": [181257.14, 182403.80, 178159.56, 180720.91, 179422.92],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "KNN 100K k=10 (us)": {
+        "average": 4.425326,
+        "runs": [4.44, 4.42, 4.43, 4.42, 4.41],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "dwithin 100K r=500 (us)": {
+        "average": 6.660184,
+        "runs": [6.68, 6.65, 6.66, 6.66, 6.66],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "range 100K 1% area (us)": {
+        "average": 6.559396,
+        "runs": [6.57, 6.57, 6.56, 6.55, 6.56],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "delete_by_data/sec": {
+        "average": 608976.742132,
+        "runs": [551544.60, 582961.21, 641420.36, 621272.37, 647685.17],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

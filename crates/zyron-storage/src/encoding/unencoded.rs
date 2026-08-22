@@ -18,6 +18,19 @@ impl Encoding for UnencodedEncoding {
     fn decode(&self, encoded: &[u8], _row_count: usize, _value_size: usize) -> Result<Vec<u8>> {
         Ok(encoded.to_vec())
     }
+
+    /// The stored bytes are the decoded bytes, so a range is a slice and
+    /// costs nothing but the copy of what was asked for
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        crate::encoding::slice_decoded(encoded, row_count, value_size, start, end)
+    }
 }
 
 #[cfg(test)]

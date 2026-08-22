@@ -3,7 +3,7 @@
 
 use crate::value::{AnalyticsValue, VerifiedKeyMap, hash_value_128};
 use zyron_common::error::{Result, ZyronError};
-use zyron_common::{fx_finalize, fx_mix};
+use zyron_common::{fx_mix, mix_finalize_2round};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CohortPeriod {
@@ -167,7 +167,7 @@ const COHORT_SEED_LABEL_HIGH: u64 = 0x71A8_D532_6BCE_4F08;
 #[inline]
 fn user_hash_128(u: &AnalyticsValue) -> (u64, u64) {
     let (lo, hi) = hash_value_128(COHORT_SEED_USER_LOW, COHORT_SEED_USER_HIGH, u);
-    (fx_finalize(lo), fx_finalize(hi))
+    (mix_finalize_2round(lo), mix_finalize_2round(hi))
 }
 
 impl CohortAnalyser {
@@ -225,8 +225,8 @@ impl CohortAnalyser {
             return;
         }
         let offset_u32 = offset as u32;
-        let ckey_low = fx_finalize(fx_mix(slot_label_hash, offset_u32 as u64));
-        let ckey_high = fx_finalize(fx_mix(
+        let ckey_low = mix_finalize_2round(fx_mix(slot_label_hash, offset_u32 as u64));
+        let ckey_high = mix_finalize_2round(fx_mix(
             slot_label_hash ^ COHORT_SEED_LABEL_HIGH,
             offset_u32 as u64,
         ));
@@ -284,9 +284,9 @@ impl CohortAnalyser {
             let label_hash = h;
             let mut period_values = vec![0.0f64; periods as usize];
             for offset in 0..periods {
-                let ckey_low = fx_finalize(fx_mix(label_hash, offset as u64));
+                let ckey_low = mix_finalize_2round(fx_mix(label_hash, offset as u64));
                 let ckey_high =
-                    fx_finalize(fx_mix(label_hash ^ COHORT_SEED_LABEL_HIGH, offset as u64));
+                    mix_finalize_2round(fx_mix(label_hash ^ COHORT_SEED_LABEL_HIGH, offset as u64));
                 let value = match analysis.metric {
                     CohortMetric::ActiveUsers => active_users
                         .get(ckey_low, ckey_high)

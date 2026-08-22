@@ -13,6 +13,7 @@ profile = ["zyron-common/profile"]
 zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
+zyron-lake = { path = "../zyron-lake" }
 zyron-planner = { path = "../zyron-planner" }
 zyron-lifecycle = { path = "../zyron-lifecycle" }
 zyron-executor = { path = "../zyron-executor" }
@@ -61,3 +62,4 @@ tokio-util.workspace = true
 futures.workspace = true
 rcgen.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }
+zyron-tpc = { path = "../zyron-tpc" }

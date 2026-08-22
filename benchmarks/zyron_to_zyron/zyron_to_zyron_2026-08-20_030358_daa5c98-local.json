@@ -1,0 +1,114 @@
+{
+  "id": "2026-08-20_030358_daa5c98-local",
+  "date": "2026-08-20 03:04:12Z",
+  "ts": 1787195052,
+  "commit": "daa5c98-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "URI Parse": {
+      "parse_zyron_uri throughput (ops/sec)": {
+        "average": 6282764.103920,
+        "runs": [6268688.53, 6395203.09, 6283735.81, 6218348.61, 6247844.49],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription Control": {
+      "Y+W+A+j encode throughput (ops/sec)": {
+        "average": 324875208.416880,
+        "runs": [325552625.58, 327326884.99, 319238934.38, 328774329.30, 323483267.83],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription X Encode": {
+      "ChangeBatch encode (100 rows, ops/sec)": {
+        "average": 2576065.931459,
+        "runs": [2579762.38, 2570593.64, 2576366.07, 2576051.48, 2577556.09],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription X Decode": {
+      "ChangeBatch decode (100 rows, ops/sec)": {
+        "average": 326251.871074,
+        "runs": [326398.22, 326430.40, 326069.74, 326165.73, 326195.27],
+        "target": 200000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Credential Seal": {
+      "seal_credentials throughput (ops/sec)": {
+        "average": 2699076.690018,
+        "runs": [2837040.40, 2869967.51, 2644649.08, 3062093.12, 2081633.33],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Credential Open": {
+      "open_credentials throughput (ops/sec)": {
+        "average": 3291679.820048,
+        "runs": [3147980.26, 3337159.94, 3330624.43, 3335690.55, 3306943.92],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "INSERT VALUES encode": {
+      "rows/sec at batch=1000": {
+        "average": 42815269.371484,
+        "runs": [42618116.11, 43050192.22, 42953296.88, 42976925.69, 42477815.96],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "COPY BINARY encode": {
+      "rows/sec at batch=1000": {
+        "average": 315777272.256450,
+        "runs": [316997400.62, 315955766.19, 313361744.80, 316525812.68, 316045636.99],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Pool Acquire Primitive": {
+      "Semaphore(4) acquire+release (ops/sec)": {
+        "average": 26800879.811338,
+        "runs": [26582312.13, 26915726.86, 26842755.14, 26756568.74, 26907036.19],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Snapshot Chunk Distribution": {
+      "compute_chunks ops/sec": {
+        "average": 111630322.106153,
+        "runs": [110204981.27, 111696899.29, 112012186.93, 111890615.73, 112346927.31],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Publication Retention Sweep": {
+      "decisions/sec": {
+        "average": 515602295.390512,
+        "runs": [511236989.02, 517384105.96, 516475570.71, 517737693.38, 515177117.89],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

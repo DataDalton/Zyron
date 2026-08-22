@@ -425,9 +425,8 @@ impl std::hash::BuildHasher for ZyBuildHasher {
 //   2. Store it in a HashMap whose hasher is `IdentityHasher`, which passes
 //      the u64 through unchanged so the table never re-hashes.
 
-/// Mixing constant used by fx_mix and fx_finalize. Matches the constant
-/// the catalog cache and executor compute kernels use so cross-component
-/// hashes agree.
+/// Mixing constant used by fx_mix. Matches the constant the catalog cache
+/// and executor compute kernels use so cross-component hashes agree.
 pub const FX_K: u64 = 0x517cc1b727220a95;
 
 /// Single-step mix: rotate the running hash, xor in the byte/word, multiply
@@ -438,13 +437,40 @@ pub fn fx_mix(h: u64, b: u64) -> u64 {
     (h.rotate_left(5) ^ b).wrapping_mul(FX_K)
 }
 
-/// Avalanche finalizer for an fx_mix-built u64. Spreads bits so the result
-/// is well-distributed across the lower bits used by HashMap bucket
-/// selection.
+// Two Murmur3 finalizers, and callers name the one they want.
+//
+// They produce different output from the same input, so they are not
+// interchangeable: anything persisted or shared between components has to be
+// read back through the same one that wrote it. Naming the round count at the
+// call site is what keeps that visible. Collapsing them into one primitive
+// would rehash every table on whichever side lost.
+
+/// Murmur3 finalizer, two multiply-xorshift rounds.
+///
+/// Spreads bits well enough for the lower bits HashMap bucket selection uses,
+/// at two thirds the work of the three round form. Used by the catalog cache,
+/// `PreHashMap` and the analytics grouping, funnel, cohort, profiling and
+/// period-comparison kernels
 #[inline(always)]
-pub fn fx_finalize(mut h: u64) -> u64 {
+pub fn mix_finalize_2round(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h
+}
+
+/// Murmur3 finalizer, three multiply-xorshift rounds.
+///
+/// The full construction: every input bit affects every output bit. Used by
+/// the executor join, distinct and set-operation hash tables and by the
+/// streaming aggregate, where the extra round buys distribution across the
+/// whole word rather than only the bucket bits
+#[inline(always)]
+pub fn mix_finalize_3round(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
     h ^= h >> 33;
     h
 }
@@ -524,6 +550,45 @@ impl std::hash::BuildHasher for ZyBuildHasherSeeded {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Murmur3 finalizers -----
+
+    /// The two finalizers exist because their output differs, and a caller
+    /// that reads back through the wrong one gets a different key for the
+    /// same value. Pinning both against the round count they are named for
+    /// is what makes a later attempt to collapse them fail loudly here
+    /// rather than quietly rehash a live table
+    #[test]
+    fn mix_finalizers_stay_distinct_and_match_their_round_count() {
+        fn two_rounds(h: u64) -> u64 {
+            let mut v = h;
+            v ^= v >> 33;
+            v = v.wrapping_mul(0xff51afd7ed558ccd);
+            v ^= v >> 33;
+            v
+        }
+        fn three_rounds(h: u64) -> u64 {
+            let mut v = two_rounds(h);
+            v = v.wrapping_mul(0xc4ceb9fe1a85ec53);
+            v ^= v >> 33;
+            v
+        }
+
+        for input in [0u64, 1, 2, 42, 0x517cc1b727220a95, u64::MAX] {
+            assert_eq!(mix_finalize_2round(input), two_rounds(input));
+            assert_eq!(mix_finalize_3round(input), three_rounds(input));
+        }
+        // Zero is the one input both agree on, because every step of the
+        // third round is a multiply or a shift of zero
+        assert_eq!(mix_finalize_2round(0), mix_finalize_3round(0));
+        for input in [1u64, 2, 42, 0x9e3779b97f4a7c15, u64::MAX] {
+            assert_ne!(
+                mix_finalize_2round(input),
+                mix_finalize_3round(input),
+                "the two finalizers are not interchangeable at {input:#x}"
+            );
+        }
+    }
 
     // ----- One-shot API -----
 

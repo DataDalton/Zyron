@@ -1,0 +1,168 @@
+{
+  "id": "2026-08-16_184244_c4f1c07-local",
+  "date": "2026-08-16 18:42:56Z",
+  "ts": 1786905776,
+  "commit": "c4f1c07-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "branch_create_overhead": {
+      "us_per_branch": {
+        "average": 2.060400,
+        "runs": [2.12, 2.03, 2.06, 2.07, 2.01],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "branch_page_resolution": {
+      "ns_per_resolve": {
+        "average": 53.214520,
+        "runs": [54.41, 48.06, 54.42, 54.62, 54.57],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "page_version_map_skip_check": {
+      "skip_check_ops_per_sec": {
+        "average": 4216769753.746390,
+        "runs": [4302925989.67, 4278990158.32, 4290004290.00, 4282655246.25, 3929273084.48],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "page_version_map_update": {
+      "update_ops_per_sec": {
+        "average": 581416673.794762,
+        "runs": [580686371.29, 580450429.53, 581361548.75, 582411182.29, 582173837.11],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "branch_merge_10k": {
+      "ms_per_merge": {
+        "average": 1.674240,
+        "runs": [1.66, 1.72, 1.68, 1.66, 1.65],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "diff_adjacent_versions": {
+      "ms_per_diff": {
+        "average": 0.409980,
+        "runs": [0.41, 0.41, 0.41, 0.41, 0.42],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "scd_type2_merge_throughput": {
+      "rows_per_sec": {
+        "average": 46926942.776880,
+        "runs": [46337055.74, 47003525.26, 47030052.20, 47165361.76, 47098718.91],
+        "target": 150000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "time_travel_scan_overhead": {
+      "overhead_percent": {
+        "average": 12.361156,
+        "runs": [0.00, 5.20, 16.26, 22.10, 18.25],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "timestamp_resolution": {
+      "us_per_resolution": {
+        "average": 0.044070,
+        "runs": [0.04, 0.04, 0.04, 0.05, 0.04],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "version_log_append_planning": {
+      "batch_ops_per_sec": {
+        "average": 6544370.206172,
+        "runs": [6581376.42, 6584102.03, 6468732.09, 6261254.61, 6826385.89],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "version_overhead_per_tuple": {
+      "ns_per_check": {
+        "average": 0.000004,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "scd_type2_action_generation": {
+      "ns_per_action": {
+        "average": 26.940140,
+        "runs": [26.98, 26.94, 26.92, 26.93, 26.93],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "surrogate_key_generation": {
+      "keys_per_sec": {
+        "average": 163001885.844179,
+        "runs": [162746642.54, 163188840.49, 163112446.46, 163048351.99, 162913147.74],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "version_log_append_throughput": {
+      "append_ops_per_sec": {
+        "average": 719497.559221,
+        "runs": [718283.06, 721760.06, 718866.38, 712139.73, 726438.56],
+        "target": 400000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "version_log_batch_append": {
+      "batch_append_ops_per_sec": {
+        "average": 7070826.621027,
+        "runs": [6936015.26, 6794064.43, 7120813.14, 7091660.42, 7411579.85],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "version_log_lookup_by_id": {
+      "ns_per_lookup": {
+        "average": 12.597740,
+        "runs": [12.63, 12.53, 12.64, 12.59, 12.60],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "version_log_timestamp_search": {
+      "ns_per_search": {
+        "average": 42.826400,
+        "runs": [42.78, 42.76, 42.97, 42.62, 43.01],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

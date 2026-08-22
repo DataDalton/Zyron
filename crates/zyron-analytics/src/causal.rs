@@ -105,46 +105,45 @@ pub fn ateWithCi(
         .min(bootstrap.max(1));
     let perThread = (bootstrap + nThreads - 1) / nThreads;
     let mut baseRng = zyron_common::Xoshiro256pp::fromSeed(seed);
-    let mut estimates: Vec<f64> =
-        std::thread::scope(|scope| -> Vec<f64> {
-            let mut handles = Vec::with_capacity(nThreads);
-            for t in 0..nThreads {
-                let mut threadRng = baseRng;
-                baseRng.longJump();
-                let count = perThread.min(bootstrap.saturating_sub(t * perThread));
-                let outRef = outcome;
-                let treatRef = treatment;
-                let covRef = covariates;
-                let h = scope.spawn(move || {
-                    let mut bO = vec![0.0f64; n];
-                    let mut bT = vec![0.0f64; n];
-                    let mut bC = vec![0.0f64; n * p];
-                    let mut local = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        for i in 0..n {
-                            let idx = threadRng.nextRange(n as u64) as usize;
-                            bO[i] = outRef[idx];
-                            bT[i] = treatRef[idx];
-                            for j in 0..p {
-                                bC[i * p + j] = covRef[idx * p + j];
-                            }
-                        }
-                        if let Ok(e) = ate(&bO, &bT, &bC, p) {
-                            local.push(e);
+    let mut estimates: Vec<f64> = std::thread::scope(|scope| -> Vec<f64> {
+        let mut handles = Vec::with_capacity(nThreads);
+        for t in 0..nThreads {
+            let mut threadRng = baseRng;
+            baseRng.longJump();
+            let count = perThread.min(bootstrap.saturating_sub(t * perThread));
+            let outRef = outcome;
+            let treatRef = treatment;
+            let covRef = covariates;
+            let h = scope.spawn(move || {
+                let mut bO = vec![0.0f64; n];
+                let mut bT = vec![0.0f64; n];
+                let mut bC = vec![0.0f64; n * p];
+                let mut local = Vec::with_capacity(count);
+                for _ in 0..count {
+                    for i in 0..n {
+                        let idx = threadRng.nextRange(n as u64) as usize;
+                        bO[i] = outRef[idx];
+                        bT[i] = treatRef[idx];
+                        for j in 0..p {
+                            bC[i * p + j] = covRef[idx * p + j];
                         }
                     }
-                    local
-                });
-                handles.push(h);
-            }
-            let mut out = Vec::with_capacity(bootstrap);
-            for h in handles {
-                if let Ok(mut v) = h.join() {
-                    out.append(&mut v);
+                    if let Ok(e) = ate(&bO, &bT, &bC, p) {
+                        local.push(e);
+                    }
                 }
+                local
+            });
+            handles.push(h);
+        }
+        let mut out = Vec::with_capacity(bootstrap);
+        for h in handles {
+            if let Ok(mut v) = h.join() {
+                out.append(&mut v);
             }
-            out
-        });
+        }
+        out
+    });
     if estimates.is_empty() {
         return Ok(CausalEstimate {
             estimate,
@@ -155,7 +154,9 @@ pub fn ateWithCi(
     }
     estimates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lo = ((alpha / 2.0) * estimates.len() as f64).floor() as usize;
-    let hi = (((1.0 - alpha / 2.0) * estimates.len() as f64) - 1.0).ceil().max(0.0) as usize;
+    let hi = (((1.0 - alpha / 2.0) * estimates.len() as f64) - 1.0)
+        .ceil()
+        .max(0.0) as usize;
     let lo = lo.min(estimates.len() - 1);
     let hi = hi.min(estimates.len() - 1);
     Ok(CausalEstimate {
@@ -206,11 +207,7 @@ pub fn att(outcome: &[f64], treatment: &[f64], covariates: &[f64], p: usize) -> 
 /// Difference-in-differences estimator
 /// (mean(Y | T=1, post=1) - mean(Y | T=1, post=0))
 /// minus (mean(Y | T=0, post=1) - mean(Y | T=0, post=0))
-pub fn diffInDiff(
-    outcome: &[f64],
-    treatment: &[f64],
-    post: &[f64],
-) -> Result<f64> {
+pub fn diffInDiff(outcome: &[f64], treatment: &[f64], post: &[f64]) -> Result<f64> {
     let n = outcome.len();
     if n == 0 || treatment.len() != n || post.len() != n {
         return Err(ZyronError::InvalidParameter {

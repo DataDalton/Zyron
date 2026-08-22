@@ -152,6 +152,11 @@ struct SumAccumulator {
     float_sum: f64,
     saw_float: bool,
     has_value: bool,
+    /// The 128-bit accumulator overflowed. Recorded here because the per-row
+    /// updates are infallible, and surfaced as an error from
+    /// finalize_checked so the statement fails instead of returning a
+    /// wrapped sum
+    overflowed: bool,
 }
 
 impl SumAccumulator {
@@ -178,7 +183,10 @@ impl Accumulator for SumAccumulator {
             }
             _ => {
                 if let Some(i) = value.to_i128() {
-                    self.int_sum += i;
+                    match self.int_sum.checked_add(i) {
+                        Some(s) => self.int_sum = s,
+                        None => self.overflowed = true,
+                    }
                     self.has_value = true;
                 }
             }
@@ -215,10 +223,22 @@ impl Accumulator for SumAccumulator {
     fn finalize(&self) -> ScalarValue {
         self.finalize_inner()
     }
+    fn finalize_checked(&self) -> Result<ScalarValue> {
+        if self.overflowed {
+            return Err(ZyronError::ExecutionError(
+                "SUM overflowed its 128-bit accumulator".to_string(),
+            ));
+        }
+        Ok(self.finalize_inner())
+    }
     fn merge(&mut self, other: &dyn Accumulator) {
         let o = merge_peer::<SumAccumulator>(other);
+        self.overflowed |= o.overflowed;
         if o.has_value {
-            self.int_sum += o.int_sum;
+            match self.int_sum.checked_add(o.int_sum) {
+                Some(s) => self.int_sum = s,
+                None => self.overflowed = true,
+            }
             self.float_sum += o.float_sum;
             self.saw_float |= o.saw_float;
             self.has_value = true;
@@ -227,6 +247,25 @@ impl Accumulator for SumAccumulator {
     fn supports_parallel_merge(&self) -> bool {
         true
     }
+}
+
+/// The numeric value at (col, row) as an f64, dividing a decimal's raw
+/// scaled integer back onto its value scale. A plain 128-bit integer folds
+/// as its numeric value. None for NULL and non-numeric data
+fn numeric_value_f64(col: &Column, row: usize) -> Option<f64> {
+    if col.is_null(row) {
+        return None;
+    }
+    if let ColumnData::Int128(v) = &col.data {
+        let raw = v[row];
+        return Some(if col.type_id == zyron_common::TypeId::Decimal {
+            let scale = col.fractional_digits.unwrap_or(0);
+            raw as f64 / 10f64.powi(scale as i32)
+        } else {
+            raw as f64
+        });
+    }
+    col.get_scalar(row).to_f64()
 }
 
 struct AvgAccumulator {
@@ -261,6 +300,13 @@ impl Accumulator for AvgAccumulator {
             ColumnData::Float32(v) => {
                 self.sum += v[row] as f64;
                 self.count += 1;
+            }
+            // Decimals average on the value scale, not the raw scaled int
+            ColumnData::Int128(_) => {
+                if let Some(x) = numeric_value_f64(col, row) {
+                    self.sum += x;
+                    self.count += 1;
+                }
             }
             _ => self.update(&col.get_scalar(row)),
         }
@@ -412,7 +458,7 @@ fn uda_column(column_id: u16, type_id: TypeId) -> LogicalColumn {
         name: String::new(),
         type_id,
         nullable: true,
-        ts_precision: None,
+        fractional_digits: None,
     }
 }
 
@@ -590,6 +636,7 @@ pub(crate) fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumu
             float_sum: 0.0,
             saw_float: false,
             has_value: false,
+            overflowed: false,
         }),
         "avg" => Box::new(AvgAccumulator { sum: 0.0, count: 0 }),
         "min" => Box::new(MinAccumulator { min: None }),
@@ -695,6 +742,16 @@ struct StddevAccumulator {
     m2: f64,
 }
 
+impl StddevAccumulator {
+    fn accept(&mut self, x: f64) {
+        self.count += 1;
+        let delta = x - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = x - self.mean;
+        self.m2 += delta * delta2;
+    }
+}
+
 impl Accumulator for StddevAccumulator {
     fn update(&mut self, value: &ScalarValue) {
         let x = match value {
@@ -704,13 +761,20 @@ impl Accumulator for StddevAccumulator {
             ScalarValue::Int32(v) => *v as f64,
             ScalarValue::Int16(v) => *v as f64,
             ScalarValue::Int8(v) => *v as f64,
+            ScalarValue::Int128(v) => *v as f64,
             _ => return,
         };
-        self.count += 1;
-        let delta = x - self.mean;
-        self.mean += delta / self.count as f64;
-        let delta2 = x - self.mean;
-        self.m2 += delta * delta2;
+        self.accept(x);
+    }
+    fn update_typed(&mut self, col: &Column, row: usize) {
+        // A decimal folds on its value scale, which only the column knows
+        if let ColumnData::Int128(_) = &col.data {
+            if let Some(x) = numeric_value_f64(col, row) {
+                self.accept(x);
+            }
+            return;
+        }
+        self.update(&col.get_scalar(row));
     }
     fn finalize(&self) -> ScalarValue {
         if self.count < 2 {
@@ -728,6 +792,16 @@ struct VarianceAccumulator {
     m2: f64,
 }
 
+impl VarianceAccumulator {
+    fn accept(&mut self, x: f64) {
+        self.count += 1;
+        let delta = x - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = x - self.mean;
+        self.m2 += delta * delta2;
+    }
+}
+
 impl Accumulator for VarianceAccumulator {
     fn update(&mut self, value: &ScalarValue) {
         let x = match value {
@@ -737,13 +811,20 @@ impl Accumulator for VarianceAccumulator {
             ScalarValue::Int32(v) => *v as f64,
             ScalarValue::Int16(v) => *v as f64,
             ScalarValue::Int8(v) => *v as f64,
+            ScalarValue::Int128(v) => *v as f64,
             _ => return,
         };
-        self.count += 1;
-        let delta = x - self.mean;
-        self.mean += delta / self.count as f64;
-        let delta2 = x - self.mean;
-        self.m2 += delta * delta2;
+        self.accept(x);
+    }
+    fn update_typed(&mut self, col: &Column, row: usize) {
+        // A decimal folds on its value scale, which only the column knows
+        if let ColumnData::Int128(_) = &col.data {
+            if let Some(x) = numeric_value_f64(col, row) {
+                self.accept(x);
+            }
+            return;
+        }
+        self.update(&col.get_scalar(row));
     }
     fn finalize(&self) -> ScalarValue {
         if self.count < 2 {
@@ -966,35 +1047,40 @@ fn finalize_groups(
     num_group_cols: usize,
     output_schema: &[LogicalColumn],
 ) -> Result<DataBatch> {
-    let mut col_builders: Vec<(ColumnData, NullBitmap, TypeId)> =
+    let mut col_builders: Vec<(ColumnData, NullBitmap, TypeId, Option<u8>)> =
         Vec::with_capacity(output_schema.len());
     for col_def in output_schema {
         col_builders.push((
             ColumnData::with_capacity(col_def.type_id, num_groups),
             NullBitmap::empty(),
             col_def.type_id,
+            col_def.fractional_digits,
         ));
     }
 
     for gidx in 0..num_groups {
         for i in 0..num_group_cols {
-            let (data, nulls, _) = &mut col_builders[i];
+            let (data, nulls, _, _) = &mut col_builders[i];
             let store_col = &group_key_store[i];
             nulls.push(store_col.is_null(gidx));
             data.push_from(&store_col.data, gidx);
         }
         for (i, acc) in group_accumulators[gidx].iter().enumerate() {
             let raw = acc.finalize_checked()?;
-            let (data, nulls, ty) = &mut col_builders[num_group_cols + i];
+            let (data, nulls, ty, _) = &mut col_builders[num_group_cols + i];
             let val = coerce_aggregate_scalar(raw, *ty)?;
             nulls.push(val.is_null());
             data.push_scalar(&val);
         }
     }
 
+    // The declared fractional digits ride along so a decimal aggregate's
+    // output column compares and renders on its value scale
     let columns: Vec<Column> = col_builders
         .into_iter()
-        .map(|(data, nulls, type_id)| Column::with_nulls(data, nulls, type_id))
+        .map(|(data, nulls, type_id, fractional_digits)| {
+            Column::with_nulls_ts(data, nulls, type_id, fractional_digits)
+        })
         .collect();
 
     Ok(DataBatch::new(columns))
@@ -1061,9 +1147,10 @@ impl GroupAccumulatorState {
 
         if self.group_key_store.is_empty() {
             for gc in &group_cols {
-                self.group_key_store.push(Column::new(
+                self.group_key_store.push(Column::new_ts(
                     ColumnData::with_capacity(gc.type_id, 64),
                     gc.type_id,
+                    gc.fractional_digits,
                 ));
             }
         }
@@ -1297,11 +1384,28 @@ impl Operator for SortAggregateOperator {
 /// they take the serial path instead of being silently treated as parallel via
 /// the create_accumulator catch-all. Kept in sync with the accumulators that
 /// override Accumulator::supports_parallel_merge.
+/// Whether an aggregate named in a plan can be computed as partials over
+/// disjoint ranges and merged.
+///
+/// The accumulator itself answers, because it is the thing that implements
+/// `merge` and knows whether combining partial states changes the result. A
+/// second list of names here would be a copy of that knowledge, and the day
+/// the two disagreed the plan would either lose parallelism it could have had
+/// or call `merge` on an accumulator whose default body is `unreachable!`.
+///
+/// The probe accumulator is built and dropped; it holds no state before its
+/// first update, so this costs one allocation at plan time.
 pub fn aggregate_supports_parallel(function_name: &str) -> bool {
-    matches!(
-        function_name.to_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max"
-    )
+    // An unimplemented name has no accumulator of its own, and probing it
+    // would land on the catch-all COUNT and answer for the wrong aggregate.
+    // `validate_aggregates` rejects such a plan before it runs, so the only
+    // honest answer here is that it is not something to parallelize
+    if !is_supported_aggregate(function_name) {
+        return false;
+    }
+    // Argument count only distinguishes COUNT(*) from COUNT(expr), and both
+    // merge, so either probe answers for the name
+    build_accumulator(function_name, 1).supports_parallel_merge()
 }
 
 /// Aggregates a contiguous page range into one partial group state. Each
@@ -1386,6 +1490,11 @@ impl ParallelHashAggregateOperator {
             .get_heap_file(self.table_id)
             .await?
             .num_pages_cached() as u64;
+        // One scan, however many workers divide it. Each worker's scanner folds
+        // in its own row and byte totals.
+        if let Some(stats) = self.ctx.table_io_stats_for(self.table_id.0) {
+            stats.record_seq_scan();
+        }
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1472,6 +1581,55 @@ impl Operator for ParallelHashAggregateOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accumulator decides whether an aggregate can be split across
+    /// ranges, so adding one that merges is enough to make plans parallelize
+    /// it and there is no second list to keep in step
+    #[test]
+    fn test_parallel_eligibility_comes_from_the_accumulator() {
+        for name in ["count", "sum", "avg", "min", "max", "COUNT", "Sum"] {
+            assert!(
+                aggregate_supports_parallel(name),
+                "{name} merges, so a plan may split it"
+            );
+            assert!(build_accumulator(name, 1).supports_parallel_merge());
+        }
+
+        // An accumulator whose default `merge` is `unreachable!` must never be
+        // reported as splittable, or a parallel plan would panic on it
+        for name in ["first", "last", "stddev", "variance"] {
+            assert!(
+                is_supported_aggregate(name),
+                "{name} is a real aggregate, just not a splittable one"
+            );
+            assert_eq!(
+                aggregate_supports_parallel(name),
+                build_accumulator(name, 1).supports_parallel_merge(),
+                "{name}: the plan-time answer must be the accumulator's answer"
+            );
+            assert!(
+                !aggregate_supports_parallel(name),
+                "{name} defines no parallel combine"
+            );
+        }
+
+        // A name with no implementation resolves to the catch-all COUNT
+        // accumulator, which does merge. Answering from that probe would be
+        // answering for the wrong aggregate, so the guard runs first
+        for name in ["string_agg", "array_agg", "no_such_aggregate"] {
+            assert!(!is_supported_aggregate(name));
+            assert!(
+                build_accumulator(name, 1).supports_parallel_merge(),
+                "{name} lands on the COUNT catch-all, which is why the guard exists"
+            );
+            assert!(
+                !aggregate_supports_parallel(name),
+                "{name} has no implementation, so it is not something to split"
+            );
+        }
+    }
+
+    use super::*;
     use zyron_catalog::ColumnId;
     use zyron_planner::binder::ColumnRef;
 
@@ -1527,7 +1685,7 @@ mod tests {
             column_id: ColumnId(column_id),
             type_id,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 
@@ -1559,7 +1717,7 @@ mod tests {
                 name: "k".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
             LogicalColumn {
                 table_idx: Some(0),
@@ -1567,7 +1725,7 @@ mod tests {
                 name: "v".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
         ]
     }
@@ -1584,7 +1742,7 @@ mod tests {
                 name: format!("g{i}"),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             });
         }
         for (i, agg) in aggregates.iter().enumerate() {
@@ -1594,7 +1752,7 @@ mod tests {
                 name: agg.function_name.clone(),
                 type_id: agg.return_type,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
             });
         }
         schema

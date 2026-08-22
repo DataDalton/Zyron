@@ -1,0 +1,479 @@
+# suite:   storage
+# run:     2026-08-18_145637_c4ca20f-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== B+ Tree Arena Performance Test ===
+Keys per run: 1000000
+Lookup sample: 10000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Delete [PASS]: 23,009,664 ops/sec (4.346ms, 100000 keys, target: 8,000,000)
+  All 100000 deleted keys verified not found
+  Delete throughput (ops/sec) [PASS]: 23,009,664 >= 8,000,000 (target)
+  Insert: 38,587,542 ops/sec (25.9151ms), height=2
+    Breakdown: hash_table=0.0ms, flush=26.6ms, flushes=8
+  Lookup: 14.85 ns/op (148.5µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 2/5 ---
+  Insert: 40,552,158 ops/sec (24.6596ms), height=2
+    Breakdown: hash_table=0.0ms, flush=25.8ms, flushes=8
+  Lookup: 17.33 ns/op (173.3µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 3/5 ---
+  Insert: 40,300,968 ops/sec (24.8133ms), height=2
+    Breakdown: hash_table=0.0ms, flush=25.9ms, flushes=8
+  Lookup: 20.75 ns/op (207.5µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 4/5 ---
+  Insert: 40,823,825 ops/sec (24.4955ms), height=2
+    Breakdown: hash_table=0.0ms, flush=25.6ms, flushes=8
+  Lookup: 14.47 ns/op (144.7µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 5/5 ---
+  Insert: 40,698,550 ops/sec (24.5709ms), height=2
+    Breakdown: hash_table=0.0ms, flush=25.4ms, flushes=8
+  Lookup: 14.27 ns/op (142.7µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+=== B+ Tree Validation Results ===
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [38,587,542, 40,552,158, 40,300,968, 40,823,825, 40,698,550]
+    Average: 40,192,608 >= 10,000,000 (target)
+    Min/Max: 38,587,542 / 40,823,825, StdDev: 821,178
+  Lookup latency (ns/op) [PASS/OK]:
+    Runs: [15, 17, 21, 14, 14]
+    Average: 16 <= 40 (target)
+    Min/Max: 14 / 21, StdDev: 2
+  Range throughput (ops/sec) [PASS/OK]:
+    Runs: [5,005,000,000, 5,005,000,000, 5,005,000,000, 5,005,000,000, 5,005,000,000]
+    Average: 5,005,000,000 >= 40,000,000 (target)
+    Min/Max: 5,005,000,000 / 5,005,000,000, StdDev: 0
+
+=== Buffer Pool Performance Test ===
+Frames: 50, Pages: 30, Rounds: 1000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Fetch latency: 10.19 ns
+  Hit rate: 1.0000
+
+--- Run 2/5 ---
+  Fetch latency: 10.35 ns
+  Hit rate: 1.0000
+
+--- Run 3/5 ---
+  Fetch latency: 10.48 ns
+  Hit rate: 1.0000
+
+--- Run 4/5 ---
+  Fetch latency: 10.19 ns
+  Hit rate: 1.0000
+
+--- Run 5/5 ---
+  Fetch latency: 10.19 ns
+  Hit rate: 1.0000
+
+=== Buffer Pool Validation Results ===
+  Avg fetch latency (ns) [PASS/OK]:
+    Runs: [10, 10, 10, 10, 10]
+    Average: 10 <= 15 (target)
+    Min/Max: 10 / 10, StdDev: 0
+  Cache hit rate [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 >= 1 (target)
+    Min/Max: 1 / 1, StdDev: 0
+Buffer Pool Eviction: PASSED - 400 dirty evictions with 500/100 pages
+Buffer Pool Pin Test: PASSED - pin prevents eviction
+
+=== Corrupt Checkpoint Fallback Test ===
+Corrupt Checkpoint Fallback: PASSED
+  CRC validation caught corruption, system fell back to empty store
+
+=== Non-Blocking Checkpoint Integration Test ===
+  Phase 1: Inserting 100,000 rows (batch size 1000) with WAL + LSN stamping...
+  Insert throughput: 8,602,817 rows/sec (11.62ms)
+  WAL segments: 1
+  Pages flushed (trickle): 64
+  Phase 2: Running checkpoint...
+  Checkpoint duration: 2.67ms
+  Checkpoint LSN: 1/4405632
+  Wait for flush: 2.59ms
+  Pages flushed during checkpoint: 136
+  Segments deleted: 0 (1 -> 1)
+  Phase 2: PASS
+  Phase 3: Inserting 10,000 rows after checkpoint...
+  Post-checkpoint insert throughput: 4,369,102 rows/sec (2.29ms)
+  Phase 4: Recovery from checkpoint...
+  Recovered checkpoint LSN: 4299372928
+  Redo records: 10000 inserts (expected <= 10000, skipped 100000 pre-checkpoint)
+  Recovery time: 9.12ms
+  Phase 4: PASS
+  Phase 5: Concurrent writes during checkpoint...
+  Concurrent write throughput: 8,540,877 rows/sec (50,000 rows in 5.85ms)
+  Checkpoint during writes: 2.62ms, LSN=1/2252832, deleted=0 segments
+  Phase 5: PASS
+
+  === Checkpoint Integration Summary ===
+  Insert throughput (with LSN stamping): 8,602,817 rows/sec
+  Checkpoint duration: 2.67ms (0 segments deleted, 136 pages flushed)
+  Post-checkpoint insert throughput: 4,369,102 rows/sec
+  Recovery time (post-checkpoint only): 9.12ms (10000 redo records)
+  Concurrent write throughput (during checkpoint): 8,540,877 rows/sec
+  Total pages flushed by background writer: 230
+
+  Non-blocking checkpoint integration: ALL PASS
+
+=== I/O Profile ===
+  1 MB  W:   0.34 ms (  2944 MB/s)  R:   4.05 ms (   247 MB/s)
+  2 MB  W:   0.70 ms (  2861 MB/s)  R:   4.42 ms (   453 MB/s)
+  4 MB  W:   1.04 ms (  3830 MB/s)  R:   4.97 ms (   805 MB/s)
+  6 MB  W:   1.38 ms (  4336 MB/s)  R:   5.28 ms (  1137 MB/s)
+  8 MB  W:   2.10 ms (  3816 MB/s)  R:   5.78 ms (  1385 MB/s)
+ 10 MB  W:   2.56 ms (  3905 MB/s)  R:   5.83 ms (  1717 MB/s)
+ 14 MB  W:   3.79 ms (  3690 MB/s)  R:   6.87 ms (  2037 MB/s)
+ 20 MB  W:   8.30 ms (  2411 MB/s)  R:   7.19 ms (  2782 MB/s)
+
+=== I/O Profile v2 (detailed read breakdown) ===
+  6 MB  fs::read:   0.50 ms  open+read_exact:   0.63 ms  reuse_buf:   0.48 ms
+ 10 MB  fs::read:   0.88 ms  open+read_exact:   1.09 ms  reuse_buf:   0.85 ms
+ 14 MB  fs::read:   1.44 ms  open+read_exact:   1.71 ms  reuse_buf:   1.32 ms
+ 20 MB  fs::read:   2.39 ms  open+read_exact:   2.82 ms  reuse_buf:   2.33 ms
+ 46 MB  fs::read:   7.14 ms  open+read_exact:   9.86 ms  reuse_buf:   7.17 ms
+
+=== Checkpoint Write/Load Round-Trip Test ===
+Keys: 1,000,000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Checkpoint size: 9.54 MB (3 pages)
+  Write: 7.95 ms (1200 MB/sec)
+  Load: 13.52 ms (705 MB/sec)
+
+--- Run 2/5 ---
+  Checkpoint size: 9.54 MB (3 pages)
+  Write: 6.67 ms (1430 MB/sec)
+  Load: 11.60 ms (822 MB/sec)
+
+--- Run 3/5 ---
+  Checkpoint size: 9.54 MB (3 pages)
+  Write: 8.52 ms (1120 MB/sec)
+  Load: 11.84 ms (806 MB/sec)
+
+--- Run 4/5 ---
+  Checkpoint size: 9.54 MB (3 pages)
+  Write: 7.24 ms (1318 MB/sec)
+  Load: 11.60 ms (822 MB/sec)
+
+--- Run 5/5 ---
+  Checkpoint size: 9.54 MB (3 pages)
+  Write: 7.96 ms (1198 MB/sec)
+  Load: 11.56 ms (825 MB/sec)
+
+=== Checkpoint Validation Results ===
+  Write throughput (MB/sec) [FAIL/OK]:
+    Runs: [1,200, 1,430, 1,120, 1,318, 1,198]
+    Average: 1,253 >= 2,000 (target)
+    Min/Max: 1,120 / 1,430, StdDev: 109
+  Write latency 1M keys (ms) [FAIL/REGR!]:
+    Runs: [8, 7, 9, 7, 8]
+    Average: 8 <= 3 (target)
+    Min/Max: 7 / 9, StdDev: 1
+  Load throughput (MB/sec) [FAIL/REGR!]:
+    Runs: [705, 822, 806, 822, 825]
+    Average: 796 >= 3,000 (target)
+    Min/Max: 705 / 825, StdDev: 46
+  Load latency 1M keys (ms) [FAIL/REGR!]:
+    Runs: [14, 12, 12, 12, 12]
+    Average: 12 <= 2 (target)
+    Min/Max: 12 / 14, StdDev: 1
+  Write: avg 7.67 ms, 1253 MB/sec
+  Load:  avg 12.02 ms, 796 MB/sec
+
+=== Checkpoint Scale Test (10M keys) ===
+Keys: 10,000,000
+Post-checkpoint keys: 100
+Validation runs: 5
+
+--- Run 1/5 ---
+  Build: 530 ms (18,860,338 ops/sec)
+  Checkpoint write: 118.86 ms (95.4 MB, 802 MB/sec)
+  Checkpoint load: 87.66 ms (1088 MB/sec)
+  Recovery: 83.04 ms (checkpoint load + 100 WAL records)
+
+--- Run 2/5 ---
+  Build: 532 ms (18,796,424 ops/sec)
+  Checkpoint write: 121.41 ms (95.4 MB, 786 MB/sec)
+  Checkpoint load: 78.56 ms (1214 MB/sec)
+  Recovery: 79.07 ms (checkpoint load + 100 WAL records)
+
+--- Run 3/5 ---
+  Build: 542 ms (18,451,390 ops/sec)
+  Checkpoint write: 126.30 ms (95.4 MB, 755 MB/sec)
+  Checkpoint load: 86.69 ms (1100 MB/sec)
+  Recovery: 76.19 ms (checkpoint load + 100 WAL records)
+
+--- Run 4/5 ---
+  Build: 535 ms (18,683,679 ops/sec)
+  Checkpoint write: 100.53 ms (95.4 MB, 949 MB/sec)
+  Checkpoint load: 72.18 ms (1321 MB/sec)
+  Recovery: 68.11 ms (checkpoint load + 100 WAL records)
+
+--- Run 5/5 ---
+  Build: 541 ms (18,489,692 ops/sec)
+  Checkpoint write: 104.97 ms (95.4 MB, 909 MB/sec)
+  Checkpoint load: 70.47 ms (1353 MB/sec)
+  Recovery: 65.93 ms (checkpoint load + 100 WAL records)
+
+=== Checkpoint Scale Validation Results ===
+  Write 10M keys (ms) [FAIL/REGR!]:
+    Runs: [119, 121, 126, 101, 105]
+    Average: 114 <= 50 (target)
+    Min/Max: 101 / 126, StdDev: 10
+  Load 10M keys (ms) [FAIL/REGR!]:
+    Runs: [88, 79, 87, 72, 70]
+    Average: 79 <= 20 (target)
+    Min/Max: 70 / 88, StdDev: 7
+  Recovery 10M+100 (ms) [FAIL/REGR!]:
+    Runs: [83, 79, 76, 68, 66]
+    Average: 74 <= 20 (target)
+    Min/Max: 66 / 83, StdDev: 6
+  Scale recovery: avg 74.47 ms (target 20.00 ms)
+
+=== Automatic Checkpoint Scheduler Integration Test ===
+  Phase 1: Time-based trigger (1s interval)...
+  Time-triggered checkpoints in 3s: 2 (expected >= 1)
+  Phase 1: PASS
+  Phase 2: WAL segment trigger (max_wal_segments=2, 256KB segments)...
+  Insert throughput: 417,031 rows/sec (119.90ms)
+  WAL segments written: 1 -> 9 (8 rotations)
+  WAL-triggered checkpoints: 1
+  Total segments deleted: 8
+  Last checkpoint LSN: 9/103344
+  Background writer pages flushed: 100
+  Phase 2: PASS
+
+  === Scheduler Summary ===
+  Time-triggered checkpoints: 2
+  WAL-triggered checkpoints: 1
+  Total segments deleted: 8
+
+  Automatic checkpoint scheduler: ALL PASS
+
+=== Adaptive Checkpoint Trigger Test ===
+  Byte threshold: PASSED
+  Minimum interval guard: PASSED
+  Trigger check latency: 23.0 ns/call
+  Trigger check latency (ns) [FAIL]: 23 <= 10 (target)
+Adaptive Checkpoint Trigger: PASSED
+
+=== Graceful Shutdown Checkpoint Test ===
+Keys: 1,000,000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Shutdown: 7.59 ms
+  Startup: 16.10 ms
+
+--- Run 2/5 ---
+  Shutdown: 5.83 ms
+  Startup: 10.68 ms
+
+--- Run 3/5 ---
+  Shutdown: 5.88 ms
+  Startup: 10.49 ms
+
+--- Run 4/5 ---
+  Shutdown: 6.54 ms
+  Startup: 11.81 ms
+
+--- Run 5/5 ---
+  Shutdown: 6.97 ms
+  Startup: 10.53 ms
+
+=== Graceful Shutdown Validation Results ===
+  Shutdown checkpoint latency (ms) [FAIL/OK]:
+    Runs: [8, 6, 6, 7, 7]
+    Average: 7 <= 5 (target)
+    Min/Max: 6 / 8, StdDev: 1
+  Startup load latency (ms) [FAIL/REGR!]:
+    Runs: [16, 11, 10, 12, 11]
+    Average: 12 <= 2 (target)
+    Min/Max: 10 / 16, StdDev: 2
+  Shutdown: avg 6.56 ms (target 5.00 ms)
+
+=== Heap File Performance Test ===
+Tuples per run: 100000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Insert: 19,432,947 ops/sec (5.1459ms)
+  Scan: 283,527,077 ops/sec (352.7µs)
+
+--- Run 2/5 ---
+  Insert: 17,376,798 ops/sec (5.7548ms)
+  Scan: 265,041,081 ops/sec (377.3µs)
+
+--- Run 3/5 ---
+  Insert: 20,972,714 ops/sec (4.7681ms)
+  Scan: 280,033,604 ops/sec (357.1µs)
+
+--- Run 4/5 ---
+  Insert: 21,398,613 ops/sec (4.6732ms)
+  Scan: 216,590,860 ops/sec (461.7µs)
+
+--- Run 5/5 ---
+  Insert: 20,615,581 ops/sec (4.8507ms)
+  Scan: 287,852,619 ops/sec (347.4µs)
+
+=== Heap File Validation Results ===
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [19,432,947, 17,376,798, 20,972,714, 21,398,613, 20,615,581]
+    Average: 19,959,331 >= 8,000,000 (target)
+    Min/Max: 17,376,798 / 21,398,613, StdDev: 1,447,460
+  Scan throughput (ops/sec) [PASS/OK]:
+    Runs: [283,527,077, 265,041,081, 280,033,604, 216,590,860, 287,852,619]
+    Average: 266,609,048 >= 20,000,000 (target)
+    Min/Max: 216,590,860 / 287,852,619, StdDev: 26,161,060
+Heap File Delete/Scan: PASSED - deleted 1000/10000 tuples
+Initial insert: 14,600,672 ops/sec (10,000 tuples)
+Pages after insert: 72
+Delete: 18,031,013 ops/sec (target: 500,000)
+Reinsert (with compaction): 54,644,809 ops/sec (target: 1,000,000)
+Space reuse: 144 pages (was 72)
+Heap File Space Reuse: PASSED
+
+=== Recovery With Checkpoint Test ===
+Pre-checkpoint keys: 500,000
+Post-checkpoint keys: 500
+Validation runs: 5
+
+--- Run 1/5 ---
+  Checkpoint load + 500 WAL records replayed in 4.73 ms
+  All 500500 keys verified
+
+--- Run 2/5 ---
+  Checkpoint load + 500 WAL records replayed in 7.59 ms
+  All 500500 keys verified
+
+--- Run 3/5 ---
+  Checkpoint load + 500 WAL records replayed in 7.19 ms
+  All 500500 keys verified
+
+--- Run 4/5 ---
+  Checkpoint load + 500 WAL records replayed in 8.47 ms
+  All 500500 keys verified
+
+--- Run 5/5 ---
+  Checkpoint load + 500 WAL records replayed in 8.04 ms
+  All 500500 keys verified
+
+=== Recovery With Checkpoint Validation Results ===
+  Recovery time (ms) [FAIL/OK]:
+    Runs: [5, 8, 7, 8, 8]
+    Average: 7 <= 5 (target)
+    Min/Max: 5 / 8, StdDev: 1
+  Recovery: avg 7.20 ms (target 5.00 ms)
+
+=== Recovery Without Checkpoint Test ===
+Keys: 10,000
+  Replayed 10000 WAL records (full replay, no checkpoint)
+  All 10000 keys verified after full WAL replay
+Recovery Without Checkpoint: PASSED
+
+============================================================
+Zyron Storage Foundation Validation Complete
+============================================================
+
+Run: cargo test -p zyron-storage --test storage_bench --release -- --nocapture
+
+=== WAL Checksum Integrity Test ===
+  Clean read: PASSED (100 records)
+  Bit flip detection: PASSED
+  Zeroed region detection: PASSED
+  Truncation detection: PASSED (recovered 49 of 100 records from half-sized file)
+  Full corruption detection: PASSED (0 records from random data)
+WAL Checksum Integrity: PASSED
+
+=== Recovery Performance ===
+  WAL size: 106.1 KB
+  Recovery time: 309.5µs
+  Recovery time (us/KB) [PASS]: 3 <= 10 (target)
+WAL+Heap Recovery: PASSED - 1000 committed transactions recovered (106.1 KB WAL, 309.5µs)
+WAL Recovery with Uncommitted: PASSED - 10 redo, 5 undo
+
+=== WAL Segment Cleanup Test ===
+Validation runs: 5
+
+--- Run 1/5 ---
+  Segments before cleanup: 9 (["0000000000000001.wal", "0000000000000002.wal", "0000000000000003.wal", "0000000000000004.wal", "0000000000000005.wal", "0000000000000006.wal", "0000000000000007.wal", "0000000000000008.wal", "0000000000000009.wal"])
+  Segments after cleanup: 1 (["0000000000000009.wal"])
+  Deleted: 8 segments in 0.717 ms
+
+--- Run 2/5 ---
+  Segments before cleanup: 9 (["0000000000000001.wal", "0000000000000002.wal", "0000000000000003.wal", "0000000000000004.wal", "0000000000000005.wal", "0000000000000006.wal", "0000000000000007.wal", "0000000000000008.wal", "0000000000000009.wal"])
+  Segments after cleanup: 1 (["0000000000000009.wal"])
+  Deleted: 8 segments in 0.615 ms
+
+--- Run 3/5 ---
+  Segments before cleanup: 9 (["0000000000000001.wal", "0000000000000002.wal", "0000000000000003.wal", "0000000000000004.wal", "0000000000000005.wal", "0000000000000006.wal", "0000000000000007.wal", "0000000000000008.wal", "0000000000000009.wal"])
+  Segments after cleanup: 1 (["0000000000000009.wal"])
+  Deleted: 8 segments in 0.624 ms
+
+--- Run 4/5 ---
+  Segments before cleanup: 9 (["0000000000000001.wal", "0000000000000002.wal", "0000000000000003.wal", "0000000000000004.wal", "0000000000000005.wal", "0000000000000006.wal", "0000000000000007.wal", "0000000000000008.wal", "0000000000000009.wal"])
+  Segments after cleanup: 1 (["0000000000000009.wal"])
+  Deleted: 8 segments in 0.619 ms
+
+--- Run 5/5 ---
+  Segments before cleanup: 9 (["0000000000000001.wal", "0000000000000002.wal", "0000000000000003.wal", "0000000000000004.wal", "0000000000000005.wal", "0000000000000006.wal", "0000000000000007.wal", "0000000000000008.wal", "0000000000000009.wal"])
+  Segments after cleanup: 1 (["0000000000000009.wal"])
+  Deleted: 8 segments in 0.632 ms
+
+=== WAL Segment Cleanup Validation Results ===
+  Cleanup latency (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 5 (target)
+    Min/Max: 1 / 1, StdDev: 0
+WAL Segment Rotation: PASSED - rotated from segment 00000001 to 00000004
+
+=== WAL Write/Replay Performance Test ===
+Records per run: 10000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Write: 42,283,298 ops/sec (236.5µs)
+  Replay: 38,850,039 ops/sec (257.4µs)
+
+--- Run 2/5 ---
+  Write: 51,599,587 ops/sec (193.8µs)
+  Replay: 55,648,303 ops/sec (179.7µs)
+
+--- Run 3/5 ---
+  Write: 54,436,581 ops/sec (183.7µs)
+  Replay: 55,493,896 ops/sec (180.2µs)
+
+--- Run 4/5 ---
+  Write: 51,150,895 ops/sec (195.5µs)
+  Replay: 55,741,360 ops/sec (179.4µs)
+
+--- Run 5/5 ---
+  Write: 55,741,360 ops/sec (179.4µs)
+  Replay: 33,545,790 ops/sec (298.1µs)
+
+=== WAL Validation Results ===
+  Write throughput (ops/sec) [PASS/OK]:
+    Runs: [42,283,298, 51,599,587, 54,436,581, 51,150,895, 55,741,360]
+    Average: 51,042,344 >= 8,000,000 (target)
+    Min/Max: 42,283,298 / 55,741,360, StdDev: 4,704,143
+  Replay throughput (ops/sec) [PASS/OK]:
+    Runs: [38,850,039, 55,648,303, 55,493,896, 55,741,360, 33,545,790]
+    Average: 47,855,877 >= 12,000,000 (target)
+    Min/Max: 33,545,790 / 55,741,360, StdDev: 9,665,669

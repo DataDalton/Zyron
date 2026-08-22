@@ -7,8 +7,6 @@
 //! to that column. nextval produces a distinct value per row; currval, lastval,
 //! and setval broadcast one value across the batch.
 
-use std::sync::Arc;
-
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::LiteralValue;
 use zyron_planner::binder::{BoundExpr, ColumnRef};
@@ -164,7 +162,7 @@ fn rewrite(expr: &mut BoundExpr, pending: &mut Vec<PendingSeq>, counter: &mut u1
                 column_id: zyron_catalog::ColumnId(synth_id),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             });
             return Ok(());
         }
@@ -251,7 +249,7 @@ pub async fn materialize_sequences(
             name: format!("__seq_{}", p.synth_id),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         };
         batch
             .columns

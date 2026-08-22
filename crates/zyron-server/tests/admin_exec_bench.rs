@@ -42,22 +42,12 @@ async fn make_catalog() -> (tempfile::TempDir, Arc<Catalog>) {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 512 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn zyron_catalog::CatalogStorage> = Arc::new(storage);
@@ -277,8 +267,8 @@ async fn admin_replay_dlq_returns_501_when_no_sink_client_registry() {
         })
         .await;
     // The non-Zyron backend branch rejects with 400, and a missing sink
-    // resolves to 404. Either is acceptable non-501 behavior here; the
-    // legacy 501-stub path has been removed.
+    // resolves to 404. Either is a real answer, and neither is the
+    // not-implemented status this endpoint must never return
     assert!(resp.status == 400 || resp.status == 404);
 }
 
@@ -317,14 +307,11 @@ fn jwt_secret() -> Vec<u8> {
 async fn make_security_manager(with_admin_role: bool) -> Arc<SecurityManager> {
     let tmp = tempfile::tempdir().unwrap();
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: tmp.path().to_path_buf(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(tmp.path().to_path_buf()))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 256 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage: Arc<dyn zyron_auth::storage::AuthStorage> =
         Arc::new(HeapAuthStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap());
     let mut sm = SecurityManager::new(storage).await.unwrap();

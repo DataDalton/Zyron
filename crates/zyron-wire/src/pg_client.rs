@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
-use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -429,7 +428,7 @@ impl PgClient {
         let salt = base64_decode(&salt_b64)
             .ok_or_else(|| ProtocolError::AuthFailed("bad scram salt".into()))?;
 
-        let salted = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations);
+        let salted = zyron_auth::pbkdf2_sha256(password.as_bytes(), &salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = sha256_bytes(&client_key);
         let channel_binding = base64_encode(b"n,,");
@@ -1308,15 +1307,7 @@ fn sha256_bytes(input: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(msg);
-    mac.finalize().into_bytes().into()
-}
-
-fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iters, &mut out);
-    out
+    zyron_auth::hmac_sha2::hmac_sha256(key, msg)
 }
 
 fn parse_scram_first(s: &str) -> Result<(String, String, u32), ProtocolError> {
@@ -1495,10 +1486,10 @@ mod tests {
     fn test_pbkdf2_known_value() {
         // RFC 7677 test vector sanity: 1 iteration with trivial inputs produces
         // a deterministic 32-byte output. We just verify determinism here.
-        let a = pbkdf2_hmac_sha256(b"pw", b"salt", 1);
-        let b = pbkdf2_hmac_sha256(b"pw", b"salt", 1);
+        let a = zyron_auth::pbkdf2_sha256(b"pw", b"salt", 1);
+        let b = zyron_auth::pbkdf2_sha256(b"pw", b"salt", 1);
         assert_eq!(a, b);
-        let c = pbkdf2_hmac_sha256(b"pw", b"salt", 2);
+        let c = zyron_auth::pbkdf2_sha256(b"pw", b"salt", 2);
         assert_ne!(a, c);
     }
 }

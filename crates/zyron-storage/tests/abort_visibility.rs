@@ -17,23 +17,13 @@ async fn setup() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().join("data"),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(dir.path().join("data")))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 256 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: dir.path().join("wal"),
-            segment_size: 8 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 256 * 1024,
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal =
+        Arc::new(WalWriter::new(zyron_bench_harness::wal_config(dir.path().join("wal"))).unwrap());
     std::fs::create_dir_all(dir.path().join("wal")).unwrap();
     let txnm = Arc::new(TransactionManager::new(wal));
     (disk, pool, txnm, dir)

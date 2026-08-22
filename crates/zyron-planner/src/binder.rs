@@ -33,10 +33,11 @@ pub struct ColumnRef {
     pub column_id: ColumnId,
     pub type_id: TypeId,
     pub nullable: bool,
-    /// Fractional-second precision when this references a TIMESTAMP(p) column
-    /// (None otherwise). Propagates so cross-precision compare and the
-    /// physical i128 picosecond routing stay correct through projections.
-    pub ts_precision: Option<u8>,
+    /// Digits after the decimal point of the referenced column: fractional
+    /// seconds for a TIMESTAMP(p), scale for a DECIMAL(p,s). Propagates so
+    /// cross-precision compare, decimal rescaling, and the physical i128
+    /// picosecond routing stay correct through projections.
+    pub fractional_digits: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,9 +62,9 @@ pub struct BoundColumnDef {
     pub type_id: TypeId,
     pub nullable: bool,
     pub ordinal: u16,
-    /// Fractional-second precision for a TIMESTAMP(p) column (None otherwise),
-    /// carried from the catalog so it propagates into ColumnRef.
-    pub ts_precision: Option<u8>,
+    /// Digits after the decimal point (TIMESTAMP(p) fractional seconds, or
+    /// DECIMAL(p,s) scale), carried from the catalog into ColumnRef.
+    pub fractional_digits: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,10 @@ pub enum BoundExpr {
     Cast {
         expr: Box<BoundExpr>,
         target_type: TypeId,
+        /// Digits the target keeps after the point, when it declares any.
+        /// A `CAST(x AS DECIMAL(p,s))` names its own scale, and without it
+        /// the conversion would have nothing to scale onto.
+        fractional_digits: Option<u8>,
     },
     Case {
         operand: Option<Box<BoundExpr>>,
@@ -358,12 +363,14 @@ impl PartialEq for BoundExpr {
                 BoundExpr::Cast {
                     expr: e1,
                     target_type: t1,
+                    fractional_digits: d1,
                 },
                 BoundExpr::Cast {
                     expr: e2,
                     target_type: t2,
+                    fractional_digits: d2,
                 },
-            ) => t1 == t2 && e1 == e2,
+            ) => t1 == t2 && d1 == d2 && e1 == e2,
             (
                 BoundExpr::Case {
                     operand: o1,
@@ -441,16 +448,102 @@ impl BoundExpr {
         }
     }
 
-    /// Fractional-second precision this expression carries, if it is (or
-    /// passes through) a timestamp column. None means the default 6
-    /// (microseconds) or a non-timestamp expression.
-    pub fn ts_precision(&self) -> Option<u8> {
+    /// Digits after the point this expression carries: a decimal's scale or
+    /// a timestamp's fractional-second precision. None means the expression
+    /// declares neither, which for a timestamp is the default 6.
+    ///
+    /// Computed decimals derive their scale from their inputs so a plan
+    /// schema built from this expression renders and compares the value
+    /// rather than the raw scaled integer.
+    pub fn fractional_digits(&self) -> Option<u8> {
         match self {
-            BoundExpr::ColumnRef(cr) => cr.ts_precision,
-            BoundExpr::Nested(inner) => inner.ts_precision(),
-            BoundExpr::TemporalRef { inner, .. } => inner.ts_precision(),
-            // CAST AS TIMESTAMP(p) precision is carried in B5 (cross-precision
-            // cast); until then a cast result reports the default precision.
+            BoundExpr::ColumnRef(cr) => cr.fractional_digits,
+            BoundExpr::Nested(inner) => inner.fractional_digits(),
+            BoundExpr::TemporalRef { inner, .. } => inner.fractional_digits(),
+            BoundExpr::Cast {
+                fractional_digits, ..
+            } => *fractional_digits,
+            // A decimal-valued operator lands on the wider operand scale,
+            // which is where the runtime alignment puts it
+            BoundExpr::BinaryOp {
+                left,
+                right,
+                type_id,
+                ..
+            } if *type_id == TypeId::Decimal => {
+                match (left.fractional_digits(), right.fractional_digits()) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+            BoundExpr::UnaryOp { expr, type_id, .. } if *type_id == TypeId::Decimal => {
+                expr.fractional_digits()
+            }
+            // SUM, MIN and MAX keep their argument's scale
+            BoundExpr::AggregateFunction {
+                args, return_type, ..
+            } if *return_type == TypeId::Decimal => {
+                args.first().and_then(|a| a.fractional_digits())
+            }
+            // A scalar function's digits follow the argument its return type
+            // derives from, mirroring infer_function_type. time_bucket keeps
+            // its timestamp argument's precision (the evaluator buckets in
+            // the argument's own storage unit), the pass-through family keeps
+            // its first argument's scale, and the value-picking family lands
+            // on the widest argument like CASE. Functions that compute a
+            // fresh temporal value (now, cron_next, time_bucket_calendar)
+            // work in the microsecond default and stay None
+            BoundExpr::Function {
+                name,
+                args,
+                return_type,
+                ..
+            } if matches!(
+                return_type,
+                TypeId::Decimal | TypeId::Timestamp | TypeId::TimestampTz
+            ) =>
+            {
+                match name.to_lowercase().as_str() {
+                    "time_bucket" | "time_bucket_gapfill" | "date_trunc" => {
+                        args.get(1).and_then(|a| a.fractional_digits())
+                    }
+                    "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "truncate"
+                    | "locf" | "interpolate" | "nullif" => {
+                        args.first().and_then(|a| a.fractional_digits())
+                    }
+                    "coalesce" | "greatest" | "least" => {
+                        let mut widest: Option<u8> = None;
+                        for a in args {
+                            if let Some(s) = a.fractional_digits() {
+                                widest = Some(widest.map_or(s, |w| w.max(s)));
+                            }
+                        }
+                        widest
+                    }
+                    _ => None,
+                }
+            }
+            // A wide fixed-point literal carries its own scale
+            BoundExpr::Literal {
+                value: LiteralValue::Decimal { scale, .. },
+                ..
+            } => Some(*scale),
+            // A CASE unifying decimal branches lands on the widest branch
+            // scale, matching the runtime branch alignment
+            BoundExpr::Case {
+                conditions,
+                else_result,
+                type_id,
+                ..
+            } if *type_id == TypeId::Decimal => {
+                let mut widest = else_result.as_ref().and_then(|e| e.fractional_digits());
+                for when in conditions {
+                    if let Some(s) = when.result.fractional_digits() {
+                        widest = Some(widest.map_or(s, |w| w.max(s)));
+                    }
+                }
+                widest
+            }
             _ => None,
         }
     }
@@ -1046,6 +1139,35 @@ pub struct BoundSelect {
     pub set_ops: Vec<BoundSetOp>,
     pub ctes: Vec<BoundCte>,
     pub output_schema: Vec<BoundColumnDef>,
+    pub row_lock: Option<BoundRowLock>,
+}
+
+/// Row lock request bound from SELECT ... FOR UPDATE/SHARE. Carried on
+/// BoundSelect and lowered by the logical builder into LogicalPlan::LockRows
+/// directly above the locked table's row-producing subtree
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundRowLock {
+    pub table_id: TableId,
+    pub mode: RowLockMode,
+    pub wait: RowLockWait,
+}
+
+/// Lock strength. FOR UPDATE and FOR NO KEY UPDATE lock exclusively,
+/// FOR SHARE and FOR KEY SHARE lock shared. Collapsing the four SQL
+/// strengths onto two real modes is strictly conservative, a request
+/// never locks weaker than SQL asked for
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockMode {
+    Shared,
+    Exclusive,
+}
+
+/// Behavior when a requested row is already locked
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockWait {
+    Wait,
+    Nowait,
+    SkipLocked,
 }
 
 #[derive(Debug, Clone)]
@@ -2287,6 +2409,40 @@ impl<'a> Binder<'a> {
         Ok(entry)
     }
 
+    /// Binds one scalar expression against a single table's columns.
+    ///
+    /// DDL that declares an expression over a table, such as a clustering
+    /// target, needs the expression's result type and its resolved column
+    /// references before any query has been planned. Going through the same
+    /// binder a query goes through is what keeps the declared expression and
+    /// the query that later matches it agreeing on both
+    pub async fn bind_scalar_over_table(
+        &mut self,
+        table: &Arc<TableEntry>,
+        expr: &Expr,
+    ) -> Result<BoundExpr> {
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(table.id),
+            alias: table.name.clone(),
+            columns: table
+                .columns
+                .iter()
+                .map(|c| BoundColumnDef {
+                    column_id: c.id,
+                    name: c.name.clone(),
+                    type_id: c.type_id,
+                    nullable: c.nullable,
+                    ordinal: c.ordinal,
+                    fractional_digits: c.fractional_digits,
+                })
+                .collect(),
+            entry: Some(Arc::clone(table)),
+        });
+        self.bind_expr(&ctx, expr).await
+    }
+
     /// Installs the row-security provider so SELECT/UPDATE/DELETE on a single
     /// base table get RLS/ABAC/row-ownership predicates injected.
     pub fn set_row_security(&mut self, provider: std::sync::Arc<dyn crate::RowSecurityProvider>) {
@@ -2609,10 +2765,14 @@ impl<'a> Binder<'a> {
             // Build output schema from projections
             let output_schema = self.build_output_schema(ctx, &projections);
 
-            // Bind ORDER BY
+            // Bind ORDER BY, with the select list in scope so a term can name
+            // an output column
             let mut order_by = Vec::with_capacity(stmt.order_by.len());
             for o in &stmt.order_by {
-                order_by.push(self.bind_order_by(ctx, o).await?);
+                order_by.push(
+                    self.bind_select_order_by(ctx, o, &projections, &output_schema)
+                        .await?,
+                );
             }
 
             // Bind LIMIT / OFFSET
@@ -2639,6 +2799,82 @@ impl<'a> Binder<'a> {
                 });
             }
 
+            // Bind FOR UPDATE/SHARE. Row locking pins concrete base rows, so
+            // it requires exactly one base table and rejects query shapes
+            // whose output rows no longer map to storage rows. Aggregation
+            // is rejected by the logical builder where it is discovered
+            let row_lock = if let Some(fc) = &stmt.for_clause {
+                if !set_ops.is_empty() {
+                    return Err(ZyronError::PlanError(
+                        "FOR UPDATE/SHARE is not allowed with UNION, INTERSECT or EXCEPT"
+                            .to_string(),
+                    ));
+                }
+                if stmt.distinct {
+                    return Err(ZyronError::PlanError(
+                        "FOR UPDATE/SHARE is not allowed with DISTINCT".to_string(),
+                    ));
+                }
+                if !group_by.is_empty() || having.is_some() {
+                    return Err(ZyronError::PlanError(
+                        "FOR UPDATE/SHARE is not allowed with GROUP BY or HAVING".to_string(),
+                    ));
+                }
+                let (table_id, table_idx) = match from.as_slice() {
+                    [
+                        BoundFromItem::BaseTable {
+                            table_id,
+                            table_idx,
+                            as_of,
+                            ..
+                        },
+                    ] => {
+                        if as_of.is_some() {
+                            return Err(ZyronError::PlanError(
+                                "FOR UPDATE/SHARE cannot lock a time-travel read".to_string(),
+                            ));
+                        }
+                        (*table_id, *table_idx)
+                    }
+                    _ => {
+                        return Err(ZyronError::PlanError(
+                            "FOR UPDATE/SHARE requires a single base table, lock each \
+                             table with its own SELECT FOR UPDATE"
+                                .to_string(),
+                        ));
+                    }
+                };
+                for name in &fc.tables {
+                    let matches_base = ctx.tables.get(table_idx).is_some_and(|t| {
+                        t.alias.eq_ignore_ascii_case(name)
+                            || t.entry
+                                .as_ref()
+                                .is_some_and(|e| e.name.eq_ignore_ascii_case(name))
+                    });
+                    if !matches_base {
+                        return Err(ZyronError::PlanError(format!(
+                            "FOR UPDATE OF '{name}' does not name the query's base table"
+                        )));
+                    }
+                }
+                let mode = match fc.lock_type {
+                    ForLockType::Update | ForLockType::NoKeyUpdate => RowLockMode::Exclusive,
+                    ForLockType::Share | ForLockType::KeyShare => RowLockMode::Shared,
+                };
+                let wait = match fc.wait {
+                    ForWait::Wait => RowLockWait::Wait,
+                    ForWait::Nowait => RowLockWait::Nowait,
+                    ForWait::SkipLocked => RowLockWait::SkipLocked,
+                };
+                Some(BoundRowLock {
+                    table_id,
+                    mode,
+                    wait,
+                })
+            } else {
+                None
+            };
+
             Ok(BoundSelect {
                 projections,
                 from,
@@ -2652,6 +2888,7 @@ impl<'a> Binder<'a> {
                 set_ops,
                 ctes: bound_ctes,
                 output_schema,
+                row_lock,
             })
         }) // end Box::pin
     }
@@ -2794,7 +3031,7 @@ impl<'a> Binder<'a> {
                             type_id: c.type_id,
                             nullable: c.nullable,
                             ordinal: c.ordinal,
-                            ts_precision: c.ts_precision,
+                            fractional_digits: c.fractional_digits,
                         })
                         .collect();
 
@@ -2958,6 +3195,16 @@ impl<'a> Binder<'a> {
                         Ok(bound)
                     }
                 }
+                TableRef::ExternalInline(r) => {
+                    // A query reads a snapshot, an inline external source
+                    // reads a feed on a cadence, so there is nothing for a
+                    // plain SELECT to return. CREATE STREAMING JOB binds this
+                    // form through its own path
+                    Err(ZyronError::PlanError(format!(
+                        "an inline external source ('{}') can only appear in the FROM clause of a CREATE STREAMING JOB, register it with CREATE EXTERNAL SOURCE to query it by name",
+                        r.uri
+                    )))
+                }
                 TableRef::TableFunction(tf) => {
                     let name = &tf.name;
                     let args = &tf.args;
@@ -3031,7 +3278,7 @@ impl<'a> Binder<'a> {
                                 name: (*cname).to_string(),
                                 type_id: type_label_to_id(ctype),
                                 nullable: true,
-                                ts_precision: None,
+                                fractional_digits: None,
                             })
                             .collect();
 
@@ -3046,7 +3293,7 @@ impl<'a> Binder<'a> {
                                 type_id: lc.type_id,
                                 nullable: lc.nullable,
                                 ordinal: i as u16,
-                                ts_precision: lc.ts_precision,
+                                fractional_digits: lc.fractional_digits,
                             })
                             .collect();
                         let bound_table = BoundTableRef {
@@ -3114,7 +3361,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -3122,7 +3369,7 @@ impl<'a> Binder<'a> {
                                 name: "score".to_string(),
                                 type_id: TypeId::Float64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                         ],
                         "shortest_path" => vec![
@@ -3132,7 +3379,7 @@ impl<'a> Binder<'a> {
                                 name: "step".to_string(),
                                 type_id: TypeId::Int32,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -3140,7 +3387,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                         ],
                         "bfs" => vec![
@@ -3150,7 +3397,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -3158,7 +3405,7 @@ impl<'a> Binder<'a> {
                                 name: "depth".to_string(),
                                 type_id: TypeId::Int32,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                         ],
                         "betweenness_centrality" => vec![
@@ -3168,7 +3415,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -3176,7 +3423,7 @@ impl<'a> Binder<'a> {
                                 name: "centrality".to_string(),
                                 type_id: TypeId::Float64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                         ],
                         // connected_components and community_detection share
@@ -3188,7 +3435,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -3196,7 +3443,7 @@ impl<'a> Binder<'a> {
                                 name: "component".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
-                                ts_precision: None,
+                                fractional_digits: None,
                             },
                         ],
                     };
@@ -3218,7 +3465,7 @@ impl<'a> Binder<'a> {
                             type_id: lc.type_id,
                             nullable: lc.nullable,
                             ordinal: i as u16,
-                            ts_precision: lc.ts_precision,
+                            fractional_digits: lc.fractional_digits,
                         })
                         .collect();
                     let bound_table = BoundTableRef {
@@ -3304,7 +3551,7 @@ impl<'a> Binder<'a> {
                             column_id: c.column_id,
                             type_id: c.type_id,
                             nullable: c.nullable,
-                            ts_precision: c.ts_precision,
+                            fractional_digits: c.fractional_digits,
                         },
                     ));
                 }
@@ -3604,7 +3851,17 @@ impl<'a> Binder<'a> {
                         // then bind the result. Nested calls of the same
                         // function (in arguments) are fine; only unbounded
                         // recursion is rejected, via a depth bound.
-                        const MAX_FUNCTION_INLINE_DEPTH: usize = 16;
+                        //
+                        // The bound has to be reached before the stack is.
+                        // Inlining re-enters the whole expression binder per
+                        // level, and one of those frames is large enough that
+                        // sixteen of them overflow a default thread stack in
+                        // an unoptimized build, so the guard would fire only
+                        // after the thing it exists to prevent. Four levels of
+                        // the same function nested inside one another is far
+                        // past any real query and leaves the stack margin
+                        // intact
+                        const MAX_FUNCTION_INLINE_DEPTH: usize = 4;
                         let key = (func.name.clone(), func.param_names.len());
                         let depth = self.function_stack.iter().filter(|k| **k == key).count();
                         if depth >= MAX_FUNCTION_INLINE_DEPTH {
@@ -3634,6 +3891,7 @@ impl<'a> Binder<'a> {
                         Ok(BoundExpr::Cast {
                             expr: Box::new(bound),
                             target_type: func.return_type,
+                            fractional_digits: None,
                         })
                     } else {
                         let return_type = infer_function_type(name, &arg_types)?;
@@ -3654,6 +3912,7 @@ impl<'a> Binder<'a> {
                     Ok(BoundExpr::Cast {
                         expr: Box::new(bound),
                         target_type,
+                        fractional_digits: data_type.fractional_digits(),
                     })
                 }
                 Expr::Case {
@@ -3929,7 +4188,7 @@ impl<'a> Binder<'a> {
                         column_id: col.column_id,
                         type_id: col.type_id,
                         nullable: col.nullable,
-                        ts_precision: col.ts_precision,
+                        fractional_digits: col.fractional_digits,
                     });
                 }
             }
@@ -3961,7 +4220,7 @@ impl<'a> Binder<'a> {
                             column_id: col.column_id,
                             type_id: col.type_id,
                             nullable: col.nullable,
-                            ts_precision: col.ts_precision,
+                            fractional_digits: col.fractional_digits,
                         });
                     }
                 }
@@ -4016,7 +4275,7 @@ impl<'a> Binder<'a> {
                                         column_id: col.column_id,
                                         type_id: col.type_id,
                                         nullable: col.nullable,
-                                        ts_precision: col.ts_precision,
+                                        fractional_digits: col.fractional_digits,
                                     }),
                                     Some(col.name.clone()),
                                 ));
@@ -4072,7 +4331,7 @@ impl<'a> Binder<'a> {
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
                         ordinal: ordinal as u16,
-                        ts_precision: expr.ts_precision(),
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 BoundSelectItem::Wildcard => {
@@ -4111,6 +4370,68 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Binds one ORDER BY term of a SELECT, where the select list is in
+    /// scope.
+    ///
+    /// A term that is a bare name matching an output column takes that
+    /// column's expression, and a term that is a bare integer takes the
+    /// output column at that position, both of which SQL defines and neither
+    /// of which the input columns alone can answer: `ORDER BY revenue` after
+    /// `SUM(...) AS revenue` names nothing any table has.
+    ///
+    /// The name has to stand alone. Inside a larger expression it addresses
+    /// an input column, because that is where SQL evaluates it, so
+    /// `ORDER BY revenue + 1` still reads a column called revenue.
+    ///
+    /// This is not reachable from a window function's own ORDER BY, which is
+    /// evaluated before a select list exists and so keeps binding against
+    /// the input alone.
+    async fn bind_select_order_by(
+        &mut self,
+        ctx: &BindContext,
+        order: &OrderByExpr,
+        projections: &[BoundSelectItem],
+        output_schema: &[BoundColumnDef],
+    ) -> Result<BoundOrderBy> {
+        let projected = |index: usize| -> Option<BoundExpr> {
+            match projections.get(index) {
+                Some(BoundSelectItem::Expr(expr, _)) => Some(expr.clone()),
+                _ => None,
+            }
+        };
+
+        let substituted = match &order.expr {
+            // An output column name, which SQL resolves ahead of an input
+            // column of the same name
+            Expr::Identifier(name) => output_schema
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .and_then(projected),
+            // A position into the select list, counted from one
+            Expr::Literal(LiteralValue::Integer(n)) if *n >= 1 => {
+                let index = (*n - 1) as usize;
+                if index >= output_schema.len() {
+                    return Err(ZyronError::PlanError(format!(
+                        "ORDER BY position {n} is not in the select list, which has {} column(s)",
+                        output_schema.len()
+                    )));
+                }
+                projected(index)
+            }
+            _ => None,
+        };
+
+        let expr = match substituted {
+            Some(expr) => expr,
+            None => self.bind_scalar(ctx, &order.expr).await?,
+        };
+        Ok(BoundOrderBy {
+            expr,
+            asc: order.asc.unwrap_or(true),
+            nulls_first: order.nulls_first.unwrap_or(false),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // INSERT binding
     // -----------------------------------------------------------------------
@@ -4120,6 +4441,45 @@ impl<'a> Binder<'a> {
     /// evaluation schema (table columns in order, table_idx 0) without the plan
     /// carrying it. A stored predicate that no longer parses fails closed: the
     /// statement errors rather than skip an unverifiable constraint.
+    /// Binds each named column's DEFAULT expression, or a typed NULL literal
+    /// when the column declares none. Used by the write paths that fill a
+    /// column without a bound statement to read the default from.
+    pub async fn bind_column_defaults(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[ColumnId],
+    ) -> Result<Vec<(ColumnId, BoundExpr)>> {
+        let empty_ctx = BindContext::new();
+        let mut out = Vec::with_capacity(columns.len());
+        for cid in columns {
+            let Some(col) = entry.columns.iter().find(|c| c.id == *cid) else {
+                continue;
+            };
+            let bound = match &col.default_expr {
+                None => BoundExpr::Literal {
+                    value: zyron_parser::ast::LiteralValue::Null,
+                    type_id: col.type_id,
+                },
+                Some(sql) => {
+                    let expr_ast = zyron_parser::parse_expr(sql).map_err(|e| {
+                        ZyronError::PlanError(format!(
+                            "failed to parse DEFAULT expression for column '{}': {e}",
+                            col.name
+                        ))
+                    })?;
+                    self.bind_expr(&empty_ctx, &expr_ast).await.map_err(|e| {
+                        ZyronError::PlanError(format!(
+                            "failed to bind DEFAULT expression for column '{}': {e}",
+                            col.name
+                        ))
+                    })?
+                }
+            };
+            out.push((*cid, bound));
+        }
+        Ok(out)
+    }
+
     pub async fn bind_check_constraints(&mut self, entry: &TableEntry) -> Result<Vec<BoundExpr>> {
         let has_check = entry.constraints.iter().any(|c| {
             c.constraint_type == zyron_catalog::ConstraintType::Check && c.check_expr.is_some()
@@ -4137,7 +4497,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         let mut ctx = BindContext::new();
@@ -4165,6 +4525,41 @@ impl<'a> Binder<'a> {
         Ok(checks)
     }
 
+    /// Binds one predicate against a table at table_idx 0, the same scope
+    /// CHECK constraints bind in.
+    ///
+    /// Used by maintenance commands that carry a WHERE clause but no
+    /// statement to plan, so the predicate is evaluated by the same
+    /// expression machinery a query would use rather than a second
+    /// interpretation of the same SQL.
+    pub async fn bind_table_predicate(
+        &mut self,
+        entry: &TableEntry,
+        expr: &zyron_parser::ast::Expr,
+    ) -> Result<BoundExpr> {
+        let columns: Vec<BoundColumnDef> = entry
+            .columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+                fractional_digits: c.fractional_digits,
+            })
+            .collect();
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(entry.id),
+            alias: entry.name.clone(),
+            columns,
+            entry: None,
+        });
+        self.bind_expr(&ctx, expr).await
+    }
+
     /// Binds each data-quality expectation predicate against the table at
     /// table_idx 0, the same binding context as CHECK constraints. The bound
     /// predicate carries its violation action and quarantine target so the
@@ -4183,7 +4578,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         let mut ctx = BindContext::new();
@@ -4258,7 +4653,7 @@ impl<'a> Binder<'a> {
             type_id: agg.state_type,
             nullable: true,
             ordinal: 0,
-            ts_precision: None,
+            fractional_digits: None,
         });
         for (i, input_type) in agg.input_types.iter().enumerate() {
             state_cols.push(BoundColumnDef {
@@ -4267,7 +4662,7 @@ impl<'a> Binder<'a> {
                 type_id: *input_type,
                 nullable: true,
                 ordinal: (i + 1) as u16,
-                ts_precision: None,
+                fractional_digits: None,
             });
         }
         let mut sctx = BindContext::new();
@@ -4283,6 +4678,7 @@ impl<'a> Binder<'a> {
         let sfunc_expr = BoundExpr::Cast {
             expr: Box::new(sbound),
             target_type: agg.state_type,
+            fractional_digits: None,
         };
 
         let finalfunc = if let Some(fname) = &agg.finalfunc_name {
@@ -4312,7 +4708,7 @@ impl<'a> Binder<'a> {
                     type_id: agg.state_type,
                     nullable: true,
                     ordinal: 0,
-                    ts_precision: None,
+                    fractional_digits: None,
                 }],
                 entry: None,
             });
@@ -4321,6 +4717,7 @@ impl<'a> Binder<'a> {
             Some(BoundExpr::Cast {
                 expr: Box::new(fbound),
                 target_type: agg.return_type,
+                fractional_digits: None,
             })
         } else {
             None
@@ -4338,6 +4735,7 @@ impl<'a> Binder<'a> {
             Some(BoundExpr::Cast {
                 expr: Box::new(bound),
                 target_type: agg.state_type,
+                fractional_digits: None,
             })
         } else {
             None
@@ -4354,6 +4752,16 @@ impl<'a> Binder<'a> {
     }
 
     async fn bind_insert(&mut self, stmt: &InsertStatement) -> Result<BoundInsert> {
+        // Nothing downstream reads the conflict clause yet. Accepting the
+        // statement would run a plain INSERT, so DO NOTHING would raise the
+        // unique violation it asked to suppress and DO UPDATE would insert
+        // a duplicate, both silent wrong answers
+        if stmt.on_conflict.is_some() {
+            return Err(ZyronError::PlanError(
+                "INSERT ... ON CONFLICT is not supported yet, the conflict action cannot be honored"
+                    .to_string(),
+            ));
+        }
         let (schema_name, table_name) = if let Some(dot_pos) = stmt.table.find('.') {
             (Some(&stmt.table[..dot_pos]), &stmt.table[dot_pos + 1..])
         } else {
@@ -4387,7 +4795,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -4492,7 +4900,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -4604,7 +5012,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -4974,8 +5382,9 @@ impl<'a> Binder<'a> {
                     nullable: c.nullable,
                     default_expr: None,
                     max_length: None,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
+                    element_type: None,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -5169,7 +5578,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -5250,10 +5659,13 @@ impl<'a> Binder<'a> {
     }
 
     /// Validates and binds a CREATE STREAMING JOB statement.
-    /// Rules: single-table FROM, no joins, no subqueries, no LATERAL,
-    /// projection arity and types must match the target column layout, Zyron
-    /// source tables must have CDC enabled, UPSERT write mode is not yet
-    /// supported by the runner and is rejected here.
+    ///
+    /// Rules: the FROM is one base table, or a two-table JOIN driving the
+    /// interval or temporal join pipeline; no subqueries and no LATERAL;
+    /// projection arity and types must match the target column layout; a
+    /// Zyron source table must have CDC enabled; UPSERT requires a Zyron
+    /// table target with a declared primary key, which is what the sink
+    /// looks existing rows up by.
     async fn bind_create_streaming_job(
         &mut self,
         stmt: &CreateStreamingJobStatement,
@@ -5281,6 +5693,13 @@ impl<'a> Binder<'a> {
             &stmt.join,
         ) {
             (TableRef::Table { .. }, None) => None,
+            (TableRef::ExternalInline(_), None) => None,
+            (TableRef::ExternalInline(_), Some(_)) => {
+                return Err(ZyronError::PlanError(
+                    "streaming JOIN sides must be base tables, register the inline source with CREATE EXTERNAL SOURCE to join it"
+                        .to_string(),
+                ));
+            }
             (TableRef::Join(join_node), Some(spec)) => {
                 // JOIN + GROUP BY is supported: the runner composes the
                 // join engine with the aggregating engine, feeding joined
@@ -5365,9 +5784,20 @@ impl<'a> Binder<'a> {
                 ));
             }
         };
-        let source_name = match &right_join_info {
-            Some(j) => j.left_name.clone(),
-            None => match &stmt.query.from[0] {
+        // An inline FROM source has no catalog name, so it is separated out
+        // here and the name-driven resolution below runs only for named
+        // sources. Its scope alias is the declared alias when there is one,
+        // otherwise the URI, which is what a user would have to type to
+        // qualify a column anyway.
+        let inline_source: Option<zyron_parser::ast::ExternalInlineRef> =
+            match (&stmt.query.from[0], &right_join_info) {
+                (TableRef::ExternalInline(r), None) => Some(r.as_ref().clone()),
+                _ => None,
+            };
+        let source_name = match (&right_join_info, &inline_source) {
+            (Some(j), _) => j.left_name.clone(),
+            (None, Some(r)) => r.alias.clone().unwrap_or_else(|| r.uri.clone()),
+            (None, None) => match &stmt.query.from[0] {
                 TableRef::Table { name, .. } => name.clone(),
                 _ => {
                     return Err(ZyronError::PlanError(
@@ -5455,24 +5885,28 @@ impl<'a> Binder<'a> {
             ),
         };
 
-        // Step 3, resolve the source. Try Zyron table first, then fall back to
+        // Step 3, resolve the source. An inline URI resolves to itself. A
+        // named source tries a Zyron table first, then falls back to an
         // external source lookup in the session's schema.
         let (src_schema_opt, src_tbl) = split_qualified(&source_name);
-        let source_resolved: SourceResolution = {
-            let zyron_tbl = self.rt_memo(src_schema_opt, src_tbl).await;
-            match zyron_tbl {
-                Ok(entry) => SourceResolution::Zyron(entry),
-                Err(_) => {
-                    let schema_id = match src_schema_opt {
-                        Some(s) => self.resolver.resolve_schema(s).await?.id,
-                        None => self.current_schema_id().await?,
-                    };
-                    match self.catalog.get_external_source(schema_id, src_tbl) {
-                        Some(src) => SourceResolution::External(src),
-                        None => {
-                            return Err(ZyronError::TableNotFound(format!(
-                                "source '{source_name}' not found as table or external source"
-                            )));
+        let source_resolved: SourceResolution = match inline_source {
+            Some(r) => SourceResolution::Inline(Box::new(r)),
+            None => {
+                let zyron_tbl = self.rt_memo(src_schema_opt, src_tbl).await;
+                match zyron_tbl {
+                    Ok(entry) => SourceResolution::Zyron(entry),
+                    Err(_) => {
+                        let schema_id = match src_schema_opt {
+                            Some(s) => self.resolver.resolve_schema(s).await?.id,
+                            None => self.current_schema_id().await?,
+                        };
+                        match self.catalog.get_external_source(schema_id, src_tbl) {
+                            Some(src) => SourceResolution::External(src),
+                            None => {
+                                return Err(ZyronError::TableNotFound(format!(
+                                    "source '{source_name}' not found as table or external source"
+                                )));
+                            }
                         }
                     }
                 }
@@ -5495,6 +5929,51 @@ impl<'a> Binder<'a> {
                 entry.columns.clone(),
                 None,
             ),
+            SourceResolution::Inline(r) => {
+                // The declared COLUMNS clause wins. Without one the layout
+                // comes from the target table, matching how a named external
+                // source with no recorded columns is bound. Two inline ends
+                // with no declared layout have nothing to read a row shape
+                // from, so that combination is refused rather than producing
+                // zero-column rows.
+                let declared: Vec<ColumnEntry> = r
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (name, dt))| ColumnEntry {
+                        id: ColumnId(idx as u16),
+                        table_id: TableId(0),
+                        name: name.clone(),
+                        type_id: dt.to_type_id(),
+                        ordinal: idx as u16,
+                        nullable: true,
+                        default_expr: None,
+                        max_length: dt.declared_max_length(),
+                        fractional_digits: dt.fractional_digits(),
+                        tz_offset_secs: None,
+                        element_type: dt.declared_element_type(),
+                    })
+                    .collect();
+                let cols = if !declared.is_empty() {
+                    declared
+                } else if !target_columns.is_empty() {
+                    target_columns.clone()
+                } else {
+                    return Err(ZyronError::PlanError(
+                        "an inline external source needs a row layout, declare COLUMNS (...) on it or send the job into a Zyron table".to_string(),
+                    ));
+                };
+                (
+                    BoundStreamingSourceKind::ExternalInline {
+                        backend: r.backend.clone(),
+                        uri: r.uri.clone(),
+                        format: r.format.clone(),
+                        options: r.options.clone(),
+                    },
+                    cols,
+                    None,
+                )
+            }
             SourceResolution::External(src) => {
                 // Inline sink plus Confidential/Restricted external source is
                 // rejected on classification grounds before the column layout
@@ -5530,8 +6009,9 @@ impl<'a> Binder<'a> {
                         nullable: true,
                         default_expr: None,
                         max_length: None,
-                        ts_precision: None,
+                        fractional_digits: None,
                         tz_offset_secs: None,
+                        element_type: None,
                     })
                     .collect();
                 if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
@@ -5572,7 +6052,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         let source_table_id_for_scope = match &source_kind {
@@ -5627,7 +6107,7 @@ impl<'a> Binder<'a> {
                     type_id: c.type_id,
                     nullable: c.nullable,
                     ordinal: c.ordinal,
-                    ts_precision: c.ts_precision,
+                    fractional_digits: c.fractional_digits,
                 })
                 .collect();
             let r_idx = self.alloc_table_idx();
@@ -5663,7 +6143,7 @@ impl<'a> Binder<'a> {
                                 column_id: col.id,
                                 type_id: col.type_id,
                                 nullable: col.nullable,
-                                ts_precision: col.ts_precision,
+                                fractional_digits: col.fractional_digits,
                             }));
                         }
                     }
@@ -5674,7 +6154,7 @@ impl<'a> Binder<'a> {
                                 column_id: col.id,
                                 type_id: col.type_id,
                                 nullable: col.nullable,
-                                ts_precision: col.ts_precision,
+                                fractional_digits: col.fractional_digits,
                             }));
                         }
                     }
@@ -5731,7 +6211,7 @@ impl<'a> Binder<'a> {
         if let SourceResolution::Zyron(entry) = &source_resolved {
             if !entry.cdf_enabled {
                 return Err(ZyronError::PlanError(format!(
-                    "source table '{}' does not have CDC enabled, run ALTER TABLE {} SET (cdc_enabled = true) first",
+                    "source table '{}' does not have CDC enabled, run ALTER TABLE {} ENABLE change_data_feed first",
                     entry.name, entry.name
                 )));
             }
@@ -5744,6 +6224,9 @@ impl<'a> Binder<'a> {
         let max_source_cls = match &source_resolved {
             SourceResolution::External(src) => Some(src.classification),
             SourceResolution::Zyron(_) => source_classification_from_columns(&source_columns),
+            // An inline URI is not a catalog object, so nothing has labelled
+            // what it holds. Data arriving from it constrains no sink
+            SourceResolution::Inline(_) => None,
         };
         if let Some(src_cls) = max_source_cls {
             match &target_kind {
@@ -5831,6 +6314,21 @@ impl<'a> Binder<'a> {
                 schema_id,
                 columns: source_columns.clone(),
                 classification: source_classification.unwrap_or(CatalogClassification::Public),
+            },
+            BoundStreamingSourceKind::ExternalInline {
+                backend,
+                uri,
+                format,
+                options,
+            } => BoundStreamingSource::ExternalInline {
+                backend,
+                uri,
+                format,
+                options,
+                // An inline source carries no catalog entry to hold a cadence,
+                // so the job's own MODE clause governs how often it reads
+                mode: stmt.job_mode.clone(),
+                columns: source_columns.clone(),
             },
         };
         let target = match target_kind {
@@ -6483,6 +6981,9 @@ fn infer_event_time_scale(type_id: TypeId) -> BoundEventTimeScale {
 enum SourceResolution {
     Zyron(Arc<TableEntry>),
     External(Arc<zyron_catalog::schema::ExternalSourceEntry>),
+    /// A file or cloud URI written straight into the FROM clause. Carries no
+    /// catalog identity, so it is never looked up and never persisted
+    Inline(Box<zyron_parser::ast::ExternalInlineRef>),
 }
 
 enum BoundStreamingSourceKind {
@@ -6493,6 +6994,12 @@ enum BoundStreamingSourceKind {
     ExternalNamed {
         source_id: ExternalSourceId,
         schema_id: SchemaId,
+    },
+    ExternalInline {
+        backend: zyron_parser::ast::ExternalBackendKind,
+        uri: String,
+        format: zyron_parser::ast::ExternalFormatKind,
+        options: Vec<(String, String)>,
     },
 }
 
@@ -6664,6 +7171,8 @@ fn map_streaming_join_type(t: zyron_parser::ast::StreamingJoinType) -> BoundStre
 fn literal_type(lit: &LiteralValue) -> TypeId {
     match lit {
         LiteralValue::Integer(_) => TypeId::Int64,
+        LiteralValue::Int128(_) => TypeId::Int128,
+        LiteralValue::Decimal { .. } => TypeId::Decimal,
         LiteralValue::Float(_) => TypeId::Float64,
         LiteralValue::String(_) => TypeId::Varchar,
         LiteralValue::Boolean(_) => TypeId::Boolean,
@@ -6789,6 +7298,16 @@ fn promote_numeric(left: TypeId, right: TypeId) -> TypeId {
         return left;
     }
 
+    // A decimal against a whole number stays a decimal, so the exactness the
+    // type exists for survives the combination. Widening to a float instead
+    // would give the digits away, and narrowing to an integer would drop
+    // everything below the point
+    if (left == TypeId::Decimal && right.is_integer())
+        || (right == TypeId::Decimal && left.is_integer())
+    {
+        return TypeId::Decimal;
+    }
+
     // Float64 absorbs everything
     if left == TypeId::Float64 || right == TypeId::Float64 {
         return TypeId::Float64;
@@ -6862,12 +7381,24 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
     let lower = name.to_lowercase();
     Ok(match lower.as_str() {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "truncate" => {
-            arg_types.first().copied().unwrap_or(TypeId::Float64)
+            let arg = arg_types.first().copied().unwrap_or(TypeId::Float64);
+            // Rounding an instant by decimal digits has no meaning, and
+            // abs of a pre-epoch timestamp would silently flip its sign.
+            // Refused where it binds, with the temporal function named
+            if matches!(
+                arg,
+                TypeId::Timestamp | TypeId::TimestampTz | TypeId::Date | TypeId::Time
+            ) {
+                return Err(ZyronError::PlanError(format!(
+                    "{lower}() does not apply to a temporal value, \
+                     bucket the instant with time_bucket(width, ts) instead"
+                )));
+            }
+            arg
         }
         "length" | "char_length" | "character_length" | "octet_length" => TypeId::Int64,
-        "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "substring" | "replace" | "concat" => {
-            TypeId::Varchar
-        }
+        "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "substring" | "substr" | "replace"
+        | "concat" => TypeId::Varchar,
         "now" | "current_timestamp" => TypeId::TimestampTz,
         "hlc_now" => TypeId::Hlc,
         // Sequence functions return the 64-bit sequence value.
@@ -6877,10 +7408,44 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
         "time_bucket" | "time_bucket_gapfill" => {
             arg_types.get(1).copied().unwrap_or(TypeId::TimestampTz)
         }
+        // date_trunc(unit, source) returns the source's type. A DATE source
+        // widens to the timestamp its boundary lands on. The three-argument
+        // zone form needs a named-timezone database the engine does not
+        // carry, so it is refused where it binds
+        "date_trunc" => {
+            if arg_types.len() > 2 {
+                return Err(ZyronError::PlanError(
+                    "date_trunc with a timezone name is not available, \
+                     apply the zone's offset to the instant instead"
+                        .to_string(),
+                ));
+            }
+            match arg_types.get(1).copied() {
+                Some(TypeId::Timestamp) => TypeId::Timestamp,
+                Some(TypeId::TimestampTz) => TypeId::TimestampTz,
+                Some(TypeId::Date) => TypeId::Timestamp,
+                Some(TypeId::Interval) => TypeId::Interval,
+                Some(other) => {
+                    return Err(ZyronError::PlanError(format!(
+                        "date_trunc truncates a timestamp, a date or an interval, got {other:?}"
+                    )));
+                }
+                None => {
+                    return Err(ZyronError::PlanError(
+                        "date_trunc takes a unit and a source, like date_trunc('day', ts)"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         // locf/interpolate return the value column's type.
         "locf" | "interpolate" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "current_date" => TypeId::Date,
         "current_time" => TypeId::Time,
+        // EXTRACT(field FROM source), and date_part under its other name.
+        // Every field is a whole count of its unit, so the result is an
+        // integer whatever the source's type
+        "extract" | "date_part" => TypeId::Int64,
         "coalesce" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "nullif" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "greatest" | "least" => arg_types.first().copied().unwrap_or(TypeId::Null),
@@ -7618,11 +8183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bind_streaming_job_inline_file_source() {
-        // The parser does not support inline FILE references in the FROM
-        // clause today. This test exercises the inline-sink branch with a
-        // named Zyron source, which is the symmetrical shape the binder
-        // supports end-to-end through the parser.
+    async fn test_bind_streaming_job_inline_file_sink() {
         let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
             build_streaming_test_catalog(true).await;
         let sql = "CREATE STREAMING JOB j AS SELECT id, amount FROM orders INTO FILE '/tmp/out.jsonl' FORMAT JSONLINES";
@@ -7646,6 +8207,148 @@ mod tests {
                 ));
             }
             other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    /// A file named directly in FROM feeds a Zyron table, the read-side twin
+    /// of the inline sink above. Its row layout comes from the target, which
+    /// is what a named external source with no COLUMNS clause also does.
+    #[tokio::test]
+    async fn test_bind_streaming_job_inline_file_source() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE STREAMING JOB j AS SELECT id, amount \
+                   FROM FILE '/tmp/in.jsonl' FORMAT JSONLINES INTO orders_vip";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.unwrap();
+        match bound {
+            BoundStatement::CreateStreamingJob(job) => {
+                match &job.source {
+                    BoundStreamingSource::ExternalInline {
+                        uri,
+                        format,
+                        columns,
+                        ..
+                    } => {
+                        assert_eq!(uri, "/tmp/in.jsonl");
+                        assert_eq!(*format, zyron_parser::ast::ExternalFormatKind::JsonLines);
+                        assert!(!columns.is_empty(), "layout taken from the target table");
+                    }
+                    other => panic!("expected an inline source, got {other:?}"),
+                }
+                assert!(matches!(job.target, BoundStreamingSink::ZyronTable { .. }));
+            }
+            other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    /// An inline source declaring its own COLUMNS keeps that layout rather
+    /// than borrowing the target's, so the file may carry columns the target
+    /// does not. Sized declarations keep their bound, which is what lets a
+    /// DECIMAL read from a file be scaled and range-checked on the way in.
+    #[tokio::test]
+    async fn test_inline_source_columns_clause_sets_the_row_layout() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE STREAMING JOB j AS SELECT id, amount \
+                   FROM S3 's3://bucket/in' FORMAT CSV OPTIONS (header = 'true') \
+                   COLUMNS (id BIGINT, amount DOUBLE PRECISION, fee DECIMAL(12,2), note VARCHAR(24)) \
+                   INTO orders_vip";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.unwrap();
+        match bound {
+            BoundStatement::CreateStreamingJob(job) => match &job.source {
+                BoundStreamingSource::ExternalInline {
+                    columns, options, ..
+                } => {
+                    assert_eq!(columns.len(), 4, "the declared layout wins over the target");
+                    assert_eq!(columns[2].name, "fee");
+                    assert_eq!(columns[2].type_id, zyron_common::TypeId::Decimal);
+                    assert_eq!(columns[2].max_length, Some(12), "declared precision");
+                    assert_eq!(columns[2].fractional_digits, Some(2), "declared scale");
+                    assert_eq!(columns[3].max_length, Some(24), "declared text width");
+                    assert_eq!(options, &vec![("header".to_string(), "true".to_string())]);
+                }
+                other => panic!("expected an inline source, got {other:?}"),
+            },
+            other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    /// Outside a streaming job an inline source has nothing to return, so a
+    /// plain SELECT against one is refused with a message that says where it
+    /// does belong.
+    #[tokio::test]
+    async fn test_inline_source_is_refused_in_a_plain_select() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let stmt = zyron_parser::parse("SELECT * FROM FILE '/tmp/in.jsonl' FORMAT JSONLINES")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let err = binder
+            .bind(stmt)
+            .await
+            .expect_err("an inline source is not queryable");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CREATE STREAMING JOB") && msg.contains("CREATE EXTERNAL SOURCE"),
+            "the refusal names both ways forward: {msg}"
+        );
+    }
+
+    /// A backend keyword opens an inline source only when a URI follows it.
+    ///
+    /// `ZYRON` is the case that matters: it names a backend and is also
+    /// usable as an identifier, so without the string-literal guard a table
+    /// called `zyron` would stop parsing as a table. The other backend names
+    /// (FILE, S3, GCS, AZURE, HTTP) are reserved words that were never valid
+    /// table names, so the guard is what carries this on its own.
+    #[test]
+    fn test_a_backend_keyword_without_a_uri_is_still_a_table_reference() {
+        let stmt = zyron_parser::parse("SELECT * FROM zyron WHERE id = 1")
+            .expect("a table named zyron parses")
+            .into_iter()
+            .next()
+            .expect("one statement");
+        match stmt {
+            zyron_parser::ast::Statement::Select(s) => match &s.from[0] {
+                zyron_parser::ast::TableRef::Table { name, .. } => assert_eq!(name, "zyron"),
+                other => panic!("expected a table reference, got {other:?}"),
+            },
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+
+        // With a URI it is an inline source, which is the other half of the
+        // same decision
+        let stmt = zyron_parser::parse("SELECT * FROM FILE '/tmp/in.csv' FORMAT CSV")
+            .expect("an inline source parses")
+            .into_iter()
+            .next()
+            .expect("one statement");
+        match stmt {
+            zyron_parser::ast::Statement::Select(s) => {
+                assert!(matches!(
+                    &s.from[0],
+                    zyron_parser::ast::TableRef::ExternalInline(_)
+                ));
+            }
+            other => panic!("expected a SELECT, got {other:?}"),
         }
     }
 
@@ -8368,19 +9071,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_select_with_in_branch_string_literal() {
-        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+        let (catalog, _cache, db_id, _schema_id, orders_id, _vip_id) =
             build_streaming_test_catalog(true).await;
-        // IN BRANCH on a TableRef is not directly parsed (parser scopes IN BRANCH
-        // to expression position via Expr::TemporalRef), but the BoundAsOfTarget
-        // variant exists so the executor's branch error path is reachable. Verify
-        // construction directly here
-        let target = BoundAsOfTarget::Branch("main".to_string());
-        match target {
-            BoundAsOfTarget::Branch(name) => assert_eq!(name, "main"),
-            _ => panic!("wrong variant"),
+        // The branch qualifier reads on either side of an alias, and both
+        // spellings must reach the same bound target
+        for sql in [
+            "SELECT id FROM orders IN BRANCH 'work'",
+            "SELECT o.id FROM orders AS o IN BRANCH 'work'",
+            "SELECT o.id FROM orders IN BRANCH 'work' AS o",
+        ] {
+            let stmt = zyron_parser::parse(sql)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
+            let mut binder = Binder::new(resolver, &catalog);
+            let bound = binder.bind(stmt).await.unwrap();
+            let bound_select = match bound {
+                BoundStatement::Select(s) => s,
+                other => panic!("expected Select for {sql}, got {:?}", other),
+            };
+            match bound_select.from.first().expect("at least one from item") {
+                BoundFromItem::BaseTable {
+                    table_id, as_of, ..
+                } => {
+                    assert_eq!(*table_id, orders_id);
+                    assert_eq!(
+                        as_of.as_ref(),
+                        Some(&BoundAsOfTarget::Branch("work".to_string())),
+                        "{sql}"
+                    );
+                }
+                other => panic!("expected BaseTable for {sql}, got {:?}", other),
+            }
         }
-        let _ = catalog;
-        let _ = db_id;
     }
 
     #[test]

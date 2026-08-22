@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use zyron_catalog::schema::CatalogStreamingWriteMode;
 use zyron_common::{Result, TypeId, ZyronError};
-use zyron_streaming::dlq::{DeadLetterQueue, FailedRow, make_failed_row};
+use zyron_streaming::dlq::{DeadLetterQueue, make_failed_row};
 use zyron_streaming::retry::{
-    CircuitBreaker, CircuitState, ErrorClass, RetryConfig, classify_io_error, classify_message,
+    CircuitBreaker, CircuitState, ErrorClass, RetryConfig, classify_message,
 };
 use zyron_streaming::source_connector::CdfChange;
 
@@ -173,11 +173,51 @@ impl ZyronSinkClient {
         (upserts, deletes)
     }
 
-    /// Writes a batch, applying retry + circuit-breaker + DLQ semantics. The
-    /// input is classified into upserts and deletes, and each group is
-    /// emitted through its own retry loop. On final failure the rows are
-    /// dispatched to the DLQ when configured.
+    /// Accepts a batch, coalescing it with earlier ones until the sink's
+    /// `batch_size` or `flush_interval` is reached.
+    ///
+    /// The runner hands over one micro-batch at a time, and those are usually
+    /// far smaller than a transaction the remote wants. Coalescing turns many
+    /// small round trips into one larger one, which is what `batch_size` on
+    /// the sink DDL asks for.
+    ///
+    /// Deferring is safe against the checkpoint contract: `flush` drains
+    /// everything and the runner calls it at each barrier, so a row waits at
+    /// most until the next checkpoint, and a crash before that replays it
+    /// because the checkpoint never advanced.
     pub async fn write_batch(&self, records: Vec<CdfChange>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // A sink configured to coalesce stages the rows and writes when it
+        // has enough of them, or when it has held them long enough
+        if self.batch_size > 1 {
+            let ready = {
+                let mut pending = self.pending.lock();
+                pending.extend(records);
+                let full = pending.len() >= self.batch_size;
+                let stale = self.last_flush.lock().elapsed() >= self.flush_interval;
+                if full || stale {
+                    std::mem::take(&mut *pending)
+                } else {
+                    Vec::new()
+                }
+            };
+            if ready.is_empty() {
+                return Ok(());
+            }
+            return self.send_now(ready).await;
+        }
+
+        self.send_now(records).await
+    }
+
+    /// Writes rows through now, applying retry, circuit breaker and DLQ
+    /// semantics. The input is classified into upserts and deletes, and each
+    /// group is emitted through its own retry loop. On final failure the rows
+    /// are dispatched to the DLQ when configured.
+    async fn send_now(&self, records: Vec<CdfChange>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -588,9 +628,11 @@ impl ZyronSinkClient {
         }
     }
 
-    /// Flushes any buffered rows. Currently write_batch commits immediately
-    /// so the pending buffer is only used when a caller explicitly stages
-    /// rows. Flushing when empty is a no-op.
+    /// Writes every row this sink has staged.
+    ///
+    /// This is what bounds how long a coalesced row waits: the runner calls
+    /// it at each checkpoint barrier, so nothing sits in the buffer across
+    /// one. Flushing when empty is a no-op.
     pub async fn flush(&self) -> Result<()> {
         let to_send = {
             let mut g = self.pending.lock();
@@ -599,7 +641,9 @@ impl ZyronSinkClient {
         if to_send.is_empty() {
             return Ok(());
         }
-        self.write_batch(to_send).await
+        // Straight through rather than back into write_batch, which would
+        // stage these rows again and defer the flush it was asked to perform
+        self.send_now(to_send).await
     }
 
     /// Gracefully closes the sink. Flushes outstanding rows and returns.
@@ -1027,6 +1071,81 @@ mod tests {
         assert_eq!(s.rows_written, 0);
     }
 
+    /// `batch_size` on the sink DDL is honored rather than recorded and
+    /// ignored: rows stage until the batch is full, and a full batch is what
+    /// triggers the write
+    #[tokio::test]
+    async fn batch_size_coalesces_until_the_batch_is_full() {
+        let (dlq, vec_sink) = DeadLetterQueue::with_vec_sink("dlq", 100);
+        let dlq_arc = Arc::new(dlq);
+        let cb = Arc::new(CircuitBreaker::new(0.5, 2, Duration::from_secs(60)));
+        cb.record_failure();
+        cb.record_failure();
+        let cfg = ZyronSinkConfig {
+            pool: make_pool(),
+            target_schema: "public".into(),
+            target_table: "t".into(),
+            write_mode: CatalogStreamingWriteMode::Append,
+            pk_columns: vec![],
+            target_types: vec![TypeId::Int64],
+            target_column_names: vec!["id".into()],
+            copy_threshold_rows: 1000,
+            batch_size: 4,
+            // Long enough that only the row count can trigger the write
+            flush_interval: Duration::from_secs(3600),
+            dlq: Some(Arc::clone(&dlq_arc)),
+            circuit_breaker: cb,
+            retry_config: RetryConfig::default(),
+            idempotency_key_columns: vec![],
+        };
+        let sink = ZyronSinkClient::new(cfg);
+
+        // Three rows is under the batch size, so nothing is attempted yet
+        sink.write_batch(vec![sample_change(1), sample_change(2)])
+            .await
+            .unwrap();
+        sink.write_batch(vec![sample_change(3)]).await.unwrap();
+        assert_eq!(vec_sink.len(), 0, "an unfilled batch is not sent");
+
+        // The fourth fills it, and the whole accumulation goes at once rather
+        // than as three separate round trips
+        sink.write_batch(vec![sample_change(4)]).await.unwrap();
+        assert_eq!(
+            vec_sink.len(),
+            4,
+            "a full batch sends everything staged, not just the arriving rows"
+        );
+    }
+
+    /// A sink asked not to coalesce writes through, so nothing waits
+    #[tokio::test]
+    async fn a_batch_size_of_one_writes_through() {
+        let (dlq, vec_sink) = DeadLetterQueue::with_vec_sink("dlq", 100);
+        let dlq_arc = Arc::new(dlq);
+        let cb = Arc::new(CircuitBreaker::new(0.5, 2, Duration::from_secs(60)));
+        cb.record_failure();
+        cb.record_failure();
+        let cfg = ZyronSinkConfig {
+            pool: make_pool(),
+            target_schema: "public".into(),
+            target_table: "t".into(),
+            write_mode: CatalogStreamingWriteMode::Append,
+            pk_columns: vec![],
+            target_types: vec![TypeId::Int64],
+            target_column_names: vec!["id".into()],
+            copy_threshold_rows: 1000,
+            batch_size: 1,
+            flush_interval: Duration::from_secs(3600),
+            dlq: Some(Arc::clone(&dlq_arc)),
+            circuit_breaker: cb,
+            retry_config: RetryConfig::default(),
+            idempotency_key_columns: vec![],
+        };
+        let sink = ZyronSinkClient::new(cfg);
+        sink.write_batch(vec![sample_change(1)]).await.unwrap();
+        assert_eq!(vec_sink.len(), 1, "nothing is held back");
+    }
+
     #[tokio::test]
     async fn write_batch_routes_to_dlq_when_circuit_open() {
         let (dlq, vec_sink) = DeadLetterQueue::with_vec_sink("dlq", 100);
@@ -1052,9 +1171,13 @@ mod tests {
             idempotency_key_columns: vec![],
         };
         let sink = ZyronSinkClient::new(cfg);
+        // Two rows against a batch size of ten stage rather than send, so the
+        // flush is what drives the write, the way a checkpoint does
         sink.write_batch(vec![sample_change(1), sample_change(2)])
             .await
             .unwrap();
+        assert_eq!(vec_sink.len(), 0, "a staged batch has not been attempted");
+        sink.flush().await.unwrap();
         assert_eq!(vec_sink.len(), 2);
         assert_eq!(sink.stats().dlq_rows, 2);
     }
@@ -1063,20 +1186,21 @@ mod tests {
     async fn write_batch_fails_fast_on_bad_host_without_dlq() {
         let (sink, _) = make_sink(false);
         // The pool targets port 1 which nothing listens on. Without a DLQ,
-        // the error bubbles up to the caller.
-        let res = sink
-            .write_batch(vec![sample_change(1), sample_change(2)])
-            .await;
-        assert!(res.is_err());
+        // the error bubbles up to whoever drives the write, which for a
+        // coalescing sink is the flush rather than the accept
+        sink.write_batch(vec![sample_change(1), sample_change(2)])
+            .await
+            .expect("staging does not reach the network");
+        assert!(sink.flush().await.is_err());
     }
 
     #[tokio::test]
     async fn write_batch_bad_host_drains_to_dlq() {
         let (sink, dlq) = make_sink(true);
-        let _ = sink
-            .write_batch(vec![sample_change(1), sample_change(2)])
+        sink.write_batch(vec![sample_change(1), sample_change(2)])
             .await
-            .unwrap();
+            .expect("staging does not reach the network");
+        let _ = sink.flush().await;
         // Either the retries exhaust normally or the circuit opens during the
         // attempts: in both cases rows land in the DLQ.
         let dlq = dlq.unwrap();

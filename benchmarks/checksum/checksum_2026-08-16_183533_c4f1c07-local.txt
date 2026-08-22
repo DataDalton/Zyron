@@ -1,0 +1,102 @@
+# suite:   checksum
+# run:     2026-08-16_183533_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Cross-tier consistency (scalar reference vs active tier) ===
+  Active tier: x86_aes
+  All 12 sizes match scalar reference: PASS
+
+=== Dispatch stability ===
+  Tier stable across 1000 calls: x86_aes PASS
+
+=== hash128 (Bloom filter insert/probe pattern) ===
+  Active tier: x86_aes
+  Run 1: 15.2 ns/call
+  Run 2: 15.1 ns/call
+  Run 3: 16.0 ns/call
+  Run 4: 15.2 ns/call
+  Run 5: 15.2 ns/call
+  Average: 15.3 ns/call
+
+=== hash32 small-input (<=32 B) latency ===
+  Active tier: x86_aes
+  Run 1: 7.8 ns/call
+  Run 2: 7.8 ns/call
+  Run 3: 7.8 ns/call
+  Run 4: 7.8 ns/call
+  Run 5: 7.8 ns/call
+  hash32 <=32B latency (ns) [PASS/OK]:
+    Runs: [8, 8, 8, 8, 8]
+    Average: 8 <= 120 (target)
+    Min/Max: 8 / 8, StdDev: 0
+
+=== hash32 throughput at 16 MB ===
+  Active tier: x86_aes
+  Run 1: 47479.7 MB/s
+  Run 2: 49204.7 MB/s
+  Run 3: 49013.0 MB/s
+  Run 4: 48736.2 MB/s
+  Run 5: 48435.2 MB/s
+  hash32 16MB throughput (MB/s) [PASS/OK]:
+    Runs: [47,480, 49,205, 49,013, 48,736, 48,435]
+    Average: 48,574 >= 6,000 (target)
+    Min/Max: 47,480 / 49,205, StdDev: 606
+
+=== hash32 throughput at 1 KB ===
+  Active tier: x86_aes
+  Run 1: 53309.6 MB/s
+  Run 2: 53386.5 MB/s
+  Run 3: 53286.3 MB/s
+  Run 4: 53390.0 MB/s
+  Run 5: 53235.1 MB/s
+  hash32 1KB throughput (MB/s) [PASS/OK]:
+    Runs: [53,310, 53,387, 53,286, 53,390, 53,235]
+    Average: 53,322 >= 3,000 (target)
+    Min/Max: 53,235 / 53,390, StdDev: 60
+
+=== hash32 throughput at 1 MB ===
+  Active tier: x86_aes
+  Run 1: 93440.0 MB/s
+  Run 2: 98532.8 MB/s
+  Run 3: 99112.0 MB/s
+  Run 4: 98712.3 MB/s
+  Run 5: 99191.6 MB/s
+  hash32 1MB throughput (MB/s) [PASS/OK]:
+    Runs: [93,440, 98,533, 99,112, 98,712, 99,192]
+    Average: 97,798 >= 6,000 (target)
+    Min/Max: 93,440 / 99,192, StdDev: 2,193
+
+=== hash64 (8-16 byte keys, hashmap pattern) ===
+  Active tier: x86_aes
+  Run 1: 10.1 ns/call
+  Run 2: 9.9 ns/call
+  Run 3: 9.9 ns/call
+  Run 4: 9.9 ns/call
+  Run 5: 9.9 ns/call
+  Average: 10.0 ns/call
+
+=== Seeded variant overhead vs unseeded ===
+  Run 1: unseeded 98062 MB/s, seeded 96372 MB/s (overhead 1.7%)
+  Run 2: unseeded 95907 MB/s, seeded 95554 MB/s (overhead 0.4%)
+  Run 3: unseeded 97575 MB/s, seeded 98182 MB/s (overhead -0.6%)
+  Run 4: unseeded 98052 MB/s, seeded 98278 MB/s (overhead -0.2%)
+  Run 5: unseeded 97121 MB/s, seeded 97330 MB/s (overhead -0.2%)
+  Average overhead: 0.2% (target: <= 20.0%)
+
+=== Seeded hash variants produce distinct outputs ===
+  Distinct seeds produce distinct outputs across all widths: PASS
+
+=== streaming Hasher update+finish throughput at 1 MB ===
+  Active tier: x86_aes
+  Run 1: 52143.1 MB/s (chunk=16384B)
+  Run 2: 52175.0 MB/s (chunk=16384B)
+  Run 3: 52715.8 MB/s (chunk=16384B)
+  Run 4: 52668.2 MB/s (chunk=16384B)
+  Run 5: 52321.5 MB/s (chunk=16384B)
+  streaming 1MB throughput (MB/s) [PASS/OK]:
+    Runs: [52,143, 52,175, 52,716, 52,668, 52,322]
+    Average: 52,405 >= 5,000 (target)
+    Min/Max: 52,143 / 52,716, StdDev: 243

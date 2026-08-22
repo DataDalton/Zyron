@@ -117,13 +117,22 @@ impl Snapshot {
         !self.status.is_committed(xmax)
     }
 
-    /// Returns true if a tuple is a live, committed row as of NOW (not as of
-    /// this snapshot): its inserter committed and it has no committed deleter.
+    /// Returns true if a tuple is live as of NOW rather than as of this
+    /// snapshot, from the point of view of transaction `self_txn`.
+    ///
     /// Used by unique-constraint enforcement, which must consider the latest
-    /// committed state rather than the inserting transaction's frozen snapshot.
+    /// committed state rather than the inserting transaction's frozen
+    /// snapshot, and must also see what `self_txn` has already done. Its own
+    /// writes are not committed yet but are certain to it: a row it inserted
+    /// is a conflict for its next statement, and a row it deleted is free for
+    /// that statement to reuse the key of. Judging by commit status alone
+    /// would get both backwards, admitting a duplicate written twice in one
+    /// transaction and refusing a delete-then-reinsert of the same key.
     #[inline]
-    pub fn is_live_latest(&self, xmin: u64, xmax: u64) -> bool {
-        self.status.is_committed(xmin) && (xmax == 0 || !self.status.is_committed(xmax))
+    pub fn is_live_latest(&self, xmin: u64, xmax: u64, self_txn: u64) -> bool {
+        let inserted = xmin == self_txn || self.status.is_committed(xmin);
+        let deleted = xmax != 0 && (xmax == self_txn || self.status.is_committed(xmax));
+        inserted && !deleted
     }
 
     /// Returns the prune horizon for this snapshot: every transaction below it

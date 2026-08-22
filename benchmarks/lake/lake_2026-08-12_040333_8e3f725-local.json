@@ -1,0 +1,158 @@
+{
+  "id": "2026-08-12_040333_8e3f725-local",
+  "date": "2026-08-12 04:03:35Z",
+  "ts": 1786507415,
+  "commit": "8e3f725-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "lake_log": {
+      "Head read": {
+        "average": 5.540200,
+        "runs": [5.19, 5.27, 5.19, 6.58, 5.49],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Latest manifest (cached)": {
+        "average": 363.880000,
+        "runs": [381.30, 357.50, 358.70, 357.80, 364.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Prune index build (cold)": {
+        "average": 83.700000,
+        "runs": [83.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Prune index at version (cached)": {
+        "average": 376.540000,
+        "runs": [402.10, 372.40, 366.90, 369.00, 372.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Commit rate": {
+        "average": 959.402868,
+        "runs": [959.40],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Retries": {
+        "average": 1.043750,
+        "runs": [1.04],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_clustering": {
+      "skip rate after a bucket-ordered pass": {
+        "average": 0.875000,
+        "runs": [0.88],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Cluster pass": {
+        "average": 139140.700000,
+        "runs": [139140.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Rows rewritten": {
+        "average": 235502.624322,
+        "runs": [235502.62],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_scan": {
+      "Scan throughput": {
+        "average": 152241515.690812,
+        "runs": [146678603.40, 142966841.19, 156634799.24, 157085330.78, 157842003.85],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_pruning": {
+      "point predicate files pruned (fraction)": {
+        "average": 0.999950,
+        "runs": [1.00],
+        "target": 0.999900,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "strided predicate files pruned (fraction)": {
+        "average": 0.937500,
+        "runs": [0.94],
+        "target": 0.930000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Prune index build": {
+        "average": 3703.260000,
+        "runs": [5651.70, 3480.00, 3111.10, 3140.50, 3133.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "point sweep over 20000 files": {
+        "average": 165.880000,
+        "runs": [168.30, 165.30, 165.30, 165.20, 165.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "range sweep over 20000 files": {
+        "average": 182.460000,
+        "runs": [224.00, 172.70, 176.30, 166.40, 172.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "strided sweep over 20000 files": {
+        "average": 165.260000,
+        "runs": [166.00, 165.00, 165.00, 165.10, 165.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_skipping": {
+      "zone map rows rejected (fraction)": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Zone map rejection": {
+        "average": 18.660000,
+        "runs": [23.00, 18.50, 17.30, 17.50, 17.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Full column decode": {
+        "average": 182.540000,
+        "runs": [236.10, 187.00, 172.90, 158.20, 158.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

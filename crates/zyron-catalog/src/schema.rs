@@ -99,12 +99,24 @@ pub struct ColumnEntry {
     pub nullable: bool,
     pub default_expr: Option<String>,
     pub max_length: Option<usize>,
-    /// TIMESTAMP(p) fractional-second precision 0..=12. None means the default
-    /// 6 (microseconds). p>6 routes the column to the i128 picosecond path.
-    pub ts_precision: Option<u8>,
+    /// Digits kept after the decimal point, for the two types that declare
+    /// one. A TIMESTAMP(p) counts fractional seconds, 0..=12, where None
+    /// means the default 6 (microseconds) and p>6 routes the column to the
+    /// i128 picosecond path. A DECIMAL(p,s) counts s, the digits its scaled
+    /// i128 holds below the point, where None means 0.
+    ///
+    /// One field because it is one property. A column declares at most one of
+    /// those types, so the two readings never contend, and every consumer
+    /// dispatches on `type_id` before interpreting it.
+    pub fractional_digits: Option<u8>,
     /// Original timezone offset in seconds for a single-zone TIMESTAMPTZ
     /// column, reattached on display/export. None == unknown (display UTC).
     pub tz_offset_secs: Option<i32>,
+    /// Element type of an ARRAY column, from the `T[]` in its declaration.
+    /// Values are re-encoded to it on write, so an INT[] stores four-byte
+    /// elements rather than whatever width the constructor's literals bound
+    /// to. None on every other column type.
+    pub element_type: Option<TypeId>,
 }
 
 impl ColumnEntry {
@@ -113,7 +125,7 @@ impl ColumnEntry {
     /// This is the single key the executor/storage layer uses for byte
     /// layout, so encode and decode stay consistent.
     pub fn physical_type_id(&self) -> TypeId {
-        TypeId::timestamp_physical_type_id(self.type_id, self.ts_precision)
+        TypeId::timestamp_physical_type_id(self.type_id, self.fractional_digits)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -126,8 +138,9 @@ impl ColumnEntry {
         write_bool(&mut buf, self.nullable);
         write_option_string(&mut buf, &self.default_expr);
         write_option_usize(&mut buf, &self.max_length);
-        // 0 = None, 1..=13 = Some(0..=12).
-        write_u8(&mut buf, self.ts_precision.map(|p| p + 1).unwrap_or(0));
+        // 0 = None, 1..=39 = Some(0..=38). Timestamp precision uses 0..=12
+        // and a decimal scale reaches 38, the widest an i128 can hold
+        write_u8(&mut buf, self.fractional_digits.map(|p| p + 1).unwrap_or(0));
         match self.tz_offset_secs {
             Some(secs) => {
                 write_u8(&mut buf, 1);
@@ -135,6 +148,9 @@ impl ColumnEntry {
             }
             None => write_u8(&mut buf, 0),
         }
+        // Tail-appended, so a column written before arrays carried an element
+        // type reads back as None rather than as a decode failure
+        write_u8(&mut buf, self.element_type.map(|t| t as u8).unwrap_or(255));
         buf
     }
 
@@ -148,12 +164,12 @@ impl ColumnEntry {
         let nullable = read_bool(data, &mut off)?;
         let default_expr = read_option_string(data, &mut off)?;
         let max_length = read_option_usize(data, &mut off)?;
-        let ts_precision = match read_u8(data, &mut off)? {
+        let fractional_digits = match read_u8(data, &mut off)? {
             0 => None,
-            n if n <= 13 => Some(n - 1),
+            n if n <= 39 => Some(n - 1),
             n => {
                 return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
-                    "invalid ts_precision byte {n} (expected 0..=13)"
+                    "invalid fractional_digits byte {n} (expected 0..=39)"
                 )));
             }
         };
@@ -166,6 +182,14 @@ impl ColumnEntry {
                 )));
             }
         };
+        let element_type = if off >= data.len() {
+            None
+        } else {
+            match read_u8(data, &mut off)? {
+                255 => None,
+                raw => Some(type_id_from_u8(raw)?),
+            }
+        };
         Ok(Self {
             id,
             table_id,
@@ -175,8 +199,9 @@ impl ColumnEntry {
             nullable,
             default_expr,
             max_length,
-            ts_precision,
+            fractional_digits,
             tz_offset_secs,
+            element_type,
         })
     }
 }
@@ -267,6 +292,45 @@ pub struct ConstraintEntry {
     /// Foreign-key ON UPDATE action. NoAction for non-FK constraints.
     #[serde(default)]
     pub on_update: ReferentialAction,
+    /// False when the constraint was declared NOT ENFORCED: the planner
+    /// still uses it, no write path checks it.
+    #[serde(default = "constraint_enforced_default")]
+    pub enforced: bool,
+    /// What a violating row does: Fail aborts the statement, Quarantine
+    /// diverts the row into `quarantine_table_id` and lets the batch land.
+    #[serde(default)]
+    pub on_violation: ConstraintViolationAction,
+    /// Companion table quarantined rows go to. Set when the constraint is
+    /// declared ON VIOLATION QUARANTINE, provisioned at table creation.
+    #[serde(default)]
+    pub quarantine_table_id: Option<u32>,
+}
+
+/// What happens to a row a constraint rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ConstraintViolationAction {
+    /// Abort the statement, the default: a constraint that lets bad rows
+    /// through silently is not a constraint
+    #[default]
+    Fail = 0,
+    /// Divert the row to the companion quarantine table and keep going
+    Quarantine = 1,
+}
+
+impl ConstraintViolationAction {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Quarantine,
+            _ => Self::Fail,
+        }
+    }
+}
+
+/// A constraint with no recorded mode is enforced, which is what every
+/// constraint written before the mode existed meant.
+fn constraint_enforced_default() -> bool {
+    true
 }
 
 impl ConstraintEntry {
@@ -292,6 +356,17 @@ impl ConstraintEntry {
         write_option_string(&mut buf, &self.check_expr);
         write_u8(&mut buf, self.on_delete as u8);
         write_u8(&mut buf, self.on_update as u8);
+        // Tail append: bytes written before the mode existed decode as
+        // enforced, which is what they meant
+        write_u8(&mut buf, self.enforced as u8);
+        write_u8(&mut buf, self.on_violation as u8);
+        match self.quarantine_table_id {
+            None => write_u8(&mut buf, 0),
+            Some(id) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, id);
+            }
+        }
         buf
     }
 
@@ -318,6 +393,21 @@ impl ConstraintEntry {
         let check_expr = read_option_string(data, offset)?;
         let on_delete = ReferentialAction::from_u8(read_u8(data, offset)?);
         let on_update = ReferentialAction::from_u8(read_u8(data, offset)?);
+        let enforced = if *offset < data.len() {
+            read_u8(data, offset)? != 0
+        } else {
+            true
+        };
+        let on_violation = if *offset < data.len() {
+            ConstraintViolationAction::from_u8(read_u8(data, offset)?)
+        } else {
+            ConstraintViolationAction::Fail
+        };
+        let quarantine_table_id = if *offset < data.len() && read_u8(data, offset)? != 0 {
+            Some(read_u32(data, offset)?)
+        } else {
+            None
+        };
         Ok(Self {
             name,
             constraint_type,
@@ -327,6 +417,9 @@ impl ConstraintEntry {
             check_expr,
             on_delete,
             on_update,
+            enforced,
+            on_violation,
+            quarantine_table_id,
         })
     }
 }
@@ -406,8 +499,9 @@ pub struct TableEntry {
     pub cdf_enabled: bool,
     /// CDF retention in days (0 = unlimited).
     pub cdf_retention_days: u32,
-    /// Phase 17 data lifecycle configuration (tail-appended, backward
-    /// compatible; defaults to all-off for tables created before Phase 17).
+    /// Data lifecycle configuration (tail-appended). A table whose bytes
+    /// end before this section decodes with every policy off, which is what
+    /// declaring no policy means.
     pub lifecycle: LifecycleConfig,
     /// Columnar tier registry (tail-appended). Empty until the compaction
     /// thread folds rows into .zyr segments.
@@ -431,26 +525,487 @@ pub struct TableEntry {
     /// pin history regardless of this window.
     #[serde(default)]
     pub time_travel_retention_secs: u64,
+    /// Lake table format configuration (tail-appended). Default is a heap
+    /// table, the lake format is chosen at CREATE TABLE with USING ZYRONLAKE
+    /// and the table's state then lives in its own transaction log under
+    /// data_dir/lake, not in heap pages or the columnar registry.
+    #[serde(default)]
+    pub lake: LakeConfig,
+    /// Clustering policy (tail-appended). A lake table keeps its policy in
+    /// the transaction log, versioned with the layout it governs. A heap
+    /// table has no log, so its policy lives here and the fold tier reads
+    /// it to decide how to lay out the segments it writes.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+    /// Remote this table stands for (tail-appended), empty for a local
+    /// table. A foreign table has columns and no storage: no heap file, no
+    /// lake root, no segments. Every read of it is a read of the peer.
+    #[serde(default)]
+    pub foreign: ForeignConfig,
 }
 
-/// Per-table data lifecycle configuration. All fields default to off so a
-/// table with no lifecycle policy behaves exactly as before Phase 17.
+/// The remote a foreign table stands for.
+///
+/// The peer is named rather than addressed, because an address changes and
+/// a peering does not. What the peer stores is not recorded here either:
+/// the peer registry learns that on contact and it is the authority, so
+/// copying it would create a second place to be wrong.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignConfig {
+    /// Peer holding the real table, empty when this table is local
+    pub peer: String,
+    /// Table name on that peer, which need not match the local name
+    pub table: String,
+}
+
+impl ForeignConfig {
+    /// The peer and table this one stands for, None when it is local. A
+    /// half-set pair reads as local rather than as a partial remote
+    pub fn remote(&self) -> Option<(&str, &str)> {
+        if self.peer.is_empty() || self.table.is_empty() {
+            return None;
+        }
+        Some((&self.peer, &self.table))
+    }
+
+    pub fn is_foreign(&self) -> bool {
+        self.remote().is_some()
+    }
+
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        write_string(buf, &self.peer);
+        write_string(buf, &self.table);
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let mut c = ForeignConfig::default();
+        // Tail append: a table written before federation existed is local,
+        // which is what it meant
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        c.peer = read_string(data, off)?;
+        c.table = read_string(data, off)?;
+        Ok(c)
+    }
+}
+
+/// Per-table clustering policy for the heap fold tier.
+///
+/// Clustering governs both storage tiers, so this carries the same three
+/// pieces the lake keeps in its log properties: how the choice interacts
+/// with measurement, when maintenance may run, and the keys themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// 0 force, 1 auto, 2 hybrid. See zyron_common::ClusterMode
+    pub mode: u8,
+    /// 0 on demand, 1 incremental, 2 continuous
+    pub schedule: u8,
+    /// Monotone spec version, bumped by every accepted layout change. Files
+    /// record the spec they were written under, so a segment carrying an
+    /// older id is one a later pass has not reached yet
+    pub spec_id: u32,
+    /// Declared keys in order. Under Force these are the layout, under
+    /// Hybrid they are the anchors measurement may not reorder or drop, and
+    /// under Auto they are empty until measurement fills them in
+    pub keys: Vec<ClusterKeyEntry>,
+    /// Expressions this table is clustered by, mirrored from the lake
+    /// manifest so the planner can match a query's expression without
+    /// opening the log. Empty on a heap table and on any lake table
+    /// clustered only by stored columns
+    #[serde(default)]
+    pub derived: Vec<DerivedColumnEntry>,
+    /// Keys the table is currently laid out by, mirrored from the spec a
+    /// clustering pass accepted. Empty until a pass replaces the declared
+    /// set, which is why `effective_keys` falls back to `keys`.
+    ///
+    /// Separate from `keys` because under Auto the two diverge: the
+    /// declared set is what a statement asked for and the active set is
+    /// what measurement chose, and a plan is only as good as the set the
+    /// files are actually sorted by
+    #[serde(default)]
+    pub active_keys: Vec<ClusterKeyEntry>,
+    /// Columns the `bloom_filter_columns` property asked for, mirrored so
+    /// planning can say which of them the layout already covers without
+    /// opening the log. What the writer actually builds is this minus the
+    /// leading range-partitioned key
+    #[serde(default)]
+    pub bloom_columns: Vec<u32>,
+}
+
+/// An expression a lake table is clustered by, mirrored from its manifest.
+///
+/// The planner needs this at plan time to rewrite a query's expression into
+/// a reference to the column holding its values, and the planner reads the
+/// catalog rather than opening a transaction log, so the identity is
+/// mirrored here. The expression text is not: matching is by hash, and the
+/// text belongs to the manifest and the system view that reads it
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedColumnEntry {
+    /// Column holding the expression's values
+    pub column_id: u32,
+    /// Identity of the canonical form, matched against a query's expression
+    pub canonical_hash: u64,
+    /// What the expression evaluates to, so a lowered predicate types its
+    /// constant the way the stored values are typed
+    pub type_id: u8,
+    /// Digits the result keeps after the point, 0xFF for none. An
+    /// expression over a TIMESTAMP(9) yields picosecond-physical values,
+    /// and a constant converted at the default precision instead would
+    /// compare against a different scale and prune files that match
+    pub fractional_digits: u8,
+    /// The expression's canonical text.
+    ///
+    /// Carried here as well as in the manifest because every insert has to
+    /// recompute the column's values, and reading the manifest on the write
+    /// path to find out how would put a file read in front of each write
+    pub sql: String,
+}
+
+/// One clustering key as the catalog stores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterKeyEntry {
+    pub column_id: u32,
+    /// See zyron_common::ClusterStrategy for the numbering
+    pub strategy: u8,
+    /// Strategy parameter, zero when the strategy takes none
+    pub param: u32,
+}
+
+impl ClusterConfig {
+    /// The keys as the fold tier consumes them. An unknown strategy code
+    /// reads as RangePartition, which is plain ascending order: a
+    /// corrupted byte then costs ordering quality rather than the fold
+    pub fn fold_keys(&self) -> Vec<zyron_common::ClusterKey> {
+        self.keys
+            .iter()
+            .map(|k| zyron_common::ClusterKey {
+                column_id: k.column_id,
+                strategy: zyron_common::ClusterStrategy::from_u8(k.strategy)
+                    .unwrap_or(zyron_common::ClusterStrategy::RangePartition),
+                param: k.param,
+            })
+            .collect()
+    }
+
+    pub fn mode(&self) -> zyron_common::ClusterMode {
+        zyron_common::ClusterMode::from_u8(self.mode).unwrap_or_default()
+    }
+
+    pub fn schedule(&self) -> zyron_common::ClusteringSchedule {
+        zyron_common::ClusteringSchedule::from_u8(self.schedule).unwrap_or_default()
+    }
+
+    /// The keys the table is laid out by right now.
+    ///
+    /// What a clustering pass accepted, or the declared set when no pass
+    /// has replaced it. Planning reads this rather than `keys`, because a
+    /// declared key measurement has replaced prunes nothing
+    pub fn effective_keys(&self) -> &[ClusterKeyEntry] {
+        if self.active_keys.is_empty() {
+            &self.keys
+        } else {
+            &self.active_keys
+        }
+    }
+
+    /// Declared bloom columns the layout already covers, so the writer
+    /// builds no filter for them.
+    ///
+    /// Only the leading key qualifies, and only under RangePartition,
+    /// which is the one strategy that gives a file a contiguous range of
+    /// the key. `ManifestFile::bloom_redundant_key` carries the reasoning
+    pub fn redundant_bloom_columns(&self) -> Vec<u32> {
+        let Some(leading) = self.effective_keys().first() else {
+            return Vec::new();
+        };
+        if leading.strategy != zyron_common::ClusterStrategy::RangePartition.to_u8() {
+            return Vec::new();
+        }
+        self.bloom_columns
+            .iter()
+            .copied()
+            .filter(|c| *c == leading.column_id)
+            .collect()
+    }
+
+    /// Mirrors the keys a clustering pass accepted.
+    ///
+    /// Called by whoever ran the pass, because the pass itself runs inside
+    /// the lake crate and has no catalog to write to
+    pub fn set_active_keys(&mut self, keys: &[zyron_common::ClusterKey]) {
+        self.active_keys = keys
+            .iter()
+            .map(|k| ClusterKeyEntry {
+                column_id: k.column_id,
+                strategy: k.strategy.to_u8(),
+                param: k.param,
+            })
+            .collect();
+    }
+
+    /// Replaces the declared keys and advances the spec id, so segments
+    /// written before the change are distinguishable from ones after it
+    pub fn set_keys(&mut self, keys: &[zyron_common::ClusterKey]) {
+        self.spec_id = self.spec_id.saturating_add(1);
+        self.keys = keys
+            .iter()
+            .map(|k| ClusterKeyEntry {
+                column_id: k.column_id,
+                strategy: k.strategy.to_u8(),
+                param: k.param,
+            })
+            .collect();
+    }
+
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        buf.push(self.mode);
+        buf.push(self.schedule);
+        write_u32(buf, self.spec_id);
+        write_u16(buf, self.keys.len() as u16);
+        for key in &self.keys {
+            write_u32(buf, key.column_id);
+            buf.push(key.strategy);
+            write_u32(buf, key.param);
+        }
+        // Tail appended, so a table written before expression clustering
+        // existed reads back with none
+        write_u16(buf, self.derived.len() as u16);
+        for derived in &self.derived {
+            write_u32(buf, derived.column_id);
+            write_u64(buf, derived.canonical_hash);
+            buf.push(derived.type_id);
+            buf.push(derived.fractional_digits);
+            write_string(buf, &derived.sql);
+        }
+        // Tail appended again, so a table written before a pass could
+        // replace the declared keys reads back with none active, which is
+        // what "the declared keys are the active ones" means
+        write_u16(buf, self.active_keys.len() as u16);
+        for key in &self.active_keys {
+            write_u32(buf, key.column_id);
+            buf.push(key.strategy);
+            write_u32(buf, key.param);
+        }
+        // Tail appended again, so a table written before bloom selection
+        // read the catalog declares none here
+        write_u16(buf, self.bloom_columns.len() as u16);
+        for column_id in &self.bloom_columns {
+            write_u32(buf, *column_id);
+        }
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let mut c = ClusterConfig::default();
+        // Tail append: a table written before clustering existed declared
+        // no keys, which is what an empty policy means
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        c.mode = read_u8(data, off)?;
+        c.schedule = read_u8(data, off)?;
+        c.spec_id = read_u32(data, off)?;
+        let count = read_u16(data, off)? as usize;
+        c.keys.reserve(count);
+        for _ in 0..count {
+            let column_id = read_u32(data, off)?;
+            let strategy = read_u8(data, off)?;
+            let param = read_u32(data, off)?;
+            c.keys.push(ClusterKeyEntry {
+                column_id,
+                strategy,
+                param,
+            });
+        }
+        // Tail append again: a table written before expression clustering
+        // ends here and has none
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        let derived_count = read_u16(data, off)? as usize;
+        c.derived.reserve(derived_count);
+        for _ in 0..derived_count {
+            let column_id = read_u32(data, off)?;
+            let canonical_hash = read_u64(data, off)?;
+            let type_id = read_u8(data, off)?;
+            let fractional_digits = read_u8(data, off)?;
+            let sql = read_string(data, off)?;
+            c.derived.push(DerivedColumnEntry {
+                column_id,
+                canonical_hash,
+                type_id,
+                fractional_digits,
+                sql,
+            });
+        }
+        // Tail append again: a table written before a pass could replace
+        // the declared keys ends here, and none active means the declared
+        // keys are the active ones
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        let active_count = read_u16(data, off)? as usize;
+        c.active_keys.reserve(active_count);
+        for _ in 0..active_count {
+            let column_id = read_u32(data, off)?;
+            let strategy = read_u8(data, off)?;
+            let param = read_u32(data, off)?;
+            c.active_keys.push(ClusterKeyEntry {
+                column_id,
+                strategy,
+                param,
+            });
+        }
+        // Tail append again: a table written before bloom selection read
+        // the catalog ends here and declares none
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        let bloom_count = read_u16(data, off)? as usize;
+        c.bloom_columns.reserve(bloom_count);
+        for _ in 0..bloom_count {
+            c.bloom_columns.push(read_u32(data, off)?);
+        }
+        Ok(c)
+    }
+}
+
+/// Storage format discriminant for a table. A lake table has no heap file
+/// and no MVCC system columns, visibility is by transaction log version
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LakeConfig {
+    /// 0 is a heap table, 1 is a lake table
+    pub format: u8,
+    /// Set on a heap table converted back from the lake format without
+    /// `drop_history`. Its lake root is kept for its version history, so
+    /// startup reclaim must leave it alone rather than read it as work a
+    /// crashed conversion abandoned.
+    #[serde(default)]
+    pub retained_history: bool,
+    /// Peer this table follows, empty when it is its own authority.
+    ///
+    /// A follower replays a leader's log rather than accepting writes, so
+    /// naming the leader here is what turns an ordinary lake table into a
+    /// replica. Both fields are empty or both are set.
+    #[serde(default)]
+    pub follow_peer: String,
+    /// Table name on that peer, which need not match the local name
+    #[serde(default)]
+    pub follow_table: String,
+}
+
+impl LakeConfig {
+    pub const FORMAT_HEAP: u8 = 0;
+    pub const FORMAT_LAKE: u8 = 1;
+
+    pub fn lake() -> Self {
+        Self {
+            format: Self::FORMAT_LAKE,
+            retained_history: false,
+            follow_peer: String::new(),
+            follow_table: String::new(),
+        }
+    }
+
+    /// A heap table whose lake root is kept for its history.
+    pub fn heap_retaining_history() -> Self {
+        Self {
+            format: Self::FORMAT_HEAP,
+            retained_history: true,
+            follow_peer: String::new(),
+            follow_table: String::new(),
+        }
+    }
+
+    /// True when a lake root on disk belongs to this table rather than being
+    /// work a crashed conversion left behind.
+    pub fn owns_lake_root(&self) -> bool {
+        self.is_lake() || self.retained_history
+    }
+
+    pub fn is_lake(&self) -> bool {
+        self.format == Self::FORMAT_LAKE
+    }
+
+    /// The peer and table this one replays, None when it is its own
+    /// authority. A half-set pair is treated as unset rather than as a
+    /// partial leader, because following half a name is not a thing
+    pub fn follows(&self) -> Option<(&str, &str)> {
+        if self.follow_peer.is_empty() || self.follow_table.is_empty() {
+            return None;
+        }
+        Some((&self.follow_peer, &self.follow_table))
+    }
+
+    /// Declares the leader this table replays.
+    pub fn follow(&mut self, peer: &str, table: &str) {
+        self.follow_peer = peer.to_string();
+        self.follow_table = table.to_string();
+    }
+
+    /// Stops following, leaving the table as its own authority with
+    /// whatever it has already applied
+    pub fn unfollow(&mut self) {
+        self.follow_peer.clear();
+        self.follow_table.clear();
+    }
+
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        buf.push(self.format);
+        buf.push(self.retained_history as u8);
+        write_string(buf, &self.follow_peer);
+        write_string(buf, &self.follow_table);
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let mut c = LakeConfig::default();
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        c.format = read_u8(data, off)?;
+        // Tail append: a table written before conversion existed retains no
+        // history, which is what it meant
+        if *off < data.len() {
+            c.retained_history = read_u8(data, off)? != 0;
+        }
+        // Same for following: a table written before replicas existed
+        // follows nobody, which is what it meant
+        if *off < data.len() {
+            c.follow_peer = read_string(data, off)?;
+            c.follow_table = read_string(data, off)?;
+        }
+        Ok(c)
+    }
+}
+
+/// Marks a lifecycle column id as unset.
+///
+/// Zero cannot serve here: it is the id of a table's first column, so a
+/// policy declared on that column would read back as no policy at all and
+/// the rows it governs would never expire.
+pub const NO_LIFECYCLE_COLUMN: u32 = u32::MAX;
+
+/// Per-table data lifecycle configuration. All fields default to off so a
+/// table with no lifecycle policy is governed by none of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleConfig {
     /// Soft delete enabled on this table.
     pub soft_delete_enabled: bool,
-    /// Column id of the boolean is_deleted marker (0 = unset).
+    /// Column id of the boolean is_deleted marker, NO_LIFECYCLE_COLUMN when
+    /// unset.
     pub soft_delete_is_deleted_col_id: u32,
-    /// Column id of the deleted_at timestamp (0 = unset).
+    /// Column id of the deleted_at timestamp, NO_LIFECYCLE_COLUMN when unset.
     pub soft_delete_deleted_at_col_id: u32,
-    /// Column id used for TTL expiry comparison (0 = unset).
+    /// Column id used for TTL expiry comparison, NO_LIFECYCLE_COLUMN when
+    /// unset.
     pub ttl_column_id: u32,
     /// TTL interval in seconds (0 = no TTL).
     pub ttl_seconds: i64,
     /// TTL action: 0 Delete, 1 Archive, 2 Anonymize.
     pub ttl_action: u8,
-    /// Per-row retention column id (0 = unset). When set, expiry is
-    /// `retention_column < now()` instead of `ttl_column + ttl_seconds`.
+    /// Per-row retention column id, NO_LIFECYCLE_COLUMN when unset. When
+    /// set, expiry is `retention_column < now()` instead of
+    /// `ttl_column + ttl_seconds`.
     pub retention_column_id: u32,
     /// Current storage tier: 0 Hot, 1 Warm, 2 Cold, 3 Archive.
     pub storage_tier: u8,
@@ -477,7 +1032,40 @@ pub struct LifecycleConfig {
     pub immutable: bool,
 }
 
+impl Default for LifecycleConfig {
+    /// Every policy off. The four column-id fields hold NO_LIFECYCLE_COLUMN
+    /// rather than zero, which is a real column id.
+    fn default() -> Self {
+        Self {
+            soft_delete_enabled: false,
+            soft_delete_is_deleted_col_id: NO_LIFECYCLE_COLUMN,
+            soft_delete_deleted_at_col_id: NO_LIFECYCLE_COLUMN,
+            ttl_column_id: NO_LIFECYCLE_COLUMN,
+            ttl_seconds: 0,
+            ttl_action: 0,
+            retention_column_id: NO_LIFECYCLE_COLUMN,
+            storage_tier: 0,
+            cold_after_seconds: 0,
+            archive_after_seconds: 0,
+            archive_destination: String::new(),
+            archive_on_purge: false,
+            purge_grace_seconds: 0,
+            retention_lock_until: 0,
+            recycle_window_seconds: 0,
+            data_key_id: 0,
+            residency_region: String::new(),
+            immutable: false,
+        }
+    }
+}
+
 impl LifecycleConfig {
+    /// True when `col_id` names a real column rather than the unset marker.
+    #[inline]
+    pub fn column_is_set(col_id: u32) -> bool {
+        col_id != NO_LIFECYCLE_COLUMN
+    }
+
     fn write_into(&self, buf: &mut Vec<u8>) {
         buf.push(if self.soft_delete_enabled { 1 } else { 0 });
         write_u32(buf, self.soft_delete_is_deleted_col_id);
@@ -544,6 +1132,16 @@ pub struct ColumnarSegmentEntry {
     pub sys_xmin_lo: u64,
     /// Highest sys_xmin in the file.
     pub sys_xmin_hi: u64,
+    /// Cluster spec the file was written under, so a segment carrying an
+    /// older id is one a later pass has not reached yet. Zero for a
+    /// segment folded with no clustering policy declared.
+    pub cluster_spec_id: u32,
+    /// Storage tier holding this file: 0 Hot, 1 Warm, 2 Cold, 3 Archive.
+    /// `path` always names where the file actually is, so a read needs
+    /// nothing from this field. The planner reads it to cost a scan that
+    /// touches the segment, and ALTER TABLE MOVE reads it to report what a
+    /// relocation would change.
+    pub storage_tier: u8,
 }
 
 /// Per-table columnar tier registry. Durable so it survives WAL truncation.
@@ -573,6 +1171,8 @@ impl ColumnarRegistry {
             write_u64(buf, seg.sys_rowid_hi);
             write_u64(buf, seg.sys_xmin_lo);
             write_u64(buf, seg.sys_xmin_hi);
+            write_u32(buf, seg.cluster_spec_id);
+            buf.push(seg.storage_tier);
         }
         write_u64(buf, self.next_rowid);
         write_u64(buf, self.next_file_id);
@@ -595,6 +1195,8 @@ impl ColumnarRegistry {
             seg.sys_rowid_hi = read_u64(data, off)?;
             seg.sys_xmin_lo = read_u64(data, off)?;
             seg.sys_xmin_hi = read_u64(data, off)?;
+            seg.cluster_spec_id = read_u32(data, off)?;
+            seg.storage_tier = read_u8(data, off)?;
             r.segments.push(seg);
         }
         r.next_rowid = read_u64(data, off)?;
@@ -638,7 +1240,7 @@ impl TableEntry {
         buf.push(if self.cdf_enabled { 1 } else { 0 });
         write_u32(&mut buf, self.cdf_retention_days);
 
-        // Phase 17 lifecycle config (tail-appended)
+        // Lifecycle config (tail-appended)
         self.lifecycle.write_into(&mut buf);
 
         // Columnar registry (tail-appended)
@@ -663,6 +1265,15 @@ impl TableEntry {
 
         // Time-travel retention window in seconds (tail-appended)
         write_u64(&mut buf, self.time_travel_retention_secs);
+
+        // Lake format configuration (tail-appended)
+        self.lake.write_into(&mut buf);
+
+        // Clustering policy (tail-appended)
+        self.cluster.write_into(&mut buf);
+
+        // Foreign table target (tail-appended)
+        self.foreign.write_into(&mut buf);
 
         buf
     }
@@ -738,7 +1349,7 @@ impl TableEntry {
             0
         };
 
-        // Phase 17 lifecycle config (tail-appended, defaults when absent).
+        // Lifecycle config (tail-appended, defaults when absent).
         let lifecycle = LifecycleConfig::read_from(data, &mut off)?;
 
         // Columnar registry (tail-appended, defaults when absent).
@@ -779,6 +1390,15 @@ impl TableEntry {
             0
         };
 
+        // Lake format configuration (tail-appended, heap when absent).
+        let lake = LakeConfig::read_from(data, &mut off)?;
+
+        // Clustering policy (tail-appended, no keys when absent).
+        let cluster = ClusterConfig::read_from(data, &mut off)?;
+
+        // Foreign target (tail-appended, local when absent).
+        let foreign = ForeignConfig::read_from(data, &mut off)?;
+
         Ok(Self {
             id,
             schema_id,
@@ -799,6 +1419,9 @@ impl TableEntry {
             dropped_at,
             expectations,
             time_travel_retention_secs,
+            lake,
+            cluster,
+            foreign,
         })
     }
 }
@@ -901,6 +1524,10 @@ impl IndexEntry {
                 }
                 let params = data[off..off + param_len].to_vec();
                 off += param_len;
+                // Kept correct for whatever section is appended after this
+                // one. A tail codec that stopped advancing its cursor at the
+                // last field would read the next section from the wrong place
+                debug_assert!(off <= data.len(), "index parameters overran the entry");
                 Some(params)
             } else {
                 None
@@ -3068,7 +3695,7 @@ impl SecurityMapEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 17 data lifecycle catalog entries
+// Data lifecycle catalog entries
 // ---------------------------------------------------------------------------
 
 /// A legal hold protecting rows of a table from deletion/modification.
@@ -3308,8 +3935,9 @@ mod tests {
             nullable: false,
             default_expr: None,
             max_length: None,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
+            element_type: None,
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -3331,8 +3959,9 @@ mod tests {
             nullable: true,
             default_expr: Some("'unknown'".to_string()),
             max_length: Some(255),
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
+            element_type: None,
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -3359,11 +3988,12 @@ mod tests {
                 nullable: true,
                 default_expr: None,
                 max_length: None,
-                ts_precision: p,
+                fractional_digits: p,
                 tz_offset_secs: off,
+                element_type: None,
             };
             let decoded = ColumnEntry::from_bytes(&entry.to_bytes()).unwrap();
-            assert_eq!(decoded.ts_precision, p, "precision {p:?}");
+            assert_eq!(decoded.fractional_digits, p, "precision {p:?}");
             assert_eq!(decoded.tz_offset_secs, off, "offset {off:?}");
         }
     }
@@ -3386,8 +4016,9 @@ mod tests {
                     nullable: false,
                     default_expr: None,
                     max_length: None,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
+                    element_type: None,
                 },
                 ColumnEntry {
                     id: ColumnId(1),
@@ -3398,8 +4029,9 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     max_length: Some(100),
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
+                    element_type: None,
                 },
             ],
             constraints: vec![ConstraintEntry {
@@ -3411,6 +4043,9 @@ mod tests {
                 check_expr: None,
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
+                enforced: true,
+                on_violation: ConstraintViolationAction::Fail,
+                quarantine_table_id: None,
             }],
             created_at: 1700000000,
             versioning_enabled: false,
@@ -3424,6 +4059,9 @@ mod tests {
             dropped_at: None,
             expectations: Vec::new(),
             time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -3451,6 +4089,9 @@ mod tests {
             check_expr: None,
             on_delete: ReferentialAction::Cascade,
             on_update: ReferentialAction::Restrict,
+            enforced: true,
+            on_violation: ConstraintViolationAction::Fail,
+            quarantine_table_id: None,
         };
         let bytes = entry.to_bytes();
         let mut off = 0;
@@ -3578,6 +4219,9 @@ mod tests {
             dropped_at: None,
             expectations: Vec::new(),
             time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -3947,5 +4591,112 @@ mod tests {
         assert_eq!(decoded.key, entry.key);
         assert_eq!(decoded.role_id, entry.role_id);
         assert_eq!(decoded.created_at, entry.created_at);
+    }
+
+    /// The derived registry is tail appended to the clustering policy, so a
+    /// round trip has to return every entry and an entry written before
+    /// expression clustering existed has to read back with none
+    #[test]
+    fn test_cluster_config_roundtrip_carries_every_derived_entry() {
+        for count in [0usize, 1, 2, 7, 64] {
+            let cluster = ClusterConfig {
+                mode: 1,
+                schedule: 2,
+                spec_id: 9,
+                keys: vec![
+                    ClusterKeyEntry {
+                        column_id: 3,
+                        strategy: 2,
+                        param: 0,
+                    },
+                    ClusterKeyEntry {
+                        column_id: 40,
+                        strategy: 0,
+                        param: 16,
+                    },
+                ],
+                derived: (0..count)
+                    .map(|i| DerivedColumnEntry {
+                        column_id: 100 + i as u32,
+                        canonical_hash: 0xFFFF_0000_0000_0001u64.wrapping_mul(i as u64 + 1),
+                        type_id: TypeId::Timestamp as u8,
+                        fractional_digits: if i % 2 == 0 { 9 } else { 0xFF },
+                        sql: format!("time_bucket('1 day', ts_{i})"),
+                    })
+                    .collect(),
+                // Varied alongside, because an active set is what a pass
+                // chose and it is not the declared one
+                active_keys: (0..count % 3)
+                    .map(|i| ClusterKeyEntry {
+                        column_id: 200 + i as u32,
+                        strategy: 1,
+                        param: i as u32,
+                    })
+                    .collect(),
+                bloom_columns: (0..count % 5).map(|i| 300 + i as u32).collect(),
+            };
+            let mut buf = Vec::new();
+            cluster.write_into(&mut buf);
+            let mut off = 0usize;
+            let decoded = ClusterConfig::read_from(&buf, &mut off).expect("decodes");
+            assert_eq!(off, buf.len(), "the reader consumed the whole record");
+            assert_eq!(decoded, cluster, "round trip changed the policy");
+        }
+    }
+
+    /// A policy encoded before the derived registry existed ends where the
+    /// keys end, and reads back with an empty registry rather than failing
+    #[test]
+    fn test_cluster_config_without_a_derived_section_reads_back_empty() {
+        let mut buf = Vec::new();
+        buf.push(1u8);
+        buf.push(2u8);
+        write_u32(&mut buf, 9);
+        write_u16(&mut buf, 1);
+        write_u32(&mut buf, 3);
+        buf.push(2u8);
+        write_u32(&mut buf, 0);
+
+        let mut off = 0usize;
+        let decoded = ClusterConfig::read_from(&buf, &mut off).expect("decodes");
+        assert_eq!(decoded.keys.len(), 1);
+        assert!(decoded.derived.is_empty());
+        assert!(decoded.active_keys.is_empty());
+        assert!(decoded.bloom_columns.is_empty());
+        // No pass has replaced anything, so the declared keys are what a
+        // plan should be judged against
+        assert_eq!(decoded.effective_keys(), decoded.keys.as_slice());
+    }
+
+    /// The active set is what a pass chose, and it is what planning has to
+    /// read. Falling back to the declared set only when nothing is active
+    /// is what keeps a table nobody has measured planning correctly
+    #[test]
+    fn test_effective_keys_prefers_what_a_pass_accepted() {
+        let mut cluster = ClusterConfig {
+            keys: vec![ClusterKeyEntry {
+                column_id: 3,
+                strategy: 0,
+                param: 0,
+            }],
+            ..ClusterConfig::default()
+        };
+        assert_eq!(cluster.effective_keys()[0].column_id, 3);
+
+        cluster.set_active_keys(&[zyron_common::ClusterKey {
+            column_id: 7,
+            strategy: zyron_common::ClusterStrategy::RangePartition,
+            param: 0,
+        }]);
+        assert_eq!(cluster.effective_keys().len(), 1);
+        assert_eq!(
+            cluster.effective_keys()[0].column_id,
+            7,
+            "a declared key measurement replaced prunes nothing, so planning must not read it"
+        );
+
+        // A pass that accepts nothing leaves the declared set in force
+        cluster.set_active_keys(&[]);
+        assert_eq!(cluster.effective_keys()[0].column_id, 3);
     }
 }

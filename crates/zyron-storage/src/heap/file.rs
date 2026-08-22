@@ -7,11 +7,11 @@ use crate::disk::DiskManager;
 use crate::freespace::{
     ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, category_to_min_space, space_to_category,
 };
-use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
-use crate::heap::page::{HeapPage, HeapPageHeader, SlotId};
-use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
+use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_SLOT_SIZE};
+use crate::heap::page::{HeapPage, SlotId};
+use crate::tuple::{Tuple, TupleFlags, TupleHeader, TupleId, TupleView};
 use std::sync::Arc;
-use zyron_buffer::{BufferPool, FrameId};
+use zyron_buffer::BufferPool;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
 
@@ -139,23 +139,6 @@ impl AtomicHintSlots {
         }
         None
     }
-
-    /// Sums the conservative min free space across every cached slot.
-    /// Used by `insert_batch` to predict how many bytes can be reused
-    /// from existing pages before deciding how many to allocate
-    #[inline]
-    fn estimated_total_min_space(&self) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut total = 0usize;
-        for slot in &self.slots {
-            let current = slot.load(Relaxed);
-            if current != HINT_EMPTY {
-                let (_, cat) = Self::unpack(current);
-                total += category_to_min_space(cat as u8);
-            }
-        }
-        total
-    }
 }
 
 /// HeapFile manages tuple storage with buffer pool caching.
@@ -275,13 +258,6 @@ impl HeapFile {
         self.cached_fsm_pages.load(Ordering::Relaxed)
     }
 
-    /// Increments cached heap page count.
-    #[inline]
-    fn increment_heap_pages(&self) {
-        use std::sync::atomic::Ordering;
-        self.cached_heap_pages.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// This thread's insertion shard. A stable per-thread slot keeps each shard
     /// single-writer while writer threads do not exceed the shard count, so the
     /// page-header claim is uncontended; beyond that the slots wrap and a few
@@ -367,22 +343,6 @@ impl HeapFile {
         }
 
         self.pool.unpin_page(page_id, true); // Mark dirty
-        Ok(())
-    }
-
-    /// Writes a newly allocated page to the buffer pool.
-    /// Skips the fetch_page check since the page is known to not exist in the pool yet.
-    #[inline]
-    async fn write_new_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        let (_, evicted) = self.pool.load_page(page_id, data)?;
-
-        if let Some(evicted_page) = evicted {
-            self.disk
-                .write_page(evicted_page.page_id, &evicted_page.data)
-                .await?;
-        }
-
-        self.pool.unpin_page(page_id, true);
         Ok(())
     }
 
@@ -668,6 +628,12 @@ impl HeapFile {
     /// Returns a guard that holds pinned pages. Use `.iter()` to iterate
     /// over tuples as borrowed `TupleView` references. Pages are automatically
     /// unpinned when the guard is dropped.
+    ///
+    /// A page the pool evicted is read back from disk and re-installed
+    /// pinned. Without that, an evicted page's rows silently vanished from
+    /// the scan, so any whole-heap read under memory pressure lost rows.
+    /// When the pool cannot take another frame, the guard carries the
+    /// page's bytes itself, so the scan is complete either way.
     pub fn scan(&self) -> Result<ScanGuard<'_>> {
         let num_pages = self.heap_page_count();
         let file_id = self.config.heap_file_id;
@@ -676,12 +642,80 @@ impl HeapFile {
             .map(|n| PageId::new(file_id, n as u64))
             .collect();
 
-        self.pool.batch_pin(&page_ids);
-
-        Ok(ScanGuard {
+        let resident = self.pool.batch_pin(&page_ids);
+        // The guard exists from here on so an error below unpins what was
+        // already pinned instead of leaking the pins
+        let mut guard = ScanGuard {
             pool: &self.pool,
-            page_ids,
-        })
+            page_ids: Vec::with_capacity(page_ids.len()),
+            owned: Vec::new(),
+        };
+        for (i, &pid) in page_ids.iter().enumerate() {
+            if resident[i] {
+                guard.page_ids.push(pid);
+                continue;
+            }
+            let data = self.read_page_from_disk_sync(pid)?;
+            match self.pool.load_page(pid, data.as_ref()) {
+                Ok((_, evicted)) => {
+                    if let Some(ev) = evicted {
+                        self.write_page_to_disk_sync(ev.page_id, ev.data.as_ref())?;
+                    }
+                    guard.page_ids.push(pid);
+                }
+                Err(ZyronError::BufferPoolFull) => guard.owned.push((pid, data)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(guard)
+    }
+
+    /// Reads one page's bytes straight from its data file, for the scan
+    /// path that runs without an async context. A page past the file's
+    /// current end reads as zeroes, which decodes as an empty page, the
+    /// same answer the async read gives for a never-flushed page
+    fn read_page_from_disk_sync(&self, page_id: PageId) -> Result<Box<[u8; PAGE_SIZE]>> {
+        let path = self
+            .disk
+            .data_dir()
+            .join(format!("{:08}.dat", page_id.file_id));
+        let mut buf: Box<[u8; PAGE_SIZE]> = Box::new([0u8; PAGE_SIZE]);
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| ZyronError::IoError(format!("scan open {}: {}", path.display(), e)))?;
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+            .map_err(|e| ZyronError::IoError(format!("scan seek: {}", e)))?;
+        let mut read = 0usize;
+        while read < PAGE_SIZE {
+            match std::io::Read::read(&mut file, &mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(ZyronError::IoError(format!("scan read: {}", e))),
+            }
+        }
+        Ok(buf)
+    }
+
+    /// Writes one page's bytes straight to its data file, for the scan
+    /// path's dirty evictions
+    fn write_page_to_disk_sync(&self, page_id: PageId, data: &[u8]) -> Result<()> {
+        let path = self
+            .disk
+            .data_dir()
+            .join(format!("{:08}.dat", page_id.file_id));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                ZyronError::IoError(format!("scan flush open {}: {}", path.display(), e))
+            })?;
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+            .map_err(|e| ZyronError::IoError(format!("scan flush seek: {}", e)))?;
+        std::io::Write::write_all(&mut file, data)
+            .map_err(|e| ZyronError::IoError(format!("scan flush write: {}", e)))?;
+        Ok(())
     }
 
     /// Returns the number of pages in the heap file.
@@ -782,19 +816,6 @@ impl HeapFile {
         }
     }
 
-    /// Pushes a batch of FSM updates under a single lock acquisition.
-    #[inline]
-    pub(crate) fn push_fsm_updates(&self, updates: &[(u32, usize)]) {
-        let mut pending = self.pending_fsm.lock();
-        pending.reserve(updates.len());
-        for &(heap_page_num, free_space) in updates {
-            pending.push(PendingFsmUpdate {
-                heap_page_num,
-                free_space,
-            });
-        }
-    }
-
     /// Flushes all pending FSM updates in a single batch.
     ///
     /// Groups updates by FSM page to minimize I/O. Each FSM page is
@@ -872,7 +893,7 @@ impl HeapFile {
         let usable_per_page = PAGE_SIZE - DATA_START;
         let total_bytes: usize = tuples
             .iter()
-            .map(|t| t.size_on_disk() + TUPLE_SLOT_SIZE)
+            .map(|t| t.data().len() + TUPLE_SLOT_SIZE)
             .sum();
         let estimated_pages = ((total_bytes + usable_per_page - 1) / usable_per_page).max(1) as u64;
 
@@ -909,9 +930,17 @@ impl HeapFile {
             };
 
             if is_fresh {
-                let mut buf = [0u8; PAGE_SIZE];
-                HeapPage::init_fresh_slice_reuse(&mut buf, page_id);
-                let (_, evicted) = self.pool.load_page(page_id, &buf)?;
+                let (frame, evicted, installed) = self.pool.new_page_reporting_fresh(page_id)?;
+                if installed {
+                    // Only the page and heap headers are written. Everything
+                    // past them is free space this page never reads, so
+                    // clearing it would cost a full page of stores for every
+                    // page allocated
+                    // SAFETY: the frame is pinned by the call above and no
+                    // other thread can reach a page installed a moment ago
+                    let raw = unsafe { &mut *frame.data_ptr_mut() };
+                    HeapPage::init_fresh_slice_reuse(raw, page_id);
+                }
                 if let Some(ev) = evicted {
                     self.disk.write_page(ev.page_id, &ev.data).await?;
                 }
@@ -1044,186 +1073,6 @@ impl HeapFile {
             Err(other) => Ok(other),
         }
     }
-
-    /// Core insert loop, separated so the caller can release reserved frames
-    /// on both success and error paths.
-    async fn insert_batch_inner(
-        &self,
-        tuples: &[Tuple],
-        pre_alloc: &[PageId],
-        pre_alloc_idx: &mut usize,
-        reserved_frames: &[FrameId],
-        reserved_idx: &mut usize,
-        estimated_pages: u32,
-    ) -> Result<Vec<TupleId>> {
-        let mut results = Vec::with_capacity(tuples.len());
-        let mut current_page_id: Option<PageId> = None;
-        // Stack-allocated page buffer, reused across pages to avoid Box allocation per page.
-        let mut buf = [0u8; PAGE_SIZE];
-        let mut buf_active = false;
-        // Track whether current page is freshly allocated (no deleted slots).
-        // Fresh pages use the O(1) append path instead of scanning for deleted slots.
-        let mut is_fresh_page = false;
-        // Caller-managed heap page header for fresh pages. Read once at page init,
-        // written once at page flush. Eliminates per-tuple header read/write from slice.
-        let mut page_header = HeapPageHeader::new();
-        // Accumulate FSM updates locally to apply in a single lock acquisition at the end.
-        let mut local_fsm_updates: Vec<(u32, usize)> =
-            Vec::with_capacity(estimated_pages as usize + 1);
-
-        for tuple in tuples {
-            let space_needed = tuple.size_on_disk() + TUPLE_SLOT_SIZE;
-
-            let needs_new_page = if buf_active {
-                if is_fresh_page {
-                    page_header.free_space() < space_needed
-                } else {
-                    HeapPage::free_space_in_slice(&buf) < space_needed
-                }
-            } else {
-                true
-            };
-
-            if needs_new_page {
-                // Flush current page to buffer pool before moving on.
-                if let Some(pid) = current_page_id
-                    && buf_active
-                {
-                    self.flush_page_buf(
-                        pid,
-                        &mut buf,
-                        is_fresh_page,
-                        &page_header,
-                        reserved_frames,
-                        reserved_idx,
-                        &mut local_fsm_updates,
-                    )
-                    .await?;
-                }
-
-                // Check hint cache for an existing page with sufficient free space (lock-free).
-                let hint_page_num = self.hint_slots.find_page_with_space(space_needed);
-
-                if let Some(page_num) = hint_page_num {
-                    let pid = PageId::new(self.config.heap_file_id, page_num as u64);
-                    let page_data = self.fetch_page(pid).await?;
-                    buf = page_data;
-                    let usable = HeapPage::total_usable_space_in_slice(&buf);
-                    if usable >= space_needed {
-                        current_page_id = Some(pid);
-                        buf_active = true;
-                        is_fresh_page = false;
-                    } else {
-                        // Hint cache promised more space than the page has,
-                        // remove the stale entry so we don't pay the wasted
-                        // fetch on the next tuple in this batch
-                        self.hint_slots.remove(page_num);
-                        let pid = if *pre_alloc_idx < pre_alloc.len() {
-                            let p = pre_alloc[*pre_alloc_idx];
-                            *pre_alloc_idx += 1;
-                            p
-                        } else {
-                            let p = self.disk.allocate_page(self.config.heap_file_id).await?;
-                            self.increment_heap_pages();
-                            p
-                        };
-                        HeapPage::init_fresh_slice_reuse(&mut buf, pid);
-                        current_page_id = Some(pid);
-                        buf_active = true;
-                        is_fresh_page = true;
-                        page_header = HeapPageHeader::new();
-                    }
-                } else {
-                    let pid = if *pre_alloc_idx < pre_alloc.len() {
-                        let p = pre_alloc[*pre_alloc_idx];
-                        *pre_alloc_idx += 1;
-                        p
-                    } else {
-                        let p = self.disk.allocate_page(self.config.heap_file_id).await?;
-                        self.increment_heap_pages();
-                        p
-                    };
-                    HeapPage::init_fresh_slice_reuse(&mut buf, pid);
-                    current_page_id = Some(pid);
-                    buf_active = true;
-                    is_fresh_page = true;
-                    page_header = HeapPageHeader::new();
-                }
-            }
-
-            let pid = current_page_id.unwrap();
-            let slot_id = if is_fresh_page {
-                HeapPage::insert_tuple_append_with_header(&mut buf, tuple, &mut page_header)?
-            } else {
-                let (sid, _) = HeapPage::insert_tuple_in_slice(&mut buf, tuple)?;
-                sid
-            };
-            results.push(TupleId::new(pid, slot_id.0));
-        }
-
-        // Flush the final page.
-        if let Some(pid) = current_page_id
-            && buf_active
-        {
-            self.flush_page_buf(
-                pid,
-                &mut buf,
-                is_fresh_page,
-                &page_header,
-                reserved_frames,
-                reserved_idx,
-                &mut local_fsm_updates,
-            )
-            .await?;
-        }
-
-        // Apply all FSM updates: hint slots atomically (lock-free), pending Vec in single lock.
-        for &(page_num, free_space) in &local_fsm_updates {
-            self.update_hints(page_num, free_space);
-        }
-        self.push_fsm_updates(&local_fsm_updates);
-
-        // Batch flush all FSM updates.
-        self.flush_fsm_updates().await?;
-
-        Ok(results)
-    }
-
-    /// Flushes a page buffer to the buffer pool or disk.
-    /// For fresh pages, writes the heap header and uses reserved frames when available.
-    /// For existing pages, writes through the standard write_page path.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    async fn flush_page_buf(
-        &self,
-        pid: PageId,
-        buf: &mut [u8; PAGE_SIZE],
-        is_fresh_page: bool,
-        page_header: &HeapPageHeader,
-        reserved_frames: &[FrameId],
-        reserved_idx: &mut usize,
-        local_fsm_updates: &mut Vec<(u32, usize)>,
-    ) -> Result<()> {
-        if is_fresh_page {
-            HeapPage::set_heap_header_in_slice(buf, *page_header);
-            if *reserved_idx < reserved_frames.len() {
-                let fid = reserved_frames[*reserved_idx];
-                *reserved_idx += 1;
-                self.pool.load_reserved_frame(fid, pid, buf);
-                self.pool.unpin_page(pid, true);
-            } else {
-                self.write_new_page(pid, buf).await?;
-            }
-            local_fsm_updates.push((pid.page_num as u32, page_header.free_space()));
-        } else {
-            self.write_page(pid, buf).await?;
-            local_fsm_updates.push((
-                pid.page_num as u32,
-                HeapPage::total_usable_space_in_slice(buf),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Guard that holds pinned pages during zero-copy scan iteration.
@@ -1232,11 +1081,15 @@ impl HeapFile {
 /// borrowing of tuple data directly from page buffers.
 pub struct ScanGuard<'a> {
     pool: &'a BufferPool,
+    /// Pages pinned in the pool for the guard's lifetime, unpinned on drop
     page_ids: Vec<PageId>,
+    /// Pages the pool had no frame for, carried as owned copies so the
+    /// scan still serves their rows
+    owned: Vec<(PageId, Box<[u8; PAGE_SIZE]>)>,
 }
 
 impl<'a> ScanGuard<'a> {
-    /// Returns the list of page IDs held by this scan guard.
+    /// Returns the list of pool-pinned page IDs held by this scan guard.
     #[inline]
     pub fn page_ids(&self) -> &[PageId] {
         &self.page_ids
@@ -1249,53 +1102,15 @@ impl<'a> ScanGuard<'a> {
     where
         F: FnMut(TupleId, TupleView<'_>),
     {
-        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 // Safety: page is pinned and frame_data_ptr returned valid pointer
                 let data = unsafe { &*p };
-                let raw_slot_count =
-                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
-                        as usize;
-                // Cap slot_count to prevent out-of-bounds reads from corrupt page headers.
-                let slot_count = raw_slot_count.min(max_slots);
-
-                for i in 0..slot_count {
-                    // Safety: slot_base is within page bounds (slot_count from page header)
-                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                    let tuple_length = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base + 2),
-                            *data.get_unchecked(slot_base + 3),
-                        ])
-                    } as usize;
-
-                    if tuple_length == 0 {
-                        continue;
-                    }
-
-                    let tuple_offset = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base),
-                            *data.get_unchecked(slot_base + 1),
-                        ])
-                    } as usize;
-
-                    // Safety: tuple_offset validated by page format, header fits in page
-                    let header = unsafe {
-                        TupleHeader::from_bytes_unchecked(
-                            &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
-                        )
-                    };
-                    let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-                    let data_end = data_start + header.data_len as usize;
-
-                    f(
-                        TupleId::new(page_id, i as u16),
-                        TupleView::new(header, &data[data_start..data_end]),
-                    );
-                }
+                for_each_tuple_in_page(page_id, data, &mut f);
             }
+        }
+        for (page_id, data) in &self.owned {
+            for_each_tuple_in_page(*page_id, data, &mut f);
         }
     }
 
@@ -1307,50 +1122,17 @@ impl<'a> ScanGuard<'a> {
     where
         F: FnMut(TupleId, TupleView<'_>) -> bool,
     {
-        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 let data = unsafe { &*p };
-                let raw_slot_count =
-                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
-                        as usize;
-                let slot_count = raw_slot_count.min(max_slots);
-
-                for i in 0..slot_count {
-                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                    let tuple_length = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base + 2),
-                            *data.get_unchecked(slot_base + 3),
-                        ])
-                    } as usize;
-
-                    if tuple_length == 0 {
-                        continue;
-                    }
-
-                    let tuple_offset = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base),
-                            *data.get_unchecked(slot_base + 1),
-                        ])
-                    } as usize;
-
-                    let header = unsafe {
-                        TupleHeader::from_bytes_unchecked(
-                            &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
-                        )
-                    };
-                    let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-                    let data_end = data_start + header.data_len as usize;
-
-                    if !f(
-                        TupleId::new(page_id, i as u16),
-                        TupleView::new(header, &data[data_start..data_end]),
-                    ) {
-                        return;
-                    }
+                if !try_for_each_tuple_in_page(page_id, data, &mut f) {
+                    return;
                 }
+            }
+        }
+        for (page_id, data) in &self.owned {
+            if !try_for_each_tuple_in_page(*page_id, data, &mut f) {
+                return;
             }
         }
     }
@@ -1358,32 +1140,125 @@ impl<'a> ScanGuard<'a> {
     /// Fast tuple count without constructing TupleView for each tuple.
     #[inline]
     pub fn count(&self) -> usize {
-        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         let mut total = 0;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 let data = unsafe { &*p };
-                let raw_slot_count =
-                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
-                        as usize;
-                let slot_count = raw_slot_count.min(max_slots);
-
-                for i in 0..slot_count {
-                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                    let tuple_length = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base + 2),
-                            *data.get_unchecked(slot_base + 3),
-                        ])
-                    } as usize;
-                    if tuple_length != 0 {
-                        total += 1;
-                    }
-                }
+                total += count_tuples_in_page(data);
             }
+        }
+        for (_, data) in &self.owned {
+            total += count_tuples_in_page(data.as_ref());
         }
         total
     }
+}
+
+/// Applies `f` to every live tuple of one page image.
+/// Uses raw pointer access and unchecked indexing for maximum throughput
+#[inline]
+fn for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F)
+where
+    F: FnMut(TupleId, TupleView<'_>),
+{
+    try_for_each_tuple_in_page(page_id, data, &mut |tid, view| {
+        f(tid, view);
+        true
+    });
+}
+
+/// Applies `f` to every live tuple of one page image until it returns
+/// false. Returns false when the callback stopped the iteration
+///
+/// Every field this reads lives in the slot array, which is dense and walked
+/// in order, so the row data is never touched and no prefetch hint is needed
+#[inline]
+fn try_for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F) -> bool
+where
+    F: FnMut(TupleId, TupleView<'_>) -> bool,
+{
+    let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
+    let raw_slot_count =
+        u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]]) as usize;
+    // Cap slot_count to prevent out-of-bounds reads from corrupt page headers
+    let slot_count = raw_slot_count.min(max_slots);
+
+    for i in 0..slot_count {
+        // Safety: slot_base spans one slot inside the page, because
+        // slot_count is capped at max_slots
+        let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+        let tuple_offset = unsafe {
+            u16::from_le_bytes([
+                *data.get_unchecked(slot_base),
+                *data.get_unchecked(slot_base + 1),
+            ])
+        } as usize;
+
+        // Offset 0 lies inside the page header, so it marks an empty slot
+        if tuple_offset == 0 {
+            continue;
+        }
+
+        let header = unsafe {
+            TupleHeader {
+                data_len: u16::from_le_bytes([
+                    *data.get_unchecked(slot_base + 2),
+                    *data.get_unchecked(slot_base + 3),
+                ]),
+                flags: TupleFlags(u16::from_le_bytes([
+                    *data.get_unchecked(slot_base + 4),
+                    *data.get_unchecked(slot_base + 5),
+                ])),
+                xmin: u32::from_le_bytes([
+                    *data.get_unchecked(slot_base + 8),
+                    *data.get_unchecked(slot_base + 9),
+                    *data.get_unchecked(slot_base + 10),
+                    *data.get_unchecked(slot_base + 11),
+                ]),
+                xmax: u32::from_le_bytes([
+                    *data.get_unchecked(slot_base + 12),
+                    *data.get_unchecked(slot_base + 13),
+                    *data.get_unchecked(slot_base + 14),
+                    *data.get_unchecked(slot_base + 15),
+                ]),
+            }
+        };
+        let data_end = tuple_offset + header.data_len as usize;
+        if data_end > PAGE_SIZE {
+            continue;
+        }
+
+        if !f(
+            TupleId::new(page_id, i as u16),
+            TupleView::new(header, &data[tuple_offset..data_end]),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Live tuples in one page image, from the slot directory alone
+#[inline]
+fn count_tuples_in_page(data: &[u8; PAGE_SIZE]) -> usize {
+    let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
+    let raw_slot_count =
+        u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]]) as usize;
+    let slot_count = raw_slot_count.min(max_slots);
+    let mut total = 0;
+    for i in 0..slot_count {
+        let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+        let tuple_offset = unsafe {
+            u16::from_le_bytes([
+                *data.get_unchecked(slot_base),
+                *data.get_unchecked(slot_base + 1),
+            ])
+        } as usize;
+        if tuple_offset != 0 {
+            total += 1;
+        }
+    }
+    total
 }
 
 impl Drop for ScanGuard<'_> {
@@ -1417,6 +1292,45 @@ mod tests {
         let (heap, _dir) = create_test_heap().await;
         assert_eq!(heap.heap_file_id(), 0);
         assert_eq!(heap.fsm_file_id(), 1);
+    }
+
+    /// A pool smaller than the heap forces evictions, and the scan must
+    /// read the missing pages back rather than skipping their rows. This
+    /// needs no concurrency: filling the heap past the pool evicts pages,
+    /// and the very next scan used to lose their tuples.
+    #[tokio::test]
+    async fn test_scan_serves_rows_from_evicted_pages() {
+        let dir = tempdir().unwrap();
+        let config = DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+        };
+        let disk = Arc::new(DiskManager::new(config).await.unwrap());
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8 }));
+        let heap = HeapFile::with_defaults(disk, pool).unwrap();
+
+        // ~1.5KB tuples, a handful per 16KB page, spread over far more
+        // pages than the pool has frames
+        let mut inserted = 0usize;
+        for _ in 0..20 {
+            let tuples: Vec<Tuple> = (0..10).map(|_| Tuple::new(vec![7u8; 1500], 1)).collect();
+            heap.insert_batch(&tuples).await.unwrap();
+            inserted += 10;
+        }
+
+        let guard = heap.scan().unwrap();
+        assert_eq!(
+            guard.count(),
+            inserted,
+            "every inserted row is served, resident or evicted"
+        );
+
+        let mut seen = 0usize;
+        guard.for_each(|_, view| {
+            assert_eq!(view.data[0], 7u8);
+            seen += 1;
+        });
+        assert_eq!(seen, inserted);
     }
 
     #[tokio::test]

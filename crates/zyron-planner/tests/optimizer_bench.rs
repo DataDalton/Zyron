@@ -15,7 +15,9 @@ use zyron_common::TypeId;
 use zyron_parser::ast::{BinaryOperator, JoinType, LiteralValue};
 use zyron_planner::binder::{BoundExpr, ColumnRef};
 use zyron_planner::cost::{CostModel, EncodingCostParameters, PlanCost};
-use zyron_planner::explain::{ActualMetrics, ExplainFormat, ExplainNode, ExplainOptions};
+use zyron_planner::explain::{
+    ActualMetrics, ExplainFormat, ExplainNode, ExplainOptions, NodeMetrics,
+};
 use zyron_planner::logical::LogicalPlan;
 use zyron_planner::optimizer::cardinality::CardinalityEstimator;
 use zyron_planner::optimizer::rules::encoding_pushdown::{self, EncodingHint};
@@ -41,7 +43,7 @@ fn col_ref(col_id: u16) -> BoundExpr {
         column_id: ColumnId(col_id),
         type_id: TypeId::Int64,
         nullable: false,
-        ts_precision: None,
+        fractional_digits: None,
     })
 }
 
@@ -254,7 +256,7 @@ fn test_cardinality_estimator_equality() {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })),
         op: BinaryOperator::Eq,
         right: Box::new(BoundExpr::Literal {
@@ -523,7 +525,7 @@ fn test_encoding_hint_analysis() {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })),
         op: BinaryOperator::Eq,
         right: Box::new(BoundExpr::Literal {
@@ -550,7 +552,7 @@ fn test_encoding_hint_analysis() {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })),
         op: BinaryOperator::Gt,
         right: Box::new(BoundExpr::Literal {
@@ -1168,11 +1170,22 @@ fn test_v6_explain_analyze() {
 
     // Merge actual metrics (simulating EXPLAIN ANALYZE)
     let mut analyzed = root;
-    let metrics = vec![
-        (982, 3.2, 5),       // Filter: 982 actual rows, 3.2ms
-        (100000, 15.7, 100), // SeqScan: 100000 actual rows, 15.7ms
-    ];
-    analyzed.merge_metrics_flat(&metrics);
+    let metrics = NodeMetrics {
+        name: analyzed.operator_name.clone(),
+        rows: 982,
+        elapsed_ns: 3_200_000,
+        batches: 5,
+        aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
+        children: vec![NodeMetrics {
+            name: analyzed.children[0].operator_name.clone(),
+            rows: 100_000,
+            elapsed_ns: 15_700_000,
+            batches: 100,
+            aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
+            children: Vec::new(),
+        }],
+    };
+    analyzed.merge_metrics(&metrics);
 
     let analyze_opts = ExplainOptions {
         analyze: true,
@@ -1225,8 +1238,9 @@ fn test_v6_explain_analyze() {
         }),
         actual_metrics: Some(ActualMetrics {
             rows: 500_000,
-            elapsed_ms: 100.0,
+            elapsed_ns: 100_000_000,
             batches: 50,
+            aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
         }),
         children: Vec::new(),
     };
@@ -1678,8 +1692,9 @@ fn test_perf_explain_analyze_overhead() {
         let mut plan_with_metrics = plan.clone();
         plan_with_metrics.actual_metrics = Some(ActualMetrics {
             rows: 1_000_000,
-            elapsed_ms: 150.0,
+            elapsed_ns: 150_000_000,
             batches: 1000,
+            aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
         });
 
         let start_analyze = Instant::now();

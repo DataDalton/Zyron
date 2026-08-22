@@ -431,6 +431,20 @@ pub enum ZyronError {
     #[error("Graph algorithm error: {0}")]
     GraphAlgorithmError(String),
 
+    // Lake table format errors
+    #[error("Lake commit conflict: {mine} vs concurrent {theirs}: {reason}")]
+    ConflictError {
+        mine: String,
+        theirs: String,
+        reason: String,
+    },
+
+    #[error("Lake manifest corrupted: {path}: {reason}")]
+    ManifestCorrupted { path: String, reason: String },
+
+    #[error("Clustering proposal rejected: {0}")]
+    ClusteringRejected(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),

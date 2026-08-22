@@ -1,0 +1,34 @@
+# suite:   wire
+# run:     2026-08-16_220048_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Connection Handshake Latency Test ===
+  Server listening on 127.0.0.1:60480
+
+--- Run 1/5 ---
+
+  500 handshakes (500 success) in 212.30ms, avg 424.6 us/handshake
+
+--- Run 2/5 ---
+
+  500 handshakes (500 success) in 225.38ms, avg 450.8 us/handshake
+
+--- Run 3/5 ---
+
+  500 handshakes (500 success) in 256.34ms, avg 512.7 us/handshake
+
+--- Run 4/5 ---
+
+  500 handshakes (500 success) in 200.82ms, avg 401.6 us/handshake
+
+--- Run 5/5 ---
+
+  500 handshakes (500 success) in 177.31ms, avg 354.6 us/handshake
+
+  Handshake latency (us) [FAIL/REGR!]:
+    Runs: [425, 451, 513, 402, 355]
+    Average: 429 <= 50 (target)
+    Min/Max: 355 / 513, StdDev: 52

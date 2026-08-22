@@ -8,10 +8,14 @@ pub trait Replacer: Send + Sync {
     /// Records that the given frame was accessed (sets reference bit).
     fn record_access(&self, frame_id: FrameId);
 
-    /// Selects a victim frame for eviction.
-    /// The is_evictable closure checks if a frame can be evicted (pin_count == 0).
-    /// Returns None if no frames are evictable.
-    fn evict<F>(&self, is_evictable: F) -> Option<FrameId>
+    /// Selects a victim frame for eviction and hands it to the caller
+    /// exclusively.
+    ///
+    /// `try_claim` must take the frame in one step, returning true only if
+    /// this caller now owns it. A closure that merely reports evictability
+    /// lets two concurrent sweeps return the same frame. Returns None when no
+    /// frame could be claimed.
+    fn evict<F>(&self, try_claim: F) -> Option<FrameId>
     where
         F: Fn(FrameId) -> bool;
 
@@ -63,7 +67,7 @@ impl Replacer for ClockReplacer {
         }
     }
 
-    fn evict<F>(&self, is_evictable: F) -> Option<FrameId>
+    fn evict<F>(&self, try_claim: F) -> Option<FrameId>
     where
         F: Fn(FrameId) -> bool,
     {
@@ -74,15 +78,18 @@ impl Replacer for ClockReplacer {
             let idx = self.clock_hand.fetch_add(1, Ordering::Relaxed) % num_frames;
             let frame_id = FrameId(idx as u32);
 
-            // Check if frame is evictable (pin_count == 0)
-            if is_evictable(frame_id) {
-                if !self.reference_bits[idx].load(Ordering::Relaxed) {
-                    // Found victim: evictable and reference bit is 0
-                    return Some(frame_id);
-                } else {
-                    // Clear reference bit, give second chance
-                    self.reference_bits[idx].store(false, Ordering::Relaxed);
-                }
+            if self.reference_bits[idx].load(Ordering::Relaxed) {
+                // Referenced recently, clear the bit and give it a second chance
+                self.reference_bits[idx].store(false, Ordering::Relaxed);
+                continue;
+            }
+            // The claim takes the frame in the same step that finds it free.
+            // Reporting a victim the caller then has to take separately let
+            // two sweeps return the same frame, and both callers reused it:
+            // two page ids ended up sharing one buffer, so a read of either
+            // returned the other's bytes
+            if try_claim(frame_id) {
+                return Some(frame_id);
             }
         }
 

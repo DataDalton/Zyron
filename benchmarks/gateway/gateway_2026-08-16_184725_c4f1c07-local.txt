@@ -1,0 +1,216 @@
+# suite:   gateway
+# run:     2026-08-16_184725_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Endpoint Param Substitution Throughput ===
+--- Run 1/5 ---
+
+  1,000,000 substitutions in 205.00ms, 4,877,973 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 substitutions in 204.76ms, 4,883,816 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 substitutions in 203.25ms, 4,919,994 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 substitutions in 203.37ms, 4,917,245 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 substitutions in 204.13ms, 4,898,873 ops/sec
+
+  3-param template substitution (ops/sec) [PASS/OK]:
+    Runs: [4,877,973, 4,883,816, 4,919,994, 4,917,245, 4,898,873]
+    Average: 4,899,580 >= 500,000 (target)
+    Min/Max: 4,877,973 / 4,919,994, StdDev: 16,998
+
+=== Middleware Pipeline Throughput ===
+--- Run 1/5 ---
+
+  100,000 pipeline runs in 1.96ms, 51,085,568 ops/sec, 0.02 us/iter
+
+--- Run 2/5 ---
+
+  100,000 pipeline runs in 1.90ms, 52,759,312 ops/sec, 0.02 us/iter
+
+--- Run 3/5 ---
+
+  100,000 pipeline runs in 1.89ms, 52,856,916 ops/sec, 0.02 us/iter
+
+--- Run 4/5 ---
+
+  100,000 pipeline runs in 1.92ms, 52,077,909 ops/sec, 0.02 us/iter
+
+--- Run 5/5 ---
+
+  100,000 pipeline runs in 1.90ms, 52,637,120 ops/sec, 0.02 us/iter
+
+  run_pipeline throughput (ops/sec) [PASS/OK]:
+    Runs: [51,085,568, 52,759,312, 52,856,916, 52,077,909, 52,637,120]
+    Average: 52,283,365 >= 100,000 (target)
+    Min/Max: 51,085,568 / 52,856,916, StdDev: 656,895
+
+=== OpenAPI Emission Cost ===
+--- Run 1/5 ---
+
+  1,000 emissions (50 endpoints) in 12.80ms, 0.013 ms/emission
+
+--- Run 2/5 ---
+
+  1,000 emissions (50 endpoints) in 12.64ms, 0.013 ms/emission
+
+--- Run 3/5 ---
+
+  1,000 emissions (50 endpoints) in 12.65ms, 0.013 ms/emission
+
+--- Run 4/5 ---
+
+  1,000 emissions (50 endpoints) in 12.88ms, 0.013 ms/emission
+
+--- Run 5/5 ---
+
+  1,000 emissions (50 endpoints) in 12.55ms, 0.013 ms/emission
+
+  emit_openapi_json(50) per emission (ms) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Path Param Extraction Throughput ===
+--- Run 1/5 ---
+
+  1,000,000 extracts (1,000,000 matched) in 113.93ms, 8,777,481 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 extracts (1,000,000 matched) in 113.80ms, 8,787,200 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 extracts (1,000,000 matched) in 113.78ms, 8,788,644 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 extracts (1,000,000 matched) in 114.98ms, 8,697,505 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 extracts (1,000,000 matched) in 114.64ms, 8,722,989 ops/sec
+
+  CompiledRoute.match_path throughput (ops/sec) [PASS/OK]:
+    Runs: [8,777,481, 8,787,200, 8,788,644, 8,697,505, 8,722,989]
+    Average: 8,754,764 >= 1,000,000 (target)
+    Min/Max: 8,697,505 / 8,788,644, StdDev: 37,428
+
+=== Router Lookup Throughput ===
+--- Run 1/5 ---
+
+  1,000,000 lookups (666,666 hits) in 113.85ms, 8,783,518 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 lookups (666,666 hits) in 113.64ms, 8,799,711 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 lookups (666,666 hits) in 113.44ms, 8,815,567 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 lookups (666,666 hits) in 113.49ms, 8,811,667 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 lookups (666,666 hits) in 113.23ms, 8,831,652 ops/sec
+
+  Router.lookup throughput (ops/sec) [PASS/OK]:
+    Runs: [8,783,518, 8,799,711, 8,815,567, 8,811,667, 8,831,652]
+    Average: 8,808,423 >= 2,000,000 (target)
+    Min/Max: 8,783,518 / 8,831,652, StdDev: 16,108
+
+=== SSE Event Emission Throughput ===
+--- Run 1/5 ---
+
+  1,000,000 events, 62,888,890 bytes written in 29.55ms, 33,842,436 events/sec
+
+--- Run 2/5 ---
+
+  1,000,000 events, 62,888,890 bytes written in 29.45ms, 33,959,432 events/sec
+
+--- Run 3/5 ---
+
+  1,000,000 events, 62,888,890 bytes written in 29.44ms, 33,962,431 events/sec
+
+--- Run 4/5 ---
+
+  1,000,000 events, 62,888,890 bytes written in 29.43ms, 33,978,009 events/sec
+
+--- Run 5/5 ---
+
+  1,000,000 events, 62,888,890 bytes written in 29.38ms, 34,040,931 events/sec
+
+  encode_event+sink.extend (events/sec) [PASS/OK]:
+    Runs: [33,842,436, 33,959,432, 33,962,431, 33,978,009, 34,040,931]
+    Average: 33,956,648 >= 1,000,000 (target)
+    Min/Max: 33,842,436 / 34,040,931, StdDev: 64,258
+
+=== WebSocket Frame Encode+Decode Throughput ===
+--- Run 1/5 ---
+
+  Text 100B: 1,000,000 roundtrips in 7.02ms, 142,525,263 ops/sec
+
+  Binary 1KB: 1,000,000 roundtrips in 28.28ms, 35,358,303 ops/sec
+
+  Ping+Pong: 2,000,000 frames in 4.89ms, 409,031,414 ops/sec
+
+--- Run 2/5 ---
+
+  Text 100B: 1,000,000 roundtrips in 6.21ms, 160,981,342 ops/sec
+
+  Binary 1KB: 1,000,000 roundtrips in 28.47ms, 35,120,498 ops/sec
+
+  Ping+Pong: 2,000,000 frames in 4.87ms, 410,340,583 ops/sec
+
+--- Run 3/5 ---
+
+  Text 100B: 1,000,000 roundtrips in 6.76ms, 147,979,342 ops/sec
+
+  Binary 1KB: 1,000,000 roundtrips in 28.09ms, 35,598,083 ops/sec
+
+  Ping+Pong: 2,000,000 frames in 4.91ms, 407,207,574 ops/sec
+
+--- Run 4/5 ---
+
+  Text 100B: 1,000,000 roundtrips in 6.67ms, 149,999,250 ops/sec
+
+  Binary 1KB: 1,000,000 roundtrips in 28.15ms, 35,523,600 ops/sec
+
+  Ping+Pong: 2,000,000 frames in 4.91ms, 407,439,852 ops/sec
+
+--- Run 5/5 ---
+
+  Text 100B: 1,000,000 roundtrips in 6.54ms, 152,879,485 ops/sec
+
+  Binary 1KB: 1,000,000 roundtrips in 28.28ms, 35,359,429 ops/sec
+
+  Ping+Pong: 2,000,000 frames in 4.94ms, 404,907,479 ops/sec
+
+  100-byte text frame roundtrip (ops/sec) [PASS/OK]:
+    Runs: [142,525,263, 160,981,342, 147,979,342, 149,999,250, 152,879,485]
+    Average: 150,872,936 >= 10,000,000 (target)
+    Min/Max: 142,525,263 / 160,981,342, StdDev: 6,083,190
+  1 KB binary frame roundtrip (ops/sec) [PASS/OK]:
+    Runs: [35,358,303, 35,120,498, 35,598,083, 35,523,600, 35,359,429]
+    Average: 35,391,983 >= 5,000,000 (target)
+    Min/Max: 35,120,498 / 35,598,083, StdDev: 164,741
+  Ping+Pong frame roundtrip (ops/sec) [PASS/OK]:
+    Runs: [409,031,414, 410,340,583, 407,207,574, 407,439,852, 404,907,479]
+    Average: 407,785,380 >= 10,000,000 (target)
+    Min/Max: 404,907,479 / 410,340,583, StdDev: 1,833,970

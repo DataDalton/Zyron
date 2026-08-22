@@ -304,9 +304,9 @@ pub fn scalar_write_binary(scalar: &ScalarValue, buf: &mut BytesMut) -> bool {
             true
         }
         ScalarValue::Int128(v) => {
-            // Numeric types sent as text representation in binary mode.
-            let mut b = itoa::Buffer::new();
-            buf.extend_from_slice(b.format(*v).as_bytes());
+            // An Int128 column maps to the NUMERIC oid, so binary format
+            // means the numeric wire layout, not text digits
+            write_numeric_binary(*v, 0, buf);
             true
         }
         ScalarValue::UInt8(v) => {
@@ -322,8 +322,9 @@ pub fn scalar_write_binary(scalar: &ScalarValue, buf: &mut BytesMut) -> bool {
             true
         }
         ScalarValue::UInt64(v) => {
-            let mut b = itoa::Buffer::new();
-            buf.extend_from_slice(b.format(*v).as_bytes());
+            // A UInt64 column maps to the NUMERIC oid, so binary format
+            // means the numeric wire layout, not text digits
+            write_numeric_parts(*v as u128, false, 0, buf);
             true
         }
         ScalarValue::Float32(v) => {
@@ -351,6 +352,87 @@ pub fn scalar_write_binary(scalar: &ScalarValue, buf: &mut BytesMut) -> bool {
             buf.extend_from_slice(&i.to_le_bytes());
             true
         }
+    }
+}
+
+/// The numeric sign field for a negative value.
+const NUMERIC_NEG: i16 = 0x4000;
+/// The numeric sign field for NaN.
+const NUMERIC_NAN: u16 = 0xC000;
+
+/// Writes a scaled decimal in the PG numeric binary wire layout: digit
+/// count, weight, sign and display scale as i16, then the digits in base
+/// 10000, most significant group first. `digits` holds the value times ten
+/// to `dscale`, which is how DECIMAL columns store it.
+pub fn write_numeric_binary(digits: i128, dscale: u8, buf: &mut BytesMut) {
+    write_numeric_parts(digits.unsigned_abs(), digits < 0, dscale, buf);
+}
+
+/// The layout writer behind `write_numeric_binary`, on an unsigned
+/// magnitude so a u64 value routes through without a signed detour.
+pub fn write_numeric_parts(abs: u128, negative: bool, dscale: u8, buf: &mut BytesMut) {
+    let sign: i16 = if negative { NUMERIC_NEG } else { 0 };
+    let scale_pow = 10u128.pow(dscale as u32);
+    let int_part = abs / scale_pow;
+    let frac_part = abs % scale_pow;
+
+    // Integer groups, most significant first
+    let mut groups: Vec<i16> = Vec::new();
+    let mut n = int_part;
+    while n > 0 {
+        groups.push((n % 10_000) as i16);
+        n /= 10_000;
+    }
+    groups.reverse();
+    let int_groups = groups.len();
+
+    // Fraction digits with leading zeros out to the declared scale,
+    // chunked into base 10000 groups from the decimal point rightward,
+    // the last group padded with trailing zeros. The string walk avoids
+    // multiplying a 38-digit magnitude past what u128 holds
+    if dscale > 0 {
+        let s = format!("{:0width$}", frac_part, width = dscale as usize);
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut group: i16 = 0;
+            for j in 0..4 {
+                let d = if i + j < bytes.len() {
+                    (bytes[i + j] - b'0') as i16
+                } else {
+                    0
+                };
+                group = group * 10 + d;
+            }
+            groups.push(group);
+            i += 4;
+        }
+    }
+
+    // Zero groups at either end carry no value. Each dropped leading
+    // group moves the first kept digit one base 10000 place lower
+    let mut start = 0;
+    while start < groups.len() && groups[start] == 0 {
+        start += 1;
+    }
+    let mut end = groups.len();
+    while end > start && groups[end - 1] == 0 {
+        end -= 1;
+    }
+    if start == end {
+        buf.put_i16(0);
+        buf.put_i16(0);
+        buf.put_i16(sign);
+        buf.put_i16(dscale as i16);
+        return;
+    }
+    let weight = int_groups as i16 - 1 - start as i16;
+    buf.put_i16((end - start) as i16);
+    buf.put_i16(weight);
+    buf.put_i16(sign);
+    buf.put_i16(dscale as i16);
+    for g in &groups[start..end] {
+        buf.put_i16(*g);
     }
 }
 
@@ -431,6 +513,19 @@ pub fn write_vector_text(bytes: &[u8], buf: &mut BytesMut) {
         buf.extend_from_slice(rb.format(val as f64).as_bytes());
     }
     buf.put_u8(b']');
+}
+
+/// Writes an array value in the braced form it is written in, `{1,2,NULL}`.
+/// A value that does not parse as an array falls back to its plain text form
+/// rather than being dropped.
+pub fn write_array_text(scalar: &ScalarValue, buf: &mut BytesMut) {
+    if let ScalarValue::Binary(bytes) = scalar
+        && let Some(view) = zyron_common::ArrayView::parse(bytes)
+    {
+        buf.extend_from_slice(view.render_text().as_bytes());
+        return;
+    }
+    scalar_write_text(scalar, buf);
 }
 
 /// Writes a vector value in binary format: u16 dimension count followed by
@@ -686,6 +781,7 @@ pub fn binary_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Prot
                 bytes[..8].try_into().unwrap(),
             )))
         }
+        PG_NUMERIC_OID => decode_numeric_binary(bytes),
         // A binary-format parameter carries an explicit nonzero type oid. An oid
         // not handled above has no defined binary layout here, so reject it
         // rather than mis-decode the bytes as text.
@@ -693,6 +789,86 @@ pub fn binary_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Prot
             "Unsupported binary parameter type oid {other}"
         ))),
     }
+}
+
+/// Decodes a PG numeric binary parameter. An integral value binds as Int64
+/// or Int128, a fractional one binds as Float64, which is the same value
+/// domain a text-format numeric parameter binds to, so the two formats
+/// select and insert identically.
+fn decode_numeric_binary(bytes: &[u8]) -> Result<ScalarValue, ProtocolError> {
+    if bytes.len() < 8 {
+        return Err(ProtocolError::Malformed(
+            "Numeric requires at least 8 bytes".into(),
+        ));
+    }
+    let ndigits = i16::from_be_bytes([bytes[0], bytes[1]]);
+    let weight = i16::from_be_bytes([bytes[2], bytes[3]]) as i32;
+    let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let dscale = i16::from_be_bytes([bytes[6], bytes[7]]) as i32;
+    if sign == NUMERIC_NAN {
+        return Ok(ScalarValue::Float64(f64::NAN));
+    }
+    if sign != 0 && sign != NUMERIC_NEG as u16 {
+        return Err(ProtocolError::Malformed(format!(
+            "Numeric sign field {sign:#06x} is not positive, negative or NaN"
+        )));
+    }
+    if ndigits < 0 || bytes.len() != 8 + ndigits as usize * 2 {
+        return Err(ProtocolError::Malformed(
+            "Numeric digit count does not match the payload".into(),
+        ));
+    }
+    if !(0..=38).contains(&dscale) {
+        return Err(ProtocolError::Malformed(format!(
+            "Numeric scale {dscale} is outside the supported 0 to 38 range"
+        )));
+    }
+    // The value times ten to dscale, so every declared fractional place is
+    // a whole digit. A group's contribution is g * 10^(4 * (weight - i)),
+    // and up to three digits of the last group can sit past the declared
+    // scale as zero padding, which divides back out exactly
+    let mut scaled: i128 = 0;
+    for i in 0..ndigits as i32 {
+        let off = 8 + i as usize * 2;
+        let g = i16::from_be_bytes([bytes[off], bytes[off + 1]]);
+        if !(0..=9999).contains(&g) {
+            return Err(ProtocolError::Malformed(format!(
+                "Numeric digit group {g} is outside base 10000"
+            )));
+        }
+        let exp = 4 * (weight - i) + dscale;
+        let contribution = if exp >= 0 {
+            if exp > 42 {
+                return Err(ProtocolError::Malformed(
+                    "Numeric value exceeds the 128-bit decimal range".into(),
+                ));
+            }
+            (g as i128).checked_mul(10i128.pow(exp as u32))
+        } else {
+            let divisor = 10i128.pow((-exp).min(8) as u32);
+            if (g as i128) % divisor != 0 {
+                return Err(ProtocolError::Malformed(format!(
+                    "Numeric value carries more fractional digits than its declared scale {dscale}"
+                )));
+            }
+            Some((g as i128) / divisor)
+        };
+        scaled = contribution
+            .and_then(|c| scaled.checked_add(c))
+            .ok_or_else(|| {
+                ProtocolError::Malformed("Numeric value exceeds the 128-bit decimal range".into())
+            })?;
+    }
+    if sign == NUMERIC_NEG as u16 {
+        scaled = -scaled;
+    }
+    if dscale == 0 {
+        return Ok(match i64::try_from(scaled) {
+            Ok(v) => ScalarValue::Int64(v),
+            Err(_) => ScalarValue::Int128(scaled),
+        });
+    }
+    Ok(ScalarValue::Float64(scaled as f64 / 10f64.powi(dscale)))
 }
 
 /// Parses a UUID string into 16 bytes. Accepts "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
@@ -1041,5 +1217,95 @@ mod tests {
     fn test_text_to_scalar_invalid_int() {
         let result = text_to_scalar(b"not_a_number", PG_INT4_OID);
         assert!(result.is_err());
+    }
+
+    /// Reads the header fields and digit groups back out of an encoded
+    /// numeric so a test asserts the exact wire layout.
+    fn numeric_fields(buf: &[u8]) -> (i16, i16, u16, i16, Vec<i16>) {
+        let ndigits = i16::from_be_bytes([buf[0], buf[1]]);
+        let weight = i16::from_be_bytes([buf[2], buf[3]]);
+        let sign = u16::from_be_bytes([buf[4], buf[5]]);
+        let dscale = i16::from_be_bytes([buf[6], buf[7]]);
+        let digits = (0..ndigits as usize)
+            .map(|i| i16::from_be_bytes([buf[8 + 2 * i], buf[9 + 2 * i]]))
+            .collect();
+        (ndigits, weight, sign, dscale, digits)
+    }
+
+    /// The numeric binary layout the encoder writes, checked against the
+    /// wire format field by field. Text digits in a binary-format column
+    /// are unreadable to a client that asked for binary, which is what
+    /// these values used to receive.
+    #[test]
+    fn test_numeric_binary_layout_matches_the_wire_format() {
+        let mut buf = BytesMut::new();
+        write_numeric_binary(12345, 2, &mut buf);
+        assert_eq!(numeric_fields(&buf), (2, 0, 0, 2, vec![123, 4500]));
+
+        let mut buf = BytesMut::new();
+        write_numeric_binary(5, 5, &mut buf);
+        assert_eq!(
+            numeric_fields(&buf),
+            (1, -2, 0, 5, vec![5000]),
+            "a leading zero group is dropped and the weight steps down"
+        );
+
+        let mut buf = BytesMut::new();
+        write_numeric_binary(-99_999_999, 4, &mut buf);
+        assert_eq!(
+            numeric_fields(&buf),
+            (2, 0, 0x4000, 4, vec![9999, 9999]),
+            "the sign field carries the negative marker"
+        );
+
+        let mut buf = BytesMut::new();
+        write_numeric_binary(0, 3, &mut buf);
+        assert_eq!(
+            numeric_fields(&buf),
+            (0, 0, 0, 3, vec![]),
+            "zero keeps its declared scale with no digit groups"
+        );
+
+        let mut buf = BytesMut::new();
+        write_numeric_parts(u64::MAX as u128, false, 0, &mut buf);
+        assert_eq!(
+            numeric_fields(&buf),
+            (5, 4, 0, 0, vec![1844, 6744, 737, 955, 1615]),
+            "a UInt64 magnitude encodes as plain base 10000 groups"
+        );
+    }
+
+    /// A binary NUMERIC parameter binds instead of being rejected, and it
+    /// binds to the same value domain a text-format numeric bind produces.
+    #[test]
+    fn test_binary_numeric_params_bind_like_text_ones() {
+        let mut buf = BytesMut::new();
+        let wide: i128 = 123_456_789_012_345_678_901_234_567;
+        write_numeric_binary(wide, 0, &mut buf);
+        assert_eq!(
+            binary_to_scalar(&buf, PG_NUMERIC_OID).expect("wide integral binds"),
+            ScalarValue::Int128(wide)
+        );
+
+        let mut buf = BytesMut::new();
+        write_numeric_binary(-42, 0, &mut buf);
+        assert_eq!(
+            binary_to_scalar(&buf, PG_NUMERIC_OID).expect("small integral binds"),
+            ScalarValue::Int64(-42)
+        );
+
+        let mut buf = BytesMut::new();
+        write_numeric_binary(12345, 2, &mut buf);
+        assert_eq!(
+            binary_to_scalar(&buf, PG_NUMERIC_OID).expect("fractional binds"),
+            ScalarValue::Float64(123.45),
+            "the fractional bind matches what the text path produces"
+        );
+
+        let garbage = [0u8; 6];
+        assert!(
+            binary_to_scalar(&garbage, PG_NUMERIC_OID).is_err(),
+            "a short payload is refused"
+        );
     }
 }

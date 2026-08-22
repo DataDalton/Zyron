@@ -22,10 +22,7 @@ use zyron_parser::ast::{ColumnDef, DataType};
 use zyron_planner::physical::PhysicalPlan;
 use zyron_server::background::compaction::{CompactionWorker, CompactionWorkerConfig};
 use zyron_server::columnar_recovery::reconcile_columnar;
-use zyron_storage::columnar::{
-    ColumnarPatchManager, SEGMENT_HEADER_SIZE, SYS_COL_XMIN, SegmentHeader, ZONE_MAP_BATCH_SIZE,
-    ZONE_MAP_ENTRY_SIZE, ZyrFileReader,
-};
+use zyron_storage::columnar::{ColumnarPatchManager, SYS_COL_XMIN, ZyrFileReader, segment_regions};
 use zyron_storage::encoding::create_encoding;
 use zyron_storage::txn::TransactionManager;
 use zyron_storage::{DiskManager, DiskManagerConfig, HeapFile, HeapFileConfig, Tuple};
@@ -53,6 +50,12 @@ fn encode_row(k: i64, name: &str, v: i64) -> Vec<u8> {
     d
 }
 
+/// Decodes one column straight from its raw segment bytes.
+///
+/// The region arithmetic lives in `columnar::segment_regions`, which is
+/// what the decode path, the predicate path and the scan all read. A
+/// fourth copy here would drift from them and then assert against a
+/// layout nobody writes
 fn decode_column_raw(
     reader: &ZyrFileReader,
     column_id: u32,
@@ -60,21 +63,12 @@ fn decode_column_raw(
     value_size: usize,
 ) -> Vec<u8> {
     let raw = reader.read_segment_raw(column_id).expect("segment raw");
-    let mut hdr = [0u8; SEGMENT_HEADER_SIZE];
-    hdr.copy_from_slice(&raw[..SEGMENT_HEADER_SIZE]);
-    let h = SegmentHeader::from_bytes(&hdr).expect("seg header");
-    let bloom = h.bloom_filter_size as usize;
-    let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
-    let zm = zones * ZONE_MAP_ENTRY_SIZE;
-    let nb = if h.null_count > 0 {
-        row_count.div_ceil(8)
-    } else {
-        0
-    };
-    let start = SEGMENT_HEADER_SIZE + bloom + zm + nb;
-    let end = start + h.encoded_size as usize;
-    create_encoding(h.encoding_type)
-        .decode(&raw[start..end], row_count, value_size)
+    let regions = segment_regions(&raw, column_id, row_count).expect("segment regions");
+    let encoded = regions
+        .verified_payload(&raw, column_id)
+        .expect("payload checksum");
+    create_encoding(regions.header.encoding_type)
+        .decode(encoded, row_count, value_size)
         .expect("decode")
 }
 
@@ -88,22 +82,12 @@ async fn columnar_seam_fold_read_mutate_recover() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -151,7 +135,6 @@ async fn columnar_seam_fold_read_mutate_recover() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let rt_handle = tokio::runtime::Handle::current();
@@ -170,7 +153,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, catalog2, txn2, disk2, pool2, wal2, cfg2, None)
+            CompactionWorker::run_cycle(
+                &rt, catalog2, txn2, disk2, pool2, wal2, cfg2, None, None, None, None,
+            )
         })
     };
     let _ = rt_handle;
@@ -204,15 +189,15 @@ async fn columnar_seam_fold_read_mutate_recover() {
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect(),
         alias: "metrics".into(),
         encoding_hints: None,
         as_of: None,
     };
-    let physical =
-        zyron_planner::physical::builder::build_physical_plan(logical, &catalog).expect("plan");
+    let physical = zyron_planner::physical::builder::build_physical_plan(logical, &catalog, None)
+        .expect("plan");
     assert!(
         matches!(physical, PhysicalPlan::HybridScan { .. }),
         "planner must pick HybridScan once segments exist, got {:?}",
@@ -229,7 +214,7 @@ async fn columnar_seam_fold_read_mutate_recover() {
             column_id: c.id,
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
     };
     let scan_for_agg = zyron_planner::logical::LogicalPlan::Scan {
@@ -244,7 +229,7 @@ async fn columnar_seam_fold_read_mutate_recover() {
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect(),
         alias: "metrics".into(),
@@ -278,8 +263,8 @@ async fn columnar_seam_fold_read_mutate_recover() {
         ],
         child: Arc::new(scan_for_agg),
     };
-    let agg_phys =
-        zyron_planner::physical::builder::build_physical_plan(agg, &catalog).expect("agg plan");
+    let agg_phys = zyron_planner::physical::builder::build_physical_plan(agg, &catalog, None)
+        .expect("agg plan");
     match agg_phys {
         PhysicalPlan::ColumnarMetadataAggregate { ref specs, .. } => {
             use zyron_planner::physical::MetaAggKind::*;
@@ -320,7 +305,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
     });
     assert_eq!(rows2, 0, "folded rows were handed off out of the heap");
 
@@ -331,9 +318,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
     let fid = seg.file_id;
     let rid0 = seg.sys_rowid_lo;
     store
-        .append_value_patch(fid, rid0, v_col, 50, 1, &7777i64.to_le_bytes())
+        .append_value_patch(0, fid, rid0, v_col, 50, 1, &7777i64.to_le_bytes())
         .unwrap();
-    store.append_supersede(fid, rid0 + 1, 60, 2).unwrap();
+    store.append_supersede(0, fid, rid0 + 1, 60, 2).unwrap();
     let o0 = store.row_overlay(fid, rid0).expect("value overlay");
     assert_eq!(
         i64::from_le_bytes(o0.patches[&v_col][0].value[..8].try_into().unwrap()),
@@ -350,7 +337,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
     });
     let te = catalog.get_table_by_id(table_id).unwrap();
     assert_eq!(
@@ -442,22 +431,12 @@ async fn columnar_time_travel_version_visibility() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -509,7 +488,6 @@ async fn columnar_time_travel_version_visibility() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let (rows, _segs) = tokio::task::block_in_place(|| {
@@ -517,7 +495,9 @@ async fn columnar_time_travel_version_visibility() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
     });
     assert_eq!(rows, 12, "all rows folded out of the heap");
     let te = catalog.get_table_by_id(table_id).unwrap();
@@ -536,7 +516,7 @@ async fn columnar_time_travel_version_visibility() {
         name: "k".into(),
         type_id: kcol_entry.type_id,
         nullable: kcol_entry.nullable,
-        ts_precision: kcol_entry.ts_precision,
+        fractional_digits: kcol_entry.fractional_digits,
     };
 
     async fn scan_as_of(
@@ -610,22 +590,12 @@ async fn columnar_merge_retains_within_window_history() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
@@ -663,10 +633,11 @@ async fn columnar_merge_retains_within_window_history() {
     heap.insert_batch(&tuples).await.unwrap();
     heap.flush().await.unwrap();
 
+    // Only the two triggers move, so the fold and the merge happen at all
+    // on four rows. Everything else is what the server runs
     let cfg = CompactionWorkerConfig {
         min_rows: 1,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         merge_min_churn_ratio: 0.0,
         ..CompactionWorkerConfig::default()
     };
@@ -676,7 +647,9 @@ async fn columnar_merge_retains_within_window_history() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
     });
     let te = catalog.get_table_by_id(table_id).unwrap();
     assert_eq!(te.columnar.segments.len(), 1, "one folded segment");
@@ -696,10 +669,10 @@ async fn columnar_merge_retains_within_window_history() {
         .store(table_id.0 as u64)
         .unwrap();
     store
-        .append_supersede(seg.file_id, rid_lo + 1, 50, 1)
+        .append_supersede(0, seg.file_id, rid_lo + 1, 50, 1)
         .unwrap();
     store
-        .append_supersede(seg.file_id, rid_lo + 2, 40, 2)
+        .append_supersede(0, seg.file_id, rid_lo + 2, 40, 2)
         .unwrap();
 
     // Merge with the retention floor in effect.
@@ -708,7 +681,9 @@ async fn columnar_merge_retains_within_window_history() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
     });
 
     let te = catalog.get_table_by_id(table_id).unwrap();
@@ -745,4 +720,315 @@ async fn columnar_merge_retains_within_window_history() {
     // The untouched rows survive as live (sys_supersede 0).
     assert_eq!(rid_to_sup.get(&rid_lo).copied(), Some(0));
     assert_eq!(rid_to_sup.get(&(rid_lo + 3)).copied(), Some(0));
+}
+
+struct FoldedTable {
+    _tmp: tempfile::TempDir,
+    wal_dir: std::path::PathBuf,
+    columnar_dir: std::path::PathBuf,
+    catalog: Catalog,
+    disk: Arc<DiskManager>,
+    table_id: zyron_catalog::TableId,
+}
+
+/// Builds a catalog with one table whose rows are folded into a single
+/// registered .zyr segment, the starting state for the tier reconcile tests.
+async fn fold_one_segment() -> FoldedTable {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let columnar_dir = data_dir.join("columnar");
+
+    let disk = Arc::new(
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
+
+    let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+    storage.init_cache().await.unwrap();
+    let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
+    let cache = Arc::new(CatalogCache::new(1024, 256));
+    let catalog = Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
+        .await
+        .unwrap();
+    let db = catalog.create_database("db", "admin").await.unwrap();
+    let schema = catalog.create_schema(db, "app", "admin").await.unwrap();
+    let cols = vec![
+        col("k", DataType::BigInt),
+        col("name", DataType::Text),
+        col("v", DataType::BigInt),
+    ];
+    let table_id = catalog
+        .create_table(schema, "metrics", &cols, &[])
+        .await
+        .unwrap();
+    let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
+
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let heap = HeapFile::new(
+        Arc::clone(&disk),
+        Arc::clone(&pool),
+        HeapFileConfig {
+            heap_file_id: te.heap_file_id,
+            fsm_file_id: te.fsm_file_id,
+        },
+    )
+    .unwrap();
+    let mut tuples = Vec::new();
+    for i in 0..8i64 {
+        tuples.push(Tuple::new(encode_row(i, &format!("row-{}", i), i * 100), 1));
+    }
+    heap.insert_batch(&tuples).await.unwrap();
+    heap.flush().await.unwrap();
+
+    let cfg = CompactionWorkerConfig {
+        min_rows: 4,
+        columnar_dir: columnar_dir.clone(),
+        ..CompactionWorkerConfig::default()
+    };
+    let (rows, segs) = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
+    });
+    assert_eq!(rows, 8, "all rows folded");
+    assert_eq!(segs, 1, "one segment registered");
+
+    FoldedTable {
+        _tmp: tmp,
+        wal_dir,
+        columnar_dir,
+        catalog,
+        disk,
+        table_id,
+    }
+}
+
+/// A crash between a relocation's rename and its registry write leaves the
+/// catalog naming a path with no file behind it while the bytes sit whole in
+/// a tier directory. Startup reconciliation adopts the location that holds
+/// the file, so the segment's rows read again with no operator involvement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn columnar_tier_recovery_adopts_a_moved_but_unpersisted_segment() {
+    let f = fold_one_segment().await;
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    let seg = te.columnar.segments[0].clone();
+    let old_path = std::path::PathBuf::from(&seg.path);
+
+    // The crash state: the file was renamed onto the tier, the registry
+    // write never happened
+    let cold_dir = f.columnar_dir.join("tiers").join("cold");
+    std::fs::create_dir_all(&cold_dir).unwrap();
+    let moved = cold_dir.join(old_path.file_name().unwrap());
+    std::fs::rename(&old_path, &moved).unwrap();
+
+    reconcile_columnar(&f.wal_dir, &f.catalog, &f.disk, &f.columnar_dir)
+        .await
+        .unwrap();
+
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    assert_eq!(te.columnar.segments.len(), 1, "still one registration");
+    let repaired = &te.columnar.segments[0];
+    assert_eq!(
+        std::path::PathBuf::from(&repaired.path),
+        moved,
+        "the registration points where the file sits"
+    );
+    assert_eq!(
+        repaired.storage_tier, 2,
+        "the tier byte matches the directory"
+    );
+    let reader = ZyrFileReader::open(std::path::Path::new(&repaired.path)).unwrap();
+    assert_eq!(
+        reader.header().row_count,
+        seg.row_count,
+        "the adopted segment reads in full"
+    );
+}
+
+/// The recorded path is authoritative when its file exists. A same-named
+/// copy on another tier and a staging file are debris from an interrupted
+/// cross-device move, and either would keep the next relocation from
+/// placing the file under that name, so reconciliation sweeps both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn columnar_tier_recovery_sweeps_duplicates_and_staging_leftovers() {
+    let f = fold_one_segment().await;
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    let seg = te.columnar.segments[0].clone();
+    let hot_path = std::path::PathBuf::from(&seg.path);
+    let name = hot_path.file_name().unwrap().to_os_string();
+
+    let warm_dir = f.columnar_dir.join("tiers").join("warm");
+    std::fs::create_dir_all(&warm_dir).unwrap();
+    let duplicate = warm_dir.join(&name);
+    std::fs::copy(&hot_path, &duplicate).unwrap();
+    let cold_dir = f.columnar_dir.join("tiers").join("cold");
+    std::fs::create_dir_all(&cold_dir).unwrap();
+    let staging = cold_dir.join(&name).with_extension("zyr.moving");
+    std::fs::write(&staging, b"half a copy").unwrap();
+
+    reconcile_columnar(&f.wal_dir, &f.catalog, &f.disk, &f.columnar_dir)
+        .await
+        .unwrap();
+
+    assert!(!duplicate.exists(), "the stale copy is swept");
+    assert!(!staging.exists(), "the staging leftover is swept");
+    assert!(hot_path.exists(), "the authoritative file is untouched");
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    assert_eq!(
+        te.columnar.segments[0].path, seg.path,
+        "the registration is untouched"
+    );
+    assert_eq!(te.columnar.segments[0].storage_tier, 0, "still hot");
+}
+
+/// A registration whose file is on no tier is left in place and reported.
+/// Unregistering it would silently discard the rows it serves, while
+/// leaving it lets a restored file make them readable again with no
+/// catalog surgery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn columnar_tier_recovery_never_unregisters_a_missing_segment() {
+    let f = fold_one_segment().await;
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    let seg = te.columnar.segments[0].clone();
+    std::fs::remove_file(&seg.path).unwrap();
+
+    reconcile_columnar(&f.wal_dir, &f.catalog, &f.disk, &f.columnar_dir)
+        .await
+        .unwrap();
+
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    assert_eq!(te.columnar.segments.len(), 1, "the registration survives");
+    assert_eq!(
+        te.columnar.segments[0].path, seg.path,
+        "the path is unchanged"
+    );
+}
+
+/// A table that a cycle found fully settled while no transaction was in
+/// flight is skipped by later cycles until its write counters move, so an
+/// idle table costs no heap scan or overlay check. New writes reopen the
+/// gate and the next cycle folds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_gate_skips_settled_tables_until_writes_return() {
+    use zyron_server::background::compaction::CompactionGate;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let columnar_dir = data_dir.join("columnar");
+
+    let disk = Arc::new(
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
+    let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+    storage.init_cache().await.unwrap();
+    let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
+    let cache = Arc::new(CatalogCache::new(1024, 256));
+    let catalog = Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
+        .await
+        .unwrap();
+    let db = catalog.create_database("db", "admin").await.unwrap();
+    let schema = catalog.create_schema(db, "app", "admin").await.unwrap();
+    let cols = vec![
+        col("k", DataType::BigInt),
+        col("name", DataType::Text),
+        col("v", DataType::BigInt),
+    ];
+    let table_id = catalog
+        .create_table(schema, "metrics", &cols, &[])
+        .await
+        .unwrap();
+    let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
+
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let heap = HeapFile::new(
+        Arc::clone(&disk),
+        Arc::clone(&pool),
+        HeapFileConfig {
+            heap_file_id: te.heap_file_id,
+            fsm_file_id: te.fsm_file_id,
+        },
+    )
+    .unwrap();
+    let mut tuples = Vec::new();
+    for i in 0..8i64 {
+        tuples.push(Tuple::new(encode_row(i, &format!("row-{}", i), i * 100), 1));
+    }
+    heap.insert_batch(&tuples).await.unwrap();
+    heap.flush().await.unwrap();
+
+    // The registry counters move the way DML moves them
+    let io = Arc::new(zyron_common::TableIOStatsRegistry::new());
+    io.get_or_create(table_id.0).record_inserts(8);
+    let gate = CompactionGate::new(Arc::clone(&io));
+
+    let cfg = CompactionWorkerConfig {
+        min_rows: 4,
+        columnar_dir: columnar_dir.clone(),
+        ..CompactionWorkerConfig::default()
+    };
+    let run = |gate: &CompactionGate| {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            CompactionWorker::run_cycle(
+                &rt,
+                &catalog,
+                &txn,
+                &disk,
+                &pool,
+                &wal,
+                &cfg,
+                None,
+                None,
+                None,
+                Some(gate),
+            )
+        })
+    };
+
+    let (rows, _) = run(&gate);
+    assert_eq!(rows, 8, "the first cycle folds the rows");
+    assert_eq!(gate.skipped(), 0, "a cycle that did work never skips");
+
+    let (rows2, _) = run(&gate);
+    assert_eq!(rows2, 0, "nothing left to fold");
+    assert_eq!(gate.skipped(), 0, "the settling cycle itself still scans");
+
+    let (rows3, _) = run(&gate);
+    assert_eq!(rows3, 0);
+    assert!(
+        gate.skipped() >= 1,
+        "a settled table is skipped without a scan"
+    );
+
+    // New writes reopen the gate
+    let mut more = Vec::new();
+    for i in 8..12i64 {
+        more.push(Tuple::new(encode_row(i, &format!("row-{}", i), i * 100), 1));
+    }
+    heap.insert_batch(&more).await.unwrap();
+    heap.flush().await.unwrap();
+    io.get_or_create(table_id.0).record_inserts(4);
+
+    let (rows4, _) = run(&gate);
+    assert_eq!(rows4, 4, "new rows fold once the gate reopens");
 }

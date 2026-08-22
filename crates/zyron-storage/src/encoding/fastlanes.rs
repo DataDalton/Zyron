@@ -21,27 +21,113 @@ const FLAG_DELTA_OF_DELTA: u8 = 0x02;
 const FLAG_PFOR: u8 = 0x04;
 /// Constant-step closed form (no packed bit array).
 const FLAG_CONST_STEP: u8 = 0x08;
-/// Reserved for per-mini-block bit width (A4).
-#[allow(dead_code)]
+/// Per-mini-block bit width: each block of MINIBLOCK_SIZE residuals carries
+/// its own width and is packed byte-aligned.
 const FLAG_MINIBLOCK: u8 = 0x10;
-/// Reserved for effective-resolution scale (A5).
-#[allow(dead_code)]
+/// Effective-resolution scale: residuals share a common factor, stored once
+/// with a nested core blob holding the quotients.
 const FLAG_SCALE: u8 = 0x20;
+/// Periodic restart values ahead of the packed array, so a range decode of a
+/// cumulative layout seeds from the nearest boundary rather than replaying
+/// the whole prefix. Set alongside FLAG_DELTA or FLAG_DELTA_OF_DELTA.
+const FLAG_RESTART: u8 = 0x40;
 
 /// 8-byte (and narrower) encoded format:
 ///   [0..8]    base_value: u64 (FoR base, little-endian)
 ///   [8]       bit_width: u8 (bits per packed value after FoR subtraction)
 ///   [9]       flags: u8 (FLAG_DELTA / FLAG_DELTA_OF_DELTA)
-///   [10..12]  reserved: u16
-///   [12..]    packed bit array
+///   [10..12]  reserved: u16, or [10] = restart shift when FLAG_RESTART is set
+///   [12..]    restart table when FLAG_RESTART is set, then the packed bit array
 ///
 /// 16-byte (i128/u128) encoded format:
 ///   [0..16]   base_value: u128 (FoR base, little-endian)
 ///   [16]      bit_width: u8 (bits per packed value, up to 128)
 ///   [17]      flags: u8
-///   [18..24]  reserved
-///   [24..]    packed bit array
+///   [18]      restart shift when FLAG_RESTART is set
+///   [19..24]  reserved
+///   [24..]    restart table when FLAG_RESTART is set, then the packed bit array
 const WIDE_HEADER_SIZE: usize = 24;
+
+/// Restart spacing floor, matching the columnar zone map batch size so every
+/// restart point lands on a zone boundary and a zone-aligned range needs no
+/// replay at all.
+const RESTART_MIN_SHIFT: u32 = 10;
+
+/// Number of restart boundaries for a row count and spacing. Boundary k covers
+/// row `k << shift` counted from 1, so a segment shorter than one spacing
+/// carries no table.
+#[inline]
+fn restart_count(row_count: usize, shift: u32) -> usize {
+    if row_count == 0 || shift >= usize::BITS {
+        0
+    } else {
+        (row_count - 1) >> shift
+    }
+}
+
+/// Widens the restart spacing until the table costs at most a thirty-second of
+/// the packed array. The spacing stays a power-of-two multiple of the floor, so
+/// restart points remain aligned to zone boundaries at every width.
+fn choose_restart_shift(row_count: usize, packed_bytes: usize, entry_size: usize) -> u32 {
+    let budget = (packed_bytes / 32).max(entry_size);
+    let mut shift = RESTART_MIN_SHIFT;
+    while shift < 31 && restart_count(row_count, shift) * entry_size > budget {
+        shift += 1;
+    }
+    shift
+}
+
+/// Bits needed to pack residuals up to `max`. A column of identical values
+/// still packs one bit per row so the width is never zero.
+#[inline]
+fn pack_width(max: u64) -> u8 {
+    if max == 0 {
+        1
+    } else {
+        (64 - max.leading_zeros()) as u8
+    }
+}
+
+/// Restart entry width for the narrow layouts. Delta carries one accumulator,
+/// delta-of-delta carries the running residual and the running first difference.
+#[inline]
+fn narrow_restart_entry(flags: u8) -> usize {
+    if flags & FLAG_DELTA_OF_DELTA != 0 {
+        16
+    } else {
+        8
+    }
+}
+
+/// Byte offset of the packed bit array in the narrow layout, past any restart
+/// table.
+#[inline]
+fn narrow_packed_offset(encoded: &[u8], flags: u8, row_count: usize) -> usize {
+    if flags & FLAG_RESTART == 0 {
+        return 12;
+    }
+    12 + restart_count(row_count, encoded[10] as u32) * narrow_restart_entry(flags)
+}
+
+/// Restart entry width for the 16-byte layouts.
+#[inline]
+fn wide_restart_entry(flags: u8) -> usize {
+    if flags & FLAG_DELTA_OF_DELTA != 0 {
+        32
+    } else {
+        16
+    }
+}
+
+/// Byte offset of the packed bit array in the 16-byte layout.
+#[inline]
+fn wide_packed_offset(encoded: &[u8], flags: u8, row_count: usize) -> usize {
+    if flags & FLAG_RESTART == 0 {
+        return WIDE_HEADER_SIZE;
+    }
+    WIDE_HEADER_SIZE + restart_count(row_count, encoded[18] as u32) * wide_restart_entry(flags)
+}
+
 impl Encoding for FastLanesEncoding {
     fn encoding_type(&self) -> EncodingType {
         EncodingType::FastLanes
@@ -105,6 +191,216 @@ impl Encoding for FastLanesEncoding {
         Ok(best)
     }
 
+    /// Every layout of this encoding answers a range without materializing the
+    /// rows outside it.
+    ///
+    /// A constant step is a closed form: row i is `first + i * step`, computed
+    /// from the header alone. Plain frame of reference, patched frame of
+    /// reference and the mini-block form all pack residuals to a known width,
+    /// so row i is at a computable bit offset and only the exception entries
+    /// landing inside the range are applied.
+    ///
+    /// Delta and delta-of-delta are cumulative, row i being defined against
+    /// row i-1. They carry a table of periodic restart values, so a range
+    /// seeds its running state at the boundary at or before `start` and
+    /// replays at most one restart spacing instead of the whole prefix.
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        if value_size == 16 {
+            return decode_range_wide(encoded, row_count, start, end);
+        }
+        // The scale layout wraps another core blob, so it unwraps its own
+        // header here and recurses on the inner blob
+        if value_size == 0 || encoded.len() < 12 {
+            let decoded = self.decode(encoded, row_count, value_size)?;
+            return crate::encoding::slice_decoded(&decoded, row_count, value_size, start, end);
+        }
+        let flags = encoded[9];
+        let base_value = u64::from_le_bytes([
+            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
+            encoded[7],
+        ]);
+        let taken = end - start;
+
+        if flags & FLAG_SCALE != 0 {
+            if encoded.len() < 20 {
+                return Err(ZyronError::DecodingFailed(
+                    "FastLanes scale blob too short".to_string(),
+                ));
+            }
+            let scale = u64::from_le_bytes([
+                encoded[12],
+                encoded[13],
+                encoded[14],
+                encoded[15],
+                encoded[16],
+                encoded[17],
+                encoded[18],
+                encoded[19],
+            ]);
+            let quotients = self.decode_range(&encoded[20..], row_count, value_size, start, end)?;
+            // SAFETY: the loop below writes every one of the taken slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+            for i in 0..taken {
+                let q = read_u64_le(&quotients, i * value_size, value_size);
+                write_le(
+                    &mut out,
+                    i,
+                    value_size,
+                    base_value.wrapping_add(q.wrapping_mul(scale)),
+                );
+            }
+            return Ok(out);
+        }
+
+        if flags & FLAG_CONST_STEP != 0 {
+            if encoded.len() < 20 {
+                return Err(ZyronError::DecodingFailed(
+                    "FastLanes constant-step blob too short".to_string(),
+                ));
+            }
+            let step = u64::from_le_bytes([
+                encoded[12],
+                encoded[13],
+                encoded[14],
+                encoded[15],
+                encoded[16],
+                encoded[17],
+                encoded[18],
+                encoded[19],
+            ]);
+            // SAFETY: the loop below writes every one of the taken slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+            for i in 0..taken {
+                let row = start + i;
+                let v = base_value.wrapping_add((row as u64).wrapping_mul(step));
+                write_le(&mut out, i, value_size, v);
+            }
+            return Ok(out);
+        }
+
+        if flags & FLAG_MINIBLOCK != 0 {
+            return decode_range_miniblock(encoded, row_count, value_size, start, end, base_value);
+        }
+
+        let bit_width = encoded[8];
+        if bit_width == 0 || bit_width > 64 {
+            return Err(ZyronError::DecodingFailed(format!(
+                "invalid FastLanes bit width: {bit_width}"
+            )));
+        }
+        let mask: u64 = if bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_width) - 1
+        };
+
+        if flags & FLAG_PFOR != 0 {
+            let exc_count = u16::from_le_bytes([encoded[10], encoded[11]]) as usize;
+            let table_off = 12usize;
+            let table_bytes = exc_count * 12;
+            if encoded.len() < table_off + table_bytes {
+                return Err(ZyronError::DecodingFailed(
+                    "FastLanes PFOR blob malformed".to_string(),
+                ));
+            }
+            let packed = &encoded[table_off + table_bytes..];
+            // SAFETY: the loop below writes every one of the taken slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+            let packed_ptr = packed.as_ptr();
+            let packed_len = packed.len();
+            for i in 0..taken {
+                let bit_offset = (start + i) as u64 * bit_width as u64;
+                let residual = unpack_inline(packed_ptr, packed_len, bit_offset, bit_width, mask);
+                write_le(&mut out, i, value_size, residual.wrapping_add(base_value));
+            }
+            // Exceptions carry their own row index, so the ones outside the
+            // range are stepped over rather than decoded
+            for e in 0..exc_count {
+                let o = table_off + e * 12;
+                let pos = u32::from_le_bytes([
+                    encoded[o],
+                    encoded[o + 1],
+                    encoded[o + 2],
+                    encoded[o + 3],
+                ]) as usize;
+                if pos < start || pos >= end {
+                    continue;
+                }
+                let resid = u64::from_le_bytes([
+                    encoded[o + 4],
+                    encoded[o + 5],
+                    encoded[o + 6],
+                    encoded[o + 7],
+                    encoded[o + 8],
+                    encoded[o + 9],
+                    encoded[o + 10],
+                    encoded[o + 11],
+                ]);
+                write_le(
+                    &mut out,
+                    pos - start,
+                    value_size,
+                    resid.wrapping_add(base_value),
+                );
+            }
+            return Ok(out);
+        }
+
+        let packed_off = narrow_packed_offset(encoded, flags, row_count);
+        if encoded.len() < packed_off {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes restart table truncated".to_string(),
+            ));
+        }
+        let restart = if flags & FLAG_RESTART != 0 {
+            Some((&encoded[12..packed_off], encoded[10] as u32))
+        } else {
+            None
+        };
+        let packed = &encoded[packed_off..];
+
+        if flags & FLAG_DELTA_OF_DELTA != 0 {
+            return Ok(decode_range_dod(
+                packed, bit_width, mask, base_value, value_size, row_count, restart, start, end,
+            ));
+        }
+        if flags & FLAG_DELTA != 0 {
+            return Ok(decode_range_delta(
+                packed, bit_width, mask, base_value, value_size, restart, start, end,
+            ));
+        }
+
+        // SAFETY: the loop below writes every one of the taken slots
+        // at value_size bytes each, which is the whole buffer, before
+        // anything reads it
+        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+        let packed_ptr = packed.as_ptr();
+        let packed_len = packed.len();
+        for i in 0..taken {
+            let bit_offset = (start + i) as u64 * bit_width as u64;
+            let residual = unpack_inline(packed_ptr, packed_len, bit_offset, bit_width, mask);
+            write_le(&mut out, i, value_size, residual.wrapping_add(base_value));
+        }
+        Ok(out)
+    }
+
     fn decode(&self, encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
@@ -142,7 +438,10 @@ impl Encoding for FastLanesEncoding {
                 encoded[19],
             ]);
             let q_raw = self.decode(&encoded[20..], row_count, value_size)?;
-            let mut out = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
             for i in 0..row_count {
                 let q = read_u64_le(&q_raw, i * value_size, value_size);
                 let v = base.wrapping_add(q.wrapping_mul(scale));
@@ -239,7 +538,10 @@ impl Encoding for FastLanesEncoding {
             };
             let mut r = vec![0u64; row_count];
             unpack_batch(packed, bit_width, mask, row_count, &mut r);
-            let mut out = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
             write_residuals_add_base(&mut out, value_size, &r, base_value);
             for e in 0..exc_count {
                 let o = table_off + e * 12;
@@ -270,7 +572,10 @@ impl Encoding for FastLanesEncoding {
         if flags & FLAG_MINIBLOCK != 0 {
             let nblocks = row_count.div_ceil(MINIBLOCK_SIZE);
             let mut off = 12usize;
-            let mut out = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
             for b in 0..nblocks {
                 if off >= encoded.len() {
                     return Err(ZyronError::DecodingFailed(
@@ -314,7 +619,13 @@ impl Encoding for FastLanesEncoding {
             )));
         }
 
-        let packed = &encoded[12..];
+        let packed_off = narrow_packed_offset(encoded, flags, row_count);
+        if encoded.len() < packed_off {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes restart table truncated".to_string(),
+            ));
+        }
+        let packed = &encoded[packed_off..];
 
         if use_dod {
             // Reconstruct FoR residuals from the packed [r0, zz(d1), zz(dd2)..]
@@ -326,7 +637,10 @@ impl Encoding for FastLanesEncoding {
             };
             let mut r = vec![0u64; row_count];
             unpack_batch(packed, bit_width, mask, row_count, &mut r);
-            let mut out: Vec<u8> = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out: Vec<u8> = unsafe { super::scratch::take_uninit(row_count * value_size) };
             let mut residual: u64 = r[0];
             write_le(&mut out, 0, value_size, residual.wrapping_add(base_value));
             if row_count > 1 {
@@ -865,7 +1179,13 @@ impl Encoding for FastLanesEncoding {
             );
         }
 
-        let packed = &encoded[12..];
+        let packed_off = narrow_packed_offset(encoded, flags, row_count);
+        if encoded.len() < packed_off {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes restart table truncated".to_string(),
+            ));
+        }
+        let packed = &encoded[packed_off..];
         let mask: u64 = if bit_width >= 64 {
             u64::MAX
         } else {
@@ -918,33 +1238,25 @@ impl Encoding for FastLanesEncoding {
                         return Ok(vec![0u8; row_count.div_ceil(8)]);
                     };
 
-                    let bitmaskLen = row_count.div_ceil(8);
-                    let mut bitmask = vec![0u8; bitmaskLen];
-                    for i in 0..row_count {
-                        let residual =
-                            unpack_fast(packed, i as u64 * bit_width as u64, bit_width, mask);
-                        if residual >= loResidual && residual <= hiResidual {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-                    return Ok(bitmask);
+                    // The residual is read straight out of the packed array,
+                    // eight rows at a time, so a row that survives the zone
+                    // maps is answered without materializing the column
+                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
+                        let residual = residuals.at(i);
+                        residual >= loResidual && residual <= hiResidual
+                    }));
                 }
                 Predicate::Equality(target) => {
                     let targetVal = read_u64_le(target, 0, target.len().min(8));
-                    let bitmaskLen = row_count.div_ceil(8);
                     if targetVal < base_value || targetVal > maxRepresentable {
-                        return Ok(vec![0u8; bitmaskLen]);
+                        return Ok(vec![0u8; row_count.div_ceil(8)]);
                     }
                     let targetResidual = targetVal - base_value;
-                    let mut bitmask = vec![0u8; bitmaskLen];
-                    for i in 0..row_count {
-                        let residual =
-                            unpack_fast(packed, i as u64 * bit_width as u64, bit_width, mask);
-                        if residual == targetResidual {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-                    return Ok(bitmask);
+                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
+                        residuals.at(i) == targetResidual
+                    }));
                 }
                 Predicate::In(values) => {
                     let targetResiduals: Vec<u64> = values
@@ -958,19 +1270,13 @@ impl Encoding for FastLanesEncoding {
                             }
                         })
                         .collect();
-                    let bitmaskLen = row_count.div_ceil(8);
                     if targetResiduals.is_empty() {
-                        return Ok(vec![0u8; bitmaskLen]);
+                        return Ok(vec![0u8; row_count.div_ceil(8)]);
                     }
-                    let mut bitmask = vec![0u8; bitmaskLen];
-                    for i in 0..row_count {
-                        let residual =
-                            unpack_fast(packed, i as u64 * bit_width as u64, bit_width, mask);
-                        if targetResiduals.contains(&residual) {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-                    return Ok(bitmask);
+                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
+                        targetResiduals.contains(&residuals.at(i))
+                    }));
                 }
             }
         }
@@ -1121,7 +1427,7 @@ impl Encoding for FastLanesEncoding {
 
         // General fallback for non-sorted delta data or non-Range predicates.
         // Uses u64 numeric comparison for consistency with eval_predicate_on_raw.
-        match predicate {
+        Ok(match predicate {
             Predicate::Range { low, high } => {
                 let loVal = match low {
                     Some(lo) => read_u64_le(lo, 0, lo.len().min(8)),
@@ -1131,37 +1437,473 @@ impl Encoding for FastLanesEncoding {
                     Some(hi) => read_u64_le(hi, 0, hi.len().min(8)),
                     None => u64::MAX,
                 };
-                for i in 0..row_count {
+                crate::encoding::bitmask_from_rows(row_count, |i| {
                     let v = residuals[i].wrapping_add(base_value);
-                    if v >= loVal && v <= hiVal {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                }
+                    v >= loVal && v <= hiVal
+                })
             }
             Predicate::Equality(target) => {
                 let targetVal = read_u64_le(target, 0, target.len().min(8));
-                for i in 0..row_count {
-                    if residuals[i].wrapping_add(base_value) == targetVal {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                }
+                crate::encoding::bitmask_from_rows(row_count, |i| {
+                    residuals[i].wrapping_add(base_value) == targetVal
+                })
             }
             Predicate::In(values) => {
                 let targets: Vec<u64> = values
                     .iter()
                     .map(|v| read_u64_le(v, 0, v.len().min(8)))
                     .collect();
-                for i in 0..row_count {
-                    let v = residuals[i].wrapping_add(base_value);
-                    if targets.contains(&v) {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
+                crate::encoding::bitmask_from_rows(row_count, |i| {
+                    targets.contains(&residuals[i].wrapping_add(base_value))
+                })
+            }
+        })
+    }
+}
+
+/// Reads restart entry `k - 1` as a fixed number of little-endian u64 words,
+/// where k is the boundary index covering `start`. Returns the seeded words and
+/// the row that decoding resumes at, or None when the range starts before the
+/// first boundary.
+fn seed_narrow_restart<const W: usize>(
+    restart: Option<(&[u8], u32)>,
+    start: usize,
+) -> Option<([u64; W], usize)> {
+    let (table, shift) = restart?;
+    if shift >= usize::BITS {
+        return None;
+    }
+    let k = start >> shift;
+    if k == 0 {
+        return None;
+    }
+    let at = (k - 1) * W * 8;
+    if at + W * 8 > table.len() {
+        return None;
+    }
+    let mut words = [0u64; W];
+    for (w, slot) in words.iter_mut().enumerate() {
+        let o = at + w * 8;
+        *slot = u64::from_le_bytes([
+            table[o],
+            table[o + 1],
+            table[o + 2],
+            table[o + 3],
+            table[o + 4],
+            table[o + 5],
+            table[o + 6],
+            table[o + 7],
+        ]);
+    }
+    Some((words, k << shift))
+}
+
+/// Range decode for the narrow delta layout. Seeds the running sum at the
+/// restart boundary at or before `start`, replays the rows between that
+/// boundary and `start` without writing, then emits the requested rows.
+#[allow(clippy::too_many_arguments)]
+fn decode_range_delta(
+    packed: &[u8],
+    bit_width: u8,
+    mask: u64,
+    base_value: u64,
+    value_size: usize,
+    restart: Option<(&[u8], u32)>,
+    start: usize,
+    end: usize,
+) -> Vec<u8> {
+    let bw = bit_width as u64;
+    let packed_ptr = packed.as_ptr();
+    let packed_len = packed.len();
+    let (mut accumulator, mut row) = match seed_narrow_restart::<1>(restart, start) {
+        Some((words, at)) => (words[0], at),
+        None => (0u64, 0usize),
+    };
+    while row < start {
+        accumulator = accumulator.wrapping_add(unpack_inline(
+            packed_ptr,
+            packed_len,
+            row as u64 * bw,
+            bit_width,
+            mask,
+        ));
+        row += 1;
+    }
+    let mut out = vec![0u8; (end - start) * value_size];
+    while row < end {
+        accumulator = accumulator.wrapping_add(unpack_inline(
+            packed_ptr,
+            packed_len,
+            row as u64 * bw,
+            bit_width,
+            mask,
+        ));
+        write_le(
+            &mut out,
+            row - start,
+            value_size,
+            accumulator.wrapping_add(base_value),
+        );
+        row += 1;
+    }
+    out
+}
+
+/// Range decode for the narrow delta-of-delta layout. A restart entry carries
+/// both running values the double prefix sum needs, the residual and the first
+/// difference. Without one the two head rows are replayed verbatim, which is
+/// what the layout stores them as.
+#[allow(clippy::too_many_arguments)]
+fn decode_range_dod(
+    packed: &[u8],
+    bit_width: u8,
+    mask: u64,
+    base_value: u64,
+    value_size: usize,
+    row_count: usize,
+    restart: Option<(&[u8], u32)>,
+    start: usize,
+    end: usize,
+) -> Vec<u8> {
+    let bw = bit_width as u64;
+    let packed_ptr = packed.as_ptr();
+    let packed_len = packed.len();
+    let mut out = vec![0u8; (end - start) * value_size];
+    let mut residual: u64;
+    let mut delta: u64;
+    let mut row: usize;
+
+    match seed_narrow_restart::<2>(restart, start) {
+        Some((words, at)) => {
+            residual = words[0];
+            delta = words[1];
+            row = at;
+        }
+        None => {
+            residual = unpack_inline(packed_ptr, packed_len, 0, bit_width, mask);
+            delta = 0;
+            if start == 0 {
+                write_le(&mut out, 0, value_size, residual.wrapping_add(base_value));
+            }
+            if row_count > 1 {
+                delta =
+                    unzigzag_i64(unpack_inline(packed_ptr, packed_len, bw, bit_width, mask)) as u64;
+                residual = residual.wrapping_add(delta);
+                if start <= 1 && end > 1 {
+                    write_le(
+                        &mut out,
+                        1 - start,
+                        value_size,
+                        residual.wrapping_add(base_value),
+                    );
                 }
             }
+            row = 2;
         }
-
-        Ok(bitmask)
     }
+
+    while row < start {
+        let dd = unzigzag_i64(unpack_inline(
+            packed_ptr,
+            packed_len,
+            row as u64 * bw,
+            bit_width,
+            mask,
+        ));
+        delta = delta.wrapping_add(dd as u64);
+        residual = residual.wrapping_add(delta);
+        row += 1;
+    }
+    while row < end {
+        let dd = unzigzag_i64(unpack_inline(
+            packed_ptr,
+            packed_len,
+            row as u64 * bw,
+            bit_width,
+            mask,
+        ));
+        delta = delta.wrapping_add(dd as u64);
+        residual = residual.wrapping_add(delta);
+        write_le(
+            &mut out,
+            row - start,
+            value_size,
+            residual.wrapping_add(base_value),
+        );
+        row += 1;
+    }
+    out
+}
+
+/// Range decode for the mini-block layout. Block widths are walked to reach the
+/// byte offset of the block holding `start`, which costs one byte read per
+/// skipped block, then only the blocks overlapping the range are unpacked.
+fn decode_range_miniblock(
+    encoded: &[u8],
+    row_count: usize,
+    value_size: usize,
+    start: usize,
+    end: usize,
+    base_value: u64,
+) -> Result<Vec<u8>> {
+    let first_block = start / MINIBLOCK_SIZE;
+    let last_block = (end - 1) / MINIBLOCK_SIZE;
+    let mut out = vec![0u8; (end - start) * value_size];
+    let mut off = 12usize;
+    for b in 0..=last_block {
+        if off >= encoded.len() {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes mini-block blob truncated".to_string(),
+            ));
+        }
+        let bw = encoded[off];
+        off += 1;
+        if bw == 0 || bw > 64 {
+            return Err(ZyronError::DecodingFailed(format!(
+                "invalid FastLanes mini-block width: {bw}"
+            )));
+        }
+        let block_start = b * MINIBLOCK_SIZE;
+        let block_end = (block_start + MINIBLOCK_SIZE).min(row_count);
+        let block_bytes = ((block_end - block_start) as u64 * bw as u64).div_ceil(8) as usize;
+        if off + block_bytes > encoded.len() {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes mini-block blob truncated".to_string(),
+            ));
+        }
+        if b >= first_block {
+            let lo = start.max(block_start);
+            let hi = end.min(block_end);
+            let packed_ptr = encoded[off..off + block_bytes].as_ptr();
+            let mask: u64 = if bw >= 64 { u64::MAX } else { (1u64 << bw) - 1 };
+            for row in lo..hi {
+                let residual = unpack_inline(
+                    packed_ptr,
+                    block_bytes,
+                    (row - block_start) as u64 * bw as u64,
+                    bw,
+                    mask,
+                );
+                write_le(
+                    &mut out,
+                    row - start,
+                    value_size,
+                    residual.wrapping_add(base_value),
+                );
+            }
+        }
+        off += block_bytes;
+    }
+    Ok(out)
+}
+
+/// Reads restart entry `k - 1` from the 16-byte layout table as u128 words.
+fn seed_wide_restart<const W: usize>(
+    restart: Option<(&[u8], u32)>,
+    start: usize,
+) -> Option<([u128; W], usize)> {
+    let (table, shift) = restart?;
+    if shift >= usize::BITS {
+        return None;
+    }
+    let k = start >> shift;
+    if k == 0 {
+        return None;
+    }
+    let at = (k - 1) * W * 16;
+    if at + W * 16 > table.len() {
+        return None;
+    }
+    let mut words = [0u128; W];
+    for (w, slot) in words.iter_mut().enumerate() {
+        *slot = read_u128_le(table, at + w * 16);
+    }
+    Some((words, k << shift))
+}
+
+/// Range decode for the 16-byte layouts. Mirrors the narrow path: closed form
+/// for a constant step, direct bit addressing for plain and patched frame of
+/// reference, and restart-seeded replay for the two cumulative forms.
+fn decode_range_wide(
+    encoded: &[u8],
+    row_count: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
+    if encoded.len() < WIDE_HEADER_SIZE {
+        return Err(ZyronError::DecodingFailed(
+            "FastLanes wide header too short".to_string(),
+        ));
+    }
+    let base = read_u128_le(encoded, 0);
+    let bit_width = encoded[16];
+    let flags = encoded[17];
+    let taken = end - start;
+    let mut out = vec![0u8; taken * 16];
+    let write = |out: &mut [u8], i: usize, v: u128| {
+        out[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
+    };
+
+    if flags & FLAG_SCALE != 0 {
+        if encoded.len() < WIDE_HEADER_SIZE + 16 {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes wide scale blob too short".to_string(),
+            ));
+        }
+        let scale = read_u128_le(encoded, WIDE_HEADER_SIZE);
+        let quotients =
+            decode_range_wide(&encoded[WIDE_HEADER_SIZE + 16..], row_count, start, end)?;
+        for i in 0..taken {
+            let q = read_u128_le(&quotients, i * 16);
+            write(&mut out, i, base.wrapping_add(q.wrapping_mul(scale)));
+        }
+        return Ok(out);
+    }
+
+    if flags & FLAG_CONST_STEP != 0 {
+        if encoded.len() < WIDE_HEADER_SIZE + 16 {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes wide constant-step blob too short".to_string(),
+            ));
+        }
+        let step = read_u128_le(encoded, WIDE_HEADER_SIZE);
+        for i in 0..taken {
+            write(
+                &mut out,
+                i,
+                base.wrapping_add(((start + i) as u128).wrapping_mul(step)),
+            );
+        }
+        return Ok(out);
+    }
+
+    if bit_width == 0 || bit_width > 128 {
+        return Err(ZyronError::DecodingFailed(format!(
+            "invalid FastLanes wide bit width: {bit_width}"
+        )));
+    }
+
+    if flags & FLAG_PFOR != 0 {
+        let exc_count = u16::from_le_bytes([encoded[18], encoded[19]]) as usize;
+        let table_off = WIDE_HEADER_SIZE;
+        let table_bytes = exc_count * 20;
+        if encoded.len() < table_off + table_bytes {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes wide PFOR blob malformed".to_string(),
+            ));
+        }
+        let packed = &encoded[table_off + table_bytes..];
+        for i in 0..taken {
+            let r = unpack_bits_128(packed, (start + i) as u64 * bit_width as u64, bit_width);
+            write(&mut out, i, r.wrapping_add(base));
+        }
+        for e in 0..exc_count {
+            let o = table_off + e * 20;
+            let pos =
+                u32::from_le_bytes([encoded[o], encoded[o + 1], encoded[o + 2], encoded[o + 3]])
+                    as usize;
+            if pos < start || pos >= end {
+                continue;
+            }
+            let resid = read_u128_le(encoded, o + 4);
+            write(&mut out, pos - start, resid.wrapping_add(base));
+        }
+        return Ok(out);
+    }
+
+    let packed_off = wide_packed_offset(encoded, flags, row_count);
+    if encoded.len() < packed_off {
+        return Err(ZyronError::DecodingFailed(
+            "FastLanes wide restart table truncated".to_string(),
+        ));
+    }
+    let restart = if flags & FLAG_RESTART != 0 {
+        Some((&encoded[WIDE_HEADER_SIZE..packed_off], encoded[18] as u32))
+    } else {
+        None
+    };
+    let packed = &encoded[packed_off..];
+    let at_bit = |row: usize| row as u64 * bit_width as u64;
+
+    if flags & FLAG_DELTA_OF_DELTA != 0 {
+        let mut residual: u128;
+        let mut delta: i128;
+        let mut row: usize;
+        match seed_wide_restart::<2>(restart, start) {
+            Some((words, at)) => {
+                residual = words[0];
+                delta = words[1] as i128;
+                row = at;
+            }
+            None => {
+                residual = unpack_bits_128(packed, 0, bit_width);
+                delta = 0;
+                if start == 0 {
+                    write(&mut out, 0, residual.wrapping_add(base));
+                }
+                if row_count > 1 {
+                    delta = unzigzag_i128(unpack_bits_128(packed, at_bit(1), bit_width));
+                    residual = residual.wrapping_add(delta as u128);
+                    if start <= 1 && end > 1 {
+                        write(&mut out, 1 - start, residual.wrapping_add(base));
+                    }
+                }
+                row = 2;
+            }
+        }
+        while row < start {
+            delta = delta.wrapping_add(unzigzag_i128(unpack_bits_128(
+                packed,
+                at_bit(row),
+                bit_width,
+            )));
+            residual = residual.wrapping_add(delta as u128);
+            row += 1;
+        }
+        while row < end {
+            delta = delta.wrapping_add(unzigzag_i128(unpack_bits_128(
+                packed,
+                at_bit(row),
+                bit_width,
+            )));
+            residual = residual.wrapping_add(delta as u128);
+            write(&mut out, row - start, residual.wrapping_add(base));
+            row += 1;
+        }
+        return Ok(out);
+    }
+
+    if flags & FLAG_DELTA != 0 {
+        let (mut residual, mut row) = match seed_wide_restart::<1>(restart, start) {
+            Some((words, at)) => (words[0], at),
+            None => (unpack_bits_128(packed, 0, bit_width), 1usize),
+        };
+        if row == 1 && start == 0 {
+            write(&mut out, 0, residual.wrapping_add(base));
+        }
+        while row < start {
+            residual =
+                residual.wrapping_add(
+                    unzigzag_i128(unpack_bits_128(packed, at_bit(row), bit_width)) as u128,
+                );
+            row += 1;
+        }
+        while row < end {
+            residual =
+                residual.wrapping_add(
+                    unzigzag_i128(unpack_bits_128(packed, at_bit(row), bit_width)) as u128,
+                );
+            write(&mut out, row - start, residual.wrapping_add(base));
+            row += 1;
+        }
+        return Ok(out);
+    }
+
+    for i in 0..taken {
+        let s = unpack_bits_128(packed, at_bit(start + i), bit_width);
+        write(&mut out, i, s.wrapping_add(base));
+    }
+    Ok(out)
 }
 
 /// Reads a value of up to 8 bytes from data as a u64 (little-endian).
@@ -1207,6 +1949,43 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
 #[inline(always)]
 fn unpack_fast(packed: &[u8], bit_offset: u64, bit_width: u8, mask: u64) -> u64 {
     unpack_inline(packed.as_ptr(), packed.len(), bit_offset, bit_width, mask)
+}
+
+/// Random access into a packed residual array with the buffer's pointer,
+/// length and bit width held once rather than re-derived per read.
+///
+/// A predicate evaluated against the packed form reads one residual per row
+/// and never materializes the column, so the read is the whole loop body and
+/// the slice header work around it is the difference between reading the
+/// packed array and decoding it
+struct PackedResiduals<'a> {
+    packed: &'a [u8],
+    bit_width: u8,
+    bits: u64,
+    mask: u64,
+}
+
+impl<'a> PackedResiduals<'a> {
+    #[inline]
+    fn new(packed: &'a [u8], bit_width: u8, mask: u64) -> Self {
+        Self {
+            packed,
+            bit_width,
+            bits: bit_width as u64,
+            mask,
+        }
+    }
+
+    #[inline(always)]
+    fn at(&self, row: usize) -> u64 {
+        unpack_inline(
+            self.packed.as_ptr(),
+            self.packed.len(),
+            row as u64 * self.bits,
+            self.bit_width,
+            self.mask,
+        )
+    }
 }
 
 /// Raw pointer version of unpack_fast. Takes pre-computed pointer and length
@@ -1514,38 +2293,59 @@ fn gcd_residual_u128(values: &[u128], base: u128) -> u128 {
 /// 8-byte-or-narrower path. Returns the smallest representation. Does not apply
 /// the scale wrapper (that is layered by the caller).
 fn encode_narrow_core(values: &[u64], row_count: usize) -> Vec<u8> {
-    let sorted_count = values.windows(2).filter(|w| w[1] >= w[0]).count();
-    let use_delta = row_count > 1 && sorted_count >= (row_count - 1) * 9 / 10;
     let base_value = values.iter().copied().min().unwrap_or(0);
     let mut residuals: Vec<u64> = values.iter().map(|v| v - base_value).collect();
+    let mut bit_width = pack_width(residuals.iter().copied().max().unwrap_or(0));
+    let mut packed_bytes = (row_count as u64 * bit_width as u64).div_ceil(8) as usize;
+    let mut flags = 0u8;
+    let mut shift = RESTART_MIN_SHIFT;
+    let mut restarts = 0usize;
 
-    let flags = if use_delta {
-        for i in (1..residuals.len()).rev() {
-            residuals[i] = residuals[i].wrapping_sub(residuals[i - 1]);
+    // Delta wins on data that ascends smoothly, but a column that ascends and
+    // drops once wraps that single difference to a full-width value, which
+    // makes the delta stream wider than the residuals it replaces. Both forms
+    // are measured and the smaller is kept, restart table included
+    let sorted_count = values.windows(2).filter(|w| w[1] >= w[0]).count();
+    if row_count > 1 && sorted_count >= (row_count - 1) * 9 / 10 {
+        let mut delta = residuals.clone();
+        for i in (1..delta.len()).rev() {
+            delta[i] = delta[i].wrapping_sub(delta[i - 1]);
         }
-        FLAG_DELTA
-    } else {
-        0
-    };
+        let delta_width = pack_width(delta.iter().copied().max().unwrap_or(0));
+        let delta_bytes = (row_count as u64 * delta_width as u64).div_ceil(8) as usize;
+        let delta_shift = choose_restart_shift(row_count, delta_bytes, 8);
+        let delta_restarts = restart_count(row_count, delta_shift);
+        if delta_bytes + delta_restarts * 8 < packed_bytes {
+            residuals = delta;
+            bit_width = delta_width;
+            packed_bytes = delta_bytes;
+            flags = FLAG_DELTA;
+            shift = delta_shift;
+            restarts = delta_restarts;
+        }
+    }
 
-    let max_residual = residuals.iter().copied().max().unwrap_or(0);
-    let bit_width = if max_residual == 0 {
-        1
-    } else {
-        64 - max_residual.leading_zeros()
-    } as u8;
-
-    let packed_bytes = (row_count as u64 * bit_width as u64).div_ceil(8) as usize;
     let mut packed = vec![0u8; packed_bytes];
     for (i, &val) in residuals.iter().enumerate() {
         pack_bits(&mut packed, i as u64 * bit_width as u64, val, bit_width);
     }
 
-    let mut out = Vec::with_capacity(12 + packed_bytes);
+    // The entry for restart boundary k holds the running sum reached at the row
+    // before it, which is that row's FoR residual
+    let mut out = Vec::with_capacity(12 + restarts * 8 + packed_bytes);
     out.extend_from_slice(&base_value.to_le_bytes()); // [0..8]
     out.push(bit_width); // [8]
-    out.push(flags); // [9]
-    out.extend_from_slice(&0u16.to_le_bytes()); // [10..12] reserved
+    out.push(if restarts > 0 {
+        flags | FLAG_RESTART
+    } else {
+        flags
+    }); // [9]
+    out.push(shift as u8); // [10] restart spacing
+    out.push(0); // [11] reserved
+    for k in 1..=restarts {
+        let row = (k << shift) - 1;
+        out.extend_from_slice(&values[row].wrapping_sub(base_value).to_le_bytes());
+    }
     out.extend_from_slice(&packed);
 
     let mut best = out;
@@ -1677,11 +2477,28 @@ fn encode_dod_narrow(values: &[u64], base: u64, row_count: usize) -> Option<Vec<
         pack_bits(&mut packed, i as u64 * bit_width as u64, val, bit_width);
     }
 
-    let mut out = Vec::with_capacity(12 + packed_bytes);
+    // The double prefix sum carries two running values, so a restart entry
+    // holds the residual and the first difference reached at the row before
+    // its boundary
+    let shift = choose_restart_shift(row_count, packed_bytes, 16);
+    let restarts = restart_count(row_count, shift);
+    let mut out = Vec::with_capacity(12 + restarts * 16 + packed_bytes);
     out.extend_from_slice(&base.to_le_bytes());
     out.push(bit_width);
-    out.push(FLAG_DELTA_OF_DELTA);
-    out.extend_from_slice(&0u16.to_le_bytes());
+    out.push(if restarts > 0 {
+        FLAG_DELTA_OF_DELTA | FLAG_RESTART
+    } else {
+        FLAG_DELTA_OF_DELTA
+    });
+    out.push(shift as u8);
+    out.push(0);
+    for k in 1..=restarts {
+        let row = (k << shift) - 1;
+        let residual = values[row].wrapping_sub(base);
+        let prior = values[row - 1].wrapping_sub(base);
+        out.extend_from_slice(&residual.to_le_bytes());
+        out.extend_from_slice(&residual.wrapping_sub(prior).to_le_bytes());
+    }
     out.extend_from_slice(&packed);
     Some(out)
 }
@@ -1773,11 +2590,35 @@ fn encode_wide_core(values: &[u128], row_count: usize) -> Vec<u8> {
         };
 
     let packed_bytes = (row_count as u64 * bit_width as u64).div_ceil(8) as usize;
-    let mut out = vec![0u8; WIDE_HEADER_SIZE + packed_bytes];
+    // Restart values for the two cumulative streams, mirroring the narrow path
+    let entry = wide_restart_entry(flags);
+    let shift = choose_restart_shift(row_count, packed_bytes, entry);
+    let restarts = if flags & (FLAG_DELTA | FLAG_DELTA_OF_DELTA) != 0 {
+        restart_count(row_count, shift)
+    } else {
+        0
+    };
+    let table_bytes = restarts * entry;
+    let mut out = vec![0u8; WIDE_HEADER_SIZE + table_bytes + packed_bytes];
     out[0..16].copy_from_slice(&base.to_le_bytes());
     out[16] = bit_width;
-    out[17] = flags;
-    let packed = &mut out[WIDE_HEADER_SIZE..];
+    out[17] = if restarts > 0 {
+        flags | FLAG_RESTART
+    } else {
+        flags
+    };
+    out[18] = shift as u8;
+    for k in 1..=restarts {
+        let row = (k << shift) - 1;
+        let o = WIDE_HEADER_SIZE + (k - 1) * entry;
+        let residual = residuals[row];
+        out[o..o + 16].copy_from_slice(&residual.to_le_bytes());
+        if entry == 32 {
+            let prior = residuals[row - 1];
+            out[o + 16..o + 32].copy_from_slice(&residual.wrapping_sub(prior).to_le_bytes());
+        }
+    }
+    let packed = &mut out[WIDE_HEADER_SIZE + table_bytes..];
     for (i, &val) in stream.iter().enumerate() {
         pack_bits_128(packed, i as u64 * bit_width as u64, val, bit_width);
     }
@@ -2041,7 +2882,13 @@ fn decode_wide(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
             bit_width
         )));
     }
-    let packed = &encoded[WIDE_HEADER_SIZE..];
+    let packed_off = wide_packed_offset(encoded, flags, row_count);
+    if encoded.len() < packed_off {
+        return Err(ZyronError::DecodingFailed(
+            "FastLanes wide restart table truncated".to_string(),
+        ));
+    }
+    let packed = &encoded[packed_off..];
 
     let mut stream = vec![0u128; row_count];
     for (i, slot) in stream.iter_mut().enumerate() {
@@ -2087,9 +2934,7 @@ fn decode_wide(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
 /// numerically as u128 (same unsigned-pattern semantics the 8-byte path uses).
 fn eval_predicate_wide(encoded: &[u8], row_count: usize, predicate: &Predicate) -> Result<Vec<u8>> {
     let decoded = decode_wide(encoded, row_count)?;
-    let bitmask_len = row_count.div_ceil(8);
-    let mut bitmask = vec![0u8; bitmask_len];
-    match predicate {
+    Ok(match predicate {
         Predicate::Range { low, high } => {
             let lo = match *low {
                 Some(b) => read_u128_bound(b),
@@ -2099,32 +2944,22 @@ fn eval_predicate_wide(encoded: &[u8], row_count: usize, predicate: &Predicate) 
                 Some(b) => read_u128_bound(b),
                 None => u128::MAX,
             };
-            for i in 0..row_count {
+            crate::encoding::bitmask_from_rows(row_count, |i| {
                 let v = read_u128_le(&decoded, i * 16);
-                if v >= lo && v <= hi {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
-            }
+                v >= lo && v <= hi
+            })
         }
         Predicate::Equality(target) => {
             let t = read_u128_bound(target);
-            for i in 0..row_count {
-                if read_u128_le(&decoded, i * 16) == t {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
-            }
+            crate::encoding::bitmask_from_rows(row_count, |i| read_u128_le(&decoded, i * 16) == t)
         }
         Predicate::In(values) => {
             let targets: Vec<u128> = values.iter().map(|v| read_u128_bound(v)).collect();
-            for i in 0..row_count {
-                let v = read_u128_le(&decoded, i * 16);
-                if targets.contains(&v) {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
-            }
+            crate::encoding::bitmask_from_rows(row_count, |i| {
+                targets.contains(&read_u128_le(&decoded, i * 16))
+            })
         }
-    }
-    Ok(bitmask)
+    })
 }
 
 #[cfg(test)]
@@ -2397,6 +3232,116 @@ mod tests {
             let got = bm[i / 8] & (1 << (i % 8)) != 0;
             assert_eq!(got, want, "row {i}");
         }
+    }
+
+    /// The shapes the ranged-decode property test relies on must actually
+    /// select the layouts they are named for. A shape that quietly fell back
+    /// to a different layout would make that test agree for the wrong reason.
+    #[test]
+    fn test_shapes_select_the_layouts_they_are_named_for() {
+        let enc = FastLanesEncoding;
+        const ROWS: usize = 4100;
+
+        let ascending: Vec<u8> = (0..ROWS)
+            .flat_map(|i| ((i as i64) * 3 + (i as i64) / 50).to_le_bytes())
+            .collect();
+        let encoded = enc.encode(&ascending, ROWS, 8).unwrap();
+        assert_eq!(encoded[9] & FLAG_DELTA, FLAG_DELTA, "ascending is delta");
+        assert_eq!(
+            encoded[9] & FLAG_RESTART,
+            FLAG_RESTART,
+            "a delta stream this long carries restart points"
+        );
+
+        let quadratic: Vec<u8> = (0..ROWS)
+            .flat_map(|i| (((i * i) / 3 + i) as i64).to_le_bytes())
+            .collect();
+        let encoded = enc.encode(&quadratic, ROWS, 8).unwrap();
+        assert_eq!(
+            encoded[9] & FLAG_DELTA_OF_DELTA,
+            FLAG_DELTA_OF_DELTA,
+            "quadratic growth is delta-of-delta"
+        );
+        assert_eq!(encoded[9] & FLAG_RESTART, FLAG_RESTART);
+
+        let bursty: Vec<u8> = (0..ROWS)
+            .flat_map(|i| {
+                let v = if (i / 1024) % 3 == 1 {
+                    (i as i64) * 1_000_003
+                } else {
+                    (i % 7) as i64
+                };
+                v.to_le_bytes()
+            })
+            .collect();
+        let encoded = enc.encode(&bursty, ROWS, 8).unwrap();
+        assert_eq!(
+            encoded[9] & FLAG_MINIBLOCK,
+            FLAG_MINIBLOCK,
+            "a burst confined to whole blocks is per-mini-block"
+        );
+
+        let with_outliers: Vec<u8> = (0..ROWS)
+            .flat_map(|i| {
+                let v = if i % 97 == 0 {
+                    1i64 << 40
+                } else {
+                    (i % 13) as i64
+                };
+                v.to_le_bytes()
+            })
+            .collect();
+        let encoded = enc.encode(&with_outliers, ROWS, 8).unwrap();
+        assert_eq!(
+            encoded[9] & FLAG_PFOR,
+            FLAG_PFOR,
+            "scattered outliers are patched frame of reference"
+        );
+
+        let wide_ascending: Vec<u8> = (0..ROWS)
+            .flat_map(|i| ((i as i128) * 7 + (i as i128) / 40).to_le_bytes())
+            .collect();
+        let encoded = enc.encode(&wide_ascending, ROWS, 16).unwrap();
+        assert_ne!(
+            encoded[17] & (FLAG_DELTA | FLAG_DELTA_OF_DELTA),
+            0,
+            "an ascending 16-byte column is cumulative"
+        );
+        assert_eq!(encoded[17] & FLAG_RESTART, FLAG_RESTART);
+    }
+
+    /// A range decode of a cumulative column resumes at the restart boundary
+    /// at or before it, so the rows replayed ahead of the first requested one
+    /// are bounded by the restart spacing rather than by the segment length.
+    #[test]
+    fn test_cumulative_range_replays_at_most_one_restart_spacing() {
+        let enc = FastLanesEncoding;
+        const ROWS: usize = 40_000;
+        let values: Vec<u64> = (0..ROWS as u64).map(|i| i * 3 + i / 50).collect();
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let encoded = enc.encode(&data, ROWS, 8).unwrap();
+        assert_eq!(encoded[9] & FLAG_RESTART, FLAG_RESTART);
+
+        let shift = encoded[10] as u32;
+        let table_end = narrow_packed_offset(&encoded, encoded[9], ROWS);
+        let restart = Some((&encoded[12..table_end], shift));
+        let start = ROWS - 3;
+        let (_, resume) =
+            seed_narrow_restart::<1>(restart, start).expect("a boundary covers the tail");
+        assert!(resume > 0, "the tail resumes past the head of the stream");
+        assert!(
+            start - resume < (1usize << shift),
+            "replayed {} rows, more than the {} row spacing",
+            start - resume,
+            1usize << shift
+        );
+
+        let ranged = enc.decode_range(&encoded, ROWS, 8, start, ROWS).unwrap();
+        let got: Vec<u64> = ranged
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, values[start..]);
     }
 
     #[test]

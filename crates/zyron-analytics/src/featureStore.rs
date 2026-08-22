@@ -430,10 +430,12 @@ impl FeatureStore {
         featureNames: &[String],
         asOfMs: i64,
     ) -> Result<FeatureFrame> {
-        let group = self.group(groupName).ok_or_else(|| ZyronError::InvalidParameter {
-            name: "feature_group".to_string(),
-            value: format!("'{}' not found", groupName),
-        })?;
+        let group = self
+            .group(groupName)
+            .ok_or_else(|| ZyronError::InvalidParameter {
+                name: "feature_group".to_string(),
+                value: format!("'{}' not found", groupName),
+            })?;
         let store = self
             .resolveStore(groupName)
             .ok_or_else(|| ZyronError::InvalidParameter {
@@ -466,10 +468,12 @@ impl FeatureStore {
         version: u32,
         asOfMs: i64,
     ) -> Result<FeatureFrame> {
-        let group = self.group(groupName).ok_or_else(|| ZyronError::InvalidParameter {
-            name: "feature_group".to_string(),
-            value: format!("'{}' not found", groupName),
-        })?;
+        let group = self
+            .group(groupName)
+            .ok_or_else(|| ZyronError::InvalidParameter {
+                name: "feature_group".to_string(),
+                value: format!("'{}' not found", groupName),
+            })?;
         let mut frame = FeatureFrame::new(group.entityKey.clone(), featureNames.to_vec());
         let store = match self.resolveStore(groupName) {
             Some(s) => s,
@@ -693,7 +697,11 @@ mod tests {
             )
             .unwrap();
         if let AnalyticsValue::Float(f) = &f150.rows[0].values[0] {
-            assert!((f - 50.0).abs() < 1e-12, "AS OF 150 should see 50, got {}", f);
+            assert!(
+                (f - 50.0).abs() < 1e-12,
+                "AS OF 150 should see 50, got {}",
+                f
+            );
         }
     }
 
@@ -744,10 +752,9 @@ mod tests {
                 200,
             )
             .unwrap();
-        if let (AnalyticsValue::Float(a), AnalyticsValue::Float(b)) = (
-            &frame1.rows[0].values[0],
-            &frame2.rows[0].values[0],
-        ) {
+        if let (AnalyticsValue::Float(a), AnalyticsValue::Float(b)) =
+            (&frame1.rows[0].values[0], &frame2.rows[0].values[0])
+        {
             assert!((a - 50.0).abs() < 1e-12);
             assert!((b - 88.0).abs() < 1e-12);
         } else {

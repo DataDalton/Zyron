@@ -106,7 +106,7 @@ pub struct ColumnBuilder {
     type_id: TypeId,
     /// Fractional-second precision carried onto the finished Column so a
     /// physical i128 is known to be a logical ps timestamp.
-    ts_precision: Option<u8>,
+    fractional_digits: Option<u8>,
 }
 
 impl ColumnBuilder {
@@ -115,24 +115,24 @@ impl ColumnBuilder {
             data: ColumnData::with_capacity(type_id, capacity),
             nulls: NullBitmap::empty(),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
     /// Builder for a timestamp column: the physical buffer is sized for
     /// `physical_type` (Int128 when p>6) while the finished Column reports the
-    /// `logical_type` and carries `ts_precision`.
+    /// `logical_type` and carries `fractional_digits`.
     pub fn new_ts(
         logical_type: TypeId,
         physical_type: TypeId,
-        ts_precision: Option<u8>,
+        fractional_digits: Option<u8>,
         capacity: usize,
     ) -> Self {
         Self {
             data: ColumnData::with_capacity(physical_type, capacity),
             nulls: NullBitmap::empty(),
             type_id: logical_type,
-            ts_precision,
+            fractional_digits,
         }
     }
 
@@ -142,13 +142,20 @@ impl ColumnBuilder {
         self.data.push_scalar(scalar);
     }
 
+    /// Appends a value the caller is done with, moving a text or binary
+    /// cell's allocation into the column rather than copying it.
+    pub fn push_owned(&mut self, scalar: ScalarValue) {
+        self.nulls.push(scalar.is_null());
+        self.data.push_scalar_owned(scalar);
+    }
+
     pub fn push_null(&mut self) {
         self.nulls.push(true);
         self.data.push_scalar(&ScalarValue::Null);
     }
 
     pub fn finish(self) -> Column {
-        Column::with_nulls_ts(self.data, self.nulls, self.type_id, self.ts_precision)
+        Column::with_nulls_ts(self.data, self.nulls, self.type_id, self.fractional_digits)
     }
 }
 
@@ -159,9 +166,9 @@ pub fn create_builders(columns: &[LogicalColumn], capacity: usize) -> Vec<Column
     columns
         .iter()
         .map(|col| {
-            let phys = TypeId::timestamp_physical_type_id(col.type_id, col.ts_precision);
-            if phys != col.type_id {
-                ColumnBuilder::new_ts(col.type_id, phys, col.ts_precision, capacity)
+            let phys = TypeId::timestamp_physical_type_id(col.type_id, col.fractional_digits);
+            if phys != col.type_id || col.fractional_digits.is_some() {
+                ColumnBuilder::new_ts(col.type_id, phys, col.fractional_digits, capacity)
             } else {
                 ColumnBuilder::new(col.type_id, capacity)
             }
@@ -241,7 +248,7 @@ pub fn decode_tuple_into_builders(
                 let value_bytes = &data[offset..offset + fixed_size];
                 if let Some(b) = builder_idx {
                     let scalar = decode_fixed_scalar(phys_type, value_bytes);
-                    builders[b].push(&scalar);
+                    builders[b].push_owned(scalar);
                 }
                 offset += fixed_size;
             }
@@ -263,8 +270,10 @@ pub fn decode_tuple_into_builders(
             } else {
                 let value_bytes = &data[offset..offset + len];
                 if let Some(b) = builder_idx {
+                    // push_owned moves the freshly decoded text or binary
+                    // allocation into the column instead of copying it again
                     let scalar = decode_varlen_scalar(col.type_id, value_bytes);
-                    builders[b].push(&scalar);
+                    builders[b].push_owned(scalar);
                 }
                 offset += len;
             }
@@ -359,7 +368,7 @@ fn tuple_decodes_within_bounds(data: &[u8], columns: &[ColumnEntry]) -> bool {
 }
 
 /// Decodes a fixed-size value from raw bytes into a ScalarValue.
-pub(crate) fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
+pub fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
         TypeId::Null => ScalarValue::Null,
         TypeId::Boolean => ScalarValue::Boolean(bytes[0] != 0),
@@ -393,18 +402,15 @@ pub(crate) fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue 
 }
 
 /// Decodes a variable-length value from raw bytes into a ScalarValue.
-pub(crate) fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
+pub fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
         TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
             ScalarValue::Utf8(String::from_utf8_lossy(bytes).into_owned())
         }
-        TypeId::Binary
-        | TypeId::Varbinary
-        | TypeId::Bytea
-        | TypeId::Array
-        | TypeId::Composite
-        | TypeId::Vector => ScalarValue::Binary(bytes.to_vec()),
-        _ => ScalarValue::Null,
+        // Every other variable-length type (geometry, matrix, range, the
+        // sketch family, and future additions) is byte-backed. A type list
+        // here would silently turn unlisted values into NULL
+        _ => ScalarValue::Binary(bytes.to_vec()),
     }
 }
 
@@ -438,7 +444,7 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
         } else if is_null {
             buf.extend_from_slice(&0u32.to_le_bytes());
         } else {
-            encode_varlen_scalar(&mut buf, col.type_id, &column.data.get_scalar(row_idx));
+            encode_varlen_scalar(&mut buf, &column.data.get_scalar(row_idx));
         }
     }
 
@@ -455,20 +461,37 @@ pub(crate) fn encode_scalar_value(
     scalar: &ScalarValue,
     value_size: usize,
 ) -> Vec<u8> {
-    if value_size == 0 {
-        return match scalar {
-            ScalarValue::Utf8(s) => s.as_bytes().to_vec(),
-            ScalarValue::Binary(b) => b.clone(),
-            ScalarValue::Null => Vec::new(),
-            _ => Vec::new(),
-        };
-    }
     let mut buf = Vec::with_capacity(value_size);
-    encode_fixed_scalar(&mut buf, type_id, scalar);
-    if buf.len() < value_size {
-        buf.resize(value_size, 0);
-    }
+    encode_scalar_value_into(&mut buf, type_id, scalar, value_size);
     buf
+}
+
+/// Encodes one scalar into the end of `buf` rather than into a buffer of its
+/// own.
+///
+/// A caller filling a column reuses one buffer across every cell, which is
+/// the difference between one allocation per cell and none: a ten thousand
+/// row batch of two columns spent 415us building twenty thousand of them
+#[inline]
+pub(crate) fn encode_scalar_value_into(
+    buf: &mut Vec<u8>,
+    type_id: TypeId,
+    scalar: &ScalarValue,
+    value_size: usize,
+) {
+    if value_size == 0 {
+        match scalar {
+            ScalarValue::Utf8(s) => buf.extend_from_slice(s.as_bytes()),
+            ScalarValue::Binary(b) => buf.extend_from_slice(b),
+            _ => {}
+        }
+        return;
+    }
+    let start = buf.len();
+    encode_fixed_scalar(buf, type_id, scalar);
+    if buf.len() - start < value_size {
+        buf.resize(start + value_size, 0);
+    }
 }
 
 /// Encodes a fixed-size scalar value into the output buffer.
@@ -489,6 +512,11 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
             TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc,
             ScalarValue::Int128(v),
         ) => buf.extend_from_slice(&v.to_le_bytes()),
+        // A TIMESTAMP(p>6) column carries i128 picosecond values under its
+        // logical timestamp type, stored at the 16-byte physical width
+        (TypeId::Timestamp | TypeId::TimestampTz, ScalarValue::Int128(v)) => {
+            buf.extend_from_slice(&v.to_le_bytes())
+        }
         (TypeId::UInt8, ScalarValue::UInt8(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt16, ScalarValue::UInt16(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt32, ScalarValue::UInt32(v)) => buf.extend_from_slice(&v.to_le_bytes()),
@@ -506,25 +534,19 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
 }
 
 /// Encodes a variable-length scalar value with 4-byte LE length prefix.
-fn encode_varlen_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue) {
-    match (type_id, scalar) {
-        (
-            TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb,
-            ScalarValue::Utf8(s),
-        ) => {
+fn encode_varlen_scalar(buf: &mut Vec<u8>, scalar: &ScalarValue) {
+    // Encode by the scalar's representation, not by a type list. Every
+    // variable-length column materializes as Utf8 or Binary, and a type
+    // enumeration here silently wrote empty cells for unlisted types
+    // (geometry, matrix, range, the sketch family), losing the payload on
+    // every heap insert
+    match scalar {
+        ScalarValue::Utf8(s) => {
             let bytes = s.as_bytes();
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
-        (
-            TypeId::Binary
-            | TypeId::Varbinary
-            | TypeId::Bytea
-            | TypeId::Array
-            | TypeId::Composite
-            | TypeId::Vector,
-            ScalarValue::Binary(b),
-        ) => {
+        ScalarValue::Binary(b) => {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
@@ -561,8 +583,9 @@ mod row_filter_tests {
             nullable: false,
             default_expr: None,
             max_length: None,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
+            element_type: None,
         }
     }
 
@@ -573,7 +596,7 @@ mod row_filter_tests {
             name: name.to_string(),
             type_id,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -612,7 +635,7 @@ mod row_filter_tests {
                 column_id: ColumnId(1),
                 type_id: TypeId::Text,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Eq,
             right: Box::new(BoundExpr::Literal {
@@ -657,7 +680,7 @@ mod row_filter_tests {
                 column_id: ColumnId(1),
                 type_id: TypeId::Text,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Eq,
             right: Box::new(BoundExpr::Literal {

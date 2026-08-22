@@ -268,7 +268,7 @@ pub trait CatalogStorage: Send + Sync {
     async fn update_security_map(&self, entry: &SecurityMapEntry) -> Result<bool>;
     async fn delete_security_map(&self, id: SecurityMapId) -> Result<bool>;
 
-    // Data lifecycle operations (Phase 17)
+    // Data lifecycle operations
     async fn load_legal_holds(&self) -> Result<Vec<LegalHoldEntry>>;
     async fn store_legal_hold(&self, entry: &LegalHoldEntry) -> Result<TupleId>;
     async fn update_legal_hold(&self, entry: &LegalHoldEntry) -> Result<bool>;
@@ -1815,7 +1815,7 @@ impl CatalogStorage for HeapCatalogStorage {
         }
     }
 
-    // ----- Data lifecycle (Phase 17) -----
+    // ----- Data lifecycle -----
 
     async fn load_legal_holds(&self) -> Result<Vec<LegalHoldEntry>> {
         scan_decode(

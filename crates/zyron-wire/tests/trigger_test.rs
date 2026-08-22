@@ -30,24 +30,13 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
-        .await
-        .expect("disk"),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
+            .await
+            .expect("disk"),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
         Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).expect("storage"));
     let cache = Arc::new(CatalogCache::new(256, 64));
@@ -68,6 +57,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -120,6 +113,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -160,14 +157,21 @@ async fn try_exec(
         return res.map(|_| Vec::new()).map_err(|e| format!("{e:?}"));
     }
 
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .map_err(|e| e.to_string())?;
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut txn = server
         .txn_manager
         .begin(IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
+    let db_txn_id = txn.txn_id;
     let txn_id = txn.txn_id as u32;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
@@ -184,10 +188,15 @@ async fn try_exec(
     match zyron_executor::execute(plan, &ctx).await {
         Ok(batches) => {
             server.txn_manager.commit(&mut txn).await.expect("commit");
+            // Mirrors the wire layer: a lake version becomes visible only
+            // after the durable commit, so a suite that skips this reads a
+            // lake table as permanently empty
+            let _ = zyron_lake::publish_txn(server.disk_manager.data_dir(), db_txn_id);
             Ok(batches)
         }
         Err(e) => {
             let _ = server.txn_manager.abort(&mut txn);
+            let _ = zyron_lake::abandon_txn(server.disk_manager.data_dir(), db_txn_id);
             Err(e.to_string())
         }
     }
@@ -390,4 +399,87 @@ async fn create_trigger_requires_existing_procedure() {
         err.to_lowercase().contains("procedure") || err.to_lowercase().contains("nope"),
         "unexpected: {err}"
     );
+}
+
+#[tokio::test]
+async fn triggers_fire_on_a_lake_table_the_same_as_on_a_heap_one() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE lt (id INT, v INT) USING ZYRONLAKE",
+    )
+    .await;
+    exec(&server, &mut session, "CREATE TABLE audit (tid INT)").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE PROCEDURE log_row() AS 'INSERT INTO audit (tid) VALUES ($1)' LANGUAGE SQL",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE TRIGGER lt_trg AFTER INSERT ON lt FOR EACH ROW EXECUTE FUNCTION log_row",
+    )
+    .await;
+
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO lt (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .await;
+
+    // Where a row is stored does not decide whether its triggers run
+    let logged = sorted_col(
+        &exec(&server, &mut session, "SELECT tid FROM audit").await,
+        0,
+    );
+    assert_eq!(logged, vec![1, 2, 3]);
+    assert_eq!(
+        sorted_col(&exec(&server, &mut session, "SELECT id FROM lt").await, 0),
+        vec![1, 2, 3],
+        "the rows themselves must still land"
+    );
+}
+
+#[tokio::test]
+async fn an_update_trigger_fires_on_a_lake_table() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE lu (id INT, v INT) USING ZYRONLAKE",
+    )
+    .await;
+    exec(&server, &mut session, "CREATE TABLE audit (tid INT)").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE PROCEDURE log_row() AS 'INSERT INTO audit (tid) VALUES ($1)' LANGUAGE SQL",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO lu (id, v) VALUES (1, 10), (2, 20)",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE TRIGGER lu_trg AFTER UPDATE ON lu FOR EACH ROW EXECUTE FUNCTION log_row",
+    )
+    .await;
+
+    exec(&server, &mut session, "UPDATE lu SET v = 99 WHERE id = 2").await;
+
+    let logged = sorted_col(
+        &exec(&server, &mut session, "SELECT tid FROM audit").await,
+        0,
+    );
+    assert_eq!(logged, vec![2], "the updated row did not fire its trigger");
 }

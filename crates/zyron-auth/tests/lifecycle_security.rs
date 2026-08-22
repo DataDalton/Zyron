@@ -1,4 +1,4 @@
-//! Phase 17 security additions: new privilege variants and two-person gating
+//! Lifecycle security: the privilege variants and two-person gating
 //! for irreversible data-lifecycle operations.
 
 use zyron_auth::governance::{TwoPersonManager, TwoPersonOperation, TwoPersonRule};

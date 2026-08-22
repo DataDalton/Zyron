@@ -77,25 +77,17 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
-        .expect("WalWriter creation failed"),
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
+            .expect("WalWriter creation failed"),
     );
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
-        .await
-        .expect("DiskManager creation failed"),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
+            .await
+            .expect("DiskManager creation failed"),
     );
 
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     let storage = Arc::new(
         HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool))
@@ -122,6 +114,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -174,6 +170,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -518,7 +518,7 @@ fn make_column(type_id: TypeId, values: Vec<ScalarValue>) -> Column {
         data,
         nulls,
         type_id,
-        ts_precision: None,
+        fractional_digits: None,
     }
 }
 
@@ -531,7 +531,7 @@ fn make_test_columns() -> Vec<LogicalColumn> {
             name: "id".to_string(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -539,7 +539,7 @@ fn make_test_columns() -> Vec<LogicalColumn> {
             name: "name".to_string(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ]
 }
@@ -1045,7 +1045,7 @@ fn test_wire_copy_protocol() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1053,7 +1053,7 @@ fn test_wire_copy_protocol() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ];
 
@@ -1580,7 +1580,7 @@ fn test_wire_copy_from_throughput() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1588,7 +1588,7 @@ fn test_wire_copy_from_throughput() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1596,7 +1596,7 @@ fn test_wire_copy_from_throughput() {
             name: "value".into(),
             type_id: TypeId::Float64,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ];
 
@@ -1673,7 +1673,7 @@ fn test_wire_copy_to_throughput() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1681,7 +1681,7 @@ fn test_wire_copy_to_throughput() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ];
 
@@ -1879,7 +1879,14 @@ fn test_wire_connection_handshake_latency() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let (server_state, _tmp) = create_test_server("testdb").await;
-        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
+        // Bind through the server's own listener setup rather than the plain
+        // constructor, so the accept queue here is the one production runs
+        // with. A default-bound listener has a far smaller queue, and a burst
+        // deeper than that queue stalls on handshake retransmits, so the
+        // result reports connection setup rather than what the server does
+        let std_listener = zyron_wire::create_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+            .expect("bind failed");
+        let listener = Arc::new(TcpListener::from_std(std_listener).expect("from_std"));
         let addr = listener.local_addr().unwrap();
         tprintln!("  Server listening on {}\n", addr);
 
@@ -1971,7 +1978,14 @@ fn test_wire_concurrent_connections() {
 
     rt.block_on(async {
         let (server_state, _tmp) = create_test_server("testdb").await;
-        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
+        // Bind through the server's own listener setup rather than the plain
+        // constructor, so the accept queue here is the one production runs
+        // with. A default-bound listener has a far smaller queue, and a burst
+        // deeper than that queue stalls on handshake retransmits, so the
+        // result reports connection setup rather than what the server does
+        let std_listener = zyron_wire::create_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+            .expect("bind failed");
+        let listener = Arc::new(TcpListener::from_std(std_listener).expect("from_std"));
         let addr = listener.local_addr().unwrap();
         tprintln!("  Server listening on {}\n", addr);
 

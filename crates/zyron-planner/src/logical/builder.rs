@@ -71,7 +71,7 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
                 name: "".to_string(),
                 type_id: TypeId::Null,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
             }],
         }
     } else {
@@ -176,6 +176,27 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
         };
     }
 
+    // FOR UPDATE/SHARE -> LockRows, above Sort so the locked set is the
+    // final row set, below Project because projection drops row locators.
+    // The binder rejected multi-table, DISTINCT, GROUP BY and set-op shapes,
+    // aggregation hiding in the projection list is only discoverable here
+    if let Some(lock) = &select.row_lock {
+        if aggregate_pushed {
+            return Err(ZyronError::PlanError(
+                "FOR UPDATE/SHARE is not allowed with aggregate functions".to_string(),
+            ));
+        }
+        let cap = extract_u64_literal(&select.limit)
+            .map(|l| l + extract_u64_literal(&select.offset).unwrap_or(0));
+        plan = LogicalPlan::LockRows {
+            table_id: lock.table_id,
+            mode: lock.mode,
+            wait: lock.wait,
+            cap,
+            child: Arc::new(plan),
+        };
+    }
+
     // 6. SELECT -> Project
     //
     // When an aggregate is in scope, the projection list still references
@@ -262,7 +283,7 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
                     name: c.name.clone(),
                     type_id: c.type_id,
                     nullable: c.nullable,
-                    ts_precision: c.ts_precision,
+                    fractional_digits: c.fractional_digits,
                 })
                 .collect();
             let as_of_target = match as_of {
@@ -414,7 +435,7 @@ fn relabel_derived(inner: LogicalPlan, table_idx: usize) -> LogicalPlan {
                         column_id: c.column_id,
                         type_id: c.type_id,
                         nullable: c.nullable,
-                        ts_precision: c.ts_precision,
+                        fractional_digits: c.fractional_digits,
                     })
                 })
                 .collect();
@@ -524,7 +545,7 @@ fn rewrite_post_aggregate(
             column_id: ColumnId(i as u16),
             type_id: g.type_id(),
             nullable: g.nullable(),
-            ts_precision: g.ts_precision(),
+            fractional_digits: g.fractional_digits(),
         });
         return;
     }
@@ -557,14 +578,20 @@ fn rewrite_post_aggregate(
                 return;
             };
             let column_idx = group_by.len() + agg_idx;
+            // A decimal aggregate keeps its argument's scale, so a HAVING
+            // or ORDER BY reading the output column compares the value
+            // rather than the raw scaled integer
+            let fractional_digits = if *return_type == zyron_common::TypeId::Decimal {
+                args.first().and_then(|a| a.fractional_digits())
+            } else {
+                None
+            };
             *expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
                 table_idx: AGGREGATE_TABLE_IDX,
                 column_id: ColumnId(column_idx as u16),
                 type_id: *return_type,
                 nullable: true,
-                // Aggregate-result precision (e.g. MIN/MAX over TIMESTAMP(p))
-                // is finalized in B5; default precision until then.
-                ts_precision: None,
+                fractional_digits,
             });
         }
         BoundExpr::BinaryOp { left, right, .. } => {
@@ -697,7 +724,7 @@ fn rewrite_group_keys(expr: &mut BoundExpr, group_by: &[BoundExpr]) {
             column_id: ColumnId(i as u16),
             type_id: g.type_id(),
             nullable: g.nullable(),
-            ts_precision: g.ts_precision(),
+            fractional_digits: g.fractional_digits(),
         });
         return;
     }
@@ -1009,7 +1036,7 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
                     name: c.name.clone(),
                     type_id: c.type_id,
                     nullable: c.nullable,
-                    ts_precision: c.ts_precision,
+                    fractional_digits: c.fractional_digits,
                 });
             }
             LogicalPlan::Values {
@@ -1045,7 +1072,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -1087,7 +1114,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -1236,7 +1263,7 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })];
         let mut having = BoundExpr::BinaryOp {
             left: Box::new(count_star()),

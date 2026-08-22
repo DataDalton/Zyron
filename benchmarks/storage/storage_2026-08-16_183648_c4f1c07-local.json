@@ -1,0 +1,218 @@
+{
+  "id": "2026-08-16_183648_c4f1c07-local",
+  "date": "2026-08-16 18:38:42Z",
+  "ts": 1786905522,
+  "commit": "c4f1c07-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "B+ Tree": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 13.41 },
+      "util_after": { "cpu_pct": 22.0, "ram_used_gb": 13.46 },
+      "Delete throughput (ops/sec)": {
+        "average": 22761932.943346,
+        "runs": [22761932.94],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Insert throughput (ops/sec)": {
+        "average": 40188209.392523,
+        "runs": [39398619.47, 40370276.17, 40411877.86, 39910600.26, 40849673.20],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Lookup latency (ns/op)": {
+        "average": 18.190000,
+        "runs": [17.89, 16.43, 13.64, 20.55, 22.44],
+        "target": 40.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Range throughput (ops/sec)": {
+        "average": 5005000000.000000,
+        "runs": [5005000000.00, 5005000000.00, 5005000000.00, 5005000000.00, 5005000000.00],
+        "target": 40000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Buffer Pool": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.44 },
+      "util_after": { "cpu_pct": 9.0, "ram_used_gb": 13.57 },
+      "Avg fetch latency (ns)": {
+        "average": 10.326000,
+        "runs": [10.72, 10.20, 10.33, 10.19, 10.19],
+        "target": 15.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Cache hit rate": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 13.72 },
+      "util_after": { "cpu_pct": 11.0, "ram_used_gb": 13.80 },
+      "Write throughput (MB/sec)": {
+        "average": 1420.269598,
+        "runs": [1375.48, 1558.51, 1331.10, 1532.91, 1303.34],
+        "target": 2000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Write latency 1M keys (ms)": {
+        "average": 13.502240,
+        "runs": [13.87, 12.24, 14.33, 12.44, 14.63],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Load throughput (MB/sec)": {
+        "average": 1025.351512,
+        "runs": [1051.98, 1038.35, 967.43, 1030.30, 1038.70],
+        "target": 3000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Load latency 1M keys (ms)": {
+        "average": 18.618260,
+        "runs": [18.13, 18.37, 19.72, 18.51, 18.36],
+        "target": 2.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Checkpoint Scale": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 13.76 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 14.24 },
+      "Write 10M keys (ms)": {
+        "average": 209.818340,
+        "runs": [242.29, 224.39, 183.04, 192.26, 207.11],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Load 10M keys (ms)": {
+        "average": 124.154400,
+        "runs": [140.86, 127.07, 138.03, 106.49, 108.32],
+        "target": 20.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Recovery 10M+100 (ms)": {
+        "average": 118.209140,
+        "runs": [130.96, 152.05, 102.83, 102.91, 102.29],
+        "target": 20.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Checkpoint Trigger": {
+      "Trigger check latency (ns)": {
+        "average": 23.052800,
+        "runs": [23.05],
+        "target": 10.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Graceful Shutdown": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.11 },
+      "util_after": { "cpu_pct": 11.0, "ram_used_gb": 14.07 },
+      "Shutdown checkpoint latency (ms)": {
+        "average": 12.284280,
+        "runs": [12.89, 12.21, 11.67, 12.77, 11.88],
+        "target": 5.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Startup load latency (ms)": {
+        "average": 13.982980,
+        "runs": [14.25, 12.90, 13.99, 14.49, 14.28],
+        "target": 2.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Heap File": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 14.07 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 17.17 },
+      "Insert throughput (ops/sec)": {
+        "average": 18368075.793391,
+        "runs": [17162667.77, 17817371.94, 19114245.85, 18701376.42, 19044717.00],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Scan throughput (ops/sec)": {
+        "average": 79814794.184694,
+        "runs": [78131103.99, 77059412.81, 88999644.00, 85521252.03, 69362558.09],
+        "target": 20000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Recovery with Checkpoint": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 17.19 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 17.06 },
+      "Recovery time (ms)": {
+        "average": 10.790860,
+        "runs": [8.45, 11.35, 10.88, 12.09, 11.19],
+        "target": 5.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Recovery": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 17.18 },
+      "util_after": { "cpu_pct": 8.0, "ram_used_gb": 17.11 },
+      "Recovery time (us/KB)": {
+        "average": 41.911348,
+        "runs": [41.91],
+        "target": 10.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "WAL Segment Cleanup": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 17.07 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 17.04 },
+      "Cleanup latency (ms)": {
+        "average": 0.569320,
+        "runs": [0.55, 0.59, 0.56, 0.59, 0.57],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "WAL Write/Replay": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 17.06 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 17.09 },
+      "Write throughput (ops/sec)": {
+        "average": 53940480.756649,
+        "runs": [47641734.16, 52029136.32, 57636887.61, 51493305.87, 60901339.83],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Replay throughput (ops/sec)": {
+        "average": 55995239.555215,
+        "runs": [55432372.51, 56116722.78, 60422960.73, 52938062.47, 55066079.30],
+        "target": 12000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

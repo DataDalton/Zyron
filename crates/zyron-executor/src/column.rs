@@ -534,6 +534,29 @@ impl ColumnData {
         dispatch_column!(self, v, v[offset..offset + len].to_vec())
     }
 
+    /// Shortens the column to len rows in place, keeping the front. Frees
+    /// nothing but drops the tail values, unlike slice this copies no data.
+    pub fn truncate(&mut self, len: usize) {
+        match self {
+            ColumnData::Boolean(v) => v.truncate(len),
+            ColumnData::Int8(v) => v.truncate(len),
+            ColumnData::Int16(v) => v.truncate(len),
+            ColumnData::Int32(v) => v.truncate(len),
+            ColumnData::Int64(v) => v.truncate(len),
+            ColumnData::Int128(v) => v.truncate(len),
+            ColumnData::UInt8(v) => v.truncate(len),
+            ColumnData::UInt16(v) => v.truncate(len),
+            ColumnData::UInt32(v) => v.truncate(len),
+            ColumnData::UInt64(v) => v.truncate(len),
+            ColumnData::Float32(v) => v.truncate(len),
+            ColumnData::Float64(v) => v.truncate(len),
+            ColumnData::Utf8(v) => v.truncate(len),
+            ColumnData::Binary(v) => v.truncate(len),
+            ColumnData::FixedBinary16(v) => v.truncate(len),
+            ColumnData::Interval(v) => v.truncate(len),
+        }
+    }
+
     /// Extracts a scalar value at the given row.
     pub fn get_scalar(&self, row: usize) -> ScalarValue {
         match self {
@@ -557,6 +580,22 @@ impl ColumnData {
     }
 
     /// Appends a scalar value. Pushes a zero/empty default if the type does not match.
+    /// Appends a value this buffer owns outright.
+    ///
+    /// Only the variable-length variants are handled here, because they are
+    /// the only ones where owning saves anything: a text or binary cell moves
+    /// its allocation into the column instead of being copied into a fresh
+    /// one. Everything else is a fixed-width copy either way and falls
+    /// through, so this stays a short list beside `push_scalar` rather than a
+    /// second full codec that could drift from it.
+    pub fn push_scalar_owned(&mut self, scalar: ScalarValue) {
+        match (self, scalar) {
+            (ColumnData::Utf8(v), ScalarValue::Utf8(s)) => v.push(s),
+            (ColumnData::Binary(v), ScalarValue::Binary(s)) => v.push(s),
+            (this, other) => this.push_scalar(&other),
+        }
+    }
+
     pub fn push_scalar(&mut self, scalar: &ScalarValue) {
         match (self, scalar) {
             (ColumnData::Boolean(v), ScalarValue::Boolean(s)) => v.push(*s),
@@ -847,7 +886,7 @@ pub struct Column {
     /// including p<=6 timestamps (i64 microseconds). Carried with the value so
     /// cross-precision compare, casts, and presentation know a physical i128
     /// is logically a ps timestamp, not a plain Int128.
-    pub ts_precision: Option<u8>,
+    pub fractional_digits: Option<u8>,
 }
 
 impl Column {
@@ -858,18 +897,18 @@ impl Column {
             data,
             nulls: NullBitmap::none(len),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
     /// Creates a timestamp column carrying its fractional-second precision.
-    pub fn new_ts(data: ColumnData, type_id: TypeId, ts_precision: Option<u8>) -> Self {
+    pub fn new_ts(data: ColumnData, type_id: TypeId, fractional_digits: Option<u8>) -> Self {
         let len = data.len();
         Self {
             data,
             nulls: NullBitmap::none(len),
             type_id,
-            ts_precision,
+            fractional_digits,
         }
     }
 
@@ -880,7 +919,7 @@ impl Column {
             data,
             nulls,
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -889,14 +928,14 @@ impl Column {
         data: ColumnData,
         nulls: NullBitmap,
         type_id: TypeId,
-        ts_precision: Option<u8>,
+        fractional_digits: Option<u8>,
     ) -> Self {
         debug_assert_eq!(data.len(), nulls.len());
         Self {
             data,
             nulls,
             type_id,
-            ts_precision,
+            fractional_digits,
         }
     }
 
@@ -906,7 +945,7 @@ impl Column {
             data: ColumnData::null_fill(type_id, len),
             nulls: NullBitmap::all_null(len),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -944,7 +983,7 @@ impl Column {
             data: self.data.filter(mask),
             nulls: self.nulls.filter(mask),
             type_id: self.type_id,
-            ts_precision: self.ts_precision,
+            fractional_digits: self.fractional_digits,
         }
     }
 
@@ -954,7 +993,7 @@ impl Column {
             data: self.data.take(indices),
             nulls: self.nulls.take(indices),
             type_id: self.type_id,
-            ts_precision: self.ts_precision,
+            fractional_digits: self.fractional_digits,
         }
     }
 
@@ -964,7 +1003,7 @@ impl Column {
             data: self.data.slice(offset, len),
             nulls: self.nulls.slice(offset, len),
             type_id: self.type_id,
-            ts_precision: self.ts_precision,
+            fractional_digits: self.fractional_digits,
         }
     }
 

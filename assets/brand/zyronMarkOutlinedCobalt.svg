@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Zyron">
+  <title>Zyron</title>
+  <path fill="#0B0B0D" fill-rule="evenodd" d="M17 4 H47 A13 13 0 0 1 60 17 V47 A13 13 0 0 1 47 60 H17 A13 13 0 0 1 4 47 V17 A13 13 0 0 1 17 4 Z M17 8 A9 9 0 0 0 8 17 V47 A9 9 0 0 0 17 56 H47 A9 9 0 0 0 56 47 V17 A9 9 0 0 0 47 8 Z"/>
+  <g transform="translate(8 8) scale(0.75)">
+    <g fill="#0B0B0D">
+      <path d="M8 8 H53.88 L44.88 17 H8 Z"/>
+      <path d="M8 21 H40.88 L31.88 30 H8 Z"/>
+      <path d="M8 34 H27.88 L18.88 43 H8 Z"/>
+    </g>
+    <g fill="#1F49FF">
+      <path d="M47 19.12 L56 10.12 V56 H47 Z"/>
+      <path d="M34 32.12 L43 23.12 V56 H34 Z"/>
+      <path d="M21 45.12 L30 36.12 V56 H21 Z"/>
+    </g>
+  </g>
+</svg>

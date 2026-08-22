@@ -16,7 +16,7 @@ pub mod sequence;
 pub mod stats;
 pub mod storage;
 
-pub use cache::{CatalogCache, TableIndexSnapshot};
+pub use cache::{BTreeIndexSpec, CatalogCache, TableIndexSnapshot};
 pub use catalog::{Catalog, DropOutcome};
 pub use ids::{
     ColumnId, DatabaseId, EndpointId, ExternalSinkId, ExternalSourceId, IndexId, Oid, OidAllocator,

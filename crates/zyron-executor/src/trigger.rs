@@ -94,11 +94,18 @@ async fn run_trigger_body(
     params: &[ScalarValue],
 ) -> Result<()> {
     for stmt in stmts {
+        // A trigger body is planned here rather than above, so it reads the
+        // same peer facts the firing statement was planned against. Binding
+        // is async, so this takes the snapshot pointer rather than a guard:
+        // a lock held across the bind would block every peer declaration
+        // behind it, and the pointer copies nothing
+        let peerFacts = ctx.peers.as_ref().map(|p| Arc::clone(&p.read()));
         let plan = zyron_planner::plan(
             &ctx.catalog,
             zyron_catalog::DatabaseId(1),
             vec!["public".to_string()],
             stmt.clone(),
+            peerFacts.as_deref(),
         )
         .await?;
 
@@ -113,10 +120,16 @@ async fn run_trigger_body(
         nested.heap_files = ctx.heap_files.clone();
         nested.btree_indexes = ctx.btree_indexes.clone();
         nested.intent_locks = ctx.intent_locks.clone();
+        nested.row_locks = ctx.row_locks.clone();
+        nested.doc_registry = ctx.doc_registry.clone();
         nested.fts_manager = ctx.fts_manager.clone();
         nested.vector_manager = ctx.vector_manager.clone();
         nested.spatial_manager = ctx.spatial_manager.clone();
         nested.graph_manager = ctx.graph_manager.clone();
+        // A trigger body reads the same tables its statement can, foreign
+        // ones included, so it carries the client and the mesh view too
+        nested.foreign_reader = ctx.foreign_reader.clone();
+        nested.peers = ctx.peers.clone();
         nested.params = params.to_vec();
         nested.trigger_depth = ctx.trigger_depth + 1;
         let nested = Arc::new(nested);

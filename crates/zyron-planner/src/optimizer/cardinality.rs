@@ -362,6 +362,12 @@ fn extract_literal_bytes(expr: &BoundExpr) -> Option<Vec<u8>> {
     match expr {
         BoundExpr::Literal { value, .. } => match value {
             LiteralValue::Integer(v) => Some(v.to_be_bytes().to_vec()),
+            LiteralValue::Int128(v) => Some(v.to_be_bytes().to_vec()),
+            // Histogram bounds for a decimal column are stored at the
+            // column's scale, which this literal's own scale need not
+            // match, so no bytes are offered and selectivity falls back
+            // to the non-histogram estimate
+            LiteralValue::Decimal { .. } => None,
             LiteralValue::Float(v) => Some(v.to_be_bytes().to_vec()),
             LiteralValue::String(v) => Some(v.as_bytes().to_vec()),
             LiteralValue::Boolean(v) => Some(vec![*v as u8]),
@@ -422,7 +428,7 @@ mod tests {
             column_id: ColumnId(col_id),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 

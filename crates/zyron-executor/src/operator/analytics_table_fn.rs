@@ -8,8 +8,7 @@ use std::sync::Arc;
 use zyron_analytics::{
     AnalyticsFunctionKind, AnalyticsValue, CohortAnalysis, CohortDefinition, CohortEvent,
     CohortMetric, CohortPeriod, CohortType, ColumnProfile, FunnelConfig, FunnelEvent, FunnelStep,
-    TableProfile, column_profile, correlation_matrix, funnel_analysis, profile_table,
-    retention_analysis,
+    TableProfile,
 };
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::LiteralValue;
@@ -619,36 +618,6 @@ impl AnalyticsTableFunctionOperator {
 
     // ---- Feature store and ML ----
 
-    fn first_pos_strings(&self) -> Result<Vec<String>> {
-        match self.positional_args.first() {
-            Some(BoundExpr::Function { name, args, .. }) if name == "array" => {
-                let mut out = Vec::with_capacity(args.len());
-                for e in args {
-                    if let BoundExpr::Literal {
-                        value: LiteralValue::String(s),
-                        ..
-                    } = e
-                    {
-                        out.push(s.clone());
-                    } else {
-                        return Err(ZyronError::ExecutionError(
-                            "expected array of string literals".to_string(),
-                        ));
-                    }
-                }
-                Ok(out)
-            }
-            Some(BoundExpr::Literal {
-                value: LiteralValue::String(s),
-                ..
-            }) => Ok(vec![s.clone()]),
-            _ => Err(ZyronError::ExecutionError(format!(
-                "{} requires a string or array-of-strings as the first argument",
-                self.function_name
-            ))),
-        }
-    }
-
     fn pos_strings_at(&self, idx: usize) -> Result<Vec<String>> {
         match self.positional_args.get(idx) {
             Some(BoundExpr::Function { name, args, .. }) if name == "array" => {
@@ -1156,10 +1125,22 @@ impl Operator for AnalyticsTableFunctionOperator {
             let batch = self.execute().await?;
             self.finished = true;
             if batch.num_rows == 0 && batch.num_columns() == 0 {
-                Ok(None)
-            } else {
-                Ok(Some(ExecutionBatch::new(batch)))
+                return Ok(None);
             }
+            // The planner declares this node's schema from the function name
+            // and the function builds its own columns from the same name. A
+            // disagreement would hand the parent columns it does not expect
+            // and be read as wrong values rather than as a mismatch, so it is
+            // caught here where the two meet
+            if batch.num_columns() != self.output_columns.len() {
+                return Err(ZyronError::ExecutionError(format!(
+                    "table function \"{}\" produced {} columns, its plan declares {}",
+                    self.function_name,
+                    batch.num_columns(),
+                    self.output_columns.len()
+                )));
+            }
+            Ok(Some(ExecutionBatch::new(batch)))
         })
     }
 }

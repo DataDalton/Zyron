@@ -1,0 +1,79 @@
+{
+  "id": "2026-08-16_183552_c4f1c07-local",
+  "date": "2026-08-16 18:36:09Z",
+  "ts": 1786905369,
+  "commit": "c4f1c07-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Error Recovery": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.39 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 13.38 },
+      "Latency (us/error)": {
+        "average": 0.264057,
+        "runs": [0.26, 0.26, 0.26, 0.26, 0.26],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Lexer Throughput": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 13.38 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 13.39 },
+      "Throughput (MB/sec)": {
+        "average": 230.389941,
+        "runs": [230.24, 230.39, 230.44, 230.31, 230.57],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Memory": {
+      "Estimated per-parse (bytes)": {
+        "average": 856.000000,
+        "runs": [856.00],
+        "target": 1024.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Parser Batch": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.38 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 13.36 },
+      "Throughput (stmts/sec)": {
+        "average": 1662346.488175,
+        "runs": [1660770.38, 1662556.27, 1660563.54, 1664503.37, 1663338.88],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parser Complex": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 13.38 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 13.37 },
+      "Latency (us/parse)": {
+        "average": 8.029726,
+        "runs": [8.30, 8.14, 7.91, 7.91, 7.90],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Parser Simple": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 13.36 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 13.36 },
+      "Latency (ns/parse)": {
+        "average": 1024.875400,
+        "runs": [1026.59, 1024.43, 1023.77, 1025.09, 1024.50],
+        "target": 1000.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    }
+  }
+}

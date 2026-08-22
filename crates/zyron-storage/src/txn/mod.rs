@@ -5,6 +5,8 @@
 //! access to heap tuple headers (xmin/xmax), B+tree latch ordering,
 //! and buffer pool pin/unpin.
 
+#[cfg(test)]
+mod commit_status_ordering_test;
 mod deadlock;
 mod durability;
 mod gc;
@@ -22,7 +24,7 @@ use durability::DurabilityQueue;
 pub use gc::{GcStats, MvccGc};
 pub use intent_lock::IntentLockTable;
 pub use isolation::IsolationLevel;
-pub use lock_table::LockTable;
+pub use lock_table::{LockMode, LockTable};
 pub use proc_array::ProcArray;
 pub use retention_clock::RetentionClock;
 pub use snapshot::Snapshot;
@@ -316,13 +318,17 @@ impl TransactionManager {
     /// Creates a new transaction manager.
     pub fn new(wal: Arc<WalWriter>) -> Self {
         let durability = Self::register_durability(&wal);
+        // the lock table owns the wait-for graph its blocking acquisitions
+        // feed, the manager shares it so commit/abort clear a txn's edges
+        let lock_table = Arc::new(LockTable::new());
+        let wait_for_graph = Arc::clone(lock_table.wait_graph());
         Self {
             next_txn_id: AtomicU64::new(1),
             proc_array: Arc::new(ProcArray::new()),
             wal,
-            lock_table: Arc::new(LockTable::new()),
+            lock_table,
             intent_locks: Arc::new(IntentLockTable::new()),
-            wait_for_graph: Arc::new(WaitForGraph::new()),
+            wait_for_graph,
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
             durability,
@@ -333,13 +339,15 @@ impl TransactionManager {
     /// Used for recovery to resume from the last known txn_id.
     pub fn with_start_txn_id(wal: Arc<WalWriter>, start_txn_id: u64) -> Self {
         let durability = Self::register_durability(&wal);
+        let lock_table = Arc::new(LockTable::new());
+        let wait_for_graph = Arc::clone(lock_table.wait_graph());
         Self {
             next_txn_id: AtomicU64::new(start_txn_id),
             proc_array: Arc::new(ProcArray::new()),
             wal,
-            lock_table: Arc::new(LockTable::new()),
+            lock_table,
             intent_locks: Arc::new(IntentLockTable::new()),
-            wait_for_graph: Arc::new(WaitForGraph::new()),
+            wait_for_graph,
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
             durability,
@@ -380,9 +388,17 @@ impl TransactionManager {
     /// does not leak.
     pub fn begin(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let _s = profile::scope(Phase::TxnBegin);
-        let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
-
-        let slot_idx = self.proc_array.claim(txn_id)?;
+        // The slot is claimed BEFORE the id is allocated, under a
+        // conservative placeholder no higher than the id will be. A horizon
+        // scan sampling next_txn_id and then the active set can otherwise
+        // land between the allocation and the claim, compute a horizon above
+        // this transaction, and let vacuum reclaim versions whose deleter
+        // later aborts. The placeholder only ever lowers a horizon, which is
+        // the safe direction
+        let placeholder = self.next_txn_id.load(Ordering::SeqCst);
+        let slot_idx = self.proc_array.claim(placeholder)?;
+        let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
+        self.proc_array.set(slot_idx, txn_id);
 
         // Empty until snapshot_into pushes live txn ids. At low concurrency the
         // active set is usually empty, so starting empty skips a heap allocation
@@ -437,6 +453,20 @@ impl TransactionManager {
     /// then await durability (via `commit` or `commit_blocking`) before
     /// acknowledging the commit; this method alone does not guarantee the record
     /// is on stable storage.
+    ///
+    /// Visibility deliberately precedes durability. Publishing the commit
+    /// here and fsyncing after keeps locks out of the group-commit flush
+    /// wait, and the WAL's total order makes that safe for every dependent
+    /// writer: a transaction that read this one's data and then commits
+    /// appends its record at a higher LSN, so its durability wait flushes
+    /// this record first and a crash can never keep the dependent while
+    /// losing the antecedent. The accepted residual is a read-only
+    /// observer: a reader can see this transaction's data and act on it
+    /// outside the database inside the group-commit window (tens of
+    /// microseconds) before the record is on stable storage, and a crash
+    /// in that window erases what the observer saw. Holding locks and the
+    /// active-set entry across the fsync would close that window at the
+    /// cost of serializing contended rows on device latency.
     fn commit_inner(&self, txn: &mut Transaction) -> Result<Lsn> {
         if txn.status != TransactionStatus::Active {
             return Err(ZyronError::TransactionAborted(format!(
@@ -457,18 +487,22 @@ impl TransactionManager {
         // without replay.
         txn.undo_log.clear();
 
+        // Publish the committed status BEFORE releasing any lock and before
+        // leaving the active set. A waiter that wins a released row lock
+        // consults the status map in its next instruction: the FOR UPDATE
+        // recheck and the unique probe both judge this transaction by it,
+        // and a lock released ahead of the status hands them a committer
+        // that still looks in flight. The commit-record LSN dates the
+        // transaction for time-travel; it is stored only while commit-LSN
+        // tracking is enabled.
+        self.status_map.record_committed_at(txn.txn_id, lsn.0);
+
         {
             let _s = profile::scope(Phase::LockRelease);
             self.lock_table.unlock_all(txn.txn_id);
             self.intent_locks.unlock_all(txn.txn_id);
             self.wait_for_graph.remove_transaction(txn.txn_id);
         }
-
-        // Publish the committed status BEFORE leaving the active set, so no
-        // snapshot can observe this transaction as neither active nor committed.
-        // The commit-record LSN dates the transaction for time-travel; it is
-        // stored only while commit-LSN tracking is enabled.
-        self.status_map.record_committed_at(txn.txn_id, lsn.0);
 
         {
             let _s = profile::scope(Phase::ProcArrayRelease);
@@ -575,13 +609,15 @@ impl TransactionManager {
         // discarded without replay.
         txn.undo_log.clear();
 
+        // Record the abort BEFORE releasing any lock, mirroring commit's
+        // ordering: a waiter that wins a released lock judges this
+        // transaction by the status map, and its writes must already read
+        // as aborted there. The engine performs no physical undo.
+        self.status_map.record_aborted(txn.txn_id);
+
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
         self.wait_for_graph.remove_transaction(txn.txn_id);
-
-        // Record the abort so this transaction's writes stay invisible after it
-        // leaves the active set. The engine performs no physical undo.
-        self.status_map.record_aborted(txn.txn_id);
 
         self.proc_array.release(txn.slot_idx);
 
@@ -601,8 +637,10 @@ impl TransactionManager {
         Snapshot::new(txn.txn_id, active_ids, Arc::clone(&self.status_map))
     }
 
-    /// Returns a reference to the row-level lock table.
-    pub fn lock_table(&self) -> &LockTable {
+    /// Returns the shared row-level lock table. The executor takes row locks
+    /// through this for SELECT FOR UPDATE/SHARE and the DML write paths; the
+    /// locks are released by this transaction's commit/abort.
+    pub fn lock_table(&self) -> &Arc<LockTable> {
         &self.lock_table
     }
 
@@ -632,7 +670,11 @@ impl TransactionManager {
 
     /// Returns the next txn_id that will be assigned.
     pub fn next_txn_id(&self) -> u64 {
-        self.next_txn_id.load(Ordering::Relaxed)
+        // SeqCst pairs with begin's claim-then-allocate ordering: any
+        // transaction whose id is below this fence has already claimed its
+        // proc-array slot, so a horizon computed as (active set, capped by
+        // this fence) can never sit above a transaction that is starting
+        self.next_txn_id.load(Ordering::SeqCst)
     }
 }
 
@@ -726,16 +768,21 @@ mod tests {
     fn dropped_active_transaction_releases_locks() {
         let (mgr, _dir) = create_test_manager();
         let rid = crate::tuple::TupleId::new(zyron_common::page::PageId::new(0, 1), 0);
+        let loc = rid.locator();
         let txn_id = {
             let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-            mgr.lock_table().lock_row(txn.txn_id, 7, rid).unwrap();
+            mgr.lock_table()
+                .lock_row(txn.txn_id, 7, loc, LockMode::Exclusive)
+                .unwrap();
             assert_eq!(mgr.lock_table().current_count(txn.txn_id), 1);
             txn.txn_id
         };
         assert_eq!(mgr.lock_table().current_count(txn_id), 0);
 
         let txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-        mgr.lock_table().lock_row(txn2.txn_id, 7, rid).unwrap();
+        mgr.lock_table()
+            .lock_row(txn2.txn_id, 7, loc, LockMode::Exclusive)
+            .unwrap();
         assert_eq!(mgr.lock_table().current_count(txn2.txn_id), 1);
     }
 

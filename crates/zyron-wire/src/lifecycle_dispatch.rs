@@ -1,4 +1,4 @@
-//! Phase 17 data lifecycle DDL handlers: TTL, table options, legal hold,
+//! Data lifecycle DDL handlers: TTL, table options, legal hold,
 //! FORGET/EXPORT USER, tier move, column classification, soft-delete restore,
 //! retention jobs, and undrop. Every handler is privilege-gated and writes a
 //! tamper-evident compliance log entry.
@@ -82,10 +82,17 @@ fn ttl_action_code(a: lc_ast::TtlAction) -> u8 {
 }
 
 /// Parses a human duration like "30 days" / "7 years" / "90d" into seconds.
-fn parse_duration_secs(s: &str) -> i64 {
+/// A malformed number or an unknown unit is refused rather than defaulted:
+/// silently reading "30 dyas" as thirty days or "abc" as zero would enact a
+/// retention policy the operator never wrote.
+fn parse_duration_secs(s: &str) -> Result<i64, ProtocolError> {
     let s = s.trim();
     let num: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let n: i64 = num.parse().unwrap_or(0);
+    let n: i64 = num.parse().map_err(|_| {
+        ProtocolError::Database(ZyronError::PlanError(format!(
+            "duration \"{s}\" has no leading number, expected a form like '30 days' or '90d'"
+        )))
+    })?;
     let rest = s[num.len()..].trim().to_ascii_lowercase();
     let unit = if rest.starts_with("year") || rest == "y" {
         365 * 86400
@@ -93,7 +100,8 @@ fn parse_duration_secs(s: &str) -> i64 {
         30 * 86400
     } else if rest.starts_with("week") || rest == "w" {
         7 * 86400
-    } else if rest.starts_with("day") || rest == "d" {
+    } else if rest.starts_with("day") || rest == "d" || rest.is_empty() {
+        // a bare number keeps its long-standing day reading
         86400
     } else if rest.starts_with("hour") || rest == "h" {
         3600
@@ -102,9 +110,12 @@ fn parse_duration_secs(s: &str) -> i64 {
     } else if rest.starts_with("sec") || rest == "s" {
         1
     } else {
-        86400
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "duration \"{s}\" has an unknown unit \"{rest}\", expected years, months, weeks, \
+             days, hours, minutes or seconds"
+        ))));
     };
-    n.saturating_mul(unit)
+    Ok(n.saturating_mul(unit))
 }
 
 /// Rebuilds the lock-free legal-hold registry from the catalog so the DML
@@ -229,6 +240,129 @@ fn discover_erasure_targets(server: &Arc<ServerState>, cascade: bool) -> Vec<Era
 /// Plans and executes a DML/SELECT statement in its own transaction with the
 /// legal-hold / WORM enforcement hook attached. Returns rows affected
 /// (DELETE/UPDATE) or rows produced (SELECT).
+/// Table options that describe how a lake table is maintained.
+///
+/// They are written to the table's transaction log rather than to the
+/// catalog, because the maintenance loop that reads them works from the
+/// manifest
+fn is_lake_maintenance_option(key: &str) -> bool {
+    matches!(
+        key,
+        "auto_compact_small_file_ratio"
+            | "auto_compact_dead_row_ratio"
+            | "target_rows_per_file"
+            | "cluster_repair_max_inputs"
+            | "cluster_repair_interval_secs"
+            | "cluster_repair_urgency_threshold"
+            | "bloom_filter_columns"
+    )
+}
+
+/// Commits maintenance options to a lake table's log and refreshes what
+/// the catalog mirrors of them.
+///
+/// Values are checked here rather than where they are read. The readers
+/// fall back to the shipped default on anything unreadable, which is the
+/// right answer for a manifest that has been damaged and the wrong one for
+/// a statement with a typo in it: the operator would be told nothing and
+/// get the default
+async fn apply_lake_maintenance_options(
+    server: &Arc<ServerState>,
+    entry: &mut zyron_catalog::schema::TableEntry,
+    table_name: &str,
+    pairs: &[(String, String)],
+) -> Result<(), ProtocolError> {
+    if !entry.lake.is_lake() {
+        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+            "'{}' is not a lake table, so it has no data files to maintain",
+            table_name
+        ))));
+    }
+    for (key, value) in pairs {
+        let lowered = key.to_ascii_lowercase();
+        match lowered.as_str() {
+            "auto_compact_small_file_ratio" | "auto_compact_dead_row_ratio" => {
+                let parsed = value.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+                match parsed {
+                    Some(v) if v >= 0.0 => {}
+                    _ => {
+                        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                            "{lowered} on '{table_name}' has to be a number of at least zero, \
+                             got '{value}'"
+                        ))));
+                    }
+                }
+            }
+            "target_rows_per_file" | "cluster_repair_max_inputs" => {
+                if value
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .is_none()
+                {
+                    return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "{lowered} on '{table_name}' has to be a positive whole number, got \
+                         '{value}'"
+                    ))));
+                }
+            }
+            // Zero is meaningful for both: an interval of zero asks for a
+            // pass on every tick the node makes, and a threshold of zero
+            // asks for one as soon as any file needs repair
+            "cluster_repair_interval_secs" | "cluster_repair_urgency_threshold" => {
+                if value.trim().parse::<u64>().is_err() {
+                    return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "{lowered} on '{table_name}' has to be a whole number, got '{value}'"
+                    ))));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = zyron_lake::TransactionLog::lookup_shared(&paths).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::ConfigError(format!(
+            "this node does not run the lake tier, so it cannot set options on '{table_name}'"
+        )))
+    })?;
+    let commits: Vec<zyron_lake::LogEntry> = pairs
+        .iter()
+        .map(|(k, v)| zyron_lake::LogEntry::SetProperty {
+            key: k.to_ascii_lowercase(),
+            value: v.clone(),
+        })
+        .collect();
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    log.commit(
+        zyron_lake::CommitAttempt {
+            operation: zyron_lake::OperationKind::SetProperty,
+            db_txn_id: 0,
+            commit_lsn: 0,
+            timestamp_us,
+            read_predicate: None,
+            read_version: 0,
+            audit: None,
+            deadline: None,
+        },
+        |_| Ok(commits.clone()),
+    )
+    .map_err(ProtocolError::Database)?;
+
+    // The declared filter set is mirrored so planning can say which of them
+    // the layout already covers, and a request the writer will not carry
+    // out is said out loud rather than dropped
+    if let Ok(manifest) = log.latest_manifest() {
+        entry.cluster.bloom_columns = manifest.declared_bloom_columns();
+        crate::ddl_dispatch::warn_redundant_blooms(table_name, &manifest);
+    }
+    Ok(())
+}
+
 async fn run_sql(
     server: &Arc<ServerState>,
     sql: &str,
@@ -244,6 +378,7 @@ async fn run_sql(
         zyron_catalog::DatabaseId(1),
         vec!["public".to_string()],
         stmt,
+        Some(&server.peer_facts()),
     )
     .await
     .map_err(ProtocolError::Database)?;
@@ -338,7 +473,7 @@ pub async fn handle_alter_table_ttl(
             });
         }
         lc_ast::TtlOperation::Drop => {
-            entry.lifecycle.ttl_column_id = 0;
+            entry.lifecycle.ttl_column_id = zyron_catalog::schema::NO_LIFECYCLE_COLUMN;
             entry.lifecycle.ttl_seconds = 0;
             entry.lifecycle.ttl_action = 0;
         }
@@ -413,6 +548,16 @@ pub async fn handle_alter_table_options(
         )?;
     }
 
+    // Options describing how a lake table is maintained live in its
+    // transaction log rather than in the catalog, because the maintenance
+    // that reads them runs from the manifest and never opens the catalog
+    let (lake_pairs, pairs): (Vec<(String, String)>, Vec<(String, String)>) = pairs
+        .into_iter()
+        .partition(|(k, _)| is_lake_maintenance_option(&k.to_ascii_lowercase()));
+    if !lake_pairs.is_empty() {
+        apply_lake_maintenance_options(server, &mut entry, &stmt.table, &lake_pairs).await?;
+    }
+
     for (k, v) in &pairs {
         match k.to_ascii_lowercase().as_str() {
             "soft_delete" => entry.lifecycle.soft_delete_enabled = v == "true",
@@ -434,9 +579,15 @@ pub async fn handle_alter_table_options(
                 })?;
                 entry.lifecycle.soft_delete_deleted_at_col_id = id;
             }
-            "cold_after" => entry.lifecycle.cold_after_seconds = parse_duration_secs(v),
-            "archive_after" | "purge_after_soft_delete" => {
-                entry.lifecycle.archive_after_seconds = parse_duration_secs(v)
+            "cold_after" => entry.lifecycle.cold_after_seconds = parse_duration_secs(v)?,
+            "archive_after" => entry.lifecycle.archive_after_seconds = parse_duration_secs(v)?,
+            // The window a soft-deleted row is kept before it is physically
+            // purged, which the retention worker reads from
+            // purge_grace_seconds. Writing it to archive_after_seconds left
+            // the grace at zero, so a table declaring this option purged its
+            // soft-deleted rows on the next pass instead of holding them
+            "purge_after_soft_delete" => {
+                entry.lifecycle.purge_grace_seconds = parse_duration_secs(v)?
             }
             "archive_destination" | "archive_location" => {
                 entry.lifecycle.archive_destination = v.clone()
@@ -444,9 +595,9 @@ pub async fn handle_alter_table_options(
             "archive_on_purge" => entry.lifecycle.archive_on_purge = v == "true",
             "retention_lock" => {
                 entry.lifecycle.retention_lock_until =
-                    now_micros() + parse_duration_secs(v).saturating_mul(1_000_000)
+                    now_micros() + parse_duration_secs(v)?.saturating_mul(1_000_000)
             }
-            "recycle_window" => entry.lifecycle.recycle_window_seconds = parse_duration_secs(v),
+            "recycle_window" => entry.lifecycle.recycle_window_seconds = parse_duration_secs(v)?,
             "data_residency" => entry.lifecycle.residency_region = v.clone(),
             "immutable" => entry.lifecycle.immutable = v == "true",
             "time_travel_retention" | "time_travel_retention_period" => {
@@ -499,7 +650,7 @@ pub(crate) fn parse_time_travel_retention(v: &str) -> Result<u64, ProtocolError>
     if vl.is_empty() || vl == "default" || vl == "off" || vl == "0" {
         return Ok(0);
     }
-    let secs = parse_duration_secs(&vl);
+    let secs = parse_duration_secs(&vl)?;
     if secs <= 0 {
         return Err(ProtocolError::Database(ZyronError::ParseError(format!(
             "invalid time_travel_retention '{v}': expected a duration like '30 days', 'unlimited', or 'default'"
@@ -768,6 +919,45 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Turns `PARTITION 'col=value'` into the equality predicate it stands for.
+///
+/// The value is quoted unless it reads as a number, so a text partition key
+/// parses as a string literal rather than an unknown identifier. A quote
+/// inside the value is doubled, which is how SQL escapes one.
+fn partition_spec_to_predicate(spec: &str) -> Result<lc_ast::Expr, ProtocolError> {
+    let (col, value) = spec.split_once('=').ok_or_else(|| {
+        ProtocolError::Database(ZyronError::PlanError(format!(
+            "PARTITION spec '{spec}' must be written as 'column=value'"
+        )))
+    })?;
+    let col = col.trim();
+    let value = value.trim();
+    if col.is_empty() {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "PARTITION spec '{spec}' names no column"
+        ))));
+    }
+    let literal = if value.parse::<i128>().is_ok() || value.parse::<f64>().is_ok() {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    };
+    zyron_parser::parse_expr(&format!("\"{}\" = {literal}", col.replace('"', "\"\"")))
+        .map_err(ProtocolError::Database)
+}
+
+/// Relocates a table's columnar segments to another storage tier.
+///
+/// A tier is a directory: the fold writes into the columnar root and a
+/// relocation moves the file into `<root>/tiers/<name>/`, so pointing that
+/// directory at a cheaper mount is what makes the tier cheaper. Nothing about
+/// the file changes, and a read of a relocated segment is the same positioned
+/// read as before, because the catalog records where the file went.
+///
+/// The statement names rows but the unit that moves is a whole file, so a
+/// segment relocates only when every row in it visible to this statement
+/// satisfies the predicate. A partly matching segment stays where it is
+/// rather than dragging rows the operator did not name onto a colder tier.
 pub async fn handle_alter_table_move(
     stmt: &lc_ast::AlterTableMoveStatement,
     server: &Arc<ServerState>,
@@ -784,17 +974,346 @@ pub async fn handle_alter_table_move(
         zyron_auth::PrivilegeType::ManageDataLifecycle,
         table.id.0,
     )?;
-    // Validate the requested tier name so a typo is rejected with a clear
-    // message rather than the unsupported-operation error below.
-    let _tier = zyron_lifecycle::tiered_storage::StorageTier::parse(&stmt.tier)
+    let tier = zyron_lifecycle::tiered_storage::StorageTier::parse(&stmt.tier)
         .map_err(ProtocolError::Database)?;
-    // No storage or executor path relocates rows between tiers. Writing
-    // storage_tier and recording a done retention job would report a move that
-    // never happened, so reject the operation instead of faking completion.
-    Err(ProtocolError::Database(ZyronError::PlanError(format!(
-        "ALTER TABLE MOVE to tier '{}' is not available, tiered storage relocation is not implemented",
-        stmt.tier
-    ))))
+
+    let predicate_expr = match &stmt.target {
+        lc_ast::MoveTarget::Where(e) => (**e).clone(),
+        lc_ast::MoveTarget::Partition(spec) => partition_spec_to_predicate(spec)?,
+    };
+    let outcome =
+        relocate_covered_segments(server, &table, &predicate_expr, tier, stmt.dry_run).await?;
+
+    let detail = format!(
+        "{} move '{}' to tier '{}': {} of {} segments, {} rows",
+        if stmt.dry_run { "DRY RUN" } else { "apply" },
+        stmt.table,
+        tier.name(),
+        outcome.segments,
+        table.columnar.segments.len(),
+        outcome.rows
+    );
+    audit(server, 7, &stmt.table, table.id.0, &detail).await?;
+    if stmt.dry_run {
+        return Ok(DdlResult::Tag(format!(
+            "ALTER TABLE MOVE DRY RUN {}",
+            outcome.segments
+        )));
+    }
+    Ok(DdlResult::Tag(format!(
+        "ALTER TABLE MOVE {}",
+        outcome.segments
+    )))
+}
+
+/// Relocates a table's aged segments per its `cold_after` and `archive_after`
+/// options, returning (segments moved, rows on them).
+///
+/// The age column is the table's per-row retention column when it declares
+/// one, otherwise its TTL column. Without either there is nothing to measure
+/// age against, so the options are reported as unusable rather than applied
+/// against an arbitrary column. Archive is applied after cold, so a segment
+/// old enough for both ends on the colder of the two.
+///
+/// Public because the retention worker drives the same pass every cycle,
+/// so a declared tiering policy relocates without a manual
+/// RUN RETENTION JOB.
+pub async fn run_age_tiering(
+    server: &Arc<ServerState>,
+    table: &Arc<zyron_catalog::schema::TableEntry>,
+    now_us: i64,
+    dry_run: bool,
+) -> Result<(u64, u64), ProtocolError> {
+    let lc = &table.lifecycle;
+    if lc.cold_after_seconds <= 0 && lc.archive_after_seconds <= 0 {
+        return Ok((0, 0));
+    }
+    let age_column_id =
+        if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
+            lc.retention_column_id
+        } else {
+            lc.ttl_column_id
+        };
+    let Some(column) = column_name_by_id(table, age_column_id) else {
+        // A declared tiering policy with nothing to measure age against is
+        // a misconfiguration, and silence here left it relocating nothing
+        // forever with no trace
+        tracing::warn!(
+            target: "zyron::lifecycle",
+            table = %table.name,
+            "cold_after/archive_after are set but the table declares no retention or TTL \
+             column to measure age against, so no segment is relocated"
+        );
+        return Ok((0, 0));
+    };
+
+    let mut segments = 0u64;
+    let mut rows = 0u64;
+    for (after_seconds, tier) in [
+        (lc.cold_after_seconds, zyron_common::StorageTier::Cold),
+        (lc.archive_after_seconds, zyron_common::StorageTier::Archive),
+    ] {
+        if after_seconds <= 0 {
+            continue;
+        }
+        // Temporal columns store microseconds, the same domain the expiry
+        // predicate below compares against
+        let cutoff = now_us - after_seconds.saturating_mul(1_000_000);
+        let expr =
+            zyron_parser::parse_expr(&format!("\"{}\" < {cutoff}", column.replace('"', "\"\"")))
+                .map_err(ProtocolError::Database)?;
+        // Re-read the entry between passes so the archive pass sees the paths
+        // the cold pass wrote rather than the ones it replaced
+        let current = server
+            .catalog
+            .get_table_by_id(table.id)
+            .map_err(ProtocolError::Database)?;
+        let outcome = relocate_covered_segments(server, &current, &expr, tier, dry_run).await?;
+        segments += outcome.segments;
+        rows += outcome.rows;
+    }
+    Ok((segments, rows))
+}
+
+/// What a relocation did, or would do under a dry run.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RelocationOutcome {
+    pub segments: u64,
+    pub rows: u64,
+}
+
+/// Moves every segment of `table` that `predicate_expr` covers in full onto
+/// `tier`, leaving partly matching segments where they are.
+///
+/// Shared by `ALTER TABLE ... MOVE` and the age-driven tiering the retention
+/// job runs, so an operator-issued move and a scheduled one relocate by
+/// exactly the same rule.
+pub(crate) async fn relocate_covered_segments(
+    server: &Arc<ServerState>,
+    table: &Arc<zyron_catalog::schema::TableEntry>,
+    predicate_expr: &lc_ast::Expr,
+    tier: zyron_common::StorageTier,
+    dry_run: bool,
+) -> Result<RelocationOutcome, ProtocolError> {
+    if table.columnar.segments.is_empty() {
+        // Rows still in the heap have no file to relocate. Reporting zero is
+        // honest here: nothing matched because nothing has folded yet
+        return Ok(RelocationOutcome::default());
+    }
+
+    let bound = zyron_planner::bind_table_predicate(&server.catalog, table, predicate_expr)
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    let columns: Vec<zyron_planner::logical::LogicalColumn> = table
+        .columns
+        .iter()
+        .map(|c| zyron_planner::logical::LogicalColumn {
+            table_idx: Some(0),
+            column_id: c.id,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+        })
+        .collect();
+
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .map_err(ProtocolError::Database)?;
+    let snapshot = txn.snapshot.clone();
+    let txn_id = u32::try_from(txn.txn_id)
+        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let ctx = Arc::new(zyron_executor::context::ExecutionContext::new(
+        Arc::clone(&server.catalog),
+        Arc::clone(&server.wal),
+        Arc::clone(&server.buffer_pool),
+        Arc::clone(&server.disk_manager),
+        txn_id,
+        snapshot,
+    ));
+    let coverage =
+        zyron_executor::tier_move::segment_predicate_coverage(&ctx, table.id, &columns, &bound)
+            .await;
+    let _ = server.txn_manager.abort(&mut txn);
+    let coverage = coverage.map_err(ProtocolError::Database)?;
+
+    // Segments the predicate covers whole and that are not already on the
+    // requested tier. A segment already there is left untouched so a repeated
+    // statement moves nothing and reports nothing. Candidates carry the
+    // segment's file id, the registry is re-read under the update lock
+    // below and positional indexes into this snapshot would be stale there
+    let mut candidates: Vec<(u64, u64)> = Vec::new();
+    for cov in &coverage {
+        if !cov.fully_covered() {
+            continue;
+        }
+        let Some(seg) = table
+            .columnar
+            .segments
+            .iter()
+            .find(|s| s.file_id == cov.file_id)
+        else {
+            continue;
+        };
+        if seg.storage_tier == tier as u8 {
+            continue;
+        }
+        candidates.push((seg.file_id, cov.live_rows));
+    }
+
+    if dry_run {
+        return Ok(RelocationOutcome {
+            segments: candidates.len() as u64,
+            rows: candidates.iter().map(|(_, r)| *r).sum(),
+        });
+    }
+
+    // The renames and the registry edit run as one read-modify-write under
+    // the table's update lock, re-reading the entry inside it. Editing the
+    // pre-lock snapshot and writing it back raced the fold worker's segment
+    // registration, and whichever side wrote last erased the other's change:
+    // a lost fold registration leaves rows that are already zeroed out of
+    // the heap with no registered segment to serve them
+    let update_lock = server.catalog.table_update_lock(table.id);
+    let _entry_guard = update_lock.lock().await;
+    let current = server
+        .catalog
+        .get_table_by_id(table.id)
+        .map_err(ProtocolError::Database)?;
+    let mut entry = (*current).clone();
+    let mut outcome = RelocationOutcome::default();
+    // A failure part way through the list must not lose the moves that
+    // already happened. Their files sit at the new paths, so the registry
+    // edits recorded so far are persisted before the error surfaces. Held
+    // back, a scan would resolve the moved segments at paths that no
+    // longer hold a file
+    let mut failure: Option<ProtocolError> = None;
+    for (file_id, rows) in candidates {
+        // The segment may have been merged away or moved since the
+        // coverage scan, only what the fresh registry still carries moves
+        let Some(idx) = entry
+            .columnar
+            .segments
+            .iter()
+            .position(|s| s.file_id == file_id && s.storage_tier != tier as u8)
+        else {
+            continue;
+        };
+        match relocate_one_segment(&entry.columnar.segments[idx].path, tier) {
+            Ok(Some(new_path)) => {
+                entry.columnar.segments[idx].path = new_path.to_string_lossy().into_owned();
+                entry.columnar.segments[idx].storage_tier = tier as u8;
+                outcome.rows += rows;
+                outcome.segments += 1;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+
+    if outcome.segments > 0 {
+        server.catalog.update_table(entry).await.map_err(|e| {
+            let stopped = failure
+                .take()
+                .map(|f| format!(", after the move stopped on {f}"))
+                .unwrap_or_default();
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "{} segments moved on disk but the registry write failed: {e}{stopped}. \
+                 The registrations are repaired from the tier directories at the next startup",
+                outcome.segments
+            )))
+        })?;
+        // A cached plan costed against the old tier would keep quoting the
+        // old scan cost, so the layout change has to invalidate it
+        server.catalog.bump_schema_version();
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(outcome),
+    }
+}
+
+/// Moves one registered segment file onto `tier` and returns its new path,
+/// or None when the file already sits where the tier would place it.
+fn relocate_one_segment(
+    recorded_path: &str,
+    tier: zyron_common::StorageTier,
+) -> Result<Option<std::path::PathBuf>, ProtocolError> {
+    let old_path = std::path::PathBuf::from(recorded_path);
+    let root = zyron_storage::columnar::columnar_root_for_segment(&old_path).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::Internal(format!(
+            "segment path {} has no columnar root",
+            old_path.display()
+        )))
+    })?;
+    let file_name = old_path.file_name().ok_or_else(|| {
+        ProtocolError::Database(ZyronError::Internal(format!(
+            "segment path {} names no file",
+            old_path.display()
+        )))
+    })?;
+    let dest_dir = zyron_storage::columnar::tier_segment_dir(root, tier.name());
+    let new_path = dest_dir.join(file_name);
+    if new_path == old_path {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(&dest_dir).map_err(|e| {
+        ProtocolError::Database(ZyronError::IoError(format!(
+            "failed to create tier directory {}: {e}",
+            dest_dir.display()
+        )))
+    })?;
+    relocate_segment_file(&old_path, &new_path)?;
+    Ok(Some(new_path))
+}
+
+/// Moves one segment file to its new tier directory.
+///
+/// A rename is used when both sides sit on the same filesystem. Tier
+/// directories are expected to be separate mounts, which is the whole point
+/// of a tier, so the cross-device case falls back to copy-then-remove. The
+/// copy lands on a temporary name and is renamed into place, so an
+/// interrupted move never leaves a half-written file under the name the
+/// catalog is about to point at.
+fn relocate_segment_file(
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+) -> Result<(), ProtocolError> {
+    if std::fs::rename(old_path, new_path).is_ok() {
+        return Ok(());
+    }
+    let staging = new_path.with_extension("zyr.moving");
+    std::fs::copy(old_path, &staging).map_err(|e| {
+        ProtocolError::Database(ZyronError::IoError(format!(
+            "failed to copy segment {} to {}: {e}",
+            old_path.display(),
+            staging.display()
+        )))
+    })?;
+    std::fs::rename(&staging, new_path).map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        ProtocolError::Database(ZyronError::IoError(format!(
+            "failed to place segment at {}: {e}",
+            new_path.display()
+        )))
+    })?;
+    // The source is removed only after the destination is in place, so a
+    // failure here leaves both copies rather than neither. The catalog still
+    // points at the old path until it is updated, so the leftover is the one
+    // that gets reclaimed
+    std::fs::remove_file(old_path).map_err(|e| {
+        ProtocolError::Database(ZyronError::IoError(format!(
+            "segment copied to {} but the original {} could not be removed: {e}",
+            new_path.display(),
+            old_path.display()
+        )))
+    })?;
+    Ok(())
 }
 
 pub async fn handle_alter_column_classification(
@@ -897,7 +1416,7 @@ pub async fn handle_restore_soft_delete(
 
 /// Resolves a table column name from its stored column id (0 = unset).
 fn column_name_by_id(table: &zyron_catalog::schema::TableEntry, col_id: u32) -> Option<String> {
-    if col_id == 0 {
+    if !zyron_catalog::schema::LifecycleConfig::column_is_set(col_id) {
         return None;
     }
     table
@@ -942,18 +1461,34 @@ pub async fn handle_run_retention_job(
     for table in &tables {
         let lc = &table.lifecycle;
 
+        // Age-driven tiering runs before expiry, and on its own age column,
+        // so a table that only declares cold_after or archive_after is still
+        // processed. Data that has aged past a threshold relocates to the
+        // matching tier; the same coverage rule the DDL uses applies, so a
+        // segment holding any row younger than the threshold stays put
+        let (tiered_segments, tiered_rows) =
+            run_age_tiering(server, table, started, stmt.dry_run).await?;
+        if tiered_segments > 0 {
+            tables_processed += 1;
+            total_rows += tiered_rows;
+        }
+
         // Expiry predicate: a per-row retention column compares directly to now;
         // a TTL column compares to a cutoff `now - ttl_seconds`. Temporal columns
         // store i64 microseconds, so the comparison is against a micro cutoff.
-        let where_sql = if lc.retention_column_id != 0 {
-            column_name_by_id(table, lc.retention_column_id)
-                .map(|col| format!("\"{col}\" < {started}"))
-        } else if lc.ttl_column_id != 0 && lc.ttl_seconds > 0 {
-            let cutoff = started - lc.ttl_seconds.saturating_mul(1_000_000);
-            column_name_by_id(table, lc.ttl_column_id).map(|col| format!("\"{col}\" < {cutoff}"))
-        } else {
-            None
-        };
+        let where_sql =
+            if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
+                column_name_by_id(table, lc.retention_column_id)
+                    .map(|col| format!("\"{col}\" < {started}"))
+            } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
+                && lc.ttl_seconds > 0
+            {
+                let cutoff = started - lc.ttl_seconds.saturating_mul(1_000_000);
+                column_name_by_id(table, lc.ttl_column_id)
+                    .map(|col| format!("\"{col}\" < {cutoff}"))
+            } else {
+                None
+            };
         let Some(where_sql) = where_sql else {
             continue; // no retention/TTL policy on this table
         };

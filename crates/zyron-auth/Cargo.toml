@@ -16,6 +16,7 @@ sha2.workspace = true
 sha1.workspace = true
 md-5.workspace = true
 hmac.workspace = true
+pbkdf2.workspace = true
 base64.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -31,10 +32,22 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
 ] }
-aws-sdk-sts = "1"
-aws-sdk-secretsmanager = "1"
+# default-features is off on all three to keep the AWS SDK's legacy `rustls`
+# feature out. That feature resolves to aws-smithy-http-client's
+# legacy-rustls-ring, which pulls a second whole TLS stack (rustls 0.21,
+# hyper 0.14, h2 0.3) alongside the rustls 0.23 that default-https-client
+# already provides, and both then get compiled
+aws-sdk-sts = { version = "1", default-features = false, features = [
+    "sigv4a",
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-config = { version = "1", default-features = false, features = [
-    "rustls",
+    "default-https-client",
     "rt-tokio",
 ] }
 

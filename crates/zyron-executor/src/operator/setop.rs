@@ -22,6 +22,49 @@ pub struct SetOpOperator {
     op: SetOpType,
     all: bool,
     state: SetOpState,
+    /// Per-column decimal scales of the first left batch, used by the
+    /// streaming UNION ALL path to align right-branch batches onto the
+    /// operation's declared output type
+    stream_scales: Option<Vec<Option<u8>>>,
+}
+
+/// Aligns a batch's decimal columns onto the target scales, which are the
+/// left branch's and therefore the operation's output type. The stored
+/// representation is a scaled integer, so without this equal values written
+/// at different scales hash and compare as different: UNION keeps both,
+/// INTERSECT and EXCEPT miss every cross-branch match. Returns None when
+/// nothing needed converting
+fn align_decimals(scales: &[Option<u8>], batch: &DataBatch) -> Result<Option<DataBatch>> {
+    let mut aligned: Option<Vec<Column>> = None;
+    for (ci, col) in batch.columns.iter().enumerate() {
+        if col.type_id != zyron_common::TypeId::Decimal || ci >= scales.len() {
+            continue;
+        }
+        let target = scales[ci].unwrap_or(0);
+        if col.fractional_digits.unwrap_or(0) == target {
+            continue;
+        }
+        let cast = compute::cast_column_to_decimal(col, target)?;
+        aligned.get_or_insert_with(|| batch.columns.clone())[ci] = cast;
+    }
+    Ok(aligned.map(DataBatch::new))
+}
+
+/// Aligns a streamed right-branch batch onto the captured left scales,
+/// passing everything else through untouched. An absent capture means the
+/// left branch produced no batch, and the schema's declared scales stand
+fn align_streamed(
+    eb: Option<ExecutionBatch>,
+    scales: &Option<Vec<Option<u8>>>,
+) -> Result<Option<ExecutionBatch>> {
+    let Some(eb) = eb else { return Ok(None) };
+    let Some(scales) = scales else {
+        return Ok(Some(eb));
+    };
+    match align_decimals(scales, &eb.batch)? {
+        Some(batch) => Ok(Some(ExecutionBatch::new(batch))),
+        None => Ok(Some(eb)),
+    }
 }
 
 enum SetOpState {
@@ -44,6 +87,10 @@ struct RowStore {
     hash_map: PreHashMap<u64, Vec<usize>>,
     counts: Vec<usize>,
     num_rows: usize,
+    /// Per-column decimal scale of the first batch seen, which is the left
+    /// branch and therefore the operation's declared output type. Every
+    /// later batch aligns its decimal columns onto these before hashing
+    scales: Vec<Option<u8>>,
 }
 
 impl RowStore {
@@ -53,6 +100,7 @@ impl RowStore {
             hash_map: PreHashMap::default(),
             counts: Vec::new(),
             num_rows: 0,
+            scales: Vec::new(),
         }
     }
 
@@ -61,8 +109,15 @@ impl RowStore {
             self.columns = batch
                 .columns
                 .iter()
-                .map(|c| Column::new(ColumnData::with_capacity(c.type_id, 64), c.type_id))
+                .map(|c| {
+                    Column::new_ts(
+                        ColumnData::with_capacity(c.type_id, 64),
+                        c.type_id,
+                        c.fractional_digits,
+                    )
+                })
                 .collect();
+            self.scales = batch.columns.iter().map(|c| c.fractional_digits).collect();
         }
     }
 
@@ -115,9 +170,10 @@ impl RowStore {
             .columns
             .iter()
             .map(|c| {
-                Column::new(
+                Column::new_ts(
                     ColumnData::with_capacity(c.type_id, indices.len()),
                     c.type_id,
+                    c.fractional_digits,
                 )
             })
             .collect();
@@ -153,6 +209,7 @@ impl SetOpOperator {
             op,
             all,
             state,
+            stream_scales: None,
         }
     }
 
@@ -174,6 +231,8 @@ impl SetOpOperator {
                 Some(eb) => {
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
+                    let realigned = align_decimals(&store.scales, batch)?;
+                    let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
@@ -190,6 +249,8 @@ impl SetOpOperator {
                 Some(eb) => {
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
+                    let realigned = align_decimals(&store.scales, batch)?;
+                    let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
@@ -217,6 +278,8 @@ impl SetOpOperator {
                 Some(eb) => {
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
+                    let realigned = align_decimals(&store.scales, batch)?;
+                    let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
@@ -235,6 +298,8 @@ impl SetOpOperator {
             match self.right.next().await? {
                 Some(eb) => {
                     let batch = &eb.batch;
+                    let realigned = align_decimals(&store.scales, batch)?;
+                    let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
@@ -278,6 +343,8 @@ impl SetOpOperator {
                 Some(eb) => {
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
+                    let realigned = align_decimals(&store.scales, batch)?;
+                    let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
@@ -295,6 +362,8 @@ impl SetOpOperator {
             match self.right.next().await? {
                 Some(eb) => {
                     let batch = &eb.batch;
+                    let realigned = align_decimals(&store.scales, batch)?;
+                    let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
@@ -359,14 +428,25 @@ impl Operator for SetOpOperator {
                 SetOpState::Left => {
                     // UNION ALL: drain left first, then right.
                     match self.left.next().await? {
-                        Some(eb) => Ok(Some(eb)),
+                        Some(eb) => {
+                            if self.stream_scales.is_none() {
+                                self.stream_scales = Some(
+                                    eb.batch
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.fractional_digits)
+                                        .collect(),
+                                );
+                            }
+                            Ok(Some(eb))
+                        }
                         None => {
                             self.state = SetOpState::Right;
-                            self.right.next().await
+                            align_streamed(self.right.next().await?, &self.stream_scales)
                         }
                     }
                 }
-                SetOpState::Right => self.right.next().await,
+                SetOpState::Right => align_streamed(self.right.next().await?, &self.stream_scales),
                 SetOpState::Materialized { result, cursor } => {
                     let Some(batch) = result else {
                         self.state = SetOpState::Done;

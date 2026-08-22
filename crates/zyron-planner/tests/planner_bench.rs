@@ -88,22 +88,12 @@ async fn setup_catalog(
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
+            .await
+            .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
-    let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            fsync_enabled: false,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -210,6 +200,7 @@ async fn plan_sql(catalog: &Catalog, sql: &str) -> PhysicalPlan {
         DatabaseId(1),
         vec!["planner_test".to_string()],
         stmt,
+        None,
     )
     .await
     .unwrap()
@@ -264,6 +255,7 @@ fn logical_op_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Distinct { .. } => "Distinct",
+        LogicalPlan::LockRows { .. } => "LockRows",
         LogicalPlan::SetOp { .. } => "SetOp",
         LogicalPlan::Insert { .. } => "Insert",
         LogicalPlan::Values { .. } => "Values",
@@ -780,7 +772,7 @@ async fn test_join_ordering() {
     tprintln!("  Top-level operator: {}", logical_op_name(&optimized));
 
     // Build physical plan to see the final join order
-    let physical = build_physical_plan(optimized, &catalog).unwrap();
+    let physical = build_physical_plan(optimized, &catalog, None).unwrap();
     tprintln!("  Physical plan top: {}", physical_op_name(&physical));
     tprintln!("  Physical plan cost: {:.2}", physical.total_cost().total());
 
@@ -1293,13 +1285,18 @@ async fn test_bench_planner_performance() {
     for run in 0..VALIDATION_RUNS {
         tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
-        // Binding latency
+        // Binding latency. Parsing and resolver construction are setup,
+        // not binding: parsing inside the loop timed the parser, and a
+        // per-iteration resolver threw away its schema-id cache, so the
+        // loop paid the exact cold lookup the resolver exists to avoid.
+        // One binder binds a pre-parsed statement per iteration, each bind
+        // opening its own BindContext exactly as production does
         let iterations = 1000;
+        let parsed: Vec<_> = (0..iterations).map(|_| parse_sql(bind_sql_str)).collect();
+        let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
         let start = Instant::now();
-        for _ in 0..iterations {
-            let stmt = parse_sql(bind_sql_str);
-            let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
-            let mut binder = Binder::new(resolver, &catalog);
+        for stmt in parsed {
             let _ = binder.bind(stmt).await.unwrap();
         }
         let binding_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
@@ -1339,7 +1336,7 @@ async fn test_bench_planner_performance() {
         let start = Instant::now();
         for _ in 0..iterations {
             let optimized = optimized_plan_sql(&catalog, simple_sql).await;
-            let _ = build_physical_plan(optimized, &catalog).unwrap();
+            let _ = build_physical_plan(optimized, &catalog, None).unwrap();
         }
         let phys_total_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
         let pure_phys_us = (phys_total_us - opt_total_us).max(0.01);
@@ -1365,7 +1362,7 @@ async fn test_bench_planner_performance() {
         let start = Instant::now();
         for _ in 0..iterations {
             let optimized = optimized_plan_sql(&catalog, index_sql).await;
-            let _ = build_physical_plan(optimized, &catalog).unwrap();
+            let _ = build_physical_plan(optimized, &catalog, None).unwrap();
         }
         let idx_total_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
         let pure_idx_us = (idx_total_us - opt_total_us).max(0.01);

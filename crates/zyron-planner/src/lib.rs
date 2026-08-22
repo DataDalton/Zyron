@@ -4,8 +4,11 @@
 //! Pipeline: Parse -> Bind -> Logical Plan -> Optimize -> Physical Plan.
 
 pub mod binder;
+pub mod bound_predicate_sql;
+pub mod cluster_expr;
 pub mod cost;
 pub mod explain;
+pub mod lake_predicate;
 pub mod logical;
 pub mod optimizer;
 pub mod physical;
@@ -13,10 +16,13 @@ pub mod statistics;
 
 pub use binder::{BindContext, Binder, BoundStatement, BoundStreamingJob};
 pub use cost::{CostModel, PlanCost};
-pub use explain::{ExplainFormat, ExplainNode, ExplainOptions};
+pub use explain::{
+    ACTUAL_AUX_SLOTS, ActualMetrics, ExplainFormat, ExplainNode, ExplainOptions, NodeMetrics,
+    aux_labels, millis_parts,
+};
 pub use logical::LogicalPlan;
 pub use optimizer::Optimizer;
-pub use physical::PhysicalPlan;
+pub use physical::{ClusterFitDetail, PhysicalPlan};
 
 use std::sync::Arc;
 
@@ -35,6 +41,37 @@ pub async fn bind_table_check_constraints(
     let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
     let mut binder = Binder::new(resolver, catalog);
     binder.bind_check_constraints(entry).await
+}
+
+/// Binds one predicate against a table (at a canonical table_idx of 0), so a
+/// maintenance command carrying a WHERE clause evaluates it through the same
+/// expression machinery a query would.
+pub async fn bind_table_predicate(
+    catalog: &Catalog,
+    entry: &TableEntry,
+    expr: &zyron_parser::ast::Expr,
+) -> Result<binder::BoundExpr> {
+    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let mut binder = Binder::new(resolver, catalog);
+    binder.bind_table_predicate(entry, expr).await
+}
+
+/// Binds the DEFAULT expression of each named column, so an
+/// executor-internal write path with no bound statement can fill a column
+/// the way INSERT does. A column with no default yields a NULL literal of
+/// its own type, which is what SET DEFAULT means for it.
+///
+/// A default is a constant or a volatile call with no column references, so
+/// it binds in an empty scope. One that fails to parse or bind is a real
+/// catalog error and is reported rather than quietly becoming NULL.
+pub async fn bind_column_defaults(
+    catalog: &Catalog,
+    entry: &TableEntry,
+    columns: &[zyron_catalog::ColumnId],
+) -> Result<Vec<(zyron_catalog::ColumnId, binder::BoundExpr)>> {
+    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let mut binder = Binder::new(resolver, catalog);
+    binder.bind_column_defaults(entry, columns).await
 }
 
 /// One row-security predicate for a table. `permissive` predicates within a
@@ -64,8 +101,9 @@ pub async fn plan(
     database_id: DatabaseId,
     search_path: Vec<String>,
     stmt: Statement,
+    peers: Option<&zyron_common::PeerRegistry>,
 ) -> Result<PhysicalPlan> {
-    plan_with_security(catalog, database_id, search_path, stmt, None).await
+    plan_with_security(catalog, database_id, search_path, stmt, None, peers).await
 }
 
 /// Plans a statement, injecting RLS/ABAC/row-ownership predicates from the
@@ -76,6 +114,7 @@ pub async fn plan_with_security(
     search_path: Vec<String>,
     stmt: Statement,
     security: Option<Arc<dyn RowSecurityProvider>>,
+    peers: Option<&zyron_common::PeerRegistry>,
 ) -> Result<PhysicalPlan> {
     let resolver = catalog.resolver(database_id, search_path);
     let mut binder = Binder::new(resolver, catalog);
@@ -85,7 +124,7 @@ pub async fn plan_with_security(
     let bound = binder.bind(stmt).await?;
     let logical = logical::builder::build_logical_plan(&bound)?;
     let optimized = Optimizer::new(catalog).optimize(logical)?;
-    let physical = physical::builder::build_physical_plan(optimized, catalog)?;
+    let physical = physical::builder::build_physical_plan(optimized, catalog, peers)?;
     Ok(physical)
 }
 
@@ -97,12 +136,13 @@ pub async fn plan_for_explain(
     search_path: Vec<String>,
     stmt: Statement,
     options: ExplainOptions,
+    peers: Option<&zyron_common::PeerRegistry>,
 ) -> Result<(PhysicalPlan, ExplainOptions)> {
     let resolver = catalog.resolver(database_id, search_path);
     let mut binder = Binder::new(resolver, catalog);
     let bound = binder.bind(stmt).await?;
     let logical = logical::builder::build_logical_plan(&bound)?;
     let optimized = Optimizer::new(catalog).optimize(logical)?;
-    let physical = physical::builder::build_physical_plan(optimized, catalog)?;
+    let physical = physical::builder::build_physical_plan(optimized, catalog, peers)?;
     Ok((physical, options))
 }

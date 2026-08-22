@@ -7,8 +7,8 @@
 // single RecordBatch and readers iterate over batches to handle files that
 // contain more than one batch.
 
-use super::{ColumnSpec, FormatReader, FormatWriter};
 use super::schema::{arrow_to_type_id, timestamp_arrow_type};
+use super::{ColumnSpec, FormatReader, FormatWriter};
 use crate::row_codec::StreamValue;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema};
@@ -21,20 +21,14 @@ use zyron_common::{Result, ZyronError};
 pub struct ArrowIpcReader;
 
 impl FormatReader for ArrowIpcReader {
-    fn read_rows(
-        &mut self,
-        bytes: &[u8],
-        schema: &[ColumnSpec],
-    ) -> Result<Vec<Vec<StreamValue>>> {
+    fn read_rows(&mut self, bytes: &[u8], schema: &[ColumnSpec]) -> Result<Vec<Vec<StreamValue>>> {
         let cursor = Cursor::new(bytes);
-        let reader = StreamReader::try_new(cursor, None).map_err(|e| {
-            ZyronError::StreamingError(format!("arrow_ipc: open error: {e}"))
-        })?;
+        let reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| ZyronError::StreamingError(format!("arrow_ipc: open error: {e}")))?;
         let mut rows = Vec::new();
         for batch in reader {
-            let batch = batch.map_err(|e| {
-                ZyronError::StreamingError(format!("arrow_ipc: read error: {e}"))
-            })?;
+            let batch = batch
+                .map_err(|e| ZyronError::StreamingError(format!("arrow_ipc: read error: {e}")))?;
             super::record_batch::batch_to_rows(&batch, schema, &mut rows)?;
         }
         Ok(rows)
@@ -44,17 +38,13 @@ impl FormatReader for ArrowIpcReader {
 pub struct ArrowIpcWriter;
 
 impl FormatWriter for ArrowIpcWriter {
-    fn write_rows(
-        &mut self,
-        rows: &[Vec<StreamValue>],
-        schema: &[ColumnSpec],
-    ) -> Result<Vec<u8>> {
+    fn write_rows(&mut self, rows: &[Vec<StreamValue>], schema: &[ColumnSpec]) -> Result<Vec<u8>> {
         let fields: Vec<Field> = schema
             .iter()
             .map(|c| {
                 Field::new(
                     &c.name,
-                    timestamp_arrow_type(c.type_id, c.ts_precision),
+                    timestamp_arrow_type(c.type_id, c.fractional_digits),
                     true,
                 )
             })
@@ -67,12 +57,12 @@ impl FormatWriter for ArrowIpcWriter {
             let mut writer = StreamWriter::try_new(&mut buf, &arrow_schema).map_err(|e| {
                 ZyronError::StreamingError(format!("arrow_ipc: writer init error: {e}"))
             })?;
-            writer.write(&batch).map_err(|e| {
-                ZyronError::StreamingError(format!("arrow_ipc: write error: {e}"))
-            })?;
-            writer.finish().map_err(|e| {
-                ZyronError::StreamingError(format!("arrow_ipc: finish error: {e}"))
-            })?;
+            writer
+                .write(&batch)
+                .map_err(|e| ZyronError::StreamingError(format!("arrow_ipc: write error: {e}")))?;
+            writer
+                .finish()
+                .map_err(|e| ZyronError::StreamingError(format!("arrow_ipc: finish error: {e}")))?;
         }
         Ok(buf)
     }
@@ -86,9 +76,8 @@ impl FormatWriter for ArrowIpcWriter {
 /// Field order matches the file's Arrow schema.
 pub fn infer_arrow_ipc_schema(bytes: &[u8]) -> Result<Vec<ColumnSpec>> {
     let cursor = Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None).map_err(|e| {
-        ZyronError::StreamingError(format!("arrow_ipc: schema read error: {e}"))
-    })?;
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| ZyronError::StreamingError(format!("arrow_ipc: schema read error: {e}")))?;
     let schema = reader.schema();
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
@@ -125,11 +114,7 @@ mod tests {
 
         // A TIMESTAMP(9) column: i128 picoseconds. Arrow has no ps unit, so it
         // must export as Timestamp(Nanosecond) with values truncated ps/1000.
-        let schema = vec![ColumnSpec::with_precision(
-            "t9",
-            TypeId::Timestamp,
-            Some(9),
-        )];
+        let schema = vec![ColumnSpec::with_precision("t9", TypeId::Timestamp, Some(9))];
         // 1_700_000_000_123_456_789_000 ps -> 1_700_000_000_123_456_789 ns.
         // 1_999 ps -> 1 ns (truncating, not rounding). A null passes through.
         let rows = vec![

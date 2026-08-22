@@ -1,11 +1,11 @@
 //! Sort operator for ordering results.
 //!
 //! Materializes all child output, computes sort indices, reorders
-//! all data in a single take() pass, then emits output via cheap
-//! contiguous slice() calls. Uses radix sort for integer key types.
+//! all data in a single take() pass, then emits the sorted batch as
+//! one output by move, no copy. Uses radix sort for integer key types.
 //! Supports top-N via optional limit parameter.
 
-use zyron_common::Result;
+use zyron_common::{Result, RowLocator, ZyronError};
 use zyron_planner::binder::{BoundExpr, BoundOrderBy};
 use zyron_planner::logical::LogicalColumn;
 
@@ -23,11 +23,14 @@ pub struct SortOperator {
     order_by: Vec<BoundOrderBy>,
     input_schema: Vec<LogicalColumn>,
     limit: Option<u64>,
-    /// Fully sorted batch. Output is emitted via contiguous slice().
+    /// Fully sorted batch, emitted whole by move on the first next() call
     sorted_batch: Option<DataBatch>,
-    total_rows: usize,
-    output_cursor: usize,
     finished: bool,
+    /// Carry row locators through the sort permutation. Set only when the
+    /// sort feeds a row-locking operator, the normal path pays nothing
+    track_locators: bool,
+    /// Locators permuted into sorted order, emitted alongside sorted_batch
+    sorted_locators: Option<Vec<RowLocator>>,
 }
 
 impl SortOperator {
@@ -43,15 +46,24 @@ impl SortOperator {
             input_schema,
             limit,
             sorted_batch: None,
-            total_rows: 0,
-            output_cursor: 0,
             finished: false,
+            track_locators: false,
+            sorted_locators: None,
         }
+    }
+
+    /// Carries row locators through the sort so a row-locking operator
+    /// above still addresses storage rows. Disables the indices-free
+    /// in-place fast path, which cannot express its permutation
+    pub fn with_locator_tracking(mut self) -> Self {
+        self.track_locators = true;
+        self
     }
 
     async fn materialize(&mut self) -> Result<()> {
         // Collect all input batches.
         let mut all_columns: Vec<Vec<Column>> = Vec::new();
+        let mut all_locators: Vec<RowLocator> = Vec::new();
         let mut total_rows = 0usize;
 
         loop {
@@ -60,6 +72,15 @@ impl SortOperator {
                     total_rows += eb.batch.num_rows;
                     if all_columns.is_empty() {
                         all_columns.resize_with(eb.batch.num_columns(), Vec::new);
+                    }
+                    if self.track_locators {
+                        let locs = eb.locators.ok_or_else(|| {
+                            ZyronError::ExecutionError(
+                                "sort under row locking received a batch without row locators"
+                                    .to_string(),
+                            )
+                        })?;
+                        all_locators.extend(locs);
                     }
                     for (i, col) in eb.batch.columns.into_iter().enumerate() {
                         all_columns[i].push(col);
@@ -84,44 +105,53 @@ impl SortOperator {
                 let key_batches = &all_columns[key_idx];
                 let has_nulls = key_batches.iter().any(|c| c.nulls.has_nulls());
 
-                if !has_nulls && num_cols == 1 {
-                    // Single column: sort values in-place, no indices needed.
+                if !has_nulls && num_cols == 1 && !self.track_locators {
+                    // Single column: produce sorted values directly from the
+                    // batches, no indices needed. Skipped under locator
+                    // tracking, a values-only sort has no permutation to
+                    // apply to the locators
                     let type_id = key_batches[0].type_id;
-                    let mut merged = concat_columns(key_batches);
-                    compute::sort_column_inplace(&mut merged.data, self.order_by[0].asc);
+                    let mut sorted =
+                        match compute::radix_sort_batches_values(key_batches, self.order_by[0].asc)
+                        {
+                            Some(data) => Column::new(data, type_id),
+                            None => {
+                                let mut merged = concat_columns(key_batches);
+                                compute::sort_column_inplace(
+                                    &mut merged.data,
+                                    self.order_by[0].asc,
+                                );
+                                merged
+                            }
+                        };
                     if let Some(limit) = self.limit {
                         let limit = limit as usize;
                         if total_rows > limit {
-                            merged.data = merged.data.slice(0, limit);
-                            merged.nulls = crate::column::NullBitmap::none(limit);
-                            merged.type_id = type_id;
-                            self.total_rows = limit;
-                            self.sorted_batch = Some(DataBatch::new(vec![merged]));
-                            return Ok(());
+                            sorted.data.truncate(limit);
+                            sorted.nulls = crate::column::NullBitmap::none(limit);
                         }
                     }
-                    self.total_rows = total_rows;
-                    self.sorted_batch = Some(DataBatch::new(vec![merged]));
+                    self.sorted_batch = Some(DataBatch::new(vec![sorted]));
                     return Ok(());
                 }
 
                 if !has_nulls {
                     // Multi-column: radix sort with value extraction for key,
-                    // take() for non-key columns.
-                    let merged_key = concat_columns(key_batches);
-                    if let Some((mut indices, sorted_key)) =
-                        compute::radix_sort_contiguous(&merged_key, self.order_by[0].asc)
+                    // take() for non-key columns. The key pairs are built
+                    // straight from the batches, so the key is never
+                    // concatenated separately.
+                    if let Some((mut indices, mut sorted_key)) =
+                        compute::radix_sort_column_batches(key_batches, self.order_by[0].asc)
                     {
                         if let Some(limit) = self.limit {
                             indices.truncate(limit as usize);
                         }
                         let final_len = indices.len();
                         let key_type = all_columns[key_idx][0].type_id;
-                        let mut sorted_key_opt = Some(if final_len < total_rows {
-                            sorted_key.slice(0, final_len)
-                        } else {
-                            sorted_key
-                        });
+                        if final_len < total_rows {
+                            sorted_key.truncate(final_len);
+                        }
+                        let mut sorted_key_opt = Some(sorted_key);
                         let idx_slice = &indices[..final_len];
                         let mut result_columns = Vec::with_capacity(num_cols);
                         for (col_idx, col_batches) in all_columns.iter().enumerate() {
@@ -133,7 +163,14 @@ impl SortOperator {
                                 result_columns.push(merged.take(idx_slice));
                             }
                         }
-                        self.total_rows = final_len;
+                        if self.track_locators {
+                            self.sorted_locators = Some(
+                                idx_slice
+                                    .iter()
+                                    .map(|&i| all_locators[i as usize])
+                                    .collect(),
+                            );
+                        }
                         self.sorted_batch = Some(DataBatch::new(result_columns));
                         return Ok(());
                     }
@@ -191,9 +228,11 @@ impl SortOperator {
             }
         }
 
-        // Single full take() pass: reorder all data once. Output is then
-        // emitted via contiguous slice() calls which are cheap memcpy.
-        self.total_rows = indices.len();
+        // Single full take() pass: reorder all data once.
+        if self.track_locators {
+            self.sorted_locators =
+                Some(indices.iter().map(|&i| all_locators[i as usize]).collect());
+        }
         self.sorted_batch = Some(merged.take(&indices));
         Ok(())
     }
@@ -206,31 +245,20 @@ impl Operator for SortOperator {
                 return Ok(None);
             }
 
-            if self.sorted_batch.is_none() && self.output_cursor == 0 {
+            if self.sorted_batch.is_none() {
                 self.materialize().await?;
             }
 
-            let Some(ref sorted) = self.sorted_batch else {
-                self.finished = true;
-                return Ok(None);
-            };
-
-            if self.output_cursor >= self.total_rows {
-                self.finished = true;
-                self.sorted_batch = None;
-                return Ok(None);
+            // The sort already materialized everything, so the whole result
+            // moves out as one batch instead of being re-copied in chunks.
+            self.finished = true;
+            match self.sorted_batch.take() {
+                Some(batch) => {
+                    let locators = self.sorted_locators.take();
+                    Ok(Some(ExecutionBatch { batch, locators }))
+                }
+                None => Ok(None),
             }
-
-            let remaining = self.total_rows - self.output_cursor;
-            // Use larger output chunks to reduce slice() allocation overhead.
-            // Sort materializes all data up front, so emitting larger batches
-            // reduces per-batch overhead without affecting streaming behavior.
-            const SORT_OUTPUT_CHUNK: usize = 8192;
-            let chunk_size = remaining.min(SORT_OUTPUT_CHUNK);
-            let batch = sorted.slice(self.output_cursor, chunk_size);
-            self.output_cursor += chunk_size;
-
-            Ok(Some(ExecutionBatch::new(batch)))
         })
     }
 }

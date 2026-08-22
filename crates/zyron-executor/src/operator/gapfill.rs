@@ -185,7 +185,7 @@ impl GapFillOperator {
             .map(|(bld, src)| {
                 let mut col = bld.finish();
                 // Preserve timestamp precision metadata on the bucket column.
-                col.ts_precision = src.ts_precision;
+                col.fractional_digits = src.fractional_digits;
                 col
             })
             .collect();

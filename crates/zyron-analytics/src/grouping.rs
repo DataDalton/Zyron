@@ -3,7 +3,7 @@
 // set in one scan rather than re-running the input for each set
 
 use crate::value::{AnalyticsValue, VerifiedKeyMap, hash_value_into};
-use zyron_common::fx_finalize;
+use zyron_common::mix_finalize_2round;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupingSetType {
@@ -411,8 +411,8 @@ impl<A: Aggregator> GroupingSetsRunner<A> {
                 h_low = hash_value_into(h_low, v);
                 h_high = hash_value_into(h_high, v);
             }
-            let key_low = fx_finalize(h_low);
-            let key_high = fx_finalize(h_high);
+            let key_low = mix_finalize_2round(h_low);
+            let key_high = mix_finalize_2round(h_high);
             let template = &self.template;
             let set_idx_copy = *set_idx as u32;
             let agg = self.state.entry_or_insert(

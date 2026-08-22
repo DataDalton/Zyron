@@ -66,6 +66,10 @@ pub struct RetentionWorker {
     waker: Arc<OnceLock<thread::Thread>>,
     thread: Option<JoinHandle<()>>,
     stats: Arc<RetentionStats>,
+    /// Installed once the server state exists, which is after the workers
+    /// start. The age-tiering pass drives the wire relocation and needs it,
+    /// cycles before installation skip that pass
+    server_state: Arc<OnceLock<Arc<zyron_wire::connection::ServerState>>>,
 }
 
 struct WorkerCtx {
@@ -75,6 +79,7 @@ struct WorkerCtx {
     buffer_pool: Arc<BufferPool>,
     disk_manager: Arc<DiskManager>,
     legal_holds: Arc<zyron_lifecycle::legal_hold::LegalHoldRegistry>,
+    server_state: Arc<OnceLock<Arc<zyron_wire::connection::ServerState>>>,
 }
 
 impl RetentionWorker {
@@ -90,10 +95,13 @@ impl RetentionWorker {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
         let stats = Arc::new(RetentionStats::new());
+        let server_state: Arc<OnceLock<Arc<zyron_wire::connection::ServerState>>> =
+            Arc::new(OnceLock::new());
 
         let t_shutdown = Arc::clone(&shutdown);
         let t_waker = Arc::clone(&waker);
         let t_stats = Arc::clone(&stats);
+        let t_server_state = Arc::clone(&server_state);
 
         let handle = thread::Builder::new()
             .name("zyron-retention".into())
@@ -116,6 +124,7 @@ impl RetentionWorker {
                     buffer_pool,
                     disk_manager,
                     legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+                    server_state: t_server_state,
                 };
                 let interval = Duration::from_secs(config.interval_secs.max(1));
                 loop {
@@ -133,7 +142,14 @@ impl RetentionWorker {
             waker,
             thread: Some(handle),
             stats,
+            server_state,
         }
+    }
+
+    /// Installs the server state once it exists, enabling the age-tiering
+    /// pass from the next cycle on
+    pub fn install_server_state(&self, state: Arc<zyron_wire::connection::ServerState>) {
+        let _ = self.server_state.set(state);
     }
 
     pub fn stats(&self) -> Arc<RetentionStats> {
@@ -179,16 +195,19 @@ impl RetentionWorker {
             };
             let lc = &table.lifecycle;
             // Resolve the comparison column and cutoff.
-            let (col_id, cutoff) = if lc.retention_column_id != 0 {
-                (lc.retention_column_id, now_us)
-            } else if lc.ttl_column_id != 0 && lc.ttl_seconds > 0 {
-                (
-                    lc.ttl_column_id,
-                    now_us - lc.ttl_seconds.saturating_mul(1_000_000),
-                )
-            } else {
-                continue;
-            };
+            let (col_id, cutoff) =
+                if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
+                    (lc.retention_column_id, now_us)
+                } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
+                    && lc.ttl_seconds > 0
+                {
+                    (
+                        lc.ttl_column_id,
+                        now_us - lc.ttl_seconds.saturating_mul(1_000_000),
+                    )
+                } else {
+                    continue;
+                };
             let col_name = match table.columns.iter().find(|c| c.id.0 as u32 == col_id) {
                 Some(c) => c.name.clone(),
                 None => continue,
@@ -217,6 +236,36 @@ impl RetentionWorker {
                 Err(e) => {
                     // Legal hold / WORM violations land here; skip, do not abort.
                     warn!("retention delete for '{}' skipped: {e}", table.name);
+                }
+            }
+        }
+
+        // Age tiering: cold_after and archive_after are declarations, so
+        // they run every cycle rather than waiting for a manual
+        // RUN RETENTION JOB. The relocation drives the same wire pass the
+        // manual job does, and it needs the server state, which is
+        // installed shortly after startup, so the first cycle or two may
+        // skip it
+        if let Some(server) = wc.server_state.get() {
+            for t in wc.catalog.list_all_tables() {
+                let lc = &t.lifecycle;
+                if lc.cold_after_seconds <= 0 && lc.archive_after_seconds <= 0 {
+                    continue;
+                }
+                match zyron_wire::lifecycle_dispatch::run_age_tiering(server, &t, now_us, false)
+                    .await
+                {
+                    Ok((segments, rows)) if segments > 0 => {
+                        info!(
+                            table = %t.name,
+                            segments,
+                            rows,
+                            "age tiering relocated segments"
+                        );
+                        Self::record_job(wc, t.id.0, 2, rows, "age tiering").await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("age tiering for '{}' failed: {e}", t.name),
                 }
             }
         }
@@ -332,6 +381,7 @@ impl RetentionWorker {
             zyron_catalog::DatabaseId(1),
             vec!["public".to_string()],
             stmt,
+            None,
         )
         .await
         .map_err(|e| format!("plan: {e}"))?;
@@ -386,6 +436,7 @@ impl RetentionWorker {
             zyron_catalog::DatabaseId(1),
             vec!["public".to_string()],
             stmt,
+            None,
         )
         .await
         .map_err(|e| format!("plan: {e}"))?;

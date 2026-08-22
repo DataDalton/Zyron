@@ -7,6 +7,12 @@ use zyron_common::page::{PAGE_SIZE, PageId};
 /// Sentinel value indicating no page is loaded in the frame.
 const NO_PAGE: u64 = u64::MAX;
 
+/// Claim bit in the pin count. A frame is claimed while an eviction or a
+/// delete owns it exclusively to replace its identity: `try_pin` refuses to
+/// pin a claimed frame and a second claim fails, so the owner can flush,
+/// unmap and reset the frame knowing no reader can arrive mid replacement
+pub(crate) const CLAIM: u32 = 1 << 31;
+
 /// Unique identifier for a frame in the buffer pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameId(pub u32);
@@ -137,13 +143,16 @@ impl BufferFrame {
     /// Release so the pinner's page accesses are visible before the frame
     /// becomes evictable. Saturating compare-exchange loop refuses to drop
     /// below 0 and never blindly stores over a concurrent pin or unpin.
+    /// A bare claim is not a pin, so an unpin never subtracts from the
+    /// claim bit: eroding it would hand a claimed frame's exclusivity to
+    /// whoever pins next.
     #[inline(always)]
     pub fn unpin(&self) -> u32 {
         let mut current = self.pin_count.load(Ordering::Relaxed);
         loop {
-            if current == 0 {
+            if current & !CLAIM == 0 {
                 // Already at floor, nothing to decrement
-                return 0;
+                return current;
             }
             match self.pin_count.compare_exchange_weak(
                 current,
@@ -274,17 +283,98 @@ impl BufferFrame {
         unsafe { &mut **box_ptr as *mut [u8; PAGE_SIZE] }
     }
 
-    /// Resets the frame to empty state.
+    /// Resets the frame to empty state. The identity clears before the pin
+    /// count releases: a zero count is what lets a claim-aware pin succeed,
+    /// and a pin taken at that instant must observe the cleared page id and
+    /// retreat rather than validate against the identity of a frame whose
+    /// bytes are being wiped.
     #[inline]
     pub fn reset(&self) {
-        self.page_id.store(NO_PAGE, Ordering::Release);
+        self.reset_keeping_pin();
         self.pin_count.store(0, Ordering::Release);
+    }
+
+    /// Prepares the frame for reuse without touching the pin count.
+    ///
+    /// An evicted frame arrives already claimed by `try_claim`, and that
+    /// claim is what stops a second eviction sweep from choosing it. Clearing
+    /// the pin here would drop the claim for the window between this call and
+    /// the caller's own pin, which is long enough to lose the frame to
+    /// another sweep and end with two page ids sharing it.
+    pub fn reset_keeping_pin(&self) {
+        self.page_id.store(NO_PAGE, Ordering::Release);
         self.is_dirty.store(false, Ordering::Release);
         self.dirty_lsn.store(0, Ordering::Release);
         self.reference_bit.store(false, Ordering::Relaxed);
         // Zero out data for security
         let mut data = self.data.write();
         data.fill(0);
+    }
+
+    /// Takes exclusive ownership of an unpinned frame by moving its pin
+    /// count from 0 to the claim state in one step. Returns false when the
+    /// frame is pinned or already claimed, which means another thread owns
+    /// it.
+    ///
+    /// Checking `pin_count() == 0` and pinning separately is not the same
+    /// thing: two eviction sweeps both observe zero and both take the frame.
+    /// The claim state, unlike a plain pin, is visible to `try_pin`, so a
+    /// reader that races the claim retreats instead of pinning a frame
+    /// whose identity is being replaced.
+    #[inline]
+    pub fn try_claim(&self) -> bool {
+        let claimed = self
+            .pin_count
+            .compare_exchange(0, CLAIM, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if claimed {
+            self.reference_bit.store(true, Ordering::Relaxed);
+        }
+        claimed
+    }
+
+    /// Pins the frame unless it is claimed. A claimed frame is mid
+    /// replacement: its mapping is being removed and its bytes are about to
+    /// belong to another page, so the caller must retry its lookup instead.
+    /// The failed attempt's increment is rolled back through the saturating
+    /// unpin, which leaves the owner's claim intact.
+    #[inline]
+    pub fn try_pin(&self) -> bool {
+        let prev = self.pin_count.fetch_add(1, Ordering::AcqRel);
+        if prev & CLAIM != 0 {
+            self.unpin();
+            return false;
+        }
+        if prev == 0 {
+            self.reference_bit.store(true, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Converts an eviction claim into a normal pin once the frame carries
+    /// its new identity, leaving a frame that holds a plain pin untouched.
+    /// From this point readers may pin the frame and will validate its page
+    /// id against the one they looked up.
+    #[inline]
+    pub fn claim_to_pin_if_claimed(&self) {
+        let _ = self
+            .pin_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c & CLAIM != 0 {
+                    Some(c - CLAIM + 1)
+                } else {
+                    None
+                }
+            });
+    }
+
+    /// Releases a claim without keeping any pin, for an owner that decided
+    /// not to reuse the frame after all. Subtraction rather than a store, so
+    /// the transient increment of a concurrently failing `try_pin` is never
+    /// erased.
+    #[inline]
+    pub fn unclaim(&self) {
+        self.pin_count.fetch_sub(CLAIM, Ordering::AcqRel);
     }
 }
 

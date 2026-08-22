@@ -2,6 +2,11 @@
 
 use zyron_common::TypeId;
 
+// Clustering mode and schedule are persisted encodings shared with the
+// catalog and the metrics, so one definition lives in zyron-common and
+// the AST names it rather than redeclaring it
+pub use zyron_common::{ClusterMode, ClusteringSchedule};
+
 // ---------------------------------------------------------------------------
 // Top-level statement
 // ---------------------------------------------------------------------------
@@ -94,8 +99,15 @@ pub enum Statement {
     ArchiveTable(Box<ArchiveTableStatement>),
     /// RESTORE TABLE name FROM 'path' [INTO target]
     RestoreTable(Box<RestoreTableStatement>),
+    RestoreTableVersion(Box<RestoreTableVersionStatement>),
     /// ALTER TABLE name SET (key = value, ...)
     AlterTableOptions(Box<AlterTableOptionsStatement>),
+    /// ALTER TABLE t SET USING ZYRONLAKE | HEAP [WITH (...)]
+    AlterTableSetUsing(Box<AlterTableSetUsingStatement>),
+    /// ALTER TABLE t CLUSTER BY (...) | AUTO | (...) AUTO
+    AlterTableClusterBy(Box<AlterTableClusterByStatement>),
+    /// ALTER TABLE t SET CLUSTERING SCHEDULE = OnDemand | Incremental | Continuous
+    AlterTableClusteringSchedule(Box<AlterTableClusteringScheduleStatement>),
     /// CREATE/DROP/RELEASE LEGAL HOLD
     LegalHold(Box<LegalHoldStatement>),
     /// FORGET USER 'id' [CASCADE] [DRY RUN]
@@ -137,6 +149,16 @@ pub enum Statement {
     AlterSystemSet(Box<AlterSystemSetStatement>),
     /// ANALYZE [table_name]
     Analyze(Box<AnalyzeStatement>),
+    /// ALTER TABLE t FOLLOW <peer>.<table>, or UNFOLLOW
+    AlterTableFollow(Box<AlterTableFollowStatement>),
+    /// CREATE PEER name ADDRESS 'host:port' [MODE db|lake|unified]
+    CreatePeer(Box<CreatePeerStatement>),
+    /// DROP PEER [IF EXISTS] name
+    DropPeer(Box<DropPeerStatement>),
+    /// CREATE FOREIGN TABLE t (cols) SERVER peer [TABLE remote]
+    CreateForeignTable(Box<CreateForeignTableStatement>),
+    /// DROP FOREIGN TABLE [IF EXISTS] t
+    DropForeignTable(Box<DropForeignTableStatement>),
     /// CREATE BRANCH name [FROM name] [AT VERSION expr]
     CreateBranch(Box<CreateBranchStatement>),
     /// MERGE BRANCH name INTO name
@@ -350,6 +372,94 @@ pub struct CreateTableStatement {
     pub options: Vec<TableOption>,
     /// Optional inline `TTL <duration> ON <column> [ACTION ...]` clause.
     pub ttl: Option<TtlClause>,
+    /// Storage format from `USING ZYRONLAKE | HEAP`. None uses the
+    /// deployment mode's default format.
+    pub using: Option<TableFormat>,
+    /// Clustering layout from `CLUSTER BY ...`.
+    pub cluster_by: Option<ClusterByClause>,
+    /// `CLONE OF <table> [AT VERSION <n>]`. The new table takes the
+    /// source's schema, layout and file set rather than declaring columns
+    /// of its own, so `columns` is empty when this is set
+    pub clone_of: Option<CloneSource>,
+}
+
+/// The table a `CREATE TABLE ... CLONE OF` copies, and the version of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneSource {
+    pub table: String,
+    /// None clones the source's current head
+    pub at_version: Option<u64>,
+}
+
+/// Storage format named in a `USING` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableFormat {
+    Heap,
+    ZyronLake,
+}
+
+/// `CLUSTER BY` clause. Keys with mode Force pin the layout, AUTO with no
+/// keys hands the layout to measurement, keys plus AUTO anchor the listed
+/// keys and let measurement fill in around them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterByClause {
+    pub keys: Vec<ClusterKeyDef>,
+    pub mode: ClusterMode,
+}
+
+/// What one clustering key orders rows by.
+///
+/// An expression is clustered by giving it a column of its own, so the
+/// values are stored and file statistics cover them. That is what lets a
+/// query filtering on the expression prune files, which a target with no
+/// stored values could never do
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClusterKeyTarget {
+    /// A column the table declared
+    Column(String),
+    /// An expression over declared columns
+    Expression(Expr),
+}
+
+/// One clustering key, optionally pinned to a strategy by name via
+/// `<target> USING <strategy>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterKeyDef {
+    pub target: ClusterKeyTarget,
+    pub strategy: Option<String>,
+}
+
+impl ClusterKeyDef {
+    /// The column this key names, or None when it orders by an expression
+    pub fn column_name(&self) -> Option<&str> {
+        match &self.target {
+            ClusterKeyTarget::Column(name) => Some(name.as_str()),
+            ClusterKeyTarget::Expression(_) => None,
+        }
+    }
+}
+
+/// `ALTER TABLE t SET USING <format>` storage conversion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableSetUsingStatement {
+    pub table: String,
+    pub format: TableFormat,
+    /// Conversion options such as drop_history.
+    pub options: Vec<TableOption>,
+}
+
+/// `ALTER TABLE t CLUSTER BY ...` layout change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableClusterByStatement {
+    pub table: String,
+    pub clause: ClusterByClause,
+}
+
+/// `ALTER TABLE t SET CLUSTERING SCHEDULE = ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableClusteringScheduleStatement {
+    pub table: String,
+    pub schedule: ClusteringSchedule,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -388,6 +498,12 @@ pub enum AlterTableOperation {
     DropConstraint { name: String, if_exists: bool },
     /// ALTER TABLE ... RENAME TO new_name
     RenameTable { new_name: String },
+    /// ALTER TABLE ... ADD DERIVED COLUMN name AS <expr>
+    ///
+    /// Names an expression column so it can be selected and referred to.
+    /// A `CLUSTER BY (<expr>)` creates the same kind of column without a
+    /// name, reachable through the expression rather than by identifier
+    AddDerivedColumn { name: String, expr: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -430,6 +546,11 @@ pub struct BeginStatement {
     pub isolation: Option<TxnIsolation>,
     /// Some(true) for READ ONLY, Some(false) for READ WRITE, None for default.
     pub read_only: Option<bool>,
+    /// BEGIN ZYRONLAKE TRANSACTION: the transaction's lake writes commit
+    /// through a cross-table intent rather than the database commit record,
+    /// so several lake tables land together without paying the OLTP commit
+    /// barrier.
+    pub lake: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -648,6 +769,10 @@ pub struct SetVariableStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowStatement {
     pub name: String,
+    /// Object the shown state belongs to, as in `SHOW CLUSTERING FOR t`.
+    /// None for a plain `SHOW <setting>`, which reads session or server
+    /// state that belongs to no object.
+    pub target: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1167,7 @@ pub struct TtlClause {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 17 data lifecycle statements
+// Data lifecycle statements
 // ---------------------------------------------------------------------------
 
 /// CREATE/DROP/RELEASE LEGAL HOLD
@@ -1168,10 +1293,19 @@ pub struct ResumeScheduleStatement {
 // OPTIMIZE
 // ---------------------------------------------------------------------------
 
-/// OPTIMIZE TABLE name (vacuum + reindex + consolidate free space)
+/// OPTIMIZE TABLE name [CLUSTER [, DELETE] | DELETE [, CLUSTER]]
+///
+/// The action list selects which maintenance runs. A statement naming none
+/// compacts, which is what OPTIMIZE has always done, so DELETE names that
+/// behavior explicitly. CLUSTER runs a clustering pass over the table's
+/// current layout evidence, and the two compose
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptimizeTableStatement {
     pub table: String,
+    /// Run a clustering pass
+    pub cluster: bool,
+    /// Apply delete predicates and compact free space
+    pub delete: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1414,26 @@ pub struct ArchiveTableStatement {
     pub dry_run: bool,
 }
 
+/// `RESTORE TABLE t TO VERSION n` and `... TO TIMESTAMP '...'`.
+///
+/// Rolls a table's data back to what it showed then, by committing a new
+/// head whose file set is that version's. The history is not rewritten:
+/// the versions in between stay readable, and the restore is one more
+/// version on top of them
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTableVersionStatement {
+    pub table: String,
+    pub target: RestoreVersionTarget,
+}
+
+/// What a `RESTORE ... TO` names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreVersionTarget {
+    Version(u64),
+    /// Literal text, resolved against the table's commit timestamps
+    Timestamp(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoreTableStatement {
     pub table: String,
@@ -1298,18 +1452,87 @@ pub struct CreateBranchStatement {
     pub name: String,
     pub from_branch: Option<String>,
     pub at_version: Option<Expr>,
+    /// `ON <table>` scopes the branch to one table's log. Without it the
+    /// branch is database wide.
+    pub on_table: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeBranchStatement {
     pub source: String,
     pub into_target: String,
+    /// `FOR TABLE <table>` merges one table's branch rather than the
+    /// database-wide branch.
+    pub for_table: Option<String>,
+}
+
+/// `ALTER TABLE <t> FOLLOW <peer>.<table>` and `ALTER TABLE <t> UNFOLLOW`.
+///
+/// A follower replays a leader's log instead of accepting writes. Naming
+/// the leader is what turns an ordinary lake table into a replica, and
+/// UNFOLLOW leaves it as its own authority holding whatever it applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableFollowStatement {
+    pub table: String,
+    /// The peer and its table, None for UNFOLLOW
+    pub leader: Option<(String, String)>,
+}
+
+/// `CREATE PEER <name> ADDRESS '<host:port>' [MODE <mode>]`.
+///
+/// Peering is declared, never discovered. A node that joined a mesh
+/// because it saw traffic would be a node an operator did not decide to
+/// trust, so the address and the mode are both stated here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePeerStatement {
+    pub name: String,
+    pub address: String,
+    /// What the peer stores, as the operator understands it. Absent means
+    /// unknown until the peer is first reached
+    pub mode: Option<String>,
+    pub if_not_exists: bool,
+}
+
+/// `DROP PEER [IF EXISTS] <name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropPeerStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// `CREATE FOREIGN TABLE <name> (<columns>) SERVER <peer> [TABLE <remote>]`.
+///
+/// Declares the shape of a table that lives on a peer. The columns are
+/// stated rather than fetched, because a plan is built before anything is
+/// reached and a node that had to contact a peer to parse a query would
+/// stall on a peer being down.
+///
+/// SERVER names a declared peer, never an address. TABLE names the table on
+/// that peer when it differs from the local name, which it usually does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateForeignTableStatement {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    /// Peer holding the real table
+    pub server: String,
+    /// Table name on the peer, None when it matches the local name
+    pub remote_table: Option<String>,
+    pub if_not_exists: bool,
+}
+
+/// `DROP FOREIGN TABLE [IF EXISTS] <name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropForeignTableStatement {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropBranchStatement {
     pub name: String,
     pub if_exists: bool,
+    /// `ON <table>` drops one table's branch.
+    pub on_table: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1984,7 +2207,7 @@ pub enum AsOf {
         start: Expr,
         end: Expr,
     },
-    /// `IN BRANCH 'name'` (expression-position only at parse time)
+    /// `IN BRANCH 'name'`, as a FROM-clause qualifier or an expression postfix
     Branch(Expr),
 }
 
@@ -2262,6 +2485,18 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
     Integer(i64),
+    /// A whole number too wide for i64, which INT128 and DECIMAL columns
+    /// both accept. Kept separate so an ordinary literal stays i64 and only
+    /// the wide case pays for the wider type.
+    Int128(i128),
+    /// A fixed-point literal with more significant digits than an f64 holds
+    /// exactly, carried as unscaled digits and a scale so every digit the
+    /// statement wrote survives to the row. Narrow fixed-point literals stay
+    /// Float, keeping their long-standing float typing.
+    Decimal {
+        digits: i128,
+        scale: u8,
+    },
     Float(f64),
     String(String),
     Boolean(bool),
@@ -2396,6 +2631,10 @@ pub enum TableRef {
     /// Boxed because the inline variant pushed TableRef from 56 to 72 bytes,
     /// and TableRef is held in many AST nodes
     TableFunction(Box<TableFunctionRef>),
+    /// Inline external source in a FROM clause, the read-side twin of the
+    /// inline sink `CREATE STREAMING JOB` already accepts after INTO.
+    /// Boxed for the same reason `TableFunction` is
+    ExternalInline(Box<ExternalInlineRef>),
 }
 
 /// Table-valued function call data, extracted so `TableRef::TableFunction` can
@@ -2404,6 +2643,23 @@ pub enum TableRef {
 pub struct TableFunctionRef {
     pub name: String,
     pub args: Vec<FunctionArg>,
+    pub alias: Option<String>,
+}
+
+/// A file or cloud URI named directly in a FROM clause:
+/// `FILE '<uri>' FORMAT CSV [OPTIONS (...)] [COLUMNS (...)] [AS alias]`.
+///
+/// Only a streaming job's FROM binds one. Every other statement rejects it,
+/// because a source read on a schedule has no meaning outside a job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalInlineRef {
+    pub backend: ExternalBackendKind,
+    pub uri: String,
+    pub format: ExternalFormatKind,
+    pub options: Vec<(String, String)>,
+    /// Row layout declared inline. Empty when the layout is taken from the
+    /// job's target table instead.
+    pub columns: Vec<(String, DataType)>,
     pub alias: Option<String>,
 }
 
@@ -2554,6 +2810,49 @@ impl DataType {
         }
     }
 
+    /// Digits this declaration keeps after the decimal point, for the two
+    /// families that declare one: a TIMESTAMP(p) counts fractional seconds
+    /// and a DECIMAL(p,s) counts s.
+    ///
+    /// A `DECIMAL` written with no parameters scales to zero, which is what
+    /// SQL says it means, so the value is exact rather than left undeclared
+    /// and silently rescaled later.
+    pub fn fractional_digits(&self) -> Option<u8> {
+        match self {
+            DataType::Timestamp(p) | DataType::TimestampTz(p) => *p,
+            DataType::Decimal(_, s) | DataType::Numeric(_, s) => Some(s.unwrap_or(0)),
+            _ => None,
+        }
+    }
+
+    /// The single number a declaration bounds its values by, stored in the
+    /// catalog column's `max_length` slot.
+    ///
+    /// A string or byte string measures characters, a vector measures its
+    /// dimension count, and a decimal measures its total digits. None where
+    /// the declaration places no bound, including a bare `DECIMAL`.
+    pub fn declared_max_length(&self) -> Option<usize> {
+        match self {
+            DataType::Char(n)
+            | DataType::Varchar(n)
+            | DataType::Binary(n)
+            | DataType::Varbinary(n)
+            | DataType::Vector(n) => *n,
+            DataType::Decimal(p, _) | DataType::Numeric(p, _) => p.map(|v| v as usize),
+            _ => None,
+        }
+    }
+
+    /// The element type of a `T[]` declaration, so array values written to
+    /// the column are re-encoded to the width it declares. None for every
+    /// non-array type.
+    pub fn declared_element_type(&self) -> Option<TypeId> {
+        match self {
+            DataType::Array(inner) => Some(inner.to_type_id()),
+            _ => None,
+        }
+    }
+
     /// Converts this SQL data type to the corresponding internal TypeId.
     pub fn to_type_id(&self) -> TypeId {
         match self {
@@ -2658,6 +2957,15 @@ pub enum ColumnConstraint {
 pub struct TableConstraint {
     pub name: Option<String>,
     pub kind: TableConstraintKind,
+    /// What a violating row does. Fail aborts the statement, Quarantine
+    /// moves the row into the table's companion quarantine table and lets
+    /// the rest of the batch land, which is what keeps a foreign key usable
+    /// on a bulk load.
+    pub on_violation: ViolationAction,
+    /// False when the statement said NOT ENFORCED. The declaration still
+    /// reaches the catalog and the planner, the engine just does not check
+    /// it on write.
+    pub enforced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3075,6 +3383,7 @@ mod tests {
         let begin = Statement::Begin(Box::new(BeginStatement {
             isolation: None,
             read_only: None,
+            lake: false,
         }));
         assert!(matches!(begin, Statement::Begin(_)));
 

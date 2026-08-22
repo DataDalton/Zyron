@@ -5,8 +5,8 @@ use super::types::{
     DeleteResult, InternalEntry, InternalEntryView, InternalPageHeader, LeafEntry, LeafEntryView,
     LeafPageHeader, compare_keys,
 };
-use crate::tuple::TupleId;
 use bytes::Bytes;
+use zyron_common::RowLocator;
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
@@ -131,17 +131,38 @@ impl BTreeLeafPage {
         views
     }
 
-    /// Binary search for a key. Returns Ok(index) if found, Err(index) for insertion point.
-    pub fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
-        let views = self.entry_views();
-        views.binary_search_by(|e| compare_keys(e.key, key))
+    /// Slot index holding `key`, or None when the leaf does not hold it.
+    /// Searches the slot array directly, so it allocates nothing.
+    #[inline]
+    fn find_slot(data: &[u8], key: &[u8]) -> Option<usize> {
+        let header_offset = LeafPageHeader::OFFSET;
+        let num_slots = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
+
+        let mut low = 0usize;
+        let mut high = num_slots;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let slot_off = Self::SLOT_ARRAY_START + mid * Self::SLOT_SIZE;
+            let entry_off = u16::from_le_bytes([data[slot_off], data[slot_off + 1]]) as usize;
+            let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
+            let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
+
+            let cmp = compare_keys(key, entry_key);
+            if cmp == std::cmp::Ordering::Equal {
+                return Some(mid);
+            }
+            let is_less = cmp == std::cmp::Ordering::Less;
+            high = if is_less { mid } else { high };
+            low = if is_less { low } else { mid + 1 };
+        }
+        None
     }
 
     /// Inserts a key-value pair into the leaf. Returns error if page is full.
     /// Uses single-pass in-place insertion for efficiency.
     #[inline]
-    pub fn insert(&mut self, key: Bytes, tuple_id: TupleId) -> Result<()> {
-        Self::insert_in_slice(&mut *self.data, &key, tuple_id)
+    pub fn insert(&mut self, key: Bytes, locator: RowLocator) -> Result<()> {
+        Self::insert_in_slice(&mut *self.data, &key, locator)
     }
 
     /// Writes entries to the page using slotted format.
@@ -179,20 +200,20 @@ impl BTreeLeafPage {
     }
 
     /// Gets the value for a key.
-    pub fn get(&self, key: &[u8]) -> Option<TupleId> {
+    pub fn get(&self, key: &[u8]) -> Option<RowLocator> {
         Self::get_in_slice(&*self.data, key)
     }
 
     /// Gets the value for a key using slotted page format
     /// Binary search directly on slot array for O(log n) lookup, no offset building needed
-    /// Returns TupleId with file_id=0. Caller sets file_id from index context
+    /// Heap locators decode with file_id=0. Caller sets file_id from index context
     ///
     /// Search loop is structured for branchless lowering, the Less/Greater
     /// arms become cmov pairs for low and high, only the rare Equal arm
     /// takes a real branch which is well-predicted on the typical
     /// either-found-once-or-not-at-all access pattern
     #[inline(always)]
-    pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<TupleId> {
+    pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<RowLocator> {
         // Parse header - read num_slots as single u16
         let header_offset = LeafPageHeader::OFFSET;
         let num_slots = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
@@ -224,16 +245,8 @@ impl BTreeLeafPage {
 
             let cmp = compare_keys(key, entry_key);
             if cmp == std::cmp::Ordering::Equal {
-                let tuple_offset = entry_off + 2 + key_len;
-                let page_num = u32::from_le_bytes([
-                    data[tuple_offset],
-                    data[tuple_offset + 1],
-                    data[tuple_offset + 2],
-                    data[tuple_offset + 3],
-                ]);
-                let slot_id = u16::from_le_bytes([data[tuple_offset + 4], data[tuple_offset + 5]]);
-                let page_id = PageId::new(0, page_num as u64);
-                return Some(TupleId::new(page_id, slot_id));
+                let payload_offset = entry_off + 2 + key_len;
+                return RowLocator::read_payload(&data[payload_offset..]);
             }
             let is_less = cmp == std::cmp::Ordering::Less;
             high = if is_less { mid } else { high };
@@ -244,7 +257,7 @@ impl BTreeLeafPage {
 
     /// Inserts a key-value pair using slotted page format
     /// Binary search for O(log n) lookup, only shift 4-byte slots instead of full entries
-    /// Stores page_num (u32) + slot_id (u16) = 6 bytes per entry (file_id is implicit)
+    /// Stores the fixed RowLocator payload per entry (heap file_id is implicit)
     /// Returns Ok(()) on success, Err(NodeFull) if page is full, Err(DuplicateKey) if key exists
     ///
     /// Search loop is structured for branchless lowering, both low and high
@@ -253,7 +266,7 @@ impl BTreeLeafPage {
     /// duplicate-key path takes a real branch and that one is correctly
     /// predicted on the rare-Equal common case
     #[inline(always)]
-    pub fn insert_in_slice(data: &mut [u8], key: &[u8], tuple_id: TupleId) -> Result<()> {
+    pub fn insert_in_slice(data: &mut [u8], key: &[u8], locator: RowLocator) -> Result<()> {
         // Parse header
         let header_offset = LeafPageHeader::OFFSET;
         let num_slots = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
@@ -267,8 +280,8 @@ impl BTreeLeafPage {
             raw_data_end
         };
 
-        // Entry size: key_len(2) + key + page_num(4) + slot_id(2)
-        let entry_size = 2 + key.len() + 6;
+        // Entry size: key_len(2) + key + locator payload
+        let entry_size = 2 + key.len() + locator.payload_len();
 
         // Calculate free space: between slot array end and data start
         let slot_array_end = Self::SLOT_ARRAY_START + num_slots * Self::SLOT_SIZE;
@@ -322,10 +335,7 @@ impl BTreeLeafPage {
         write_offset += 2;
         data[write_offset..write_offset + key.len()].copy_from_slice(key);
         write_offset += key.len();
-        data[write_offset..write_offset + 4]
-            .copy_from_slice(&(tuple_id.page_id.page_num as u32).to_le_bytes());
-        write_offset += 4;
-        data[write_offset..write_offset + 2].copy_from_slice(&tuple_id.slot_id.to_le_bytes());
+        locator.write_payload(&mut data[write_offset..]);
 
         // Shift slots forward to make room for new slot (only 4 bytes per slot)
         let insert_slot_offset = Self::SLOT_ARRAY_START + insert_slot_idx * Self::SLOT_SIZE;
@@ -355,25 +365,24 @@ impl BTreeLeafPage {
     /// Uses entry_views to avoid Bytes allocation during search, then
     /// materializes remaining entries for the rewrite.
     pub fn delete(&mut self, key: &[u8]) -> DeleteResult {
-        match self.search(key) {
-            Ok(idx) => {
-                let views = self.entry_views();
-                let owned: Vec<LeafEntry> = views
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != idx)
-                    .map(|(_, v)| v.to_owned())
-                    .collect();
-                drop(views);
-                self.write_entries(&owned)
-                    .expect("write_entries failed after delete, page data corrupted");
-                if self.is_underfull() {
-                    DeleteResult::Underfull
-                } else {
-                    DeleteResult::Ok
-                }
-            }
-            Err(_) => DeleteResult::NotFound,
+        let Some(idx) = Self::find_slot(&*self.data, key) else {
+            return DeleteResult::NotFound;
+        };
+
+        let views = self.entry_views();
+        let owned: Vec<LeafEntry> = views
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, v)| v.to_owned())
+            .collect();
+        drop(views);
+        self.write_entries(&owned)
+            .expect("write_entries failed after delete, page data corrupted");
+        if self.is_underfull() {
+            DeleteResult::Underfull
+        } else {
+            DeleteResult::Ok
         }
     }
 
@@ -389,12 +398,6 @@ impl BTreeLeafPage {
         let total_data_space = PAGE_SIZE - Self::SLOT_ARRAY_START;
         let fill_ratio = used_space as f64 / total_data_space as f64;
         fill_ratio < MIN_FILL_FACTOR && self.num_entries() > 0
-    }
-
-    /// Returns the minimum number of bytes that should be used to avoid underflow.
-    pub fn min_used_space(&self) -> usize {
-        let total_data_space = PAGE_SIZE - Self::SLOT_ARRAY_START;
-        (total_data_space as f64 * MIN_FILL_FACTOR) as usize
     }
 
     /// Borrows entries from a right sibling to fix underflow.
@@ -539,6 +542,20 @@ impl BTreeInternalPage {
     /// Size of the leftmost child pointer.
     const LEFTMOST_PTR_SIZE: usize = 8;
 
+    /// First byte of the slot array, immediately after the leftmost pointer.
+    const SLOT_START: usize = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+
+    /// Bytes per slot: key head (8) + child page_num (4) + key_len (2) +
+    /// key_off (2). A power of two, so slot addressing is a shift
+    const SLOT_SIZE: usize = 16;
+
+    /// Keys this long or shorter are held entirely in the slot's key head,
+    /// so they cost no bytes outside the slot array
+    const INLINE_KEY_LEN: usize = 8;
+
+    /// Bytes available to the slot array and the long key region together.
+    const USABLE: usize = PAGE_SIZE - Self::SLOT_START;
+
     /// Creates a new empty internal page.
     pub fn new(page_id: PageId, level: u16) -> Self {
         let mut data = Box::new([0u8; PAGE_SIZE]);
@@ -580,103 +597,166 @@ impl BTreeInternalPage {
         self.data[offset..offset + InternalPageHeader::SIZE].copy_from_slice(&header.to_bytes());
     }
 
-    /// Returns the number of keys in this internal node.
+    /// The first eight key bytes in big-endian order, zero padded. Comparing
+    /// two of these as u64 reproduces lexicographic order over the first
+    /// eight bytes, and the zero padding keeps a short key below any longer
+    /// key that extends it
+    #[inline(always)]
+    fn key_head(key: &[u8]) -> u64 {
+        let mut head = [0u8; 8];
+        let n = if key.len() < Self::INLINE_KEY_LEN {
+            key.len()
+        } else {
+            Self::INLINE_KEY_LEN
+        };
+        head[..n].copy_from_slice(&key[..n]);
+        u64::from_be_bytes(head)
+    }
+
+    /// Byte offset of slot `idx`.
+    #[inline(always)]
+    const fn slot_offset(idx: usize) -> usize {
+        Self::SLOT_START + idx * Self::SLOT_SIZE
+    }
+
+    #[inline(always)]
+    fn slot_head(data: &[u8], slot_off: usize) -> u64 {
+        u64::from_be_bytes([
+            data[slot_off],
+            data[slot_off + 1],
+            data[slot_off + 2],
+            data[slot_off + 3],
+            data[slot_off + 4],
+            data[slot_off + 5],
+            data[slot_off + 6],
+            data[slot_off + 7],
+        ])
+    }
+
+    #[inline(always)]
+    fn slot_child(data: &[u8], slot_off: usize) -> u32 {
+        u32::from_le_bytes([
+            data[slot_off + 8],
+            data[slot_off + 9],
+            data[slot_off + 10],
+            data[slot_off + 11],
+        ])
+    }
+
+    #[inline(always)]
+    fn slot_key_len(data: &[u8], slot_off: usize) -> usize {
+        u16::from_le_bytes([data[slot_off + 12], data[slot_off + 13]]) as usize
+    }
+
+    #[inline(always)]
+    fn slot_key_off(data: &[u8], slot_off: usize) -> usize {
+        u16::from_le_bytes([data[slot_off + 14], data[slot_off + 15]]) as usize
+    }
+
+    /// The key bytes of one slot. A key of at most eight bytes is read
+    /// straight out of the big-endian key head, so it needs no second load
+    /// and no space outside the slot
+    #[inline(always)]
+    fn slot_key(data: &[u8], slot_off: usize) -> &[u8] {
+        let len = Self::slot_key_len(data, slot_off);
+        if len <= Self::INLINE_KEY_LEN {
+            &data[slot_off..slot_off + len]
+        } else {
+            let off = Self::slot_key_off(data, slot_off);
+            &data[off..off + len]
+        }
+    }
+
+    /// Orders `key` against the key in slot `slot_off`. `head` is the caller's
+    /// precomputed key head. Differing heads settle the comparison from the
+    /// slot alone, two short keys settle it from the lengths, and only a key
+    /// longer than the head reaches a full byte compare
+    #[inline(always)]
+    fn cmp_slot(data: &[u8], slot_off: usize, key: &[u8], head: u64) -> std::cmp::Ordering {
+        let slot_head = Self::slot_head(data, slot_off);
+        if slot_head != head {
+            return head.cmp(&slot_head);
+        }
+        let len = Self::slot_key_len(data, slot_off);
+        if key.len() <= Self::INLINE_KEY_LEN && len <= Self::INLINE_KEY_LEN {
+            return key.len().cmp(&len);
+        }
+        key.cmp(Self::slot_key(data, slot_off))
+    }
+
+    /// Index of the first slot whose key is strictly greater than `key`.
+    ///
+    /// The loop is structured for branchless lowering, both bounds are
+    /// updated by plain assignments the compiler turns into a cmov pair, so
+    /// a descent costs one predictable-free comparison per level of the
+    /// slot array rather than a mispredicting branch
+    #[inline(always)]
+    fn upper_bound(data: &[u8], num_keys: usize, key: &[u8], head: u64) -> usize {
+        let mut low = 0usize;
+        let mut high = num_keys;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let is_less = Self::cmp_slot(data, Self::slot_offset(mid), key, head).is_lt();
+            high = if is_less { mid } else { high };
+            low = if is_less { low } else { mid + 1 };
+        }
+        low
+    }
+
+    /// Number of keys in this internal node.
     pub fn num_keys(&self) -> u16 {
         self.internal_header().num_keys
     }
 
-    /// Returns the level of this internal node.
+    /// Level of this node in the tree.
     pub fn level(&self) -> u16 {
         self.internal_header().level
     }
 
-    /// Returns the amount of free space available.
+    /// Bytes still available for slots and long keys.
     pub fn free_space(&self) -> usize {
-        PAGE_SIZE - self.internal_header().free_space_offset as usize
+        let header = self.internal_header();
+        let slot_end = Self::slot_offset(header.num_keys as usize);
+        (header.key_region_start as usize).saturating_sub(slot_end)
     }
 
-    /// Gets the leftmost child pointer.
+    /// Returns the leftmost child pointer.
     pub fn leftmost_child(&self) -> PageId {
-        let offset = Self::DATA_START;
-        let bytes = &self.data[offset..offset + 8];
-        PageId::from_u64(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
+        Self::leftmost_child_in_slice(&*self.data)
     }
 
     /// Sets the leftmost child pointer.
     pub fn set_leftmost_child(&mut self, page_id: PageId) {
         let offset = Self::DATA_START;
-        self.data[offset..offset + 8].copy_from_slice(&page_id.as_u64().to_le_bytes());
-
-        // Update header if this is the first entry
-        let mut header = self.internal_header();
-        if header.free_space_offset == Self::DATA_START as u16 {
-            header.free_space_offset = (Self::DATA_START + Self::LEFTMOST_PTR_SIZE) as u16;
-            self.set_internal_header(header);
-        }
+        self.data[offset..offset + Self::LEFTMOST_PTR_SIZE]
+            .copy_from_slice(&page_id.as_u64().to_le_bytes());
     }
 
     /// Reads all entries from the internal node (allocates per key).
     pub fn entries(&self) -> Vec<InternalEntry> {
-        let header = self.internal_header();
-        let mut entries = Vec::with_capacity(header.num_keys as usize);
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-
-        for _ in 0..header.num_keys {
-            if let Some((entry, consumed)) = InternalEntry::from_bytes(&self.data[offset..]) {
-                entries.push(entry);
-                offset += consumed;
-            } else {
-                break;
-            }
+        let num_keys = self.num_keys() as usize;
+        let mut entries = Vec::with_capacity(num_keys);
+        for idx in 0..num_keys {
+            let slot_off = Self::slot_offset(idx);
+            entries.push(InternalEntry {
+                key: Bytes::copy_from_slice(Self::slot_key(&*self.data, slot_off)),
+                child_page_id: PageId::new(0, Self::slot_child(&*self.data, slot_off) as u64),
+            });
         }
-
         entries
     }
 
     /// Zero-copy read of all entries. Borrows keys from page buffer.
     pub fn entry_views(&self) -> Vec<InternalEntryView<'_>> {
-        let header = self.internal_header();
-        let mut views = Vec::with_capacity(header.num_keys as usize);
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-
-        for _ in 0..header.num_keys {
-            if let Some((view, consumed)) = InternalEntryView::from_bytes(&self.data[offset..]) {
-                views.push(view);
-                offset += consumed;
-            } else {
-                break;
-            }
+        let num_keys = self.num_keys() as usize;
+        let mut views = Vec::with_capacity(num_keys);
+        for idx in 0..num_keys {
+            let slot_off = Self::slot_offset(idx);
+            views.push(InternalEntryView {
+                key: Self::slot_key(&*self.data, slot_off),
+                child_page_id: PageId::new(0, Self::slot_child(&*self.data, slot_off) as u64),
+            });
         }
-
-        views
-    }
-
-    /// Reads entry views via raw pointer, bypassing borrow checker.
-    /// Internal page entries are sequential, so writes to self.data at the same
-    /// offsets would overlap with reads. Callers must write to a DIFFERENT buffer
-    /// (right_page, sibling) or ensure the write region is beyond the read region.
-    ///
-    /// SAFETY: Returned views reference self.data via raw pointer with 'static lifetime.
-    /// The caller must ensure self.data is not deallocated while views are in use.
-    unsafe fn entry_views_raw(&self) -> Vec<InternalEntryView<'static>> {
-        let header = self.internal_header();
-        let mut views = Vec::with_capacity(header.num_keys as usize);
-        let ptr = self.data.as_ptr();
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-
-        for _ in 0..header.num_keys {
-            let remaining = PAGE_SIZE - offset;
-            let buf = unsafe { std::slice::from_raw_parts(ptr.add(offset), remaining) };
-            if let Some((view, consumed)) = InternalEntryView::from_bytes(buf) {
-                views.push(view);
-                offset += consumed;
-            } else {
-                break;
-            }
-        }
-
         views
     }
 
@@ -685,117 +765,46 @@ impl BTreeInternalPage {
         Self::find_child_in_slice(&*self.data, key)
     }
 
+    /// Reads the leftmost child pointer straight from the page bytes, so a
+    /// descent does not have to materialize a whole BTreeInternalPage.
+    #[inline(always)]
+    pub fn leftmost_child_in_slice(data: &[u8]) -> PageId {
+        let offset = Self::DATA_START;
+        PageId::from_u64(u64::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]))
+    }
+
     /// Finds the child page for a given key directly from raw page data.
-    /// Uses linear search for small pages (common case), binary search for large ones.
-    /// Child pointers stored as page_num (u32). Returns PageId with file_id=0.
+    /// Child pointers are stored as page_num (u32), so the returned PageId
+    /// carries file_id 0 and callers stamp the owning file from context.
+    ///
+    /// Binary search runs over the fixed-stride slot array, so one probe is
+    /// one cache line that already holds the key head, the child pointer and
+    /// the key length. A page of short keys is routed without ever reading
+    /// the key bytes
     #[inline(always)]
     pub fn find_child_in_slice(data: &[u8], key: &[u8]) -> PageId {
-        // Parse header to get num_keys
         let header_offset = InternalPageHeader::OFFSET;
         let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
 
-        // Leftmost child pointer (stored as u64 for page linking)
-        let leftmost_offset = Self::DATA_START;
-        let leftmost = PageId::from_u64(u64::from_le_bytes([
-            data[leftmost_offset],
-            data[leftmost_offset + 1],
-            data[leftmost_offset + 2],
-            data[leftmost_offset + 3],
-            data[leftmost_offset + 4],
-            data[leftmost_offset + 5],
-            data[leftmost_offset + 6],
-            data[leftmost_offset + 7],
-        ]));
-
         if num_keys == 0 {
-            return leftmost;
+            return Self::leftmost_child_in_slice(data);
         }
 
-        // For internal nodes with <= 8 entries, linear search is faster
-        if num_keys <= 8 {
-            let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-            let mut last_child = leftmost;
-
-            for _ in 0..num_keys {
-                let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-                let entry_key = &data[offset + 2..offset + 2 + key_len];
-
-                if compare_keys(key, entry_key).is_lt() {
-                    return last_child;
-                }
-
-                // Read child page_num as u32
-                let child_offset = offset + 2 + key_len;
-                let page_num = u32::from_le_bytes([
-                    data[child_offset],
-                    data[child_offset + 1],
-                    data[child_offset + 2],
-                    data[child_offset + 3],
-                ]);
-                last_child = PageId::new(0, page_num as u64);
-
-                offset += 2 + key_len + 4;
-            }
-
-            return last_child;
-        }
-
-        // For larger pages, use binary search with offset indexing
-        // Typical internal page holds ~200-400 entries (PAGE_SIZE/avg-entry),
-        // so a 256-entry inline buffer covers the common case without the
-        // 16 KB stack allocation that a fixed [usize; 2048] would force on
-        // every traversal frame, the heap-spill path activates only when a
-        // page exceeds the inline capacity which is rare in production
-        const INLINE_OFFSETS: usize = 256;
-        let mut inline_offsets = [0usize; INLINE_OFFSETS];
-        let mut spill_offsets: Vec<usize> = Vec::new();
-        let limit = num_keys.min(2048);
-        if limit > INLINE_OFFSETS {
-            spill_offsets.reserve_exact(limit);
-        }
-        let offsets: &mut [usize] = if limit > INLINE_OFFSETS {
-            spill_offsets.resize(limit, 0);
-            &mut spill_offsets[..]
+        let head = Self::key_head(key);
+        let pos = Self::upper_bound(data, num_keys, key, head);
+        if pos == 0 {
+            Self::leftmost_child_in_slice(data)
         } else {
-            &mut inline_offsets[..limit]
-        };
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-
-        for o in offsets.iter_mut() {
-            *o = offset;
-            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            offset += 2 + key_len + 4;
-        }
-
-        let mut low = 0usize;
-        let mut high = limit;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let entry_offset = offsets[mid];
-            let key_len = u16::from_le_bytes([data[entry_offset], data[entry_offset + 1]]) as usize;
-            let entry_key = &data[entry_offset + 2..entry_offset + 2 + key_len];
-
-            if compare_keys(key, entry_key).is_lt() {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-
-        if low == 0 {
-            leftmost
-        } else {
-            let entry_offset = offsets[low - 1];
-            let key_len = u16::from_le_bytes([data[entry_offset], data[entry_offset + 1]]) as usize;
-            let child_offset = entry_offset + 2 + key_len;
-            let page_num = u32::from_le_bytes([
-                data[child_offset],
-                data[child_offset + 1],
-                data[child_offset + 2],
-                data[child_offset + 3],
-            ]);
-            PageId::new(0, page_num as u64)
+            PageId::new(0, Self::slot_child(data, Self::slot_offset(pos - 1)) as u64)
         }
     }
 
@@ -808,55 +817,28 @@ impl BTreeInternalPage {
     pub fn find_child_with_upper(data: &[u8], key: &[u8]) -> (u32, Option<Vec<u8>>) {
         let header_offset = InternalPageHeader::OFFSET;
         let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
-
-        let leftmost_offset = Self::DATA_START;
-        let leftmost = PageId::from_u64(u64::from_le_bytes([
-            data[leftmost_offset],
-            data[leftmost_offset + 1],
-            data[leftmost_offset + 2],
-            data[leftmost_offset + 3],
-            data[leftmost_offset + 4],
-            data[leftmost_offset + 5],
-            data[leftmost_offset + 6],
-            data[leftmost_offset + 7],
-        ]))
-        .page_num as u32;
+        let leftmost = Self::leftmost_child_in_slice(data).page_num as u32;
 
         if num_keys == 0 {
             return (leftmost, None);
         }
 
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        let mut last_child = leftmost;
-
-        for _ in 0..num_keys {
-            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            let entry_key = &data[offset + 2..offset + 2 + key_len];
-
-            // First separator strictly greater than `key`: the chosen child
-            // is everything to its left, and this separator is the exclusive
-            // upper bound of that subtree.
-            if compare_keys(key, entry_key).is_lt() {
-                return (last_child, Some(entry_key.to_vec()));
-            }
-
-            let child_offset = offset + 2 + key_len;
-            last_child = u32::from_le_bytes([
-                data[child_offset],
-                data[child_offset + 1],
-                data[child_offset + 2],
-                data[child_offset + 3],
-            ]);
-
-            offset += 2 + key_len + 4;
-        }
-
-        // key >= every separator: rightmost child, no upper bound here.
-        (last_child, None)
+        let head = Self::key_head(key);
+        let pos = Self::upper_bound(data, num_keys, key, head);
+        let child = if pos == 0 {
+            leftmost
+        } else {
+            Self::slot_child(data, Self::slot_offset(pos - 1))
+        };
+        let bound = if pos < num_keys {
+            Some(Self::slot_key(data, Self::slot_offset(pos)).to_vec())
+        } else {
+            None
+        };
+        (child, bound)
     }
 
     /// Inserts a key and right child pointer.
-    /// Uses in-place insertion for efficiency.
     #[inline]
     pub fn insert(&mut self, key: Bytes, right_child: PageId) -> Result<()> {
         Self::insert_in_slice(&mut *self.data, key.as_ref(), right_child)
@@ -867,143 +849,243 @@ impl BTreeInternalPage {
     /// Returns Ok(()) on success, Err(NodeFull) if page is full.
     #[inline(always)]
     pub fn insert_in_slice(data: &mut [u8], key: &[u8], right_child: PageId) -> Result<()> {
-        // Parse header
-        let header_offset = InternalPageHeader::OFFSET;
-        let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
-        let raw_free_offset =
-            u16::from_le_bytes([data[header_offset + 2], data[header_offset + 3]]) as usize;
-
-        // Handle uninitialized pages
-        let free_space_offset = if raw_free_offset < Self::DATA_START + Self::LEFTMOST_PTR_SIZE {
-            Self::DATA_START + Self::LEFTMOST_PTR_SIZE
-        } else {
-            raw_free_offset
-        };
-
-        // Entry size: key_len(2) + key + page_num(4)
-        let entry_size = 2 + key.len() + 4;
-        let free_space = PAGE_SIZE - free_space_offset;
-
-        if free_space < entry_size {
+        if key.len() > u16::MAX as usize {
             return Err(ZyronError::NodeFull);
         }
 
-        // Find insertion point using linear scan (internal nodes have fewer entries)
-        let mut insert_offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        let mut offset = insert_offset;
+        let header_offset = InternalPageHeader::OFFSET;
+        let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
+        let raw_region =
+            u16::from_le_bytes([data[header_offset + 2], data[header_offset + 3]]) as usize;
 
-        for _ in 0..num_keys {
-            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            let entry_key = &data[offset + 2..offset + 2 + key_len];
-            let entry_total = 2 + key_len + 4;
+        // A page that was never written through this codec carries a zero or
+        // an out-of-range value here, the long key region then starts at the
+        // page end
+        let key_region_start = if raw_region <= Self::SLOT_START || raw_region > PAGE_SIZE {
+            PAGE_SIZE
+        } else {
+            raw_region
+        };
 
-            if compare_keys(key, entry_key).is_lt() {
-                insert_offset = offset;
-                break;
-            }
-            offset += entry_total;
-            insert_offset = offset;
+        let spill = key.len() > Self::INLINE_KEY_LEN;
+        let needed = Self::SLOT_SIZE + if spill { key.len() } else { 0 };
+        let slot_end = Self::slot_offset(num_keys);
+        if key_region_start.saturating_sub(slot_end) < needed {
+            return Err(ZyronError::NodeFull);
         }
 
-        // Shift existing entries to make room
-        let bytes_to_shift = free_space_offset - insert_offset;
-        if bytes_to_shift > 0 {
-            data.copy_within(insert_offset..free_space_offset, insert_offset + entry_size);
+        let head = Self::key_head(key);
+        let pos = Self::upper_bound(data, num_keys, key, head);
+
+        // Open a slot-sized gap at the insertion point
+        let insert_off = Self::slot_offset(pos);
+        if slot_end > insert_off {
+            data.copy_within(insert_off..slot_end, insert_off + Self::SLOT_SIZE);
         }
 
-        // Write the new entry
-        let mut write_offset = insert_offset;
-        data[write_offset..write_offset + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-        write_offset += 2;
-        data[write_offset..write_offset + key.len()].copy_from_slice(key);
-        write_offset += key.len();
-        data[write_offset..write_offset + 4]
+        let mut new_region = key_region_start;
+        let key_off = if spill {
+            new_region -= key.len();
+            data[new_region..new_region + key.len()].copy_from_slice(key);
+            new_region
+        } else {
+            0
+        };
+
+        data[insert_off..insert_off + 8].copy_from_slice(&head.to_be_bytes());
+        data[insert_off + 8..insert_off + 12]
             .copy_from_slice(&(right_child.page_num as u32).to_le_bytes());
+        data[insert_off + 12..insert_off + 14].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        data[insert_off + 14..insert_off + 16].copy_from_slice(&(key_off as u16).to_le_bytes());
 
-        // Update header
-        let new_num_keys = (num_keys + 1) as u16;
-        let new_free_offset = (free_space_offset + entry_size) as u16;
-        data[header_offset..header_offset + 2].copy_from_slice(&new_num_keys.to_le_bytes());
-        data[header_offset + 2..header_offset + 4].copy_from_slice(&new_free_offset.to_le_bytes());
+        data[header_offset..header_offset + 2]
+            .copy_from_slice(&((num_keys + 1) as u16).to_le_bytes());
+        data[header_offset + 2..header_offset + 4]
+            .copy_from_slice(&(new_region as u16).to_le_bytes());
 
         Ok(())
     }
 
+    /// Rewrites the long key region so it holds only the keys the slot array
+    /// still points at, reclaiming the space left by replaced or removed
+    /// separators. A page whose keys all fit in their slots has no region and
+    /// skips the walk entirely
+    fn compact_key_region(&mut self) {
+        let num_keys = self.num_keys() as usize;
+        let mut moved: Vec<(usize, Vec<u8>)> = Vec::new();
+        for idx in 0..num_keys {
+            let slot_off = Self::slot_offset(idx);
+            let len = Self::slot_key_len(&*self.data, slot_off);
+            if len > Self::INLINE_KEY_LEN {
+                let off = Self::slot_key_off(&*self.data, slot_off);
+                moved.push((slot_off, self.data[off..off + len].to_vec()));
+            }
+        }
+
+        let mut region = PAGE_SIZE;
+        for (slot_off, key) in &moved {
+            region -= key.len();
+            self.data[region..region + key.len()].copy_from_slice(key);
+            self.data[slot_off + 14..slot_off + 16].copy_from_slice(&(region as u16).to_le_bytes());
+        }
+
+        let mut header = self.internal_header();
+        header.key_region_start = region as u16;
+        self.set_internal_header(header);
+    }
+
+    /// True when this page holds long keys, so its region is worth compacting.
+    #[inline]
+    fn has_long_keys(&self) -> bool {
+        (self.internal_header().key_region_start as usize) < PAGE_SIZE
+    }
+
+    /// The separator key at entry index `idx`, or None when `idx` is past the
+    /// end. Reads the one slot rather than materializing every entry.
+    pub fn separator_key_at(&self, idx: usize) -> Option<Bytes> {
+        if idx >= self.num_keys() as usize {
+            return None;
+        }
+        Some(Bytes::copy_from_slice(Self::slot_key(
+            &*self.data,
+            Self::slot_offset(idx),
+        )))
+    }
+
+    /// Total bytes the long key region owes to keys the slot array still
+    /// points at.
+    fn live_long_bytes(data: &[u8], num_keys: usize) -> usize {
+        let mut total = 0;
+        for idx in 0..num_keys {
+            let len = Self::slot_key_len(data, Self::slot_offset(idx));
+            if len > Self::INLINE_KEY_LEN {
+                total += len;
+            }
+        }
+        total
+    }
+
     /// Replaces the separator key at entry index `idx`, keeping its child
     /// pointer. Used after a borrow shifts the boundary between two children.
-    /// Rewrites the entry region in place; the leftmost child is untouched.
-    pub fn set_separator_key(&mut self, idx: usize, new_key: Bytes) {
-        let mut entries = self.entries();
-        entries[idx].key = new_key;
-        let _ = self.write_entries(&entries);
+    /// Returns false when the replacement key does not fit, in which case the
+    /// page is left exactly as it was.
+    pub fn set_separator_key(&mut self, idx: usize, new_key: Bytes) -> bool {
+        let num_keys = self.num_keys() as usize;
+        if idx >= num_keys || new_key.len() > u16::MAX as usize {
+            return false;
+        }
+
+        let slot_off = Self::slot_offset(idx);
+        let old_len = Self::slot_key_len(&*self.data, slot_off);
+        let old_long = if old_len > Self::INLINE_KEY_LEN {
+            old_len
+        } else {
+            0
+        };
+        let new_long = if new_key.len() > Self::INLINE_KEY_LEN {
+            new_key.len()
+        } else {
+            0
+        };
+
+        let mut key_off = 0usize;
+        if new_long > 0 || old_long > 0 {
+            // The key being replaced gives its own bytes back, so measure the
+            // region without it
+            let slot_end = Self::slot_offset(num_keys);
+            let in_use = Self::live_long_bytes(&*self.data, num_keys) - old_long;
+            if new_long > (PAGE_SIZE - slot_end) - in_use {
+                return false;
+            }
+            // Zeroing the length drops the old key from the live set, so the
+            // compaction below reclaims its bytes
+            self.data[slot_off + 12..slot_off + 14].copy_from_slice(&0u16.to_le_bytes());
+            self.compact_key_region();
+            if new_long > 0 {
+                let mut header = self.internal_header();
+                let region = header.key_region_start as usize - new_key.len();
+                self.data[region..region + new_key.len()].copy_from_slice(&new_key);
+                header.key_region_start = region as u16;
+                self.set_internal_header(header);
+                key_off = region;
+            }
+        }
+
+        self.data[slot_off..slot_off + 8].copy_from_slice(&Self::key_head(&new_key).to_be_bytes());
+        self.data[slot_off + 12..slot_off + 14]
+            .copy_from_slice(&(new_key.len() as u16).to_le_bytes());
+        self.data[slot_off + 14..slot_off + 16].copy_from_slice(&(key_off as u16).to_le_bytes());
+        true
     }
 
     /// Removes entry `idx` (a separator and its right child pointer) from this
     /// node. The leftmost child pointer is untouched, so the child at slot
     /// `idx+1` is dropped from routing (callers merge that child away first).
     pub fn remove_entry(&mut self, idx: usize) {
-        let mut entries = self.entries();
-        entries.remove(idx);
-        let _ = self.write_entries(&entries);
-    }
-
-    /// Writes entries to the page using write_to_slice (no BytesMut alloc).
-    fn write_entries(&mut self, entries: &[InternalEntry]) -> Result<()> {
-        let mut header = self.internal_header();
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-
-        for entry in entries {
-            let entry_size = entry.size_on_disk();
-            if offset + entry_size > PAGE_SIZE {
-                return Err(ZyronError::NodeFull);
-            }
-            entry.write_to_slice(&mut *self.data, offset);
-            offset += entry_size;
+        let num_keys = self.num_keys() as usize;
+        if idx >= num_keys {
+            return;
         }
 
-        header.num_keys = entries.len() as u16;
-        header.free_space_offset = offset as u16;
+        let start = Self::slot_offset(idx);
+        let end = Self::slot_offset(num_keys);
+        self.data.copy_within(start + Self::SLOT_SIZE..end, start);
+
+        let mut header = self.internal_header();
+        header.num_keys = (num_keys - 1) as u16;
         self.set_internal_header(header);
-        Ok(())
+
+        if self.has_long_keys() {
+            self.compact_key_region();
+        }
     }
 
     /// Splits this internal node. Returns (promoted_key, new_right_page).
-    /// Uses raw pointer reads to avoid per-entry Bytes allocation.
+    ///
+    /// The left half keeps its slots exactly where they are, so the split
+    /// copies only the right half's slot range and, when the page carries
+    /// long keys, their bytes.
     pub fn split(&mut self, new_page_id: PageId) -> (Bytes, BTreeInternalPage) {
-        // SAFETY: Views read via raw pointer. Left half is written to self (sequential
-        // entries start at same offset, but left half is always <= original size so
-        // the write is bounded within the original data). Right half writes to a
-        // different buffer (right_page).
-        let views = unsafe { self.entry_views_raw() };
-        let mid = views.len() / 2;
-
-        let promoted_key = Bytes::copy_from_slice(views[mid].key);
-        let right_first_child = views[mid].child_page_id;
+        let num_keys = self.num_keys() as usize;
+        let mid = num_keys / 2;
         let level = self.level();
 
-        // Left half: entries are already in place at their current offsets
-        // (they're the first `mid` entries in sequential order). Just update the header.
-        let mut left_end = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        for view in &views[..mid] {
-            left_end += view.size_on_disk();
-        }
-        let mut header = self.internal_header();
-        header.num_keys = mid as u16;
-        header.free_space_offset = left_end as u16;
-        self.set_internal_header(header);
+        let mid_off = Self::slot_offset(mid);
+        let promoted_key = Bytes::copy_from_slice(Self::slot_key(&*self.data, mid_off));
+        let right_first_child = PageId::new(0, Self::slot_child(&*self.data, mid_off) as u64);
 
-        // Write right half to new page (different buffer, no overlap)
         let mut right_page = BTreeInternalPage::new(new_page_id, level);
         right_page.set_leftmost_child(right_first_child);
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        for view in &views[mid + 1..] {
-            view.write_to_slice(&mut *right_page.data, offset);
-            offset += view.size_on_disk();
+
+        let right_count = num_keys - mid - 1;
+        let mut region = PAGE_SIZE;
+        for i in 0..right_count {
+            let src_off = Self::slot_offset(mid + 1 + i);
+            let dst_off = Self::slot_offset(i);
+            right_page.data[dst_off..dst_off + Self::SLOT_SIZE]
+                .copy_from_slice(&self.data[src_off..src_off + Self::SLOT_SIZE]);
+
+            let len = Self::slot_key_len(&*self.data, src_off);
+            if len > Self::INLINE_KEY_LEN {
+                let off = Self::slot_key_off(&*self.data, src_off);
+                region -= len;
+                right_page.data[region..region + len].copy_from_slice(&self.data[off..off + len]);
+                right_page.data[dst_off + 14..dst_off + 16]
+                    .copy_from_slice(&(region as u16).to_le_bytes());
+            }
         }
-        let mut rh = right_page.internal_header();
-        rh.num_keys = (views.len() - mid - 1) as u16;
-        rh.free_space_offset = offset as u16;
-        right_page.set_internal_header(rh);
+
+        let mut right_header = right_page.internal_header();
+        right_header.num_keys = right_count as u16;
+        right_header.key_region_start = region as u16;
+        right_page.set_internal_header(right_header);
+
+        let mut header = self.internal_header();
+        header.num_keys = mid as u16;
+        self.set_internal_header(header);
+        if self.has_long_keys() {
+            self.compact_key_region();
+        }
 
         (promoted_key, right_page)
     }
@@ -1018,52 +1100,39 @@ impl BTreeInternalPage {
     /// An underfull node should trigger rebalancing (borrowing from siblings
     /// or merging with a sibling) to maintain B+ tree balance invariants.
     pub fn is_underfull(&self) -> bool {
-        let used_space = self.internal_header().free_space_offset as usize
-            - Self::DATA_START
-            - Self::LEFTMOST_PTR_SIZE;
-        let total_data_space = PAGE_SIZE - Self::DATA_START - Self::LEFTMOST_PTR_SIZE;
-        let fill_ratio = used_space as f64 / total_data_space as f64;
-        fill_ratio < MIN_FILL_FACTOR && self.num_keys() > 0
-    }
-
-    /// Returns the minimum number of bytes that should be used to avoid underflow.
-    pub fn min_used_space(&self) -> usize {
-        let total_data_space = PAGE_SIZE - Self::DATA_START - Self::LEFTMOST_PTR_SIZE;
-        (total_data_space as f64 * MIN_FILL_FACTOR) as usize
+        let header = self.internal_header();
+        if header.num_keys == 0 {
+            return false;
+        }
+        let used = header.num_keys as usize * Self::SLOT_SIZE
+            + (PAGE_SIZE - header.key_region_start as usize);
+        (used as f64 / Self::USABLE as f64) < MIN_FILL_FACTOR
     }
 
     /// Deletes a key from the internal node. Returns DeleteResult indicating outcome.
     pub fn delete(&mut self, key: &[u8]) -> DeleteResult {
-        // SAFETY: Views read via raw pointer. Deleting one entry and rewriting
-        // the rest sequentially is safe because the written data is always
-        // <= the original data size (one entry removed).
-        let views = unsafe { self.entry_views_raw() };
-        let pos = views.iter().position(|v| v.key == key);
+        let num_keys = self.num_keys() as usize;
+        if num_keys == 0 {
+            return DeleteResult::NotFound;
+        }
 
-        match pos {
-            Some(idx) => {
-                // Entries before idx are already in place. Compute offset of entry[idx].
-                let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-                for view in &views[..idx] {
-                    offset += view.size_on_disk();
-                }
-                // Skip entry[idx], write entries after it starting at offset
-                for view in &views[idx + 1..] {
-                    view.write_to_slice(&mut *self.data, offset);
-                    offset += view.size_on_disk();
-                }
-                let mut header = self.internal_header();
-                header.num_keys = (views.len() - 1) as u16;
-                header.free_space_offset = offset as u16;
-                self.set_internal_header(header);
+        let head = Self::key_head(key);
+        let pos = Self::upper_bound(&*self.data, num_keys, key, head);
+        if pos == 0 {
+            return DeleteResult::NotFound;
+        }
+        let idx = pos - 1;
+        if Self::cmp_slot(&*self.data, Self::slot_offset(idx), key, head)
+            != std::cmp::Ordering::Equal
+        {
+            return DeleteResult::NotFound;
+        }
 
-                if self.is_underfull() {
-                    DeleteResult::Underfull
-                } else {
-                    DeleteResult::Ok
-                }
-            }
-            None => DeleteResult::NotFound,
+        self.remove_entry(idx);
+        if self.is_underfull() {
+            DeleteResult::Underfull
+        } else {
+            DeleteResult::Ok
         }
     }
 
@@ -1077,49 +1146,20 @@ impl BTreeInternalPage {
             return None;
         }
 
-        // SAFETY: Raw reads from both pages. Self grows by one entry (appended past
-        // existing data). Right sibling shrinks (fewer entries, no overlap issue).
-        let right_views = unsafe { right_sibling.entry_views_raw() };
-        let my_views = unsafe { self.entry_views_raw() };
-
-        let new_sep = Bytes::copy_from_slice(right_views[0].key);
-        let borrowed_child = right_views[0].child_page_id;
+        let first_off = Self::slot_offset(0);
+        let new_sep = Bytes::copy_from_slice(Self::slot_key(&*right_sibling.data, first_off));
+        let borrowed_child =
+            PageId::new(0, Self::slot_child(&*right_sibling.data, first_off) as u64);
         let right_leftmost = right_sibling.leftmost_child();
 
-        // Self: existing entries are already in place. Append separator past them.
-        let sep_view = InternalEntryView {
-            key: &separator_key,
-            child_page_id: right_leftmost,
-        };
-        let my_count = my_views.len() + 1;
-        let mut append_offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        for view in my_views.iter() {
-            append_offset += view.size_on_disk();
+        // The separator sorts above every key already here, so the insert
+        // lands at the end of the slot array
+        if Self::insert_in_slice(&mut *self.data, &separator_key, right_leftmost).is_err() {
+            return None;
         }
-        sep_view.write_to_slice(&mut *self.data, append_offset);
-        append_offset += sep_view.size_on_disk();
-        let mut header = self.internal_header();
-        header.num_keys = my_count as u16;
-        header.free_space_offset = append_offset as u16;
-        self.set_internal_header(header);
 
-        // Right sibling: remove first entry by shifting remaining entries left.
-        // Uses copy_within to handle overlapping regions safely.
         right_sibling.set_leftmost_child(borrowed_child);
-        let first_entry_size = right_views[0].size_on_disk();
-        let entries_start = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        let old_free = right_sibling.internal_header().free_space_offset as usize;
-        let src_start = entries_start + first_entry_size;
-        let shift_len = old_free - src_start;
-        if shift_len > 0 {
-            right_sibling
-                .data
-                .copy_within(src_start..old_free, entries_start);
-        }
-        let mut rh = right_sibling.internal_header();
-        rh.num_keys = (right_views.len() - 1) as u16;
-        rh.free_space_offset = (old_free - first_entry_size) as u16;
-        right_sibling.set_internal_header(rh);
+        right_sibling.remove_entry(0);
 
         Some(new_sep)
     }
@@ -1134,50 +1174,20 @@ impl BTreeInternalPage {
             return None;
         }
 
-        // SAFETY: Raw reads. Self grows by one entry (prepended). Left shrinks.
-        // For self: prepending shifts all data, but raw views point to old locations
-        // which are read before being overwritten. Since we write sequentially from
-        // the start, entry[0] is written first (from sep_view, not from self),
-        // then entry[1] is written from my_views[0] which was read before any overlap.
-        let left_views = unsafe { left_sibling.entry_views_raw() };
-        let my_views = unsafe { self.entry_views_raw() };
-
-        let last_idx = left_views.len() - 1;
-        let new_sep = Bytes::copy_from_slice(left_views[last_idx].key);
-        let borrowed_child = left_views[last_idx].child_page_id;
+        let last_idx = left_sibling.num_keys() as usize - 1;
+        let last_off = Self::slot_offset(last_idx);
+        let new_sep = Bytes::copy_from_slice(Self::slot_key(&*left_sibling.data, last_off));
+        let borrowed_child = PageId::new(0, Self::slot_child(&*left_sibling.data, last_off) as u64);
         let my_leftmost = self.leftmost_child();
 
-        // Write self: separator + existing entries
+        // The separator sorts below every key already here, so the insert
+        // lands at the front of the slot array
+        if Self::insert_in_slice(&mut *self.data, &separator_key, my_leftmost).is_err() {
+            return None;
+        }
         self.set_leftmost_child(borrowed_child);
-        let sep_view = InternalEntryView {
-            key: &separator_key,
-            child_page_id: my_leftmost,
-        };
-        let my_count = 1 + my_views.len();
-        // For prepend on sequential layout, we need owned entries to avoid overlap
-        let owned_my: Vec<InternalEntry> = my_views.iter().map(|v| v.to_owned()).collect();
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        sep_view.write_to_slice(&mut *self.data, offset);
-        offset += sep_view.size_on_disk();
-        for entry in &owned_my {
-            entry.write_to_slice(&mut *self.data, offset);
-            offset += entry.size_on_disk();
-        }
-        let mut header = self.internal_header();
-        header.num_keys = my_count as u16;
-        header.free_space_offset = offset as u16;
-        self.set_internal_header(header);
 
-        // Left sibling: removing last entry is just a header update (truncation).
-        // Entries before last_idx are already in place.
-        let mut left_end = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        for view in &left_views[..last_idx] {
-            left_end += view.size_on_disk();
-        }
-        let mut lh = left_sibling.internal_header();
-        lh.num_keys = last_idx as u16;
-        lh.free_space_offset = left_end as u16;
-        left_sibling.set_internal_header(lh);
+        left_sibling.remove_entry(last_idx);
 
         Some(new_sep)
     }
@@ -1188,37 +1198,38 @@ impl BTreeInternalPage {
         right_sibling: &BTreeInternalPage,
         separator_key: Bytes,
     ) -> bool {
-        // SAFETY: Raw reads from both pages. Self grows (existing entries + sep + right),
-        // but existing entries are written first at the same offsets (identity copy),
-        // then separator and right entries are appended past the original data.
-        let my_views = unsafe { self.entry_views_raw() };
-        let right_views = unsafe { right_sibling.entry_views_raw() };
+        let right_count = right_sibling.num_keys() as usize;
+
+        let mut needed = Self::SLOT_SIZE * (right_count + 1);
+        if separator_key.len() > Self::INLINE_KEY_LEN {
+            needed += separator_key.len();
+        }
+        for idx in 0..right_count {
+            let len = Self::slot_key_len(&*right_sibling.data, Self::slot_offset(idx));
+            if len > Self::INLINE_KEY_LEN {
+                needed += len;
+            }
+        }
+
+        if self.free_space() < needed && self.has_long_keys() {
+            self.compact_key_region();
+        }
+        if self.free_space() < needed {
+            return false;
+        }
 
         let right_leftmost = right_sibling.leftmost_child();
-        let sep_view = InternalEntryView {
-            key: &separator_key,
-            child_page_id: right_leftmost,
-        };
-
-        let total = my_views.len() + 1 + right_views.len();
-        // Skip identity copy of my_views (already in place), start appending at their end
-        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        for view in my_views.iter() {
-            offset += view.size_on_disk();
+        if Self::insert_in_slice(&mut *self.data, &separator_key, right_leftmost).is_err() {
+            return false;
         }
-        // Append separator + right entries past existing data
-        for view in std::iter::once(&sep_view).chain(right_views.iter()) {
-            let sz = view.size_on_disk();
-            if offset + sz > PAGE_SIZE {
+        for idx in 0..right_count {
+            let slot_off = Self::slot_offset(idx);
+            let key = Self::slot_key(&*right_sibling.data, slot_off);
+            let child = PageId::new(0, Self::slot_child(&*right_sibling.data, slot_off) as u64);
+            if Self::insert_in_slice(&mut *self.data, key, child).is_err() {
                 return false;
             }
-            view.write_to_slice(&mut *self.data, offset);
-            offset += sz;
         }
-        let mut header = self.internal_header();
-        header.num_keys = total as u16;
-        header.free_space_offset = offset as u16;
-        self.set_internal_header(header);
 
         true
     }

@@ -141,11 +141,17 @@ impl CheckpointCoordinator {
     }
 
     /// Waits for the background writer to flush all dirty pages below checkpoint_lsn.
-    /// Uses exponential backoff from 100us to 10ms with a configurable timeout.
+    ///
+    /// Scanning the pool for remaining dirty pages walks the page table, and
+    /// the terminating case is the full walk, so this waits on the writer's
+    /// own cycle counter rather than rescanning on a timer. A checkpoint
+    /// then finishes when the writer finishes, instead of at whatever point
+    /// a backoff interval happened to expire afterwards. The timeout on the
+    /// wait only bounds a missed notification, it is not the polling rate
     fn wait_for_flush_completion(&self, checkpoint_lsn: Lsn) -> Result<()> {
         let timeout = Duration::from_secs(self.config.checkpoint_timeout_secs);
         let start = Instant::now();
-        let mut backoff_us: u64 = 100;
+        let mut seen_cycles = self.background_writer.cycles_completed();
 
         loop {
             // Check the pool directly for remaining dirty pages below the boundary.
@@ -173,12 +179,13 @@ impl CheckpointCoordinator {
                 )));
             }
 
-            // Exponential backoff: 100us -> 200us -> 400us -> ... -> 10ms cap
-            std::thread::sleep(Duration::from_micros(backoff_us));
-            backoff_us = (backoff_us * 2).min(10_000);
-
-            // Wake the background writer in case it's parked
+            // Wake the writer in case it is parked, then block until it has
+            // completed another cycle. The bound is short so a lost wakeup
+            // costs one interval rather than the whole checkpoint timeout
             self.background_writer.wake();
+            seen_cycles = self
+                .background_writer
+                .wait_for_cycle_after(seen_cycles, Duration::from_millis(1));
         }
     }
 

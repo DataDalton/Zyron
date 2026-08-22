@@ -2,10 +2,7 @@
 //!
 //! DataProfile is computed once from a sample of vectors at build time. All HNSW
 //! and IVF-PQ parameters become functions of the profile, eliminating hardcoded
-//! constants. QueryTuner adjusts search parameters at runtime based on result
-//! quality signals.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! constants.
 
 use super::distance::{distWithFn, resolveDistFn};
 use super::types::DistanceMetric;
@@ -373,99 +370,6 @@ impl DataProfile {
     }
 }
 
-// ---------------------------------------------------------------------------
-// QueryTuner: runtime search parameter auto-adjustment
-// ---------------------------------------------------------------------------
-
-/// Adjusts search parameters at runtime based on result quality signals.
-/// Uses exponential weighted moving average of the gap ratio quality metric.
-pub struct QueryTuner {
-    /// Target recall level (default 0.95).
-    targetRecall: f32,
-    /// Exponential weighted moving average of quality signal.
-    ewmaQuality: f32,
-    /// Current auto-tuned efSearch value for HNSW.
-    currentEfSearch: u16,
-    /// Current auto-tuned numProbes value for IVF-PQ.
-    currentNumProbes: u16,
-    /// Total queries processed.
-    queryCount: AtomicU64,
-    /// Minimum efSearch/numProbes (2 * m for HNSW, 1 for IVF-PQ).
-    minParam: u16,
-    /// Maximum efSearch/numProbes.
-    maxParam: u16,
-}
-
-impl QueryTuner {
-    /// Creates a new QueryTuner with the given initial search parameter and bounds.
-    pub fn new(initialParam: u16, minParam: u16, maxParam: u16) -> Self {
-        Self {
-            targetRecall: 0.95,
-            ewmaQuality: 0.5,
-            currentEfSearch: initialParam,
-            currentNumProbes: initialParam,
-            queryCount: AtomicU64::new(0),
-            minParam,
-            maxParam,
-        }
-    }
-
-    /// Returns the current auto-tuned efSearch value.
-    pub fn efSearch(&self) -> u16 {
-        self.currentEfSearch
-    }
-
-    /// Returns the current auto-tuned numProbes value.
-    pub fn numProbes(&self) -> u16 {
-        self.currentNumProbes
-    }
-
-    /// Computes the gap ratio quality signal from search results.
-    /// High gap ratio (near 1.0) means well-separated results (high recall).
-    /// Low gap ratio (near 0.0) means flat distance distribution (low recall).
-    pub fn gapRatio(results: &[(u64, f32)]) -> f32 {
-        if results.len() < 2 {
-            return 1.0;
-        }
-        let nearest = results[0].1;
-        let farthest = results[results.len() - 1].1;
-        if farthest.abs() < 1e-10 {
-            return 1.0;
-        }
-        1.0 - (nearest / farthest)
-    }
-
-    /// Updates the tuner with quality feedback from a search result.
-    /// Call this after each search to let the tuner adapt.
-    pub fn observe(&mut self, results: &[(u64, f32)]) {
-        let count = self.queryCount.fetch_add(1, Ordering::Relaxed) + 1;
-        let quality = Self::gapRatio(results);
-
-        // EWMA with alpha = 0.05 for smooth adaptation.
-        let alpha = 0.05f32;
-        self.ewmaQuality = alpha * quality + (1.0 - alpha) * self.ewmaQuality;
-
-        // After 10 queries, start adjusting if quality is below target.
-        if count >= 10 && self.ewmaQuality < self.targetRecall {
-            // Increase search effort by 1.5x.
-            let newEf = ((self.currentEfSearch as f32 * 1.5).round() as u16).min(self.maxParam);
-            self.currentEfSearch = newEf;
-            let newProbes =
-                ((self.currentNumProbes as f32 * 1.5).round() as u16).min(self.maxParam);
-            self.currentNumProbes = newProbes;
-        }
-
-        // After 50 queries, decrease if quality is 5%+ above target.
-        if count >= 50 && self.ewmaQuality > self.targetRecall + 0.05 {
-            let newEf = ((self.currentEfSearch as f32 * 0.9).round() as u16).max(self.minParam);
-            self.currentEfSearch = newEf;
-            let newProbes =
-                ((self.currentNumProbes as f32 * 0.9).round() as u16).max(self.minParam);
-            self.currentNumProbes = newProbes;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,38 +461,6 @@ mod tests {
         assert!((restored.intrinsicDim - profile.intrinsicDim).abs() < 1e-3);
         assert_eq!(restored.isClustered, profile.isClustered);
         assert_eq!(restored.numCores, profile.numCores);
-    }
-
-    #[test]
-    fn queryTunerGapRatio() {
-        // Well-separated results: gap ratio should be high.
-        let results = vec![(1, 0.1), (2, 0.5), (3, 1.0)];
-        let gap = QueryTuner::gapRatio(&results);
-        assert!(gap > 0.8, "gap was {gap}");
-
-        // Flat results: gap ratio should be low.
-        let flat = vec![(1, 0.99), (2, 0.995), (3, 1.0)];
-        let flatGap = QueryTuner::gapRatio(&flat);
-        assert!(flatGap < 0.02, "flat gap was {flatGap}");
-    }
-
-    #[test]
-    fn queryTunerAdaptation() {
-        let mut tuner = QueryTuner::new(128, 16, 2048);
-        let initialEf = tuner.efSearch();
-
-        // Feed many low-quality results to trigger increase.
-        let lowQuality = vec![(1, 0.99), (2, 0.995), (3, 1.0)];
-        for _ in 0..20 {
-            tuner.observe(&lowQuality);
-        }
-
-        assert!(
-            tuner.efSearch() > initialEf,
-            "efSearch should increase: {} vs {}",
-            tuner.efSearch(),
-            initialEf
-        );
     }
 
     /// Generates clustered vectors normalized to the unit sphere.

@@ -38,6 +38,25 @@ pub enum UndoEntry {
         fsm_file_id: u32,
         tid: TupleId,
     },
+    /// The transaction superseded this columnar-resident row (a DELETE routed
+    /// to the patch log). Reverse by revoking the supersede on the branch
+    /// that wrote it, 0 for the main line.
+    ColumnarSupersede {
+        table_id: u32,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+    },
+    /// The transaction patched one column of this columnar-resident row (an
+    /// UPDATE routed to the patch log). Reverse by revoking the patch on the
+    /// branch that wrote it, 0 for the main line.
+    ColumnarPatch {
+        table_id: u32,
+        branch: u64,
+        file_id: u64,
+        sys_rowid: u64,
+        column_id: u32,
+    },
 }
 
 /// Ordered undo log shared between the owning Transaction and the execution

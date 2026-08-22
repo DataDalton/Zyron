@@ -1979,7 +1979,8 @@ impl AnnIndex {
         let mut file = std::fs::File::create(path)?;
         let dims = self.dimensions as usize;
 
-        file.write_all(b"ZYVEC\x01")?;
+        // version 2: node ids are registry ordinals, not heap page and slot
+        file.write_all(b"ZYVEC\x02")?;
         file.write_all(&self.dimensions.to_le_bytes())?;
         file.write_all(&(storeGuard.len() as u64).to_le_bytes())?;
 
@@ -2037,7 +2038,7 @@ impl AnnIndex {
 
         let mut magic = [0u8; 6];
         file.read_exact(&mut magic)?;
-        if &magic != b"ZYVEC\x01" {
+        if &magic != b"ZYVEC\x02" {
             return Err(ZyronError::InvalidParameter {
                 name: "magic".to_string(),
                 value: "invalid HNSW file header".to_string(),

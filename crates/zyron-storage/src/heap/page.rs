@@ -6,7 +6,7 @@
 //! | Page Header (40) |
 //! +------------------+
 //! | Slot Array       |  <- Grows downward
-//! | (4 bytes/slot)   |
+//! | (16 bytes/slot)  |     offset plus the tuple header
 //! +------------------+
 //! |                  |
 //! | Free Space       |
@@ -15,10 +15,16 @@
 //! | Tuple Data       |  <- Grows upward
 //! +------------------+
 //! ```
+//!
+//! Each slot carries its tuple header rather than storing it beside the data.
+//! A scan then walks one dense array instead of following an offset into the
+//! data region for every row, and stamping xmax writes into that array too.
+//! The bytes move rather than grow: the slot gains the twelve header bytes
+//! that the data region loses.
 
 use super::constants::{DATA_START, HEAP_HEADER_OFFSET, HEAP_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::TupleId;
-use crate::tuple::{Tuple, TupleHeader, TupleView};
+use crate::tuple::{Tuple, TupleFlags, TupleHeader, TupleView};
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
@@ -42,38 +48,94 @@ impl std::fmt::Display for SlotId {
     }
 }
 
-/// A slot in the slot array pointing to tuple data.
+/// Rows ahead of the copy whose bytes are warmed. Measured against a bare
+/// copy loop over the same rows, eight is where the gain flattens
+const INSERT_PREFETCH_ROWS: usize = 8;
+
+/// Starts the loads for one row body without waiting on them.
+#[inline(always)]
+fn prefetch_row(row: &Tuple) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let data = row.data();
+        let ptr = data.as_ptr();
+        let mut at = 0usize;
+        while at < data.len() {
+            // SAFETY: at stays below the row length, and a prefetch has no
+            // architectural effect beyond warming the cache
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    ptr.add(at) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+            at += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = row;
+}
+
+/// A slot in the slot array. It points at the tuple data and carries the
+/// tuple header, so reading a row header costs no second load.
 ///
-/// Layout (4 bytes):
-/// - offset: 2 bytes (offset from page start to tuple data)
-/// - length: 2 bytes (length of tuple data including header)
+/// Layout (16 bytes):
+/// - offset: 2 bytes (offset from page start to tuple data, 0 = empty slot)
+/// - data_len: 2 bytes
+/// - flags: 2 bytes
+/// - reserved: 2 bytes
+/// - xmin: 4 bytes
+/// - xmax: 4 bytes
+///
+/// offset and data_len share the leading u32, which lets a writer publish a
+/// finished slot with one release store once the fields above it are in place
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TupleSlot {
-    /// Offset from page start to tuple data.
+    /// Offset from page start to tuple data, 0 on an empty slot.
     pub offset: u16,
-    /// Length of tuple data (0 = deleted/empty slot).
-    pub length: u16,
+    /// The tuple header, held here rather than beside the data.
+    pub header: TupleHeader,
 }
 
 impl TupleSlot {
     /// Size of a slot entry in bytes.
     pub const SIZE: usize = TUPLE_SLOT_SIZE;
 
-    /// Creates a new slot.
-    pub fn new(offset: u16, length: u16) -> Self {
-        Self { offset, length }
+    /// Byte offset of the xmax field within a slot.
+    pub(crate) const XMAX_OFFSET: usize = 12;
+
+    /// Creates a slot for a tuple whose data begins at `offset`.
+    pub fn new(offset: u16, header: TupleHeader) -> Self {
+        Self { offset, header }
+    }
+
+    /// The slot a deleted tuple leaves behind. Offset 0 lies inside the page
+    /// header, so it can never name real tuple data
+    pub fn empty() -> Self {
+        Self {
+            offset: 0,
+            header: TupleHeader::default(),
+        }
     }
 
     /// Returns true if this slot is empty/deleted.
     pub fn is_empty(&self) -> bool {
-        self.length == 0
+        self.offset == 0
+    }
+
+    /// Bytes this tuple occupies in the data region.
+    pub fn data_len(&self) -> usize {
+        self.header.data_len as usize
     }
 
     /// Serializes the slot to bytes.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..2].copy_from_slice(&self.offset.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.length.to_le_bytes());
+        buf[2..4].copy_from_slice(&self.header.data_len.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.header.flags.0.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.header.xmin.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.header.xmax.to_le_bytes());
         buf
     }
 
@@ -81,7 +143,12 @@ impl TupleSlot {
     pub fn from_bytes(buf: &[u8]) -> Self {
         Self {
             offset: u16::from_le_bytes([buf[0], buf[1]]),
-            length: u16::from_le_bytes([buf[2], buf[3]]),
+            header: TupleHeader {
+                flags: TupleFlags(u16::from_le_bytes([buf[4], buf[5]])),
+                data_len: u16::from_le_bytes([buf[2], buf[3]]),
+                xmin: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+                xmax: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            },
         }
     }
 }
@@ -262,17 +329,17 @@ impl HeapPage {
             if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
                 && !slot.is_empty()
             {
-                active_tuple_space += slot.length as usize;
+                active_tuple_space += slot.data_len();
             }
         }
         let tuple_area_size = (PAGE_SIZE as u16 - header.free_space_end) as usize;
         free + tuple_area_size.saturating_sub(active_tuple_space)
     }
 
-    /// Stamps `xmax` on a tuple in place within a page slice. The xmax field is
-    /// the last 4 bytes of the 12-byte tuple header. Returns false if the slot
-    /// is empty. Used by the delete/update path while holding the frame write
-    /// lock so the change is not lost to a concurrent append.
+    /// Stamps `xmax` on a tuple in place within a page slice. The field lives
+    /// in the tuple slot. Returns false if the slot is empty. Used by the
+    /// delete/update path while holding the frame write lock so the change is
+    /// not lost to a concurrent append.
     pub fn set_tuple_xmax_in_slice(data: &mut [u8], slot_id: SlotId, xmax: u32) -> bool {
         let header = Self::heap_header_from_slice(data);
         let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
@@ -281,7 +348,7 @@ impl HeapPage {
         if slot.is_empty() {
             return false;
         }
-        let off = slot.offset as usize + TupleHeader::SIZE - 4;
+        let off = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
         data[off..off + 4].copy_from_slice(&xmax.to_le_bytes());
         true
     }
@@ -297,7 +364,7 @@ impl HeapPage {
         if slot.is_empty() {
             return false;
         }
-        let off = slot.offset as usize + TupleHeader::SIZE - 4;
+        let off = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
         data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
         true
     }
@@ -321,11 +388,9 @@ impl HeapPage {
             if slot.is_empty() {
                 continue;
             }
-            let off = slot.offset as usize;
-            let hdr = TupleHeader::from_bytes(&data[off..off + TupleHeader::SIZE]);
-            if is_dead(hdr.xmin, hdr.xmax) {
+            if is_dead(slot.header.xmin, slot.header.xmax) {
                 // Mark the slot empty; compaction below reclaims the bytes.
-                Self::set_slot_in_slice(data, slot_id, TupleSlot::new(slot.offset, 0));
+                Self::set_slot_in_slice(data, slot_id, TupleSlot::empty());
                 pruned = true;
             }
         }
@@ -384,22 +449,20 @@ impl HeapPage {
             if slot.is_empty() {
                 continue;
             }
-            let off = slot.offset as usize;
-            let hdr = TupleHeader::from_bytes(&data[off..off + TupleHeader::SIZE]);
-            if is_dead(hdr.xmin, hdr.xmax) {
+            if is_dead(slot.header.xmin, slot.header.xmax) {
                 reclaimed += 1;
                 // Capture the row image before prune_dead_in_slice zeroes it, so
                 // its index entries can be removed against the heap-resident key.
                 if let Some(out) = dead_out.as_deref_mut() {
-                    let ds = off + TupleHeader::SIZE;
-                    let de = ds + hdr.data_len as usize;
+                    let ds = slot.offset as usize;
+                    let de = ds + slot.data_len();
                     if de <= data.len() {
                         out.push((i, data[ds..de].to_vec()));
                     }
                 }
-            } else if hdr.xmax != 0 && is_aborted(hdr.xmax) {
+            } else if slot.header.xmax != 0 && is_aborted(slot.header.xmax) {
                 // Live row whose deleter aborted: clear the stale stamp.
-                let xoff = off + TupleHeader::SIZE - 4;
+                let xoff = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
                 data[xoff..xoff + 4].copy_from_slice(&0u32.to_le_bytes());
                 modified = true;
             }
@@ -422,7 +485,7 @@ impl HeapPage {
             if let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count)
                 && !slot.is_empty()
             {
-                active.push((slot_id, slot.offset as usize, slot.length as usize));
+                active.push((slot_id, slot.offset as usize, slot.data_len()));
             }
         }
 
@@ -441,14 +504,32 @@ impl HeapPage {
             new_free_space_end -= length as u16;
             let new_offset = new_free_space_end as usize;
             data.copy_within(old_offset..old_offset + length, new_offset);
-            let new_slot = TupleSlot::new(new_free_space_end, length as u16);
-            Self::set_slot_in_slice(data, slot_id, new_slot);
+            let mut moved = Self::get_slot_from_slice(data, slot_id, header.slot_count)
+                .unwrap_or_else(TupleSlot::empty);
+            moved.offset = new_free_space_end;
+            Self::set_slot_in_slice(data, slot_id, moved);
         }
 
         // Update header
         let mut new_header = header;
         new_header.free_space_end = new_free_space_end;
         Self::set_heap_header_in_slice(data, new_header);
+    }
+
+    /// Reads slot `slot` from a page image, or None when the index is past
+    /// the slot array, the slot is empty, or its data range leaves the page.
+    /// The one decoder every reader of a raw heap page should go through
+    #[inline]
+    pub fn live_slot_in_slice(data: &[u8], slot: u16) -> Option<TupleSlot> {
+        let header = Self::heap_header_from_slice(data);
+        let slot = Self::get_slot_from_slice(data, SlotId(slot), header.slot_count)?;
+        if slot.is_empty() {
+            return None;
+        }
+        if slot.offset as usize + slot.data_len() > data.len() {
+            return None;
+        }
+        Some(slot)
     }
 
     /// Reads a slot from a slice.
@@ -494,8 +575,11 @@ impl HeapPage {
             return None;
         }
         let start = slot.offset as usize;
-        let end = start + slot.length as usize;
-        Tuple::deserialize(&data[start..end])
+        let end = start + slot.data_len();
+        if end > data.len() {
+            return None;
+        }
+        Some(Tuple::with_header(slot.header, data[start..end].to_vec()))
     }
 
     /// Zero-copy tuple read from a slice. Borrows data from the page buffer.
@@ -507,81 +591,11 @@ impl HeapPage {
             return None;
         }
         let start = slot.offset as usize;
-        let hdr = TupleHeader::from_bytes(&data[start..start + TupleHeader::SIZE]);
-        let data_end = start + TupleHeader::SIZE + hdr.data_len as usize;
-        Some(TupleView::new(
-            hdr,
-            &data[start + TupleHeader::SIZE..data_end],
-        ))
-    }
-
-    /// Inserts a tuple into a page slice.
-    ///
-    /// Returns (slot_id, free_space_after) on success.
-    pub fn insert_tuple_in_slice(data: &mut [u8], tuple: &Tuple) -> Result<(SlotId, usize)> {
-        let tuple_size = tuple.size_on_disk();
-
-        let mut header = Self::heap_header_from_slice(data);
-
-        // Check for a deleted slot we can reuse
-        let mut reuse_slot: Option<SlotId> = None;
-        for i in 0..header.slot_count {
-            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
-                && slot.is_empty()
-            {
-                reuse_slot = Some(SlotId(i));
-                break;
-            }
+        let end = start + slot.data_len();
+        if end > data.len() {
+            return None;
         }
-
-        // Calculate required space
-        let need_new_slot = reuse_slot.is_none();
-        let space_needed = if need_new_slot {
-            tuple_size + TupleSlot::SIZE
-        } else {
-            tuple_size
-        };
-
-        if header.free_space() < space_needed {
-            // Check if compaction would help
-            if Self::total_usable_space_in_slice(data) >= space_needed {
-                Self::compact_in_slice(data);
-                header = Self::heap_header_from_slice(data);
-            } else {
-                return Err(ZyronError::PageFull);
-            }
-        }
-
-        // Allocate tuple space (grows upward from end)
-        header.free_space_end -= tuple_size as u16;
-        let tuple_offset = header.free_space_end;
-
-        // Write tuple header + data directly (no Vec allocation)
-        let offset = tuple_offset as usize;
-        let hdr_bytes = tuple.header().to_bytes();
-        data[offset..offset + TupleHeader::SIZE].copy_from_slice(&hdr_bytes);
-        data[offset + TupleHeader::SIZE..offset + tuple_size].copy_from_slice(tuple.data());
-
-        // Get or create slot
-        let slot_id = if let Some(sid) = reuse_slot {
-            sid
-        } else {
-            let sid = SlotId(header.slot_count);
-            header.slot_count += 1;
-            header.free_space_start += TupleSlot::SIZE as u16;
-            sid
-        };
-
-        // Write slot
-        let slot = TupleSlot::new(tuple_offset, tuple_size as u16);
-        Self::set_slot_in_slice(data, slot_id, slot);
-
-        let free_space = header.free_space();
-
-        // Update header
-        Self::set_heap_header_in_slice(data, header);
-
-        Ok((slot_id, free_space))
+        Some(TupleView::new(slot.header, &data[start..end]))
     }
 
     /// Lock-free burst insert, one CAS reserves N slots and N tuple-byte
@@ -622,12 +636,14 @@ impl HeapPage {
             let mut n_fit: usize = 0;
             let mut tuple_bytes_total: usize = 0;
             for t in tuples {
-                let cost = t.size_on_disk() + TupleSlot::SIZE;
+                // The data region holds only row bytes now, the header rides
+                // in the slot
+                let cost = t.data().len() + TupleSlot::SIZE;
                 if free < cost {
                     break;
                 }
                 free -= cost;
-                tuple_bytes_total += t.size_on_disk();
+                tuple_bytes_total += t.data().len();
                 n_fit += 1;
             }
             if n_fit == 0 {
@@ -654,26 +670,39 @@ impl HeapPage {
                     let base_slot = hdr.slot_count;
                     let mut tuple_offset = hdr.free_space_end;
                     for (i, t) in tuples[..n_fit].iter().enumerate() {
-                        let ts = t.size_on_disk();
+                        // Warm a row further down the batch. Row bodies are
+                        // separate allocations, but the Tuple structs holding
+                        // their pointers are contiguous, so the address is
+                        // known well before the copy needs it. Reaching past
+                        // n_fit is deliberate, the rows after this page still
+                        // get inserted
+                        if let Some(ahead) = tuples.get(i + INSERT_PREFETCH_ROWS) {
+                            prefetch_row(ahead);
+                        }
+                        let data = t.data();
+                        let ts = data.len();
                         tuple_offset -= ts as u16;
                         unsafe {
-                            let tuple_dst = page_ptr.add(tuple_offset as usize);
-                            let hdr_bytes = t.header().to_bytes();
-                            std::ptr::copy_nonoverlapping(
-                                hdr_bytes.as_ptr(),
-                                tuple_dst,
-                                TupleHeader::SIZE,
-                            );
-                            let data = t.data();
                             std::ptr::copy_nonoverlapping(
                                 data.as_ptr(),
-                                tuple_dst.add(TupleHeader::SIZE),
-                                data.len(),
+                                page_ptr.add(tuple_offset as usize),
+                                ts,
                             );
 
                             let slot_id = base_slot + i as u16;
                             let slot_addr =
                                 page_ptr.add(Self::DATA_START + slot_id as usize * TupleSlot::SIZE);
+                            // Everything above the publish word first, so a
+                            // reader that sees the slot sees a whole header
+                            let th = t.header();
+                            // flags with the reserved half zeroed, then the two
+                            // transaction ids as one word
+                            (slot_addr.add(4) as *mut u32)
+                                .write_unaligned((th.flags.0 as u32).to_le());
+                            (slot_addr.add(8) as *mut u64).write_unaligned(
+                                ((th.xmin as u64) | ((th.xmax as u64) << 32)).to_le(),
+                            );
+
                             let slot_atomic = &*(slot_addr as *const AtomicU32);
                             let slot_packed = (tuple_offset as u32) | ((ts as u32) << 16);
                             slot_atomic.store(slot_packed, Ordering::Release);
@@ -690,181 +719,6 @@ impl HeapPage {
         }
     }
 
-    /// Single-tuple atomic insert, returns Err(PageFull) when the page
-    /// cannot fit the tuple
-    ///
-    /// # Safety
-    /// Same constraints as `insert_tuples_burst`
-    pub unsafe fn insert_tuple_atomic(page_ptr: *mut u8, tuple: &Tuple) -> Result<SlotId> {
-        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-        let tuple_size = tuple.size_on_disk();
-        let space_needed = tuple_size + TupleSlot::SIZE;
-
-        let header_atomic = unsafe { &*(page_ptr.add(HEAP_HEADER_OFFSET) as *const AtomicU64) };
-
-        let mut packed = header_atomic.load(Ordering::Acquire);
-        let (slot_id, tuple_offset) = loop {
-            let mut hdr = HeapPageHeader::from_u64(packed);
-            if hdr.free_space() < space_needed {
-                return Err(ZyronError::PageFull);
-            }
-            let slot_id = hdr.slot_count;
-            hdr.slot_count += 1;
-            hdr.free_space_start += TupleSlot::SIZE as u16;
-            hdr.free_space_end -= tuple_size as u16;
-            let tuple_offset = hdr.free_space_end;
-            let new_packed = hdr.to_u64();
-
-            match header_atomic.compare_exchange_weak(
-                packed,
-                new_packed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break (slot_id, tuple_offset),
-                Err(observed) => {
-                    packed = observed;
-                    std::hint::spin_loop();
-                }
-            }
-        };
-
-        // Phase 2, write tuple bytes, then commit slot entry with Release
-        unsafe {
-            let tuple_dst = page_ptr.add(tuple_offset as usize);
-            let hdr_bytes = tuple.header().to_bytes();
-            std::ptr::copy_nonoverlapping(hdr_bytes.as_ptr(), tuple_dst, TupleHeader::SIZE);
-            let data_src = tuple.data();
-            std::ptr::copy_nonoverlapping(
-                data_src.as_ptr(),
-                tuple_dst.add(TupleHeader::SIZE),
-                data_src.len(),
-            );
-
-            let slot_addr = page_ptr.add(Self::DATA_START + slot_id as usize * TupleSlot::SIZE);
-            let slot_atomic = &*(slot_addr as *const AtomicU32);
-            // Pack matches TupleSlot::to_bytes little-endian, offset in low
-            // 16 bits, length in high 16 bits
-            let slot_packed = (tuple_offset as u32) | ((tuple_size as u32) << 16);
-            slot_atomic.store(slot_packed, Ordering::Release);
-        }
-
-        Ok(SlotId(slot_id))
-    }
-
-    /// Append-only insert with caller-managed header.
-    ///
-    /// The caller maintains the HeapPageHeader as a local variable across
-    /// multiple inserts on the same page, reading it once at page init and
-    /// writing it once at page flush. Eliminates per-tuple header read/write
-    /// from the slice (saves 2 x 8-byte memcpy per tuple).
-    #[inline]
-    pub fn insert_tuple_append_with_header(
-        data: &mut [u8],
-        tuple: &Tuple,
-        header: &mut HeapPageHeader,
-    ) -> Result<SlotId> {
-        let tuple_size = tuple.size_on_disk();
-
-        let space_needed = tuple_size + TupleSlot::SIZE;
-        if header.free_space() < space_needed {
-            return Err(ZyronError::PageFull);
-        }
-
-        // Allocate tuple space (grows upward from end)
-        header.free_space_end -= tuple_size as u16;
-        let tuple_offset = header.free_space_end;
-
-        // Write tuple header + data directly
-        let offset = tuple_offset as usize;
-        let hdr_bytes = tuple.header().to_bytes();
-        data[offset..offset + TupleHeader::SIZE].copy_from_slice(&hdr_bytes);
-        data[offset + TupleHeader::SIZE..offset + tuple_size].copy_from_slice(tuple.data());
-
-        // Always create new slot (no reuse scan)
-        let slot_id = SlotId(header.slot_count);
-        header.slot_count += 1;
-        header.free_space_start += TupleSlot::SIZE as u16;
-
-        // Write slot entry to data
-        let slot = TupleSlot::new(tuple_offset, tuple_size as u16);
-        Self::set_slot_in_slice(data, slot_id, slot);
-
-        Ok(slot_id)
-    }
-
-    /// Inserts pre-serialized tuple bytes directly into a page slice.
-    ///
-    /// This avoids the serialization step for higher throughput.
-    /// Returns (slot_id, free_space_after) on success.
-    #[inline]
-    pub fn insert_tuple_bytes_in_slice(
-        data: &mut [u8],
-        tuple_bytes: &[u8],
-    ) -> Result<(SlotId, usize)> {
-        let tuple_size = tuple_bytes.len();
-
-        let mut header = Self::heap_header_from_slice(data);
-
-        // Check for a deleted slot we can reuse
-        let mut reuse_slot: Option<SlotId> = None;
-        for i in 0..header.slot_count {
-            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
-                && slot.is_empty()
-            {
-                reuse_slot = Some(SlotId(i));
-                break;
-            }
-        }
-
-        // Calculate required space
-        let need_new_slot = reuse_slot.is_none();
-        let space_needed = if need_new_slot {
-            tuple_size + TupleSlot::SIZE
-        } else {
-            tuple_size
-        };
-
-        if header.free_space() < space_needed {
-            if Self::total_usable_space_in_slice(data) >= space_needed {
-                Self::compact_in_slice(data);
-                header = Self::heap_header_from_slice(data);
-            } else {
-                return Err(ZyronError::PageFull);
-            }
-        }
-
-        // Allocate tuple space (grows upward from end)
-        header.free_space_end -= tuple_size as u16;
-        let tuple_offset = header.free_space_end;
-
-        // Write tuple data directly (no serialization needed)
-        data[tuple_offset as usize..tuple_offset as usize + tuple_size]
-            .copy_from_slice(tuple_bytes);
-
-        // Get or create slot
-        let slot_id = if let Some(sid) = reuse_slot {
-            sid
-        } else {
-            let sid = SlotId(header.slot_count);
-            header.slot_count += 1;
-            header.free_space_start += TupleSlot::SIZE as u16;
-            sid
-        };
-
-        // Write slot
-        let slot = TupleSlot::new(tuple_offset, tuple_size as u16);
-        Self::set_slot_in_slice(data, slot_id, slot);
-
-        let free_space = header.free_space();
-
-        // Update header
-        Self::set_heap_header_in_slice(data, header);
-
-        Ok((slot_id, free_space))
-    }
-
     /// Returns the raw page data.
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
         &self.data
@@ -879,12 +733,6 @@ impl HeapPage {
     fn heap_header(&self) -> HeapPageHeader {
         let offset = HeapPageHeader::OFFSET;
         HeapPageHeader::from_bytes(&self.data[offset..offset + HeapPageHeader::SIZE])
-    }
-
-    /// Writes the heap header back to the page.
-    fn set_heap_header(&mut self, header: HeapPageHeader) {
-        let offset = HeapPageHeader::OFFSET;
-        self.data[offset..offset + HeapPageHeader::SIZE].copy_from_slice(&header.to_bytes());
     }
 
     /// Returns the number of slots in the page.
@@ -921,71 +769,47 @@ impl HeapPage {
         self.data[offset..offset + TupleSlot::SIZE].copy_from_slice(&slot.to_bytes());
     }
 
-    /// Inserts a tuple into the page.
-    ///
-    /// Returns the slot ID where the tuple was inserted.
+    /// Inserts a tuple into the page, reusing a slot a delete left behind
+    /// when one exists. Returns Err(PageFull) when the page cannot hold it.
     pub fn insert_tuple(&mut self, tuple: &Tuple) -> Result<SlotId> {
-        let tuple_size = tuple.size_on_disk();
-
+        let data_len = tuple.data().len();
         let mut header = self.heap_header();
 
-        // Check for a deleted slot we can reuse
-        let mut reuse_slot: Option<SlotId> = None;
+        let mut reuse: Option<SlotId> = None;
         for i in 0..header.slot_count {
             if let Some(slot) = self.get_slot(SlotId(i))
                 && slot.is_empty()
             {
-                reuse_slot = Some(SlotId(i));
+                reuse = Some(SlotId(i));
                 break;
             }
         }
 
-        // Calculate required space
-        let need_new_slot = reuse_slot.is_none();
-        let space_needed = if need_new_slot {
-            tuple_size + TupleSlot::SIZE
-        } else {
-            tuple_size
-        };
-
-        // If not enough contiguous space, try compaction
-        if header.free_space() < space_needed {
-            // Check if compaction would help
-            if self.total_usable_space() >= space_needed {
-                self.compact();
-                header = self.heap_header();
-            } else {
+        let needed = data_len + if reuse.is_some() { 0 } else { TupleSlot::SIZE };
+        if header.free_space() < needed {
+            if Self::total_usable_space_in_slice(&*self.data) < needed {
                 return Err(ZyronError::PageFull);
             }
+            Self::compact_in_slice(&mut *self.data);
+            header = self.heap_header();
         }
 
-        // Allocate tuple space (grows upward from end)
-        header.free_space_end -= tuple_size as u16;
-        let tuple_offset = header.free_space_end;
+        header.free_space_end -= data_len as u16;
+        let offset = header.free_space_end;
+        let start = offset as usize;
+        self.data[start..start + data_len].copy_from_slice(tuple.data());
 
-        // Write tuple header + data directly (no Vec allocation)
-        let offset = tuple_offset as usize;
-        let hdr_bytes = tuple.header().to_bytes();
-        self.data[offset..offset + TupleHeader::SIZE].copy_from_slice(&hdr_bytes);
-        self.data[offset + TupleHeader::SIZE..offset + tuple_size].copy_from_slice(tuple.data());
-
-        // Get or create slot
-        let slot_id = if let Some(sid) = reuse_slot {
-            sid
-        } else {
-            let sid = SlotId(header.slot_count);
-            header.slot_count += 1;
-            header.free_space_start += TupleSlot::SIZE as u16;
-            sid
+        let slot_id = match reuse {
+            Some(sid) => sid,
+            None => {
+                let sid = SlotId(header.slot_count);
+                header.slot_count += 1;
+                header.free_space_start += TupleSlot::SIZE as u16;
+                sid
+            }
         };
-
-        // Write slot
-        let slot = TupleSlot::new(tuple_offset, tuple_size as u16);
-        self.set_slot(slot_id, slot);
-
-        // Update header
-        self.set_heap_header(header);
-
+        Self::set_heap_header_in_slice(&mut *self.data, header);
+        self.set_slot(slot_id, TupleSlot::new(offset, *tuple.header()));
         Ok(slot_id)
     }
 
@@ -998,25 +822,20 @@ impl HeapPage {
         }
 
         let start = slot.offset as usize;
-        let end = start + slot.length as usize;
-
-        Tuple::deserialize(&self.data[start..end])
+        let end = start + slot.data_len();
+        if end > self.data.len() {
+            return None;
+        }
+        Some(Tuple::with_header(
+            slot.header,
+            self.data[start..end].to_vec(),
+        ))
     }
 
     /// Zero-copy tuple read. Borrows data from this page's buffer.
     #[inline]
     pub fn get_tuple_view(&self, slot_id: SlotId) -> Option<TupleView<'_>> {
         Self::get_tuple_view_from_slice(&*self.data, slot_id)
-    }
-
-    /// Returns an iterator that yields zero-copy tuple views.
-    pub fn iter_views(&self) -> HeapPageViewIterator<'_> {
-        let header = self.heap_header();
-        HeapPageViewIterator {
-            page: self,
-            current_slot: 0,
-            slot_count: header.slot_count,
-        }
     }
 
     /// Stamps a tuple's `xmax` with the deleting transaction id, in place,
@@ -1031,8 +850,8 @@ impl HeapPage {
         if slot.is_empty() {
             return false;
         }
-        // xmax is the last 4 bytes of the 12-byte tuple header.
-        let off = slot.offset as usize + TupleHeader::SIZE - 4;
+        // xmax lives in the tuple slot
+        let off = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
         self.data[off..off + 4].copy_from_slice(&xmax.to_le_bytes());
         true
     }
@@ -1045,8 +864,7 @@ impl HeapPage {
             && !slot.is_empty()
         {
             // Mark slot as empty
-            let empty_slot = TupleSlot::new(slot.offset, 0);
-            self.set_slot(slot_id, empty_slot);
+            self.set_slot(slot_id, TupleSlot::empty());
             return true;
         }
         false
@@ -1065,23 +883,18 @@ impl HeapPage {
             )));
         }
 
-        let new_size = tuple.size_on_disk();
-        let old_size = old_slot.length as usize;
+        let new_size = tuple.data().len();
+        let old_size = old_slot.data_len();
 
         // Only allow in-place update if new tuple fits in old space
         if new_size > old_size {
             return Err(ZyronError::PageFull);
         }
 
-        // Write tuple header + data directly (no Vec allocation)
+        // The data region holds only the row bytes, the header rides in the slot
         let start = old_slot.offset as usize;
-        let hdr_bytes = tuple.header().to_bytes();
-        self.data[start..start + TupleHeader::SIZE].copy_from_slice(&hdr_bytes);
-        self.data[start + TupleHeader::SIZE..start + new_size].copy_from_slice(tuple.data());
-
-        // Update slot length (offset stays the same)
-        let new_slot = TupleSlot::new(old_slot.offset, new_size as u16);
-        self.set_slot(slot_id, new_slot);
+        self.data[start..start + new_size].copy_from_slice(tuple.data());
+        self.set_slot(slot_id, TupleSlot::new(old_slot.offset, *tuple.header()));
 
         Ok(())
     }
@@ -1123,7 +936,7 @@ impl HeapPage {
             if let Some(slot) = self.get_slot(SlotId(i))
                 && !slot.is_empty()
             {
-                active_tuple_space += slot.length as usize;
+                active_tuple_space += slot.data_len();
             }
         }
 
@@ -1170,31 +983,6 @@ impl<'a> Iterator for HeapPageIterator<'a> {
         None
     }
 }
-
-/// Zero-copy iterator over tuples in a heap page.
-/// Yields borrowed TupleView references instead of owned Tuples.
-pub struct HeapPageViewIterator<'a> {
-    page: &'a HeapPage,
-    current_slot: u16,
-    slot_count: u16,
-}
-
-impl<'a> Iterator for HeapPageViewIterator<'a> {
-    type Item = (SlotId, TupleView<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.current_slot < self.slot_count {
-            let slot_id = SlotId(self.current_slot);
-            self.current_slot += 1;
-
-            if let Some(view) = self.page.get_tuple_view(slot_id) {
-                return Some((slot_id, view));
-            }
-        }
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,20 +1003,21 @@ mod tests {
 
     #[test]
     fn test_tuple_slot_roundtrip() {
-        let slot = TupleSlot::new(100, 50);
+        let slot = TupleSlot::new(100, TupleHeader::new(50, 7));
         let bytes = slot.to_bytes();
         let recovered = TupleSlot::from_bytes(&bytes);
 
         assert_eq!(recovered.offset, 100);
-        assert_eq!(recovered.length, 50);
+        assert_eq!(recovered.header.data_len, 50);
+        assert_eq!(recovered.header.xmin, 7);
     }
 
     #[test]
     fn test_tuple_slot_empty() {
-        let empty = TupleSlot::new(100, 0);
+        let empty = TupleSlot::empty();
         assert!(empty.is_empty());
 
-        let valid = TupleSlot::new(100, 50);
+        let valid = TupleSlot::new(100, TupleHeader::new(50, 1));
         assert!(!valid.is_empty());
     }
 

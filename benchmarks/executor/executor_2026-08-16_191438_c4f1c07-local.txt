@@ -1,0 +1,31 @@
+# suite:   executor
+# run:     2026-08-16_191438_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Hash Join Performance Test ===
+Left rows: 500000, Right rows: 50000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Join: 81,353,726 rows/sec (6.7606ms), 50000 output rows
+
+--- Run 2/5 ---
+  Join: 82,244,220 rows/sec (6.6874ms), 50000 output rows
+
+--- Run 3/5 ---
+  Join: 85,764,631 rows/sec (6.4129ms), 50000 output rows
+
+--- Run 4/5 ---
+  Join: 86,427,707 rows/sec (6.3637ms), 50000 output rows
+
+--- Run 5/5 ---
+  Join: 84,038,750 rows/sec (6.5446ms), 50000 output rows
+
+=== Hash Join Validation Results ===
+  Join throughput (rows/sec) [FAIL/OK]:
+    Runs: [81,353,726, 82,244,220, 85,764,631, 86,427,707, 84,038,750]
+    Average: 83,965,807 >= 100,000,000 (target)
+    Min/Max: 81,353,726 / 86,427,707, StdDev: 1,953,912

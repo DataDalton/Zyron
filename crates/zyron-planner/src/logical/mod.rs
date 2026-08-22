@@ -43,13 +43,14 @@ pub struct LogicalColumn {
     pub column_id: ColumnId,
     pub name: String,
     /// Logical type. For a TIMESTAMP(p)/TIMESTAMPTZ(p) column this stays the
-    /// logical timestamp type; ts_precision records p so the executor can
+    /// logical timestamp type; fractional_digits records p so the executor can
     /// pick the i128 picosecond physical buffer for p>6 while keeping the
     /// logical identity for compare/cast/presentation.
     pub type_id: TypeId,
     pub nullable: bool,
-    /// Fractional-second precision for timestamp columns (None otherwise).
-    pub ts_precision: Option<u8>,
+    /// Digits after the decimal point: fractional seconds for a TIMESTAMP(p),
+    /// scale for a DECIMAL(p,s), None for every other type.
+    pub fractional_digits: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +152,21 @@ pub enum LogicalPlan {
 
     /// Distinct elimination.
     Distinct { child: Arc<LogicalPlan> },
+
+    /// Row locking for SELECT ... FOR UPDATE/SHARE. Sits directly above the
+    /// locked table's row-producing subtree, below Project, so every row it
+    /// sees still carries a storage locator.
+    LockRows {
+        table_id: TableId,
+        mode: crate::binder::RowLockMode,
+        wait: crate::binder::RowLockWait,
+        /// LIMIT plus OFFSET when both are literal. The nodes between this
+        /// one and the Limit preserve row count, so locking stops once this
+        /// many rows are emitted. Keeps FOR UPDATE SKIP LOCKED LIMIT n
+        /// locking exactly n rows instead of a whole batch
+        cap: Option<u64>,
+        child: Arc<LogicalPlan>,
+    },
 
     /// Set operations (UNION, INTERSECT, EXCEPT).
     SetOp {
@@ -285,7 +301,7 @@ impl LogicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: expr.ts_precision(),
+                        fractional_digits: expr.fractional_digits(),
                     }
                 })
                 .collect(),
@@ -312,7 +328,7 @@ impl LogicalPlan {
                         name: col.name.clone(),
                         type_id: col.type_id,
                         nullable: col.nullable || force_nullable,
-                        ts_precision: col.ts_precision,
+                        fractional_digits: col.fractional_digits,
                     });
                 }
                 schema
@@ -330,19 +346,26 @@ impl LogicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: expr.ts_precision(),
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
                     let idx = group_by.len() + i;
+                    // A decimal aggregate keeps its argument's scale, so
+                    // the output column compares and renders the value
+                    // rather than the raw scaled integer
+                    let fractional_digits = if agg.return_type == zyron_common::TypeId::Decimal {
+                        agg.args.first().and_then(|a| a.fractional_digits())
+                    } else {
+                        None
+                    };
                     schema.push(LogicalColumn {
                         table_idx: None,
                         column_id: ColumnId(idx as u16),
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,
                         nullable: true,
-                        // Aggregate-result precision finalized in B5.
-                        ts_precision: None,
+                        fractional_digits,
                     });
                 }
                 schema
@@ -350,6 +373,7 @@ impl LogicalPlan {
             LogicalPlan::Sort { child, .. } => child.output_schema(),
             LogicalPlan::Limit { child, .. } => child.output_schema(),
             LogicalPlan::Distinct { child } => child.output_schema(),
+            LogicalPlan::LockRows { child, .. } => child.output_schema(),
             LogicalPlan::SetOp { left, .. } => left.output_schema(),
             LogicalPlan::Insert { .. } => Vec::new(),
             LogicalPlan::Values { schema, .. } => schema.clone(),
@@ -373,6 +397,7 @@ impl LogicalPlan {
             | LogicalPlan::Sort { child, .. }
             | LogicalPlan::Limit { child, .. }
             | LogicalPlan::Distinct { child }
+            | LogicalPlan::LockRows { child, .. }
             | LogicalPlan::Insert { source: child, .. }
             | LogicalPlan::Update { child, .. }
             | LogicalPlan::Delete { child, .. } => vec![child],
@@ -403,7 +428,7 @@ mod tests {
                     name: "id".to_string(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                 },
                 LogicalColumn {
                     table_idx: Some(0),
@@ -411,7 +436,7 @@ mod tests {
                     name: "name".to_string(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                 },
             ],
             alias: "users".to_string(),
@@ -435,7 +460,7 @@ mod tests {
                 name: "id".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }],
             alias: "t".to_string(),
             encoding_hints: None,
@@ -464,7 +489,7 @@ mod tests {
                 name: "a".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }],
             alias: "l".to_string(),
             encoding_hints: None,
@@ -479,7 +504,7 @@ mod tests {
                 name: "b".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }],
             alias: "r".to_string(),
             encoding_hints: None,

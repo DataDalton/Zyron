@@ -68,6 +68,18 @@ pub enum Predicate<'a> {
     /// Match rows equal to the given value.
     Equality(&'a [u8]),
     /// Match rows within [low, high]. None means unbounded on that side.
+    ///
+    /// Bounds are cell bytes compared in the column's stored order, which
+    /// `range_admits` defines: little endian numeric for a fixed-width
+    /// cell, lexicographic for a variable-length one. Every encoding that
+    /// resolves a range from its own compact form goes through that, so
+    /// two segments of one column answer alike whatever encoding each
+    /// picked.
+    ///
+    /// A float column is the exception and must not be pushed one. Its
+    /// stored bytes put negatives above positives and reverse their order,
+    /// so byte order is not value order and ALP answers in float order
+    /// while an unencoded segment of the same column would not.
     Range {
         low: Option<&'a [u8]>,
         high: Option<&'a [u8]>,
@@ -105,6 +117,76 @@ pub trait Encoding: Send + Sync {
         let decoded = self.decode(encoded, row_count, value_size)?;
         eval_predicate_on_raw(&decoded, row_count, value_size, predicate)
     }
+
+    /// Decodes rows `start..end` in the same layout `decode` produces for a
+    /// column of `end - start` rows.
+    ///
+    /// A point read wants a handful of rows out of a segment holding
+    /// millions, and decoding the segment to reach them costs the whole
+    /// column. An encoding that can address a row without replaying the
+    /// ones before it overrides this and pays for the range alone.
+    ///
+    /// The default is correct for every encoding and cheaper for none: it
+    /// decodes the segment and takes the range out of the result, which is
+    /// what a caller would otherwise have written itself
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let decoded = self.decode(encoded, row_count, value_size)?;
+        slice_decoded(&decoded, row_count, value_size, start, end)
+    }
+}
+
+/// Takes rows `start..end` out of a fully decoded column, in the layout the
+/// decode produced.
+///
+/// Fixed-width rows are a byte range. Variable-length rows are repacked
+/// into their own canonical buffer, because the offsets in the original are
+/// relative to a blob the range does not carry
+pub fn slice_decoded(
+    decoded: &[u8],
+    row_count: usize,
+    value_size: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
+    let (start, end) = clamp_range(row_count, start, end);
+    // Every encoding's `decode` answers a zero-row column with no bytes at
+    // all rather than an empty canonical buffer, so an empty range does the
+    // same and the two stay interchangeable
+    if start == end {
+        return Ok(Vec::new());
+    }
+    if value_size > 0 {
+        let from = start * value_size;
+        let to = end * value_size;
+        if to > decoded.len() {
+            return Err(ZyronError::DecodingFailed(format!(
+                "decoded column of {} bytes cannot supply rows {}..{} at {} bytes each",
+                decoded.len(),
+                start,
+                end,
+                value_size
+            )));
+        }
+        return Ok(decoded[from..to].to_vec());
+    }
+    let rows = varlen_slice_rows(decoded, row_count)?;
+    let taken: Vec<Option<&[u8]>> = rows[start..end].iter().map(|r| Some(*r)).collect();
+    Ok(varlen_pack(&taken))
+}
+
+/// Clamps a requested row range to what the column holds, so a caller
+/// asking past the end gets the rows that exist rather than an error
+pub fn clamp_range(row_count: usize, start: usize, end: usize) -> (usize, usize) {
+    let start = start.min(row_count);
+    let end = end.clamp(start, row_count);
+    (start, end)
 }
 
 /// Canonical variable-length column buffer, used when `value_size == 0`:
@@ -197,6 +279,84 @@ pub fn slice_rows(data: &[u8], row_count: usize, value_size: usize) -> Result<Ve
     Ok(rows)
 }
 
+/// Orders two cells of one column the way that column stores them.
+///
+/// A fixed-width cell holds a little endian value, so its last byte is the
+/// most significant and a plain slice comparison would rank 256 below 255.
+/// A variable-length cell is compared lexicographically, which is already
+/// its value order. Bytes past the shorter operand read as zero, so a
+/// bound narrower than the cell still compares.
+#[inline]
+pub fn compare_cell_bytes(a: &[u8], b: &[u8], value_size: usize) -> std::cmp::Ordering {
+    if value_size == 0 {
+        return a.cmp(b);
+    }
+    let byte = |s: &[u8], i: usize| -> u8 { s.get(i).copied().unwrap_or(0) };
+    for i in (0..value_size.max(a.len()).max(b.len())).rev() {
+        match byte(a, i).cmp(&byte(b, i)) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Whether one cell falls inside a Range under the column's stored order.
+///
+/// Every encoding that resolves a range from its own compact form calls
+/// this instead of comparing bytes itself. Two segments of one column
+/// choose their encodings independently, so a range that meant
+/// lexicographic order in a run length segment and numeric order in a
+/// bit-packed one would return different rows for the same query.
+#[inline]
+pub fn range_admits(
+    cell: &[u8],
+    value_size: usize,
+    low: Option<&[u8]>,
+    high: Option<&[u8]>,
+) -> bool {
+    low.is_none_or(|lo| compare_cell_bytes(cell, lo, value_size) != std::cmp::Ordering::Less)
+        && high.is_none_or(|hi| {
+            compare_cell_bytes(cell, hi, value_size) != std::cmp::Ordering::Greater
+        })
+}
+
+/// Builds one row bitmask from a per-row answer, folding eight answers into
+/// a byte before storing it.
+///
+/// Setting the mask a bit at a time reads and writes the same byte on eight
+/// consecutive rows, which serializes those rows on that byte and pays a
+/// bounds check each time. Eight answers folded in a register leave one
+/// store per eight rows, and the eight `admits` calls have no dependency on
+/// each other so they pipeline. Every encoding that resolves a predicate
+/// row by row builds its mask through here.
+///
+/// `admits` is called exactly once for every row, in ascending row order, so
+/// an encoding whose rows are addressed by walking forward (a stored length
+/// per row, for one) can carry its cursor in the closure
+#[inline]
+pub fn bitmask_from_rows<F: FnMut(usize) -> bool>(row_count: usize, mut admits: F) -> Vec<u8> {
+    let mut bitmask = vec![0u8; row_count.div_ceil(8)];
+    let full = row_count / 8;
+    for (byte_index, slot) in bitmask.iter_mut().enumerate().take(full) {
+        let base = byte_index * 8;
+        let mut bits = 0u8;
+        for lane in 0..8usize {
+            bits |= (admits(base + lane) as u8) << lane;
+        }
+        *slot = bits;
+    }
+    let tail = full * 8;
+    if tail < row_count {
+        let mut bits = 0u8;
+        for row in tail..row_count {
+            bits |= (admits(row) as u8) << (row - tail);
+        }
+        bitmask[full] = bits;
+    }
+    bitmask
+}
+
 /// Evaluates a predicate on raw (decoded) column data, producing a packed bitmask.
 pub fn eval_predicate_on_raw(
     data: &[u8],
@@ -205,122 +365,103 @@ pub fn eval_predicate_on_raw(
     predicate: &Predicate,
 ) -> Result<Vec<u8>> {
     if value_size == 0 {
-        // Variable-length: lexicographic comparison over the canonical buffer.
+        // Slicing either reaches every row the count claims or fails, so the
+        // row a mask bit stands for is always there to compare
         let rows = varlen_slice_rows(data, row_count)?;
-        let bitmask_len = row_count.div_ceil(8);
-        let mut bitmask = vec![0u8; bitmask_len];
-        for (i, value) in rows.iter().enumerate() {
-            let matches = match predicate {
-                Predicate::Equality(target) => value == target,
-                Predicate::Range { low, high } => {
-                    let above_low = low.map_or(true, |lo| *value >= lo);
-                    let below_high = high.map_or(true, |hi| *value <= hi);
-                    above_low && below_high
-                }
-                Predicate::In(values) => values.iter().any(|t| value == t),
-            };
-            if matches {
-                bitmask[i / 8] |= 1 << (i % 8);
-            }
-        }
-        return Ok(bitmask);
-    }
-    let bitmask_len = row_count.div_ceil(8);
-    let mut bitmask = vec![0u8; bitmask_len];
-
-    // For integer-sized values (1-8 bytes), use numeric u64 comparison
-    // instead of lexicographic byte comparison. LE-encoded integers are
-    // not sorted by their byte representation at byte boundaries
-    // (e.g., 256 = [0,1,0,0] is lexicographically less than 255 = [255,0,0,0]).
-    if value_size <= 8
-        && let Predicate::Range { low, high } = predicate
-    {
-        let lo_val = match low {
-            Some(lo) => read_as_u64(lo, value_size),
-            None => 0,
-        };
-        let hi_val = match high {
-            Some(hi) => read_as_u64(hi, value_size),
-            None => u64::MAX,
-        };
-
-        for i in 0..row_count {
-            let start = i * value_size;
-            let end = start + value_size;
-            if end > data.len() {
-                return Err(ZyronError::DecodingFailed(
-                    "data shorter than expected row count".to_string(),
-                ));
-            }
-            let v = read_as_u64(&data[start..end], value_size);
-            if v >= lo_val && v <= hi_val {
-                bitmask[i / 8] |= 1 << (i % 8);
-            }
-        }
-
-        return Ok(bitmask);
-    }
-
-    for i in 0..row_count {
-        let start = i * value_size;
-        let end = start + value_size;
-        if end > data.len() {
-            return Err(ZyronError::DecodingFailed(
-                "data shorter than expected row count".to_string(),
-            ));
-        }
-        let value = &data[start..end];
-
-        let matches = match predicate {
-            Predicate::Equality(target) => value == *target,
+        return Ok(match predicate {
+            Predicate::Equality(target) => bitmask_from_rows(row_count, |i| rows[i] == *target),
             Predicate::Range { low, high } => {
-                let above_low = match low {
-                    Some(lo) => value >= *lo,
-                    None => true,
-                };
-                let below_high = match high {
-                    Some(hi) => value <= *hi,
-                    None => true,
-                };
-                above_low && below_high
+                bitmask_from_rows(row_count, |i| range_admits(rows[i], 0, *low, *high))
             }
-            Predicate::In(values) => values.contains(&value),
-        };
-
-        if matches {
-            bitmask[i / 8] |= 1 << (i % 8);
-        }
+            Predicate::In(values) => {
+                bitmask_from_rows(row_count, |i| values.iter().any(|t| rows[i] == *t))
+            }
+        });
     }
+    // The widest row this reads is the last one, so the one check that
+    // decides every row is made once rather than per row
+    if row_count * value_size > data.len() {
+        return Err(ZyronError::DecodingFailed(
+            "data shorter than expected row count".to_string(),
+        ));
+    }
+    let row = |i: usize| &data[i * value_size..(i + 1) * value_size];
 
-    Ok(bitmask)
+    Ok(match predicate {
+        Predicate::Equality(target) => bitmask_from_rows(row_count, |i| row(i) == *target),
+        Predicate::Range { low, high } => {
+            bitmask_from_rows(row_count, |i| range_admits(row(i), value_size, *low, *high))
+        }
+        Predicate::In(values) => bitmask_from_rows(row_count, |i| values.contains(&row(i))),
+    })
 }
 
-/// Reads up to 8 bytes from a slice as a u64 (little-endian).
-#[inline(always)]
-fn read_as_u64(bytes: &[u8], value_size: usize) -> u64 {
-    let mut buf = [0u8; 8];
-    let len = bytes.len().min(value_size).min(8);
-    buf[..len].copy_from_slice(&bytes[..len]);
-    u64::from_le_bytes(buf)
-}
+/// Cardinality at or above which a dictionary is never chosen, whatever the
+/// row count. Both selection paths test `cardinality < 65536`, so this is
+/// that constant named once
+const DICTIONARY_MAX_CARDINALITY: usize = 65536;
 
 /// Statistics computed from a column sample for encoding selection.
-struct ColumnSampleStats {
-    cardinality: usize,
-    run_count: usize,
-    all_identical: bool,
+///
+/// A caller that already walks every cell, which a segment build does to
+/// pack its buffer and bound its zones, gathers these on that walk and
+/// hands them to [`select_encoding_prepared`] rather than making selection
+/// walk the column a second time to rebuild them
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnSampleStats {
+    /// Distinct values, saturating at the point the exact count stops
+    /// changing any decision. Every consumer tests it as an upper bound, so
+    /// a saturated value reads as "more than the ceiling" and compares the
+    /// same way the true count would
+    pub cardinality: usize,
+    /// Adjacent non-null values that differ, plus one. An all-null column
+    /// counts as one run
+    pub run_count: usize,
+    /// Whether the column is one repeated value, which is all-null or a
+    /// single distinct value with no nulls at all
+    pub all_identical: bool,
+}
+
+/// Distinct values a caller has to count before both decisions that read
+/// the count are settled.
+///
+/// Cardinality decides exactly two things, whether the column is one
+/// repeated value and whether it is sparse enough for a dictionary, and
+/// past this the answer to both is already fixed whatever the true count
+/// turns out to be. Two is the floor, because `all_identical` still has to
+/// tell one distinct value from more than one
+pub fn cardinality_cap(row_count: usize) -> usize {
+    DICTIONARY_MAX_CARDINALITY.min(row_count / 2).max(2)
 }
 
 /// Computes sample statistics from a set of values.
 /// Each value is Option<&[u8]> where None represents null.
+///
+/// The distinct set stops growing once the count can no longer change an
+/// answer. Cardinality decides exactly two things here, whether the column
+/// is one repeated value and whether it is sparse enough for a dictionary,
+/// and past `min(DICTIONARY_MAX_CARDINALITY, rows / 2)` both are already
+/// settled. Without the cap a column builds a hash set with one entry per
+/// distinct value purely to choose an encoding, so a million row column
+/// allocated a million entry set to conclude it would not be dictionary
+/// encoded. Selection cost and memory now stay flat in the row count.
+///
+/// Runs are counted from a comparison against the previous value rather than
+/// from the set, so `run_count` stays exact after the set saturates
 fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
+    let cap = cardinality_cap(sample.len());
     let mut distinct = hashbrown::HashSet::new();
+    let mut saturated = false;
     let mut run_count = 1usize;
     let mut prev_value: Option<&[u8]> = None;
+    let mut null_count = 0usize;
 
     for val in sample {
         if let Some(v) = val {
-            distinct.insert(*v);
+            if !saturated {
+                distinct.insert(*v);
+                saturated = distinct.len() > cap;
+            }
 
             if let Some(prev) = prev_value {
                 if *v != prev {
@@ -328,13 +469,23 @@ fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
                 }
             }
             prev_value = Some(*v);
+        } else {
+            null_count += 1;
         }
     }
+
+    // Constant encoding stores the raw buffer's single repeated cell, and a
+    // NULL occupies a placeholder cell (zero-filled fixed cell or zero-length
+    // row) that differs from any non-null value. So a column is
+    // all-identical only when it is all null (every placeholder identical)
+    // or has exactly one distinct value and no nulls at all
+    let all_identical =
+        !saturated && (distinct.is_empty() || (distinct.len() == 1 && null_count == 0));
 
     ColumnSampleStats {
         cardinality: distinct.len(),
         run_count,
-        all_identical: distinct.len() <= 1,
+        all_identical,
     }
 }
 
@@ -355,65 +506,372 @@ fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
 /// 7. FSST - string types (symbol table encoding)
 /// 8. Unencoded - fallback
 pub fn select_encoding(type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingType {
+    select_encoding_bounded(type_id, sample, TRIAL_ENCODE_ROWS)
+}
+
+/// The encoding a column will use, and the bytes selection already produced.
+pub struct EncodingChoice {
+    pub encoding: EncodingType,
+    /// Output of the trial encode, present only when the trial covered every
+    /// row and its candidate is the encoding that was chosen.
+    ///
+    /// A caller holding this must not encode again. These are the bytes a
+    /// second encode would produce, from the same buffer through the same
+    /// encoder, so re-encoding would spend a full pass to arrive back here
+    pub encoded: Option<Vec<u8>>,
+}
+
+/// Chooses an encoding for a fixed-width column the caller has already
+/// packed into `raw_data`.
+///
+/// Selection cannot know whether its candidate beats storing the column raw
+/// without encoding it, and under `exact` that trial is a full encode of
+/// every row. The previous form built its own copy of the packed buffer,
+/// encoded into it, compared the size and then discarded both, leaving the
+/// caller to pack and encode the same column a second time. Passing the
+/// buffer in and the result back means a column is packed once and encoded
+/// once.
+///
+/// `exact` trials every row, which is what a caller holding the whole
+/// column wants: the candidate is then chosen exactly when it wins over the
+/// data the decoder will actually face. Otherwise the trial is a bounded
+/// prefix and no output is returned, because a prefix's bytes are not the
+/// column's bytes
+pub fn select_encoding_packed(
+    type_id: TypeId,
+    sample: &[Option<&[u8]>],
+    raw_data: &[u8],
+    value_size: usize,
+    exact: bool,
+) -> EncodingChoice {
+    let trial_rows = if exact { usize::MAX } else { TRIAL_ENCODE_ROWS };
+    select_encoding_inner(type_id, sample, Some((raw_data, value_size)), trial_rows)
+}
+
+/// Selects a fixed-width column's encoding with the trial encode run over
+/// every row rather than a bounded prefix.
+///
+/// The statistical heuristics already read the whole column, only the
+/// candidate-versus-raw trial is sampled in `select_encoding`. A caller that
+/// already holds the full column, such as the lake writer, gets the decision
+/// the decoder will actually face: the candidate is chosen exactly when it is
+/// smaller over every row, so an unrepresentative prefix can no longer pick
+/// an encoding that loses on the rest of the column.
+pub fn select_encoding_exact(type_id: TypeId, values: &[Option<&[u8]>]) -> EncodingType {
+    select_encoding_bounded(type_id, values, usize::MAX)
+}
+
+/// Buffers a finished decode hands back, so the next one writes into memory
+/// this thread already holds.
+///
+/// A decoded column is the widest allocation on the scan path, and taking it
+/// fresh every  time measured a tenth of a microsecond at the median and eighteen
+/// at the ninetieth percentile: the operating system takes the pages back
+/// when the buffer is dropped and faults them in again on the next write,
+/// which costs more than the decode it serves. Reused, the same buffer never
+/// measured above a tenth of a microsecond
+mod scratch {
+    use std::cell::RefCell;
+
+    /// Buffers held per thread. A scan decodes one column at a time and a
+    /// predicate pass holds a second, so two covers the depth actually in
+    /// flight and anything past it is returned to the allocator
+    const POOL_DEPTH: usize = 2;
+
+    /// Largest buffer worth holding.
+    ///
+    /// Kept small deliberately. What this pool is for is the buffer a scan
+    /// decodes into over and over, which is a column of a file and not a
+    /// column of a table. Holding megabyte buffers instead measured worse
+    /// across the board: memory the allocator would have returned stays out
+    /// of circulation for the whole process, and every later allocation
+    /// pays for it, including work that decodes nothing at all
+    const POOL_BYTES_MAX: usize = 256 << 10;
+
+    /// Smallest buffer worth routing through the pool.
+    ///
+    /// A short decode asks the allocator for a block from its fast size
+    /// class and gets it back just as quickly, and taking that path costs
+    /// less than a thread local lookup, a borrow and a search. Measured on a
+    /// unique check, which decodes a small range per key, pooling every
+    /// buffer regardless of size doubled the pass. What actually needed
+    /// recycling is the full column a scan decodes over and over, which is
+    /// far above this
+    const POOL_BYTES_MIN: usize = 64 << 10;
+
+    thread_local! {
+        static POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A held buffer that already has room for `len` bytes, or None.
+    ///
+    /// Only a buffer that fits is taken. Growing one that does not would
+    /// reallocate, which is the cost this pool exists to avoid, and would
+    /// spend a held buffer to do it
+    fn take_fitting(len: usize) -> Option<Vec<u8>> {
+        if len < POOL_BYTES_MIN {
+            return None;
+        }
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            // The smallest buffer that fits, so a short decode does not
+            // take the one a long decode is about to want. Any fit will do:
+            // the buffer is handed out uninitialised and the decode writes
+            // every byte of it, so reuse costs nothing beyond the search
+            let at = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, buf)| buf.capacity() >= len)
+                .min_by_key(|(_, buf)| buf.capacity())
+                .map(|(at, _)| at)?;
+            Some(pool.swap_remove(at))
+        })
+    }
+
+    /// A buffer of `len` bytes whose contents are undefined.
+    ///
+    /// # Safety
+    /// The caller writes every one of the `len` bytes before any read
+    pub unsafe fn take_uninit(len: usize) -> Vec<u8> {
+        match take_fitting(len) {
+            Some(mut buf) => {
+                buf.clear();
+                // SAFETY: the buffer was chosen for holding `len` bytes, and
+                // the caller's contract is to write every one before reading
+                unsafe { buf.set_len(len) };
+                buf
+            }
+            None => {
+                let mut buf = Vec::with_capacity(len);
+                // SAFETY: as above, over the capacity just reserved
+                unsafe { buf.set_len(len) };
+                buf
+            }
+        }
+    }
+
+    /// Offers a finished buffer back. Dropped rather than held when the pool
+    /// is full or the buffer is larger than one worth keeping
+    #[inline]
+    pub fn give_back(buf: Vec<u8>) {
+        if buf.capacity() < POOL_BYTES_MIN || buf.capacity() > POOL_BYTES_MAX {
+            return;
+        }
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < POOL_DEPTH {
+                pool.push(buf);
+            }
+        });
+    }
+}
+
+/// Hands a decoded column's buffer back for the next decode on this thread.
+///
+/// A caller that owns a buffer [`Encoding::decode`] produced offers it here
+/// when it is finished with it. Anything else is dropped as normal
+#[inline]
+pub fn recycle_decode_buffer(buf: Vec<u8>) {
+    scratch::give_back(buf);
+}
+
+/// Rows the trial encode compares when the caller does not ask for exact
+/// selection. Bounded so a wide column does not encode twice in full.
+const TRIAL_ENCODE_ROWS: usize = 1024;
+
+fn select_encoding_bounded(
+    type_id: TypeId,
+    sample: &[Option<&[u8]>],
+    trial_rows: usize,
+) -> EncodingType {
+    select_encoding_inner(type_id, sample, None, trial_rows).encoding
+}
+
+/// The encoding the statistics settle on their own, or None when the choice
+/// needs the trial that compares a candidate against storing the column raw.
+///
+/// Dictionary and RLE take priority over the type's own candidate because
+/// both support predicate pushdown on encoded data, which is worth their
+/// structural overhead
+fn encoding_from_stats(
+    type_id: TypeId,
+    row_count: usize,
+    stats: ColumnSampleStats,
+) -> Option<EncodingType> {
+    // All values identical (including all-null): constant encoding is
+    // always optimal
+    if stats.all_identical {
+        return Some(EncodingType::Constant);
+    }
+    // Booleans: bit-pack to 1-bit is always the best choice
+    if type_id == TypeId::Boolean {
+        return Some(EncodingType::BitPack);
+    }
+    if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
+        return Some(EncodingType::Dictionary);
+    }
+    if stats.run_count < row_count / 10 {
+        return Some(EncodingType::Rle);
+    }
+    None
+}
+
+/// The encoding a trial compares against storing the column raw, or None
+/// for a type with no encoder to try.
+///
+/// Temporal and HLC types are integer-backed fixed-width values (Date i32,
+/// Time/Timestamp/TimestampTz/Interval i64, ps Timestamp/HLC i128), so they
+/// ride the FastLanes FoR+delta/delta-of-delta/const-step path exactly like
+/// the integer types. `ColumnSegment::build` is handed the logical type id,
+/// which for a ps column is Timestamp rather than Int128, so keying only on
+/// `is_integer()` here would fold every timestamp column Unencoded and the
+/// "ps at us-class density" property would never hold. The trial still falls
+/// back to Unencoded when FastLanes is not actually smaller
+fn trial_candidate(type_id: TypeId) -> Option<EncodingType> {
+    if type_id.is_integer() || type_id.is_temporal() || type_id == TypeId::Hlc {
+        Some(EncodingType::FastLanes)
+    } else if type_id.is_floating_point() {
+        Some(EncodingType::Alp)
+    } else if type_id.is_string() {
+        Some(EncodingType::Fsst)
+    } else {
+        None
+    }
+}
+
+/// Chooses an encoding for a fixed-width column the caller has already
+/// packed and already gathered statistics over.
+///
+/// A segment build walks every cell to pack its buffer, bound its zones and
+/// count its nulls, and the statistics selection reads come off that same
+/// walk. Handing them in is what keeps the column to one pass: the previous
+/// form recomputed them from the cells, which meant a second traversal of
+/// every value and a second saturating distinct set built from the same
+/// data the first one saw.
+///
+/// The trial covers every row, so its output is the column's own bytes and
+/// is handed back for the caller to keep rather than encoded again
+pub fn select_encoding_prepared(
+    type_id: TypeId,
+    row_count: usize,
+    stats: ColumnSampleStats,
+    raw_data: &[u8],
+    value_size: usize,
+    exact: bool,
+) -> EncodingChoice {
+    let plain = |encoding| EncodingChoice {
+        encoding,
+        encoded: None,
+    };
+    if row_count == 0 {
+        return plain(EncodingType::Unencoded);
+    }
+    if let Some(decided) = encoding_from_stats(type_id, row_count, stats) {
+        return plain(decided);
+    }
+    let Some(candidate) = trial_candidate(type_id) else {
+        return plain(EncodingType::Unencoded);
+    };
+    if value_size == 0 {
+        return plain(candidate);
+    }
+    let trial_rows = if exact {
+        row_count
+    } else {
+        TRIAL_ENCODE_ROWS.min(row_count)
+    };
+    let span = trial_rows * value_size;
+    if raw_data.len() < span {
+        return plain(EncodingType::Unencoded);
+    }
+    let raw = &raw_data[..span];
+    match create_encoding(candidate).encode(raw, trial_rows, value_size) {
+        Ok(encoded) if encoded.len() < raw.len() => EncodingChoice {
+            encoding: candidate,
+            // Reusable only when the trial encoded the whole column. A
+            // prefix's output describes a prefix and would truncate the
+            // column if a caller wrote it out
+            encoded: (trial_rows == row_count).then_some(encoded),
+        },
+        _ => plain(EncodingType::Unencoded),
+    }
+}
+
+/// Shared selection. `packed` is the caller's already-built raw buffer and
+/// the fixed value width it was built at, or None when selection has to
+/// build its own to trial with
+fn select_encoding_inner(
+    type_id: TypeId,
+    sample: &[Option<&[u8]>],
+    packed: Option<(&[u8], usize)>,
+    trial_rows: usize,
+) -> EncodingChoice {
+    let plain = |encoding| EncodingChoice {
+        encoding,
+        encoded: None,
+    };
     if sample.is_empty() {
-        return EncodingType::Unencoded;
+        return plain(EncodingType::Unencoded);
     }
 
     let stats = compute_sample_stats(sample);
     let row_count = sample.len();
 
-    // All values identical (including all-null): constant encoding is always optimal
-    if stats.all_identical {
-        return EncodingType::Constant;
+    if let Some(decided) = encoding_from_stats(type_id, row_count, stats) {
+        return plain(decided);
     }
 
-    // Booleans: bit-pack to 1-bit is always the best choice
-    if type_id == TypeId::Boolean {
-        return EncodingType::BitPack;
-    }
-
-    // Statistical heuristics: Dictionary and RLE are chosen based on
-    // data characteristics and take priority. They support predicate
-    // pushdown on encoded data, which is worth structural overhead.
-    if stats.cardinality < 65536 && stats.cardinality < row_count / 2 {
-        return EncodingType::Dictionary;
-    }
-
-    if stats.run_count < row_count / 10 {
-        return EncodingType::Rle;
-    }
-
-    // Type-specific candidate and Unencoded fallback for trial-encode.
-    // Temporal and HLC types are integer-backed fixed-width values (Date i32,
-    // Time/Timestamp/TimestampTz/Interval i64, ps Timestamp/HLC i128), so they
-    // ride the FastLanes FoR+delta/delta-of-delta/const-step path exactly like
-    // the integer types. ColumnSegment::build is handed the logical type id,
-    // which for a ps column is Timestamp (not Int128), so keying only on
-    // is_integer() here would fold every timestamp column Unencoded and the
-    // "ps at us-class density" property would never hold. Trial-encode still
-    // falls back to Unencoded when FastLanes is not actually smaller.
-    let typeCandidate = if type_id.is_integer() || type_id.is_temporal() || type_id == TypeId::Hlc {
-        EncodingType::FastLanes
-    } else if type_id.is_floating_point() {
-        EncodingType::Alp
-    } else if type_id.is_string() {
-        EncodingType::Fsst
-    } else {
-        return EncodingType::Unencoded;
+    let Some(typeCandidate) = trial_candidate(type_id) else {
+        return plain(EncodingType::Unencoded);
     };
 
     // Trial-encode: compare type-specific encoding against Unencoded
     // to verify it produces a smaller output.
-    let valueSize = sample.iter().find_map(|v| v.map(|b| b.len())).unwrap_or(0);
+    let valueSize = match packed {
+        Some((_, width)) => width,
+        None => sample.iter().find_map(|v| v.map(|b| b.len())).unwrap_or(0),
+    };
 
     if valueSize == 0 {
-        return typeCandidate;
+        return plain(typeCandidate);
     }
 
-    let sampleCount = sample.len().min(1024);
-    let trialSample = &sample[..sampleCount];
-    let mut rawData = vec![0u8; sampleCount * valueSize];
-    for (i, val) in trialSample.iter().enumerate() {
+    let sampleCount = sample.len().min(trial_rows);
+    // The caller's buffer already holds exactly what the trial would build,
+    // values at `i * valueSize` and null slots zeroed, so a prefix of it is
+    // the trial input. Only a caller that supplied none pays to build one
+    let mut ownedRaw: Vec<u8> = Vec::new();
+    let rawData: &[u8] = match packed {
+        Some((buffer, _)) if buffer.len() >= sampleCount * valueSize => {
+            &buffer[..sampleCount * valueSize]
+        }
+        _ => {
+            let trialSample = &sample[..sampleCount];
+            ownedRaw = vec![0u8; sampleCount * valueSize];
+            fill_trial_buffer(&mut ownedRaw, trialSample, valueSize);
+            &ownedRaw
+        }
+    };
+
+    let encoder = create_encoding(typeCandidate);
+    match encoder.encode(rawData, sampleCount, valueSize) {
+        Ok(encoded) if encoded.len() < rawData.len() => EncodingChoice {
+            encoding: typeCandidate,
+            // Reusable only when the trial encoded the whole column. A
+            // prefix's output describes a prefix and would truncate the
+            // column if a caller wrote it out
+            encoded: (sampleCount == sample.len()).then_some(encoded),
+        },
+        _ => plain(EncodingType::Unencoded),
+    }
+}
+
+/// Packs values into a fixed-width trial buffer, leaving null slots zeroed.
+///
+/// Matches the layout a segment build produces so the two are byte
+/// identical, which is what lets a caller hand its own buffer in
+fn fill_trial_buffer(rawData: &mut [u8], sample: &[Option<&[u8]>], valueSize: usize) {
+    for (i, val) in sample.iter().enumerate() {
         if let Some(v) = val {
             let start = i * valueSize;
             let end = start + valueSize;
@@ -422,15 +880,6 @@ pub fn select_encoding(type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingTyp
             }
         }
     }
-
-    let encoder = create_encoding(typeCandidate);
-    if let Ok(encoded) = encoder.encode(&rawData, sampleCount, valueSize)
-        && encoded.len() < rawData.len()
-    {
-        return typeCandidate;
-    }
-
-    EncodingType::Unencoded
 }
 
 /// Selects the encoding for a variable-length column (`value_size == 0`,
@@ -472,7 +921,7 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
     let mut best = EncodingType::Unencoded;
     let mut best_size = raw.len();
 
-    if stats.cardinality < 65536 && stats.cardinality < row_count / 2 {
+    if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
         let dict = create_encoding(EncodingType::Dictionary);
         if let Ok(enc) = dict.encode(&raw, probe_rows, 0)
             && enc.len() < best_size
@@ -510,6 +959,295 @@ pub fn create_encoding(encoding_type: EncodingType) -> Box<dyn Encoding> {
 mod tests {
     use super::*;
 
+    /// Capping the distinct set is only sound if it never changes a choice.
+    ///
+    /// Cardinality reaches two decisions, `all_identical` and the dictionary
+    /// threshold, and both are compared against an independent uncapped
+    /// count here across the shapes that straddle every boundary the cap
+    /// touches: a column with one value, with two, with exactly half its
+    /// rows distinct, with one more than half, and with every row distinct.
+    /// Run counts are compared too, because they are counted outside the set
+    /// and must stay exact after it saturates
+    #[test]
+    fn capping_cardinality_preserves_every_encoding_decision() {
+        fn uncapped(sample: &[Option<&[u8]>]) -> (usize, usize, bool) {
+            let mut distinct = std::collections::HashSet::new();
+            let mut run_count = 1usize;
+            let mut prev: Option<&[u8]> = None;
+            let mut nulls = 0usize;
+            for val in sample {
+                if let Some(v) = val {
+                    distinct.insert(*v);
+                    if let Some(p) = prev
+                        && *v != p
+                    {
+                        run_count += 1;
+                    }
+                    prev = Some(*v);
+                } else {
+                    nulls += 1;
+                }
+            }
+            let all_identical = distinct.is_empty() || (distinct.len() == 1 && nulls == 0);
+            (distinct.len(), run_count, all_identical)
+        }
+
+        for rows in [0usize, 1, 2, 3, 8, 100, 1000, 4096] {
+            for distinct_values in [1usize, 2, 3, 7, 64, 65, 512, 999, 4096] {
+                if distinct_values > rows.max(1) {
+                    continue;
+                }
+                for nulls in [0usize, 1] {
+                    let owned: Vec<Vec<u8>> = (0..rows)
+                        .map(|i| ((i % distinct_values) as u64).to_le_bytes().to_vec())
+                        .collect();
+                    let sample: Vec<Option<&[u8]>> = owned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            if nulls == 1 && i % 17 == 0 {
+                                None
+                            } else {
+                                Some(v.as_slice())
+                            }
+                        })
+                        .collect();
+
+                    let capped = compute_sample_stats(&sample);
+                    let (true_cardinality, true_runs, true_identical) = uncapped(&sample);
+
+                    assert_eq!(
+                        capped.run_count, true_runs,
+                        "rows {rows} distinct {distinct_values} nulls {nulls}: runs are                          counted outside the set and must stay exact"
+                    );
+                    assert_eq!(
+                        capped.all_identical, true_identical,
+                        "rows {rows} distinct {distinct_values} nulls {nulls}: all_identical                          changed under the cap"
+                    );
+
+                    let capped_dict = capped.cardinality < DICTIONARY_MAX_CARDINALITY
+                        && capped.cardinality < rows / 2;
+                    let true_dict = true_cardinality < DICTIONARY_MAX_CARDINALITY
+                        && true_cardinality < rows / 2;
+                    assert_eq!(
+                        capped_dict, true_dict,
+                        "rows {rows} distinct {distinct_values} nulls {nulls}: the dictionary                          decision changed, capped said {} from {} and the true count {} says {}",
+                        capped_dict, capped.cardinality, true_cardinality, true_dict
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole point of the cap is that a high cardinality column stops
+    /// paying for distinct values it will never use. A column where every
+    /// row is unique must not retain a set that grows with the row count
+    #[test]
+    fn a_high_cardinality_column_saturates_instead_of_counting_every_value() {
+        let rows = 8192usize;
+        let owned: Vec<Vec<u8>> = (0..rows)
+            .map(|i| (i as u64).to_le_bytes().to_vec())
+            .collect();
+        let sample: Vec<Option<&[u8]>> = owned.iter().map(|v| Some(v.as_slice())).collect();
+        let stats = compute_sample_stats(&sample);
+        assert!(
+            stats.cardinality <= rows / 2 + 1,
+            "the set kept counting past the point the answer was fixed, reached {}",
+            stats.cardinality
+        );
+        assert!(!stats.all_identical);
+        assert!(
+            !(stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < rows / 2),
+            "an all-distinct column must not be dictionary encoded"
+        );
+    }
+
+    /// Every encoding's ranged decode must agree with its full decode over
+    /// the same rows, for every range including the empty and the whole.
+    ///
+    /// The default implementation decodes and takes a slice, so it agrees
+    /// by construction. The value of this test is the encodings that
+    /// override it to address rows directly: an off-by-one in a bit offset
+    /// there returns neighbouring values rather than failing, which is a
+    /// wrong answer no caller can detect.
+    ///
+    /// Both row counts matter. The small one keeps every cumulative layout
+    /// below the restart spacing so the head of the stream is replayed, and
+    /// the large one crosses several restart boundaries so the seeded replay
+    /// is what answers instead.
+    #[test]
+    fn test_ranged_decode_agrees_with_full_decode_for_every_encoding() {
+        for rows in [300usize, 4100] {
+            ranged_decode_agrees_with_full_decode(rows);
+        }
+    }
+
+    fn ranged_decode_agrees_with_full_decode(rows: usize) {
+        // Values with a small distinct set, so dictionary and bitpack both
+        // apply, and a run structure RLE can use
+        let fixed: Vec<u8> = (0..rows)
+            .flat_map(|i| (((i / 7) % 11) as i64).to_le_bytes())
+            .collect();
+        // Shapes that steer FastLanes into each of its layouts, so a fast
+        // path that is only correct for one of them cannot pass. Ascending
+        // has a step that widens every fiftieth row, which keeps it out of
+        // the constant-step closed form and inside the delta stream
+        let ascending: Vec<u8> = (0..rows)
+            .flat_map(|i| ((i as i64) * 3 + (i as i64) / 50).to_le_bytes())
+            .collect();
+        let const_step: Vec<u8> = (0..rows)
+            .flat_map(|i| ((i as i64) * 8).to_le_bytes())
+            .collect();
+        // Quadratic growth: first differences rise steadily and second
+        // differences stay tiny, which is what delta-of-delta packs
+        let quadratic: Vec<u8> = (0..rows)
+            .flat_map(|i| (((i * i) / 3 + i) as i64).to_le_bytes())
+            .collect();
+        let with_outliers: Vec<u8> = (0..rows)
+            .flat_map(|i| {
+                let v = if i % 97 == 0 {
+                    1i64 << 40
+                } else {
+                    (i % 13) as i64
+                };
+                v.to_le_bytes()
+            })
+            .collect();
+        // Wide values confined to every third block of a thousand rows, which
+        // is what per-mini-block widths exist for
+        let bursty: Vec<u8> = (0..rows)
+            .flat_map(|i| {
+                let v = if (i / 1024) % 3 == 1 {
+                    (i as i64) * 1_000_003
+                } else {
+                    (i % 7) as i64
+                };
+                v.to_le_bytes()
+            })
+            .collect();
+        let floats: Vec<u8> = (0..rows)
+            .flat_map(|i| ((i as f64) * 0.25 + 1.5).to_le_bytes())
+            .collect();
+        let float_unsorted: Vec<u8> = (0..rows)
+            .flat_map(|i| (((i % 37) as f64) * 0.5).to_le_bytes())
+            .collect();
+        let varlen_rows: Vec<Vec<u8>> = (0..rows)
+            .map(|i| format!("value-{:03}", (i / 5) % 17).into_bytes())
+            .collect();
+        let varlen_refs: Vec<Option<&[u8]>> =
+            varlen_rows.iter().map(|v| Some(v.as_slice())).collect();
+        let varlen = varlen_pack(&varlen_refs);
+
+        let constant_fixed: Vec<u8> = (0..rows).flat_map(|_| 42i64.to_le_bytes()).collect();
+
+        // The 16-byte layouts mirror the narrow ones and are addressed the
+        // same way, so each of them is covered too
+        let wide_flat: Vec<u8> = (0..rows)
+            .flat_map(|i| (((i / 9) % 5) as i128).to_le_bytes())
+            .collect();
+        let wide_ascending: Vec<u8> = (0..rows)
+            .flat_map(|i| ((i as i128) * 7 + (i as i128) / 40).to_le_bytes())
+            .collect();
+        let wide_const_step: Vec<u8> = (0..rows)
+            .flat_map(|i| ((i as i128) * 4).to_le_bytes())
+            .collect();
+        let wide_quadratic: Vec<u8> = (0..rows)
+            .flat_map(|i| (((i * i) / 5 + 2 * i) as i128).to_le_bytes())
+            .collect();
+        let wide_outliers: Vec<u8> = (0..rows)
+            .flat_map(|i| {
+                let v = if i % 89 == 0 {
+                    1i128 << 100
+                } else {
+                    (i % 11) as i128
+                };
+                v.to_le_bytes()
+            })
+            .collect();
+
+        let cases: Vec<(EncodingType, &[u8], usize)> = vec![
+            (EncodingType::Unencoded, &fixed, 8),
+            (EncodingType::BitPack, &fixed, 8),
+            (EncodingType::Dictionary, &fixed, 8),
+            (EncodingType::Rle, &fixed, 8),
+            (EncodingType::Constant, &constant_fixed, 8),
+            (EncodingType::Dictionary, &varlen, 0),
+            (EncodingType::Unencoded, &varlen, 0),
+            (EncodingType::Fsst, &varlen, 0),
+            // FastLanes over every shape that steers it to a different
+            // layout: flat, ascending (delta), constant step (closed form),
+            // quadratic (delta-of-delta), outliers (patched frame of
+            // reference) and bursty (per-mini-block widths)
+            (EncodingType::FastLanes, &fixed, 8),
+            (EncodingType::FastLanes, &ascending, 8),
+            (EncodingType::FastLanes, &const_step, 8),
+            (EncodingType::FastLanes, &quadratic, 8),
+            (EncodingType::FastLanes, &with_outliers, 8),
+            (EncodingType::FastLanes, &bursty, 8),
+            (EncodingType::FastLanes, &wide_flat, 16),
+            (EncodingType::FastLanes, &wide_ascending, 16),
+            (EncodingType::FastLanes, &wide_const_step, 16),
+            (EncodingType::FastLanes, &wide_quadratic, 16),
+            (EncodingType::FastLanes, &wide_outliers, 16),
+            (EncodingType::BitPack, &ascending, 8),
+            (EncodingType::Rle, &constant_fixed, 8),
+            (EncodingType::Alp, &floats, 8),
+            (EncodingType::Alp, &float_unsorted, 8),
+            (EncodingType::Unencoded, &floats, 8),
+        ];
+
+        let mut ranges = vec![
+            (0usize, 0usize),
+            (0, 1),
+            (0, rows),
+            (1, 2),
+            (7, 8),
+            (127, 129),
+            (rows - 1, rows),
+            (rows / 3, (rows / 3 + 64).min(rows)),
+            // Past the end clamps rather than failing
+            (rows - 2, rows + 50),
+        ];
+        // Ranges pinned to the restart spacing: exactly on a boundary, either
+        // side of one, and spanning several
+        for boundary in [1024usize, 2048, 3072] {
+            if boundary < rows {
+                ranges.push((boundary, boundary + 1));
+                ranges.push((boundary - 1, boundary + 2));
+                ranges.push((boundary, rows));
+            }
+        }
+        if rows > 2048 {
+            ranges.push((1000, 3000));
+            ranges.push((rows - 1024, rows));
+        }
+
+        for (kind, data, value_size) in cases {
+            let encoding = create_encoding(kind);
+            let Ok(encoded) = encoding.encode(data, rows, value_size) else {
+                // An encoding that refuses this shape has nothing to check
+                continue;
+            };
+            let full = encoding
+                .decode(&encoded, rows, value_size)
+                .unwrap_or_else(|e| panic!("{kind:?} value_size {value_size} full decode: {e}"));
+
+            for &(start, end) in &ranges {
+                let ranged = encoding
+                    .decode_range(&encoded, rows, value_size, start, end)
+                    .unwrap_or_else(|e| {
+                        panic!("{kind:?} value_size {value_size} range {start}..{end}: {e}")
+                    });
+                let expected = slice_decoded(&full, rows, value_size, start, end)
+                    .expect("slicing the full decode");
+                assert_eq!(
+                    ranged, expected,
+                    "{kind:?} value_size {value_size} rows {rows} disagreed on {start}..{end}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_encoding_type_roundtrip() {
         for v in 0..=7u8 {
@@ -530,6 +1268,33 @@ mod tests {
         let sample: Vec<Option<&[u8]>> = (0..100).map(|_| Some(val.as_slice())).collect();
         assert_eq!(
             select_encoding(TypeId::Int32, &sample),
+            EncodingType::Constant
+        );
+    }
+
+    #[test]
+    fn test_one_distinct_value_plus_nulls_is_not_constant() {
+        // A NULL occupies a placeholder cell that differs from the value,
+        // constant encoding of the raw buffer would fail
+        let val = 5i64.to_le_bytes();
+        let sample: Vec<Option<&[u8]>> = vec![Some(val.as_slice()), None, Some(val.as_slice())];
+        assert_ne!(
+            select_encoding(TypeId::Int64, &sample),
+            EncodingType::Constant
+        );
+        let text: Vec<Option<&[u8]>> = vec![Some(b"dave".as_slice()), None];
+        assert_ne!(
+            select_encoding_varlen(TypeId::Text, &text),
+            EncodingType::Constant
+        );
+        // All null stays constant, every placeholder is identical
+        let all_null: Vec<Option<&[u8]>> = vec![None, None, None];
+        assert_eq!(
+            select_encoding(TypeId::Int64, &all_null),
+            EncodingType::Constant
+        );
+        assert_eq!(
+            select_encoding_varlen(TypeId::Text, &all_null),
             EncodingType::Constant
         );
     }

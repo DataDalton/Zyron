@@ -425,7 +425,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
 }
 
 /// Splits an AND expression into its conjuncts.
-fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
+pub(crate) fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
     match expr {
         BoundExpr::BinaryOp {
             left,
@@ -442,7 +442,7 @@ fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
 }
 
 /// Combines conjuncts into an AND expression.
-fn combine_conjuncts(mut conjuncts: Vec<BoundExpr>) -> BoundExpr {
+pub(crate) fn combine_conjuncts(mut conjuncts: Vec<BoundExpr>) -> BoundExpr {
     if conjuncts.len() == 1 {
         return conjuncts.remove(0);
     }
@@ -458,8 +458,15 @@ fn combine_conjuncts(mut conjuncts: Vec<BoundExpr>) -> BoundExpr {
     result
 }
 
-/// Collects all table indices referenced in a plan's scan nodes.
-fn collect_table_indices(plan: &LogicalPlan) -> Vec<usize> {
+/// Collects the table indices a plan's output can be addressed by.
+///
+/// A derived table is addressed by the index its enclosing query gave it,
+/// which its projection carries as `output_table_idx`, and the indices of
+/// the scans inside it are not visible above it. Descending past that
+/// projection would report the inner indices instead, and a caller deciding
+/// which side of a join a predicate belongs to would then conclude the
+/// predicate touches neither side and push it into the wrong one.
+pub(crate) fn collect_table_indices(plan: &LogicalPlan) -> Vec<usize> {
     let mut indices = Vec::new();
     collect_table_indices_recursive(plan, &mut indices);
     indices
@@ -468,6 +475,12 @@ fn collect_table_indices(plan: &LogicalPlan) -> Vec<usize> {
 fn collect_table_indices_recursive(plan: &LogicalPlan, out: &mut Vec<usize>) {
     match plan {
         LogicalPlan::Scan { table_idx, .. } => out.push(*table_idx),
+        // A relabeled projection is the boundary of a derived table: above
+        // it only this index exists
+        LogicalPlan::Project {
+            output_table_idx: Some(idx),
+            ..
+        } => out.push(*idx),
         other => {
             for child in other.children() {
                 collect_table_indices_recursive(child, out);
@@ -477,7 +490,7 @@ fn collect_table_indices_recursive(plan: &LogicalPlan, out: &mut Vec<usize>) {
 }
 
 /// Collects all column references in an expression.
-fn collect_column_refs(expr: &BoundExpr) -> Vec<ColumnRef> {
+pub(crate) fn collect_column_refs(expr: &BoundExpr) -> Vec<ColumnRef> {
     let mut refs = Vec::new();
     collect_column_refs_recursive(expr, &mut refs);
     refs
@@ -558,7 +571,7 @@ mod tests {
             column_id: ColumnId(col),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 

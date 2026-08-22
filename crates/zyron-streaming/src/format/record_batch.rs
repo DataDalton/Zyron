@@ -31,7 +31,7 @@ pub fn rows_to_batch(
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.len());
     for (ci, col) in schema.iter().enumerate() {
-        arrays.push(build_column(ci, col.type_id, col.ts_precision, rows)?);
+        arrays.push(build_column(ci, col.type_id, col.fractional_digits, rows)?);
     }
     RecordBatch::try_new(arrow_schema, arrays)
         .map_err(|e| ZyronError::StreamingError(format!("record_batch: build error: {e}")))
@@ -40,7 +40,7 @@ pub fn rows_to_batch(
 fn build_column(
     ci: usize,
     t: TypeId,
-    ts_precision: Option<u8>,
+    fractional_digits: Option<u8>,
     rows: &[Vec<StreamValue>],
 ) -> Result<ArrayRef> {
     let n = rows.len();
@@ -50,7 +50,7 @@ fn build_column(
     // This is the only sanctioned silent narrowing for the picosecond feature
     // and is documented in the format spec. p<=6/None keeps the i64
     // microsecond path below, byte-identical to before.
-    if matches!(t, TypeId::Timestamp | TypeId::TimestampTz) && ts_precision.unwrap_or(6) > 6 {
+    if matches!(t, TypeId::Timestamp | TypeId::TimestampTz) && fractional_digits.unwrap_or(6) > 6 {
         let mut b = TimestampNanosecondBuilder::with_capacity(n);
         for row in rows {
             match &row[ci] {

@@ -252,7 +252,11 @@ fn build_default_registry() -> Arc<AnalyticsRegistry> {
         min_args: 3,
         max_args: Some(4),
         description: "Point-in-time correct retrieval of feature values",
-        output_schema: &[("entity_key", "TEXT"), ("feature_name", "TEXT"), ("value", "TEXT")],
+        output_schema: &[
+            ("entity_key", "TEXT"),
+            ("feature_name", "TEXT"),
+            ("value", "TEXT"),
+        ],
     });
     entries.push(AnalyticsFunction {
         name: "FEATURE_LINEAGE",
@@ -313,10 +317,7 @@ fn build_default_registry() -> Arc<AnalyticsRegistry> {
         min_args: 1,
         max_args: Some(1),
         description: "Training metadata and feature dependencies for a model",
-        output_schema: &[
-            ("attribute", "TEXT"),
-            ("value", "TEXT"),
-        ],
+        output_schema: &[("attribute", "TEXT"), ("value", "TEXT")],
     });
 
     // Causal inference
@@ -368,7 +369,11 @@ fn build_default_registry() -> Arc<AnalyticsRegistry> {
         min_args: 1,
         max_args: Some(3),
         description: "Anomaly detection on a series, returns per-row score and flag",
-        output_schema: &[("idx", "INT64"), ("is_anomaly", "BOOL"), ("score", "FLOAT64")],
+        output_schema: &[
+            ("idx", "INT64"),
+            ("is_anomaly", "BOOL"),
+            ("score", "FLOAT64"),
+        ],
     });
     entries.push(AnalyticsFunction {
         name: "TREND",

@@ -1,0 +1,53 @@
+# suite:   lifecycle
+# run:     2026-08-20_025632_daa5c98-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Performance (5-run average) ===
+
+=== Soft Delete ===
+
+=== Soft-Delete Purge ===
+
+=== Compliance Report ===
+
+=== Row-Level TTL ===
+
+=== Partition-Scoped TTL ===
+
+=== FORGET USER (cross-table) ===
+
+=== Archive + Restore ===
+
+=== Legal Hold ===
+
+=== Tiered Storage ===
+  SOX retention validation + PII detection: PASS
+  Soft-delete purge after grace window: PASS
+  Partition-scoped TTL (predicate drop): PASS
+  Tiered storage transparent query + cost model: PASS
+  FORGET USER cross-table erasure + PII detect: PASS
+  Legal hold blocks DELETE/UPDATE/TTL, release restores: PASS
+  Soft delete + visibility modifiers + HARD: PASS
+  Row-level TTL delete + retention boundary: PASS
+  Archive write + delete + restore round-trip: PASS
+  latency (ns/op) [PASS/OK]:
+    Runs: [7.6922, 7.5102, 7.5853, 7.4660, 7.4250]
+    Average: 7.5357 <= 50 (target)
+    Min/Max: 7.4250 / 7.6922, StdDev: 0.0946
+  latency (s) [PASS/OK]:
+    Runs: [0.0012, 0.0012, 0.0012, 0.0012, 0.0012]
+    Average: 0.0012 <= 5 (target)
+    Min/Max: 0.0012 / 0.0012, StdDev: 0.0000
+  throughput (rows/sec) [PASS/OK]:
+    Runs: [7,838,834, 9,092,273, 6,771,443, 6,556,324, 9,318,883]
+    Average: 7,915,551 >= 500,000 (target)
+    Min/Max: 6,556,324 / 9,318,883, StdDev: 1,141,611
+  throughput (rows/sec) [PASS/OK]:
+    Runs: [51,600,918, 54,676,180, 63,605,139, 60,288,177, 56,861,797]
+    Average: 57,406,443 >= 500,000 (target)
+    Min/Max: 51,600,918 / 63,605,139, StdDev: 4,199,603
+
+  Performance suite complete.

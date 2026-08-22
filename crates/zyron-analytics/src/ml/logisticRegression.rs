@@ -4,7 +4,7 @@
 // Outputs P(y=1 | x) in [0,1]
 
 use crate::ml::f64Kernels::{axpy, dot, log1pExp, sigmoid};
-use crate::ml::{Hyperparameters, ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData};
+use crate::ml::{ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData};
 use crate::numeric::{KahanSum, columnStandardize};
 use zyron_common::Xoshiro256pp;
 use zyron_common::error::{Result, ZyronError};
@@ -25,7 +25,11 @@ pub fn train(config: &ModelConfig, data: &TrainingData) -> Result<TrainedModel> 
     let lambda = config.hyperparameters.getF64Or("lambda", 0.0).max(0.0);
     let lr = config.hyperparameters.getF64Or("learning_rate", 0.1);
     let epochs = config.hyperparameters.getUsizeOr("max_epochs", 100);
-    let batchSize = config.hyperparameters.getUsizeOr("batch_size", 1024).max(1).min(data.n);
+    let batchSize = config
+        .hyperparameters
+        .getUsizeOr("batch_size", 1024)
+        .max(1)
+        .min(data.n);
     let tol = config.hyperparameters.getF64Or("tolerance", 1e-5);
     let seed = config.hyperparameters.getU64Or("seed", 42);
     let standardize = config.hyperparameters.getBoolOr("standardize", true);
@@ -215,12 +219,24 @@ fn computeClassificationMetrics(model: &TrainedModel, xs: &[f64], ys: &[f64]) ->
     let total = (tp + tn + fp + fnCount) as f64;
     m.accuracy = Some((tp + tn) as f64 / total);
     let precDenom = (tp + fp) as f64;
-    m.precision = Some(if precDenom > 0.0 { tp as f64 / precDenom } else { 0.0 });
+    m.precision = Some(if precDenom > 0.0 {
+        tp as f64 / precDenom
+    } else {
+        0.0
+    });
     let recallDenom = (tp + fnCount) as f64;
-    m.recall = Some(if recallDenom > 0.0 { tp as f64 / recallDenom } else { 0.0 });
+    m.recall = Some(if recallDenom > 0.0 {
+        tp as f64 / recallDenom
+    } else {
+        0.0
+    });
     let p = m.precision.unwrap();
     let r = m.recall.unwrap();
-    m.f1Score = Some(if p + r > 0.0 { 2.0 * p * r / (p + r) } else { 0.0 });
+    m.f1Score = Some(if p + r > 0.0 {
+        2.0 * p * r / (p + r)
+    } else {
+        0.0
+    });
     m.logLoss = Some(logLossSum.value() / n as f64);
     m
 }

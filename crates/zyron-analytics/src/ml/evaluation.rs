@@ -56,11 +56,7 @@ impl ConfusionMatrix {
             }
         }
         let denom = (tp + fp) as f64;
-        if denom > 0.0 {
-            tp as f64 / denom
-        } else {
-            0.0
-        }
+        if denom > 0.0 { tp as f64 / denom } else { 0.0 }
     }
 
     pub fn recall(&self, cls: usize) -> f64 {
@@ -75,23 +71,27 @@ impl ConfusionMatrix {
             }
         }
         let denom = (tp + fnc) as f64;
-        if denom > 0.0 {
-            tp as f64 / denom
-        } else {
-            0.0
-        }
+        if denom > 0.0 { tp as f64 / denom } else { 0.0 }
     }
 
     pub fn f1(&self, cls: usize) -> f64 {
         let p = self.precision(cls);
         let r = self.recall(cls);
-        if p + r > 0.0 { 2.0 * p * r / (p + r) } else { 0.0 }
+        if p + r > 0.0 {
+            2.0 * p * r / (p + r)
+        } else {
+            0.0
+        }
     }
 }
 
 /// ROC curve points (fpr, tpr) sorted by threshold descending
 pub fn rocCurve(yTrue: &[u32], yScore: &[f64]) -> Vec<(f64, f64)> {
-    let mut pairs: Vec<(f64, u32)> = yTrue.iter().zip(yScore.iter()).map(|(y, s)| (*s, *y)).collect();
+    let mut pairs: Vec<(f64, u32)> = yTrue
+        .iter()
+        .zip(yScore.iter())
+        .map(|(y, s)| (*s, *y))
+        .collect();
     pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     let totalPos: u64 = yTrue.iter().filter(|&&y| y == 1).count() as u64;
     let totalNeg: u64 = yTrue.iter().filter(|&&y| y == 0).count() as u64;
@@ -105,8 +105,16 @@ pub fn rocCurve(yTrue: &[u32], yScore: &[f64]) -> Vec<(f64, f64)> {
         } else {
             fp += 1;
         }
-        let fpr = if totalNeg > 0 { fp as f64 / totalNeg as f64 } else { 0.0 };
-        let tpr = if totalPos > 0 { tp as f64 / totalPos as f64 } else { 0.0 };
+        let fpr = if totalNeg > 0 {
+            fp as f64 / totalNeg as f64
+        } else {
+            0.0
+        };
+        let tpr = if totalPos > 0 {
+            tp as f64 / totalPos as f64
+        } else {
+            0.0
+        };
         out.push((fpr, tpr));
     }
     out
@@ -146,7 +154,11 @@ pub fn demographicParity(yPred: &[u32], group: &[u32]) -> HashMap<u32, f64> {
     }
     let mut out = HashMap::new();
     for (g, (pos, total)) in counts {
-        let r = if total > 0 { pos as f64 / total as f64 } else { 0.0 };
+        let r = if total > 0 {
+            pos as f64 / total as f64
+        } else {
+            0.0
+        };
         out.insert(g, r);
     }
     out

@@ -516,11 +516,13 @@ fn fold_expr(expr: &BoundExpr) -> (BoundExpr, bool) {
         BoundExpr::Cast {
             expr: inner,
             target_type,
+            fractional_digits,
         } => {
             let (folded, changed) = fold_expr(inner);
             if changed {
                 (
                     BoundExpr::Cast {
+                        fractional_digits: *fractional_digits,
                         expr: Box::new(folded),
                         target_type: *target_type,
                     },
@@ -643,7 +645,7 @@ mod tests {
                 column_id: zyron_catalog::ColumnId(0),
                 type_id: TypeId::Boolean,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::And,
             right: Box::new(BoundExpr::Literal {
@@ -665,7 +667,7 @@ mod tests {
                 column_id: zyron_catalog::ColumnId(0),
                 type_id: TypeId::Boolean,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::And,
             right: Box::new(BoundExpr::Literal {

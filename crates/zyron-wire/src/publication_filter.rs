@@ -128,6 +128,7 @@ impl PublicationRowFilter {
                     schema.database_id,
                     vec![schema.name.clone()],
                     stmt,
+                    None,
                 )
                 .await?;
 

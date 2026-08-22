@@ -394,47 +394,9 @@ impl Authenticator for ScramAuthenticator {
 // Crypto helpers
 // ---------------------------------------------------------------------------
 
-/// PBKDF2-SHA-256 key derivation.
-fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    use hmac::Mac;
-
-    let mut result = [0u8; 32];
-    // PBKDF2 with HMAC-SHA256, single block (dk_len <= hash_len)
-    // U1 = HMAC(password, salt || INT(1))
-    let mut mac =
-        hmac::Hmac::<sha2::Sha256>::new_from_slice(password).expect("HMAC key length is valid");
-    mac.update(salt);
-    mac.update(&1u32.to_be_bytes());
-    let u1 = mac.finalize().into_bytes();
-
-    result.copy_from_slice(&u1);
-    let mut prev = u1;
-
-    for _ in 1..iterations {
-        let mut mac =
-            hmac::Hmac::<sha2::Sha256>::new_from_slice(password).expect("HMAC key length is valid");
-        mac.update(&prev);
-        let ui = mac.finalize().into_bytes();
-        for j in 0..32 {
-            result[j] ^= ui[j];
-        }
-        prev = ui;
-    }
-
-    result
-}
-
 /// HMAC-SHA-256.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use hmac::Mac;
-
-    let mut mac =
-        hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC key length is valid");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    zyron_auth::hmac_sha2::hmac_sha256(key, data)
 }
 
 /// SHA-256 hash.
@@ -1084,6 +1046,7 @@ fn extract_json_field(json: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zyron_auth::pbkdf2_sha256;
 
     #[test]
     fn test_trust_authenticator() {

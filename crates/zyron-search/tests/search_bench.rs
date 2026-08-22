@@ -735,6 +735,17 @@ fn test_10_performance() {
     let mut indexing_results = Vec::new();
     let mut idx = InvertedIndex::new(10, 100, vec![1, 2]);
 
+    // The corpus is generated once outside every timed region. Article
+    // generation and the title-body concatenation used to run inside the
+    // timed loop at a multiple of the per-document indexing cost, so the
+    // metric measured the generator, not the index
+    let corpus: Vec<String> = (0..DOC_COUNT)
+        .map(|doc_id| {
+            let (title, body) = generate_article(doc_id, WORD_COUNT);
+            format!("{title} {body}")
+        })
+        .collect();
+
     // SimpleAnalyzer indexing (production baseline for exact-match workloads)
     tprintln!("  [SimpleAnalyzer]");
     for run in 0..VALIDATION_RUNS {
@@ -743,10 +754,8 @@ fn test_10_performance() {
         let mut buf = AnalysisBuffer::new();
 
         let start = Instant::now();
-        for doc_id in 0..DOC_COUNT {
-            let (title, body) = generate_article(doc_id, WORD_COUNT);
-            let combined = format!("{title} {body}");
-            idx.add_document_with_buf(doc_id, &combined, &analyzer, &mut buf)
+        for (doc_id, combined) in corpus.iter().enumerate() {
+            idx.add_document_with_buf(doc_id as u64, combined, &analyzer, &mut buf)
                 .expect("add_document failed");
         }
         let elapsed = start.elapsed();
@@ -786,11 +795,9 @@ fn test_10_performance() {
 
         let mut buf = AnalysisBuffer::new();
         let start = Instant::now();
-        for doc_id in 0..DOC_COUNT {
-            let (title, body) = generate_article(doc_id, WORD_COUNT);
-            let combined = format!("{title} {body}");
+        for (doc_id, combined) in corpus.iter().enumerate() {
             std_idx
-                .add_document_with_buf(doc_id, &combined, &analyzer, &mut buf)
+                .add_document_with_buf(doc_id as u64, combined, &analyzer, &mut buf)
                 .expect("add_document failed");
         }
         let elapsed = start.elapsed();
@@ -1804,6 +1811,12 @@ fn test_recall_diagnostic() {
 
 fn runClusteredScale(n: usize, numClusters: usize, stdDev: f32, seed: u64) {
     zyron_bench_harness::init("search");
+    // Building an HNSW graph over this many vectors without optimization runs
+    // for hours to produce a timing that would be discarded
+    if zyron_bench_harness::skip_expensive("Clustered Scale", &format!("a {n} vector index build"))
+    {
+        return;
+    }
     let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dims = 128usize;
@@ -1904,6 +1917,9 @@ fn test_clustered_scale_1m() {
 
 fn runUniformScale(n: usize, seed: u64) {
     zyron_bench_harness::init("search");
+    if zyron_bench_harness::skip_expensive("Uniform Scale", &format!("a {n} vector index build")) {
+        return;
+    }
     let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dims = 128usize;

@@ -79,6 +79,74 @@ impl ServerConfig {
     }
 }
 
+/// Storage tiers a node runs, set by `storage.deployment_mode`.
+///
+/// The mode picks the format `CREATE TABLE` uses when the statement carries
+/// no `USING` clause and refuses DDL naming the format the node does not run,
+/// so nobody is handed a table whose commit-rate profile they did not ask for.
+/// It also gates startup work: a `db` node opens no lake transaction log and
+/// runs no lake worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentMode {
+    /// Heap tables only, the latency-critical shape for an application's own
+    /// database
+    Db,
+    /// ZyronLake tables only, the centrally managed lakehouse shape
+    Lake,
+    /// Both formats on one node, heap by default, so a heap table and a lake
+    /// table join locally with no federation hop
+    Unified,
+}
+
+impl Default for DeploymentMode {
+    fn default() -> Self {
+        Self::Unified
+    }
+}
+
+impl DeploymentMode {
+    /// Parses a configured mode name, case-insensitive. None on anything else
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "db" => Some(Self::Db),
+            "lake" => Some(Self::Lake),
+            "unified" => Some(Self::Unified),
+            _ => None,
+        }
+    }
+
+    /// The configured spelling of this mode
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Db => "db",
+            Self::Lake => "lake",
+            Self::Unified => "unified",
+        }
+    }
+
+    /// True when a CREATE TABLE with no USING clause creates a lake table
+    pub fn defaults_to_lake(self) -> bool {
+        matches!(self, Self::Lake)
+    }
+
+    /// True when a table may be created in the ZyronLake format
+    pub fn allows_lake(self) -> bool {
+        matches!(self, Self::Lake | Self::Unified)
+    }
+
+    /// True when a table may be created in the heap format
+    pub fn allows_heap(self) -> bool {
+        matches!(self, Self::Db | Self::Unified)
+    }
+
+    /// True when the node opens lake transaction logs at startup and runs the
+    /// lake background workers
+    pub fn runs_lake_tier(self) -> bool {
+        self.allows_lake()
+    }
+}
+
 /// Storage configuration for the database engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -272,6 +340,47 @@ mod tests {
         assert_eq!(original.data_dir, deserialized.data_dir);
         assert_eq!(original.page_size, deserialized.page_size);
         assert_eq!(original.buffer_pool_pages, deserialized.buffer_pool_pages);
+    }
+
+    #[test]
+    fn test_deployment_mode_parses_every_name_case_insensitively() {
+        assert_eq!(DeploymentMode::parse("db"), Some(DeploymentMode::Db));
+        assert_eq!(DeploymentMode::parse("LAKE"), Some(DeploymentMode::Lake));
+        assert_eq!(
+            DeploymentMode::parse(" Unified "),
+            Some(DeploymentMode::Unified)
+        );
+        assert_eq!(DeploymentMode::parse("hybrid"), None);
+        assert_eq!(DeploymentMode::parse(""), None);
+        for mode in [
+            DeploymentMode::Db,
+            DeploymentMode::Lake,
+            DeploymentMode::Unified,
+        ] {
+            assert_eq!(DeploymentMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_deployment_mode_gates_match_the_deployment_table() {
+        // db stores heap only, lake stores ZyronLake only, unified runs both
+        // with heap as the unqualified default
+        let db = DeploymentMode::Db;
+        assert!(db.allows_heap() && !db.allows_lake());
+        assert!(!db.defaults_to_lake());
+        assert!(!db.runs_lake_tier());
+
+        let lake = DeploymentMode::Lake;
+        assert!(lake.allows_lake() && !lake.allows_heap());
+        assert!(lake.defaults_to_lake());
+        assert!(lake.runs_lake_tier());
+
+        let unified = DeploymentMode::Unified;
+        assert!(unified.allows_lake() && unified.allows_heap());
+        assert!(!unified.defaults_to_lake());
+        assert!(unified.runs_lake_tier());
+
+        assert_eq!(DeploymentMode::default(), DeploymentMode::Unified);
     }
 
     #[test]

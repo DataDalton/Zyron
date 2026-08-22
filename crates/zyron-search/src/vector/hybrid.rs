@@ -456,47 +456,83 @@ impl HybridSearch {
         }
 
         let docIds: Vec<u64> = allIds.into_iter().collect();
-        let mut ftsScores: Vec<f32> = Vec::with_capacity(n);
-        let mut vecSims: Vec<f32> = Vec::with_capacity(n);
 
-        // Normalize FTS scores to [0, 1] using min-max on the actual FTS results
-        let ftsMin = ftsMap.values().copied().fold(f32::INFINITY, f32::min);
-        let ftsMax = ftsMap.values().copied().fold(f32::NEG_INFINITY, f32::max);
+        // Both score families reach the blend as an affine map of a raw
+        // value, so both are gathered raw and transformed by the same SIMD
+        // kernel rather than one scalar branch per document.
+        //
+        // FTS wants (score - min) / range. Vector wants 1 - dist / maxDist,
+        // which is (dist - maxDist) * (-1 / maxDist), the same shape with a
+        // negative scale.
+        //
+        // A document missing from either map has to end at 0.0. Gathering it
+        // as the value that maps to zero, the minimum for FTS and maxDist for
+        // vector, gets that from the transform itself, so the gather carries
+        // no per-document branch at all.
+        // One pass over each map into a contiguous buffer, then one SIMD
+        // pass for both bounds. Folding twice per map walked the hash table
+        // twice to get two numbers out of the same values.
+        //
+        // An empty map keeps the identities a fold would have produced, so a
+        // search with hits on only one side behaves exactly as before.
+        let minMax = get_min_max_fn();
+        let ftsValues: Vec<f32> = ftsMap.values().copied().collect();
+        let (ftsMin, ftsMax) = if ftsValues.is_empty() {
+            (f32::INFINITY, f32::NEG_INFINITY)
+        } else {
+            unsafe { minMax(ftsValues.as_ptr(), ftsValues.len()) }
+        };
         let ftsRange = ftsMax - ftsMin;
 
-        // Convert vector distances to similarities: 1 - (dist / maxDist)
-        // Only consider docs that actually have vector scores
-        let vecMaxDist = vecMap.values().copied().fold(f32::NEG_INFINITY, f32::max);
+        let vecValues: Vec<f32> = vecMap.values().copied().collect();
+        let vecMaxDist = if vecValues.is_empty() {
+            f32::NEG_INFINITY
+        } else {
+            unsafe { minMax(vecValues.as_ptr(), vecValues.len()).1 }
+        };
 
+        let mut ftsScores: Vec<f32> = Vec::with_capacity(n);
+        let mut vecSims: Vec<f32> = Vec::with_capacity(n);
         for &docId in &docIds {
-            // FTS: normalize to [0, 1]. Docs without FTS results get 0.0.
-            let ftsNorm = match ftsMap.get(&docId) {
-                Some(&score) => {
-                    if ftsRange > f32::EPSILON {
-                        (score - ftsMin) / ftsRange
-                    } else if ftsMax > 0.0 {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                None => 0.0,
-            };
-            ftsScores.push(ftsNorm);
+            ftsScores.push(ftsMap.get(&docId).copied().unwrap_or(ftsMin));
+            vecSims.push(vecMap.get(&docId).copied().unwrap_or(vecMaxDist));
+        }
 
-            // Vector: convert distance to similarity [0, 1].
-            // Docs without vector results get 0.0 similarity.
-            let vecSim = match vecMap.get(&docId) {
-                Some(&dist) => {
-                    if vecMaxDist > f32::EPSILON {
-                        1.0 - (dist / vecMaxDist)
-                    } else {
-                        1.0
-                    }
-                }
-                None => 0.0,
-            };
-            vecSims.push(vecSim);
+        let normalize = get_normalize_fn();
+
+        // Every FTS score equal means min-max says nothing, so a document
+        // that has one scores 1.0 and a document that has none still scores
+        // 0.0. That distinction is the one thing the transform cannot carry,
+        // and it needs the map to tell the two apart
+        if ftsRange > f32::EPSILON {
+            unsafe {
+                normalize(ftsScores.as_mut_ptr(), n, ftsMin, 1.0 / ftsRange);
+            }
+        } else {
+            let present = if ftsMax > 0.0 { 1.0 } else { 0.0 };
+            for (slot, &docId) in ftsScores.iter_mut().zip(docIds.iter()) {
+                *slot = if ftsMap.contains_key(&docId) {
+                    present
+                } else {
+                    0.0
+                };
+            }
+        }
+
+        // Distances all zero means every hit is exact, so each one is a
+        // perfect match and a document with no vector hit is still 0.0
+        if vecMaxDist > f32::EPSILON {
+            unsafe {
+                normalize(vecSims.as_mut_ptr(), n, vecMaxDist, -1.0 / vecMaxDist);
+            }
+        } else {
+            for (slot, &docId) in vecSims.iter_mut().zip(docIds.iter()) {
+                *slot = if vecMap.contains_key(&docId) {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
         }
 
         // Blend scores using SIMD: result = alpha * vecSim + (1-alpha) * ftsSim
@@ -521,34 +557,18 @@ impl HybridSearch {
             .map(|(id, &score)| (id, score as f64))
             .collect();
 
-        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Ties break on doc id so the same query over the same data returns
+        // the same documents every time. The candidate order coming in is set
+        // iteration order, which varies per process, so without a total order
+        // here a top-k cut through a tie group would keep different documents
+        // across restarts
+        results.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         results.truncate(k);
         results
-    }
-}
-
-/// Normalizes an f32 array to [0, 1] using SIMD min/max and normalization.
-fn normalize_array(data: &mut [f32]) {
-    if data.len() <= 1 {
-        return;
-    }
-
-    let min_max = get_min_max_fn();
-    let (lo, hi) = unsafe { min_max(data.as_ptr(), data.len()) };
-
-    let range = hi - lo;
-    if range < f32::EPSILON {
-        // All values are the same, set to 0
-        for v in data.iter_mut() {
-            *v = 0.0;
-        }
-        return;
-    }
-
-    let inv_range = 1.0 / range;
-    let normalize = get_normalize_fn();
-    unsafe {
-        normalize(data.as_mut_ptr(), data.len(), lo, inv_range);
     }
 }
 
@@ -596,22 +616,199 @@ mod tests {
         assert_eq!(results.len(), 5);
     }
 
+    /// The same query over the same data returns the same documents, even
+    /// when a top-k cut lands inside a group of equal scores. Candidates
+    /// arrive in set iteration order, which is not stable across processes,
+    /// so the ordering has to be total rather than score-only
     #[test]
-    fn test_normalize_array() {
-        let mut data = vec![2.0f32, 4.0, 6.0, 8.0, 10.0];
-        normalize_array(&mut data);
-        assert!((data[0] - 0.0).abs() < 1e-6);
-        assert!((data[4] - 1.0).abs() < 1e-6);
-        assert!((data[2] - 0.5).abs() < 1e-6);
+    fn test_top_k_is_stable_when_scores_tie() {
+        // Every document scores identically, so the cut is entirely inside a
+        // tie group and only the tie-break decides who survives
+        let fts: Vec<(u64, f64)> = (0..200u64).map(|i| (i, 1.0)).collect();
+        let vectors: Vec<(u64, f32)> = (0..200u64).map(|i| (i, 1.0)).collect();
+
+        let first = HybridSearch::linear_combination(&fts, &vectors, 0.5, 10);
+        assert_eq!(first.len(), 10);
+        for _ in 0..16 {
+            let again = HybridSearch::linear_combination(&fts, &vectors, 0.5, 10);
+            assert_eq!(
+                first, again,
+                "a tied top-k must not depend on candidate arrival order"
+            );
+        }
+
+        // And a partial tie: distinct scores order by score, the tied tail
+        // orders by id
+        let mixed: Vec<(u64, f64)> = (0..50u64)
+            .map(|i| (i, if i < 5 { 10.0 - i as f64 } else { 0.0 }))
+            .collect();
+        let ranked = HybridSearch::linear_combination(&mixed, &[], 0.0, 12);
+        let ids: Vec<u64> = ranked.iter().map(|&(id, _)| id).collect();
+        assert_eq!(&ids[..5], &[0, 1, 2, 3, 4], "scored docs rank by score");
+        let tail = &ids[5..];
+        let mut sortedTail = tail.to_vec();
+        sortedTail.sort_unstable();
+        assert_eq!(tail, &sortedTail[..], "the tied tail is ordered by id");
     }
 
+    /// The min/max kernel agrees with a scalar fold over the same values,
+    /// including the tail past the last full SIMD lane
     #[test]
-    fn test_normalize_uniform() {
-        let mut data = vec![5.0f32; 10];
-        normalize_array(&mut data);
-        // All same value, should normalize to 0
-        for &v in &data {
-            assert_eq!(v, 0.0);
+    fn test_min_max_kernel_matches_a_scalar_fold() {
+        let minMax = get_min_max_fn();
+        // Lengths either side of a 4, 8 and 16 lane boundary, so the tail
+        // handling is exercised rather than assumed
+        for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 33, 100] {
+            let data: Vec<f32> = (0..len).map(|i| ((i * 37 % 71) as f32) - 20.0).collect();
+            let (lo, hi) = unsafe { minMax(data.as_ptr(), len) };
+            let expectedLo = data.iter().copied().fold(f32::INFINITY, f32::min);
+            let expectedHi = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(lo, expectedLo, "min at len {len}");
+            assert_eq!(hi, expectedHi, "max at len {len}");
+        }
+    }
+
+    /// The normalize kernel is an affine map, which is what lets the scorer
+    /// use it for both the FTS direction and the inverted vector direction
+    #[test]
+    fn test_normalize_kernel_applies_the_affine_map() {
+        let normalize = get_normalize_fn();
+        for len in [1usize, 3, 8, 17, 64, 100] {
+            let source: Vec<f32> = (0..len).map(|i| i as f32).collect();
+
+            // Ascending: (x - min) / range lands on [0, 1]
+            let mut ascending = source.clone();
+            let range = (len as f32 - 1.0).max(1.0);
+            unsafe { normalize(ascending.as_mut_ptr(), len, 0.0, 1.0 / range) };
+            for (i, &v) in ascending.iter().enumerate() {
+                assert!(
+                    (v - (i as f32 / range)).abs() < 1e-6,
+                    "len {len} index {i} got {v}"
+                );
+            }
+
+            // Descending: a negative scale inverts, which is how a distance
+            // becomes a similarity
+            let mut inverted = source.clone();
+            let top = (len as f32) - 1.0;
+            unsafe { normalize(inverted.as_mut_ptr(), len, top, -1.0 / range) };
+            for (i, &v) in inverted.iter().enumerate() {
+                let want = (top - i as f32) / range;
+                assert!((v - want).abs() < 1e-6, "len {len} index {i} got {v}");
+            }
+        }
+    }
+
+    /// The SIMD scoring path returns what the straightforward scalar
+    /// formulation returns, including for documents present on only one side
+    /// and for the degenerate cases where min-max says nothing
+    #[test]
+    fn test_hybrid_scores_match_the_scalar_reference() {
+        fn reference(
+            fts: &[(u64, f64)],
+            vectors: &[(u64, f32)],
+            alpha: f32,
+            k: usize,
+        ) -> Vec<(u64, f64)> {
+            use std::collections::{HashMap, HashSet};
+            let ftsMap: HashMap<u64, f32> = fts.iter().map(|&(id, s)| (id, s as f32)).collect();
+            let vecMap: HashMap<u64, f32> = vectors.iter().copied().collect();
+            let mut ids: HashSet<u64> = HashSet::new();
+            ids.extend(ftsMap.keys());
+            ids.extend(vecMap.keys());
+            if ids.is_empty() {
+                return Vec::new();
+            }
+            let ftsMin = ftsMap.values().copied().fold(f32::INFINITY, f32::min);
+            let ftsMax = ftsMap.values().copied().fold(f32::NEG_INFINITY, f32::max);
+            let ftsRange = ftsMax - ftsMin;
+            let vecMaxDist = vecMap.values().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut out: Vec<(u64, f64)> = ids
+                .into_iter()
+                .map(|id| {
+                    let f = match ftsMap.get(&id) {
+                        Some(&s) => {
+                            if ftsRange > f32::EPSILON {
+                                (s - ftsMin) / ftsRange
+                            } else if ftsMax > 0.0 {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        None => 0.0,
+                    };
+                    let v = match vecMap.get(&id) {
+                        Some(&d) => {
+                            if vecMaxDist > f32::EPSILON {
+                                1.0 - (d / vecMaxDist)
+                            } else {
+                                1.0
+                            }
+                        }
+                        None => 0.0,
+                    };
+                    (id, (alpha * v + (1.0 - alpha) * f) as f64)
+                })
+                .collect();
+            out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.truncate(k);
+            out
+        }
+
+        let cases: Vec<(Vec<(u64, f64)>, Vec<(u64, f32)>)> = vec![
+            // Overlapping, distinct scores
+            (
+                (0..40).map(|i| (i, (i * 3 % 17) as f64)).collect(),
+                (20..60).map(|i| (i, (i % 11) as f32 * 0.5)).collect(),
+            ),
+            // Disjoint: every document is missing from one side
+            (
+                (0..10).map(|i| (i, i as f64 + 1.0)).collect(),
+                (100..110).map(|i| (i, i as f32 * 0.01)).collect(),
+            ),
+            // Every FTS score equal, which makes the range degenerate
+            (
+                (0..12).map(|i| (i, 7.0)).collect(),
+                (5..15).map(|i| (i, 2.0)).collect(),
+            ),
+            // Every FTS score zero, the other degenerate direction
+            (
+                (0..12).map(|i| (i, 0.0)).collect(),
+                (5..15).map(|i| (i, 2.0)).collect(),
+            ),
+            // Every distance zero, so every vector hit is exact
+            (
+                (0..8).map(|i| (i, i as f64)).collect(),
+                (4..12).map(|i| (i, 0.0)).collect(),
+            ),
+            // One side empty
+            ((0..6).map(|i| (i, i as f64)).collect(), Vec::new()),
+            (Vec::new(), (0..6).map(|i| (i, i as f32)).collect()),
+        ];
+
+        // k is larger than any union here on purpose. Truncating would compare
+        // which members of a tie group each side happened to keep, and with
+        // set iteration feeding an unstable sort that is not a property either
+        // implementation promises. What is being checked is the score.
+        const KEEP_ALL: usize = 1000;
+
+        for (index, (fts, vectors)) in cases.iter().enumerate() {
+            for &alpha in &[0.0f32, 0.35, 0.5, 1.0] {
+                let got = HybridSearch::linear_combination(fts, vectors, alpha, KEEP_ALL);
+                let want = reference(fts, vectors, alpha, KEEP_ALL);
+                assert_eq!(got.len(), want.len(), "case {index} alpha {alpha}");
+                let gotScores: std::collections::HashMap<u64, f64> = got.iter().copied().collect();
+                for (id, wantScore) in want {
+                    let gotScore = gotScores
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("case {index} alpha {alpha} lost doc {id}"));
+                    assert!(
+                        (gotScore - wantScore).abs() < 1e-6,
+                        "case {index} alpha {alpha} doc {id}: {gotScore} vs {wantScore}"
+                    );
+                }
+            }
         }
     }
 }

@@ -1,0 +1,180 @@
+{
+  "id": "2026-08-21_135559_6456b90-local",
+  "date": "2026-08-21 13:56:27Z",
+  "ts": 1787320587,
+  "commit": "6456b90-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Startup": {
+      "cold boot latency (ms)": {
+        "average": 38.658700,
+        "runs": [38.66],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Bootstrap": {
+      "first ReadyForQuery (ms)": {
+        "average": 0.583300,
+        "runs": [0.58],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "schema DDL total (ms)": {
+        "average": 7.891000,
+        "runs": [7.89],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "seed insert (rows/sec)": {
+        "average": 279357.700774,
+        "runs": [279357.70],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "OLTP": {
+      "c1 tps": {
+        "average": 12464.572465,
+        "runs": [12464.57],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c1 p99 us": {
+        "average": 252.000000,
+        "runs": [252.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c4 tps": {
+        "average": 38787.245240,
+        "runs": [38787.25],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c4 p99 us": {
+        "average": 277.000000,
+        "runs": [277.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c16 tps": {
+        "average": 64704.896403,
+        "runs": [64704.90],
+        "target": 30000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c16 p99 us": {
+        "average": 477.000000,
+        "runs": [477.00],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c64 tps": {
+        "average": 63398.605482,
+        "runs": [63398.61],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c64 p99 us": {
+        "average": 1693.000000,
+        "runs": [1693.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c256 tps": {
+        "average": 57209.086237,
+        "runs": [57209.09],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "c256 p99 us": {
+        "average": 8130.000000,
+        "runs": [8130.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Analytics": {
+      "median query us": {
+        "average": 1206.000000,
+        "runs": [1206.00],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Gateway": {
+      "pipeline ops/sec": {
+        "average": 20060985.395603,
+        "runs": [20060985.40],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Shutdown": {
+      "teardown (ms)": {
+        "average": 50.827800,
+        "runs": [50.83],
+        "target": 250.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

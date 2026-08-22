@@ -1,0 +1,17 @@
+# suite:   pipeline
+# run:     2026-08-21_135740_6456b90-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Benchmark: Trigger Dispatch (No Triggers) ===
+  Run 1: 15.42 ns/check
+  Run 2: 15.46 ns/check
+  Run 3: 15.49 ns/check
+  Run 4: 15.44 ns/check
+  Run 5: 15.44 ns/check
+  Latency (ns/check) [FAIL/OK]:
+    Runs: [15.4217, 15.4643, 15.4870, 15.4389, 15.4383]
+    Average: 15.4500 <= 15 (target)
+    Min/Max: 15.4217 / 15.4870, StdDev: 0.0230

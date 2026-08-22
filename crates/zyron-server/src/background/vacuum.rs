@@ -25,6 +25,12 @@ fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
+/// Converts an epoch-microsecond instant to epoch seconds, the unit the
+/// maintenance timestamps in zyron_stat_tables are reported in.
+fn epoch_seconds(micros: u64) -> u64 {
+    micros / 1_000_000
+}
+
 /// Configuration for the vacuum worker.
 #[derive(Debug, Clone)]
 pub struct VacuumWorkerConfig {
@@ -80,6 +86,7 @@ impl VacuumWorker {
         buffer_pool: Arc<BufferPool>,
         _wal: Arc<WalWriter>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
+        table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
         config: VacuumWorkerConfig,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -101,6 +108,7 @@ impl VacuumWorker {
                     &txn_manager,
                     &disk_manager,
                     &buffer_pool,
+                    &table_io_stats,
                     &config,
                     &thread_shutdown,
                     &thread_stats,
@@ -124,11 +132,20 @@ impl VacuumWorker {
         txn_manager: &TransactionManager,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
+        table_io_stats: &zyron_common::TableIOStatsRegistry,
         config: &VacuumWorkerConfig,
         shutdown: &AtomicBool,
         stats: &VacuumStats,
     ) {
         let interval = Duration::from_secs(config.interval_secs);
+        // Per table, the write-activity count at the last completed pass
+        // that ran with no transaction in flight. A table whose count has
+        // not moved since then provably has nothing new to reclaim: every
+        // dead tuple it had was below that pass's horizon and got swept,
+        // and nothing has written since. Its page scan is skipped. Any
+        // active transaction during a pass keeps the table ungated, so an
+        // abort landing after the scan can never be stranded
+        let mut clean_at: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
 
         loop {
             thread::park_timeout(interval);
@@ -140,12 +157,18 @@ impl VacuumWorker {
             debug!("Vacuum cycle starting");
 
             // Determine the horizon: oldest active transaction ID.
-            // Tuples deleted by transactions older than this are safe to reclaim.
+            // Tuples deleted by transactions older than this are safe to
+            // reclaim. The id fence is sampled BEFORE the active set: a
+            // transaction beginning between the two samples then either
+            // appears in the active set or holds an id at or above the
+            // fence, so the horizon can never advance past a transaction
+            // that is still starting, whose deleted versions must survive
+            // in case it aborts
+            let id_fence = txn_manager.next_txn_id();
             let active_txns = txn_manager.active_txn_ids();
-            let oldest_active = if active_txns.is_empty() {
-                txn_manager.next_txn_id()
-            } else {
-                active_txns[0] // already sorted
+            let oldest_active = match active_txns.first() {
+                Some(&oldest) => oldest.min(id_fence),
+                None => id_fence,
             };
 
             // Record a (now, durable LSN) sample so time-based retention can map
@@ -202,6 +225,13 @@ impl VacuumWorker {
                     now_micros,
                 );
                 global_floor = global_floor.min(retention_floor);
+                // The floor above still counts toward the global floor, only
+                // the page scan is skipped for a provably clean table
+                let io = table_io_stats.get_or_create(table_entry.id.0);
+                let writes_before = io.write_activity();
+                if clean_at.get(&table_entry.id.0).copied() == Some(writes_before) {
+                    continue;
+                }
                 match Self::vacuum_table(
                     &table_entry,
                     oldest_active,
@@ -216,13 +246,34 @@ impl VacuumWorker {
                     Ok((reclaimed, pages)) => {
                         total_reclaimed += reclaimed;
                         total_pages += pages;
+                        // Only a pass that reached the end of the table clears
+                        // the dead estimate. A page-capped cycle left dead rows
+                        // behind, so reporting zero would be a lie the next
+                        // cycle has to undo
+                        if config.max_pages_per_cycle == 0
+                            || pages < config.max_pages_per_cycle as u64
+                        {
+                            io.record_vacuum(epoch_seconds(now_micros));
+                            // Writes counted before the scan, so activity
+                            // landing mid-pass reopens the gate next cycle
+                            if active_txns.is_empty() {
+                                clean_at.insert(table_entry.id.0, writes_before);
+                            } else {
+                                clean_at.remove(&table_entry.id.0);
+                            }
+                        } else {
+                            clean_at.remove(&table_entry.id.0);
+                        }
                     }
                     Err(e) => {
                         debug!("Vacuum for table {} failed: {}", table_entry.name, e);
                         full_sweep = false;
+                        clean_at.remove(&table_entry.id.0);
                     }
                 }
             }
+            // Dropped tables leave no gate entries behind
+            clean_at.retain(|id, _| tables.iter().any(|t| t.id.0 == *id));
 
             // Bound the retention clock: keep samples back to the longest finite
             // retention window across tables; unlimited and unset tables need no
@@ -310,7 +361,7 @@ impl VacuumWorker {
         buffer_pool: &Arc<BufferPool>,
         status_map: &zyron_storage::TxnStatusMap,
         retention_floor: u64,
-        btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+        btree: &[zyron_catalog::BTreeIndexSpec],
         btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
     ) -> std::result::Result<(u64, u64), String> {
         let heap_file = HeapFile::new(
@@ -439,7 +490,7 @@ pub fn vacuum_table_immediate(
     buffer_pool: &Arc<BufferPool>,
     status_map: &zyron_storage::TxnStatusMap,
     retention_floor: u64,
-    btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+    btree: &[zyron_catalog::BTreeIndexSpec],
     btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) -> std::result::Result<(u64, u64), String> {
     VacuumWorker::vacuum_table(

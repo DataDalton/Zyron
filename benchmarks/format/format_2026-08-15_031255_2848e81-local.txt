@@ -1,0 +1,319 @@
+# suite:   format
+# run:     2026-08-15_031255_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Arrow IPC write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 2,631,537 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 2,908,634 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 2,933,222 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 2,933,825 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 2,953,913 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 5,856,687 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 5,977,679 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 5,984,243 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 6,124,036 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 6,015,092 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 6,307,497 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 6,614,741 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 6,642,973 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 6,624,381 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 6,671,070 rows/sec
+  rows/sec at batch=10000 [NOT MEASURED, unoptimized build]:
+    Runs: [6,307,497, 6,614,741, 6,642,973, 6,624,381, 6,671,070]
+    Average: 6,572,132 (target >= 1,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Avro write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 279,078 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 294,215 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 295,335 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 293,716 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 284,426 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 346,334 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 348,773 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 344,297 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 346,630 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 347,019 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 353,960 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 355,018 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 353,836 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 351,146 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 352,949 rows/sec
+  rows/sec at batch=10000 [NOT MEASURED, unoptimized build]:
+    Runs: [353,960, 355,018, 353,836, 351,146, 352,949]
+    Average: 353,382 (target >= 300,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== CSV write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 814,290 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 703,860 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 722,199 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 717,642 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 714,964 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 714,911 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 709,207 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 713,656 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 716,554 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 711,709 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 691,940 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 702,099 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 691,993 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 708,588 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 711,526 rows/sec
+  rows/sec at batch=10000 [NOT MEASURED, unoptimized build]:
+    Runs: [691,940, 702,099, 691,993, 708,588, 711,526]
+    Average: 701,229 (target >= 2,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== JSON array write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 230,929 rows/sec (1000 batches x 100 rows)
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 230,784 rows/sec (1000 batches x 100 rows)
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 232,181 rows/sec (1000 batches x 100 rows)
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 232,220 rows/sec (1000 batches x 100 rows)
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 231,931 rows/sec (1000 batches x 100 rows)
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 220,350 rows/sec (100 batches x 1000 rows)
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 221,636 rows/sec (100 batches x 1000 rows)
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 221,803 rows/sec (100 batches x 1000 rows)
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 226,945 rows/sec (100 batches x 1000 rows)
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 231,117 rows/sec (100 batches x 1000 rows)
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 218,985 rows/sec (10 batches x 10000 rows)
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 220,042 rows/sec (10 batches x 10000 rows)
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 219,842 rows/sec (10 batches x 10000 rows)
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 222,200 rows/sec (10 batches x 10000 rows)
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 221,864 rows/sec (10 batches x 10000 rows)
+  rows/sec at batch=10000 [NOT MEASURED, unoptimized build]:
+    Runs: [218,985, 220,042, 219,842, 222,200, 221,864]
+    Average: 220,586 (target >= 1,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== JSON Lines write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 196,449 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 196,100 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 196,550 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 196,738 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 196,450 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 197,343 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 196,623 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 197,161 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 197,094 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 197,133 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 193,851 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 194,278 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 193,898 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 194,392 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 193,905 rows/sec
+  rows/sec at batch=10000 [NOT MEASURED, unoptimized build]:
+    Runs: [193,851, 194,278, 193,898, 194,392, 193,905]
+    Average: 194,065 (target >= 1,500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Parquet write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 157,215 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 158,960 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 157,236 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 158,986 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 160,055 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 306,522 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 309,407 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 310,568 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 308,977 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 309,291 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 236,823 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 235,885 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 236,096 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 236,027 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 236,338 rows/sec
+  rows/sec at batch=10000 [NOT MEASURED, unoptimized build]:
+    Runs: [236,823, 235,885, 236,096, 236,027, 236,338]
+    Average: 236,234 (target >= 500,000, not applied)
+    Re-run with --release for a number worth comparing

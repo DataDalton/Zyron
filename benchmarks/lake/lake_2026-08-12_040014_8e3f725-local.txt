@@ -1,0 +1,101 @@
+# suite:   lake
+# run:     2026-08-12_040014_8e3f725-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Clustering Pass Skip-Rate Gain ===
+  skip rate after a bucket-ordered pass [PASS]: 0.8750 (bound >= 0.5000)
+  Inputs: 8 files, 32768 rows
+  Outputs: 8 files
+  Skip rate: 0.0000 -> 0.8750
+  Cluster pass:
+    Runs: [141,314us]
+    Average: 141,314us (no target set)
+  Rows rewritten:
+    Runs: [231,880 rows/s]
+    Average: 231,880 rows/s (no target set)
+
+=== Transaction Log Under Concurrency ===
+  Writers: 8
+  Commits: 160
+  Retries: 153 (0.9563 per commit)
+  Commit rate:
+    Runs: [990.5630 commits/s]
+    Average: 990.5630 commits/s (no target set)
+  Retries:
+    Runs: [0.9563 per commit]
+    Average: 0.9563 per commit (no target set)
+
+=== Refused Clustering Pass Is Inert ===
+  Candidate: order by bucket, on files already ordered by bucket
+  Expected: refused, since it cannot improve the skip rate
+  Gate decision [PASS]: refused, BelowThreshold { delta: 0.0, required: 0.05 }
+  Active file set [PASS]: unchanged, 4 files, log still at version 5
+
+=== Data File Scan Throughput ===
+  Rows per data file: 16384
+  Scan throughput:
+    Runs: [159,688,109 rows/s, 166,843,177 rows/s, 166,504,065 rows/s, 169,431,231 rows/s, 167,697,032 rows/s]
+    Average: 166,032,723 rows/s (no target set)
+    Min/Max: 159,688,109 rows/s / 169,431,231 rows/s, StdDev: 3,330,252 rows/s
+
+=== File Pruning Effectiveness ===
+  Files in manifest: 20000
+  point predicate files pruned (fraction) [PASS]: 1.0000 (bound >= 0.9999)
+  strided predicate files pruned (fraction) [PASS]: 0.9375 (bound >= 0.9300)
+
+=== Log Head and Manifest Resolution ===
+  Head read:
+    Runs: [4.8240ns, 4.8250ns, 4.8230ns, 4.8810ns, 4.8140ns]
+    Average: 4.8334ns (no target set)
+    Min/Max: 4.8140ns / 4.8810ns, StdDev: 0.0241ns
+  Latest manifest (cached):
+    Runs: [372.4000ns, 371.8000ns, 354.9000ns, 354.7000ns, 355.9000ns]
+    Average: 361.9400ns (no target set)
+    Min/Max: 354.7000ns / 372.4000ns, StdDev: 8.3077ns
+  Prune index build (cold):
+    Runs: [67.2000us]
+    Average: 67.2000us (no target set)
+  Prune index at version (cached):
+    Runs: [381.5000ns, 364.4000ns, 360.5000ns, 372.1000ns, 362.2000ns]
+    Average: 368.1400ns (no target set)
+    Min/Max: 360.5000ns / 381.5000ns, StdDev: 7.7693ns
+
+=== Prune Index Sweep vs Exact Answer ===
+  Files in manifest: 20000
+  Prune index build:
+    Runs: [4,519us, 3,405us, 3,214us, 3,098us, 3,117us]
+    Average: 3,471us (no target set)
+    Min/Max: 3,098us / 4,519us, StdDev: 535.4872us
+  point sweep over 20000 files:
+    Runs: [183.4000us, 165.5000us, 165.1000us, 165us, 165us]
+    Average: 168.8000us (no target set)
+    Min/Max: 165us / 183.4000us, StdDev: 7.3023us
+  range sweep over 20000 files:
+    Runs: [166.7000us, 165.2000us, 165us, 169.3000us, 165.3000us]
+    Average: 166.3000us (no target set)
+    Min/Max: 165us / 169.3000us, StdDev: 1.6162us
+  strided sweep over 20000 files:
+    Runs: [166.2000us, 207.5000us, 188.4000us, 171.9000us, 165us]
+    Average: 179.8000us (no target set)
+    Min/Max: 165us / 207.5000us, StdDev: 16.1720us
+
+=== Zone Map Row Rejection ===
+  zone map rows rejected (fraction) [PASS]: 1 (bound >= 1)
+  Zone map rejection:
+    Runs: [31.8000us, 19.6000us, 18.3000us, 17.9000us, 18.1000us]
+    Average: 21.1400us (no target set)
+    Min/Max: 17.9000us / 31.8000us, StdDev: 5.3631us
+  Full column decode:
+    Runs: [215.1000us, 163us, 156.4000us, 155.2000us, 156us]
+    Average: 169.1400us (no target set)
+    Min/Max: 155.2000us / 215.1000us, StdDev: 23.1487us

@@ -22,6 +22,7 @@ pub mod encryption;
 pub mod external_credentials;
 pub mod governance;
 pub mod heap_storage;
+pub mod hmac_sha2;
 pub mod ip_management;
 pub mod k8s_auth;
 pub mod masking;
@@ -60,8 +61,8 @@ pub use column_security::{MaskingPolicy, MaskingPolicyStore};
 pub use context::SecurityContext;
 pub use credentials::{
     ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, PasswordCredential, ScramSecret,
-    TotpCredential, md5_password_credential, parse_scram_secret, scram_sha256_secret,
-    scram_sha256_secret_with_salt,
+    TotpCredential, md5_password_credential, parse_scram_secret, pbkdf2_sha256,
+    scram_sha256_secret, scram_sha256_secret_with_salt,
 };
 pub use encryption::{
     ColumnEncryption, EncryptionAlgorithm, EncryptionStore, KeyStore, LocalKeyStore,

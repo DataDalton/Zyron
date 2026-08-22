@@ -6,7 +6,7 @@
 use crate::ml::decisionTree::{TreeBuildConfig, predictTree, trainTree};
 use crate::ml::f64Kernels::sigmoid;
 use crate::ml::{
-    ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TreeNode, TrainingData,
+    ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData, TreeNode,
 };
 use zyron_common::error::{Result, ZyronError};
 
@@ -95,7 +95,8 @@ pub fn train(config: &ModelConfig, data: &TrainingData) -> Result<TrainedModel> 
     if regression {
         model.metrics = computeRegressionMetrics(baseScore, learningRate, &trees, data).intoMap();
     } else {
-        model.metrics = computeClassificationMetrics(baseScore, learningRate, &trees, data).intoMap();
+        model.metrics =
+            computeClassificationMetrics(baseScore, learningRate, &trees, data).intoMap();
     }
     Ok(model)
 }
@@ -151,7 +152,11 @@ fn computeRegressionMetrics(
     let mut m = ModelMetrics::default();
     m.rmse = Some((ssRes / n as f64).sqrt());
     m.mae = Some(absSum / n as f64);
-    m.rSquared = Some(if ssTot > 0.0 { 1.0 - ssRes / ssTot } else { 0.0 });
+    m.rSquared = Some(if ssTot > 0.0 {
+        1.0 - ssRes / ssTot
+    } else {
+        0.0
+    });
     m
 }
 
@@ -195,7 +200,11 @@ fn computeClassificationMetrics(
     let r = if rd > 0.0 { tp as f64 / rd } else { 0.0 };
     m.precision = Some(p);
     m.recall = Some(r);
-    m.f1Score = Some(if p + r > 0.0 { 2.0 * p * r / (p + r) } else { 0.0 });
+    m.f1Score = Some(if p + r > 0.0 {
+        2.0 * p * r / (p + r)
+    } else {
+        0.0
+    });
     m.logLoss = Some(logLoss / n as f64);
     m
 }

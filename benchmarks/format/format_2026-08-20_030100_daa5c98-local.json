@@ -1,0 +1,69 @@
+{
+  "id": "2026-08-20_030100_daa5c98-local",
+  "date": "2026-08-20 03:01:03Z",
+  "ts": 1787194863,
+  "commit": "daa5c98-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Arrow IPC Write": {
+      "rows/sec at batch=10000": {
+        "average": 21294001.418078,
+        "runs": [20301683.01, 22105554.02, 20887292.17, 20872469.21, 22303008.68],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CSV Write": {
+      "rows/sec at batch=10000": {
+        "average": 6283872.274246,
+        "runs": [6192027.15, 6341596.43, 6340269.59, 6294296.11, 6251172.09],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Avro Write": {
+      "rows/sec at batch=10000": {
+        "average": 1829166.139325,
+        "runs": [1813933.91, 1832367.68, 1839066.93, 1833651.17, 1826811.01],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parquet Write": {
+      "rows/sec at batch=10000": {
+        "average": 7368089.249133,
+        "runs": [6675879.38, 7224598.31, 7912393.97, 6915103.28, 8112471.30],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSON Write": {
+      "rows/sec at batch=10000": {
+        "average": 2274185.565815,
+        "runs": [1974778.13, 2014877.86, 2364518.97, 2587717.14, 2429035.72],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSONL Write": {
+      "rows/sec at batch=10000": {
+        "average": 3022073.825860,
+        "runs": [3001299.56, 3021522.30, 3010615.43, 3037279.57, 3039652.26],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

@@ -62,12 +62,151 @@ impl ExplainFormat {
 // Actual metrics
 // ---------------------------------------------------------------------------
 
+/// Auxiliary counter slots an operator may fill. Fixed width so the
+/// executor's per-operator metrics stay allocation free on the hot path;
+/// what each slot means depends on the operator and is resolved at render
+/// time by `aux_labels`
+pub const ACTUAL_AUX_SLOTS: usize = 6;
+
+/// Elapsed nanoseconds split into whole milliseconds and thousandths, the two
+/// integers the renderers print as `{}.{:03}`.
+///
+/// The digits match `{:.3}` applied to the same count as an f64 millisecond
+/// value, exactly, including where the float's representation error decides the
+/// last place. `{:.3}` rounds the true value of the float to three places with
+/// ties to even, and that value is `m * 2^e` for the integers sitting in the
+/// float's bits, so the rounding is a shift and a tie test rather than a decimal
+/// conversion. The conversion is where the float formatter spends its time.
+///
+/// The divide stays, because which side of a tie the quotient lands on is a
+/// property of the division. Scaling the integer nanosecond count instead would
+/// change printed digits at an exact half microsecond
+#[inline]
+pub fn millis_parts(ns: u64) -> (u64, u64) {
+    let thousandths = millis_thousandths(ns);
+    (thousandths / 1_000, thousandths % 1_000)
+}
+
+/// Thousandths of a millisecond, rounded the way `{:.3}` rounds.
+#[inline]
+fn millis_thousandths(ns: u64) -> u64 {
+    let value = ns as f64 / 1_000_000.0;
+    let bits = value.to_bits();
+    let biased_exponent = ((bits >> 52) & 0x7FF) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+
+    // A subnormal carries no implicit leading one and sits at a fixed exponent
+    let (mantissa, exponent) = if biased_exponent == 0 {
+        (fraction, -1074i32)
+    } else {
+        (fraction | (1u64 << 52), biased_exponent - 1075)
+    };
+    if mantissa == 0 {
+        return 0;
+    }
+
+    // Under 2^63, so scaling by a thousand still needs only a u128 to stay exact
+    let scaled = mantissa as u128 * 1_000u128;
+
+    if exponent >= 0 {
+        // A u64 nanosecond count reaches about 1.8e13 milliseconds, far under
+        // the 2^52 needed to land here. Kept so the function is total
+        return u64::try_from(scaled << (exponent as u32).min(127)).unwrap_or(u64::MAX);
+    }
+
+    let shift = exponent.unsigned_abs();
+    if shift >= 128 {
+        return 0;
+    }
+    let quotient = scaled >> shift;
+    let remainder = scaled & ((1u128 << shift) - 1);
+    let half = 1u128 << (shift - 1);
+    let rounded = if remainder > half || (remainder == half && quotient & 1 == 1) {
+        quotient + 1
+    } else {
+        quotient
+    };
+    u64::try_from(rounded).unwrap_or(u64::MAX)
+}
+
 /// Runtime metrics collected during EXPLAIN ANALYZE execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ActualMetrics {
     pub rows: u64,
-    pub elapsed_ms: f64,
+    pub elapsed_ns: u64,
     pub batches: u64,
+    /// Operator-specific counters, zero when the operator fills none
+    pub aux: [u64; ACTUAL_AUX_SLOTS],
+}
+
+/// What one executed operator measured, as a tree mirroring the plan.
+///
+/// A tree rather than a flat list on purpose. Matching measurements to plan
+/// nodes by pre-order position assumes the two trees have identical shape,
+/// and when they do not the result is not missing numbers but a join's
+/// timing reported against a scan. Merging structurally, by name at each
+/// level, attaches what matches and leaves the rest empty.
+#[derive(Debug, Clone, Default)]
+pub struct NodeMetrics {
+    pub name: String,
+    pub rows: u64,
+    pub elapsed_ns: u64,
+    pub batches: u64,
+    pub aux: [u64; ACTUAL_AUX_SLOTS],
+    pub children: Vec<NodeMetrics>,
+}
+
+/// Labels for an operator's auxiliary counters, empty for a slot the
+/// operator does not fill. Presentation lives here so the executor's
+/// counters stay a fixed-width array of atomics
+pub fn aux_labels(operator_name: &str) -> [&'static str; ACTUAL_AUX_SLOTS] {
+    match operator_name {
+        "LakeScan" | "LakeDelete" | "LakeUpdate" => [
+            "files_considered",
+            "files_pruned",
+            "bytes_considered",
+            "bytes_pruned",
+            // Zero index files read means the scan answered the predicate
+            // from the data files, either because no index applied or
+            // because probing one would have read more than it saved
+            "index_files_read",
+            "index_rows_addressed",
+        ],
+        // A foreign scan's cost is the peer's answer, so what it reports is
+        // how much came back and how long the round trip took
+        "ForeignScan" => ["rows_fetched", "remote_ms", "", "", "", ""],
+        _ => ["", "", "", "", "", ""],
+    }
+}
+
+/// Files a lake scan opened, and hundredths of a percent of the files
+/// clustering let it skip.
+///
+/// Both come from counters the operator already fills, so reporting them
+/// costs no slot on the hot path and no extra work in the scan. The rate is
+/// an integer scaled by ten thousand rather than a float, because the
+/// renderers avoid float formatting: the pair prints as `{}.{:02}`.
+///
+/// None when the operator keeps no file counters, or when it considered no
+/// file, where a skip rate would be a division by zero rather than a
+/// perfect score
+#[inline]
+pub fn clustering_skip_parts(
+    operator_name: &str,
+    aux: &[u64; ACTUAL_AUX_SLOTS],
+) -> Option<(u64, u64, u64)> {
+    if !matches!(operator_name, "LakeScan" | "LakeDelete" | "LakeUpdate") {
+        return None;
+    }
+    let considered = aux[0];
+    if considered == 0 {
+        return None;
+    }
+    // A pruned count above what was considered would be a counter bug, and
+    // clamping keeps the rate inside its range rather than printing it
+    let pruned = aux[1].min(considered);
+    let hundredths = (pruned as u128 * 10_000u128 / considered as u128) as u64;
+    Some((considered - pruned, hundredths / 100, hundredths % 100))
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +226,23 @@ pub struct ExplainNode {
     pub actual_metrics: Option<ActualMetrics>,
     /// Child operator nodes.
     pub children: Vec<ExplainNode>,
+}
+
+/// Records the time-travel qualifier a scan reads at, so a plan says which
+/// version answered rather than only which access path ran.
+fn push_as_of(details: &mut Vec<(String, String)>, as_of: &Option<crate::logical::AsOfTarget>) {
+    match as_of {
+        Some(crate::logical::AsOfTarget::Version(v)) => {
+            details.push(("as_of_version".to_string(), v.to_string()))
+        }
+        Some(crate::logical::AsOfTarget::Timestamp(us)) => {
+            details.push(("as_of_timestamp_us".to_string(), us.to_string()))
+        }
+        Some(crate::logical::AsOfTarget::Branch(name)) => {
+            details.push(("as_of_branch".to_string(), name.clone()))
+        }
+        None => {}
+    }
 }
 
 impl ExplainNode {
@@ -138,6 +294,157 @@ impl ExplainNode {
                     children: Vec::new(),
                 }
             }
+            PhysicalPlan::LakeScan {
+                table_id,
+                columns,
+                predicate,
+                lowered,
+                cluster_fit,
+                bloom_redundant,
+                as_of,
+                cost,
+            } => {
+                let mut details = vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("columns".to_string(), format!("{}", columns.len())),
+                    ("store".to_string(), "lake".to_string()),
+                ];
+                if predicate.is_some() {
+                    details.push(("filter".to_string(), "yes".to_string()));
+                    // Whether the filter skips whole data files, which is
+                    // the difference between reading one file and all of them
+                    details.push((
+                        "file_pruning".to_string(),
+                        if lowered.is_some() {
+                            "exact".to_string()
+                        } else {
+                            "none".to_string()
+                        },
+                    ));
+                    // How much the table's layout does for this predicate.
+                    // A scan that prunes exactly and still reads every file
+                    // is usually a predicate that reached no cluster key,
+                    // and the counters alone do not say which
+                    if let Some(fit) = cluster_fit {
+                        details.push(("cluster_fit".to_string(), fit.render()));
+                    }
+                }
+                // A filter the operator asked for and the writer did not
+                // build. Saying nothing would leave them reading a plan
+                // that quietly ignores what they declared
+                if !bloom_redundant.is_empty() {
+                    details.push((
+                        "bloom_redundant".to_string(),
+                        format!(
+                            "{} (already resolved by the cluster key, no filter built)",
+                            bloom_redundant.join(", ")
+                        ),
+                    ));
+                }
+                match as_of {
+                    Some(crate::logical::AsOfTarget::Version(v)) => {
+                        details.push(("as_of_version".to_string(), v.to_string()))
+                    }
+                    Some(crate::logical::AsOfTarget::Timestamp(us)) => {
+                        details.push(("as_of_timestamp_us".to_string(), us.to_string()))
+                    }
+                    Some(crate::logical::AsOfTarget::Branch(name)) => {
+                        details.push(("as_of_branch".to_string(), name.clone()))
+                    }
+                    None => {}
+                }
+                Self {
+                    operator_name: "LakeScan".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
+            PhysicalPlan::ForeignScan {
+                table_id,
+                columns,
+                residual,
+                request,
+                cost,
+            } => {
+                let mut details = vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("columns".to_string(), format!("{}", columns.len())),
+                    ("peer".to_string(), request.peer.clone()),
+                    ("remote_table".to_string(), request.table.clone()),
+                ];
+                // Where each half of the filter runs. A predicate the peer
+                // applies costs one round trip of narrower rows; one left
+                // here costs the full result crossing the wire first, so
+                // the split is the number to look at
+                match &request.predicate {
+                    Some(sql) => details.push(("pushed_filter".to_string(), sql.clone())),
+                    None => details.push(("pushed_filter".to_string(), "none".to_string())),
+                }
+                if residual.is_some() {
+                    details.push(("local_filter".to_string(), "yes".to_string()));
+                }
+                if let Some(limit) = request.limit {
+                    details.push(("pushed_limit".to_string(), limit.to_string()));
+                }
+                Self {
+                    operator_name: "ForeignScan".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
+            PhysicalPlan::LakeDelete {
+                table_id,
+                predicate,
+                sql,
+                cost,
+                ..
+            } => Self {
+                operator_name: "LakeDelete".to_string(),
+                details: vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    (
+                        "predicate".to_string(),
+                        if predicate.is_some() {
+                            sql.clone()
+                        } else {
+                            "all rows".to_string()
+                        },
+                    ),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: Vec::new(),
+            },
+            PhysicalPlan::LakeUpdate {
+                table_id,
+                assignments,
+                predicate,
+                sql,
+                child,
+                cost,
+                ..
+            } => Self {
+                operator_name: "LakeUpdate".to_string(),
+                details: vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("assignments".to_string(), format!("{}", assignments.len())),
+                    (
+                        "predicate".to_string(),
+                        if predicate.is_some() {
+                            sql.clone()
+                        } else {
+                            "all rows".to_string()
+                        },
+                    ),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: vec![Self::from_physical_plan(child)],
+            },
             PhysicalPlan::ColumnarMetadataAggregate {
                 table_id,
                 specs,
@@ -354,6 +661,30 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: vec![Self::from_physical_plan(child)],
             },
+            PhysicalPlan::LockRows {
+                table_id,
+                mode,
+                wait,
+                cap,
+                child,
+                cost,
+            } => {
+                let mut details = vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("mode".to_string(), format!("{:?}", mode)),
+                    ("wait".to_string(), format!("{:?}", wait)),
+                ];
+                if let Some(c) = cap {
+                    details.push(("cap".to_string(), format!("{c}")));
+                }
+                Self {
+                    operator_name: "LockRows".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: vec![Self::from_physical_plan(child)],
+                }
+            }
             PhysicalPlan::SetOp {
                 op,
                 all,
@@ -489,43 +820,54 @@ impl ExplainNode {
                 table_id,
                 index_id,
                 columns,
+                as_of,
                 cost,
                 ..
-            } => Self {
-                operator_name: "FulltextScan".to_string(),
-                details: vec![
+            } => {
+                let mut details = vec![
                     ("table_id".to_string(), format!("{}", table_id.0)),
                     ("index_id".to_string(), format!("{}", index_id.0)),
                     ("columns".to_string(), format!("{}", columns.len())),
-                ],
-                estimated_cost: Some(*cost),
-                actual_metrics: None,
-                children: Vec::new(),
-            },
+                ];
+                push_as_of(&mut details, as_of);
+                Self {
+                    operator_name: "FulltextScan".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
             PhysicalPlan::VectorScan {
                 table_id,
                 index_id,
                 columns,
+                as_of,
                 cost,
                 k,
                 ..
-            } => Self {
-                operator_name: "VectorScan".to_string(),
-                details: vec![
+            } => {
+                let mut details = vec![
                     ("table_id".to_string(), format!("{}", table_id.0)),
                     ("index_id".to_string(), format!("{}", index_id.0)),
                     ("columns".to_string(), format!("{}", columns.len())),
                     ("k".to_string(), format!("{}", k)),
-                ],
-                estimated_cost: Some(*cost),
-                actual_metrics: None,
-                children: Vec::new(),
-            },
+                ];
+                push_as_of(&mut details, as_of);
+                Self {
+                    operator_name: "VectorScan".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
             PhysicalPlan::SpatialScan {
                 table_id,
                 index_id,
                 columns,
                 kind,
+                as_of,
                 cost,
                 ..
             } => {
@@ -536,14 +878,16 @@ impl ExplainNode {
                     }
                     super::physical::SpatialScanKind::Range { .. } => "range".to_string(),
                 };
+                let mut details = vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("index_id".to_string(), format!("{}", index_id.0)),
+                    ("columns".to_string(), format!("{}", columns.len())),
+                    ("kind".to_string(), kind_str),
+                ];
+                push_as_of(&mut details, as_of);
                 Self {
                     operator_name: "SpatialScan".to_string(),
-                    details: vec![
-                        ("table_id".to_string(), format!("{}", table_id.0)),
-                        ("index_id".to_string(), format!("{}", index_id.0)),
-                        ("columns".to_string(), format!("{}", columns.len())),
-                        ("kind".to_string(), kind_str),
-                    ],
+                    details,
                     estimated_cost: Some(*cost),
                     actual_metrics: None,
                     children: Vec::new(),
@@ -601,24 +945,29 @@ impl ExplainNode {
 
     /// Merges actual execution metrics into this node and its children.
     /// Metrics are matched by tree position (pre-order traversal).
-    pub fn merge_metrics_flat(&mut self, metrics: &[(u64, f64, u64)]) {
-        let mut idx = 0;
-        self.merge_metrics_recursive(metrics, &mut idx);
-    }
-
-    fn merge_metrics_recursive(&mut self, metrics: &[(u64, f64, u64)], idx: &mut usize) {
-        if *idx < metrics.len() {
-            let (rows, elapsed_ms, batches) = metrics[*idx];
-            self.actual_metrics = Some(ActualMetrics {
-                rows,
-                elapsed_ms,
-                batches,
-            });
-            *idx += 1;
+    /// Attaches measured metrics to the plan nodes they belong to.
+    ///
+    /// Walks both trees together and attaches only where the operator names
+    /// agree. A subtree the executor shaped differently from the plan, which
+    /// happens whenever an operator expands into more than one or collapses
+    /// into none, is left without actuals rather than given someone else's.
+    /// Returns how many nodes were attached, so a caller can tell a plan
+    /// that measured nothing from one that measured everything.
+    pub fn merge_metrics(&mut self, metrics: &NodeMetrics) -> usize {
+        if self.operator_name != metrics.name {
+            return 0;
         }
-        for child in &mut self.children {
-            child.merge_metrics_recursive(metrics, idx);
+        self.actual_metrics = Some(ActualMetrics {
+            rows: metrics.rows,
+            elapsed_ns: metrics.elapsed_ns,
+            batches: metrics.batches,
+            aux: metrics.aux,
+        });
+        let mut attached = 1;
+        for (child, child_metrics) in self.children.iter_mut().zip(metrics.children.iter()) {
+            attached += child.merge_metrics(child_metrics);
         }
+        attached
     }
 
     /// Renders the explain output in the specified format.
@@ -635,9 +984,26 @@ impl ExplainNode {
     // -----------------------------------------------------------------------
 
     fn to_text(&self, options: &ExplainOptions) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(self.render_capacity(96));
         self.write_text_node(&mut output, options, 0);
         output
+    }
+
+    /// Nodes in this subtree, so a render reserves its buffer once instead of
+    /// growing it by doubling. The doubling also made ANALYZE look more
+    /// expensive than it is, since its longer output crossed one more growth
+    /// step than the same plan rendered without it
+    fn node_count(&self) -> usize {
+        1 + self
+            .children
+            .iter()
+            .map(|child| child.node_count())
+            .sum::<usize>()
+    }
+
+    /// Buffer size to reserve for a render, at `per_node` bytes a node.
+    fn render_capacity(&self, per_node: usize) -> usize {
+        self.node_count() * per_node
     }
 
     fn write_text_node(&self, output: &mut String, options: &ExplainOptions, depth: usize) {
@@ -672,10 +1038,11 @@ impl ExplainNode {
         // otherwise shows up as a multi-percent rendering overhead
         match (options.analyze, &self.actual_metrics, options.timing) {
             (true, Some(actual), true) => {
+                let (ms, frac) = millis_parts(actual.elapsed_ns);
                 let _ = writeln!(
                     output,
-                    " (actual rows={} time={:.3}ms)",
-                    actual.rows, actual.elapsed_ms
+                    " (actual rows={} time={}.{:03}ms)",
+                    actual.rows, ms, frac
                 );
             }
             (true, Some(actual), false) => {
@@ -683,6 +1050,39 @@ impl ExplainNode {
             }
             _ => {
                 let _ = writeln!(output);
+            }
+        }
+
+        // Operator-specific counters on their own line, so the pruning a
+        // scan actually did is visible rather than inferable from the row
+        // count it produced
+        if options.analyze {
+            if let Some(actual) = &self.actual_metrics {
+                let labels = aux_labels(&self.operator_name);
+                if labels.iter().any(|l| !l.is_empty()) {
+                    let mut line = String::new();
+                    for (label, value) in labels.iter().zip(actual.aux.iter()) {
+                        if label.is_empty() {
+                            continue;
+                        }
+                        if !line.is_empty() {
+                            line.push(' ');
+                        }
+                        let _ = write!(line, "{}={}", label, value);
+                    }
+                    if let Some((read, pct, frac)) =
+                        clustering_skip_parts(&self.operator_name, &actual.aux)
+                    {
+                        let _ = write!(
+                            line,
+                            " files_actually_read={} clustering_skip_rate={}.{:02}",
+                            read, pct, frac
+                        );
+                    }
+                    if !line.is_empty() {
+                        let _ = writeln!(output, "{}  {}", indent, line);
+                    }
+                }
             }
         }
 
@@ -696,7 +1096,7 @@ impl ExplainNode {
     // -----------------------------------------------------------------------
 
     fn to_json(&self, options: &ExplainOptions) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(self.render_capacity(256));
         self.write_json_node(&mut output, options, 0);
         let _ = writeln!(output);
         output
@@ -736,11 +1136,8 @@ impl ExplainNode {
             if let Some(actual) = &self.actual_metrics {
                 let _ = writeln!(output, "{}  \"actual_rows\": {},", pad, actual.rows);
                 if options.timing {
-                    let _ = writeln!(
-                        output,
-                        "{}  \"actual_time_ms\": {:.3},",
-                        pad, actual.elapsed_ms
-                    );
+                    let (ms, frac) = millis_parts(actual.elapsed_ns);
+                    let _ = writeln!(output, "{}  \"actual_time_ms\": {}.{:03},", pad, ms, frac);
                 }
             }
         }
@@ -768,7 +1165,7 @@ impl ExplainNode {
     // -----------------------------------------------------------------------
 
     fn to_yaml(&self, options: &ExplainOptions) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(self.render_capacity(192));
         self.write_yaml_node(&mut output, options, 0);
         output
     }
@@ -792,7 +1189,22 @@ impl ExplainNode {
             if let Some(actual) = &self.actual_metrics {
                 let _ = writeln!(output, "{}actual_rows: {}", pad, actual.rows);
                 if options.timing {
-                    let _ = writeln!(output, "{}actual_time_ms: {:.3}", pad, actual.elapsed_ms);
+                    let (ms, frac) = millis_parts(actual.elapsed_ns);
+                    let _ = writeln!(output, "{}actual_time_ms: {}.{:03}", pad, ms, frac);
+                }
+                for (label, value) in aux_labels(&self.operator_name)
+                    .iter()
+                    .zip(actual.aux.iter())
+                {
+                    if !label.is_empty() {
+                        let _ = writeln!(output, "{}{}: {}", pad, label, value);
+                    }
+                }
+                if let Some((read, pct, frac)) =
+                    clustering_skip_parts(&self.operator_name, &actual.aux)
+                {
+                    let _ = writeln!(output, "{}files_actually_read: {}", pad, read);
+                    let _ = writeln!(output, "{}clustering_skip_rate: {}.{:02}", pad, pct, frac);
                 }
             }
         }
@@ -815,11 +1227,9 @@ impl ExplainNode {
                     if let Some(actual) = &child.actual_metrics {
                         let _ = writeln!(output, "{}    actual_rows: {}", pad, actual.rows);
                         if options.timing {
-                            let _ = writeln!(
-                                output,
-                                "{}    actual_time_ms: {:.3}",
-                                pad, actual.elapsed_ms
-                            );
+                            let (ms, frac) = millis_parts(actual.elapsed_ns);
+                            let _ =
+                                writeln!(output, "{}    actual_time_ms: {}.{:03}", pad, ms, frac);
                         }
                     }
                 }
@@ -841,6 +1251,43 @@ impl ExplainNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every digit the renderers print has to match what `{:.3}` printed for
+    /// the same count as an f64 millisecond value. The cases that matter are
+    /// exact half microseconds, where the answer is decided by which side of
+    /// the tie the division landed on rather than by any rounding rule
+    #[test]
+    fn millis_parts_matches_float_formatting_exactly() {
+        let check = |ns: u64| {
+            let (ms, frac) = millis_parts(ns);
+            assert_eq!(
+                format!("{}.{:03}", ms, frac),
+                format!("{:.3}", ns as f64 / 1_000_000.0),
+                "ns={ns}"
+            );
+        };
+
+        // Every nanosecond across the first two milliseconds, covering every
+        // tie and every carry in that range
+        for ns in 0u64..2_000_000 {
+            check(ns);
+        }
+        // Exact half microseconds much further out, where float spacing is
+        // coarser and ties resolve the other way
+        for k in 0u64..100_000 {
+            check(k * 1_000 + 500);
+            check(k * 1_000_000 + 500);
+        }
+        // Magnitudes up to the width of the field itself
+        for shift in 0..64 {
+            let base = 1u64 << shift;
+            for delta in [0u64, 1, 499, 500, 501, 999] {
+                check(base.saturating_add(delta));
+                check(base.saturating_sub(delta));
+            }
+        }
+        check(u64::MAX);
+    }
 
     fn make_simple_plan() -> ExplainNode {
         ExplainNode {
@@ -908,8 +1355,9 @@ mod tests {
         let mut node = make_simple_plan();
         node.actual_metrics = Some(ActualMetrics {
             rows: 982,
-            elapsed_ms: 3.2,
+            elapsed_ns: 3_200_000,
             batches: 5,
+            ..Default::default()
         });
         let options = ExplainOptions {
             analyze: true,
@@ -944,11 +1392,34 @@ mod tests {
         assert!(yaml.contains("children:"));
     }
 
+    fn measured(name: &str, rows: u64, children: Vec<NodeMetrics>) -> NodeMetrics {
+        NodeMetrics {
+            name: name.to_string(),
+            rows,
+            elapsed_ns: 1_000_000,
+            batches: 2,
+            aux: [0; ACTUAL_AUX_SLOTS],
+            children,
+        }
+    }
+
     #[test]
-    fn test_merge_metrics() {
+    fn test_merge_metrics_attaches_every_matching_node() {
         let mut node = make_simple_plan();
-        let metrics = vec![(1000, 5.0, 10), (5000, 3.0, 8), (200, 1.5, 4)];
-        node.merge_metrics_flat(&metrics);
+        let names: Vec<String> = node
+            .children
+            .iter()
+            .map(|c| c.operator_name.clone())
+            .collect();
+        let metrics = measured(
+            &node.operator_name,
+            1000,
+            vec![
+                measured(&names[0], 5000, vec![]),
+                measured(&names[1], 200, vec![]),
+            ],
+        );
+        assert_eq!(node.merge_metrics(&metrics), 3);
         assert_eq!(node.actual_metrics.as_ref().map(|m| m.rows), Some(1000));
         assert_eq!(
             node.children[0].actual_metrics.as_ref().map(|m| m.rows),
@@ -958,6 +1429,66 @@ mod tests {
             node.children[1].actual_metrics.as_ref().map(|m| m.rows),
             Some(200)
         );
+    }
+
+    /// The reason the merge is structural: a shape the executor built
+    /// differently must leave a node without actuals rather than give it
+    /// another operator's numbers
+    #[test]
+    fn test_a_shape_mismatch_attaches_nothing_rather_than_the_wrong_numbers() {
+        let mut node = make_simple_plan();
+        let metrics = measured("SomeOtherOperator", 1000, vec![]);
+        assert_eq!(node.merge_metrics(&metrics), 0);
+        assert!(node.actual_metrics.is_none());
+
+        // A root that matches with children that do not: the root gets its
+        // own numbers and the children get none
+        let mut node = make_simple_plan();
+        let metrics = measured(
+            &node.operator_name,
+            1000,
+            vec![measured("Mismatch", 5000, vec![])],
+        );
+        assert_eq!(node.merge_metrics(&metrics), 1);
+        assert_eq!(node.actual_metrics.as_ref().map(|m| m.rows), Some(1000));
+        assert!(node.children[0].actual_metrics.is_none());
+        assert!(node.children[1].actual_metrics.is_none());
+    }
+
+    /// Auxiliary counters render under the label their operator gives them
+    #[test]
+    fn test_lake_scan_reports_its_pruning_counters() {
+        let mut node = ExplainNode {
+            operator_name: "LakeScan".to_string(),
+            details: Vec::new(),
+            estimated_cost: None,
+            actual_metrics: None,
+            children: Vec::new(),
+        };
+        let mut metrics = measured("LakeScan", 12, vec![]);
+        metrics.aux = [40, 37, 4_096_000, 3_788_800, 1, 6];
+        assert_eq!(node.merge_metrics(&metrics), 1);
+        let text = node.render(&ExplainOptions {
+            analyze: true,
+            ..Default::default()
+        });
+        assert!(text.contains("files_considered=40"), "{text}");
+        assert!(text.contains("files_pruned=37"), "{text}");
+        assert!(text.contains("bytes_pruned=3788800"), "{text}");
+        // Which access path answered, so a plan distinguishes a scan whose
+        // statistics were enough from one an index addressed
+        assert!(text.contains("index_files_read=1"), "{text}");
+        assert!(text.contains("index_rows_addressed=6"), "{text}");
+
+        // An operator that fills no aux slot prints none of them
+        let mut plain = make_simple_plan();
+        let plain_metrics = measured(&plain.operator_name, 5, vec![]);
+        plain.merge_metrics(&plain_metrics);
+        let text = plain.render(&ExplainOptions {
+            analyze: true,
+            ..Default::default()
+        });
+        assert!(!text.contains("files_considered"));
     }
 
     #[test]

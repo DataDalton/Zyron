@@ -14,16 +14,40 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use zyron_common::{FX_K, IdentityBuildHasher, fx_finalize, fx_mix};
+use zyron_common::{FX_K, IdentityBuildHasher, fx_mix, mix_finalize_2round};
+
+/// One B+Tree index's key shape, as the DML hot path needs it.
+///
+/// `columns` holds every key column in key order, not just the leading one.
+/// A unique index over more than one column conflicts only when a row
+/// matches on all of them, so an enforcement path that saw the leading
+/// column alone would refuse rows the constraint permits.
+#[derive(Debug, Clone)]
+pub struct BTreeIndexSpec {
+    pub id: IndexId,
+    /// Never empty. A catalog index entry declaring no column is skipped at
+    /// snapshot build rather than represented here, so `leading` is total
+    pub columns: Box<[ColumnId]>,
+    /// Drives constraint enforcement on insert
+    pub unique: bool,
+}
+
+impl BTreeIndexSpec {
+    /// The key's leading column, which is what index selection and range
+    /// bounds are built from
+    #[inline]
+    pub fn leading(&self) -> ColumnId {
+        self.columns[0]
+    }
+}
 
 /// Pre-partitioned view of a table's indexes for fast DML hot-path lookup.
 /// One snapshot per table, rebuilt only on index DDL and atomically swapped
 /// in via `Arc` so readers take no locks.
 #[derive(Debug, Clone, Default)]
 pub struct TableIndexSnapshot {
-    /// (index_id, indexed leading column_id, unique) tuples for B+Tree indexes.
-    /// The unique flag drives constraint enforcement on insert.
-    pub btree: Vec<(IndexId, ColumnId, bool)>,
+    /// Key shape and uniqueness of every B+Tree index on the table.
+    pub btree: Vec<BTreeIndexSpec>,
     /// (index_id, indexed leading column_id) pairs for spatial R-tree indexes.
     pub spatial: Vec<(IndexId, ColumnId)>,
     /// Index ids for full-text indexes.
@@ -58,7 +82,7 @@ fn name_key(id: u32, name: &str) -> u64 {
     for &b in name.as_bytes() {
         h = fx_mix(h, b as u64);
     }
-    fx_finalize(h)
+    mix_finalize_2round(h)
 }
 
 type NameMap<V> = scc::HashMap<u64, V, IdentityBuildHasher>;
@@ -486,8 +510,17 @@ impl CatalogCache {
                     };
                     match entry.index_type {
                         IndexType::BTree => {
-                            if let Some(col) = entry.columns.first() {
-                                s.btree.push((entry.id, col.column_id, entry.unique));
+                            if !entry.columns.is_empty() {
+                                s.btree.push(BTreeIndexSpec {
+                                    id: entry.id,
+                                    columns: entry
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.column_id)
+                                        .collect::<Vec<_>>()
+                                        .into_boxed_slice(),
+                                    unique: entry.unique,
+                                });
                             }
                         }
                         IndexType::Spatial => {
@@ -994,8 +1027,9 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 max_length: None,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
+                element_type: None,
             }],
             constraints: vec![],
             created_at: 0,
@@ -1010,6 +1044,9 @@ mod tests {
             dropped_at: None,
             expectations: Vec::new(),
             time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
         }
     }
 
