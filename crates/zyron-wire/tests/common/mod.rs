@@ -646,6 +646,145 @@ pub async fn run_on_branch(
     }
 }
 
+/// What one statement produced, read back from the protocol stream
+pub struct WireStatementOutcome {
+    /// NoticeResponse message texts, in arrival order
+    pub notices: Vec<String>,
+    /// ErrorResponse message texts, in arrival order
+    pub errors: Vec<String>,
+    /// CommandComplete tags, in arrival order
+    pub tags: Vec<String>,
+}
+
+/// Runs statements over a real TCP connection against the production
+/// connection loop, one Query message per statement.
+///
+/// This is the path a client takes: startup handshake under trust auth,
+/// simple-query dispatch, and a clean terminate. A test that has to prove
+/// a statement's grammar reaches its work goes through here rather than
+/// through a helper that starts past the parse
+pub async fn wire_query(
+    server: &Arc<ServerState>,
+    statements: &[&str],
+) -> Vec<WireStatementOutcome> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let state = Arc::clone(server);
+
+    let server_side = async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
+        if let Err(e) = conn.run().await {
+            eprintln!("wire_query server side ended with {e:?}");
+        }
+    };
+
+    let client_side = async move {
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        // One protocol message off the stream: a type byte, a length that
+        // includes itself, and the payload
+        async fn read_message(client: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+            let mut head = [0u8; 5];
+            client.read_exact(&mut head).await.expect("message head");
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut payload = vec![0u8; len - 4];
+            client
+                .read_exact(&mut payload)
+                .await
+                .expect("message payload");
+            (head[0], payload)
+        }
+
+        // The M field of a NoticeResponse or ErrorResponse payload, which
+        // is the human message among the coded fields
+        fn message_field(payload: &[u8]) -> Option<String> {
+            let mut i = 0;
+            while i < payload.len() && payload[i] != 0 {
+                let code = payload[i];
+                i += 1;
+                let start = i;
+                while i < payload.len() && payload[i] != 0 {
+                    i += 1;
+                }
+                if code == b'M' {
+                    return Some(String::from_utf8_lossy(&payload[start..i]).into_owned());
+                }
+                i += 1;
+            }
+            None
+        }
+
+        // Startup at protocol 3.0 against the bootstrap database, the
+        // one the rest of the harness plans in. Trust auth answers
+        // AuthenticationOk with no credential round trip
+        let mut params = Vec::new();
+        params.extend_from_slice(&196608i32.to_be_bytes());
+        params.extend_from_slice(b"user\0test_user\0database\0zyron\0\0");
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&((params.len() + 4) as i32).to_be_bytes());
+        startup.extend_from_slice(&params);
+        client.write_all(&startup).await.expect("startup");
+        client.flush().await.expect("flush");
+        loop {
+            let (kind, _) = read_message(&mut client).await;
+            if kind == b'Z' {
+                break;
+            }
+        }
+
+        let mut outcomes = Vec::with_capacity(statements.len());
+        for sql in statements {
+            let mut payload = sql.as_bytes().to_vec();
+            payload.push(0);
+            let mut msg = vec![b'Q'];
+            msg.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+            msg.extend_from_slice(&payload);
+            client.write_all(&msg).await.expect("query");
+            client.flush().await.expect("flush");
+
+            let mut outcome = WireStatementOutcome {
+                notices: Vec::new(),
+                errors: Vec::new(),
+                tags: Vec::new(),
+            };
+            loop {
+                let (kind, payload) = read_message(&mut client).await;
+                match kind {
+                    b'N' => outcome.notices.extend(message_field(&payload)),
+                    b'E' => outcome.errors.extend(message_field(&payload)),
+                    b'C' => {
+                        let end = payload
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(payload.len());
+                        outcome
+                            .tags
+                            .push(String::from_utf8_lossy(&payload[..end]).into_owned());
+                    }
+                    b'Z' => break,
+                    _ => {}
+                }
+            }
+            outcomes.push(outcome);
+        }
+
+        client
+            .write_all(&[b'X', 0, 0, 0, 4])
+            .await
+            .expect("terminate");
+        let _ = client.shutdown().await;
+        outcomes
+    };
+
+    let (_, outcomes) = tokio::join!(server_side, client_side);
+    outcomes
+}
+
 // =============================================================================
 // EXPLAIN ANALYZE
 // =============================================================================

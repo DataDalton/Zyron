@@ -851,6 +851,94 @@ async fn test_the_source_pin_keeps_a_cloned_version_reclaimable_only_after_the_c
     );
 }
 
+/// Orphan cleanup honors clone pins the way vacuum does. The statement's
+/// default floor is the head version, which does not name the file the
+/// pinned version needs, so without the pin the file is an orphan and the
+/// source silently stops serving the version its clone was taken from
+#[tokio::test]
+async fn test_cleanup_orphans_keeps_the_files_a_clone_pin_names() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE orders (id BIGINT NOT NULL) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO orders VALUES (1), (2)").await;
+
+    let pinned_version = manifest_of(&server, "orders").snapshot_id;
+    exec_ddl(&server, &mut session, "CREATE TABLE backup CLONE OF orders")
+        .await
+        .expect("clone");
+    let pinned_file = manifest_of(&server, "backup").entries[0].partition_id;
+
+    // The rewrite drops the pinned file from the source's head, so the
+    // pin is the only thing between it and the orphan list
+    exec_dml(&server, "INSERT INTO orders VALUES (3)").await;
+    optimize(&server, "orders", false, true).await;
+
+    let source = server
+        .catalog
+        .get_table(schema_id, "orders")
+        .expect("entry");
+    let source_paths = LakePaths::new(server.disk_manager.data_dir(), source.id.0);
+    exec_ddl(
+        &server,
+        &mut session,
+        "CALL zyronlake_cleanup_orphans('orders')",
+    )
+    .await
+    .expect("cleanup");
+    assert!(
+        source_paths.data_file(pinned_file).exists(),
+        "cleanup reclaimed a file a clone is still holding a version of"
+    );
+
+    // The source still serves the pinned version, and a new clone can
+    // still be taken at it
+    let then = query_values(
+        &server,
+        &format!("SELECT id FROM orders VERSION AS OF {pinned_version} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(then.len(), 2, "the pinned version answers with its rows");
+    exec_ddl(
+        &server,
+        &mut session,
+        &format!("CREATE TABLE again CLONE OF orders AT VERSION {pinned_version}"),
+    )
+    .await
+    .expect("a second clone at the pinned version");
+    assert_eq!(query_rows(&server, "SELECT id FROM again").await, 2);
+
+    // Releasing every pin makes the file reclaimable, which is the other
+    // half of the claim: the pin protects, it does not leak
+    exec_ddl(&server, &mut session, "DROP TABLE backup")
+        .await
+        .expect("drop the first clone");
+    exec_ddl(&server, &mut session, "DROP TABLE again")
+        .await
+        .expect("drop the second clone");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CALL zyronlake_cleanup_orphans('orders')",
+    )
+    .await
+    .expect("cleanup after release");
+    assert!(
+        !source_paths.data_file(pinned_file).exists(),
+        "with no pin left the dropped file is an ordinary orphan"
+    );
+    assert_eq!(
+        query_rows(&server, "SELECT id FROM orders").await,
+        3,
+        "the live rows are untouched by the reclaim"
+    );
+}
+
 /// A clone only means something on a format whose files are immutable and
 /// shareable
 #[tokio::test]
@@ -1392,4 +1480,204 @@ async fn test_a_restored_head_reads_the_same_as_a_time_travel_query() {
     )
     .await;
     assert_eq!(format!("{again:?}"), format!("{as_of:?}"));
+}
+
+/// Runs one OPTIMIZE statement from its SQL text through the same function
+/// statement dispatch calls, so the grammar's flag assignment and the
+/// statement-to-work threading are what these tests exercise
+async fn optimize_sql(server: &Arc<ServerState>, sql: &str) -> String {
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let zyron_parser::Statement::OptimizeTable(o) = stmt else {
+        panic!("not an OPTIMIZE statement: {sql}");
+    };
+    zyron_wire::connection::lake_optimize_statement(server, &o)
+        .await
+        .expect("optimize")
+}
+
+/// An OPTIMIZE statement's flags reach their work over the real wire
+/// protocol. The statement travels as protocol bytes through the
+/// production connection loop, its session command dispatch, and the
+/// lake half, so every hop between a client's SQL text and the
+/// maintenance it names is the one under test
+#[tokio::test]
+async fn test_optimize_over_the_wire_runs_the_half_its_grammar_names() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE tiny (id BIGINT NOT NULL) USING ZYRONLAKE CLUSTER BY () FORCE",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO tiny VALUES (1)").await;
+    exec_dml(&server, "INSERT INTO tiny VALUES (2)").await;
+    assert_eq!(manifest_of(&server, "tiny").entries.len(), 2);
+
+    let cluster = common::wire_query(&server, &["OPTIMIZE TABLE tiny CLUSTER"]).await;
+    assert!(cluster[0].errors.is_empty(), "{:?}", cluster[0].errors);
+    assert_eq!(cluster[0].tags, vec!["OPTIMIZE"]);
+    assert!(
+        cluster[0]
+            .notices
+            .iter()
+            .any(|n| n.contains("clustering key")),
+        "the notice reports the layout half's verdict, got {:?}",
+        cluster[0].notices
+    );
+    assert!(
+        !cluster[0].notices.iter().any(|n| n.contains("rewrote")),
+        "CLUSTER over the wire must not report a delete pass, got {:?}",
+        cluster[0].notices
+    );
+    assert_eq!(
+        manifest_of(&server, "tiny").entries.len(),
+        2,
+        "CLUSTER over the wire must not compact"
+    );
+
+    let bare = common::wire_query(&server, &["OPTIMIZE TABLE tiny"]).await;
+    assert!(bare[0].errors.is_empty(), "{:?}", bare[0].errors);
+    assert!(
+        bare[0].notices.iter().any(|n| n.contains("rewrote")),
+        "the bare form reports the compaction, got {:?}",
+        bare[0].notices
+    );
+    assert_eq!(
+        manifest_of(&server, "tiny").entries.len(),
+        1,
+        "the bare form compacts over the wire"
+    );
+    assert_eq!(query_rows(&server, "SELECT id FROM tiny").await, 2);
+}
+
+/// `OPTIMIZE TABLE t CLUSTER` from SQL runs only the layout half, and the
+/// bare form runs only the compactor. The two forms land on different
+/// state, so a grammar or dispatch step assigning either keyword to the
+/// other flag fails here whatever the layers below do
+#[tokio::test]
+async fn test_optimize_sql_cluster_and_bare_forms_run_their_own_half() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    // Clustering pinned off, so the layout half is a stated no-op and any
+    // file movement can only come from the compactor
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE tiny (id BIGINT NOT NULL) USING ZYRONLAKE CLUSTER BY () FORCE",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO tiny VALUES (1)").await;
+    exec_dml(&server, "INSERT INTO tiny VALUES (2)").await;
+    assert_eq!(manifest_of(&server, "tiny").entries.len(), 2);
+
+    let message = optimize_sql(&server, "OPTIMIZE TABLE tiny CLUSTER").await;
+    assert_eq!(
+        manifest_of(&server, "tiny").entries.len(),
+        2,
+        "CLUSTER must not run the compactor, the two small files have to survive"
+    );
+    assert!(
+        !message.contains("rewrote"),
+        "the message must not report a delete pass, got {message}"
+    );
+    assert!(
+        message.contains("clustering key"),
+        "the message reports the layout half's verdict, got {message}"
+    );
+
+    let message = optimize_sql(&server, "OPTIMIZE TABLE tiny").await;
+    assert_eq!(
+        manifest_of(&server, "tiny").entries.len(),
+        1,
+        "the bare form compacts, the two small files have to merge"
+    );
+    assert!(
+        message.contains("rewrote"),
+        "the message reports the compaction, got {message}"
+    );
+    assert!(
+        !message.contains("clustering key"),
+        "the bare form must not run a layout pass, got {message}"
+    );
+    assert_eq!(query_rows(&server, "SELECT id FROM tiny").await, 2);
+}
+
+/// `OPTIMIZE TABLE t DELETE` from SQL names the compactor explicitly and
+/// runs nothing else
+#[tokio::test]
+async fn test_optimize_sql_delete_form_runs_the_compactor() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE tiny (id BIGINT NOT NULL) USING ZYRONLAKE CLUSTER BY () FORCE",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO tiny VALUES (1)").await;
+    exec_dml(&server, "INSERT INTO tiny VALUES (2)").await;
+
+    let message = optimize_sql(&server, "OPTIMIZE TABLE tiny DELETE").await;
+    assert_eq!(
+        manifest_of(&server, "tiny").entries.len(),
+        1,
+        "DELETE compacts the two small files"
+    );
+    assert!(message.contains("rewrote"), "{message}");
+    assert!(
+        !message.contains("clustering key"),
+        "DELETE must not run a layout pass, got {message}"
+    );
+    assert_eq!(query_rows(&server, "SELECT id FROM tiny").await, 2);
+}
+
+/// `OPTIMIZE TABLE t CLUSTER, DELETE` from SQL runs both halves over a
+/// table where each half has distinct visible work
+#[tokio::test]
+async fn test_optimize_sql_combined_form_runs_both_halves() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE sales (id BIGINT NOT NULL, region BIGINT) USING ZYRONLAKE \
+         CLUSTER BY (region) FORCE",
+    )
+    .await
+    .expect("create");
+    for i in 0..4 {
+        exec_dml(
+            &server,
+            &format!(
+                "INSERT INTO sales VALUES ({}, 1), ({}, 5), ({}, 9)",
+                i * 3,
+                i * 3 + 1,
+                i * 3 + 2
+            ),
+        )
+        .await;
+    }
+    exec_dml(&server, "DELETE FROM sales WHERE region = 5").await;
+    assert_eq!(manifest_of(&server, "sales").pending_deleted_rows(), 4);
+
+    let message = optimize_sql(&server, "OPTIMIZE TABLE sales CLUSTER, DELETE").await;
+
+    let after = manifest_of(&server, "sales");
+    assert_eq!(after.pending_deleted_rows(), 0, "the delete half ran");
+    assert!(after.delete_predicates.is_empty());
+    assert_eq!(
+        zyron_lake::drifted_file_count(&after),
+        0,
+        "the layout half ran too"
+    );
+    assert_eq!(query_rows(&server, "SELECT id FROM sales").await, 8);
+    assert!(message.contains("rewrote"), "{message}");
 }

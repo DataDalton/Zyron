@@ -8534,6 +8534,10 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Natural => Some("natural"),
         Keyword::Using => Some("using"),
         Keyword::Clone => Some("clone"),
+        // Statement keyword that is also the truncate() function's alias.
+        // Statement dispatch reads the leading TRUNCATE before expression
+        // parsing ever sees it, so this only unshadows the function call
+        Keyword::Truncate => Some("truncate"),
         // Schema keywords
         Keyword::Schema => Some("schema"),
         // Sequence keywords
@@ -12531,6 +12535,8 @@ mod tests {
         match stmt {
             Statement::OptimizeTable(o) => {
                 assert_eq!(o.table, "users");
+                assert!(!o.cluster, "a bare OPTIMIZE asks for no layout pass");
+                assert!(o.delete, "a bare OPTIMIZE compacts");
             }
             _ => panic!("Expected OptimizeTable"),
         }
@@ -12542,8 +12548,33 @@ mod tests {
         match stmt {
             Statement::OptimizeTable(o) => {
                 assert_eq!(o.table, "users");
+                assert!(!o.cluster);
+                assert!(o.delete);
             }
             _ => panic!("Expected OptimizeTable"),
+        }
+    }
+
+    /// The action list decides which flag each keyword sets. CLUSTER and
+    /// DELETE landing on each other's field would run the wrong maintenance
+    /// while every downstream layer behaves, so the assignment is pinned
+    /// per form
+    #[test]
+    fn test_optimize_actions_set_their_own_flags() {
+        let forms = [
+            ("OPTIMIZE TABLE t CLUSTER", true, false),
+            ("OPTIMIZE TABLE t DELETE", false, true),
+            ("OPTIMIZE TABLE t CLUSTER, DELETE", true, true),
+            ("OPTIMIZE TABLE t DELETE, CLUSTER", true, true),
+        ];
+        for (sql, cluster, delete) in forms {
+            match parse_one(sql) {
+                Statement::OptimizeTable(o) => {
+                    assert_eq!(o.cluster, cluster, "cluster flag of {sql}");
+                    assert_eq!(o.delete, delete, "delete flag of {sql}");
+                }
+                other => panic!("Expected OptimizeTable for {sql}, got {other:?}"),
+            }
         }
     }
 

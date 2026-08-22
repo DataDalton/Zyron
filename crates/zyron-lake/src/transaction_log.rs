@@ -2305,6 +2305,17 @@ impl TransactionLog {
                 name
             )));
         }
+        // A clone pins the version it was taken from, and serving that
+        // version needs its replay chain. The floor never passes the
+        // oldest pin, and an unreadable pin retains everything, the same
+        // rule vacuum applies to the data files those versions name
+        let mut retain_min_version = retain_min_version;
+        for (_, version) in crate::clone::clone_pins(&self.paths) {
+            match version {
+                Some(v) => retain_min_version = retain_min_version.min(v),
+                None => return Ok(0),
+            }
+        }
         let mut checkpoints = Vec::new();
         let mut versions = Vec::new();
         for dirent in fs::read_dir(self.paths.log_dir())? {

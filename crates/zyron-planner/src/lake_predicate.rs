@@ -290,6 +290,18 @@ fn literal_to_value(
 ) -> Option<LakeValue> {
     let value = match expr {
         BoundExpr::Nested(inner) => return literal_to_value(inner, col, fractional_digits),
+        // A typed literal like TIMESTAMP '...' parses as a cast of a
+        // string literal. When the cast lands on the column's own type,
+        // the conversion below is the same one the executor's cast runs,
+        // so the constant lowers instead of defeating every prune that
+        // spells its boundary the standard way
+        BoundExpr::Cast {
+            expr: inner,
+            target_type,
+            ..
+        } if *target_type == col.type_id => {
+            return literal_to_value(inner, col, fractional_digits);
+        }
         BoundExpr::Literal { value, .. } => value,
         _ => return None,
     };

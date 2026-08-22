@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use zyron_catalog::DatabaseId;
+use zyron_executor::column::ScalarValue;
 use zyron_lake::{AllCommitted, ClusterStrategy, LakePaths, TransactionLog};
 use zyron_wire::connection::ServerState;
 use zyron_wire::session::Session;
@@ -161,12 +162,18 @@ async fn test_lake_scan_reads_appended_rows_and_sql_insert_publishes_on_commit()
     let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
     let log = zyron_lake::TransactionLog::open_shared(paths, &AllCommitted).expect("shared log");
     let columns = vec![
-        zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![
+        zyron_lake::ColumnData::from_cells(
+            entry.columns[0].id.0 as u32,
+            vec![
                 Some(1i64.to_le_bytes().to_vec()),
                 Some(2i64.to_le_bytes().to_vec()),
                 Some(3i64.to_le_bytes().to_vec()),
-            ]),
-        zyron_lake::ColumnData::from_cells(entry.columns[1].id.0 as u32, vec![Some(b"alice".to_vec()), None, Some(b"carol".to_vec())]),
+            ],
+        ),
+        zyron_lake::ColumnData::from_cells(
+            entry.columns[1].id.0 as u32,
+            vec![Some(b"alice".to_vec()), None, Some(b"carol".to_vec())],
+        ),
     ];
     let attempt = zyron_lake::CommitAttempt {
         operation: zyron_lake::OperationKind::Append,
@@ -415,7 +422,10 @@ async fn test_drop_lake_table_reclaims_the_whole_root() {
         &log,
         attempt,
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(1i64.to_le_bytes().to_vec())])],
+        &[zyron_lake::ColumnData::from_cells(
+            entry.columns[0].id.0 as u32,
+            vec![Some(1i64.to_le_bytes().to_vec())],
+        )],
     )
     .expect("append");
     assert!(paths.root().exists());
@@ -1883,7 +1893,10 @@ async fn test_lake_branches_view_lists_branches_and_their_lead() {
             deadline: None,
         },
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(7i64.to_le_bytes().to_vec())])],
+        &[zyron_lake::ColumnData::from_cells(
+            entry.columns[0].id.0 as u32,
+            vec![Some(7i64.to_le_bytes().to_vec())],
+        )],
     )
     .expect("branch append");
 
@@ -2009,7 +2022,10 @@ async fn test_branch_ddl_routes_to_the_lake_log() {
             deadline: None,
         },
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(9i64.to_le_bytes().to_vec())])],
+        &[zyron_lake::ColumnData::from_cells(
+            entry.columns[0].id.0 as u32,
+            vec![Some(9i64.to_le_bytes().to_vec())],
+        )],
     )
     .expect("branch append");
     assert_eq!(query_rows(&server, "SELECT * FROM bt").await, 2);
@@ -2080,7 +2096,10 @@ async fn test_select_in_branch_reads_the_branch_head() {
             deadline: None,
         },
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(9i64.to_le_bytes().to_vec())])],
+        &[zyron_lake::ColumnData::from_cells(
+            entry.columns[0].id.0 as u32,
+            vec![Some(9i64.to_le_bytes().to_vec())],
+        )],
     )
     .expect("branch append");
 
@@ -4396,4 +4415,830 @@ fn join_score(table_id: u32, column_id: u32) -> f64 {
         zyron_lake::column_term(column_id, zyron_lake::TERM_JOIN_KEY),
         zyron_lake::current_epoch(),
     )
+}
+
+/// Creates a lake table clustered by time_bucket over a TIMESTAMP(p>6)
+/// column, asserts the derived column mirrors the source precision, writes
+/// rows across several files, and proves the bucket predicate loses none of
+/// them.
+///
+/// The precision mirror is what stops the pruning path from comparing a
+/// microsecond constant against picosecond file bounds: digits over six make
+/// the lowering refuse and the scan answer from the rows. A mirror that
+/// forgets the digits prunes files whose rows match the predicate, which is
+/// silent row loss
+async fn assert_time_bucket_keeps_precision(precision: u8) {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        &format!(
+            "CREATE TABLE tb (id BIGINT NOT NULL, ts TIMESTAMP({precision})) USING ZYRONLAKE \
+             CLUSTER BY (time_bucket(INTERVAL '1 hour', ts))"
+        ),
+    )
+    .await
+    .expect("create with a time_bucket cluster key over a p>6 source");
+
+    // The catalog mirror carries the source precision, not the
+    // no-precision marker
+    let entry = server.catalog.get_table(schema_id, "tb").expect("entry");
+    assert_eq!(entry.cluster.derived.len(), 1);
+    assert_eq!(
+        entry.cluster.derived[0].fractional_digits, precision,
+        "the mirrored expression column must carry the timestamp argument's precision"
+    );
+
+    // The lake schema column agrees, which is what sizes its cells at the
+    // 16 byte picosecond width
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+    let derived_id = manifest.schema.derived[0].column_id;
+    let derived_col = manifest
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.id == derived_id)
+        .expect("the expression's storage column");
+    assert_eq!(derived_col.fractional_digits, Some(precision));
+
+    // One file per statement, three buckets over three files, so a wrongly
+    // scaled prune has files to lose
+    exec_dml(
+        &server,
+        "INSERT INTO tb VALUES (1, '2026-05-17 12:10:00.123456'), \
+         (2, '2026-05-17 12:50:00.123456')",
+    )
+    .await;
+    exec_dml(
+        &server,
+        "INSERT INTO tb VALUES (3, '2026-05-17 13:10:00.123456')",
+    )
+    .await;
+    exec_dml(
+        &server,
+        "INSERT INTO tb VALUES (4, '2026-05-17 14:10:00.123456')",
+    )
+    .await;
+
+    // Both rows of the noon bucket come back. The predicate matches the
+    // declared expression, and with digits over six the file-level lowering
+    // refuses rather than pruning in the wrong unit
+    let noon = query_values(
+        &server,
+        "SELECT id FROM tb WHERE time_bucket(INTERVAL '1 hour', ts) = \
+         TIMESTAMP '2026-05-17 12:00:00' ORDER BY id",
+    )
+    .await;
+    let ids: Vec<i64> = noon
+        .iter()
+        .map(|row| match row[0] {
+            ScalarValue::Int64(v) => v,
+            ref other => panic!("id must be an Int64, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "every row of the matching bucket must survive file pruning"
+    );
+
+    // The scan states it pruned nothing for this predicate
+    let metrics = common::analyze_lake_scan(
+        &server,
+        "SELECT id FROM tb WHERE time_bucket(INTERVAL '1 hour', ts) = \
+         TIMESTAMP '2026-05-17 12:00:00'",
+    )
+    .await;
+    assert_eq!(
+        metrics.aux[1], 0,
+        "a picosecond expression column must not be pruned with microsecond constants"
+    );
+}
+
+#[tokio::test]
+async fn test_time_bucket_over_a_nanosecond_source_keeps_its_precision() {
+    assert_time_bucket_keeps_precision(9).await;
+}
+
+#[tokio::test]
+async fn test_time_bucket_over_a_picosecond_source_keeps_its_precision() {
+    assert_time_bucket_keeps_precision(12).await;
+}
+
+/// A derived expression over a DECIMAL(38, 9) column mirrors the scale, so
+/// the stored expression column declares the same fixed point domain its
+/// values are written in
+#[tokio::test]
+async fn test_a_decimal_derived_expression_mirrors_the_source_scale() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE prices (id BIGINT NOT NULL, price DECIMAL(38, 9)) USING ZYRONLAKE \
+         CLUSTER BY (abs(price))",
+    )
+    .await
+    .expect("create with a decimal expression cluster key");
+
+    let entry = server
+        .catalog
+        .get_table(schema_id, "prices")
+        .expect("entry");
+    assert_eq!(entry.cluster.derived.len(), 1);
+    assert_eq!(
+        entry.cluster.derived[0].fractional_digits, 9,
+        "the mirrored expression column must carry the decimal argument's scale"
+    );
+
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+    let derived_id = manifest.schema.derived[0].column_id;
+    let derived_col = manifest
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.id == derived_id)
+        .expect("the expression's storage column");
+    assert_eq!(derived_col.fractional_digits, Some(9));
+
+    // Writes fill the column and the rows answer through the expression
+    exec_dml(&server, "INSERT INTO prices VALUES (1, 100.5), (2, 250.25)").await;
+    let rows = query_values(&server, "SELECT id FROM prices WHERE abs(price) = 100.5").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the matching row answers through the expression"
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(1));
+}
+
+/// Builds the one-column DECIMAL(38, 9) lake table the scalar function
+/// precision tests share: three values around a rounding boundary and a
+/// NULL, in one file
+async fn decimal_fn_table(server: &Arc<ServerState>, session: &mut Option<Session>) {
+    exec_ddl(
+        server,
+        session,
+        "CREATE TABLE dec9 (id BIGINT NOT NULL, price DECIMAL(38, 9)) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        server,
+        "INSERT INTO dec9 VALUES (1, 100.4), (2, 100.5), (3, 100.6), (4, NULL)",
+    )
+    .await;
+}
+
+/// The ids a filtered query returns, in order
+async fn ids_where(server: &Arc<ServerState>, predicate: &str) -> Vec<i64> {
+    query_values(
+        server,
+        &format!("SELECT id FROM dec9 WHERE {predicate} ORDER BY id"),
+    )
+    .await
+    .into_iter()
+    .map(|row| match row[0] {
+        ScalarValue::Int64(v) => v,
+        ref other => panic!("id must be an Int64, got {other:?}"),
+    })
+    .collect()
+}
+
+/// round over a DECIMAL(38, 9) rounds the value, not the scaled integer,
+/// and the result stays on the column's scale so comparison alignment
+/// reads it correctly
+#[tokio::test]
+async fn test_round_over_a_decimal_rounds_the_value_on_its_own_scale() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    decimal_fn_table(&server, &mut session).await;
+
+    assert_eq!(
+        ids_where(&server, "round(price) = 101").await,
+        vec![2, 3],
+        "100.5 rounds half away from zero and 100.6 rounds up"
+    );
+    assert_eq!(ids_where(&server, "round(price) = 100").await, vec![1]);
+    assert_eq!(
+        ids_where(&server, "round(price, 1) = 100.5").await,
+        vec![2],
+        "a digit count finer than the boundary keeps the half"
+    );
+}
+
+/// trunc and its truncate alias drop the fractional part toward zero on
+/// the value's own scale
+#[tokio::test]
+async fn test_trunc_over_a_decimal_drops_the_fraction_on_its_own_scale() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    decimal_fn_table(&server, &mut session).await;
+
+    assert_eq!(
+        ids_where(&server, "trunc(price) = 100").await,
+        vec![1, 2, 3],
+        "every fractional part truncates to the same whole"
+    );
+    assert_eq!(
+        ids_where(&server, "truncate(price) = 100").await,
+        vec![1, 2, 3],
+        "the alias behaves as the function it names"
+    );
+    assert!(ids_where(&server, "trunc(price) = 101").await.is_empty());
+}
+
+/// coalesce writes its fallback on the result's scale, so a NULL row's
+/// substitute compares as the number that was written
+#[tokio::test]
+async fn test_coalesce_over_a_decimal_lands_every_argument_on_one_scale() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    decimal_fn_table(&server, &mut session).await;
+
+    assert_eq!(
+        ids_where(&server, "coalesce(price, 55.5) = 55.5").await,
+        vec![4],
+        "the NULL row answers with the fallback value"
+    );
+    assert_eq!(
+        ids_where(&server, "coalesce(price, 55.5) = 100.5").await,
+        vec![2],
+        "a non NULL row answers with its own value"
+    );
+}
+
+/// nullif compares its two sides on one scale, so a literal written with
+/// fewer digits still matches the stored value it names
+#[tokio::test]
+async fn test_nullif_over_a_decimal_compares_on_one_scale() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    decimal_fn_table(&server, &mut session).await;
+
+    assert_eq!(
+        ids_where(&server, "nullif(price, 100.5) = 100.4").await,
+        vec![1],
+        "an unequal row keeps its value"
+    );
+    assert!(
+        ids_where(&server, "nullif(price, 100.5) = 100.5")
+            .await
+            .is_empty(),
+        "the matched value has to become NULL"
+    );
+    assert_eq!(
+        ids_where(&server, "nullif(price, 100.5) IS NULL").await,
+        vec![2, 4],
+        "the matched row and the NULL input both answer NULL"
+    );
+}
+
+/// greatest and least compare decimal arguments on one scale and return
+/// the winner on that scale, whichever argument it came from
+#[tokio::test]
+async fn test_greatest_and_least_over_decimals_compare_on_one_scale() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE pair9 (id BIGINT NOT NULL, a DECIMAL(38, 9), b DECIMAL(38, 9)) \
+         USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO pair9 VALUES (1, 100.5, 200.5), (2, 300.5, 150.5)",
+    )
+    .await;
+
+    let pick = |predicate: &'static str| {
+        let server = Arc::clone(&server);
+        async move {
+            query_values(
+                &server,
+                &format!("SELECT id FROM pair9 WHERE {predicate} ORDER BY id"),
+            )
+            .await
+            .into_iter()
+            .map(|row| match row[0] {
+                ScalarValue::Int64(v) => v,
+                ref other => panic!("id must be an Int64, got {other:?}"),
+            })
+            .collect::<Vec<i64>>()
+        }
+    };
+
+    assert_eq!(pick("greatest(a, b) = 200.5").await, vec![1]);
+    assert_eq!(pick("greatest(a, b) = 300.5").await, vec![2]);
+    assert_eq!(pick("least(a, b) = 100.5").await, vec![1]);
+    assert_eq!(pick("least(a, b) = 150.5").await, vec![2]);
+    assert_eq!(
+        pick("greatest(a, 250.5) = 250.5").await,
+        vec![1],
+        "a literal written at one digit compares against scale nine values"
+    );
+}
+
+/// A round expression as a cluster key mirrors the source scale into the
+/// derived column, fills on write, and answers through the expression
+#[tokio::test]
+async fn test_a_round_derived_column_mirrors_the_source_scale() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE rounded (id BIGINT NOT NULL, price DECIMAL(38, 9)) USING ZYRONLAKE \
+         CLUSTER BY (round(price, 2))",
+    )
+    .await
+    .expect("create with a round expression cluster key");
+
+    let entry = server
+        .catalog
+        .get_table(schema_id, "rounded")
+        .expect("entry");
+    assert_eq!(entry.cluster.derived.len(), 1);
+    assert_eq!(
+        entry.cluster.derived[0].fractional_digits, 9,
+        "round keeps its argument's scale, and the mirror has to carry it"
+    );
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+    let derived_id = manifest.schema.derived[0].column_id;
+    let derived_col = manifest
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.id == derived_id)
+        .expect("the expression's storage column");
+    assert_eq!(derived_col.fractional_digits, Some(9));
+
+    exec_dml(
+        &server,
+        "INSERT INTO rounded VALUES (1, 100.456), (2, 100.454)",
+    )
+    .await;
+    let rows = query_values(
+        &server,
+        "SELECT id FROM rounded WHERE round(price, 2) = 100.46 ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "only the row rounding up to 100.46 matches");
+    assert_eq!(rows[0][0], ScalarValue::Int64(1));
+}
+
+/// Builds the mixed-precision timestamp lake table the scalar function
+/// unit tests share: a microsecond column beside two picosecond columns,
+/// so a function picking values across them has to land on one unit
+async fn mixed_ts_table(server: &Arc<ServerState>, session: &mut Option<Session>) {
+    exec_ddl(
+        server,
+        session,
+        "CREATE TABLE mixts (id BIGINT NOT NULL, us6 TIMESTAMP, ps9 TIMESTAMP(9), \
+         ps9b TIMESTAMP(9)) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        server,
+        "INSERT INTO mixts VALUES \
+         (1, '2026-05-17 12:00:00', '2026-05-17 13:00:00', '2026-05-17 11:00:00'), \
+         (2, NULL, '2026-05-17 14:00:00', '2026-05-17 14:00:00'), \
+         (3, '2026-05-17 15:00:00', '2026-05-17 14:30:00', '2026-05-17 16:00:00')",
+    )
+    .await;
+}
+
+/// The ids a filtered query over the mixed timestamp table returns
+async fn mixts_where(server: &Arc<ServerState>, predicate: &str) -> Vec<i64> {
+    query_values(
+        server,
+        &format!("SELECT id FROM mixts WHERE {predicate} ORDER BY id"),
+    )
+    .await
+    .into_iter()
+    .map(|row| match row[0] {
+        ScalarValue::Int64(v) => v,
+        ref other => panic!("id must be an Int64, got {other:?}"),
+    })
+    .collect()
+}
+
+/// coalesce over mixed-precision timestamps lands every argument in one
+/// unit, so a microsecond value and a picosecond fallback both compare as
+/// the instants they name
+#[tokio::test]
+async fn test_coalesce_over_mixed_precision_timestamps_lands_on_one_unit() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    mixed_ts_table(&server, &mut session).await;
+
+    assert_eq!(
+        mixts_where(
+            &server,
+            "coalesce(us6, ps9) = TIMESTAMP '2026-05-17 12:00:00'"
+        )
+        .await,
+        vec![1],
+        "a non NULL microsecond value answers as its own instant"
+    );
+    assert_eq!(
+        mixts_where(
+            &server,
+            "coalesce(us6, ps9) = TIMESTAMP '2026-05-17 14:00:00'"
+        )
+        .await,
+        vec![2],
+        "the picosecond fallback answers as its own instant"
+    );
+    // Uniform picosecond arguments exercise the merge buffer at the
+    // 16 byte physical width
+    assert_eq!(
+        mixts_where(
+            &server,
+            "coalesce(ps9, ps9b) = TIMESTAMP '2026-05-17 13:00:00'"
+        )
+        .await,
+        vec![1]
+    );
+}
+
+/// nullif over mixed-precision timestamps compares both sides in one
+/// unit, so a microsecond literal matches the picosecond instant it names
+#[tokio::test]
+async fn test_nullif_over_mixed_precision_timestamps_compares_in_one_unit() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    mixed_ts_table(&server, &mut session).await;
+
+    assert_eq!(
+        mixts_where(
+            &server,
+            "nullif(ps9, TIMESTAMP '2026-05-17 13:00:00') IS NULL"
+        )
+        .await,
+        vec![1],
+        "the matched picosecond instant has to become NULL"
+    );
+    assert_eq!(
+        mixts_where(
+            &server,
+            "nullif(ps9, TIMESTAMP '2026-05-17 13:00:00') = TIMESTAMP '2026-05-17 14:00:00'"
+        )
+        .await,
+        vec![2],
+        "an unmatched row keeps its picosecond value"
+    );
+}
+
+/// greatest and least over mixed-precision timestamps pick by instant,
+/// not by raw representation, whichever side the winner comes from
+#[tokio::test]
+async fn test_greatest_and_least_over_mixed_precision_timestamps_pick_by_instant() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    mixed_ts_table(&server, &mut session).await;
+
+    assert_eq!(
+        mixts_where(
+            &server,
+            "greatest(us6, ps9) = TIMESTAMP '2026-05-17 13:00:00'"
+        )
+        .await,
+        vec![1],
+        "the picosecond side wins when it is the later instant"
+    );
+    assert_eq!(
+        mixts_where(
+            &server,
+            "greatest(us6, ps9) = TIMESTAMP '2026-05-17 15:00:00'"
+        )
+        .await,
+        vec![3],
+        "the microsecond side wins when it is the later instant"
+    );
+    assert_eq!(
+        mixts_where(&server, "least(us6, ps9) = TIMESTAMP '2026-05-17 14:30:00'").await,
+        vec![3],
+        "the picosecond side wins when it is the earlier instant"
+    );
+    assert_eq!(
+        mixts_where(&server, "least(us6, ps9) = TIMESTAMP '2026-05-17 12:00:00'").await,
+        vec![1],
+        "the microsecond side wins when it is the earlier instant"
+    );
+    // Uniform picosecond arguments exercise the result buffer at the
+    // 16 byte physical width
+    assert_eq!(
+        mixts_where(
+            &server,
+            "greatest(ps9, ps9b) = TIMESTAMP '2026-05-17 16:00:00'"
+        )
+        .await,
+        vec![3]
+    );
+}
+
+/// The numeric rounding family has no meaning over an instant, and abs
+/// of a pre-epoch timestamp would silently flip its sign, so every one of
+/// them is refused where it binds with the temporal function to use
+/// instead
+#[tokio::test]
+async fn test_numeric_rounding_over_a_timestamp_is_refused_at_bind() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    mixed_ts_table(&server, &mut session).await;
+
+    for call in [
+        "round(us6)",
+        "round(ps9, 2)",
+        "trunc(us6)",
+        "truncate(ps9)",
+        "ceil(us6)",
+        "ceiling(ps9)",
+        "floor(us6)",
+        "abs(ps9)",
+    ] {
+        let message = query_error(&server, &format!("SELECT {call} FROM mixts")).await;
+        assert!(
+            message.contains("time_bucket"),
+            "{call} has to be refused with the temporal alternative named, got {message}"
+        );
+    }
+}
+
+/// date_trunc floors an instant to a calendar boundary through the full
+/// query path, a date widens to a timestamp, an interval zeroes its
+/// smaller fields, and the refusals name what to do instead
+#[tokio::test]
+async fn test_date_trunc_lands_on_calendar_boundaries() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMP, d DATE) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO events VALUES \
+         (1, '2026-05-17 14:30:45.123456', '2026-05-17'), \
+         (2, '2026-05-11 00:00:00', '2026-02-03'), \
+         (3, '2026-08-02 09:00:00', '2026-08-02')",
+    )
+    .await;
+
+    let picks = [
+        (
+            "date_trunc('day', ts) = TIMESTAMP '2026-05-17 00:00:00'",
+            vec![1],
+        ),
+        // 2026-05-17 is a Sunday and 2026-05-11 the Monday of its week
+        (
+            "date_trunc('week', ts) = TIMESTAMP '2026-05-11 00:00:00'",
+            vec![1, 2],
+        ),
+        (
+            "date_trunc('month', ts) = TIMESTAMP '2026-05-01 00:00:00'",
+            vec![1, 2],
+        ),
+        (
+            "date_trunc('quarter', ts) = TIMESTAMP '2026-04-01 00:00:00'",
+            vec![1, 2],
+        ),
+        (
+            "date_trunc('quarter', ts) = TIMESTAMP '2026-07-01 00:00:00'",
+            vec![3],
+        ),
+        (
+            "date_trunc('year', ts) = TIMESTAMP '2026-01-01 00:00:00'",
+            vec![1, 2, 3],
+        ),
+        (
+            "date_trunc('century', ts) = TIMESTAMP '2001-01-01 00:00:00'",
+            vec![1, 2, 3],
+        ),
+        // A DATE source answers as the timestamp its boundary lands on
+        (
+            "date_trunc('month', d) = TIMESTAMP '2026-02-01 00:00:00'",
+            vec![2],
+        ),
+    ];
+    for (predicate, expected) in picks {
+        let ids: Vec<i64> = query_values(
+            &server,
+            &format!("SELECT id FROM events WHERE {predicate} ORDER BY id"),
+        )
+        .await
+        .into_iter()
+        .map(|row| match row[0] {
+            ScalarValue::Int64(v) => v,
+            ref other => panic!("id must be an Int64, got {other:?}"),
+        })
+        .collect();
+        assert_eq!(ids, expected, "{predicate}");
+    }
+
+    // An interval keeps the fields at and above the unit and zeroes the
+    // rest
+    let iv = query_values(
+        &server,
+        "SELECT date_trunc('hour', INTERVAL '14 months 3 days 3 hours 25 minutes') FROM events \
+         WHERE id = 1",
+    )
+    .await;
+    match iv[0][0] {
+        ScalarValue::Interval(v) => {
+            assert_eq!((v.months, v.days), (14, 3));
+            assert_eq!(v.nanoseconds, 3 * 3_600_000_000_000);
+        }
+        ref other => panic!("expected an interval, got {other:?}"),
+    }
+
+    // The zone form and a non temporal source are refused where they bind
+    let zone = query_error(
+        &server,
+        "SELECT date_trunc('day', ts, 'America/New_York') FROM events",
+    )
+    .await;
+    assert!(zone.contains("timezone"), "{zone}");
+    let numeric = query_error(&server, "SELECT date_trunc('day', id) FROM events").await;
+    assert!(
+        numeric.contains("timestamp, a date or an interval"),
+        "{numeric}"
+    );
+}
+
+/// date_trunc over a picosecond column floors in the picosecond domain
+/// and keeps the precision, and field extraction reads the instant
+/// rather than wrapping its raw picosecond count through an i64
+#[tokio::test]
+async fn test_date_trunc_and_date_part_keep_picosecond_sources_exact() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE fine (id BIGINT NOT NULL, ts TIMESTAMP(9)) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO fine VALUES (1, '2026-05-17 14:30:45.123456'), \
+         (2, '2026-06-01 00:00:00')",
+    )
+    .await;
+
+    // The truncated value stays i128 picoseconds at the exact boundary
+    let rows = query_values(
+        &server,
+        "SELECT date_trunc('minute', ts) FROM fine WHERE id = 1",
+    )
+    .await;
+    let expected_ps = zyron_common::parse_timestamp_micros("2026-05-17 14:30:00").expect("parse")
+        as i128
+        * 1_000_000;
+    match rows[0][0] {
+        ScalarValue::Int128(v) => assert_eq!(v, expected_ps),
+        ref other => panic!("a p>6 result stays i128 picoseconds, got {other:?}"),
+    }
+
+    // The boundary answers an equality through the scan
+    let ids = query_values(
+        &server,
+        "SELECT id FROM fine WHERE date_trunc('day', ts) = TIMESTAMP '2026-05-17 00:00:00'",
+    )
+    .await;
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids[0][0], ScalarValue::Int64(1));
+
+    // Field extraction reads the instant, not the wrapped low bits of
+    // its picosecond count
+    let year = query_values(
+        &server,
+        "SELECT date_part('year', ts) FROM fine WHERE id = 1",
+    )
+    .await;
+    assert_eq!(year[0][0], ScalarValue::Int64(2026));
+    let minute = query_values(
+        &server,
+        "SELECT date_part('minute', ts) FROM fine WHERE id = 1",
+    )
+    .await;
+    assert_eq!(minute[0][0], ScalarValue::Int64(30));
+}
+
+/// A date_trunc expression as a cluster key stores its column, mirrors
+/// into the catalog, and prunes files whose day bounds exclude the
+/// queried boundary
+#[tokio::test]
+async fn test_a_date_trunc_derived_column_prunes_by_day() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE hits (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE \
+         CLUSTER BY (date_trunc('day', ts))",
+    )
+    .await
+    .expect("create with a date_trunc cluster key");
+
+    let entry = server.catalog.get_table(schema_id, "hits").expect("entry");
+    assert_eq!(entry.cluster.derived.len(), 1);
+    assert!(entry.cluster.derived[0].sql.contains("date_trunc"));
+
+    // One file per statement and one day per file, so a day predicate
+    // has files to prune
+    exec_dml(
+        &server,
+        "INSERT INTO hits VALUES (1, '2026-05-17 08:00:00'), (2, '2026-05-17 18:00:00')",
+    )
+    .await;
+    exec_dml(
+        &server,
+        "INSERT INTO hits VALUES (3, '2026-05-18 09:00:00')",
+    )
+    .await;
+    exec_dml(
+        &server,
+        "INSERT INTO hits VALUES (4, '2026-05-19 10:00:00')",
+    )
+    .await;
+
+    let rows = query_values(
+        &server,
+        "SELECT id FROM hits WHERE date_trunc('day', ts) = TIMESTAMP '2026-05-17 00:00:00' \
+         ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 2, "both rows of the queried day answer");
+
+    let metrics = common::analyze_lake_scan(
+        &server,
+        "SELECT id FROM hits WHERE date_trunc('day', ts) = TIMESTAMP '2026-05-17 00:00:00'",
+    )
+    .await;
+    assert_eq!(metrics.aux[0], 3, "three files considered");
+    assert_eq!(
+        metrics.aux[1], 2,
+        "the two files whose day bounds exclude the boundary are pruned"
+    );
+}
+
+/// A stored TIMESTAMP(9) lake column holds the inserted picosecond value,
+/// byte for byte. The cell is the i128 picosecond form at the 16 byte
+/// physical width, exactly the parsed microsecond instant scaled by 1e6
+#[tokio::test]
+async fn test_a_stored_p9_lake_column_round_trips_the_inserted_value() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE t9 (id BIGINT NOT NULL, ts TIMESTAMP(9)) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create a lake table with a p>6 column");
+
+    let ts_text = "2026-05-17 12:34:56.123456";
+    let expected_ps =
+        zyron_common::parse_timestamp_micros(ts_text).expect("parse") as i128 * 1_000_000;
+    exec_dml(
+        &server,
+        &format!("INSERT INTO t9 VALUES (1, '{ts_text}'), (2, '2027-01-01 00:00:00')"),
+    )
+    .await;
+
+    let rows = query_values(&server, "SELECT ts FROM t9 WHERE id = 1").await;
+    assert_eq!(rows.len(), 1);
+    match rows[0][0] {
+        ScalarValue::Int128(v) => assert_eq!(
+            v, expected_ps,
+            "the stored cell must be the inserted instant in picoseconds, not zeros"
+        ),
+        ref other => panic!("a p>6 column reads back as i128 picoseconds, got {other:?}"),
+    }
+
+    // The value also answers an equality on itself through the scan
+    let matched = query_values(
+        &server,
+        &format!("SELECT id FROM t9 WHERE ts = TIMESTAMP '{ts_text}'"),
+    )
+    .await;
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0][0], ScalarValue::Int64(1));
 }

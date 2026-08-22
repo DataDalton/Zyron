@@ -512,6 +512,11 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
             TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc,
             ScalarValue::Int128(v),
         ) => buf.extend_from_slice(&v.to_le_bytes()),
+        // A TIMESTAMP(p>6) column carries i128 picosecond values under its
+        // logical timestamp type, stored at the 16-byte physical width
+        (TypeId::Timestamp | TypeId::TimestampTz, ScalarValue::Int128(v)) => {
+            buf.extend_from_slice(&v.to_le_bytes())
+        }
         (TypeId::UInt8, ScalarValue::UInt8(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt16, ScalarValue::UInt16(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt32, ScalarValue::UInt32(v)) => buf.extend_from_slice(&v.to_le_bytes()),

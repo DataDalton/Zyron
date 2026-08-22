@@ -613,11 +613,16 @@ fn key_table(
 
 fn id_batch(ids: &[i64]) -> Vec<ColumnData> {
     vec![
-        ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
-        ColumnData::from_cells(1, ids
-                .iter()
+        ColumnData::from_cells(
+            0,
+            ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+        ),
+        ColumnData::from_cells(
+            1,
+            ids.iter()
                 .map(|_| Some(0i64.to_le_bytes().to_vec()))
-                .collect()),
+                .collect(),
+        ),
     ]
 }
 
@@ -2477,6 +2482,7 @@ fn test_commit_latency_targets() {
 
     // A predicate that covers part of every file, so it is recorded rather
     // than applied and the commit is metadata only
+    let version_before = log.latest_version();
     let mut delete_us = Vec::with_capacity(RUNS);
     for run in 0..RUNS {
         let bound = (run as i64 + 1) * 3;
@@ -2488,9 +2494,25 @@ fn test_commit_latency_targets() {
                 &predicate,
                 "bucket < n",
             )
+            .expect("delete")
         });
         delete_us.push(us);
     }
+    // The gate holds only if every timed run did the work its name claims.
+    // A delete_where that failed fast would time as a fast metadata commit
+    // and pass the ceiling while recording nothing
+    assert_eq!(
+        log.latest_version(),
+        version_before + RUNS as u64,
+        "every timed run has to have committed a version"
+    );
+    assert!(
+        !log.latest_manifest()
+            .expect("manifest")
+            .delete_predicates
+            .is_empty(),
+        "the timed commits have to have recorded their predicates"
+    );
     let delete_ms =
         record_metric("lake_targets", "Commit, delete predicate", "us", delete_us) / 1000.0;
     assert!(
@@ -2961,12 +2983,7 @@ fn test_cluster_key_sort_overhead_target() {
         });
         order_us.push(us);
     }
-    let order = record_metric(
-        "lake_targets",
-        "Cluster key ordering pass",
-        "us",
-        order_us,
-    );
+    let order = record_metric("lake_targets", "Cluster key ordering pass", "us", order_us);
     let per_row_ns = order * 1000.0 / n as f64;
     record_metric(
         "lake_targets",

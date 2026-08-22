@@ -160,7 +160,15 @@ pub async fn derived_column_data(
         let computed = evaluate_derived(catalog, table, batch, &schema).await?;
         for (slot, (_, column)) in out.iter_mut().zip(computed.into_iter()) {
             let type_id = column.type_id;
-            let value_size = type_id.fixed_size().unwrap_or(0);
+            // Width of the stored cell. A timestamp expression over a p>6
+            // source yields i128 picoseconds, 16 bytes, not the logical
+            // type's 8
+            let value_size = zyron_common::types::TypeId::timestamp_physical_type_id(
+                type_id,
+                column.fractional_digits,
+            )
+            .fixed_size()
+            .unwrap_or(0);
             for r in 0..batch.num_rows {
                 match column.get_scalar(r) {
                     crate::column::ScalarValue::Null => slot.push(None),

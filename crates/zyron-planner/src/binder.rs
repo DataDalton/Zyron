@@ -485,6 +485,44 @@ impl BoundExpr {
             } if *return_type == TypeId::Decimal => {
                 args.first().and_then(|a| a.fractional_digits())
             }
+            // A scalar function's digits follow the argument its return type
+            // derives from, mirroring infer_function_type. time_bucket keeps
+            // its timestamp argument's precision (the evaluator buckets in
+            // the argument's own storage unit), the pass-through family keeps
+            // its first argument's scale, and the value-picking family lands
+            // on the widest argument like CASE. Functions that compute a
+            // fresh temporal value (now, cron_next, time_bucket_calendar)
+            // work in the microsecond default and stay None
+            BoundExpr::Function {
+                name,
+                args,
+                return_type,
+                ..
+            } if matches!(
+                return_type,
+                TypeId::Decimal | TypeId::Timestamp | TypeId::TimestampTz
+            ) =>
+            {
+                match name.to_lowercase().as_str() {
+                    "time_bucket" | "time_bucket_gapfill" | "date_trunc" => {
+                        args.get(1).and_then(|a| a.fractional_digits())
+                    }
+                    "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "truncate"
+                    | "locf" | "interpolate" | "nullif" => {
+                        args.first().and_then(|a| a.fractional_digits())
+                    }
+                    "coalesce" | "greatest" | "least" => {
+                        let mut widest: Option<u8> = None;
+                        for a in args {
+                            if let Some(s) = a.fractional_digits() {
+                                widest = Some(widest.map_or(s, |w| w.max(s)));
+                            }
+                        }
+                        widest
+                    }
+                    _ => None,
+                }
+            }
             // A wide fixed-point literal carries its own scale
             BoundExpr::Literal {
                 value: LiteralValue::Decimal { scale, .. },
@@ -7343,7 +7381,20 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
     let lower = name.to_lowercase();
     Ok(match lower.as_str() {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "truncate" => {
-            arg_types.first().copied().unwrap_or(TypeId::Float64)
+            let arg = arg_types.first().copied().unwrap_or(TypeId::Float64);
+            // Rounding an instant by decimal digits has no meaning, and
+            // abs of a pre-epoch timestamp would silently flip its sign.
+            // Refused where it binds, with the temporal function named
+            if matches!(
+                arg,
+                TypeId::Timestamp | TypeId::TimestampTz | TypeId::Date | TypeId::Time
+            ) {
+                return Err(ZyronError::PlanError(format!(
+                    "{lower}() does not apply to a temporal value, \
+                     bucket the instant with time_bucket(width, ts) instead"
+                )));
+            }
+            arg
         }
         "length" | "char_length" | "character_length" | "octet_length" => TypeId::Int64,
         "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "substring" | "substr" | "replace"
@@ -7356,6 +7407,36 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
         // timestamp argument's type.
         "time_bucket" | "time_bucket_gapfill" => {
             arg_types.get(1).copied().unwrap_or(TypeId::TimestampTz)
+        }
+        // date_trunc(unit, source) returns the source's type. A DATE source
+        // widens to the timestamp its boundary lands on. The three-argument
+        // zone form needs a named-timezone database the engine does not
+        // carry, so it is refused where it binds
+        "date_trunc" => {
+            if arg_types.len() > 2 {
+                return Err(ZyronError::PlanError(
+                    "date_trunc with a timezone name is not available, \
+                     apply the zone's offset to the instant instead"
+                        .to_string(),
+                ));
+            }
+            match arg_types.get(1).copied() {
+                Some(TypeId::Timestamp) => TypeId::Timestamp,
+                Some(TypeId::TimestampTz) => TypeId::TimestampTz,
+                Some(TypeId::Date) => TypeId::Timestamp,
+                Some(TypeId::Interval) => TypeId::Interval,
+                Some(other) => {
+                    return Err(ZyronError::PlanError(format!(
+                        "date_trunc truncates a timestamp, a date or an interval, got {other:?}"
+                    )));
+                }
+                None => {
+                    return Err(ZyronError::PlanError(
+                        "date_trunc takes a unit and a source, like date_trunc('day', ts)"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         // locf/interpolate return the value column's type.
         "locf" | "interpolate" => arg_types.first().copied().unwrap_or(TypeId::Null),

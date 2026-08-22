@@ -304,13 +304,15 @@ pub struct OrphanReport {
     pub removed_index_files: Vec<(u32, u64)>,
 }
 
-/// Deletes data files no retained version and no branch can reach.
+/// Deletes data files no retained version, no branch, and no clone can
+/// reach.
 ///
-/// Reachability is the union of the manifest at `retain_from_version` and
-/// every file any later version added, on main and on every branch, so a
-/// time-travel read inside the retention window keeps working. A file the
-/// current manifest dropped but an older retained version still names is
-/// not an orphan.
+/// Reachability is the union of the manifest at `retain_from_version`,
+/// every file any later version added, on main and on every branch, and
+/// every file a clone's pinned version names, so a time-travel read inside
+/// the retention window and a VERSION AS OF at a pinned version keep
+/// working. A file the current manifest dropped but an older retained
+/// version still names is not an orphan.
 pub fn cleanup_orphans(
     log: &TransactionLog,
     retain_from_version: u64,
@@ -390,6 +392,17 @@ pub fn cleanup_orphans(
             reachable_index.insert((file.index_id, file.file.partition_id));
         }
     }
+
+    // A clone holds a version of this table, and the source has to stay
+    // able to serve it whatever floor the caller asked for. The pins name
+    // versions, so this costs one manifest reconstruction per clone. An
+    // unreadable pin means the reachable set is unknown, and nothing is
+    // reclaimed against an unknown set, same rule as vacuum
+    let (pinned, pins_complete) = crate::clone::pinned_partitions(log);
+    if !pins_complete {
+        return Ok(report);
+    }
+    reachable.extend(pinned);
 
     // An index file is reachable on its own key, so a dropped index frees
     // its files while a live one keeps them
@@ -512,7 +525,10 @@ mod tests {
     }
 
     fn rows(ids: &[i64]) -> Vec<ColumnData> {
-        vec![ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect())]
+        vec![ColumnData::from_cells(
+            0,
+            ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+        )]
     }
 
     fn new_log(dir: &std::path::Path) -> TransactionLog {

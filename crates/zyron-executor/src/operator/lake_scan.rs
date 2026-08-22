@@ -837,9 +837,15 @@ impl LakeScanOperator {
                         col.name
                     ))
                 })?;
+            // Cells decode by the physical type, which is what sizes them.
+            // A TIMESTAMP(p>6) column stores 16 byte i128 picoseconds, and
+            // decoding it as its logical type would read half the cell and
+            // hand the i128 builder a variant it zeroes. Every other type's
+            // physical form is its logical one
+            let physical = lake_col.physical_type_id();
             decoded.push((
-                col.type_id,
-                lake_col.physical_type_id().fixed_size().unwrap_or(0),
+                physical,
+                physical.fixed_size().unwrap_or(0),
                 reader.read_column_range(lake_col, span_start, span_end)?,
             ));
         }

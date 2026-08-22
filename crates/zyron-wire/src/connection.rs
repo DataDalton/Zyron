@@ -444,6 +444,43 @@ pub async fn lake_optimize(
     Ok(format!("OPTIMIZE {}", parts.join(", ")))
 }
 
+/// Runs one parsed OPTIMIZE statement against the lake tier, the flags read
+/// from the statement itself so no dispatch step can reorder them.
+///
+/// Statement dispatch and a test drive the same function, which is what
+/// makes the grammar's cluster/delete assignment part of the tested path
+/// rather than an untyped pair of booleans between the parser and the work
+pub async fn lake_optimize_statement(
+    server: &Arc<ServerState>,
+    stmt: &zyron_parser::ast::OptimizeTableStatement,
+) -> Result<String, zyron_common::ZyronError> {
+    let table = server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .find(|t| t.name == stmt.table)
+        .ok_or_else(|| {
+            zyron_common::ZyronError::Internal(format!(
+                "relation \"{}\" does not exist",
+                stmt.table
+            ))
+        })?;
+    if !table.lake.is_lake() {
+        return Err(zyron_common::ZyronError::ConfigError(format!(
+            "\"{}\" is not a lake table",
+            table.name
+        )));
+    }
+    let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), table.id.0);
+    let log = zyron_lake::TransactionLog::lookup_shared(&paths).ok_or_else(|| {
+        zyron_common::ZyronError::ConfigError(format!(
+            "this node does not run the lake tier, so it cannot optimize \"{}\"",
+            table.name
+        ))
+    })?;
+    lake_optimize(&server.catalog, &log, table.id.0, stmt.cluster, stmt.delete).await
+}
+
 /// Cached prepared statement.
 struct PreparedStatement {
     query: String,
@@ -3760,9 +3797,7 @@ impl<T: WireTransport> Connection<T> {
                         .await,
                 )
             }
-            zyron_parser::Statement::OptimizeTable(o) => {
-                Some(self.handle_optimize(&o.table, o.cluster, o.delete).await)
-            }
+            zyron_parser::Statement::OptimizeTable(o) => Some(self.handle_optimize(&o).await),
             _ => None,
         }
     }
@@ -4162,13 +4197,13 @@ impl<T: WireTransport> Connection<T> {
     /// no layout to cluster
     async fn handle_optimize(
         &mut self,
-        table_name: &str,
-        cluster: bool,
-        delete: bool,
+        stmt: &zyron_parser::ast::OptimizeTableStatement,
     ) -> Result<(), ProtocolError> {
         use std::sync::atomic::Ordering;
         use zyron_common::page::PAGE_SIZE;
         use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleSlot};
+
+        let table_name: &str = &stmt.table;
 
         if self
             .server
@@ -4229,16 +4264,7 @@ impl<T: WireTransport> Connection<T> {
         // files carrying retired delete predicates instead of vacuuming an
         // empty heap and reporting success
         if table.lake.is_lake() {
-            let paths = zyron_lake::LakePaths::new(self.server.disk_manager.data_dir(), table.id.0);
-            let outcome = match zyron_lake::TransactionLog::lookup_shared(&paths) {
-                Some(log) => {
-                    lake_optimize(&self.server.catalog, &log, table.id.0, cluster, delete).await
-                }
-                None => Err(zyron_common::ZyronError::ConfigError(format!(
-                    "this node does not run the lake tier, so it cannot optimize \"{}\"",
-                    table.name
-                ))),
-            };
+            let outcome = lake_optimize_statement(&self.server, stmt).await;
             return match outcome {
                 Ok(message) => {
                     let fields = crate::messages::backend::ErrorFields {

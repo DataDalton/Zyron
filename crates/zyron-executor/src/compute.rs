@@ -931,6 +931,59 @@ pub fn align_decimal_operands(left: &Column, right: &Column) -> Result<Option<(C
     )))
 }
 
+/// Puts any number of timestamp operands in one physical unit when they
+/// mix the i64 microsecond and i128 picosecond forms.
+///
+/// Returns None when no mixing exists, which is the common case and costs
+/// one pass over the type metadata with no allocation. The microsecond
+/// side scales up exactly, never the reverse, and the widest precision
+/// across the timestamp operands is what the result declares.
+pub fn align_timestamp_columns(cols: &[Column]) -> Result<Option<(Vec<Column>, Option<u8>)>> {
+    let is_ts = |c: &Column| matches!(c.type_id, TypeId::Timestamp | TypeId::TimestampTz);
+    let is_ps = |c: &Column| is_ts(c) && c.fractional_digits.unwrap_or(6) > 6;
+    if !cols.iter().any(is_ps) || !cols.iter().any(|c| is_ts(c) && !is_ps(c)) {
+        return Ok(None);
+    }
+    let precision = cols
+        .iter()
+        .filter(|c| is_ts(c))
+        .filter_map(|c| c.fractional_digits)
+        .max();
+    let aligned = cols
+        .iter()
+        .map(|c| {
+            if is_ts(c) && !is_ps(c) {
+                scale_us_to_ps(c, precision)
+            } else {
+                Ok(c.clone())
+            }
+        })
+        .collect::<Result<Vec<Column>>>()?;
+    Ok(Some((aligned, precision)))
+}
+
+/// Puts any number of operands on one decimal scale when any is a decimal.
+///
+/// Returns None when none is one. The widest scale wins across every
+/// operand, the same rule the pairwise alignment applies, so a function
+/// picking values from several arguments returns them in one
+/// representation.
+pub fn align_decimal_columns(cols: &[Column]) -> Result<Option<(Vec<Column>, u8)>> {
+    let target = cols
+        .iter()
+        .filter(|c| c.type_id == TypeId::Decimal)
+        .map(|c| c.fractional_digits.unwrap_or(0))
+        .max();
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let aligned = cols
+        .iter()
+        .map(|c| cast_column_to_decimal(c, target))
+        .collect::<Result<Vec<Column>>>()?;
+    Ok(Some((aligned, target)))
+}
+
 /// Converts a column to DECIMAL at a known scale.
 ///
 /// The stored form is an i128 holding the value multiplied by ten to the
@@ -938,6 +991,16 @@ pub fn align_decimal_operands(left: &Column, right: &Column) -> Result<Option<(C
 /// A column already at that scale is returned unchanged, and one at another
 /// scale is moved onto this one.
 pub fn cast_column_to_decimal(col: &Column, scale: u8) -> Result<Column> {
+    // A decimal already on the requested scale copies its buffer whole
+    // rather than walking a per-value rescale that changes nothing
+    if col.type_id == TypeId::Decimal && col.fractional_digits.unwrap_or(0) == scale {
+        return Ok(Column::with_nulls_ts(
+            col.data.clone(),
+            col.nulls.clone(),
+            TypeId::Decimal,
+            Some(scale),
+        ));
+    }
     let len = col.len();
     let mut out: Vec<i128> = Vec::with_capacity(len);
     let source_scale = if col.type_id == TypeId::Decimal {

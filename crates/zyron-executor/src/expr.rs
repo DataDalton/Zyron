@@ -1253,6 +1253,7 @@ fn evaluate_function(
             ))
         }
         "extract" | "date_part" => eval_extract(args, batch, schema, params),
+        "date_trunc" => eval_date_trunc(args, batch, schema, params),
         "array" => eval_array(args, batch, schema, params),
         "array_subscript" => eval_array_subscript(args, batch, schema, params),
         // Search predicates evaluated row by row. The planner routes these to
@@ -1953,14 +1954,18 @@ fn literal_string(expr: &BoundExpr) -> Option<String> {
 }
 
 fn eval_abs(col: &Column) -> Result<Column> {
+    // The result keeps the argument's fractional digits: a decimal's
+    // magnitude sits on the same scale, and comparison alignment reads the
+    // scale from the column
     // Typed fast paths for common numeric types.
     match &col.data {
         ColumnData::Int64(v) => {
             let result: Vec<i64> = v.iter().map(|x| x.wrapping_abs()).collect();
-            return Ok(Column::with_nulls(
+            return Ok(Column::with_nulls_ts(
                 ColumnData::Int64(result),
                 col.nulls.clone(),
                 col.type_id,
+                col.fractional_digits,
             ));
         }
         ColumnData::Float64(v) => {
@@ -1987,6 +1992,15 @@ fn eval_abs(col: &Column) -> Result<Column> {
                 col.type_id,
             ));
         }
+        ColumnData::Int128(v) => {
+            let result: Vec<i128> = v.iter().map(|x| x.wrapping_abs()).collect();
+            return Ok(Column::with_nulls_ts(
+                ColumnData::Int128(result),
+                col.nulls.clone(),
+                col.type_id,
+                col.fractional_digits,
+            ));
+        }
         _ => {}
     }
 
@@ -2008,12 +2022,18 @@ fn eval_abs(col: &Column) -> Result<Column> {
             ScalarValue::Float64(v) => ScalarValue::Float64(v.abs()),
             ScalarValue::Int32(v) => ScalarValue::Int32(v.wrapping_abs()),
             ScalarValue::Float32(v) => ScalarValue::Float32(v.abs()),
+            ScalarValue::Int128(v) => ScalarValue::Int128(v.wrapping_abs()),
             other => other,
         };
         data.push_scalar(&abs_val);
     }
 
-    Ok(Column::with_nulls(data, nulls, col.type_id))
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        col.type_id,
+        col.fractional_digits,
+    ))
 }
 
 fn eval_string_transform(col: &Column, transform: fn(&str) -> String) -> Result<Column> {
@@ -2077,13 +2097,44 @@ fn eval_coalesce(
     params: &[ScalarValue],
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
-    let last_idx = args.len() - 1;
-    let mut result = evaluate(&args[last_idx], batch, schema, params)?;
+    let mut cols = Vec::with_capacity(args.len());
+    for arg in args {
+        cols.push(evaluate(arg, batch, schema, params)?);
+    }
+    // Decimal operands land on one scale and mixed-precision timestamps
+    // in one unit before rows are picked, so a fallback written in
+    // another representation cannot leak its raw form into the result.
+    // Without either, the digits carry only when every operand agrees,
+    // which is what makes the value they describe unambiguous
+    let digits = match crate::compute::align_decimal_columns(&cols)? {
+        Some((aligned, scale)) => {
+            cols = aligned;
+            Some(scale)
+        }
+        None => match crate::compute::align_timestamp_columns(&cols)? {
+            Some((aligned, precision)) => {
+                cols = aligned;
+                precision
+            }
+            None if cols
+                .iter()
+                .all(|c| c.fractional_digits == cols[0].fractional_digits) =>
+            {
+                cols[0].fractional_digits
+            }
+            None => None,
+        },
+    };
 
-    for arg in args[..last_idx].iter().rev() {
-        let arg_col = evaluate(arg, batch, schema, params)?;
-        let mut new_data = ColumnData::with_capacity(result.type_id, num_rows);
-        let mut new_nulls = NullBitmap::none(num_rows);
+    let mut result = cols.pop().ok_or_else(|| {
+        ZyronError::ExecutionError("coalesce requires at least 1 argument".to_string())
+    })?;
+    // The merge buffer takes the physical form the cells are in, which
+    // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
+    let merge_type = TypeId::timestamp_physical_type_id(result.type_id, digits);
+    for arg_col in cols.iter().rev() {
+        let mut new_data = ColumnData::with_capacity(merge_type, num_rows);
+        let mut new_nulls = NullBitmap::empty();
 
         for i in 0..num_rows {
             if !arg_col.is_null(i) {
@@ -2098,19 +2149,42 @@ fn eval_coalesce(
         result = Column::with_nulls(new_data, new_nulls, result.type_id);
     }
 
+    result.fractional_digits = digits;
     Ok(result)
 }
 
 fn eval_nullif(a: &Column, b: &Column) -> Result<Column> {
+    // The equality reads both sides on one decimal scale, or both
+    // timestamps in one unit, while the returned values keep the first
+    // argument's own representation and digits
+    let aligned = match crate::compute::align_decimal_operands(a, b)? {
+        Some(pair) => Some(pair),
+        None if is_ts_col(a) && is_ts_col(b) && ts_col_is_ps(a) != ts_col_is_ps(b) => {
+            let mut left = a.clone();
+            let mut right = b.clone();
+            normalize_ts_pair(&mut left, &mut right)?;
+            Some((left, right))
+        }
+        None => None,
+    };
+    let (cmp_a, cmp_b) = match &aligned {
+        Some((left, right)) => (left, right),
+        None => (a, b),
+    };
     let len = a.len();
-    let mut data = ColumnData::with_capacity(a.type_id, len);
-    let mut nulls = NullBitmap::none(len);
+    // The result buffer takes the first argument's physical form, which
+    // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
+    let mut data = ColumnData::with_capacity(
+        TypeId::timestamp_physical_type_id(a.type_id, a.fractional_digits),
+        len,
+    );
+    let mut nulls = NullBitmap::empty();
 
     for i in 0..len {
         if a.is_null(i) {
             nulls.push(true);
             data.push_default();
-        } else if !b.is_null(i) && values_equal_at(&a.data, i, &b.data, i) {
+        } else if !b.is_null(i) && values_equal_at(&cmp_a.data, i, &cmp_b.data, i) {
             nulls.push(true);
             data.push_default();
         } else {
@@ -2119,7 +2193,12 @@ fn eval_nullif(a: &Column, b: &Column) -> Result<Column> {
         }
     }
 
-    Ok(Column::with_nulls(data, nulls, a.type_id))
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        a.type_id,
+        a.fractional_digits,
+    ))
 }
 
 /// Typed equality check for two values at given indices across ColumnData instances.
@@ -2295,12 +2374,18 @@ fn int_round_trunc(v: i128, d: i32, round: bool) -> i128 {
     if d >= 0 {
         return v;
     }
+    // Ten to the 39th exceeds i128::MAX and every representable value
+    // sits below half of it, so zero is the exact nearest multiple for
+    // rounding and truncation alike
     if d <= -39 {
         return 0;
     }
     let p = 10i128.pow((-d) as u32);
     if round {
         let half = p / 2;
+        // A value within half a step of i128's edge has no representable
+        // next multiple, and saturating lands it on the nearest one that
+        // exists instead of wrapping
         let adj = if v >= 0 {
             v.saturating_add(half)
         } else {
@@ -2342,6 +2427,19 @@ fn eval_round_trunc(
         ));
     }
     let col = evaluate(&args[0], batch, schema, params)?;
+    // A temporal argument is refused at bind. The same refusal here
+    // covers any path that reaches the evaluator without binding, where
+    // raw microseconds or picoseconds would round as plain integers
+    if matches!(
+        col.type_id,
+        TypeId::Timestamp | TypeId::TimestampTz | TypeId::Date | TypeId::Time | TypeId::Interval
+    ) {
+        return Err(ZyronError::ExecutionError(
+            "round/trunc does not apply to a temporal value, \
+             bucket the instant with time_bucket(width, ts) instead"
+                .to_string(),
+        ));
+    }
     let dcol = if args.len() == 2 {
         Some(evaluate(&args[1], batch, schema, params)?)
     } else {
@@ -2436,6 +2534,37 @@ fn eval_round_trunc(
         ColumnData::Int16(v) => int_lanes!(v, Int16, i16),
         ColumnData::Int32(v) => int_lanes!(v, Int32, i32),
         ColumnData::Int64(v) => int_lanes!(v, Int64, i64),
+        // A decimal is its value times ten to the scale, so rounding the
+        // value to d fractional digits means rounding the integer at the
+        // scale minus d low decimal digits. The result stays on the
+        // column's scale, which comparison alignment reads
+        ColumnData::Int128(v) if col.type_id == TypeId::Decimal => {
+            let scale = i32::from(col.fractional_digits.unwrap_or(0));
+            let mut out: Vec<i128> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => {
+                        out.push(int_round_trunc(x, d.saturating_sub(scale), round))
+                    }
+                    _ => {
+                        out.push(0);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int128(out),
+                nulls,
+                col.type_id,
+                col.fractional_digits,
+            ))
+        }
         ColumnData::Int128(v) => int_lanes!(v, Int128, i128),
         _ => Err(ZyronError::ExecutionError(
             "round/trunc requires a numeric argument".to_string(),
@@ -2727,7 +2856,10 @@ fn eval_extract(
     let source = evaluate(&args[1], batch, schema, params)?;
 
     // Every source reduces to microseconds since the epoch, so one split
-    // serves dates, timestamps and times alike
+    // serves dates, timestamps and times alike. A p>6 timestamp holds
+    // i128 picoseconds, a different unit whose raw count exceeds i64, so
+    // it floors to microseconds before the split
+    let source_is_ps = ts_col_is_ps(&source);
     let micros_of = |i: usize| -> Option<i64> {
         if source.is_null(i) {
             return None;
@@ -2736,6 +2868,7 @@ fn eval_extract(
             (ColumnData::Int32(v), TypeId::Date) => Some(v[i] as i64 * 86_400_000_000),
             (ColumnData::Int64(v), _) => Some(v[i]),
             (ColumnData::Int32(v), _) => Some(v[i] as i64),
+            (ColumnData::Int128(v), _) if source_is_ps => Some(v[i].div_euclid(1_000_000) as i64),
             (ColumnData::Int128(v), _) => Some(v[i] as i64),
             _ => None,
         }
@@ -2786,6 +2919,252 @@ fn eval_extract(
     ))
 }
 
+/// The truncation boundary date_trunc lands an instant on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateTruncUnit {
+    Microsecond,
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+    Decade,
+    Century,
+    Millennium,
+}
+
+impl DateTruncUnit {
+    /// The unit's width in microseconds, for the fixed-width units. The
+    /// calendar units have no fixed width and answer None
+    fn fixed_us(self) -> Option<i64> {
+        match self {
+            DateTruncUnit::Microsecond => Some(1),
+            DateTruncUnit::Millisecond => Some(1_000),
+            DateTruncUnit::Second => Some(1_000_000),
+            DateTruncUnit::Minute => Some(60_000_000),
+            DateTruncUnit::Hour => Some(3_600_000_000),
+            DateTruncUnit::Day => Some(86_400_000_000),
+            _ => None,
+        }
+    }
+}
+
+fn parse_date_trunc_unit(name: &str) -> Result<DateTruncUnit> {
+    Ok(match name {
+        "microsecond" | "microseconds" => DateTruncUnit::Microsecond,
+        "millisecond" | "milliseconds" => DateTruncUnit::Millisecond,
+        "second" | "seconds" => DateTruncUnit::Second,
+        "minute" | "minutes" => DateTruncUnit::Minute,
+        "hour" | "hours" => DateTruncUnit::Hour,
+        "day" | "days" => DateTruncUnit::Day,
+        "week" | "weeks" => DateTruncUnit::Week,
+        "month" | "months" => DateTruncUnit::Month,
+        "quarter" | "quarters" => DateTruncUnit::Quarter,
+        "year" | "years" => DateTruncUnit::Year,
+        "decade" | "decades" => DateTruncUnit::Decade,
+        "century" | "centuries" => DateTruncUnit::Century,
+        "millennium" | "millennia" | "millenniums" => DateTruncUnit::Millennium,
+        other => {
+            return Err(ZyronError::ExecutionError(format!(
+                "date_trunc does not know the unit '{other}', valid units are microseconds, \
+                 milliseconds, second, minute, hour, day, week, month, quarter, year, decade, \
+                 century and millennium"
+            )));
+        }
+    })
+}
+
+const DAY_US: i64 = 86_400_000_000;
+
+/// Floors a microsecond instant to its unit boundary. Fixed-width units
+/// are one flooring remainder. The week lands on Monday, offset three
+/// days from the Thursday the epoch fell on. Calendar units decompose to
+/// a civil date, land on the first day of their period, and recompose.
+/// Century and millennium start on year one of their period, so 2026
+/// lands on 2001, matching the numbering extract reports
+fn trunc_epoch_us(us: i64, unit: DateTruncUnit) -> i64 {
+    if let Some(w) = unit.fixed_us() {
+        return us - us.rem_euclid(w);
+    }
+    let days = us.div_euclid(DAY_US);
+    if unit == DateTruncUnit::Week {
+        return (days - (days + 3).rem_euclid(7)) * DAY_US;
+    }
+    let (year, month, _) = civil_from_epoch_days(days);
+    let (target_year, target_month) = match unit {
+        DateTruncUnit::Month => (year, month),
+        DateTruncUnit::Quarter => (year, (month - 1) / 3 * 3 + 1),
+        DateTruncUnit::Year => (year, 1),
+        DateTruncUnit::Decade => (year - year.rem_euclid(10), 1),
+        DateTruncUnit::Century => ((year - 1).div_euclid(100) * 100 + 1, 1),
+        DateTruncUnit::Millennium => ((year - 1).div_euclid(1000) * 1000 + 1, 1),
+        _ => unreachable!("fixed-width and week units returned above"),
+    };
+    epoch_days_from_civil(target_year, target_month, 1) * DAY_US
+}
+
+/// Floors a picosecond instant to its unit boundary. Fixed-width units
+/// floor directly in picoseconds so the sub-microsecond digits clear in
+/// the same step. Calendar boundaries are whole days, so the microsecond
+/// computation recomposes exactly
+fn trunc_epoch_ps(ps: i128, unit: DateTruncUnit) -> i128 {
+    if let Some(w) = unit.fixed_us() {
+        let w_ps = w as i128 * 1_000_000;
+        return ps - ps.rem_euclid(w_ps);
+    }
+    trunc_epoch_us(ps.div_euclid(1_000_000) as i64, unit) as i128 * 1_000_000
+}
+
+/// Zeroes an interval's fields below the unit and floors the field the
+/// unit lives in. A duration anchors at zero, so a century of months is
+/// a plain multiple of 1200 with no year-one shift
+fn trunc_interval(iv: zyron_common::Interval, unit: DateTruncUnit) -> zyron_common::Interval {
+    use zyron_common::Interval;
+    match unit {
+        DateTruncUnit::Microsecond => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 1_000,
+            ..iv
+        },
+        DateTruncUnit::Millisecond => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 1_000_000,
+            ..iv
+        },
+        DateTruncUnit::Second => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 1_000_000_000,
+            ..iv
+        },
+        DateTruncUnit::Minute => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 60_000_000_000,
+            ..iv
+        },
+        DateTruncUnit::Hour => Interval {
+            nanoseconds: iv.nanoseconds - iv.nanoseconds % 3_600_000_000_000,
+            ..iv
+        },
+        DateTruncUnit::Day => Interval {
+            nanoseconds: 0,
+            ..iv
+        },
+        DateTruncUnit::Month => Interval {
+            months: iv.months,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Quarter => Interval {
+            months: iv.months - iv.months % 3,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Year => Interval {
+            months: iv.months - iv.months % 12,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Decade => Interval {
+            months: iv.months - iv.months % 120,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Century => Interval {
+            months: iv.months - iv.months % 1200,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Millennium => Interval {
+            months: iv.months - iv.months % 12000,
+            days: 0,
+            nanoseconds: 0,
+        },
+        DateTruncUnit::Week => unreachable!("refused before the row loop"),
+    }
+}
+
+/// date_trunc(unit, source) floors an instant to the unit's boundary and
+/// keeps the source's type and precision. A date widens to the timestamp
+/// its boundary lands on, and an interval zeroes its fields below the
+/// unit
+fn eval_date_trunc(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(format!(
+            "date_trunc takes a unit and a source, got {} argument(s)",
+            args.len()
+        )));
+    }
+    let unit_col = evaluate(&args[0], batch, schema, params)?;
+    let unit_name = match unit_col.data {
+        ColumnData::Utf8(ref v) if !v.is_empty() => v[0].to_ascii_lowercase(),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "date_trunc needs a constant unit name, like date_trunc('day', ts)".to_string(),
+            ));
+        }
+    };
+    let unit = parse_date_trunc_unit(&unit_name)?;
+    let source = evaluate(&args[1], batch, schema, params)?;
+
+    match (&source.data, source.type_id) {
+        (ColumnData::Int64(v), TypeId::Timestamp | TypeId::TimestampTz) => {
+            let out: Vec<i64> = v.iter().map(|&us| trunc_epoch_us(us, unit)).collect();
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int64(out),
+                source.nulls.clone(),
+                source.type_id,
+                source.fractional_digits,
+            ))
+        }
+        (ColumnData::Int128(v), TypeId::Timestamp | TypeId::TimestampTz) => {
+            let out: Vec<i128> = v.iter().map(|&ps| trunc_epoch_ps(ps, unit)).collect();
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int128(out),
+                source.nulls.clone(),
+                source.type_id,
+                source.fractional_digits,
+            ))
+        }
+        (ColumnData::Int32(v), TypeId::Date) => {
+            let out: Vec<i64> = v
+                .iter()
+                .map(|&d| trunc_epoch_us(d as i64 * DAY_US, unit))
+                .collect();
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int64(out),
+                source.nulls.clone(),
+                TypeId::Timestamp,
+                None,
+            ))
+        }
+        (ColumnData::Interval(v), _) => {
+            // A week of what an interval holds is not defined, its days
+            // and months do not compose into one seven day field
+            if unit == DateTruncUnit::Week {
+                return Err(ZyronError::ExecutionError(
+                    "date_trunc('week', interval) is not defined, truncate to day instead"
+                        .to_string(),
+                ));
+            }
+            let out: Vec<zyron_common::Interval> =
+                v.iter().map(|&iv| trunc_interval(iv, unit)).collect();
+            Ok(Column::with_nulls(
+                ColumnData::Interval(out),
+                source.nulls.clone(),
+                TypeId::Interval,
+            ))
+        }
+        _ => Err(ZyronError::ExecutionError(
+            "date_trunc truncates a timestamp, a date or an interval".to_string(),
+        )),
+    }
+}
+
 /// The inverse of `civil_from_epoch_days`, for the day-of-year field.
 pub(crate) fn epoch_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
@@ -2810,7 +3189,7 @@ fn eval_greatest_least(
     }
     let first = evaluate(&args[0], batch, schema, params)?;
     let target = first.type_id;
-    let fractional_digits = first.fractional_digits;
+    let mut fractional_digits = first.fractional_digits;
     let mut cols: Vec<Column> = Vec::with_capacity(args.len());
     for (idx, a) in args.iter().enumerate() {
         let c = if idx == 0 {
@@ -2825,8 +3204,28 @@ fn eval_greatest_least(
         };
         cols.push(c);
     }
+    // Decimal operands land on the widest scale and mixed-precision
+    // timestamps in one unit before rows are compared, so the winner is
+    // chosen and returned in one representation whichever argument it
+    // came from
+    if target == TypeId::Decimal {
+        if let Some((aligned, scale)) = crate::compute::align_decimal_columns(&cols)? {
+            cols = aligned;
+            fractional_digits = Some(scale);
+        }
+    } else if matches!(target, TypeId::Timestamp | TypeId::TimestampTz) {
+        if let Some((aligned, precision)) = crate::compute::align_timestamp_columns(&cols)? {
+            cols = aligned;
+            fractional_digits = precision;
+        }
+    }
     let n = cols.iter().map(|c| c.len()).max().unwrap_or(0);
-    let mut data = ColumnData::with_capacity(target, n);
+    // The result buffer takes the physical form the cells are in, which
+    // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
+    let mut data = ColumnData::with_capacity(
+        TypeId::timestamp_physical_type_id(target, fractional_digits),
+        n,
+    );
     let mut nulls = NullBitmap::none(n);
     for i in 0..n {
         // best holds the winning argument index for this row
@@ -2916,6 +3315,142 @@ mod scalar_fn_tests {
             ScalarValue::Utf8(v) => v,
             other => panic!("expected Utf8, got {other:?}"),
         }
+    }
+
+    /// The microsecond instant of a civil date at midnight
+    fn civil_us(year: i64, month: i64, day: i64) -> i64 {
+        epoch_days_from_civil(year, month, day) * DAY_US
+    }
+
+    /// Every unit's boundary from one instant, including the flooring
+    /// direction for a pre-epoch instant and the year-one anchoring of
+    /// century and millennium
+    #[test]
+    fn date_trunc_units_land_on_their_boundaries() {
+        use DateTruncUnit as U;
+        // 2026-05-17 is a Sunday, 14:30:45.123456
+        let t = civil_us(2026, 5, 17) + 14 * 3_600_000_000 + 30 * 60_000_000 + 45_123_456;
+        assert_eq!(
+            trunc_epoch_us(t, U::Second),
+            civil_us(2026, 5, 17) + 14 * 3_600_000_000 + 30 * 60_000_000 + 45_000_000
+        );
+        assert_eq!(
+            trunc_epoch_us(t, U::Minute),
+            civil_us(2026, 5, 17) + 14 * 3_600_000_000 + 30 * 60_000_000
+        );
+        assert_eq!(
+            trunc_epoch_us(t, U::Hour),
+            civil_us(2026, 5, 17) + 14 * 3_600_000_000
+        );
+        assert_eq!(trunc_epoch_us(t, U::Day), civil_us(2026, 5, 17));
+        assert_eq!(
+            trunc_epoch_us(t, U::Week),
+            civil_us(2026, 5, 11),
+            "a Sunday lands on its own week's Monday"
+        );
+        assert_eq!(
+            trunc_epoch_us(civil_us(2026, 5, 11), U::Week),
+            civil_us(2026, 5, 11),
+            "a Monday is its own boundary"
+        );
+        assert_eq!(
+            trunc_epoch_us(0, U::Week),
+            civil_us(1969, 12, 29),
+            "the Thursday epoch lands on the Monday before it"
+        );
+        assert_eq!(trunc_epoch_us(t, U::Month), civil_us(2026, 5, 1));
+        assert_eq!(trunc_epoch_us(t, U::Quarter), civil_us(2026, 4, 1));
+        assert_eq!(trunc_epoch_us(t, U::Year), civil_us(2026, 1, 1));
+        assert_eq!(trunc_epoch_us(t, U::Decade), civil_us(2020, 1, 1));
+        assert_eq!(trunc_epoch_us(t, U::Century), civil_us(2001, 1, 1));
+        assert_eq!(trunc_epoch_us(t, U::Millennium), civil_us(2001, 1, 1));
+        // Year 2000 belongs to the twentieth century and the 1990s decade
+        let y2k = civil_us(2000, 6, 15);
+        assert_eq!(trunc_epoch_us(y2k, U::Century), civil_us(1901, 1, 1));
+        assert_eq!(trunc_epoch_us(y2k, U::Decade), civil_us(2000, 1, 1));
+        assert_eq!(
+            trunc_epoch_us(civil_us(1969, 8, 20), U::Decade),
+            civil_us(1960, 1, 1)
+        );
+        // One microsecond before the epoch floors to the previous day,
+        // not toward zero
+        assert_eq!(trunc_epoch_us(-1, U::Day), civil_us(1969, 12, 31));
+        assert_eq!(trunc_epoch_us(-1, U::Second), -1_000_000);
+    }
+
+    /// The picosecond form clears sub-microsecond digits in the same
+    /// flooring step and recomposes calendar boundaries exactly
+    #[test]
+    fn date_trunc_ps_clears_the_smaller_digits_with_the_unit() {
+        use DateTruncUnit as U;
+        let us = civil_us(2026, 5, 17) + 45_123_456;
+        let ps = us as i128 * 1_000_000 + 789_654;
+        assert_eq!(
+            trunc_epoch_ps(ps, U::Second),
+            (civil_us(2026, 5, 17) + 45_000_000) as i128 * 1_000_000
+        );
+        assert_eq!(
+            trunc_epoch_ps(ps, U::Microsecond),
+            us as i128 * 1_000_000,
+            "the microsecond unit keeps the microsecond and drops the picoseconds"
+        );
+        assert_eq!(
+            trunc_epoch_ps(ps, U::Month),
+            civil_us(2026, 5, 1) as i128 * 1_000_000
+        );
+    }
+
+    /// Interval truncation zeroes the fields below the unit and floors
+    /// the field the unit lives in, toward zero for a negative duration
+    #[test]
+    fn date_trunc_interval_zeroes_the_fields_below_the_unit() {
+        use DateTruncUnit as U;
+        let iv = zyron_common::Interval {
+            months: 14,
+            days: 3,
+            nanoseconds: 3 * 3_600_000_000_000 + 25 * 60_000_000_000 + 7_000_000_000,
+        };
+        let hour = trunc_interval(iv, U::Hour);
+        assert_eq!(
+            (hour.months, hour.days, hour.nanoseconds),
+            (14, 3, 3 * 3_600_000_000_000)
+        );
+        let day = trunc_interval(iv, U::Day);
+        assert_eq!((day.months, day.days, day.nanoseconds), (14, 3, 0));
+        let year = trunc_interval(iv, U::Year);
+        assert_eq!((year.months, year.days, year.nanoseconds), (12, 0, 0));
+        let negative = trunc_interval(
+            zyron_common::Interval {
+                months: -14,
+                days: 0,
+                nanoseconds: 0,
+            },
+            U::Year,
+        );
+        assert_eq!(
+            negative.months, -12,
+            "a negative duration floors toward zero"
+        );
+    }
+
+    /// The unit parser takes both grammatical numbers and refuses an
+    /// unknown unit naming the valid ones
+    #[test]
+    fn date_trunc_unit_names_parse_in_both_numbers() {
+        assert!(matches!(
+            parse_date_trunc_unit("milliseconds"),
+            Ok(DateTruncUnit::Millisecond)
+        ));
+        assert!(matches!(
+            parse_date_trunc_unit("week"),
+            Ok(DateTruncUnit::Week)
+        ));
+        assert!(matches!(
+            parse_date_trunc_unit("centuries"),
+            Ok(DateTruncUnit::Century)
+        ));
+        let err = parse_date_trunc_unit("fortnight").expect_err("unknown unit");
+        assert!(err.to_string().contains("valid units"));
     }
 
     /// Row-wise vector distance over a vector column and a query vector.
