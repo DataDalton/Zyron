@@ -237,18 +237,18 @@ _Release build, single machine: Intel(R) Core(TM) Ultra 7 270K Plus, 24 cores, 3
 What a client sees from a running server over the wire protocol, from cold start to shutdown:
 
 | Lifecycle / workload | Result |
-| ---------------------- | -------- |
-| Cold boot to accepting queries | 40 ms |
-| First `ReadyForQuery` | 0.60 ms |
-| Schema DDL bootstrap | 7.2 ms |
-| Seed insert | 251K rows/sec |
-| OLTP, 1 client | 12.0K tps, p99 263 us |
-| OLTP, 4 clients | 33.4K tps, p99 360 us |
-| OLTP, 16 clients | 65.1K tps, p99 493 us |
-| OLTP, 64 clients | 60.5K tps, p99 1824 us |
-| OLTP, 256 clients | 55.2K tps, p99 8487 us |
-| Analytical query (median) | 1.30 ms |
-| Graceful shutdown | 53 ms |
+|----------------------|--------|
+| Cold boot to accepting queries | 39 ms |
+| First `ReadyForQuery` | 0.58 ms |
+| Schema DDL bootstrap | 7.9 ms |
+| Seed insert | 279K rows/sec |
+| OLTP, 1 client | 12.5K tps, p99 252 us |
+| OLTP, 4 clients | 38.8K tps, p99 277 us |
+| OLTP, 16 clients | 64.7K tps, p99 477 us |
+| OLTP, 64 clients | 63.4K tps, p99 1693 us |
+| OLTP, 256 clients | 57.2K tps, p99 8130 us |
+| Analytical query (median) | 1.21 ms |
+| Graceful shutdown | 51 ms |
 
 ![OLTP throughput vs. concurrent clients (thousand tps, higher is better)](benchmarks/charts/oltp_throughput.svg)
 
@@ -262,34 +262,40 @@ Raw subsystem throughput and hot-path latency under microbenchmark:
 
 ### Row heap vs ZyronLake
 
-Same workload, same rows, run against both formats. Blue = Row heap, purple = ZyronLake; the shorter bar wins on wall-clock. Write-heavy trade-offs where the Row heap wins (bulk load, trickle load, indexed point lookup) are in the table below so the picture is honest, not cherry-picked.
+Same workload, same rows, run against both formats. Blue is Row heap and purple is ZyronLake, and the shorter bar wins on wall-clock. Write-heavy trade-offs where the Row heap wins (bulk load, trickle load, indexed point lookup) are in the table below so the picture is honest, not cherry-picked.
 
 ![Cross-format wall-clock, Row heap vs ZyronLake](benchmarks/charts/cross_format.svg)
+
+
+The wall-clock lead compounds with a much bigger I/O reduction. The same query against a lake table reads a fraction of the bytes off disk, thanks to columnar projection pushdown, zone maps, and prune-index skipping.
+
+![Bytes-read reduction on ZyronLake vs Row heap on the same query (multiplier, higher is better)](benchmarks/charts/cross_format_bytes.svg)
 
 A few more numbers not shown in the charts above:
 
 | Subsystem | Metric | Result |
-| ----------- | -------- | -------- |
+|-----------|--------|--------|
 | MVCC | GC sweep | ~1.8B tuples/sec |
-| Columnar | .zyr scan throughput | ~3.0 GB/sec |
-| Columnar | Compaction pipeline | ~3.4M rows/sec |
-| Columnar | HybridScan overhead vs heap-only | ~-2.5% |
-| Columnar | Metadata-aggregate pruning speedup | ~3.1x |
-| Temporal | Picosecond timestamp decode | ~310M rows/sec |
-| Versioning | Time-travel scan overhead | ~20% |
+| Columnar | .zyr scan throughput | ~10.8 GB/sec |
+| Columnar | Compaction pipeline | ~7.1M rows/sec |
+| Columnar | HybridScan overhead vs heap-only | ~-1.4% |
+| Columnar | Metadata-aggregate pruning speedup | ~86.7x |
+| Temporal | Picosecond timestamp decode | ~311M rows/sec |
+| Versioning | Time-travel scan overhead | ~29% |
 | Wire | QUIC PostgreSQL handshake | ~5 us |
-| Transactions | Durable commit floor (device write) | ~80.7 us |
-| Lake | Scan throughput | ~154M rows/sec |
-| Lake | Point probe through index | ~199 us |
-| Lake | Zone-map row rejection | ~100% |
-| Transactions | Durable group-commit peak | ~703K txn/sec |
-| Transactions | Group-commit amplification (c=1 to c=512) | ~70.9x |
-| Cross-format | Point-lookup bytes read, heap vs lake | ~89x less I/O for lake |
-| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~2.0x (heap wins indexed points) |
-| Cross-format | Bulk load to queryable, lake vs heap | ~10.8x (heap wins large batches) |
-| Cross-format | Trickle load to queryable, lake vs heap | ~32.1x (heap wins tiny commits) |
+| Transactions | Durable commit floor (device write) | ~76.2 us |
+| Lake | Commit rate (insert) | ~2451 commits/sec |
+| Lake | Commit latency (insert) | ~2.45 ms |
+| Lake | Commit rate (delete predicate) | ~1510 commits/sec |
+| Lake | Derived clustering expression files pruned | ~93% |
+| Lake | Load with clustering expression | ~760K rows/sec |
+| Transactions | Durable group-commit peak | ~762K txn/sec |
+| Transactions | Group-commit amplification (c=1 to c=512) | ~75.8x |
+| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.2x (heap wins indexed points) |
+| Cross-format | Bulk load to queryable, lake vs heap | ~9.8x (heap wins large batches) |
+| Cross-format | Trickle load to queryable, lake vs heap | ~24.2x (heap wins tiny commits) |
 
-32 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+33 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started

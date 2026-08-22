@@ -131,9 +131,11 @@ EXTRA = [
         1,
         " us",
     ),
-    ("lake", "lake_scan", "Scan throughput", "Lake", "Scan throughput", 1e6, 0, "M rows/sec"),
-    ("lake", "lake_index", "Point probe through the index", "Lake", "Point probe through index", 1, 0, " us"),
-    ("lake", "lake_skipping", "zone map rows rejected (fraction)", "Lake", "Zone-map row rejection", 0.01, 0, "%"),
+    ("lake", "lake_targets", "Commit, insert", "Lake", "Commit rate (insert)", 1, 0, " commits/sec"),
+    ("lake", "lake_targets", "Commit insert latency (ms)", "Lake", "Commit latency (insert)", 1, 2, " ms"),
+    ("lake", "lake_targets", "Commit, delete predicate", "Lake", "Commit rate (delete predicate)", 1, 0, " commits/sec"),
+    ("lake_derived", "lake_derived", "expression predicate files pruned (fraction)", "Lake", "Derived clustering expression files pruned", 0.01, 0, "%"),
+    ("lake_derived", "lake_derived", "Load, clustering expression", "Lake", "Load with clustering expression", 1e3, 0, "K rows/sec"),
 ]
 
 # Cross-format workloads to chart (heap vs lake wall-clock ratios).
@@ -316,10 +318,28 @@ def main():
     cf_heap_us = [cf_us(g, k, "heap") for g, k, _ in CROSS_READS]
     cf_lake_us = [cf_us(g, k, "lake") for g, k, _ in CROSS_READS]
     cf_top = int(max(cf_heap_us + cf_lake_us) * 1.15)
-    cf_bytes_reduction = 1.0 / cf_ratio("point_lookup_narrow", "Bytes read")
     cf_bulk_load = cf_ratio("bulk_load", "Bulk load to queryable")
     cf_trickle_load = cf_ratio("trickle_load", "Trickle load to queryable")
     cf_point_indexed = cf_ratio("point_lookup_index", "Point lookup with an index")
+
+    # Bytes-read reduction (heap bytes / lake bytes) per workload, sorted
+    # descending so the biggest win reads first. This is the headline lake I/O
+    # story.
+    bytes_workloads = [
+        ("point_lookup_narrow", "Point lookup"),
+        ("join", "Join"),
+        ("point_lookup_full", "Point lookup (full row)"),
+        ("range_scan", "Range scan"),
+        ("aggregate", "Aggregate"),
+    ]
+    bytes_pairs = sorted(
+        ((label, 1.0 / cf_ratio(g, "Bytes read")) for g, label in bytes_workloads),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    bytes_labels = [l for l, _ in bytes_pairs]
+    bytes_vals = [v for _, v in bytes_pairs]
+    bytes_top = int(max(bytes_vals) * 1.15)
 
     # End-to-end: a client talking to a running server over the wire.
     e2e = doc("end_to_end")
@@ -404,10 +424,10 @@ def main():
     )
     out.append("### Row heap vs ZyronLake\n")
     out.append(
-        "Same workload, same rows, run against both formats. Blue = Row heap, purple = "
-        "ZyronLake; the shorter bar wins on wall-clock. Write-heavy trade-offs where the "
-        "Row heap wins (bulk load, trickle load, indexed point lookup) are in the table "
-        "below so the picture is honest, not cherry-picked.\n"
+        "Same workload, same rows, run against both formats. Blue is Row heap and purple "
+        "is ZyronLake, and the shorter bar wins on wall-clock. Write-heavy trade-offs "
+        "where the Row heap wins (bulk load, trickle load, indexed point lookup) are in "
+        "the table below so the picture is honest, not cherry-picked.\n"
     )
     svg_top = int(max(cf_heap_us + cf_lake_us) * 1.15)
     svg_path = CHARTS / "cross_format.svg"
@@ -425,6 +445,22 @@ def main():
     svg_rel = svg_path.relative_to(ROOT).as_posix()
     out.append(f"![Cross-format wall-clock, Row heap vs ZyronLake]({svg_rel})\n")
 
+    out.append(
+        "\nThe wall-clock lead compounds with a much bigger I/O reduction. The same query "
+        "against a lake table reads a fraction of the bytes off disk, thanks to columnar "
+        "projection pushdown, zone maps, and prune-index skipping.\n"
+    )
+    svg_chart(
+        "cross_format_bytes",
+        "Bytes-read reduction on ZyronLake vs Row heap on the same query (multiplier, higher is better)",
+        bytes_labels,
+        bytes_vals,
+        bytes_top,
+        "x less I/O",
+        color="#a371f7",
+        fmt="{:.0f}x",
+    )
+
     extra_rows = []
     for suite, group, key, sub, mlabel, div, dec, suffix in EXTRA:
         v = metric(doc(suite), group, key) / div
@@ -433,7 +469,6 @@ def main():
     extra_rows.append(
         f"| Transactions | Group-commit amplification (c={dc_levels[0]} to c={dc_levels[-1]}) | ~{dc_amplification:.1f}x |"
     )
-    extra_rows.append(f"| Cross-format | Point-lookup bytes read, heap vs lake | ~{cf_bytes_reduction:.0f}x less I/O for lake |")
     extra_rows.append(f"| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~{cf_point_indexed:.1f}x (heap wins indexed points) |")
     extra_rows.append(f"| Cross-format | Bulk load to queryable, lake vs heap | ~{cf_bulk_load:.1f}x (heap wins large batches) |")
     extra_rows.append(f"| Cross-format | Trickle load to queryable, lake vs heap | ~{cf_trickle_load:.1f}x (heap wins tiny commits) |")

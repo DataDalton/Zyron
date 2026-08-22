@@ -1,0 +1,194 @@
+{
+  "id": "2026-08-22_005103_a709198-local",
+  "date": "2026-08-22 00:51:34Z",
+  "ts": 1787359894,
+  "commit": "a709198-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Bloom Filter": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 16.98 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 16.99 },
+      "Bloom probe latency (ns)": {
+        "average": 7.045200,
+        "runs": [8.29, 7.96, 6.23, 6.19, 6.57],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Bloom skip rate (%)": {
+        "average": 100.000000,
+        "runs": [100.00],
+        "target": 99.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Column Segment Format": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 16.94 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 16.95 },
+      ".zyr scan throughput (GB/sec)": {
+        "average": 10.754924,
+        "runs": [10.47, 10.87, 10.96, 10.93, 10.54],
+        "target": 1.400000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Compaction Pipeline": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 16.95 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 16.94 },
+      "Compaction throughput (rows/sec)": {
+        "average": 7053958.189869,
+        "runs": [7028740.52, 6887526.69, 7205078.14, 6964176.28, 7184269.32],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Encoded Density": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 16.92 },
+      "util_after": { "cpu_pct": 10.0, "ram_used_gb": 16.94 },
+      "Irregular series (bits/value)": {
+        "average": 64.000000,
+        "runs": [64.00, 64.00, 64.00, 64.00, 64.00],
+        "target": 64.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "HTAP Hybrid Scan": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 16.90 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 16.91 },
+      "Hybrid scan overhead (%)": {
+        "average": -1.418407,
+        "runs": [-5.94, -0.44, 1.10, -0.27, -1.55],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Metadata Aggregate": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 16.91 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 16.92 },
+      "Metadata vs scan speedup (x)": {
+        "average": 86.738275,
+        "runs": [86.74],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Zone Map": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 16.91 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 16.91 },
+      "Narrow range batch skip rate (%)": {
+        "average": 99.000000,
+        "runs": [99.00],
+        "target": 95.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parallel Column Encoding": {
+      "util_before": { "cpu_pct": 10.0, "ram_used_gb": 16.90 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 16.91 },
+      "Parallel speedup (x)": {
+        "average": 1.990331,
+        "runs": [1.93, 1.60, 2.01, 2.00, 2.41],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Shipped thread count speedup (x)": {
+        "average": 1.969420,
+        "runs": [1.96, 1.95, 1.63, 1.80, 2.51],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Sequential compaction (rows/sec)": {
+        "average": 1937095.517476,
+        "runs": [2016238.79, 1998077.85, 2067645.08, 2065130.07, 1538385.80],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Segment Cache": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 16.91 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 16.91 },
+      "Cache get (ns/lookup)": {
+        "average": 37.964600,
+        "runs": [37.96],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Sorted Segment": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 16.91 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 16.92 },
+      "Sorted PK lookup (ns)": {
+        "average": 26.974000,
+        "runs": [27.28, 26.98, 26.88, 26.81, 26.92],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Sorted PK range (keys/sec)": {
+        "average": 312955585.788035,
+        "runs": [199866755.50, 371287128.71, 386100386.10, 194300518.13, 413223140.50],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Txn-Aware Pruning": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 16.91 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 16.92 },
+      "Pruning decision (ns/file)": {
+        "average": 0.709360,
+        "runs": [0.71],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}
