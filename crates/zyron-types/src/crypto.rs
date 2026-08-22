@@ -76,13 +76,10 @@ pub fn hmac_sha256(data: &[u8], key: &[u8]) -> [u8; 32] {
 
 /// Combines two hash values into one using boost::hash_combine style mixing.
 /// Produces a deterministic combined hash suitable for composite keys.
+/// The SQL function keeps this signature, the algorithm is the canonical
+/// copy in zyron_common::checksum::helpers
 pub fn hash_combine(a: u64, b: u64) -> u64 {
-    // Uses the golden ratio constant and bit mixing from boost::hash_combine
-    let phi: u64 = 0x9E3779B97F4A7C15; // 2^64 / golden ratio
-    a ^ (b
-        .wrapping_add(phi)
-        .wrapping_add(a << 6)
-        .wrapping_add(a >> 2))
+    zyron_common::hash_combine(a, b)
 }
 
 /// Jump consistent hashing (Lamping and Veach, 2014).

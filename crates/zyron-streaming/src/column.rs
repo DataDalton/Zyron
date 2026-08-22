@@ -557,6 +557,114 @@ impl StreamBatch {
 }
 
 // ---------------------------------------------------------------------------
+// Batch column hashing
+// ---------------------------------------------------------------------------
+//
+// Typed dispatch once per column, then a tight loop of the canonical
+// per-value primitives from zyron_common::checksum (hash_int for numeric
+// values, fnv1a_64 for strings and binary, hash_combine to fold columns,
+// mix_finalize_3round to finish). The dispatch lives here because it
+// matches on StreamColumnData, the primitives are the shared copies.
+
+use zyron_common::{fnv1a_64, hash_combine, hash_int, mix_finalize_3round};
+
+/// Sentinel hash for null values
+pub const HASH_NULL_SENTINEL: u64 = 0xdeadbeefcafebabe;
+
+/// Hashes an entire column into a Vec<u64>, one hash per row.
+/// Typed dispatch avoids per-row ScalarValue creation.
+pub fn hash_column_batch(col: &StreamColumn, num_rows: usize) -> Vec<u64> {
+    let mut hashes = Vec::with_capacity(num_rows);
+    hash_column_batch_into(col, num_rows, &mut hashes);
+    hashes
+}
+
+/// Hashes a column into an existing buffer, clearing it first.
+/// Avoids allocation when the caller can reuse a buffer across calls.
+pub fn hash_column_batch_into(col: &StreamColumn, num_rows: usize, hashes: &mut Vec<u64>) {
+    hashes.clear();
+    hashes.reserve(num_rows.saturating_sub(hashes.capacity()));
+    let has_nulls = col.nulls.has_nulls();
+
+    // Expands the null-checked and null-free loops for a value expression,
+    // hoisting the null check outside the per-row loop
+    macro_rules! push_hashes {
+        ($values:expr, $hash_one:expr) => {
+            if has_nulls {
+                for i in 0..num_rows {
+                    if col.nulls.is_null(i) {
+                        hashes.push(HASH_NULL_SENTINEL);
+                    } else {
+                        hashes.push($hash_one(&$values[i]));
+                    }
+                }
+            } else {
+                for i in 0..num_rows {
+                    hashes.push($hash_one(&$values[i]));
+                }
+            }
+        };
+    }
+
+    match &col.data {
+        StreamColumnData::Int64(v) => push_hashes!(v, |x: &i64| hash_int(*x as u64)),
+        StreamColumnData::Int32(v) => push_hashes!(v, |x: &i32| hash_int(*x as i64 as u64)),
+        StreamColumnData::Int16(v) => push_hashes!(v, |x: &i16| hash_int(*x as i64 as u64)),
+        StreamColumnData::Int8(v) => push_hashes!(v, |x: &i8| hash_int(*x as i64 as u64)),
+        StreamColumnData::Int128(v) => push_hashes!(v, |x: &i128| {
+            let lo = *x as u64;
+            let hi = (*x >> 64) as u64;
+            hash_combine(hash_int(lo), hi)
+        }),
+        StreamColumnData::UInt64(v) => push_hashes!(v, |x: &u64| hash_int(*x)),
+        StreamColumnData::UInt32(v) => push_hashes!(v, |x: &u32| hash_int(*x as u64)),
+        StreamColumnData::UInt16(v) => push_hashes!(v, |x: &u16| hash_int(*x as u64)),
+        StreamColumnData::UInt8(v) => push_hashes!(v, |x: &u8| hash_int(*x as u64)),
+        StreamColumnData::Float64(v) => push_hashes!(v, |x: &f64| hash_int(x.to_bits())),
+        StreamColumnData::Float32(v) => push_hashes!(v, |x: &f32| hash_int(x.to_bits() as u64)),
+        StreamColumnData::Boolean(v) => push_hashes!(v, |x: &bool| hash_int(*x as u64)),
+        StreamColumnData::Utf8(v) => push_hashes!(v, |x: &String| fnv1a_64(x.as_bytes())),
+        StreamColumnData::Binary(v) => push_hashes!(v, |x: &Vec<u8>| fnv1a_64(x)),
+    }
+}
+
+/// Combines hashes from multiple columns into a single hash per row.
+/// Uses hash_combine to fold each column's hash into the running seed.
+pub fn hash_multi_column_batch(cols: &[&StreamColumn], num_rows: usize) -> Vec<u64> {
+    let mut hashes = Vec::with_capacity(num_rows);
+    hash_multi_column_batch_into(cols, num_rows, &mut hashes);
+    hashes
+}
+
+/// Combines hashes from multiple columns into an existing buffer.
+/// Clears the buffer first. Avoids allocation when reusing across calls.
+pub fn hash_multi_column_batch_into(
+    cols: &[&StreamColumn],
+    num_rows: usize,
+    hashes: &mut Vec<u64>,
+) {
+    if cols.is_empty() {
+        hashes.clear();
+        hashes.resize(num_rows, 0);
+        return;
+    }
+
+    hash_column_batch_into(cols[0], num_rows, hashes);
+    let mut col_hashes = Vec::with_capacity(num_rows);
+    for col in &cols[1..] {
+        hash_column_batch_into(col, num_rows, &mut col_hashes);
+        for (h, ch) in hashes.iter_mut().zip(col_hashes.iter()) {
+            *h = hash_combine(*h, *ch);
+        }
+    }
+
+    // Finalize all hashes for better distribution
+    for h in hashes.iter_mut() {
+        *h = mix_finalize_3round(*h);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -671,5 +779,54 @@ mod tests {
         assert!(batch.is_empty());
         assert_eq!(batch.num_rows, 0);
         assert_eq!(batch.num_columns(), 0);
+    }
+
+    #[test]
+    fn test_hash_column_batch_int64() {
+        let col = StreamColumn::from_data(StreamColumnData::Int64(vec![10, 20, 30]));
+        let hashes = hash_column_batch(&col, 3);
+        assert_eq!(hashes.len(), 3);
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
+    }
+
+    #[test]
+    fn test_hash_column_batch_with_nulls() {
+        let mut nulls = NullBitmap::new_valid(3);
+        nulls.set_null(1);
+        let col = StreamColumn::new(StreamColumnData::Int64(vec![10, 20, 30]), nulls);
+        let hashes = hash_column_batch(&col, 3);
+        assert_eq!(hashes[1], HASH_NULL_SENTINEL);
+        assert_ne!(hashes[0], HASH_NULL_SENTINEL);
+    }
+
+    /// Every variant's per-value hash must match the canonical primitive
+    /// applied to the same bit pattern, the batch dispatch only routes
+    #[test]
+    fn test_hash_column_batch_matches_primitives_per_type() {
+        let col = StreamColumn::from_data(StreamColumnData::Int32(vec![-5, 7]));
+        let hashes = hash_column_batch(&col, 2);
+        assert_eq!(hashes[0], hash_int(-5i64 as u64));
+        assert_eq!(hashes[1], hash_int(7u64));
+
+        let col = StreamColumn::from_data(StreamColumnData::Float64(vec![1.5]));
+        assert_eq!(hash_column_batch(&col, 1)[0], hash_int(1.5f64.to_bits()));
+
+        let col = StreamColumn::from_data(StreamColumnData::Utf8(vec!["abc".into()]));
+        assert_eq!(hash_column_batch(&col, 1)[0], fnv1a_64(b"abc"));
+    }
+
+    #[test]
+    fn test_multi_column_hash() {
+        let col1 = StreamColumn::from_data(StreamColumnData::Int64(vec![1, 2, 3]));
+        let col2 = StreamColumn::from_data(StreamColumnData::Utf8(vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+        ]));
+        let hashes = hash_multi_column_batch(&[&col1, &col2], 3);
+        assert_eq!(hashes.len(), 3);
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
     }
 }

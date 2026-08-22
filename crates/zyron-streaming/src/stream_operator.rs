@@ -13,11 +13,11 @@ use zyron_common::Result;
 
 use crate::accumulator::StreamAccumulator;
 use crate::checkpoint::CheckpointBarrier;
-use crate::column::{ScalarValue, StreamBatch, StreamColumn, StreamColumnData};
-use crate::hash::{
-    FlatU64Map, hash_column_batch, hash_column_batch_into, hash_multi_column_batch,
-    hash_multi_column_batch_into,
+use crate::column::{
+    ScalarValue, StreamBatch, StreamColumn, StreamColumnData, hash_column_batch,
+    hash_column_batch_into, hash_multi_column_batch, hash_multi_column_batch_into,
 };
+use crate::flat_map::FlatU64Map;
 use crate::record::{ChangeFlag, StreamRecord};
 use crate::state::StateSnapshot;
 use crate::watermark::Watermark;

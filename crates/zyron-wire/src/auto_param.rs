@@ -472,7 +472,7 @@ fn build_template(sql: &str, literals: Vec<Literal>) -> TemplatedQuery {
         template.push_str(&(idx + 1).to_string());
         cursor = lit.end;
 
-        type_state = type_state.rotate_left(5) ^ (lit.type_id as u64).wrapping_add(1);
+        type_state = zyron_common::hash_fold(type_state, (lit.type_id as u64).wrapping_add(1));
         values.push(lit.value);
     }
     template.push_str(std::str::from_utf8(&bytes[cursor..]).unwrap_or(""));

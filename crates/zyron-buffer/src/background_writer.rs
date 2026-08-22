@@ -37,7 +37,7 @@ impl Default for BackgroundWriterConfig {
 /// page WITHOUT issuing fsync, the writer batches fsync across a whole
 /// cycle through `FsyncFn`. Decoupled from DiskManager so the buffer
 /// crate has no storage dependency.
-pub type WriteFn = Arc<dyn Fn(PageId, &[u8; PAGE_SIZE]) -> Result<()> + Send + Sync>;
+pub type WriteFn = Arc<dyn Fn(PageId, &mut [u8; PAGE_SIZE]) -> Result<()> + Send + Sync>;
 
 /// File-level fsync function. Invoked once per touched file_id at the end
 /// of each flush cycle, replacing per-page fsync calls. On platforms where

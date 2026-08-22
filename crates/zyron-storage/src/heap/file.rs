@@ -658,8 +658,8 @@ impl HeapFile {
             let data = self.read_page_from_disk_sync(pid)?;
             match self.pool.load_page(pid, data.as_ref()) {
                 Ok((_, evicted)) => {
-                    if let Some(ev) = evicted {
-                        self.write_page_to_disk_sync(ev.page_id, ev.data.as_ref())?;
+                    if let Some(mut ev) = evicted {
+                        self.write_page_to_disk_sync(ev.page_id, ev.data.as_mut())?;
                     }
                     guard.page_ids.push(pid);
                 }
@@ -670,52 +670,27 @@ impl HeapFile {
         Ok(guard)
     }
 
-    /// Reads one page's bytes straight from its data file, for the scan
-    /// path that runs without an async context. A page past the file's
-    /// current end reads as zeroes, which decodes as an empty page, the
-    /// same answer the async read gives for a never-flushed page
+    /// Reads one page's bytes for the scan path that runs without an async
+    /// context. Routes through the disk manager so the read shares the
+    /// per-page latch, the open file handle and the verification policy
+    /// with every other page read. A page past the file's current end
+    /// reads as zeroes, which decodes as an empty page, the same answer
+    /// the async read gives for a never-flushed page
     fn read_page_from_disk_sync(&self, page_id: PageId) -> Result<Box<[u8; PAGE_SIZE]>> {
-        let path = self
-            .disk
-            .data_dir()
-            .join(format!("{:08}.dat", page_id.file_id));
-        let mut buf: Box<[u8; PAGE_SIZE]> = Box::new([0u8; PAGE_SIZE]);
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| ZyronError::IoError(format!("scan open {}: {}", path.display(), e)))?;
-        let offset = page_id.page_num * (PAGE_SIZE as u64);
-        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
-            .map_err(|e| ZyronError::IoError(format!("scan seek: {}", e)))?;
-        let mut read = 0usize;
-        while read < PAGE_SIZE {
-            match std::io::Read::read(&mut file, &mut buf[read..]) {
-                Ok(0) => break,
-                Ok(n) => read += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(ZyronError::IoError(format!("scan read: {}", e))),
-            }
-        }
-        Ok(buf)
+        self.disk.read_page_sync(page_id)
     }
 
-    /// Writes one page's bytes straight to its data file, for the scan
-    /// path's dirty evictions
-    fn write_page_to_disk_sync(&self, page_id: PageId, data: &[u8]) -> Result<()> {
-        let path = self
-            .disk
-            .data_dir()
-            .join(format!("{:08}.dat", page_id.file_id));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| {
-                ZyronError::IoError(format!("scan flush open {}: {}", path.display(), e))
+    /// Writes one page's bytes for the scan path's dirty evictions. Routes
+    /// through the disk manager so the write holds the per-page latch and
+    /// stamps its checksum, and fsync stays with the caller's flush cycle
+    fn write_page_to_disk_sync(&self, page_id: PageId, data: &mut [u8]) -> Result<()> {
+        let data_len = data.len();
+        let page: &mut [u8; PAGE_SIZE] =
+            data.try_into().map_err(|_| ZyronError::PageSizeMismatch {
+                expected: PAGE_SIZE,
+                actual: data_len,
             })?;
-        let offset = page_id.page_num * (PAGE_SIZE as u64);
-        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
-            .map_err(|e| ZyronError::IoError(format!("scan flush seek: {}", e)))?;
-        std::io::Write::write_all(&mut file, data)
-            .map_err(|e| ZyronError::IoError(format!("scan flush write: {}", e)))?;
-        Ok(())
+        self.disk.write_page_sync_no_fsync(page_id, page)
     }
 
     /// Returns the number of pages in the heap file.
@@ -732,8 +707,9 @@ impl HeapFile {
 
     /// Flushes all dirty heap pages to disk.
     /// Uses synchronous I/O because flush_all's closure cannot await.
+    /// Each page routes through the disk manager, sharing the per-page
+    /// latch and the open file handle instead of opening the file per page.
     pub async fn flush(&self) -> Result<()> {
-        let data_dir = self.disk.data_dir().to_path_buf();
         let heap_file_id = self.config.heap_file_id;
         let fsm_file_id = self.config.fsm_file_id;
 
@@ -741,22 +717,13 @@ impl HeapFile {
             if page_id.file_id != heap_file_id && page_id.file_id != fsm_file_id {
                 return Ok(());
             }
-
-            let path = data_dir.join(format!("{:08}.dat", page_id.file_id));
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|e| {
-                    ZyronError::IoError(format!("flush open {}: {}", path.display(), e))
+            let data_len = data.len();
+            let page: &mut [u8; PAGE_SIZE] =
+                data.try_into().map_err(|_| ZyronError::PageSizeMismatch {
+                    expected: PAGE_SIZE,
+                    actual: data_len,
                 })?;
-
-            let offset = page_id.page_num * (PAGE_SIZE as u64);
-            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
-                .map_err(|e| ZyronError::IoError(format!("flush seek: {}", e)))?;
-            std::io::Write::write_all(&mut file, data)
-                .map_err(|e| ZyronError::IoError(format!("flush write: {}", e)))?;
-
-            Ok(())
+            self.disk.write_page_sync_no_fsync(page_id, page)
         })?;
         Ok(())
     }
@@ -1280,6 +1247,7 @@ mod tests {
         let config = DiskManagerConfig {
             data_dir: dir.path().to_path_buf(),
             fsync_enabled: false,
+            ..Default::default()
         };
         let disk = Arc::new(DiskManager::new(config).await.unwrap());
         let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 100 }));
@@ -1304,6 +1272,7 @@ mod tests {
         let config = DiskManagerConfig {
             data_dir: dir.path().to_path_buf(),
             fsync_enabled: false,
+            ..Default::default()
         };
         let disk = Arc::new(DiskManager::new(config).await.unwrap());
         let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8 }));
@@ -1568,6 +1537,7 @@ mod tests {
         let config = DiskManagerConfig {
             data_dir: dir.path().to_path_buf(),
             fsync_enabled: false,
+            ..Default::default()
         };
         let disk = Arc::new(DiskManager::new(config).await.unwrap());
         let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 10 }));

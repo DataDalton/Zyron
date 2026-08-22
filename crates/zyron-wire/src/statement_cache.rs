@@ -99,7 +99,7 @@ impl StatementCache {
     pub fn hash_search_path(search_path: &[String]) -> u64 {
         let mut state: u64 = 0xcbf2_9ce4_8422_2325;
         for entry in search_path {
-            state = state.rotate_left(5) ^ zyron_common::hash64(entry.as_bytes());
+            state = zyron_common::hash_fold(state, zyron_common::hash64(entry.as_bytes()));
         }
         state
     }

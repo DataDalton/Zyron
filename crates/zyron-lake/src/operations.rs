@@ -1502,11 +1502,17 @@ mod tests {
 
     fn batch(ids: &[i64], names: &[Option<&str>]) -> Vec<ColumnData> {
         vec![
-            ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
-            ColumnData::from_cells(1, names
+            ColumnData::from_cells(
+                0,
+                ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+            ),
+            ColumnData::from_cells(
+                1,
+                names
                     .iter()
                     .map(|v| v.map(|s| s.as_bytes().to_vec()))
-                    .collect()),
+                    .collect(),
+            ),
         ]
     }
 

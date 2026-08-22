@@ -969,9 +969,13 @@ impl ZyrFileReader {
     }
 
     fn cached_segment_header(&self, position: usize, offset: u64) -> Result<&SegmentHeader> {
-        let cell = self.segment_cache().get(position).map(|c| &c.header).ok_or_else(|| {
-            ZyronError::InvalidZyrFile(format!("no segment at index position {}", position))
-        })?;
+        let cell = self
+            .segment_cache()
+            .get(position)
+            .map(|c| &c.header)
+            .ok_or_else(|| {
+                ZyronError::InvalidZyrFile(format!("no segment at index position {}", position))
+            })?;
         if let Some(header) = cell.get() {
             return Ok(header);
         }
@@ -1124,8 +1128,11 @@ impl ZyrFileReader {
         value_size: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
-        let decoded = crate::encoding::create_encoding(header.encoding_type)
-            .decode(&tail[null_len..], row_count, value_size)?;
+        let decoded = crate::encoding::create_encoding(header.encoding_type).decode(
+            &tail[null_len..],
+            row_count,
+            value_size,
+        )?;
         Ok((decoded, tail[..null_len].to_vec()))
     }
 
@@ -1151,8 +1158,13 @@ impl ZyrFileReader {
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
         let (start, end) = crate::encoding::clamp_range(row_count, start, end);
-        let decoded = crate::encoding::create_encoding(header.encoding_type)
-            .decode_range(&tail[null_len..], row_count, value_size, start, end)?;
+        let decoded = crate::encoding::create_encoding(header.encoding_type).decode_range(
+            &tail[null_len..],
+            row_count,
+            value_size,
+            start,
+            end,
+        )?;
         Ok((decoded, tail[..null_len].to_vec()))
     }
 
@@ -1237,8 +1249,12 @@ impl ZyrFileReader {
         predicate: &crate::encoding::Predicate<'_>,
     ) -> Result<Vec<u8>> {
         let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
-        crate::encoding::create_encoding(header.encoding_type)
-            .eval_predicate(&tail[null_len..], row_count, value_size, predicate)
+        crate::encoding::create_encoding(header.encoding_type).eval_predicate(
+            &tail[null_len..],
+            row_count,
+            value_size,
+            predicate,
+        )
     }
 
     /// Evaluates a predicate over rows `start..end`, returning a keep mask
@@ -1270,8 +1286,13 @@ impl ZyrFileReader {
             return Ok(Vec::new());
         }
         let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
-        let decoded = crate::encoding::create_encoding(header.encoding_type)
-            .decode_range(&tail[null_len..], row_count, value_size, start, end)?;
+        let decoded = crate::encoding::create_encoding(header.encoding_type).decode_range(
+            &tail[null_len..],
+            row_count,
+            value_size,
+            start,
+            end,
+        )?;
         crate::encoding::eval_predicate_on_raw(&decoded, end - start, value_size, predicate)
     }
 

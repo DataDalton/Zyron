@@ -1,70 +1,159 @@
 //! Split-block bloom filter for segment-level membership pruning.
 //!
 //! Each probe touches exactly one 64-byte cache-line-aligned block.
-//! Uses a specialized inline 2-lane multiply-xor hash with double hashing
-//! within the block to compute multiple bit positions from a single hash.
+//! Keys hash with the canonical hot-path 128-bit hash. The low half selects
+//! the block, the high half is the in-block probe base, and an odd step
+//! from the low half advances the double-hashing sequence, see
+//! `probe_params` for why the base and the block selection must come from
+//! different halves. The hash carries no runtime dispatch and no lane
+//! setup, the property the previous local fork existed for: the central
+//! AES Hasher's dispatch and lane initialization measured +78% per probe
+//! at this site.
+//!
+//! Multi-key callers use the batch probes, which hash a group of keys on
+//! independent chains and prefetch every key's block before testing any
+//! bits, so the block cache misses overlap instead of serializing.
 
 use crate::columnar::constants::*;
+use zyron_common::checksum::hot::hot_hash128;
 use zyron_common::{Result, ZyronError};
 
-/// Mixing constants shared with the WAL record checksum. wyhash-derived,
-/// proven to provide good avalanche for this multiply-xor family.
-const BLOOM_MIX_A: u64 = 0x517cc1b727220a95;
-const BLOOM_MIX_B: u64 = 0xff51afd7ed558ccd;
-const BLOOM_MIX_C: u64 = 0x9e3779b97f4a7c15;
-
-/// Inline 128-bit bloom hash specialized for 8-32 byte keys, which dominate
-/// bloom membership tests. Produces two independent 64-bit values packed into
-/// a u128, suitable for double-hashing inside the block.
-///
-/// Avoids the central Hasher's dispatch indirection and lane init, which
-/// added ~7 ns of fixed overhead per probe (measured +78% regression when
-/// this site used zyron_common::hash128).
+/// Hashes one key to the 128-bit (block, probe) pair
 #[inline(always)]
 fn bloom_hash(data: &[u8]) -> u128 {
-    let len = data.len();
-    let ptr = data.as_ptr();
-    let mut la = BLOOM_MIX_A ^ (len as u64);
-    let mut lb = BLOOM_MIX_C ^ (len as u64).rotate_left(32);
-    let mut i = 0;
-
-    // Two-lane 16-byte chunks with independent multiply chains.
-    while i + 16 <= len {
-        let w0 = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
-        let w1 = unsafe { (ptr.add(i + 8) as *const u64).read_unaligned() };
-        la = (la ^ w0).wrapping_mul(BLOOM_MIX_A);
-        lb = (lb ^ w1).wrapping_mul(BLOOM_MIX_C);
-        i += 16;
-    }
-    if i + 8 <= len {
-        let w = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
-        la = (la ^ w).wrapping_mul(BLOOM_MIX_A);
-        i += 8;
-    }
-    if i + 4 <= len {
-        let w = unsafe { (ptr.add(i) as *const u32).read_unaligned() } as u64;
-        lb = (lb ^ w).wrapping_mul(BLOOM_MIX_C);
-        i += 4;
-    }
-    // Tail bytes folded into la.
-    while i < len {
-        let b = unsafe { *ptr.add(i) } as u64;
-        la = (la ^ b).wrapping_mul(BLOOM_MIX_A);
-        i += 1;
-    }
-
-    // Finalize: mix lanes together then diffuse.
-    la ^= la >> 33;
-    la = la.wrapping_mul(BLOOM_MIX_B);
-    la ^= lb;
-    lb ^= lb >> 33;
-    lb = lb.wrapping_mul(BLOOM_MIX_B);
-    lb ^= la >> 29;
-    ((lb as u128) << 64) | (la as u128)
+    hot_hash128(data)
 }
 
-/// Serialization header size: hash_count(4) + num_blocks(4) + num_elements(8).
-const HEADER_SIZE: usize = 16;
+/// Derives the probe parameters from one 128-bit hash: block start from the
+/// low half, in-block probe base from the high half, odd probe step from
+/// the low half.
+///
+/// The base must come from a different half than the block selection.
+/// Selecting the block fixes h1 modulo num_blocks, and whenever
+/// gcd(num_blocks, 512) > 1 an h1-derived base is then confined to a
+/// fraction of the block's bit positions, which measured at 3-5x the
+/// natural false positive rate. The odd step is coprime to the 512
+/// block bits, so the probe sequence visits distinct positions
+#[inline(always)]
+fn probe_params(hash: u128, num_blocks: u32) -> (usize, u64, u64) {
+    let h1 = hash as u64;
+    let h2 = (hash >> 64) as u64;
+    let block_start = (h1 % num_blocks as u64) as usize * BLOOM_BLOCK_SIZE;
+    (block_start, h2, h1 | 1)
+}
+
+/// Prefetches the cache line holding a block into L1. The block size is one
+/// cache line, so one prefetch covers every probe of that key
+#[inline(always)]
+fn prefetch_block(bits: &[u8], block_start: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: block_start is within bits, computed as block index times
+    // BLOOM_BLOCK_SIZE against a validated length. Prefetch has no
+    // architectural effect beyond the cache
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            bits.as_ptr().add(block_start) as *const i8,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (bits, block_start);
+    }
+}
+
+/// Tests every probe position of one key without early exit. The branchless
+/// accumulation keeps a batch of keys advancing without per-probe branch
+/// mispredictions, and all probes land in one already-prefetched cache line
+#[inline(always)]
+fn probe_block_all(bits: &[u8], block_start: usize, base: u64, step: u64, hash_count: u32) -> bool {
+    let ptr = bits.as_ptr();
+    let mut all = true;
+    let mut probe = base;
+    for _ in 0..hash_count {
+        let bit_pos = probe % BLOCK_BITS as u64;
+        // SAFETY: bit_pos < 512 so the byte offset is within the 64-byte
+        // block at block_start, which the caller derived from a validated
+        // bit array length
+        let byte = unsafe { *ptr.add(block_start + (bit_pos >> 3) as usize) };
+        all &= (byte >> (bit_pos & 7)) & 1 == 1;
+        probe = probe.wrapping_add(step);
+    }
+    all
+}
+
+/// Keys probed per prefetch group in the batch paths. Four independent
+/// hash chains fill the multiplier pipeline and four outstanding block
+/// prefetches overlap their potential cache misses
+const BATCH_GROUP: usize = 4;
+
+/// Probes a group of already-hashed keys against a validated bit array:
+/// compute all block addresses, prefetch all blocks, then test bits
+#[inline(always)]
+fn probe_hashed_group(
+    bits: &[u8],
+    num_blocks: u32,
+    hash_count: u32,
+    hashes: &[u128],
+    results: &mut [bool],
+) {
+    // One probe_params call per key: the derivation lives in one place and
+    // the block-selecting division runs once, with the prefetch issued as
+    // soon as each key's block is known
+    let mut params = [(0usize, 0u64, 0u64); BATCH_GROUP];
+    for (j, h) in hashes.iter().enumerate() {
+        params[j] = probe_params(*h, num_blocks);
+        prefetch_block(bits, params[j].0);
+    }
+    for (j, &(block_start, base, step)) in params.iter().take(hashes.len()).enumerate() {
+        results[j] = probe_block_all(bits, block_start, base, step, hash_count);
+    }
+}
+
+/// Batch probe core over a validated bit array. Hashes and probes keys in
+/// groups of BATCH_GROUP so hash chains and block fetches overlap, with a
+/// sequential tail for the remainder. `hash_at` supplies the hash of the
+/// key at an index, so the u64 and byte-slice entry points share this one
+/// body and cannot drift apart
+fn probe_batch(
+    bits: &[u8],
+    num_blocks: u32,
+    hash_count: u32,
+    count: usize,
+    hash_at: impl Fn(usize) -> u128,
+    results: &mut [bool],
+) {
+    let mut i = 0;
+    while i + BATCH_GROUP <= count {
+        let mut hashes = [0u128; BATCH_GROUP];
+        for j in 0..BATCH_GROUP {
+            hashes[j] = hash_at(i + j);
+        }
+        probe_hashed_group(
+            bits,
+            num_blocks,
+            hash_count,
+            &hashes,
+            &mut results[i..i + BATCH_GROUP],
+        );
+        i += BATCH_GROUP;
+    }
+    while i < count {
+        let (block_start, base, step) = probe_params(hash_at(i), num_blocks);
+        results[i] = probe_block_all(bits, block_start, base, step, hash_count);
+        i += 1;
+    }
+}
+
+/// Version of the key hash and probe derivation baked into serialized
+/// filters. A stored filter's bits are only meaningful to the scheme that
+/// set them, so every reader checks this field before trusting a probe
+/// answer. Version 2 is the canonical 128-bit key hash with the decoupled
+/// probe derivation in probe_params
+pub const BLOOM_ALGORITHM_VERSION: u32 = 2;
+
+/// Serialization header size: algorithm_version(4) + hash_count(4) +
+/// num_blocks(4) + num_elements(8)
+const HEADER_SIZE: usize = 20;
 
 /// Bits per block (BLOOM_BLOCK_SIZE * 8).
 const BLOCK_BITS: u32 = (BLOOM_BLOCK_SIZE * 8) as u32;
@@ -72,9 +161,10 @@ const BLOCK_BITS: u32 = (BLOOM_BLOCK_SIZE * 8) as u32;
 /// Split-block bloom filter with cache-line aligned blocks.
 ///
 /// The bit array length is always a multiple of BLOOM_BLOCK_SIZE (64 bytes).
-/// Each insert or probe hashes the value once with the central 128-bit hash, selects a single
-/// block, then uses double hashing to set or check BLOOM_HASH_COUNT bit
-/// positions within that block.
+/// Each insert or probe hashes the value once with the central 128-bit
+/// hash, selects a single block, then sets or checks BLOOM_HASH_COUNT bit
+/// positions within that block via double hashing: bit_i = (base + i *
+/// step) % 512 with base and step from `probe_params`.
 pub struct BloomFilter {
     /// Bit array. Length is always num_blocks * BLOOM_BLOCK_SIZE.
     bits: Vec<u8>,
@@ -110,19 +200,16 @@ impl BloomFilter {
 
     /// Inserts a value into the bloom filter.
     ///
-    /// Hashes the value with the central 128-bit hash, selects a block via the lower 64 bits,
-    /// then sets BLOOM_HASH_COUNT bit positions within that block using double
-    /// hashing: bit_i = (h1 + i * h2) % 512.
+    /// Hashes the value with the central 128-bit hash, selects a block via
+    /// the lower 64 bits, then sets BLOOM_HASH_COUNT bit positions within
+    /// that block using double hashing: bit_i = (base + i * step) % 512
+    /// with base and step from `probe_params`.
     pub fn insert(&mut self, value: &[u8]) {
         let hash = bloom_hash(value);
-        let h1 = hash as u64;
-        let h2 = (hash >> 64) as u64;
-
-        let blockIndex = (h1 % self.numBlocks as u64) as usize;
-        let blockStart = blockIndex * BLOOM_BLOCK_SIZE;
+        let (blockStart, base, step) = probe_params(hash, self.numBlocks);
 
         for i in 0..self.hashCount {
-            let bitPos = h1.wrapping_add((i as u64).wrapping_mul(h2)) % BLOCK_BITS as u64;
+            let bitPos = base.wrapping_add((i as u64).wrapping_mul(step)) % BLOCK_BITS as u64;
             let byteOffset = blockStart + (bitPos / 8) as usize;
             let bitMask = 1u8 << (bitPos % 8);
             self.bits[byteOffset] |= bitMask;
@@ -138,18 +225,14 @@ impl BloomFilter {
     #[inline]
     pub fn might_contain(&self, value: &[u8]) -> bool {
         let hash = bloom_hash(value);
-        let h1 = hash as u64;
-        let h2 = (hash >> 64) as u64;
-
-        let blockIndex = (h1 % self.numBlocks as u64) as usize;
-        let blockStart = blockIndex * BLOOM_BLOCK_SIZE;
+        let (blockStart, base, step) = probe_params(hash, self.numBlocks);
         let ptr = self.bits.as_ptr();
 
         // Unrolled probe loop using raw pointer reads to skip bounds checks.
         // The block is always BLOOM_BLOCK_SIZE (64) bytes, and bitPos is always
         // mod 512, so byteOffset is always within [blockStart, blockStart+63].
         for i in 0..self.hashCount {
-            let bitPos = h1.wrapping_add((i as u64).wrapping_mul(h2)) % BLOCK_BITS as u64;
+            let bitPos = base.wrapping_add((i as u64).wrapping_mul(step)) % BLOCK_BITS as u64;
             let byteOffset = blockStart + (bitPos >> 3) as usize;
             let bitMask = 1u8 << (bitPos & 7);
             let byte = unsafe { *ptr.add(byteOffset) };
@@ -161,13 +244,60 @@ impl BloomFilter {
         true
     }
 
+    /// Batch membership test for u64 keys, writing one answer per key.
+    ///
+    /// Each key is hashed exactly as `might_contain(&key.to_le_bytes())`
+    /// and the answers match the sequential probes bit for bit. Keys are
+    /// processed in groups whose hash chains run independently and whose
+    /// blocks are all prefetched before any bit test, so a batch of cache
+    /// misses overlaps instead of serializing. Callers probing several keys
+    /// per iteration use this instead of a might_contain loop.
+    ///
+    /// `results` must be the same length as `keys`.
+    pub fn might_contain_batch(&self, keys: &[u64], results: &mut [bool]) {
+        assert_eq!(
+            keys.len(),
+            results.len(),
+            "results length must match keys length"
+        );
+        probe_batch(
+            &self.bits,
+            self.numBlocks,
+            self.hashCount,
+            keys.len(),
+            |i| bloom_hash(&keys[i].to_le_bytes()),
+            results,
+        );
+    }
+
+    /// Batch membership test for byte-slice keys, the same contract as
+    /// [`Self::might_contain_batch`] with each value hashed exactly as
+    /// `might_contain(value)`.
+    pub fn might_contain_batch_bytes(&self, values: &[&[u8]], results: &mut [bool]) {
+        assert_eq!(
+            values.len(),
+            results.len(),
+            "results length must match values length"
+        );
+        probe_batch(
+            &self.bits,
+            self.numBlocks,
+            self.hashCount,
+            values.len(),
+            |i| bloom_hash(values[i]),
+            results,
+        );
+    }
+
     /// Serializes the bloom filter to bytes.
     ///
-    /// Layout: hash_count(4 LE) + num_blocks(4 LE) + num_elements(8 LE) + bits.
+    /// Layout: algorithm_version(4 LE) + hash_count(4 LE) +
+    /// num_blocks(4 LE) + num_elements(8 LE) + bits.
     pub fn to_bytes(&self) -> Vec<u8> {
         let totalSize = HEADER_SIZE + self.bits.len();
         let mut buf = Vec::with_capacity(totalSize);
 
+        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
         buf.extend_from_slice(&self.hashCount.to_le_bytes());
         buf.extend_from_slice(&self.numBlocks.to_le_bytes());
         buf.extend_from_slice(&self.numElements.to_le_bytes());
@@ -189,10 +319,17 @@ impl BloomFilter {
             )));
         }
 
-        let hashCount = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let numBlocks = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let version = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if version != BLOOM_ALGORITHM_VERSION {
+            return Err(ZyronError::DecodingFailed(format!(
+                "bloom filter algorithm version {} is not the supported version {}",
+                version, BLOOM_ALGORITHM_VERSION
+            )));
+        }
+        let hashCount = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let numBlocks = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let numElements = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
         ]);
 
         if numBlocks == 0 {
@@ -235,7 +372,7 @@ impl BloomFilter {
         })
     }
 
-    /// Returns the total serialized byte count: 16-byte header + bit array.
+    /// Returns the total serialized byte count: 20-byte header + bit array.
     pub fn on_disk_size(&self) -> usize {
         HEADER_SIZE + self.bits.len()
     }
@@ -250,26 +387,15 @@ impl BloomFilter {
 /// false negative would silently drop rows.
 #[inline]
 pub fn might_contain_serialized(buf: &[u8], value: &[u8]) -> bool {
-    if buf.len() < HEADER_SIZE {
+    let Some((bits, numBlocks, hashCount)) = validate_serialized(buf) else {
         return true;
-    }
-    let hashCount = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let numBlocks = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if numBlocks == 0 || hashCount == 0 || hashCount > BLOOM_HASH_COUNT * 2 {
-        return true;
-    }
-    let bits = &buf[HEADER_SIZE..];
-    if bits.len() != numBlocks as usize * BLOOM_BLOCK_SIZE {
-        return true;
-    }
+    };
 
     let hash = bloom_hash(value);
-    let h1 = hash as u64;
-    let h2 = (hash >> 64) as u64;
-    let blockStart = (h1 % numBlocks as u64) as usize * BLOOM_BLOCK_SIZE;
+    let (blockStart, base, step) = probe_params(hash, numBlocks);
 
     for i in 0..hashCount {
-        let bitPos = h1.wrapping_add((i as u64).wrapping_mul(h2)) % BLOCK_BITS as u64;
+        let bitPos = base.wrapping_add((i as u64).wrapping_mul(step)) % BLOCK_BITS as u64;
         let byteOffset = blockStart + (bitPos >> 3) as usize;
         let bitMask = 1u8 << (bitPos & 7);
         match bits.get(byteOffset) {
@@ -281,6 +407,62 @@ pub fn might_contain_serialized(buf: &[u8], value: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Batch probe of serialized bloom bytes in place, one answer per value.
+///
+/// Each answer matches `might_contain_serialized(buf, value)` bit for bit,
+/// including the conservative rules: a header that fails validation answers
+/// true for every value and prunes nothing. The header validates once for
+/// the whole batch instead of once per value, and the group prefetch
+/// overlaps the block fetches the sequential loop would serialize.
+///
+/// `results` must be the same length as `values`.
+#[inline]
+pub fn might_contain_serialized_batch(buf: &[u8], values: &[&[u8]], results: &mut [bool]) {
+    assert_eq!(
+        values.len(),
+        results.len(),
+        "results length must match values length"
+    );
+    let Some((bits, numBlocks, hashCount)) = validate_serialized(buf) else {
+        results.fill(true);
+        return;
+    };
+    probe_batch(
+        bits,
+        numBlocks,
+        hashCount,
+        values.len(),
+        |i| bloom_hash(values[i]),
+        results,
+    );
+}
+
+/// Validates a serialized filter's header for probing. None means the
+/// buffer proves nothing absent: too short, zero or out-of-range header
+/// fields, a mismatched bit array length, or bits set by a different
+/// algorithm version
+#[inline]
+fn validate_serialized(buf: &[u8]) -> Option<(&[u8], u32, u32)> {
+    if buf.len() < HEADER_SIZE {
+        return None;
+    }
+    let version = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let hashCount = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let numBlocks = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if version != BLOOM_ALGORITHM_VERSION
+        || numBlocks == 0
+        || hashCount == 0
+        || hashCount > BLOOM_HASH_COUNT * 2
+    {
+        return None;
+    }
+    let bits = &buf[HEADER_SIZE..];
+    if bits.len() != numBlocks as usize * BLOOM_BLOCK_SIZE {
+        return None;
+    }
+    Some((bits, numBlocks, hashCount))
 }
 
 #[cfg(test)]
@@ -343,10 +525,11 @@ mod tests {
         }
 
         let fpr = falsePositives as f64 / probeCount as f64;
-        // Split-block bloom filters have higher FPR than standard bloom
-        // due to block confinement. Allow up to 8% (typically ~5-6%).
+        // Split-block bloom filters run above the classic uniform-fill rate
+        // due to block confinement. With the probe base decoupled from the
+        // block selection this configuration measures ~1-2%, allow 3%
         assert!(
-            fpr < 0.08,
+            fpr < 0.03,
             "false positive rate too high: {:.4} ({} / {})",
             fpr,
             falsePositives,
@@ -398,6 +581,7 @@ mod tests {
     #[test]
     fn test_from_bytes_zero_blocks() {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
         buf.extend_from_slice(&7u32.to_le_bytes()); // hash_count
         buf.extend_from_slice(&0u32.to_le_bytes()); // num_blocks = 0
         buf.extend_from_slice(&0u64.to_le_bytes()); // num_elements
@@ -409,6 +593,7 @@ mod tests {
     #[test]
     fn test_from_bytes_length_mismatch() {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
         buf.extend_from_slice(&7u32.to_le_bytes()); // hash_count
         buf.extend_from_slice(&2u32.to_le_bytes()); // num_blocks = 2
         buf.extend_from_slice(&0u64.to_le_bytes()); // num_elements
@@ -421,6 +606,7 @@ mod tests {
     #[test]
     fn test_from_bytes_zero_hash_count() {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // hash_count = 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
         buf.extend_from_slice(&0u64.to_le_bytes()); // num_elements
@@ -428,6 +614,25 @@ mod tests {
 
         let result = BloomFilter::from_bytes(&buf);
         assert!(result.is_err());
+    }
+
+    /// A filter tagged with a different algorithm version proves nothing
+    /// absent: loading errors, probing prunes nothing
+    #[test]
+    fn test_wrong_algorithm_version_is_conservative() {
+        let mut filter = BloomFilter::new(100);
+        filter.insert(b"present");
+        let mut serialized = filter.to_bytes();
+        serialized[0..4].copy_from_slice(&(BLOOM_ALGORITHM_VERSION + 1).to_le_bytes());
+
+        assert!(BloomFilter::from_bytes(&serialized).is_err());
+        assert!(might_contain_serialized(&serialized, b"present"));
+        assert!(might_contain_serialized(&serialized, b"never inserted"));
+
+        let values: Vec<&[u8]> = vec![b"present", b"never inserted"];
+        let mut results = vec![false; values.len()];
+        might_contain_serialized_batch(&serialized, &values, &mut results);
+        assert!(results.iter().all(|&r| r));
     }
 
     #[test]
@@ -472,5 +677,83 @@ mod tests {
         let mut filter = BloomFilter::new(10);
         filter.insert(b"");
         assert!(filter.might_contain(b""));
+    }
+
+    /// Deterministic pseudo-random test keys from the canonical splitmix64
+    fn next_key(state: &mut u64) -> u64 {
+        *state = zyron_common::splitmix64(*state);
+        *state
+    }
+
+    /// The batch probe must agree with the sequential probe on every key,
+    /// present or absent, across group boundaries and the remainder tail
+    #[test]
+    fn test_batch_matches_sequential_on_10k_random_keys() {
+        let mut filter = BloomFilter::new(4096);
+        let mut state = 0xB100_F11E_D5EEDu64;
+        let inserted: Vec<u64> = (0..4096).map(|_| next_key(&mut state)).collect();
+        for k in &inserted {
+            filter.insert(&k.to_le_bytes());
+        }
+
+        // Mix of present and absent keys, lengths exercising every tail size
+        let mut keys: Vec<u64> = (0..6000).map(|_| next_key(&mut state)).collect();
+        keys.extend(inserted.iter().take(4000));
+
+        for probe_len in [0usize, 1, 3, 4, 5, 7, 8, 10_000] {
+            let subset = &keys[..probe_len];
+            let mut batch = vec![false; probe_len];
+            filter.might_contain_batch(subset, &mut batch);
+            for (i, k) in subset.iter().enumerate() {
+                assert_eq!(
+                    batch[i],
+                    filter.might_contain(&k.to_le_bytes()),
+                    "key {k} at index {i} of batch len {probe_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_bytes_matches_sequential() {
+        let mut filter = BloomFilter::new(1000);
+        for i in 0..1000u64 {
+            filter.insert(format!("key_{i}").as_bytes());
+        }
+        let owned: Vec<String> = (0..2000).map(|i| format!("key_{i}")).collect();
+        let values: Vec<&[u8]> = owned.iter().map(|s| s.as_bytes()).collect();
+        let mut batch = vec![false; values.len()];
+        filter.might_contain_batch_bytes(&values, &mut batch);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(batch[i], filter.might_contain(v), "value index {i}");
+        }
+    }
+
+    #[test]
+    fn test_serialized_batch_matches_sequential() {
+        let mut filter = BloomFilter::new(500);
+        for i in 0..500u64 {
+            filter.insert(&i.to_le_bytes());
+        }
+        let serialized = filter.to_bytes();
+
+        let owned: Vec<[u8; 8]> = (0..1000u64).map(|i| i.to_le_bytes()).collect();
+        let values: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let mut batch = vec![false; values.len()];
+        might_contain_serialized_batch(&serialized, &values, &mut batch);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(
+                batch[i],
+                might_contain_serialized(&serialized, v),
+                "value index {i}"
+            );
+        }
+
+        // A header that fails validation answers true for every value,
+        // the same conservative answer the sequential probe gives
+        let truncated = &serialized[..HEADER_SIZE - 1];
+        let mut conservative = vec![false; values.len()];
+        might_contain_serialized_batch(truncated, &values, &mut conservative);
+        assert!(conservative.iter().all(|&r| r));
     }
 }

@@ -613,19 +613,12 @@ impl VersionFileData {
 fn removed_bloom(ids: impl Iterator<Item = u64>) -> u64 {
     let mut bloom = 0u64;
     for id in ids {
-        let h = splitmix64(id);
+        let h = zyron_common::splitmix64(id);
         bloom |= 1u64 << (h & 63);
         bloom |= 1u64 << ((h >> 8) & 63);
         bloom |= 1u64 << ((h >> 16) & 63);
     }
     bloom
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E3779B97F4A7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
-    x ^ (x >> 31)
 }
 
 /// Applies one commit's entries to a manifest state. `None` is the state

@@ -1,6 +1,13 @@
 //! WAL record integrity checksum.
 //!
-//! Custom checksum built for the WAL record format. Provides two APIs:
+//! Thin adapters over the canonical hot-path hash in
+//! `zyron_common::checksum::hot`, which consolidated this file's previous
+//! hand-rolled two-lane mixer with the change-feed, version-entry and bloom
+//! forks. Output is byte-for-byte what the pre-consolidation code produced,
+//! pinned by the matches_pre_consolidation_wal tests beside the canonical
+//! implementation, so WAL segments on disk keep their stored checksums.
+//!
+//! Two shapes are exposed:
 //!
 //! - `WalHasher`: incremental hasher for the write path. Feeds header fields
 //!   from registers and payload from the source pointer, so serialize_into
@@ -10,94 +17,18 @@
 //! - `wal_checksum`: one-shot function for the read/verify path. Processes a
 //!   contiguous byte slice (already in memory from disk read).
 //!
-//! Both APIs produce identical 32-bit checksums for the same data.
+//! Both produce identical 32-bit checksums for the same data.
 //!
-//! The hash uses multiply-xor mixing with proven constants that provide good
-//! avalanche properties: every input bit affects every output bit with ~50%
-//! probability. This reliably detects single-bit flips, partial writes, zeroed
-//! regions, and byte-level corruption.
-//!
-//! Structure-aware features that a generic library cannot provide:
+//! Structure-aware features carried by the canonical primitive:
 //!
 //! - Length is mixed into the seed, so truncated records produce different
 //!   checksums even if the surviving bytes are identical.
 //!
 //! - A phase separator is mixed in at the header/payload boundary, so data
 //!   that crosses the boundary differently (e.g. shifted by one byte) produces
-//!   a different checksum even if the raw bytes are the same.
+//!   a different checksum even if the raw bytes are the same
 
-/// Mixing constant with good bit avalanche. From wyhash, widely tested across
-/// billions of inputs for uniform distribution.
-const MIX_A: u64 = 0x517cc1b727220a95;
-
-/// Second mixing constant for the finalization step.
-const MIX_B: u64 = 0xff51afd7ed558ccd;
-
-/// Phase separator mixed in between header and payload to detect structural
-/// misalignment. Chosen to have no overlap with typical WAL data patterns.
-const PHASE_SEP: u64 = 0x9e3779b97f4a7c15; // golden ratio fractional bits
-
-/// Mixes a u64 value into the running hash state.
-#[inline(always)]
-fn mix(state: u64, value: u64) -> u64 {
-    (state ^ value).wrapping_mul(MIX_A)
-}
-
-/// Folds 64-bit state down to 32 bits with full diffusion.
-#[inline(always)]
-fn finalize(mut h: u64) -> u32 {
-    h ^= h >> 33;
-    h = h.wrapping_mul(MIX_B);
-    h ^= h >> 33;
-    h as u32
-}
-
-/// Mixes a byte slice into the hash state using two-lane parallel accumulation.
-/// Processes pairs of 8-byte words on independent lanes to break the
-/// multiply-dependency chain, halving the critical path latency on x86.
-/// Handles any alignment and any remainder bytes.
-#[inline(always)]
-fn mix_bytes(state_a: u64, state_b: u64, data: &[u8]) -> (u64, u64) {
-    let len = data.len();
-    let ptr = data.as_ptr();
-    let mut i = 0;
-    let mut la = state_a;
-    let mut lb = state_b;
-
-    // Process pairs of 8-byte words on two lanes
-    while i + 16 <= len {
-        let w0 = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
-        let w1 = unsafe { (ptr.add(i + 8) as *const u64).read_unaligned() };
-        la = mix(la, w0);
-        lb = mix(lb, w1);
-        i += 16;
-    }
-
-    // One remaining 8-byte word goes to lane A
-    if i + 8 <= len {
-        let word = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
-        la = mix(la, word);
-        i += 8;
-    }
-
-    // Process 4-byte remainder on lane A
-    if i + 4 <= len {
-        let word = unsafe { (ptr.add(i) as *const u32).read_unaligned() } as u64;
-        la = mix(la, word);
-        i += 4;
-    }
-
-    // Process remaining 1-3 bytes on lane A
-    if i < len {
-        let mut tail: u64 = 0;
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr.add(i), &mut tail as *mut u64 as *mut u8, len - i);
-        }
-        la = mix(la, tail);
-    }
-
-    (la, lb)
-}
+use zyron_common::checksum::hot::{HotHasher, hot_hash_with_header, hot_hash32};
 
 // ---------------------------------------------------------------------------
 // Incremental hasher (write path)
@@ -105,10 +36,9 @@ fn mix_bytes(state_a: u64, state_b: u64, data: &[u8]) -> (u64, u64) {
 
 /// Incremental hasher for WAL record serialization.
 ///
-/// Uses two-lane parallel accumulation to break the multiply-dependency
-/// chain. On x86, wrapping_mul has 3-cycle latency. With two independent
-/// lanes, the CPU can execute both multiplies simultaneously, halving
-/// the critical path from 12 chained multiplies to 6.
+/// Wraps the canonical two-lane hasher, mapping the WAL's typed header
+/// fields onto its register-fed word API so the write path still hashes
+/// straight from registers without materializing header bytes.
 ///
 /// Usage:
 /// ```ignore
@@ -117,33 +47,23 @@ fn mix_bytes(state_a: u64, state_b: u64, data: &[u8]) -> (u64, u64) {
 /// hasher.write_payload(&payload_bytes);
 /// let checksum = hasher.finish();
 /// ```
-pub struct WalHasher {
-    lane_a: u64,
-    lane_b: u64,
-}
+pub struct WalHasher(HotHasher);
 
 impl WalHasher {
     /// Creates a new hasher seeded with the total record size (header + payload,
     /// excluding the checksum itself). Embedding the length in the seed means
-    /// truncated records will produce different checksums.
-    ///
-    /// Lane A and lane B start from the same seed so that the two-lane merge
-    /// is order-independent at initialization.
+    /// truncated records will produce different checksums
     #[inline(always)]
     pub fn new(data_len: usize) -> Self {
-        let seed = (data_len as u64) ^ MIX_A;
-        Self {
-            lane_a: seed,
-            lane_b: seed,
-        }
+        Self(HotHasher::new(data_len))
     }
 
     /// Mixes the 24-byte header fields using two-lane parallel accumulation.
     ///
-    /// Header has 4 values: lsn, prev_lsn, packed_tail, PHASE_SEP.
-    /// Lane A processes lsn and packed_tail. Lane B processes prev_lsn and
-    /// PHASE_SEP. Both lanes execute independently, breaking the dependency
-    /// chain from 4 serial multiplies to 2.
+    /// Word order matches the on-disk header layout so the one-shot verify
+    /// over serialized bytes computes the same value: lsn to lane A,
+    /// prev_lsn to lane B, the packed tail to lane A, then the phase
+    /// separator marks the header/payload boundary
     #[inline(always)]
     pub fn write_header_fields(
         &mut self,
@@ -161,28 +81,22 @@ impl WalHasher {
             | ((flags as u64) << 40)
             | ((payload_len.to_le() as u64) << 48);
 
-        // Two-lane parallel: each lane processes 2 values independently.
-        // lsn and packed_tail on lane A, prev_lsn and PHASE_SEP on lane B.
-        self.lane_a = mix(self.lane_a, lsn.to_le());
-        self.lane_b = mix(self.lane_b, prev_lsn.to_le());
-        self.lane_a = mix(self.lane_a, packed_tail);
-        self.lane_b = mix(self.lane_b, PHASE_SEP);
+        self.0.mix_word_a(lsn.to_le());
+        self.0.mix_word_b(prev_lsn.to_le());
+        self.0.mix_word_a(packed_tail);
+        self.0.phase_separator();
     }
 
-    /// Mixes payload bytes from the source slice using two-lane accumulation.
+    /// Mixes payload bytes from the source slice using two-lane accumulation
     #[inline(always)]
     pub fn write_payload(&mut self, data: &[u8]) {
-        if !data.is_empty() {
-            let (la, lb) = mix_bytes(self.lane_a, self.lane_b, data);
-            self.lane_a = la;
-            self.lane_b = lb;
-        }
+        self.0.update_payload(data);
     }
 
-    /// Finalizes the hash by merging both lanes and folding to 32 bits.
+    /// Finalizes the hash by merging both lanes and folding to 32 bits
     #[inline(always)]
     pub fn finish(self) -> u32 {
-        finalize(mix(self.lane_a, self.lane_b))
+        self.0.finish32()
     }
 }
 
@@ -190,80 +104,16 @@ impl WalHasher {
 // One-shot checksum (read/verify path)
 // ---------------------------------------------------------------------------
 
-/// Computes a 32-bit checksum over a contiguous byte slice.
+/// Computes a 32-bit checksum over a contiguous byte slice whose first
+/// `header_size` bytes are the record header.
 ///
-/// Used during WAL replay and record verification where the data is already
-/// in a contiguous buffer read from disk.
-///
-/// For correctness, this function must produce the same checksum as
-/// WalHasher when given identical data. Both use the same seed, the same
-/// two-lane parallel accumulation, and the same processing order. The
-/// header portion uses the same lane assignment as write_header_fields:
-/// lane A gets words 0, 2 (lsn, packed_tail) and lane B gets words 1, 3
-/// (prev_lsn, PHASE_SEP).
+/// Produces the same checksum as WalHasher for identical data: the header
+/// portion gets the same lane assignment as write_header_fields (word 0 to
+/// lane A, word 1 to lane B, word 2 to lane A, phase separator to lane B)
 #[inline(always)]
 pub fn wal_checksum(data: &[u8], header_size: usize) -> u32 {
-    let seed: u64 = (data.len() as u64) ^ MIX_A;
-    let mut lane_a = seed;
-    let mut lane_b = seed;
-
-    // Process header portion using two-lane parallel accumulation.
-    // For the standard 24-byte header (3 words), this matches the
-    // incremental hasher's lane assignment: word0 -> lane A,
-    // word1 -> lane B, word2 -> lane A, PHASE_SEP -> lane B.
     let header_end = header_size.min(data.len());
-    let header = &data[..header_end];
-    let hlen = header.len();
-    let hptr = header.as_ptr();
-    let mut hi = 0;
-
-    // Process pairs of header words on two lanes
-    while hi + 16 <= hlen {
-        let w0 = unsafe { (hptr.add(hi) as *const u64).read_unaligned() };
-        let w1 = unsafe { (hptr.add(hi + 8) as *const u64).read_unaligned() };
-        lane_a = mix(lane_a, w0);
-        lane_b = mix(lane_b, w1);
-        hi += 16;
-    }
-
-    // Remaining single 8-byte word goes to lane A
-    if hi + 8 <= hlen {
-        let word = unsafe { (hptr.add(hi) as *const u64).read_unaligned() };
-        lane_a = mix(lane_a, word);
-        hi += 8;
-    }
-
-    // 4-byte remainder on lane A
-    if hi + 4 <= hlen {
-        let word = unsafe { (hptr.add(hi) as *const u32).read_unaligned() } as u64;
-        lane_a = mix(lane_a, word);
-        hi += 4;
-    }
-
-    // 1-3 byte remainder on lane A
-    if hi < hlen {
-        let mut tail: u64 = 0;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                hptr.add(hi),
-                &mut tail as *mut u64 as *mut u8,
-                hlen - hi,
-            );
-        }
-        lane_a = mix(lane_a, tail);
-    }
-
-    // Phase separator on lane B (matches write_header_fields lane assignment)
-    lane_b = mix(lane_b, PHASE_SEP);
-
-    // Process payload portion using two-lane accumulation
-    if header_end < data.len() {
-        let (la, lb) = mix_bytes(lane_a, lane_b, &data[header_end..]);
-        lane_a = la;
-        lane_b = lb;
-    }
-
-    finalize(mix(lane_a, lane_b))
+    hot_hash_with_header(&data[..header_end], &data[header_end..])
 }
 
 // ---------------------------------------------------------------------------
@@ -272,14 +122,11 @@ pub fn wal_checksum(data: &[u8], header_size: usize) -> u32 {
 
 /// Computes a 32-bit checksum over an arbitrary byte slice.
 ///
-/// Uses the same multiply-xor mixing primitives as the WAL checksum but
-/// without the header/payload phase separator. Suitable for any data
-/// integrity check (CDF records, slot state files, etc.).
+/// The canonical hash without the header/payload phase separator. Suitable
+/// for any data integrity check (CDF records, slot state files, etc.)
 #[inline]
 pub fn data_checksum(data: &[u8]) -> u32 {
-    let seed: u64 = (data.len() as u64) ^ MIX_A;
-    let (la, lb) = mix_bytes(seed, seed, data);
-    finalize(mix(la, lb))
+    hot_hash32(data)
 }
 
 #[cfg(test)]
@@ -453,7 +300,7 @@ mod tests {
     #[test]
     fn test_phase_separator_catches_shift() {
         // Two "records" with the same total bytes but header/payload split differently.
-        // The phase separator at the header boundary should produce different checksums.
+        // The phase separator at the header boundary should produce different checksums
         let data_a = vec![0xAA; 44]; // 24 header + 20 payload
         let data_b = data_a.clone(); // identical bytes
 
@@ -515,7 +362,7 @@ mod tests {
     #[test]
     fn test_data_checksum_empty() {
         // Empty input is deterministic. The actual value is not important
-        // since CDF records are never empty.
+        // since CDF records are never empty
         let c1 = data_checksum(b"");
         let c2 = data_checksum(b"");
         assert_eq!(c1, c2);

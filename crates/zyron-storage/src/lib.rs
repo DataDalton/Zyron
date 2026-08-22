@@ -34,7 +34,7 @@ pub use checkpoint_coordinator::{
     CheckpointCoordinator, CheckpointCoordinatorConfig, CheckpointResult, CheckpointScheduler,
     CheckpointStats,
 };
-pub use disk::{DiskManager, DiskManagerConfig};
+pub use disk::{DiskManager, DiskManagerConfig, PageChecksumVerify};
 pub use freespace::{
     ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmHeader, FsmPage, category_to_min_space,
     space_to_category,

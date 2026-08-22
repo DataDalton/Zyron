@@ -1,0 +1,90 @@
+{
+  "id": "2026-08-22_052133_3aab844-local",
+  "date": "2026-08-22 05:21:51Z",
+  "ts": 1787376111,
+  "commit": "3aab844-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Encoding Round-Trip": {
+      "util_before": { "cpu_pct": 23.0, "ram_used_gb": 18.18 },
+      "util_after": { "cpu_pct": 8.0, "ram_used_gb": 18.12 },
+      "FastLanes decode (int/sec)": {
+        "average": 203300654.646203,
+        "runs": [189753320.68, 206825232.68, 205846027.17, 207082211.64, 206996481.06],
+        "target": 120000000000.000000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "FSST decompress (GB/sec)": {
+        "average": 0.938068,
+        "runs": [0.95, 0.96, 0.93, 0.94, 0.91],
+        "target": 6.000000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "ALP decode (float/sec)": {
+        "average": 361205994.946902,
+        "runs": [274348422.50, 312500000.00, 415800415.80, 430107526.88, 373273609.56],
+        "target": 3000000000.000000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Dictionary lookup (ns/val)": {
+        "average": 47.607800,
+        "runs": [48.45, 47.38, 47.26, 47.48, 47.47],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "RLE decode (val/sec)": {
+        "average": 2770968584.024321,
+        "runs": [1170960187.35, 4566210045.66, 2040816326.53, 1150747986.19, 4926108374.38],
+        "target": 60000000000.000000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Query-on-Compressed": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 18.14 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 18.05 },
+      "Compressed eval speedup (x)": {
+        "average": 2277.200363,
+        "runs": [2382.87, 2343.71, 2299.16, 2347.15, 2013.11],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Encoding Selection": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 18.07 },
+      "util_after": { "cpu_pct": 13.0, "ram_used_gb": 18.07 },
+      "Encoding select (us/col)": {
+        "average": 376.799220,
+        "runs": [376.09, 378.91, 376.47, 376.36, 376.17],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

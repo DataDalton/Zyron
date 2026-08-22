@@ -2399,39 +2399,13 @@ impl FlatHashTable {
 // Fast hash primitives
 // ---------------------------------------------------------------------------
 
-/// Golden ratio constant for hash combination.
-const HASH_GOLDEN: u64 = 0x9e3779b97f4a7c15;
+// The per-value primitives are the canonical copies in
+// zyron_common::checksum. Re-exported so downstream imports from
+// zyron_executor::compute keep resolving. hash_int stays the fused join
+// path's key hash, a bijection on u64 so hash equality implies key equality
+pub use zyron_common::{HASH_GOLDEN, hash_combine, hash_int};
 
-/// Mixes a value into a hash seed (boost::hash_combine approach).
-#[inline(always)]
-pub fn hash_combine(seed: u64, value: u64) -> u64 {
-    seed ^ (value
-        .wrapping_add(HASH_GOLDEN)
-        .wrapping_add(seed << 6)
-        .wrapping_add(seed >> 2))
-}
-
-/// Fibonacci hash for a single integer value. Multiply by the golden ratio
-/// constant, then mix high bits into low bits for bucket distribution.
-/// Bijection on u64 (distinct inputs produce distinct outputs), so hash
-/// equality implies key equality with zero false positives.
-/// Used by the fused join path for single integer key columns.
-#[inline(always)]
-pub fn hash_int(v: u64) -> u64 {
-    let h = v.wrapping_mul(HASH_GOLDEN);
-    h ^ (h >> 32)
-}
-
-/// FNV-1a hash for variable-length byte data.
-#[inline]
-fn hash_bytes_fnv(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
+use zyron_common::fnv1a_64 as hash_bytes_fnv;
 
 /// Hashes an integer-like column batch into the hashes array.
 /// Hoists the null check outside the per-row loop.

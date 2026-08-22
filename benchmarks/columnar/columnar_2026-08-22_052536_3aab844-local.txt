@@ -1,0 +1,31 @@
+# suite:   columnar
+# run:     2026-08-22_052536_3aab844-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Bloom Filter ===
+  Zero false negatives (10K probes): PASS
+  False positive rate: 0.0119 (1191/100000)
+  FP rate < 8%: PASS
+  Serialization round-trip: PASS
+  Bloom skip rate: 99.0% (98/99 files skipped)
+  Low-cardinality segment: no bloom filter (cardinality=10): PASS
+  High-cardinality segment: bloom filter present (cardinality=65): PASS
+  Bloom probe latency (ns) [PASS/OK]:
+    Runs: [9.0710, 9.1530, 7.2970, 7.2580, 7.2010]
+    Average: 7.9960 <= 30 (target)
+    Min/Max: 7.2010 / 9.1530, StdDev: 0.9121
+  Bloom probe 8-way sequential (ns/key) [PASS/OK]:
+    Runs: [9.0599, 9.0252, 8.9558, 8.9672, 8.8985]
+    Average: 8.9813 <= 120 (target)
+    Min/Max: 8.8985 / 9.0599, StdDev: 0.0562
+  Bloom probe 8-way batch (ns/key) [PASS/OK]:
+    Runs: [6.0982, 6.1337, 6.0879, 6.2111, 6.0604]
+    Average: 6.1182 <= 60 (target)
+    Min/Max: 6.0604 / 6.2111, StdDev: 0.0520
+  Batch speedup: 1.47x over sequential
+  Bloom skip rate (%) [PASS]: 98.9899 >= 98 (target)
+
+  Bloom filter: ALL PASS

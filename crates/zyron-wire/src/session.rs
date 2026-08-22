@@ -115,7 +115,11 @@ impl Session {
                 .wrapping_add(sc.current_role.0 as u64)
                 .wrapping_mul(0x0100_0000_01b3);
             for role in &sc.effective_roles {
-                h = h.rotate_left(5).wrapping_add(role.0 as u64);
+                // Role ids are small sequential integers, and hash_fold is
+                // xor-linear, so folding raw ids lets distinct role sets
+                // cancel to the same key ({1, 32} and {2, 64} both fold to
+                // zero). Mix each id first so the fold consumes a hash
+                h = zyron_common::hash_fold(h, zyron_common::splitmix64(role.0 as u64));
             }
         }
         h

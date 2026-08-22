@@ -22,6 +22,16 @@ pub enum ZyronError {
     #[error("Page corrupted: {page_id}, reason: {reason}")]
     PageCorrupted { page_id: u64, reason: String },
 
+    #[error(
+        "Page checksum mismatch: file {file_id} page {page_id}, stored {expected:#010x} computed {actual:#010x}"
+    )]
+    PageChecksumMismatch {
+        file_id: u32,
+        page_id: u64,
+        expected: u32,
+        actual: u32,
+    },
+
     #[error("Buffer pool full, unable to allocate frame")]
     BufferPoolFull,
 

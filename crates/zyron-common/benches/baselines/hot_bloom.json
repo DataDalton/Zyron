@@ -1,0 +1,15 @@
+{
+  "description": "Pre-consolidation baseline for the columnar bloom probe. Captured before bloom_hash migrated onto zyron_common::checksum::hot::hot_hash128. Post-migration single-key probe must hold within 1%. The 8-way batch API did not exist before the migration, its gate is the 8-sequential-probe comparison measured in the same post-migration run.",
+  "source_run": "benchmarks/columnar/columnar_2026-08-22_012606_3aab844-local.json",
+  "commit": "3aab844-local",
+  "profile": "release",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "metrics": {
+    "Bloom probe latency (ns)": {
+      "runs": [8.797, 8.149, 6.288, 6.192, 6.195],
+      "p50_ns": 6.288,
+      "average_ns": 7.1242
+    },
+    "false_positive_rate": 0.0347
+  }
+}

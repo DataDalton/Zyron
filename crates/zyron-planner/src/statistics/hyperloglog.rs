@@ -93,24 +93,13 @@ impl Default for HyperLogLog {
 // Hash helper
 // ---------------------------------------------------------------------------
 
-/// Simple 64-bit hash mixing function for use when callers do not have
-/// a pre-computed hash. Uses the finalizer from SplitMix64.
+/// 64-bit hash for callers that do not have a pre-computed hash. The
+/// canonical hot-path hash, whose two-lane mixing and full finalization
+/// distribute better than a single-lane word fold, which register
+/// selection quality depends on. Estimates live in memory only, so the
+/// hash carries no persistence contract
 pub fn hash_bytes(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for chunk in data.chunks(8) {
-        let mut buf = [0u8; 8];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        h ^= u64::from_le_bytes(buf);
-        h = h.wrapping_mul(0x517c_c1b7_2722_0a95);
-        h = (h >> 32) | (h << 32);
-    }
-    // SplitMix64 finalizer
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^= h >> 31;
-    h
+    zyron_common::hot_hash64(data)
 }
 
 // ---------------------------------------------------------------------------

@@ -247,6 +247,80 @@ impl PageHeader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Page checksums
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the checksum field inside the serialized PageHeader
+const PAGE_CHECKSUM_OFFSET: usize = 26;
+
+/// Byte offset of the first byte after the checksum field
+const PAGE_CHECKSUM_END: usize = 30;
+
+/// Computes the page checksum: hash32 over every page byte except the
+/// 4-byte checksum field itself, so header metadata (page id, lsn, slot
+/// counts) is covered along with the body.
+///
+/// The two-segment streaming hash equals the one-shot hash of the
+/// concatenation, so the excluded field needs no zeroing and no page copy
+pub fn compute_page_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
+    let mut hasher = crate::checksum::Hasher::new();
+    hasher.update(&page[..PAGE_CHECKSUM_OFFSET]);
+    hasher.update(&page[PAGE_CHECKSUM_END..]);
+    hasher.finish32()
+}
+
+/// Reads the stored checksum out of a serialized page
+#[inline]
+pub fn stored_page_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
+    u32::from_le_bytes([
+        page[PAGE_CHECKSUM_OFFSET],
+        page[PAGE_CHECKSUM_OFFSET + 1],
+        page[PAGE_CHECKSUM_OFFSET + 2],
+        page[PAGE_CHECKSUM_OFFSET + 3],
+    ])
+}
+
+/// Computes and writes the checksum into the page's header field. Every
+/// path that puts a page on disk stamps it immediately before the write
+pub fn stamp_page_checksum(page: &mut [u8; PAGE_SIZE]) {
+    let checksum = compute_page_checksum(page);
+    page[PAGE_CHECKSUM_OFFSET..PAGE_CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
+}
+
+/// True when every byte of the page is zero. An allocated-but-never-written
+/// page reads back zero-filled and legitimately carries no checksum
+fn page_is_all_zero(page: &[u8; PAGE_SIZE]) -> bool {
+    // Word-stride scan, PAGE_SIZE is a multiple of 8
+    page.chunks_exact(8)
+        .all(|w| u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]) == 0)
+}
+
+/// Verifies a page read from disk against its stored checksum.
+///
+/// A fully zeroed page passes: it is a page that was allocated and never
+/// written, which the read paths deliberately decode as empty. Any other
+/// mismatch is corruption or a torn write and fails with
+/// [`ZyronError::PageChecksumMismatch`], the caller must not consume the
+/// bytes. Recovery does not replay physical pages, so a failed page is
+/// surfaced to the caller rather than repaired
+pub fn verify_page_checksum(page: &[u8; PAGE_SIZE], page_id: PageId) -> crate::Result<()> {
+    let stored = stored_page_checksum(page);
+    let actual = compute_page_checksum(page);
+    if stored == actual {
+        return Ok(());
+    }
+    if stored == 0 && page_is_all_zero(page) {
+        return Ok(());
+    }
+    Err(crate::ZyronError::PageChecksumMismatch {
+        file_id: page_id.file_id,
+        page_id: page_id.page_num,
+        expected: stored,
+        actual,
+    })
+}
+
 /// Flags for page state.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PageFlags(u8);
@@ -310,6 +384,65 @@ impl PageFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ZyronError;
+
+    #[test]
+    fn page_checksum_stamp_verify_roundtrip() {
+        let mut page = Box::new([0u8; PAGE_SIZE]);
+        for (i, b) in page.iter_mut().enumerate() {
+            *b = (i * 31 + 7) as u8;
+        }
+        let id = PageId::new(3, 42);
+        stamp_page_checksum(&mut page);
+        assert!(verify_page_checksum(&page, id).is_ok());
+        assert_eq!(stored_page_checksum(&page), compute_page_checksum(&page));
+    }
+
+    #[test]
+    fn page_checksum_detects_any_bit_flip() {
+        let mut page = Box::new([0u8; PAGE_SIZE]);
+        for (i, b) in page.iter_mut().enumerate() {
+            *b = (i * 17 + 3) as u8;
+        }
+        stamp_page_checksum(&mut page);
+        let id = PageId::new(1, 7);
+        // Flip one bit in the header region, the body, and the tail. A flip
+        // inside the checksum field itself must also fail, the stored value
+        // no longer matches the computed one
+        for &byte in &[0usize, 12, 26, 40, 4096, PAGE_SIZE - 1] {
+            page[byte] ^= 0x10;
+            let err = verify_page_checksum(&page, id);
+            assert!(err.is_err(), "flip at byte {byte} not detected");
+            match err {
+                Err(ZyronError::PageChecksumMismatch {
+                    file_id, page_id, ..
+                }) => {
+                    assert_eq!(file_id, 1);
+                    assert_eq!(page_id, 7);
+                }
+                other => panic!("wrong error variant: {other:?}"),
+            }
+            page[byte] ^= 0x10;
+        }
+        assert!(verify_page_checksum(&page, id).is_ok());
+    }
+
+    #[test]
+    fn page_checksum_all_zero_page_passes() {
+        // An allocated-but-never-written page reads back fully zeroed and
+        // must verify, the read paths decode it as an empty page
+        let page = Box::new([0u8; PAGE_SIZE]);
+        assert!(verify_page_checksum(&page, PageId::new(0, 99)).is_ok());
+    }
+
+    #[test]
+    fn page_checksum_zero_field_nonzero_body_fails() {
+        // A torn write can leave real bytes with a zeroed checksum field,
+        // that must not pass as a fresh page
+        let mut page = Box::new([0u8; PAGE_SIZE]);
+        page[100] = 0xAB;
+        assert!(verify_page_checksum(&page, PageId::new(0, 5)).is_err());
+    }
 
     #[test]
     fn test_page_size_constant() {

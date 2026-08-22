@@ -1713,14 +1713,18 @@ mod tests {
 
     fn batch(rows: &[(i64, Option<i64>)]) -> Vec<ColumnData> {
         vec![
-            ColumnData::from_cells(0, rows
-                    .iter()
+            ColumnData::from_cells(
+                0,
+                rows.iter()
                     .map(|(a, _)| Some(a.to_le_bytes().to_vec()))
-                    .collect()),
-            ColumnData::from_cells(1, rows
-                    .iter()
+                    .collect(),
+            ),
+            ColumnData::from_cells(
+                1,
+                rows.iter()
                     .map(|(_, b)| b.map(|v| v.to_le_bytes().to_vec()))
-                    .collect()),
+                    .collect(),
+            ),
         ]
     }
 

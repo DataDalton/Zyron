@@ -1,0 +1,19 @@
+{
+  "description": "Pre-consolidation baseline for the version-log append path, whose cost includes version_entry_hash. Captured before zyron-versioning migrated onto zyron_common::checksum::hot. Post-migration per-record write must hold within 1%.",
+  "source_run": "benchmarks/versioning/versioning_2026-08-22_012556_3aab844-local.json",
+  "commit": "3aab844-local",
+  "profile": "release",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "metrics": {
+    "version_log_append (ops/sec)": {
+      "runs": [687565, 709170, 707171, 708694, 709748],
+      "p50_ops": 708694,
+      "average_ops": 704470
+    },
+    "version_log_batch_append (ops/sec)": {
+      "runs": [6790955, 6801851, 6904356, 6999145, 7002051],
+      "p50_ops": 6904356,
+      "average_ops": 6899672
+    }
+  }
+}

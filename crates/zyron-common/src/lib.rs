@@ -25,9 +25,11 @@ pub mod zerocopy;
 
 pub use array_value::ArrayView;
 pub use checksum::{
-    ALGORITHM_VERSION, FX_K, Hasher, IdentityBuildHasher, IdentityHasher, PreHashMap,
-    ZyBuildHasher, ZyBuildHasherSeeded, fx_mix, hash32, hash32_seeded, hash64, hash64_seeded,
-    hash128, hash128_seeded, mix_finalize_2round, mix_finalize_3round,
+    ALGORITHM_VERSION, FX_K, HASH_GOLDEN, Hasher, HotHasher, IdentityBuildHasher, IdentityHasher,
+    PreHashMap, ZyBuildHasher, ZyBuildHasherSeeded, fnv1a_64, fx_mix, hash_combine, hash_fold,
+    hash_int, hash32, hash32_seeded, hash64, hash64_seeded, hash128, hash128_seeded,
+    hot_hash_with_header, hot_hash32, hot_hash64, hot_hash128, mix_finalize_2round,
+    mix_finalize_3round, splitmix64,
 };
 pub use cluster::{ClusterDecision, ClusterKey, ClusterMode, ClusterStrategy, ClusteringSchedule};
 pub use config::{DeploymentMode, ServerConfig, StorageConfig};
@@ -48,7 +50,10 @@ pub use node::{
     IDENTITY_FILE, NodeIdentity, PEERS_FILE, PeerEntry, PeerRegistry, peer_timestamp_us,
 };
 pub use obs_metrics::{LabeledMetrics, TlsDirection};
-pub use page::{BranchCatalog, BranchFiles, PAGE_SIZE, PageHeader, PageId};
+pub use page::{
+    BranchCatalog, BranchFiles, PAGE_SIZE, PageHeader, PageId, compute_page_checksum,
+    stamp_page_checksum, stored_page_checksum, verify_page_checksum,
+};
 pub use prng::{ReservoirL, Xoshiro256pp, splitMix64};
 pub use row_locator::RowLocator;
 pub use storage_tier::StorageTier;

@@ -8,11 +8,13 @@ use std::time::Instant;
 
 use tempfile::TempDir;
 use zyron_bench_harness::*;
+use zyron_common::hash_int;
 use zyron_streaming::accumulator::*;
 use zyron_streaming::backpressure::*;
 use zyron_streaming::checkpoint::*;
+use zyron_streaming::column::hash_column_batch_into;
 use zyron_streaming::column::*;
-use zyron_streaming::hash::*;
+use zyron_streaming::flat_map::FlatU64Map;
 use zyron_streaming::job::*;
 use zyron_streaming::late_data::*;
 use zyron_streaming::metrics::*;
@@ -465,7 +467,7 @@ fn test_lookup_join_cached() {
         for i in 0..num_dim_keys {
             let dim_col = StreamColumn::from_data(StreamColumnData::Int64(vec![i as i64 * 100]));
             let dim_batch = StreamBatch::new(vec![dim_col]);
-            let key_hash = hash_int(i as i64);
+            let key_hash = hash_int(i as i64 as u64);
             map.insert(key_hash, dim_batch);
         }
         std::sync::Arc::new(map)
@@ -1367,7 +1369,7 @@ fn test_lookup_join_correctness() {
         let mut map = std::collections::HashMap::new();
         for customer_id in 0..3i64 {
             let tier = customer_id + 1; // Tier: 1, 2, 3.
-            let key_hash = hash_int(customer_id);
+            let key_hash = hash_int(customer_id as u64);
             let batch = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
                 vec![tier],
             ))]);
@@ -1630,7 +1632,7 @@ fn test_stream_join_latency_breakdown() {
     // Measure FlatU64Map lookup-only cost with a standalone map.
     let mut standalone_map: FlatU64Map<i64> = FlatU64Map::new();
     for i in 0..n as u64 {
-        standalone_map.insert(hash_int(i as i64), i as i64);
+        standalone_map.insert(hash_int(i as i64 as u64), i as i64);
     }
     let lookup_start = Instant::now();
     let mut found = 0u64;

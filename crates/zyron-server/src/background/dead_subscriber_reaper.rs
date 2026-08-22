@@ -192,6 +192,7 @@ mod tests {
             DiskManager::new(DiskManagerConfig {
                 data_dir,
                 fsync_enabled: false,
+                ..Default::default()
             })
             .await
             .unwrap(),
@@ -306,6 +307,7 @@ mod tests {
             DiskManager::new(DiskManagerConfig {
                 data_dir,
                 fsync_enabled: false,
+                ..Default::default()
             })
             .await
             .unwrap(),

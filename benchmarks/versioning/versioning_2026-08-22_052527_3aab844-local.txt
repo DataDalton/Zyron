@@ -1,0 +1,28 @@
+# suite:   versioning
+# run:     2026-08-22_052527_3aab844-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+=== Version Log Append Throughput ===
+  Run 1: 704,715 ops/sec (1.42s)
+  Run 2: 712,999 ops/sec (1.40s)
+  Run 3: 731,628 ops/sec (1.37s)
+  Run 4: 706,593 ops/sec (1.42s)
+  Run 5: 692,693 ops/sec (1.44s)
+  append_ops_per_sec [PASS/OK]:
+    Runs: [704,715, 712,999, 731,628, 706,593, 692,693]
+    Average: 709,726 >= 400,000 (target)
+    Min/Max: 692,693 / 731,628, StdDev: 12,771
+
+=== Version Log Batch Append ===
+  Run 1: 7,445,152 ops/sec (134.32ms)
+  Run 2: 7,682,203 ops/sec (130.17ms)
+  Run 3: 7,710,736 ops/sec (129.69ms)
+  Run 4: 8,444,313 ops/sec (118.42ms)
+  Run 5: 7,991,893 ops/sec (125.13ms)
+  batch_append_ops_per_sec [PASS/OK]:
+    Runs: [7,445,152, 7,682,203, 7,710,736, 8,444,313, 7,991,893]
+    Average: 7,854,859 >= 5,000,000 (target)
+    Min/Max: 7,445,152 / 8,444,313, StdDev: 341,958
+

@@ -300,10 +300,22 @@ impl Server {
         })?;
 
         // 2. Create DiskManager
+        // One parse function owns the vocabulary. The validator already
+        // rejected "off" and unknown values, so the only defensive fallback
+        // left is full verification, never none
+        let page_checksum_verify = match zyron_storage::PageChecksumVerify::parse(
+            &self.config.storage.page_checksum_verify,
+        ) {
+            Some(zyron_storage::PageChecksumVerify::Sampled) => {
+                zyron_storage::PageChecksumVerify::Sampled
+            }
+            _ => zyron_storage::PageChecksumVerify::Always,
+        };
         let disk_manager = Arc::new(
             DiskManager::new(DiskManagerConfig {
                 data_dir: data_dir.clone(),
                 fsync_enabled: self.config.wal.sync_mode == "fsync",
+                page_checksum_verify,
             })
             .await?,
         );

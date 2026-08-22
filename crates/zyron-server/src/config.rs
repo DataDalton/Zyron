@@ -465,6 +465,22 @@ impl ZyronConfig {
                 self.storage.deployment_mode
             )));
         }
+        match zyron_storage::PageChecksumVerify::parse(&self.storage.page_checksum_verify) {
+            Some(zyron_storage::PageChecksumVerify::Off) => {
+                return Err(ZyronError::Internal(
+                    "storage.page_checksum_verify = 'off' is not accepted: a server never runs \
+                     with an unverified page read path. Use 'always' (the default) or 'sampled'"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                return Err(ZyronError::Internal(format!(
+                    "Invalid storage.page_checksum_verify '{}', expected 'always' or 'sampled'",
+                    self.storage.page_checksum_verify
+                )));
+            }
+        }
         if self.wal.segment_size == 0 {
             return Err(ZyronError::Internal("WAL segment_size cannot be 0".into()));
         }
@@ -943,6 +959,12 @@ pub struct StorageSection {
     /// Picks the format CREATE TABLE uses without a USING clause, refuses DDL
     /// naming the other format, and gates lake startup recovery and workers.
     pub deployment_mode: String,
+    /// Read-side page checksum verification: "always" verifies every heap
+    /// page read, "sampled" verifies roughly one in a hundred, for
+    /// benchmark investigations that isolate verification cost. "off" is
+    /// rejected by the validator, a server never runs with an unverified
+    /// read path. Writes stamp checksums unconditionally.
+    pub page_checksum_verify: String,
 }
 
 impl Default for StorageSection {
@@ -952,6 +974,7 @@ impl Default for StorageSection {
             page_size: 16384,
             buffer_pool_size: 128 * 1024 * 1024, // 128 MB
             deployment_mode: "unified".into(),
+            page_checksum_verify: "always".into(),
         }
     }
 }
@@ -1350,6 +1373,37 @@ mod tests {
     fn test_parse_size_pb_zb() {
         assert_eq!(parse_size("1PB").unwrap(), 1024 * 1024 * 1024 * 1024 * 1024);
         assert_eq!(parse_size("1P").unwrap(), 1024 * 1024 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_page_checksum_verify_validation() {
+        // The default is always-on verification
+        let config = ZyronConfig::default();
+        assert_eq!(config.storage.page_checksum_verify, "always");
+        assert!(config.validate().is_ok());
+
+        // Sampled exists for benchmark investigations
+        let mut config = ZyronConfig::default();
+        config.storage.page_checksum_verify = "sampled".into();
+        assert!(config.validate().is_ok());
+
+        // Off is rejected, a server never runs an unverified read path.
+        // The error names the setting and the acceptable values
+        let mut config = ZyronConfig::default();
+        config.storage.page_checksum_verify = "off".into();
+        let err = config.validate().expect_err("'off' must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("page_checksum_verify"), "{message}");
+        assert!(message.contains("always"), "{message}");
+        assert!(message.contains("sampled"), "{message}");
+
+        // Unknown values are rejected with the same guidance
+        let mut config = ZyronConfig::default();
+        config.storage.page_checksum_verify = "sometimes".into();
+        let err = config
+            .validate()
+            .expect_err("unknown value must be rejected");
+        assert!(err.to_string().contains("page_checksum_verify"));
     }
 
     #[test]

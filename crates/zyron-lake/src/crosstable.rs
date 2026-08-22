@@ -449,7 +449,10 @@ mod tests {
     }
 
     fn rows(ids: &[i64]) -> Vec<ColumnData> {
-        vec![ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect())]
+        vec![ColumnData::from_cells(
+            0,
+            ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+        )]
     }
 
     fn new_table(data_dir: &Path, table_id: u32) -> TransactionLog {

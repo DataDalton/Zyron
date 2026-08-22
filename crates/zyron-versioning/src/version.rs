@@ -119,48 +119,24 @@ const _: () = {
     assert!(std::mem::size_of::<PackedVersionEntry>() == PACKED_ENTRY_SIZE);
 };
 
-/// Stable inline mixer over an arbitrary byte slice. Used for the version-entry
-/// checksum so the fixed prefix and the variable metadata are covered together.
-fn version_entry_hash(bytes: &[u8]) -> u32 {
-    const MIX_A: u64 = 0x517cc1b727220a95;
-    const MIX_B: u64 = 0xff51afd7ed558ccd;
-    let mut la = MIX_A ^ (bytes.len() as u64);
-    let mut lb = MIX_A.rotate_left(32) ^ (bytes.len() as u64);
-    let mut chunks = bytes.chunks_exact(8);
-    let mut toggle = false;
-    for c in &mut chunks {
-        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
-        if toggle {
-            lb = (lb ^ w).wrapping_mul(MIX_A);
-        } else {
-            la = (la ^ w).wrapping_mul(MIX_A);
-        }
-        toggle = !toggle;
-    }
-    let rem = chunks.remainder();
-    if !rem.is_empty() {
-        let mut tail = [0u8; 8];
-        tail[..rem.len()].copy_from_slice(rem);
-        let w = u64::from_le_bytes(tail);
-        la = (la ^ w).wrapping_mul(MIX_A);
-    }
-    let mut h = la ^ lb;
-    h ^= h >> 33;
-    h = h.wrapping_mul(MIX_B);
-    h ^= h >> 33;
-    h as u32
-}
-
 impl PackedVersionEntry {
     /// Computes the checksum over the fixed prefix (every byte before the
     /// checksum field) and the trailing metadata bytes.
+    ///
+    /// Uses the canonical hot-path hash, seeded with the combined length
+    /// and fed the prefix and metadata as two segments, so no concatenation
+    /// buffer is allocated per record. Write and verify both come through
+    /// here, which keeps the two-segment split identical on both sides
     fn compute_checksum(&self, metadata: &[u8]) -> u32 {
         let ptr = self as *const _ as *const u8;
+        // SAFETY: the struct is repr(C, packed) with size PACKED_ENTRY_SIZE,
+        // and CHECKSUM_OFFSET bytes is the fixed prefix before the checksum
+        // field
         let prefix = unsafe { std::slice::from_raw_parts(ptr, CHECKSUM_OFFSET) };
-        let mut buf = Vec::with_capacity(CHECKSUM_OFFSET + metadata.len());
-        buf.extend_from_slice(prefix);
-        buf.extend_from_slice(metadata);
-        version_entry_hash(&buf)
+        let mut hasher = zyron_common::HotHasher::new(CHECKSUM_OFFSET + metadata.len());
+        hasher.update_payload(prefix);
+        hasher.update_payload(metadata);
+        hasher.finish32()
     }
 
     fn to_bytes(&self) -> [u8; PACKED_ENTRY_SIZE] {

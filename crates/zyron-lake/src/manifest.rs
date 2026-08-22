@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use zyron_common::ZyronError;
 
-use zyron_storage::columnar::might_contain_serialized;
+use zyron_storage::columnar::{might_contain_serialized, might_contain_serialized_batch};
 
 use crate::cells::value_to_cell;
 use crate::codec::{Cursor, corrupt};
@@ -211,6 +211,23 @@ impl<'a> FileStats<'a> {
     pub fn entry(&self) -> &'a PartitionEntry {
         self.entry
     }
+
+    /// Resolves everything a bloom probe needs for one column: the
+    /// serialized filter plus the physical type and width that encode a
+    /// constant into stored cell bytes. Both probe methods resolve through
+    /// here so their guard rules cannot drift apart. None means the column
+    /// carries no probeable filter and nothing can be proven absent
+    fn bloom_probe_context(
+        &self,
+        column_id: u32,
+    ) -> Option<(&'a [u8], zyron_common::TypeId, usize)> {
+        let stats = self.entry.stats_for(column_id)?;
+        let bloom = stats.bloom.as_deref()?;
+        let column = self.schema.column_by_id(column_id)?;
+        let physical = column.physical_type_id();
+        let width = physical.fixed_size().unwrap_or(0);
+        Some((bloom, physical, width))
+    }
 }
 
 impl StatsSource for FileStats<'_> {
@@ -219,22 +236,49 @@ impl StatsSource for FileStats<'_> {
     }
 
     fn may_contain(&self, column_id: u32, value: &LakeValue) -> bool {
-        let Some(stats) = self.entry.stats_for(column_id) else {
+        let Some((bloom, physical, width)) = self.bloom_probe_context(column_id) else {
             return true;
         };
-        let Some(bloom) = stats.bloom.as_deref() else {
-            return true;
-        };
-        let Some(column) = self.schema.column_by_id(column_id) else {
-            return true;
-        };
-        let physical = column.physical_type_id();
-        let width = physical.fixed_size().unwrap_or(0);
         match value_to_cell(physical, width, value) {
             Some(cell) => might_contain_serialized(bloom, cell.as_slice()),
             // A constant with no provable stored form prunes nothing
             None => true,
         }
+    }
+
+    /// Batched form of `may_contain` for IN-list pruning: the filter header
+    /// validates once and the per-value block fetches overlap. Answers match
+    /// the sequential probes value for value
+    fn may_contain_any(&self, column_id: u32, values: &[&LakeValue]) -> bool {
+        if values.is_empty() {
+            return false;
+        }
+        let Some((bloom, physical, width)) = self.bloom_probe_context(column_id) else {
+            return true;
+        };
+        // Below one prefetch group the batch machinery buys nothing, probe
+        // sequentially with no buffers and stop at the first possible hit.
+        // A constant with no provable stored form prunes nothing, so the
+        // disjunction cannot be proven absent either way
+        if values.len() < 4 {
+            return values
+                .iter()
+                .any(|value| match value_to_cell(physical, width, value) {
+                    Some(cell) => might_contain_serialized(bloom, cell.as_slice()),
+                    None => true,
+                });
+        }
+        let mut cells = Vec::with_capacity(values.len());
+        for value in values {
+            match value_to_cell(physical, width, value) {
+                Some(cell) => cells.push(cell),
+                None => return true,
+            }
+        }
+        let cell_refs: Vec<&[u8]> = cells.iter().map(|c| c.as_slice()).collect();
+        let mut results = vec![false; cell_refs.len()];
+        might_contain_serialized_batch(bloom, &cell_refs, &mut results);
+        results.into_iter().any(|present| present)
     }
 }
 

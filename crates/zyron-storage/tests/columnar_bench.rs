@@ -39,7 +39,15 @@ const COMPACTION_SEQ_TARGET_ROWS_SEC: f64 = 1_000_000.0;
 const COMPACTION_PARALLEL_SPEEDUP_TARGET: f64 = 3.0;
 const HYBRID_SCAN_OVERHEAD_TARGET_PCT: f64 = 5.0;
 const BLOOM_PROBE_TARGET_NS: f64 = 30.0;
-const BLOOM_SKIP_RATE_TARGET_PCT: f64 = 99.0;
+// One absent key probed against 99 file blooms at the filter's ~1.2%
+// false positive rate expects 1.2 false positives, so 98% (one allowed
+// miss) is the strongest target the filter can meet in expectation. The
+// old 99% only held because the previous hash's structured output made
+// this key set produce zero false positives, the same structure that put
+// the measured FPR at 3.5-6%. The FPR gate itself tightened from 8% to 3%
+const BLOOM_SKIP_RATE_TARGET_PCT: f64 = 98.0;
+const BLOOM_BATCH_PROBE_TARGET_NS: f64 = 60.0;
+const BLOOM_SEQUENTIAL_8WAY_TARGET_NS: f64 = 120.0;
 const ZONE_MAP_BATCH_SKIP_RATE_TARGET_PCT: f64 = 95.0;
 const SORTED_PK_LOOKUP_TARGET_NS: f64 = 500.0;
 const SORTED_PK_RANGE_TARGET_KEYS_SEC: f64 = 80_000_000.0;
@@ -984,6 +992,78 @@ fn test_bloom_filter() {
         probeResults,
         BLOOM_PROBE_TARGET_NS,
         false,
+    );
+
+    // 8-way batch probe against 8 sequential probes over the same keys, on
+    // a filter larger than L2 so block fetches actually miss, the regime
+    // file-level pruning blooms run in. Half the keys are present, half
+    // absent, matching a selective IN-list probe mix
+    let batchElements = 4_000_000u64;
+    let goldenStep = 0x9E3779B97F4A7C15u64;
+    let mut batchFilter = BloomFilter::new(batchElements);
+    for i in 0..batchElements {
+        batchFilter.insert(&i.wrapping_mul(goldenStep).to_le_bytes());
+    }
+    let batchKeyCount = 262_144usize;
+    let batchKeys: Vec<u64> = (0..batchKeyCount as u64)
+        .map(|i| {
+            if i % 2 == 0 {
+                (i / 2).wrapping_mul(goldenStep)
+            } else {
+                (batchElements + i).wrapping_mul(goldenStep)
+            }
+        })
+        .collect();
+
+    let mut sequentialResults = Vec::with_capacity(VALIDATION_RUNS);
+    let mut batchResults = Vec::with_capacity(VALIDATION_RUNS);
+    let mut answers = vec![false; 8];
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let mut hits = 0u64;
+        for chunk in batchKeys.chunks_exact(8) {
+            for &k in chunk {
+                if batchFilter.might_contain(&k.to_le_bytes()) {
+                    hits += 1;
+                }
+            }
+        }
+        sequentialResults.push(start.elapsed().as_nanos() as f64 / batchKeyCount as f64);
+        std::hint::black_box(hits);
+
+        let start = Instant::now();
+        let mut batchHits = 0u64;
+        for chunk in batchKeys.chunks_exact(8) {
+            batchFilter.might_contain_batch(chunk, &mut answers);
+            batchHits += answers.iter().filter(|&&a| a).count() as u64;
+        }
+        batchResults.push(start.elapsed().as_nanos() as f64 / batchKeyCount as f64);
+        std::hint::black_box(batchHits);
+    }
+
+    let sequentialResult = validate_metric(
+        "Bloom Filter",
+        "Bloom probe 8-way sequential (ns/key)",
+        sequentialResults,
+        BLOOM_SEQUENTIAL_8WAY_TARGET_NS,
+        false,
+    );
+    let batchResult = validate_metric(
+        "Bloom Filter",
+        "Bloom probe 8-way batch (ns/key)",
+        batchResults,
+        BLOOM_BATCH_PROBE_TARGET_NS,
+        false,
+    );
+    assert!(
+        batchResult.average < sequentialResult.average,
+        "batched probe must beat sequential probes: batch {:.2} ns/key vs sequential {:.2} ns/key",
+        batchResult.average,
+        sequentialResult.average
+    );
+    tprintln!(
+        "  Batch speedup: {:.2}x over sequential",
+        sequentialResult.average / batchResult.average
     );
 
     check_performance(

@@ -14,8 +14,8 @@ pub mod copy_external;
 pub mod dlq;
 pub mod external_sink;
 pub mod external_source;
+pub mod flat_map;
 pub mod format;
-pub mod hash;
 pub mod interval_join_runner;
 pub mod job;
 pub mod job_runner;
@@ -37,7 +37,7 @@ pub mod window_state;
 
 // Re-exports for convenience.
 pub use column::{NullBitmap, StreamBatch, StreamColumn, StreamColumnData};
-pub use hash::{FlatHashTable, FlatU64Map};
+pub use flat_map::{FlatHashTable, FlatU64Map};
 pub use job_runner::{BinaryOpKind, ExprSpec, StreamJobHandle, StreamingJobSpec};
 pub use late_data::{LateDataHandler, LateDataPolicy, LateDataStats};
 pub use record::{ChangeFlag, ChangelogMode, StreamRecord, StreamRecordPool};

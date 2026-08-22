@@ -24,17 +24,10 @@ pub fn xxhash128(data: &[u8]) -> u128 {
 // FNV-1a 64-bit
 // ---------------------------------------------------------------------------
 
-const FNV_OFFSET_BASIS_64: u64 = 0xCBF2_9CE4_8422_2325;
-const FNV_PRIME_64: u64 = 0x0000_0100_0000_01B3;
-
-/// Computes FNV-1a 64-bit hash
+/// Computes FNV-1a 64-bit hash. The SQL function dispatches here, the
+/// algorithm is the canonical copy in zyron_common::checksum::helpers
 pub fn fnv1a_64(data: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET_BASIS_64;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME_64);
-    }
-    h
+    zyron_common::fnv1a_64(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,10 +491,10 @@ mod tests {
     #[test]
     fn fnv1a_64_known() {
         // FNV-1a("") = offset basis
-        assert_eq!(fnv1a_64(b""), FNV_OFFSET_BASIS_64);
+        assert_eq!(fnv1a_64(b""), 0xCBF2_9CE4_8422_2325);
         // FNV-1a("a") = offset_basis ^ 'a' * prime
-        let mut expected = FNV_OFFSET_BASIS_64 ^ (b'a' as u64);
-        expected = expected.wrapping_mul(FNV_PRIME_64);
+        let mut expected = 0xCBF2_9CE4_8422_2325u64 ^ (b'a' as u64);
+        expected = expected.wrapping_mul(0x0000_0100_0000_01B3);
         assert_eq!(fnv1a_64(b"a"), expected);
     }
 

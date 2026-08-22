@@ -1807,14 +1807,29 @@ mod tests {
     /// file a comparison reads
     #[test]
     fn units_that_count_work_read_as_higher_is_better() {
-        for unit in [" rows/s", "rows/sec", " commits/s", " commits/sec", "bytes/s"] {
+        for unit in [
+            " rows/s",
+            "rows/sec",
+            " commits/s",
+            " commits/sec",
+            "bytes/s",
+        ] {
             assert!(
                 higher_is_better_for(unit),
                 "{unit} counts work done per second"
             );
         }
         for unit in [
-            "us", "ns", "ms", "s", "ns/row", "us/version", "x", " bytes", " per commit", "%",
+            "us",
+            "ns",
+            "ms",
+            "s",
+            "ns/row",
+            "us/version",
+            "x",
+            " bytes",
+            " per commit",
+            "%",
         ] {
             assert!(
                 !higher_is_better_for(unit),

@@ -385,7 +385,10 @@ mod tests {
     }
 
     fn batch(ids: &[i64]) -> Vec<ColumnData> {
-        vec![ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect())]
+        vec![ColumnData::from_cells(
+            0,
+            ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+        )]
     }
 
     /// The claim the mesh rests on: syncing a table on shared storage moves

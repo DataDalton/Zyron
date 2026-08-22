@@ -27,7 +27,21 @@
 //!
 //! See `checksum/spec.rs` for the algorithm constants and `checksum.md`
 //! (alongside this file) for the byte-level reference specification.
+//!
+//! Three submodules hold the non-AES hash primitives, each the single
+//! canonical copy in the workspace:
+//!
+//! - `helpers`: fnv1a_64 (shared by zyron-types, zyron-streaming,
+//!   zyron-executor and zyron-lake), hash_combine, hash_fold (the wire and
+//!   server fold sites) and the one-shot splitmix64
+//! - `hot`: the two-lane multiply-xor record hash behind the WAL,
+//!   change-feed, version-entry and bloom-key checksums
+//! - `batch`: the per-value primitives (fibonacci hash_int) that the
+//!   executor and streaming column-batch hash loops share
 
+pub mod batch;
+pub mod helpers;
+pub mod hot;
 pub mod scalar;
 pub mod spec;
 
@@ -37,6 +51,9 @@ pub mod x86_aes;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64_aes;
 
+pub use batch::{HASH_GOLDEN, hash_int};
+pub use helpers::{fnv1a_64, hash_combine, hash_fold, splitmix64};
+pub use hot::{HotHasher, hot_hash_with_header, hot_hash32, hot_hash64, hot_hash128};
 pub use spec::ALGORITHM_VERSION;
 
 use scalar::{Lanes, hash_scalar};

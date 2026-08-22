@@ -728,7 +728,6 @@ impl CatalogStorage for HeapCatalogStorage {
         // current heap's file ids. That is O(heaps * pool_size). One
         // dispatch table over every catalog file id lets us walk the pool
         // exactly once and write directly to the matching file.
-        let data_dir = self.disk.data_dir().to_path_buf();
         let allowed: std::collections::HashSet<u32> = [
             DATABASES_HEAP_FILE_ID,
             DATABASES_FSM_FILE_ID,
@@ -792,23 +791,19 @@ impl CatalogStorage for HeapCatalogStorage {
         .into_iter()
         .collect();
 
+        // Each page routes through the disk manager, sharing the per-page
+        // latch and the open file handle instead of opening the file per page
         self.pool.flush_all(|page_id, data| {
             if !allowed.contains(&page_id.file_id) {
                 return Ok(());
             }
-            let path = data_dir.join(format!("{:08}.dat", page_id.file_id));
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|e| {
-                    ZyronError::IoError(format!("flush open {}: {}", path.display(), e))
+            let data_len = data.len();
+            let page: &mut [u8; PAGE_SIZE] =
+                data.try_into().map_err(|_| ZyronError::PageSizeMismatch {
+                    expected: PAGE_SIZE,
+                    actual: data_len,
                 })?;
-            let offset = page_id.page_num * (PAGE_SIZE as u64);
-            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
-                .map_err(|e| ZyronError::IoError(format!("flush seek: {}", e)))?;
-            std::io::Write::write_all(&mut file, data)
-                .map_err(|e| ZyronError::IoError(format!("flush write: {}", e)))?;
-            Ok(())
+            self.disk.write_page_sync_no_fsync(page_id, page)
         })?;
         Ok(())
     }

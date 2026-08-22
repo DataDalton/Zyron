@@ -120,9 +120,7 @@ pub fn read_all_rows(
         .schema
         .columns
         .iter()
-        .map(|c| {
-            ColumnData::with_capacity(c.id, c.physical_type_id().fixed_size().unwrap_or(0), 0)
-        })
+        .map(|c| ColumnData::with_capacity(c.id, c.physical_type_id().fixed_size().unwrap_or(0), 0))
         .collect();
 
     for entry in &manifest.entries {
@@ -186,11 +184,16 @@ mod tests {
 
     fn rows(ids: &[i64], tags: &[Option<&str>]) -> Vec<ColumnData> {
         vec![
-            ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
-            ColumnData::from_cells(1, tags
-                    .iter()
+            ColumnData::from_cells(
+                0,
+                ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+            ),
+            ColumnData::from_cells(
+                1,
+                tags.iter()
                     .map(|t| t.map(|s| s.as_bytes().to_vec()))
-                    .collect()),
+                    .collect(),
+            ),
         ]
     }
 

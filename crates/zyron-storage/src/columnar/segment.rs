@@ -928,7 +928,9 @@ impl ColumnSegment {
                 !nulls
                     .get(row / 8)
                     .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
-                    || values[row * valueSize..(row + 1) * valueSize].iter().all(|&b| b == 0)
+                    || values[row * valueSize..(row + 1) * valueSize]
+                        .iter()
+                        .all(|&b| b == 0)
             }),
             "a null slot in the packed buffer is not zero-filled"
         );
@@ -1137,8 +1139,7 @@ impl ColumnSegment {
         // is null and no adjacent pair differs. Deriving it from the run
         // count rather than from the distinct count keeps it exact under a
         // set that is keyed by hashes
-        let allIdentical =
-            nullCount as usize == rowCount || (nullCount == 0 && runCount == 1);
+        let allIdentical = nullCount as usize == rowCount || (nullCount == 0 && runCount == 1);
         let stats = ColumnSampleStats {
             cardinality: distinct.estimated(),
             run_count: runCount,
@@ -1468,8 +1469,11 @@ mod tests {
                 for a in &samples {
                     for b in &samples {
                         let expected = compare_values_ordered(a, b, width, order);
-                        let folded = ordered_word(le_word(a), width, order)
-                            .cmp(&ordered_word(le_word(b), width, order));
+                        let folded = ordered_word(le_word(a), width, order).cmp(&ordered_word(
+                            le_word(b),
+                            width,
+                            order,
+                        ));
                         assert_eq!(
                             folded, expected,
                             "width {width} order {order:?} disagreed on {a:?} vs {b:?}"
@@ -1526,12 +1530,7 @@ mod tests {
         // One distinct value and a single null, which is not constant
         let mut one_and_a_null = vec![Some(7i64.to_le_bytes().to_vec()); rows];
         one_and_a_null[rows / 2] = None;
-        shapes.push((
-            "one value with a null",
-            TypeId::Int64,
-            8,
-            one_and_a_null,
-        ));
+        shapes.push(("one value with a null", TypeId::Int64, 8, one_and_a_null));
         shapes.push((
             "boolean",
             TypeId::Boolean,
@@ -1561,7 +1560,9 @@ mod tests {
             "ascending distinct",
             TypeId::Int64,
             8,
-            (0..rows).map(|r| Some((r as i64).to_le_bytes().to_vec())).collect(),
+            (0..rows)
+                .map(|r| Some((r as i64).to_le_bytes().to_vec()))
+                .collect(),
         ));
         // Distinct and scattered, with nulls through it
         shapes.push((
@@ -1573,7 +1574,11 @@ mod tests {
                     if r % 23 == 0 {
                         None
                     } else {
-                        Some(((r as i64).wrapping_mul(6_364_136_223_846_793_005)).to_le_bytes().to_vec())
+                        Some(
+                            ((r as i64).wrapping_mul(6_364_136_223_846_793_005))
+                                .to_le_bytes()
+                                .to_vec(),
+                        )
                     }
                 })
                 .collect(),
@@ -1594,7 +1599,11 @@ mod tests {
             8,
             (0..rows)
                 .map(|r| {
-                    let value = if r < rows / 2 + 2 { r } else { r % (rows / 2 + 2) };
+                    let value = if r < rows / 2 + 2 {
+                        r
+                    } else {
+                        r % (rows / 2 + 2)
+                    };
                     Some((value as i64).to_le_bytes().to_vec())
                 })
                 .collect(),
@@ -1657,7 +1666,9 @@ mod tests {
                 "ascending distinct",
                 TypeId::Int64,
                 8,
-                (0..rows).map(|r| Some((r as i64).to_le_bytes().to_vec())).collect(),
+                (0..rows)
+                    .map(|r| Some((r as i64).to_le_bytes().to_vec()))
+                    .collect(),
             ),
             (
                 "with nulls",
@@ -1702,7 +1713,9 @@ mod tests {
                 "narrow cells",
                 TypeId::Int16,
                 2,
-                (0..rows).map(|r| Some((r as i16).to_le_bytes().to_vec())).collect(),
+                (0..rows)
+                    .map(|r| Some((r as i16).to_le_bytes().to_vec()))
+                    .collect(),
             ),
             (
                 "cells wider than one word",
@@ -1726,9 +1739,7 @@ mod tests {
             let mut nulls = vec![0u8; cells.len().div_ceil(8)];
             for (row, cell) in cells.iter().enumerate() {
                 match cell {
-                    Some(value) => {
-                        packed[row * width..(row + 1) * width].copy_from_slice(value)
-                    }
+                    Some(value) => packed[row * width..(row + 1) * width].copy_from_slice(value),
                     None => nulls[row / 8] |= 1 << (row % 8),
                 }
             }
@@ -1894,8 +1905,11 @@ mod tests {
             for b in f64s {
                 let (ab, bb) = (a.to_le_bytes(), b.to_le_bytes());
                 assert_eq!(
-                    ordered_word(le_word(&ab), 8, SlotOrder::Ieee)
-                        .cmp(&ordered_word(le_word(&bb), 8, SlotOrder::Ieee)),
+                    ordered_word(le_word(&ab), 8, SlotOrder::Ieee).cmp(&ordered_word(
+                        le_word(&bb),
+                        8,
+                        SlotOrder::Ieee
+                    )),
                     compare_values_ordered(&ab, &bb, 8, SlotOrder::Ieee),
                     "f64 fold disagreed on {a} vs {b}"
                 );
@@ -1915,8 +1929,11 @@ mod tests {
             for b in f32s {
                 let (ab, bb) = (a.to_le_bytes(), b.to_le_bytes());
                 assert_eq!(
-                    ordered_word(le_word(&ab), 4, SlotOrder::Ieee)
-                        .cmp(&ordered_word(le_word(&bb), 4, SlotOrder::Ieee)),
+                    ordered_word(le_word(&ab), 4, SlotOrder::Ieee).cmp(&ordered_word(
+                        le_word(&bb),
+                        4,
+                        SlotOrder::Ieee
+                    )),
                     compare_values_ordered(&ab, &bb, 4, SlotOrder::Ieee),
                     "f32 fold disagreed on {a} vs {b}"
                 );

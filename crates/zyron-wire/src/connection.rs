@@ -6044,6 +6044,7 @@ mod subscribe_authz_tests {
             DiskManager::new(DiskManagerConfig {
                 data_dir,
                 fsync_enabled: false,
+                ..Default::default()
             })
             .await
             .unwrap(),

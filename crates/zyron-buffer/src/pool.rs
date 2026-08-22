@@ -12,8 +12,10 @@ use zyron_common::{Result, ZyronError};
 /// Write callback invoked to flush a dirty victim during eviction.
 /// Writes the page durably to disk so a dirty frame is never reused while its
 /// contents are unwritten. Wired from the pool construction site.
+/// The buffer is the pool's private copy of the frame, passed mutably so the
+/// writer can stamp integrity fields in place instead of copying the page.
 pub type EvictWriteFn =
-    std::sync::Arc<dyn Fn(PageId, &[u8; PAGE_SIZE]) -> Result<()> + Send + Sync>;
+    std::sync::Arc<dyn Fn(PageId, &mut [u8; PAGE_SIZE]) -> Result<()> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Lock-free Treiber stack for buffer pool frame allocation
@@ -402,7 +404,7 @@ impl BufferPool {
                             // Write through the hook. On failure leave the frame
                             // dirty and in the page table, and surface the error
                             // so the dirty page is not silently lost.
-                            write(page_id, &data)?;
+                            write(page_id, &mut data)?;
                             frame.set_dirty(false);
                         }
                         None => {
@@ -603,7 +605,7 @@ impl BufferPool {
     /// failed flush restores the state so the page is retried.
     pub fn flush_page<F>(&self, page_id: PageId, mut flush_fn: F) -> Result<bool>
     where
-        F: FnMut(PageId, &[u8]) -> Result<()>,
+        F: FnMut(PageId, &mut [u8]) -> Result<()>,
     {
         let Some(frame_id) = self.page_table.get(page_id) else {
             return Ok(false);
@@ -626,11 +628,11 @@ impl BufferPool {
         let expected_lsn = frame.dirty_lsn();
         frame.set_dirty(false);
         let _ = frame.clear_dirty_lsn(expected_lsn);
-        let data: Box<[u8; PAGE_SIZE]> = {
+        let mut data: Box<[u8; PAGE_SIZE]> = {
             let guard = frame.read_data();
             Box::new(**guard)
         };
-        let outcome = flush_fn(page_id, &data[..]);
+        let outcome = flush_fn(page_id, &mut data[..]);
         drop(flush_order);
         match outcome {
             Ok(()) => {
@@ -656,7 +658,7 @@ impl BufferPool {
     /// the caller knows the flush was incomplete.
     pub fn flush_all<F>(&self, mut flush_fn: F) -> Result<usize>
     where
-        F: FnMut(PageId, &[u8]) -> Result<()>,
+        F: FnMut(PageId, &mut [u8]) -> Result<()>,
     {
         let mut flushed = 0;
         let mut failed = 0;
@@ -686,11 +688,11 @@ impl BufferPool {
             let expected_lsn = frame.dirty_lsn();
             frame.set_dirty(false);
             let _ = frame.clear_dirty_lsn(expected_lsn);
-            let data: Box<[u8; PAGE_SIZE]> = {
+            let mut data: Box<[u8; PAGE_SIZE]> = {
                 let guard = frame.read_data();
                 Box::new(**guard)
             };
-            match flush_fn(page_id, &data[..]) {
+            match flush_fn(page_id, &mut data[..]) {
                 Ok(()) => {
                     frame.unpin();
                     flushed += 1;
@@ -1000,7 +1002,7 @@ impl BufferPool {
         flush_fn: F,
     ) -> Result<bool>
     where
-        F: FnOnce(PageId, &[u8; PAGE_SIZE]) -> Result<()>,
+        F: FnOnce(PageId, &mut [u8; PAGE_SIZE]) -> Result<()>,
     {
         // Pin first, then verify the tenancy under the pin. Checking the
         // page id before pinning left a window in which the frame was
@@ -1038,7 +1040,7 @@ impl BufferPool {
         drop(data);
 
         // Write to disk
-        let outcome = flush_fn(page_id, &buf);
+        let outcome = flush_fn(page_id, &mut buf);
         drop(flush_order);
         match outcome {
             Ok(()) => {

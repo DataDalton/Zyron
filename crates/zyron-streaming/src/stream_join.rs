@@ -10,7 +10,8 @@ use zyron_common::Result;
 
 use crate::checkpoint::CheckpointBarrier;
 use crate::column::{StreamBatch, StreamColumn, StreamColumnData};
-use crate::hash::{FlatU64Map, hash_column_batch_into, hash_multi_column_batch_into};
+use crate::column::{hash_column_batch_into, hash_multi_column_batch_into};
+use crate::flat_map::FlatU64Map;
 use crate::record::{ChangeFlag, StreamRecord};
 use crate::state::StateSnapshot;
 use crate::stream_operator::{OperatorMetrics, StreamOperator};
@@ -1004,7 +1005,7 @@ mod tests {
         // Build a simple lookup map for testing.
         let dim_col = StreamColumn::from_data(StreamColumnData::Int64(vec![999]));
         let dim_batch = StreamBatch::new(vec![dim_col]);
-        let key_hash = crate::hash::hash_int(42);
+        let key_hash = zyron_common::hash_int(42);
 
         let lookup_data: std::sync::Arc<std::collections::HashMap<u64, StreamBatch>> = {
             let mut map = std::collections::HashMap::new();
@@ -1030,7 +1031,7 @@ mod tests {
     fn test_temporal_join() {
         let mut join = TemporalJoin::new(4, vec![0]);
 
-        let key_hash = crate::hash::hash_int(1);
+        let key_hash = zyron_common::hash_int(1);
         let v1 = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
             vec![100],
         ))]);
@@ -1053,7 +1054,7 @@ mod tests {
     #[test]
     fn test_temporal_join_no_match() {
         let mut join = TemporalJoin::new(5, vec![0]);
-        let key_hash = crate::hash::hash_int(1);
+        let key_hash = zyron_common::hash_int(1);
         let v1 = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
             vec![100],
         ))]);
@@ -1147,7 +1148,7 @@ mod tests {
     fn test_temporal_join_lookup() {
         let mut join = TemporalJoin::new(103, vec![0]);
 
-        let key_hash = crate::hash::hash_int(77);
+        let key_hash = zyron_common::hash_int(77);
         let build = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
             vec![555],
         ))]);
@@ -1171,7 +1172,7 @@ mod tests {
     fn test_temporal_join_no_match_emits_nothing_by_default() {
         let mut join = TemporalJoin::new(104, vec![0]);
 
-        let key_hash = crate::hash::hash_int(88);
+        let key_hash = zyron_common::hash_int(88);
         let build = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
             vec![999],
         ))]);

@@ -267,6 +267,17 @@ pub trait StatsSource {
     fn may_contain(&self, _column_id: u32, _value: &LakeValue) -> bool {
         true
     }
+
+    /// True when any of `values` may be present per the column's bloom,
+    /// false only when the bloom proves every value absent. Empty `values`
+    /// answers false, nothing can be present.
+    ///
+    /// The default probes one value at a time. A source backed by a real
+    /// filter overrides this with the batched probe so a multi-value IN
+    /// list validates the filter once and overlaps its block fetches.
+    fn may_contain_any(&self, column_id: u32, values: &[&LakeValue]) -> bool {
+        values.iter().any(|v| self.may_contain(column_id, v))
+    }
 }
 
 // Nesting bound for decode, deep enough for any planner output and shallow
@@ -335,19 +346,28 @@ impl LakePredicate {
                 }
                 match stats.bounds(*column_id) {
                     Some(b) => {
-                        let mut any_may = false;
+                        // Classify against the bounds first, then hand every
+                        // value the bounds leave open to the bloom in one
+                        // batched probe instead of a probe per value. The
+                        // candidate list only allocates once a value survives
+                        // the bounds, so a file the bounds prune outright
+                        // costs no allocation
+                        let mut bloom_candidates: Vec<&LakeValue> = Vec::new();
                         for v in values {
                             match prune_compare(CompareOp::Eq, v, b) {
                                 PruneDecision::FullyCovers => return PruneDecision::FullyCovers,
                                 PruneDecision::MayMatch => {
-                                    if stats.may_contain(*column_id, v) {
-                                        any_may = true;
+                                    if bloom_candidates.capacity() == 0 {
+                                        bloom_candidates.reserve(values.len());
                                     }
+                                    bloom_candidates.push(v);
                                 }
                                 PruneDecision::CannotMatch => {}
                             }
                         }
-                        if any_may {
+                        if !bloom_candidates.is_empty()
+                            && stats.may_contain_any(*column_id, &bloom_candidates)
+                        {
                             PruneDecision::MayMatch
                         } else {
                             PruneDecision::CannotMatch
@@ -536,16 +556,13 @@ impl LakePredicate {
     }
 
     /// Stable 64-bit FNV-1a hash of the encoded form, used by the commit
-    /// header's read-predicate field so conflict checks compare one integer
+    /// header's read-predicate field so conflict checks compare one integer.
+    /// The canonical fnv1a_64 produces the same value the previous inline
+    /// byte fold did, so persisted commit headers stay comparable
     pub fn stable_hash(&self) -> u64 {
         let mut buf = Vec::with_capacity(64);
         self.encode_into(&mut buf);
-        let mut h = 0xcbf29ce484222325u64;
-        for b in &buf {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
+        zyron_common::fnv1a_64(&buf)
     }
 }
 

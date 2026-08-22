@@ -46,14 +46,17 @@ impl ServerPlanCache {
 
     #[inline]
     fn shard_index(key: &CacheKey) -> usize {
-        // Fold the independent key components together. Each is already a
-        // well-distributed hash, so an xor-rotate mix spreads them across
-        // shards without clustering.
-        let mixed = key.template_hash.rotate_left(17)
-            ^ key.search_path_hash.rotate_left(5)
-            ^ key.role_id
-            ^ key.type_kinds_hash.rotate_left(31)
-            ^ key.rls_policy_hash;
+        // Fold the independent key components together in order. Each is
+        // already a well-distributed hash, so the rotate-xor fold spreads
+        // them across shards without clustering
+        let mixed = [
+            key.search_path_hash,
+            key.role_id,
+            key.type_kinds_hash,
+            key.rls_policy_hash,
+        ]
+        .into_iter()
+        .fold(key.template_hash, zyron_common::hash_fold);
         (mixed as usize) & SHARD_MASK
     }
 

@@ -1,0 +1,55 @@
+{
+  "id": "2026-08-22_052536_3aab844-local",
+  "date": "2026-08-22 05:25:40Z",
+  "ts": 1787376340,
+  "commit": "3aab844-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Bloom Filter": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.90 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 12.86 },
+      "Bloom probe latency (ns)": {
+        "average": 7.996000,
+        "runs": [9.07, 9.15, 7.30, 7.26, 7.20],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Bloom probe 8-way sequential (ns/key)": {
+        "average": 8.981323,
+        "runs": [9.06, 9.03, 8.96, 8.97, 8.90],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Bloom probe 8-way batch (ns/key)": {
+        "average": 6.118240,
+        "runs": [6.10, 6.13, 6.09, 6.21, 6.06],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Bloom skip rate (%)": {
+        "average": 98.989899,
+        "runs": [98.99],
+        "target": 98.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

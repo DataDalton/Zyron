@@ -19,7 +19,7 @@ pub mod sorted;
 pub mod tier;
 pub mod wal_payload;
 
-pub use bloom::{BloomFilter, might_contain_serialized};
+pub use bloom::{BloomFilter, might_contain_serialized, might_contain_serialized_batch};
 pub use cache::{SegmentCache, SegmentCacheKey, SegmentCacheStats};
 pub use compaction::{
     ColumnDescriptor, CompactionConfig, CompactionInput, CompactionResult, FileOrdering,

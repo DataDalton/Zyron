@@ -46,6 +46,8 @@ pub fn disk_config(data_dir: impl AsRef<Path>) -> DiskManagerConfig {
     DiskManagerConfig {
         data_dir: data_dir.as_ref().to_path_buf(),
         fsync_enabled: StorageConfig::default().fsync_enabled,
+        // The server default, every page read verifies its checksum
+        page_checksum_verify: zyron_storage::PageChecksumVerify::Always,
     }
 }
 

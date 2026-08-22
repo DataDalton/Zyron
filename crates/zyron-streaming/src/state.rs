@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::hash::hash_bytes_fnv;
+use zyron_common::fnv1a_64;
 use zyron_common::{Result, ZyronError};
 
 // ---------------------------------------------------------------------------
@@ -197,10 +197,11 @@ impl FlatStateMap {
     /// Compute the hash for a (namespace, key) pair.
     #[inline(always)]
     pub fn compute_hash(namespace: &[u8], key: &[u8]) -> u64 {
-        let ns_hash = hash_bytes_fnv(namespace);
-        let key_hash = hash_bytes_fnv(key);
-        // Combine with a mixing step to reduce collisions.
-        ns_hash ^ key_hash.wrapping_mul(0x9e3779b97f4a7c15)
+        let ns_hash = fnv1a_64(namespace);
+        let key_hash = fnv1a_64(key);
+        // Canonical combiner, the table is in-memory only so the combined
+        // value carries no persistence contract
+        zyron_common::hash_combine(ns_hash, key_hash)
     }
 
     pub fn get(&self, namespace: &[u8], key: &[u8]) -> Option<&Vec<u8>> {

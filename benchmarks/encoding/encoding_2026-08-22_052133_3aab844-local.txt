@@ -1,0 +1,99 @@
+# suite:   encoding
+# run:     2026-08-22_052133_3aab844-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Encoding Round-Trip Correctness ===
+Rows per encoding: 100000
+
+  FastLanes (sequential i32):
+    Compression ratio: 20000.00x
+  FastLanes decode (int/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [189,753,321, 206,825,233, 205,846,027, 207,082,212, 206,996,481]
+    Average: 203,300,655 (target >= 120,000,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  FSST (32-byte strings):
+    Compression ratio: 5.08x
+  FSST decompress (GB/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [0.9481, 0.9575, 0.9345, 0.9436, 0.9066]
+    Average: 0.9381 (target >= 6, not applied)
+    Re-run with --release for a number worth comparing
+
+  ALP (f64 decimals):
+    Compression ratio: 61.92x
+  ALP decode (float/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [274,348,422, 312,500,000, 415,800,416, 430,107,527, 373,273,610]
+    Average: 361,205,995 (target >= 3,000,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  Dictionary (10 distinct i32):
+    Compression ratio: 7.99x
+  Dictionary lookup (ns/val) [NOT MEASURED, unoptimized build]:
+    Runs: [48.4480, 47.3810, 47.2620, 47.4770, 47.4710]
+    Average: 47.6078 (target <= 3, not applied)
+    Re-run with --release for a number worth comparing
+
+  RLE (runs of 1000):
+    Compression ratio: 657.89x
+  RLE decode (val/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1,170,960,187, 4,566,210,046, 2,040,816,327, 1,150,747,986, 4,926,108,374]
+    Average: 2,770,968,584 (target >= 60,000,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  BitPack (boolean):
+    Compression ratio: 7.99x
+
+  Constant (all 42):
+    Encoded size: 8 bytes (raw: 400000)
+
+  Unencoded (random u32):
+
+  Edge cases:
+    Single row: all encodings pass
+    All zeros: all encodings pass
+    Max u32: FastLanes pass
+
+  Round-trip correctness: ALL PASS
+
+=== Query-on-Compressed ===
+Rows: 100000
+  Dictionary equality: PASS
+  RLE range: PASS
+  BitPack equality: PASS
+  Constant equality: PASS
+  FastLanes range: PASS
+  Compressed eval speedup (x) [NOT MEASURED, unoptimized build]:
+    Runs: [2,383, 2,344, 2,299, 2,347, 2,013]
+    Average: 2,277 (target >= 3, not applied)
+    Re-run with --release for a number worth comparing
+  ALP range: PASS
+  FSST equality: PASS
+
+  Query-on-compressed: ALL PASS
+
+=== Encoding Selection ===
+  All-identical -> Constant: PASS
+  Boolean -> BitPack: PASS
+  Low-cardinality (10 distinct, 100K rows) -> Dictionary: PASS
+  Sequential integers -> FastLanes: PASS
+  Decimal floats -> ALP: PASS
+  Boolean column -> BitPack: PASS
+  Single-value column -> Constant: PASS
+  High-entropy random -> Unencoded: PASS
+  Empty sample -> Unencoded: PASS
+  Encoding select (us/col) [NOT MEASURED, unoptimized build]:
+    Runs: [376.0907, 378.9067, 376.4663, 376.3630, 376.1694]
+    Average: 376.7992 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+  Encoding selection: ALL PASS

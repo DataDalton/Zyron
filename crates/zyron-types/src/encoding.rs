@@ -653,13 +653,11 @@ pub fn murmur3_128(data: &[u8], seed: u32) -> u128 {
     ((h2 as u128) << 64) | (h1 as u128)
 }
 
-fn fmix64(mut h: u64) -> u64 {
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xFF51AFD7ED558CCD);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xC4CEB9FE1A85EC53);
-    h ^= h >> 33;
-    h
+// The Murmur3 finalizer is the canonical three-round mixer. SQL murmur3
+// output is user-visible, and the canonical copy is transcription-pinned,
+// so delegation cannot change it
+fn fmix64(h: u64) -> u64 {
+    zyron_common::mix_finalize_3round(h)
 }
 
 #[cfg(test)]

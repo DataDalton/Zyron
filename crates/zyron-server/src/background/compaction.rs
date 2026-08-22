@@ -1928,6 +1928,7 @@ mod tests {
             rt.block_on(DiskManager::new(DiskManagerConfig {
                 data_dir: dir.path().to_path_buf(),
                 fsync_enabled: false,
+                ..Default::default()
             }))
             .expect("disk manager"),
         );

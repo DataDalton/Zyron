@@ -120,11 +120,7 @@ pub fn clone_table(
         }
         for file in manifest.index_files.iter().take(index) {
             name.clear();
-            crate::paths::write_index_file_name(
-                &mut name,
-                file.index_id,
-                file.file.partition_id,
-            );
+            crate::paths::write_index_file_name(&mut name, file.index_id, file.file.partition_id);
             path.push(&name);
             discard_staged_file(&path);
             path.pop();
@@ -151,11 +147,7 @@ pub fn clone_table(
         }
         for file in &manifest.index_files {
             name.clear();
-            crate::paths::write_index_file_name(
-                &mut name,
-                file.index_id,
-                file.file.partition_id,
-            );
+            crate::paths::write_index_file_name(&mut name, file.index_id, file.file.partition_id);
             from.push(&name);
             to.push(&name);
             let linked = link_file(&from, &to);

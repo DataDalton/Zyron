@@ -78,16 +78,13 @@ const INLINE_HASH_MAX: usize = 16;
 
 /// Mixes one 64-bit word so that every input bit affects every output bit.
 ///
-/// The splitMix64 finalizer, which is a bijection with avalanche good
-/// enough for register selection and for keying the exact table
+/// The canonical three-round Murmur3 finalizer, a bijection with avalanche
+/// good enough for register selection and for keying the exact table.
+/// Sketch registers derived from it persist with segment stats, and
+/// mix_finalize_2round is not interchangeable with it
 #[inline(always)]
-fn mix64(mut word: u64) -> u64 {
-    word ^= word >> 33;
-    word = word.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    word ^= word >> 33;
-    word = word.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    word ^= word >> 33;
-    word
+fn mix64(word: u64) -> u64 {
+    zyron_common::mix_finalize_3round(word)
 }
 
 /// Reads eight little-endian bytes from `offset`, zero-padding past the end
@@ -371,7 +368,10 @@ mod tests {
         );
         let estimate = sketch.estimate() as f64;
         let error = (estimate - (EXACT_CAPACITY as f64 + 1.0)).abs() / (EXACT_CAPACITY as f64);
-        assert!(error < 0.05, "handover estimate {estimate} is off by {error}");
+        assert!(
+            error < 0.05,
+            "handover estimate {estimate} is off by {error}"
+        );
     }
 
     /// A hash of zero is the empty-slot marker, so it has to be counted
@@ -523,6 +523,9 @@ mod tests {
         }
         let estimate = sketch.estimate() as f64;
         let error = (estimate - 300.0).abs() / 300.0;
-        assert!(error < 0.05, "estimate {estimate} for 300 is off by {error}");
+        assert!(
+            error < 0.05,
+            "estimate {estimate} for 300 is off by {error}"
+        );
     }
 }
