@@ -33,8 +33,7 @@ const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
 
 // Record and header checksums use the canonical hot-path hash, which has
 // no runtime dispatch and no lane setup, so the per-row insert path pays
-// only the mixing itself. The per-row baseline this path must hold is
-// recorded in crates/zyron-common/benches/baselines/hot_cdc.json
+// only the mixing itself
 use zyron_common::checksum::hot::hot_hash32;
 
 /// File header: magic (8) + format_version (4) + table_id (4) + header_checksum (4) = 20 bytes.

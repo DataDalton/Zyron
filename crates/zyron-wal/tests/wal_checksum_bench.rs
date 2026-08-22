@@ -21,8 +21,8 @@ const BATCHES: usize = 256;
 /// resolution, short enough that 256 batches finish quickly
 const CALLS_PER_BATCH: usize = 512;
 
-// Baseline-derived targets. The consolidation gate is the 1% comparison
-// against benches/baselines JSON, these targets catch gross regressions
+// Targets set from measured pre-consolidation latencies, they catch gross
+// regressions on the WAL checksum hot path
 const WAL_CHECKSUM_64B_P50_NS: f64 = 25.0;
 const WAL_CHECKSUM_280B_P50_NS: f64 = 60.0;
 const WAL_CHECKSUM_8K_P50_NS: f64 = 900.0;

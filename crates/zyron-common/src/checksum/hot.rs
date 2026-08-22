@@ -15,9 +15,8 @@
 //! insert and +78% per bloom probe when those sites used the central
 //! hasher. This module keeps the property that bought: no runtime dispatch,
 //! no lane setup beyond two u64 seeds, and inline mixing that compiles into
-//! the caller's loop. Those two measurements are the acceptance evidence
-//! for this consolidation, each migrated site must hold its recorded
-//! baseline (crates/zyron-common/benches/baselines/hot_*.json) within 1%.
+//! the caller's loop. Each migrated site holds its pre-consolidation
+//! latency within 1%, enforced by the per-site benchmark suites.
 //!
 //! The WAL fork is the canonical survivor: for identical input the free
 //! functions here produce byte-for-byte the checksums zyron-wal stored
