@@ -154,10 +154,25 @@ impl CheckpointCoordinator {
         let mut seen_cycles = self.background_writer.cycles_completed();
 
         loop {
-            // Check the pool directly for remaining dirty pages below the boundary.
-            // Cannot rely on min_dirty_lsn alone because its initial value (u64::MAX)
-            // means "unknown", not "all clean".
-            if !self.pool.has_dirty_pages_below(checkpoint_lsn.0) {
+            // Check the pool directly for remaining dirty pages below the
+            // boundary. Cannot rely on min_dirty_lsn alone because its initial
+            // value (u64::MAX) means "unknown", not "all clean".
+            //
+            // A clean scan only counts when no writer cycle was in flight
+            // around it: a cycle clears dirty bits at WRITE time, before its
+            // batched fsync makes those writes durable, so a scan taken
+            // mid-cycle can observe "clean" for pages whose bytes have not
+            // reached the device. Truncating the WAL on that observation
+            // would lose the only durable copy of those pages' changes on a
+            // crash before the fsync. The started/finished sequence pair
+            // brackets each cycle, so equality before and after the scan
+            // proves the scan saw only fsync-covered clears
+            let started_before = self.background_writer.cycles_started_seq();
+            let finished_before = self.background_writer.cycles_finished_seq();
+            if started_before == finished_before
+                && !self.pool.has_dirty_pages_below(checkpoint_lsn.0)
+                && self.background_writer.cycles_started_seq() == started_before
+            {
                 return Ok(());
             }
 
@@ -476,7 +491,7 @@ mod tests {
                 wal_dir: tmp_dir.path().to_path_buf(),
                 segment_size: 1024 * 1024,
                 fsync_enabled: false,
-                ring_buffer_capacity: 256 * 1024,
+                ring_buffer_capacity: 1024 * 1024,
             })
             .unwrap(),
         );
@@ -491,6 +506,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             zyron_buffer::BackgroundWriterConfig::default(),
         ));
 
@@ -537,7 +553,7 @@ mod tests {
                 wal_dir: tmp_dir.path().to_path_buf(),
                 segment_size: 1024 * 1024,
                 fsync_enabled: false,
-                ring_buffer_capacity: 256 * 1024,
+                ring_buffer_capacity: 1024 * 1024,
             })
             .unwrap(),
         );
@@ -552,6 +568,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             zyron_buffer::BackgroundWriterConfig::default(),
         ));
 
@@ -612,7 +629,7 @@ mod tests {
                 wal_dir: tmp_dir.path().to_path_buf(),
                 segment_size: 1024 * 1024,
                 fsync_enabled: false,
-                ring_buffer_capacity: 256 * 1024,
+                ring_buffer_capacity: 1024 * 1024,
             })
             .unwrap(),
         );
@@ -627,6 +644,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             zyron_buffer::BackgroundWriterConfig::default(),
         ));
 
@@ -651,19 +669,30 @@ mod tests {
             },
         );
 
-        // Wait for the time trigger to fire
-        std::thread::sleep(Duration::from_secs(3));
+        // Wait for the time trigger to fire, polling rather than sleeping a
+        // fixed span. The interval is one second and the deadline is thirty,
+        // so a scheduler that never fires still fails and one whose thread was
+        // simply not scheduled for a few seconds under a loaded machine does
+        // not. A fixed sleep tests the machine's scheduler as much as this one
+        let start = Instant::now();
+        let deadline = Duration::from_secs(30);
+        let completed = loop {
+            let completed = scheduler
+                .stats()
+                .checkpoints_completed
+                .load(Ordering::Relaxed);
+            if completed >= 1 || start.elapsed() >= deadline {
+                break completed;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        scheduler.shutdown();
 
-        let completed = scheduler
-            .stats()
-            .checkpoints_completed
-            .load(Ordering::Relaxed);
         assert!(
             completed >= 1,
-            "expected at least 1 checkpoint from time trigger, got {}",
-            completed
+            "expected at least 1 checkpoint from a one second time trigger, got {} after {:?}",
+            completed,
+            start.elapsed()
         );
-
-        scheduler.shutdown();
     }
 }

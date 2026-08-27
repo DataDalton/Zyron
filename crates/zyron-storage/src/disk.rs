@@ -113,6 +113,14 @@ struct FileEntry {
     /// reports as corruption of a page that is fine on disk. Acquired
     /// after `extent` everywhere, held only across the I/O call itself
     page_latches: [parking_lot::RwLock<()>; PAGE_LATCH_STRIPES],
+    /// Serializes the set_len syscalls of concurrent growth. The high-water
+    /// mark in `len_bytes` decides WHAT length the file reaches, this mutex
+    /// decides the ORDER the syscalls issue in: without it two racing
+    /// extensions can apply out of order and the smaller late call would
+    /// truncate pages the larger one already made real
+    grow: parking_lot::Mutex<()>,
+    /// File length actually applied by set_len, only written under `grow`.
+    applied_len: AtomicU64,
 }
 
 impl FileEntry {
@@ -180,6 +188,8 @@ impl DiskManager {
             len_bytes: AtomicU64::new(len),
             extent: parking_lot::RwLock::new(()),
             page_latches: std::array::from_fn(|_| parking_lot::RwLock::new(())),
+            grow: parking_lot::Mutex::new(()),
+            applied_len: AtomicU64::new(len),
         });
         let _ = self.files.insert_sync(file_id, entry.clone());
         Ok(self
@@ -197,12 +207,33 @@ impl DiskManager {
         if previous >= target_len {
             return Ok(());
         }
-        entry.file.set_len(target_len).map_err(|e| {
-            // Undo the claim so a later caller retries the extension rather
-            // than trusting a length the file does not have
-            entry.len_bytes.store(previous, Ordering::Release);
-            ZyronError::IoError(format!("extend file to {}: {}", target_len, e))
-        })
+        // The syscall is serialized and always extends to the CURRENT
+        // high-water mark, never this caller's own target: two racing
+        // extensions could otherwise issue set_len out of order and the
+        // smaller late call would truncate the larger one's pages
+        let _grow = entry.grow.lock();
+        let high = entry.len_bytes.load(Ordering::Acquire);
+        if entry.applied_len.load(Ordering::Acquire) >= high {
+            return Ok(());
+        }
+        match entry.file.set_len(high) {
+            Ok(()) => {
+                entry.applied_len.store(high, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // Clamp the claim back to what the file actually has so a
+                // later caller retries the extension rather than trusting
+                // a length the file never reached. A concurrent claim above
+                // the clamp retries its own set_len under this mutex
+                let applied = entry.applied_len.load(Ordering::Acquire);
+                entry.len_bytes.fetch_min(applied, Ordering::AcqRel);
+                Err(ZyronError::IoError(format!(
+                    "extend file to {}: {}",
+                    high, e
+                )))
+            }
+        }
     }
 
     /// Returns the data directory path.
@@ -228,7 +259,11 @@ impl DiskManager {
         let file_id = page_id.file_id;
         let page_num = page_id.page_num;
         let verify = self.should_verify_page();
-        tokio::task::spawn_blocking(move || {
+        // Sampled: one read in sixty-four is timed, and the sample is weighted
+        // by how many it stands for. Timing every read would spend a few
+        // percent of a cached read on measuring it
+        let sampled = zyron_pressure::capability::sample_page_read();
+        let outcome = tokio::task::spawn_blocking(move || {
             let _extent = entry.extent.read();
             let mut buffer = [0u8; PAGE_SIZE];
             {
@@ -249,7 +284,15 @@ impl DiskManager {
             Ok(buffer)
         })
         .await
-        .map_err(|e| ZyronError::IoError(format!("read page task: {}", e)))?
+        .map_err(|e| ZyronError::IoError(format!("read page task: {}", e)))?;
+        if let Some(started) = sampled {
+            zyron_pressure::pressure_control::PressureController::global().record_page_read(
+                started.elapsed(),
+                PAGE_SIZE as u64,
+                zyron_pressure::capability::PAGE_READ_SAMPLE_WEIGHT,
+            );
+        }
+        outcome
     }
 
     /// Synchronous page read for callers without an async context (the
@@ -262,6 +305,10 @@ impl DiskManager {
         let entry = self.entry(page_id.file_id)?;
         let offset = page_id.page_num * (PAGE_SIZE as u64);
         let mut buffer: Box<[u8; PAGE_SIZE]> = Box::new([0u8; PAGE_SIZE]);
+        // Sampled the same way as the async read, and for the same reason:
+        // this is the heap scan path, where a pair of clock reads per page
+        // would be a measurable share of a page that came from cache
+        let sampled = zyron_pressure::capability::sample_page_read();
         {
             let _extent = entry.extent.read();
             let _page = entry.page_latch(page_id.page_num).read();
@@ -271,6 +318,13 @@ impl DiskManager {
                     page_id.page_num, offset, page_id.file_id, e
                 ))
             })?;
+        }
+        if let Some(started) = sampled {
+            zyron_pressure::pressure_control::PressureController::global().record_page_read(
+                started.elapsed(),
+                PAGE_SIZE as u64,
+                zyron_pressure::capability::PAGE_READ_SAMPLE_WEIGHT,
+            );
         }
         if self.should_verify_page() {
             verify_page_checksum(&buffer, page_id)?;
@@ -471,6 +525,9 @@ impl DiskManager {
             }
             entry.num_pages.store(0, Ordering::Release);
             entry.len_bytes.store(0, Ordering::Release);
+            // Under the exclusive extent lock no grow is in flight, so the
+            // applied length resets with the claim
+            entry.applied_len.store(0, Ordering::Release);
             Ok(())
         })
         .await

@@ -228,6 +228,29 @@ pub struct ExplainNode {
     pub children: Vec<ExplainNode>,
 }
 
+/// Records that an operator is expected to spill, and by how much.
+///
+/// Nothing is added when the node has no memory limit configured, which is
+/// the default and the state in which nothing spills. When there is one, the
+/// figure the plan was costed against is part of the plan: it is node state
+/// that changes, and a plan that did not say would be two different plans
+/// wearing the same text.
+fn push_spill(details: &mut Vec<(String, String)>, working_rows: f64) {
+    let budget =
+        zyron_pressure::pressure_control::PressureController::global().working_memory_bytes();
+    if budget == 0 {
+        return;
+    }
+    let bytes = working_rows.max(0.0) * crate::cost::ASSUMED_ROW_BYTES;
+    details.push(("working_memory_bytes".to_string(), budget.to_string()));
+    if bytes > budget as f64 {
+        details.push((
+            "spills".to_string(),
+            format!("{} bytes past the budget", (bytes - budget as f64) as u64),
+        ));
+    }
+}
+
 /// Records the time-travel qualifier a scan reads at, so a plan says which
 /// version answered rather than only which access path ran.
 fn push_as_of(details: &mut Vec<(String, String)>, as_of: &Option<crate::logical::AsOfTarget>) {
@@ -547,16 +570,24 @@ impl ExplainNode {
                 join_type,
                 cost,
                 ..
-            } => Self {
-                operator_name: "HashJoin".to_string(),
-                details: vec![("join_type".to_string(), format!("{:?}", join_type))],
-                estimated_cost: Some(*cost),
-                actual_metrics: None,
-                children: vec![
-                    Self::from_physical_plan(left),
-                    Self::from_physical_plan(right),
-                ],
-            },
+            } => {
+                let mut details = vec![("join_type".to_string(), format!("{:?}", join_type))];
+                // The smaller side builds, so that is the side that has to fit
+                push_spill(
+                    &mut details,
+                    left.cost().row_count.min(right.cost().row_count),
+                );
+                Self {
+                    operator_name: "HashJoin".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: vec![
+                        Self::from_physical_plan(left),
+                        Self::from_physical_plan(right),
+                    ],
+                }
+            }
             PhysicalPlan::MergeJoin {
                 left,
                 right,
@@ -578,16 +609,21 @@ impl ExplainNode {
                 aggregates,
                 child,
                 cost,
-            } => Self {
-                operator_name: "HashAggregate".to_string(),
-                details: vec![
+            } => {
+                let mut details = vec![
                     ("groups".to_string(), format!("{}", group_by.len())),
                     ("aggregates".to_string(), format!("{}", aggregates.len())),
-                ],
-                estimated_cost: Some(*cost),
-                actual_metrics: None,
-                children: vec![Self::from_physical_plan(child)],
-            },
+                ];
+                // One entry per group, not one per input row
+                push_spill(&mut details, cost.row_count);
+                Self {
+                    operator_name: "HashAggregate".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: vec![Self::from_physical_plan(child)],
+                }
+            }
             PhysicalPlan::SortAggregate {
                 group_by,
                 aggregates,
@@ -625,6 +661,7 @@ impl ExplainNode {
                 if let Some(l) = limit {
                     details.push(("top_n".to_string(), format!("{}", l)));
                 }
+                push_spill(&mut details, child.cost().row_count);
                 Self {
                     operator_name: "Sort".to_string(),
                     details,
@@ -768,19 +805,26 @@ impl ExplainNode {
                 num_workers,
                 cost,
                 ..
-            } => Self {
-                operator_name: "ParallelHashJoin".to_string(),
-                details: vec![
+            } => {
+                let mut details = vec![
                     ("join_type".to_string(), format!("{:?}", join_type)),
                     ("workers".to_string(), format!("{}", num_workers)),
-                ],
-                estimated_cost: Some(*cost),
-                actual_metrics: None,
-                children: vec![
-                    Self::from_physical_plan(left),
-                    Self::from_physical_plan(right),
-                ],
-            },
+                ];
+                push_spill(
+                    &mut details,
+                    left.cost().row_count.min(right.cost().row_count),
+                );
+                Self {
+                    operator_name: "ParallelHashJoin".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: vec![
+                        Self::from_physical_plan(left),
+                        Self::from_physical_plan(right),
+                    ],
+                }
+            }
             PhysicalPlan::Gather {
                 child,
                 num_workers,

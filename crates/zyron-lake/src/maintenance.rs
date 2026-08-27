@@ -1255,7 +1255,17 @@ fn commit_pass(
     staged: &[PartitionEntry],
 ) -> Result<u64, ZyronError> {
     fs::create_dir_all(ctx.log.paths().data_dir())?;
+    // Register every output partition id before its file appears under its
+    // final name, and hold the registrations until the commit resolves, so
+    // a concurrent vacuum never reclaims a file this commit is about to
+    // name. The index ids allocated inside the commit closure register the
+    // same way through the shared cell
+    let staging_guards: Rc<RefCell<Vec<crate::transaction_log::StagedPartition<'_>>>> =
+        Rc::new(RefCell::new(Vec::new()));
     for entry in staged {
+        staging_guards
+            .borrow_mut()
+            .push(ctx.log.stage_partition(entry.partition_id));
         let from = ctx.staging.join(data_file_name(entry.partition_id));
         let to = ctx.log.paths().data_file(entry.partition_id);
         if from.exists() {
@@ -1289,6 +1299,8 @@ fn commit_pass(
     // unlinked rather than left for vacuum to find
     let written_index_files: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
     let staged_index = Rc::clone(&written_index_files);
+    let closure_guards = Rc::clone(&staging_guards);
+    let log_for_staging = ctx.log;
     let mut attempt = attempt;
     attempt.operation = OperationKind::Optimize;
     let result = ctx.log.commit(attempt, move |base| {
@@ -1364,6 +1376,9 @@ fn commit_pass(
                     &mut || {
                         let id = allocate_unused_partition_id(base, &used);
                         used.push(id);
+                        closure_guards
+                            .borrow_mut()
+                            .push(log_for_staging.stage_partition(id));
                         id
                     },
                 )? {

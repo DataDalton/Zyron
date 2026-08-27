@@ -799,7 +799,7 @@ pub fn column_stats_entry(
             null_count: segment.header.null_count,
             row_count: row_count as u64,
         },
-        bloom: bloom_for_manifest,
+        bloom: bloom_for_manifest.map(std::sync::Arc::new),
         ndv: segment.ndv,
         size_bytes: Some(segment_bytes),
     }

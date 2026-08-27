@@ -384,19 +384,43 @@ impl HeapFile {
     /// Returns true if the tuple was deleted, false if not found.
     /// For bulk deletes, use `delete_batch` for better performance.
     pub async fn delete(&self, tuple_id: TupleId) -> Result<bool> {
-        let page_data = match self.fetch_page(tuple_id.page_id).await {
-            Ok(data) => data,
-            Err(ZyronError::IoError(_)) => return Ok(false),
-            Err(e) => return Err(e),
+        // Pin the frame and mutate under the exclusive frame write lock. The
+        // lock-free burst-append path holds the shared frame lock, so a
+        // copy-out, modify, copy-in here would clobber an append that landed
+        // between the read and the write
+        let page_id = tuple_id.page_id;
+        let frame = match self.pool.fetch_page(page_id) {
+            Some(frame) => frame,
+            None => {
+                let disk_data = match self.disk.read_page(page_id).await {
+                    Ok(d) => d,
+                    Err(ZyronError::IoError(_)) => return Ok(false),
+                    Err(e) => return Err(e),
+                };
+                let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
+                if let Some(ev) = evicted {
+                    self.disk.write_page(ev.page_id, &ev.data).await?;
+                }
+                frame
+            }
         };
 
-        let mut page = HeapPage::from_bytes(page_data);
-        let deleted = page.delete_tuple(SlotId(tuple_id.slot_id));
+        let (deleted, usable) = {
+            let mut guard = frame.write_data();
+            let data: &mut [u8] = &mut guard[..];
+            let deleted = HeapPage::delete_tuple_in_slice(data, SlotId(tuple_id.slot_id));
+            let usable = if deleted {
+                Some(HeapPage::total_usable_space_in_slice(data))
+            } else {
+                None
+            };
+            (deleted, usable)
+        };
+        self.pool.unpin_page(page_id, deleted);
 
-        if deleted {
-            self.write_page(tuple_id.page_id, page.as_bytes()).await?;
+        if let Some(usable) = usable {
             // Defer FSM update for batched processing
-            self.defer_fsm_update(tuple_id.page_id.page_num as u32, page.total_usable_space());
+            self.defer_fsm_update(page_id.page_num as u32, usable);
         }
 
         Ok(deleted)
@@ -423,27 +447,46 @@ impl HeapFile {
 
         let mut deleted_count = 0;
 
-        // Process each page once
+        // Process each page once, mutating in place under the exclusive
+        // frame write lock so a concurrent burst append is never clobbered
         for (page_id, slot_ids) in pages {
-            let page_data = match self.fetch_page(page_id).await {
-                Ok(data) => data,
-                Err(ZyronError::IoError(_)) => continue,
-                Err(e) => return Err(e),
+            let frame = match self.pool.fetch_page(page_id) {
+                Some(frame) => frame,
+                None => {
+                    let disk_data = match self.disk.read_page(page_id).await {
+                        Ok(d) => d,
+                        Err(ZyronError::IoError(_)) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
+                    if let Some(ev) = evicted {
+                        self.disk.write_page(ev.page_id, &ev.data).await?;
+                    }
+                    frame
+                }
             };
 
-            let mut page = HeapPage::from_bytes(page_data);
-            let mut page_modified = false;
-
-            for slot_id in slot_ids {
-                if page.delete_tuple(SlotId(slot_id)) {
-                    deleted_count += 1;
-                    page_modified = true;
+            let (page_modified, usable) = {
+                let mut guard = frame.write_data();
+                let data: &mut [u8] = &mut guard[..];
+                let mut page_modified = false;
+                for slot_id in slot_ids {
+                    if HeapPage::delete_tuple_in_slice(data, SlotId(slot_id)) {
+                        deleted_count += 1;
+                        page_modified = true;
+                    }
                 }
-            }
+                let usable = if page_modified {
+                    Some(HeapPage::total_usable_space_in_slice(data))
+                } else {
+                    None
+                };
+                (page_modified, usable)
+            };
+            self.pool.unpin_page(page_id, page_modified);
 
-            if page_modified {
-                self.write_page(page_id, page.as_bytes()).await?;
-                self.defer_fsm_update(page_id.page_num as u32, page.total_usable_space());
+            if let Some(usable) = usable {
+                self.defer_fsm_update(page_id.page_num as u32, usable);
             }
         }
 
@@ -462,7 +505,7 @@ impl HeapFile {
     pub async fn mark_deleted_batch(
         &self,
         tuple_ids: &[TupleId],
-        xmax: u32,
+        xmax: u64,
         prune_horizon: u64,
         status: Option<&crate::TxnStatusMap>,
         retain_history: bool,
@@ -522,7 +565,7 @@ impl HeapFile {
                 if let Some(status) = status
                     && prune_horizon > 0
                 {
-                    let is_dead = |xmin: u32, x: u32| {
+                    let is_dead = |xmin: u64, x: u64| {
                         // Aborted insert: never visible at any version, always
                         // reclaimable. Committed delete below the frozen horizon:
                         // reclaim only if no retained version still sees the row
@@ -563,7 +606,7 @@ impl HeapFile {
     /// commit, to every transaction). Frees no space, leaves index entries in
     /// place (heap visibility filters them, vacuum reclaims them later), matching
     /// the MVCC-delete invariant. Returns true if the tuple was stamped.
-    pub async fn set_xmax(&self, tuple_id: TupleId, xmax: u32) -> Result<bool> {
+    pub async fn set_xmax(&self, tuple_id: TupleId, xmax: u64) -> Result<bool> {
         self.mutate_tuple_xmax(tuple_id, Some(xmax)).await
     }
 
@@ -577,7 +620,7 @@ impl HeapFile {
     /// Shared body for set_xmax/clear_xmax. Pins the page, takes the exclusive
     /// frame write lock (the same lock mark_deleted_batch takes, so a concurrent
     /// burst-append cannot be clobbered), and stamps or clears the tuple's xmax.
-    async fn mutate_tuple_xmax(&self, tuple_id: TupleId, xmax: Option<u32>) -> Result<bool> {
+    async fn mutate_tuple_xmax(&self, tuple_id: TupleId, xmax: Option<u64>) -> Result<bool> {
         let page_id = tuple_id.page_id;
         let frame = match self.pool.fetch_page(page_id) {
             Some(frame) => frame,
@@ -611,13 +654,31 @@ impl HeapFile {
     ///
     /// Returns error if the new tuple is larger than the old one.
     pub async fn update(&self, tuple_id: TupleId, tuple: &Tuple) -> Result<()> {
-        let page_data = self.fetch_page(tuple_id.page_id).await?;
-        let mut page = HeapPage::from_bytes(page_data);
+        // In-place mutation under the exclusive frame write lock, so a
+        // concurrent burst append is never clobbered by a page copy-back
+        let page_id = tuple_id.page_id;
+        let frame = match self.pool.fetch_page(page_id) {
+            Some(frame) => frame,
+            None => {
+                let disk_data = self.disk.read_page(page_id).await?;
+                let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
+                if let Some(ev) = evicted {
+                    self.disk.write_page(ev.page_id, &ev.data).await?;
+                }
+                frame
+            }
+        };
 
-        page.update_tuple(SlotId(tuple_id.slot_id), tuple)?;
+        let result = {
+            let mut guard = frame.write_data();
+            let data: &mut [u8] = &mut guard[..];
+            HeapPage::update_tuple_in_slice(data, SlotId(tuple_id.slot_id), tuple)
+                .map(|()| HeapPage::free_space_in_slice(data))
+        };
+        self.pool.unpin_page(page_id, result.is_ok());
+        let free = result?;
 
-        self.write_page(tuple_id.page_id, page.as_bytes()).await?;
-        self.update_fsm_for_page(tuple_id.page_id.page_num as u32, page.free_space())
+        self.update_fsm_for_page(page_id.page_num as u32, free)
             .await?;
 
         Ok(())
@@ -714,8 +775,11 @@ impl HeapFile {
         let fsm_file_id = self.config.fsm_file_id;
 
         self.pool.flush_all(|page_id, data| {
+            // A page outside this heap's files belongs to another subsystem
+            // sharing the pool. Answer Skipped so its dirty state survives
+            // for the owner's flush
             if page_id.file_id != heap_file_id && page_id.file_id != fsm_file_id {
-                return Ok(());
+                return Ok(zyron_buffer::FlushOutcome::Skipped);
             }
             let data_len = data.len();
             let page: &mut [u8; PAGE_SIZE] =
@@ -723,7 +787,8 @@ impl HeapFile {
                     expected: PAGE_SIZE,
                     actual: data_len,
                 })?;
-            self.disk.write_page_sync_no_fsync(page_id, page)
+            self.disk.write_page_sync_no_fsync(page_id, page)?;
+            Ok(zyron_buffer::FlushOutcome::Written)
         })?;
         Ok(())
     }
@@ -1176,17 +1241,25 @@ where
                     *data.get_unchecked(slot_base + 4),
                     *data.get_unchecked(slot_base + 5),
                 ])),
-                xmin: u32::from_le_bytes([
+                xmin: u64::from_le_bytes([
                     *data.get_unchecked(slot_base + 8),
                     *data.get_unchecked(slot_base + 9),
                     *data.get_unchecked(slot_base + 10),
                     *data.get_unchecked(slot_base + 11),
-                ]),
-                xmax: u32::from_le_bytes([
                     *data.get_unchecked(slot_base + 12),
                     *data.get_unchecked(slot_base + 13),
                     *data.get_unchecked(slot_base + 14),
                     *data.get_unchecked(slot_base + 15),
+                ]),
+                xmax: u64::from_le_bytes([
+                    *data.get_unchecked(slot_base + 16),
+                    *data.get_unchecked(slot_base + 17),
+                    *data.get_unchecked(slot_base + 18),
+                    *data.get_unchecked(slot_base + 19),
+                    *data.get_unchecked(slot_base + 20),
+                    *data.get_unchecked(slot_base + 21),
+                    *data.get_unchecked(slot_base + 22),
+                    *data.get_unchecked(slot_base + 23),
                 ]),
             }
         };
@@ -1431,7 +1504,7 @@ mod tests {
         assert_eq!(count, 10);
 
         for (i, xmin) in xmins.iter().enumerate() {
-            assert_eq!(*xmin, i as u32);
+            assert_eq!(*xmin, i as u64);
         }
     }
 
@@ -1463,7 +1536,7 @@ mod tests {
         let tuple_size = PAGE_SIZE / 4;
         for i in 0..20 {
             let data = vec![i as u8; tuple_size];
-            let tuple = Tuple::new(data, i as u32);
+            let tuple = Tuple::new(data, i as u64);
             heap.insert_batch(&[tuple]).await.unwrap().remove(0);
         }
 

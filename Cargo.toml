@@ -5,7 +5,7 @@ members = ["crates/*", "binaries/*"]
 [workspace.package]
 # The Zyron version. Every crate and binary inherits it, so the release
 # tag, the archive names, and what --version prints all move together.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94"
 
@@ -22,6 +22,11 @@ serde = { version = "1.0.228", features = ["derive"] }
 
 # Memory allocator
 mimalloc = "0.1"
+# Page mappings for the WAL ring. The ring's two capacity-sized arrays are
+# mapped from the OS rather than allocated, so they cost no writes to create
+# and stay resident only where the workload touches them.
+libc = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 # Data structures
 bytes = { version = "1.11.1", features = ["serde"] }

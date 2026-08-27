@@ -230,7 +230,7 @@ impl WalReader {
     }
 
     /// Collects all active transactions at the given LSN.
-    pub fn find_active_transactions(&self, at_lsn: Lsn) -> Result<Vec<u32>> {
+    pub fn find_active_transactions(&self, at_lsn: Lsn) -> Result<Vec<u64>> {
         let mut active = std::collections::HashSet::new();
 
         for record in self.scan_all()? {
@@ -328,15 +328,27 @@ impl RecoveryManager {
                     // checkpoint LSN, record it; a shorter payload carries no embedded
                     // LSN and is not corruption.
                     if let Ok(bytes) = <[u8; 8]>::try_from(record.payload.get(..8).unwrap_or(&[])) {
-                        checkpoint_lsn = Some(u64::from_le_bytes(bytes));
-                    }
+                        let boundary = u64::from_le_bytes(bytes);
+                        checkpoint_lsn = Some(boundary);
 
-                    // State before this checkpoint is already durable. Reset accumulators
-                    // so only post-checkpoint work drives redo/undo.
-                    redo_records.clear();
-                    active_txns.clear();
-                    committed_txns.clear();
-                    aborted_txns.clear();
+                        // The checkpoint only guarantees durability for work
+                        // at or below its boundary LSN, which it captured
+                        // BEFORE flushing. Records between the boundary and
+                        // this CheckpointEnd were still in flight, so only
+                        // the covered prefix leaves the redo set, and a
+                        // commit above the boundary keeps dating its
+                        // retained records. Consumers tolerate replaying a
+                        // record whose page already reached disk: catalog
+                        // replay skips rows that are already present and the
+                        // commit-status map marks idempotently
+                        redo_records.retain(|r: &LogRecord| r.lsn.0 > boundary);
+                        committed_txns.retain(|_, commit_lsn: &mut u64| *commit_lsn > boundary);
+                    }
+                    // A CheckpointEnd without an embedded boundary proves
+                    // nothing about page durability, so every accumulator is
+                    // kept. Transactions still open here stay in active_txns
+                    // in every case: one that began before the checkpoint and
+                    // never commits must still reach the undo set
                 }
                 LogRecordType::Begin => {
                     active_txns.insert(txn_id, record.lsn);
@@ -364,7 +376,7 @@ impl RecoveryManager {
         redo_records.retain(|r| committed_txns.contains_key(&r.txn_id));
 
         let undo_txns: Vec<_> = active_txns.keys().copied().collect();
-        let committed_txns: Vec<(u32, u64)> = committed_txns.into_iter().collect();
+        let committed_txns: Vec<(u64, u64)> = committed_txns.into_iter().collect();
 
         Ok(RecoveryResult {
             redo_records,
@@ -384,10 +396,10 @@ pub struct RecoveryResult {
     /// Records to redo (from committed transactions).
     pub redo_records: Vec<LogRecord>,
     /// Transaction IDs to undo (uncommitted at crash).
-    pub undo_txns: Vec<u32>,
+    pub undo_txns: Vec<u64>,
     /// Committed transactions paired with their commit-record LSN, used to date
     /// each transaction for time-travel visibility after recovery.
-    pub committed_txns: Vec<(u32, u64)>,
+    pub committed_txns: Vec<(u64, u64)>,
     /// Last LSN found in the WAL.
     pub last_lsn: Option<Lsn>,
     /// Checkpoint LSN from the last CheckpointEnd record payload, if present.
@@ -422,7 +434,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = WalWriterConfig {
             wal_dir: dir.path().to_path_buf(),
-            segment_size: LogSegment::DEFAULT_SIZE,
+            // The ring must hold a whole segment (rotation precondition), so
+            // the test segment stays small rather than the ring growing large
+            segment_size: 1024 * 1024,
             fsync_enabled: true,
             ring_buffer_capacity: 1024 * 1024, // 1MB
         };
@@ -547,5 +561,82 @@ mod tests {
         assert!(result.redo_records.is_empty());
         assert_eq!(result.undo_txns.len(), 1);
         assert!(result.undo_txns.contains(&1));
+    }
+
+    // A checkpoint captures its boundary BEFORE flushing, then logs
+    // CheckpointEnd after the flush wait. A transaction that commits inside
+    // that window has records above the boundary that no flush covered, so
+    // the scan must keep its redo and its commit instead of resetting every
+    // accumulator at the CheckpointEnd record
+    #[test]
+    fn test_recovery_keeps_work_above_checkpoint_boundary() {
+        let (writer, dir) = create_test_wal();
+
+        // Txn 1 is fully below the boundary: covered by the checkpoint
+        let begin1 = writer.log_begin(1).unwrap();
+        let insert1 = writer.log_insert(1, begin1, b"old").unwrap();
+        let boundary = writer.log_commit(1, insert1).unwrap();
+
+        // Txn 2 commits between the boundary capture and CheckpointEnd
+        let begin2 = writer.log_begin(2).unwrap();
+        let insert2 = writer.log_insert(2, begin2, b"in-window").unwrap();
+        writer.log_commit(2, insert2).unwrap();
+
+        writer.log_checkpoint_begin().unwrap();
+        writer
+            .log_checkpoint_end(&boundary.0.to_le_bytes())
+            .unwrap();
+
+        // Txn 3 commits after the checkpoint completes
+        let begin3 = writer.log_begin(3).unwrap();
+        let insert3 = writer.log_insert(3, begin3, b"post").unwrap();
+        writer.log_commit(3, insert3).unwrap();
+        writer.close().unwrap();
+
+        let recovery = RecoveryManager::new(dir.path()).unwrap();
+        let result = recovery.recover().unwrap();
+
+        assert_eq!(result.checkpoint_lsn, Some(boundary.0));
+        let redo_txns: Vec<u64> = result.redo_records.iter().map(|r| r.txn_id).collect();
+        assert!(
+            !redo_txns.contains(&1),
+            "work at or below the boundary is covered and drops out"
+        );
+        assert!(
+            redo_txns.contains(&2),
+            "a commit inside the checkpoint window keeps its redo"
+        );
+        assert!(
+            redo_txns.contains(&3),
+            "post-checkpoint work keeps its redo"
+        );
+        let committed: Vec<u64> = result.committed_txns.iter().map(|&(t, _)| t).collect();
+        assert!(!committed.contains(&1));
+        assert!(
+            committed.contains(&2),
+            "the in-window commit must survive for the status map"
+        );
+        assert!(committed.contains(&3));
+    }
+
+    // A transaction still open when a CheckpointEnd is scanned must reach
+    // the undo set even though its Begin predates the checkpoint
+    #[test]
+    fn test_recovery_active_txn_spans_checkpoint() {
+        let (writer, dir) = create_test_wal();
+
+        let begin = writer.log_begin(9).unwrap();
+        let insert = writer.log_insert(9, begin, b"open").unwrap();
+        writer.log_checkpoint_begin().unwrap();
+        writer.log_checkpoint_end(&insert.0.to_le_bytes()).unwrap();
+        writer.close().unwrap();
+
+        let recovery = RecoveryManager::new(dir.path()).unwrap();
+        let result = recovery.recover().unwrap();
+
+        assert!(
+            result.undo_txns.contains(&9),
+            "an open transaction spanning the checkpoint stays in the undo set"
+        );
     }
 }

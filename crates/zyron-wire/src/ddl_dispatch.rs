@@ -1879,8 +1879,7 @@ async fn select_query_batches(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -1926,8 +1925,7 @@ async fn execute_write_stmt(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -1989,8 +1987,7 @@ async fn run_rebuild_insert(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
 
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
@@ -2092,8 +2089,7 @@ async fn count_query(server: &Arc<ServerState>, sql: &str) -> Result<u64, Protoc
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let ctx = Arc::new(ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -3012,7 +3008,7 @@ async fn handle_set_using(
         let mut writer_txn = conversion_txn;
         for batch in &batches {
             let tuples = zyron_executor::batch::batch_to_tuples(batch, &table.columns, ctx.txn_id);
-            let mut records: Vec<(u32, &[u8])> = Vec::with_capacity(tuples.len());
+            let mut records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
             for tuple in &tuples {
                 records.push((ctx.txn_id, tuple.data()));
             }
@@ -3078,7 +3074,7 @@ fn conversion_context(
         .begin(zyron_storage::txn::IsolationLevel::SnapshotIsolation)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = zyron_executor::context::ExecutionContext::new(
         Arc::clone(&server.catalog),
         Arc::clone(&server.wal),
@@ -6069,8 +6065,7 @@ async fn eval_call_args(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -6161,8 +6156,7 @@ async fn execute_call_body(
         .txn_manager
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
 
     for stmt in statements {
         let plan = match zyron_planner::plan(
@@ -6671,8 +6665,7 @@ async fn execute_schedule_body(
 
     let mut txn = txn_manager.begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id =
-        u32::try_from(txn.txn_id).map_err(|_| ZyronError::Internal("txn id overflow".into()))?;
+    let txn_id = txn.txn_id;
     let ctx = Arc::new(ExecutionContext::new(
         Arc::clone(catalog),
         Arc::clone(wal),
@@ -7185,8 +7178,7 @@ async fn pipeline_context(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -8314,8 +8306,7 @@ async fn merge_branch_into_main(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -8513,18 +8504,33 @@ fn hash_password(password: &str, server: &Arc<ServerState>) -> Result<String, Pr
         .map_err(ProtocolError::Database)
 }
 
-/// Derives the three stored credentials from one plaintext password: the
-/// Balloon PHC hash (cleartext/password verify), the SCRAM-SHA-256 secret
-/// (SCRAM verify), and md5(password + username) (MD5 verify). Sets all three
-/// on the user so any configured auth method can validate the same password.
+/// Derives the stored credentials from one plaintext password, gated by
+/// auth.password_encryption: the SCRAM-SHA-256 secret is always stored,
+/// the Balloon PHC hash (cleartext/password verify) unless the policy is
+/// "scram-sha-256", and md5(password + username) only under "md5", the one
+/// policy that permits keeping the weak digest. A method the policy left
+/// without a credential fails authentication for the user rather than
+/// falling back to a format the operator ruled out.
 fn set_user_password(
     user: &mut zyron_auth::User,
     password: &str,
     server: &Arc<ServerState>,
 ) -> Result<(), ProtocolError> {
-    user.password_hash = Some(hash_password(password, server)?);
     user.scram_secret = Some(zyron_auth::scram_sha256_secret(password));
-    user.md5_credential = Some(zyron_auth::md5_password_credential(&user.name, password));
+    match server.password_encryption.as_str() {
+        "scram-sha-256" => {
+            user.password_hash = None;
+            user.md5_credential = None;
+        }
+        "md5" => {
+            user.password_hash = Some(hash_password(password, server)?);
+            user.md5_credential = Some(zyron_auth::md5_password_credential(&user.name, password));
+        }
+        _ => {
+            user.password_hash = Some(hash_password(password, server)?);
+            user.md5_credential = None;
+        }
+    }
     Ok(())
 }
 
@@ -9373,10 +9379,7 @@ async fn eval_event_condition(server: &Arc<ServerState>, condition_sql: &str) ->
         return false;
     };
     let snapshot = txn.snapshot.clone();
-    let Ok(txn_id) = u32::try_from(txn.txn_id) else {
-        let _ = server.txn_manager.abort(&mut txn);
-        return false;
-    };
+    let txn_id = txn.txn_id;
     let ctx = Arc::new(ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -12263,8 +12266,14 @@ pub fn spawn_bound_streaming_job(
         (BoundStreamingSource::ZyronTable { .. }, tgt_variant)
             if sink_is_zyron_backend(tgt_variant, server) =>
         {
-            let zyron_sink_client =
-                build_zyron_sink_client(tgt_variant, &tgt_columns, bsj.write_mode, server)?;
+            let ctx_arc = Arc::new(parking_lot::Mutex::new(security_ctx));
+            let zyron_sink_client = build_zyron_sink_client(
+                tgt_variant,
+                &tgt_columns,
+                bsj.write_mode,
+                server,
+                ctx_arc,
+            )?;
             let source = zyron_streaming::source_connector::ZyronTableSource::new(
                 src_table_id.0,
                 Arc::clone(&cdc_registry),
@@ -12281,9 +12290,9 @@ pub fn spawn_bound_streaming_job(
                     source,
                     sink,
                     Arc::clone(&server.catalog),
+                    Arc::clone(&cdc_registry),
                 )
                 .map_err(ProtocolError::Database)?;
-            let _ = security_ctx;
             let _ = security_manager;
         }
 
@@ -12548,9 +12557,10 @@ fn build_zyron_sink_client(
     tgt_columns: &[zyron_catalog::ColumnEntry],
     write_mode: zyron_catalog::schema::CatalogStreamingWriteMode,
     server: &Arc<ServerState>,
+    security_ctx: Arc<parking_lot::Mutex<zyron_auth::SecurityContext>>,
 ) -> Result<crate::zyron_sink::ZyronSinkClient, ProtocolError> {
     use zyron_planner::binder::BoundStreamingSink;
-    let (uri, options, creds) = match tgt {
+    let (uri, options, creds, sink_name) = match tgt {
         BoundStreamingSink::ExternalNamed { sink_id, .. } => {
             let entry = server
                 .catalog
@@ -12566,12 +12576,18 @@ fn build_zyron_sink_client(
                 entry.credential_ciphertext.as_deref(),
                 server,
             )?;
-            (entry.uri.clone(), entry.options.clone(), unsealed)
+            (
+                entry.uri.clone(),
+                entry.options.clone(),
+                unsealed,
+                Some(entry.name.clone()),
+            )
         }
         BoundStreamingSink::ExternalInline { uri, options, .. } => (
             uri.clone(),
             options.clone(),
             std::collections::HashMap::new(),
+            None,
         ),
         BoundStreamingSink::ZyronTable { .. } => {
             return Err(ProtocolError::Database(ZyronError::Internal(
@@ -12624,6 +12640,76 @@ fn build_zyron_sink_client(
     ));
     let retry_config = zyron_streaming::retry::RetryConfig::default();
 
+    // Every remote sink gets a bounded dead letter queue so rows that
+    // exhaust their retries stay replayable instead of vanishing. When a
+    // dlq_table exists, rows also land in that heap table through the
+    // transactional append path, which is what the admin replay walks
+    let sink_label = sink_name.unwrap_or_else(|| format!("{}_{}", target_schema, target_table));
+    let dlq_table_name = opt_map
+        .get("dlq_table")
+        .cloned()
+        .unwrap_or_else(|| format!("{}_dlq", sink_label));
+    let dlq_explicit = opt_map.contains_key("dlq_table");
+    let dlq_max_rows: u64 = match opt_map.get("dlq_max_rows") {
+        Some(s) => s.parse().map_err(|_| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "invalid dlq_max_rows value '{}'",
+                s
+            )))
+        })?,
+        None => 10_000,
+    };
+    let dlq_heap_table = server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .find(|t| t.name == dlq_table_name);
+    let local_sink: Option<Arc<dyn zyron_streaming::dlq::LocalSink>> = match dlq_heap_table {
+        Some(table) => {
+            let sm = server.security_manager.as_ref().ok_or_else(|| {
+                ProtocolError::Database(ZyronError::Internal(format!(
+                    "DLQ table '{}' requires security to be enabled for the transactional write path",
+                    dlq_table_name
+                )))
+            })?;
+            let heap = zyron_storage::HeapFile::new(
+                Arc::clone(&server.disk_manager),
+                Arc::clone(&server.buffer_pool),
+                zyron_storage::HeapFileConfig {
+                    heap_file_id: table.heap_file_id,
+                    fsm_file_id: table.fsm_file_id,
+                },
+            )
+            .map_err(ProtocolError::Database)?;
+            let row_sink = zyron_streaming::sink_connector::ZyronRowSink::new(
+                table.id.0,
+                zyron_catalog::schema::CatalogStreamingWriteMode::Append,
+                Arc::clone(&server.catalog),
+                Arc::new(heap),
+                Arc::clone(&server.txn_manager),
+                security_ctx,
+                Arc::clone(sm),
+                Arc::clone(&server.table_io_stats),
+            );
+            let heap_sink = crate::zyron_sink::HeapDlqSink::new(row_sink, table.columns.clone())
+                .map_err(ProtocolError::Database)?;
+            Some(Arc::new(heap_sink))
+        }
+        None if dlq_explicit => {
+            return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                "DLQ table '{}' named in the sink options does not exist",
+                dlq_table_name
+            ))));
+        }
+        None => None,
+    };
+    let dlq = Arc::new(zyron_streaming::dlq::DeadLetterQueue::new(
+        dlq_table_name,
+        dlq_max_rows,
+        local_sink,
+    ));
+    server.dlq_registry.register(Arc::clone(&dlq));
+
     let cfg = crate::zyron_sink::ZyronSinkConfig {
         pool,
         target_schema,
@@ -12635,7 +12721,7 @@ fn build_zyron_sink_client(
         copy_threshold_rows,
         batch_size,
         flush_interval: std::time::Duration::from_millis(flush_ms),
-        dlq: None,
+        dlq: Some(dlq),
         circuit_breaker: cb,
         retry_config,
         idempotency_key_columns,
@@ -15117,14 +15203,13 @@ async fn collectTrainingRowsFromQuery(
         .txn_manager
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
     let snapshot = read_txn.snapshot.clone();
-    let txn_id_u32 = u32::try_from(read_txn.txn_id)
-        .map_err(|_| ZyronError::ExecutionError("txn_id overflow".into()))?;
+    let txn_id = read_txn.txn_id;
     let ctx = Arc::new(ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id_u32,
+        txn_id,
         snapshot,
     ));
     let result = zyron_executor::execute(plan, &ctx).await;

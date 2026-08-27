@@ -6,6 +6,9 @@
 //!
 //! Run: cargo test -p zyron-cdc --test cdc_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -50,7 +53,7 @@ fn make_record(
     version: u64,
     ts: i64,
     change_type: ChangeType,
-    txn_id: u32,
+    txn_id: u64,
     pk: u8,
     row: &[u8],
 ) -> ChangeRecord {
@@ -102,7 +105,7 @@ fn make_decoded(table_name: &str, op: ChangeType, id: u64) -> DecodedChange {
         },
         commit_lsn: id,
         commit_timestamp: id as i64 * 1000,
-        txn_id: id as u32,
+        txn_id: id,
         is_last_in_txn: true,
         schema_version: 1,
     }
@@ -576,7 +579,8 @@ fn test_cdc_retention_enforcement() {
     })
     .unwrap();
 
-    let stats = mgr.enforce_all().unwrap();
+    let (stats, failures) = mgr.enforce_all(None);
+    assert!(failures.is_empty(), "retention failures: {failures:?}");
     tprintln!(
         "  Enforced: {} tables, {} purged, {} bytes reclaimed",
         stats.tables_processed,

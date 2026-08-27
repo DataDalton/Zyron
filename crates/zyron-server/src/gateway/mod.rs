@@ -14,6 +14,7 @@ pub mod endpoint_exec;
 pub mod metrics;
 pub mod middleware;
 pub mod openapi;
+pub mod pressure_endpoint;
 pub mod rate_limit;
 pub mod request;
 pub mod response;

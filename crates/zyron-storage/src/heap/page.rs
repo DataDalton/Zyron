@@ -6,7 +6,7 @@
 //! | Page Header (40) |
 //! +------------------+
 //! | Slot Array       |  <- Grows downward
-//! | (16 bytes/slot)  |     offset plus the tuple header
+//! | (24 bytes/slot)  |     offset plus the tuple header
 //! +------------------+
 //! |                  |
 //! | Free Space       |
@@ -19,8 +19,8 @@
 //! Each slot carries its tuple header rather than storing it beside the data.
 //! A scan then walks one dense array instead of following an offset into the
 //! data region for every row, and stamping xmax writes into that array too.
-//! The bytes move rather than grow: the slot gains the twelve header bytes
-//! that the data region loses.
+//! The slot carries the twenty header bytes the data region no longer
+//! stores, plus the offset word.
 
 use super::constants::{DATA_START, HEAP_HEADER_OFFSET, HEAP_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::TupleId;
@@ -79,13 +79,13 @@ fn prefetch_row(row: &Tuple) {
 /// A slot in the slot array. It points at the tuple data and carries the
 /// tuple header, so reading a row header costs no second load.
 ///
-/// Layout (16 bytes):
+/// Layout (24 bytes):
 /// - offset: 2 bytes (offset from page start to tuple data, 0 = empty slot)
 /// - data_len: 2 bytes
 /// - flags: 2 bytes
 /// - reserved: 2 bytes
-/// - xmin: 4 bytes
-/// - xmax: 4 bytes
+/// - xmin: 8 bytes
+/// - xmax: 8 bytes
 ///
 /// offset and data_len share the leading u32, which lets a writer publish a
 /// finished slot with one release store once the fields above it are in place
@@ -102,7 +102,7 @@ impl TupleSlot {
     pub const SIZE: usize = TUPLE_SLOT_SIZE;
 
     /// Byte offset of the xmax field within a slot.
-    pub(crate) const XMAX_OFFSET: usize = 12;
+    pub(crate) const XMAX_OFFSET: usize = 16;
 
     /// Creates a slot for a tuple whose data begins at `offset`.
     pub fn new(offset: u16, header: TupleHeader) -> Self {
@@ -134,8 +134,8 @@ impl TupleSlot {
         buf[0..2].copy_from_slice(&self.offset.to_le_bytes());
         buf[2..4].copy_from_slice(&self.header.data_len.to_le_bytes());
         buf[4..6].copy_from_slice(&self.header.flags.0.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.header.xmin.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.header.xmax.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.header.xmin.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.header.xmax.to_le_bytes());
         buf
     }
 
@@ -146,8 +146,12 @@ impl TupleSlot {
             header: TupleHeader {
                 flags: TupleFlags(u16::from_le_bytes([buf[4], buf[5]])),
                 data_len: u16::from_le_bytes([buf[2], buf[3]]),
-                xmin: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-                xmax: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+                xmin: u64::from_le_bytes([
+                    buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+                ]),
+                xmax: u64::from_le_bytes([
+                    buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+                ]),
             },
         }
     }
@@ -336,11 +340,44 @@ impl HeapPage {
         free + tuple_area_size.saturating_sub(active_tuple_space)
     }
 
+    /// Empties a slot in place within a page slice. The tuple bytes stay
+    /// where they are and compaction reclaims them later. Returns true when
+    /// the slot held a tuple. Runs under the frame write lock so the change
+    /// is not lost to a concurrent append
+    pub fn delete_tuple_in_slice(data: &mut [u8], slot_id: SlotId) -> bool {
+        if Self::live_slot_in_slice(data, slot_id.0).is_none() {
+            return false;
+        }
+        Self::set_slot_in_slice(data, slot_id, TupleSlot::empty());
+        true
+    }
+
+    /// Rewrites a tuple's bytes and slot header in place within a page slice
+    /// when the new data fits the old footprint. Mirrors `update_tuple` over
+    /// a raw slice so the caller can hold the frame write lock
+    pub fn update_tuple_in_slice(data: &mut [u8], slot_id: SlotId, tuple: &Tuple) -> Result<()> {
+        let old_slot = Self::live_slot_in_slice(data, slot_id.0).ok_or_else(|| {
+            ZyronError::TupleNotFound(format!("slot {} not found or empty", slot_id))
+        })?;
+        let new_size = tuple.data().len();
+        if new_size > old_slot.data_len() {
+            return Err(ZyronError::PageFull);
+        }
+        let start = old_slot.offset as usize;
+        data[start..start + new_size].copy_from_slice(tuple.data());
+        Self::set_slot_in_slice(
+            data,
+            slot_id,
+            TupleSlot::new(old_slot.offset, *tuple.header()),
+        );
+        Ok(())
+    }
+
     /// Stamps `xmax` on a tuple in place within a page slice. The field lives
     /// in the tuple slot. Returns false if the slot is empty. Used by the
     /// delete/update path while holding the frame write lock so the change is
     /// not lost to a concurrent append.
-    pub fn set_tuple_xmax_in_slice(data: &mut [u8], slot_id: SlotId, xmax: u32) -> bool {
+    pub fn set_tuple_xmax_in_slice(data: &mut [u8], slot_id: SlotId, xmax: u64) -> bool {
         let header = Self::heap_header_from_slice(data);
         let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
             return false;
@@ -349,7 +386,7 @@ impl HeapPage {
             return false;
         }
         let off = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
-        data[off..off + 4].copy_from_slice(&xmax.to_le_bytes());
+        data[off..off + 8].copy_from_slice(&xmax.to_le_bytes());
         true
     }
 
@@ -365,7 +402,7 @@ impl HeapPage {
             return false;
         }
         let off = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
-        data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        data[off..off + 8].copy_from_slice(&0u64.to_le_bytes());
         true
     }
 
@@ -377,7 +414,7 @@ impl HeapPage {
     /// outstanding tuple and index references stay valid. Returns true if any
     /// tuple was pruned. This is the on-access pruning that keeps MVCC-updated
     /// heaps compact without waiting for vacuum.
-    pub fn prune_dead_in_slice(data: &mut [u8], is_dead: &impl Fn(u32, u32) -> bool) -> bool {
+    pub fn prune_dead_in_slice(data: &mut [u8], is_dead: &impl Fn(u64, u64) -> bool) -> bool {
         let header = Self::heap_header_from_slice(data);
         let mut pruned = false;
         for i in 0..header.slot_count {
@@ -412,8 +449,8 @@ impl HeapPage {
     /// a transaction that aborted. Returns (tuples reclaimed, page modified).
     pub fn vacuum_in_slice(
         data: &mut [u8],
-        is_dead: &impl Fn(u32, u32) -> bool,
-        is_aborted: &impl Fn(u32) -> bool,
+        is_dead: &impl Fn(u64, u64) -> bool,
+        is_aborted: &impl Fn(u64) -> bool,
     ) -> (u64, bool) {
         Self::vacuum_in_slice_inner(data, is_dead, is_aborted, None)
     }
@@ -425,8 +462,8 @@ impl HeapPage {
     /// the row image that is about to disappear from the heap.
     pub fn vacuum_in_slice_collect(
         data: &mut [u8],
-        is_dead: &impl Fn(u32, u32) -> bool,
-        is_aborted: &impl Fn(u32) -> bool,
+        is_dead: &impl Fn(u64, u64) -> bool,
+        is_aborted: &impl Fn(u64) -> bool,
         dead_out: &mut Vec<(u16, Vec<u8>)>,
     ) -> (u64, bool) {
         Self::vacuum_in_slice_inner(data, is_dead, is_aborted, Some(dead_out))
@@ -434,8 +471,8 @@ impl HeapPage {
 
     fn vacuum_in_slice_inner(
         data: &mut [u8],
-        is_dead: &impl Fn(u32, u32) -> bool,
-        is_aborted: &impl Fn(u32) -> bool,
+        is_dead: &impl Fn(u64, u64) -> bool,
+        is_aborted: &impl Fn(u64) -> bool,
         mut dead_out: Option<&mut Vec<(u16, Vec<u8>)>>,
     ) -> (u64, bool) {
         let header = Self::heap_header_from_slice(data);
@@ -463,7 +500,7 @@ impl HeapPage {
             } else if slot.header.xmax != 0 && is_aborted(slot.header.xmax) {
                 // Live row whose deleter aborted: clear the stale stamp.
                 let xoff = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
-                data[xoff..xoff + 4].copy_from_slice(&0u32.to_le_bytes());
+                data[xoff..xoff + 8].copy_from_slice(&0u64.to_le_bytes());
                 modified = true;
             }
         }
@@ -695,13 +732,12 @@ impl HeapPage {
                             // Everything above the publish word first, so a
                             // reader that sees the slot sees a whole header
                             let th = t.header();
-                            // flags with the reserved half zeroed, then the two
-                            // transaction ids as one word
+                            // flags with the reserved half zeroed, then the
+                            // two 64-bit transaction ids
                             (slot_addr.add(4) as *mut u32)
                                 .write_unaligned((th.flags.0 as u32).to_le());
-                            (slot_addr.add(8) as *mut u64).write_unaligned(
-                                ((th.xmin as u64) | ((th.xmax as u64) << 32)).to_le(),
-                            );
+                            (slot_addr.add(8) as *mut u64).write_unaligned(th.xmin.to_le());
+                            (slot_addr.add(16) as *mut u64).write_unaligned(th.xmax.to_le());
 
                             let slot_atomic = &*(slot_addr as *const AtomicU32);
                             let slot_packed = (tuple_offset as u32) | ((ts as u32) << 16);
@@ -843,7 +879,7 @@ impl HeapPage {
     /// physically present and is hidden by snapshot visibility once the deleting
     /// transaction commits, so an aborted delete leaves the row visible and
     /// vacuum reclaims the space later. Returns false if the slot is empty.
-    pub fn set_tuple_xmax(&mut self, slot_id: SlotId, xmax: u32) -> bool {
+    pub fn set_tuple_xmax(&mut self, slot_id: SlotId, xmax: u64) -> bool {
         let Some(slot) = self.get_slot(slot_id) else {
             return false;
         };
@@ -852,7 +888,7 @@ impl HeapPage {
         }
         // xmax lives in the tuple slot
         let off = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
-        self.data[off..off + 4].copy_from_slice(&xmax.to_le_bytes());
+        self.data[off..off + 8].copy_from_slice(&xmax.to_le_bytes());
         true
     }
 
@@ -1046,7 +1082,7 @@ mod tests {
         assert!(page.set_tuple_xmax(s1, 50));
         let free_before = page.free_space();
 
-        let is_dead = |_xmin: u32, xmax: u32| xmax != 0 && xmax < 100;
+        let is_dead = |_xmin: u64, xmax: u64| xmax != 0 && xmax < 100;
         assert!(HeapPage::prune_dead_in_slice(page.as_bytes_mut(), &is_dead));
 
         // Survivors keep their slot ids and data; the pruned slot reads empty.
@@ -1069,7 +1105,7 @@ mod tests {
             .unwrap();
         assert!(page.set_tuple_xmax(s1, 200));
 
-        let is_dead = |_xmin: u32, xmax: u32| xmax != 0 && xmax < 100;
+        let is_dead = |_xmin: u64, xmax: u64| xmax != 0 && xmax < 100;
         assert!(!HeapPage::prune_dead_in_slice(
             page.as_bytes_mut(),
             &is_dead
@@ -1100,8 +1136,8 @@ mod tests {
             .unwrap();
         assert!(page.set_tuple_xmax(s_ad, 21));
 
-        let is_dead = |xmin: u32, xmax: u32| xmin == 20 || xmax == 12;
-        let is_aborted = |xid: u32| xid == 20 || xid == 21;
+        let is_dead = |xmin: u64, xmax: u64| xmin == 20 || xmax == 12;
+        let is_aborted = |xid: u64| xid == 20 || xid == 21;
         let (reclaimed, modified) =
             HeapPage::vacuum_in_slice(page.as_bytes_mut(), &is_dead, &is_aborted);
 
@@ -1156,7 +1192,7 @@ mod tests {
 
         for i in 0..10 {
             let tuple = page.get_tuple(SlotId(i)).unwrap();
-            assert_eq!(tuple.header().xmin, i as u32);
+            assert_eq!(tuple.header().xmin, i as u64);
         }
     }
 
@@ -1375,7 +1411,7 @@ mod tests {
         while page.can_fit(tuple_size + TupleSlot::SIZE) {
             let data = vec![slots.len() as u8; tuple_size - TupleHeader::SIZE];
             let slot = page
-                .insert_tuple(&Tuple::new(data, slots.len() as u32))
+                .insert_tuple(&Tuple::new(data, slots.len() as u64))
                 .unwrap();
             slots.push(slot);
         }

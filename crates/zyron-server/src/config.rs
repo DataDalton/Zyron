@@ -22,6 +22,10 @@ pub struct ZyronConfig {
     pub compaction: CompactionSection,
     pub vacuum: VacuumSection,
     pub query: QuerySection,
+    /// How this deployment acquires and releases nodes. Lives with the
+    /// provisioner so that nothing outside it reads how the node was
+    /// registered
+    pub mesh: zyron_pressure::provisioner::MeshSection,
 }
 
 impl Default for ZyronConfig {
@@ -37,9 +41,15 @@ impl Default for ZyronConfig {
             compaction: CompactionSection::default(),
             vacuum: VacuumSection::default(),
             query: QuerySection::default(),
+            mesh: zyron_pressure::provisioner::MeshSection::default(),
         }
     }
 }
+
+/// What a config still carrying the removed connection cap is told.
+const REMOVED_MAX_CONNECTIONS: &str = "server.max_connections has been removed. \
+Connections are bounded by the memory the node measured, and the live ceiling \
+is in zyron_sys.pressure.node_capabilities";
 
 impl ZyronConfig {
     /// Loads configuration from a TOML file at the given path.
@@ -98,203 +108,258 @@ impl ZyronConfig {
         })?;
         let overrides: toml::Table = toml::from_str(&contents)
             .map_err(|e| ZyronError::Internal(format!("Failed to parse zyron.auto.conf: {}", e)))?;
-        self.apply_overrides_from_table(&overrides);
+        self.apply_overrides_from_table(&overrides).map_err(|e| {
+            ZyronError::Internal(format!(
+                "{} refers to {}, fix or remove the entry to boot",
+                auto_path.display(),
+                e
+            ))
+        })
+    }
+
+    /// Applies dotted key overrides from a TOML table. An unknown section
+    /// or key, a non-scalar value, or an unparseable value is an error, a
+    /// persisted override that cannot take effect must never vanish silently
+    fn apply_overrides_from_table(&mut self, table: &toml::Table) -> Result<()> {
+        for (section, value) in table {
+            let toml::Value::Table(sub) = value else {
+                return Err(ZyronError::Internal(format!(
+                    "config section '{}' which is not a table of keys",
+                    section
+                )));
+            };
+            for (key, val) in sub {
+                let val_str = match val {
+                    toml::Value::String(s) => s.clone(),
+                    toml::Value::Integer(i) => i.to_string(),
+                    toml::Value::Float(f) => f.to_string(),
+                    toml::Value::Boolean(b) => b.to_string(),
+                    other => {
+                        return Err(ZyronError::Internal(format!(
+                            "config key {}.{} holding a {} value, expected a scalar",
+                            section,
+                            key,
+                            other.type_str()
+                        )));
+                    }
+                };
+                self.set_config_value(section, key, &val_str)?;
+            }
+        }
         Ok(())
     }
 
-    /// Applies dotted key overrides from a TOML table.
-    fn apply_overrides_from_table(&mut self, table: &toml::Table) {
-        for (section, value) in table {
-            if let toml::Value::Table(sub) = value {
-                for (key, val) in sub {
-                    let val_str = match val {
-                        toml::Value::String(s) => s.clone(),
-                        toml::Value::Integer(i) => i.to_string(),
-                        toml::Value::Float(f) => f.to_string(),
-                        toml::Value::Boolean(b) => b.to_string(),
-                        _ => continue,
-                    };
-                    self.set_config_value(section, key, &val_str);
-                }
-            }
-        }
+    /// Applies one "section.field" override, refusing unknown keys and
+    /// unparseable values.
+    pub fn apply_override(&mut self, key: &str, value: &str) -> Result<()> {
+        let Some((section, field)) = key.split_once('.') else {
+            return Err(ZyronError::Internal(format!(
+                "invalid config key format '{}', expected 'section.field'",
+                key
+            )));
+        };
+        self.set_config_value(section, field, value)
     }
 
-    /// Sets a config value by section and key name.
-    fn set_config_value(&mut self, section: &str, key: &str, value: &str) {
+    /// Sets a config value by section and key name. Unknown sections,
+    /// unknown keys, and unparseable values are errors.
+    fn set_config_value(&mut self, section: &str, key: &str, value: &str) -> Result<()> {
+        fn parsed<T: std::str::FromStr>(section: &str, key: &str, value: &str) -> Result<T> {
+            value.parse().map_err(|_| {
+                ZyronError::Internal(format!(
+                    "invalid value '{}' for config key {}.{}",
+                    value, section, key
+                ))
+            })
+        }
+        fn parsed_size(section: &str, key: &str, value: &str) -> Result<usize> {
+            parse_size(value).map_err(|_| {
+                ZyronError::Internal(format!(
+                    "invalid size '{}' for config key {}.{}",
+                    value, section, key
+                ))
+            })
+        }
         match section {
             "server" => match key {
                 "host" => self.server.host = value.into(),
-                "port" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.port = v;
-                    }
-                }
+                "port" => self.server.port = parsed(section, key, value)?,
                 "max_connections" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.max_connections = v;
-                    }
+                    return Err(ZyronError::Internal(REMOVED_MAX_CONNECTIONS.into()));
                 }
                 "connection_timeout_secs" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.connection_timeout_secs = v;
-                    }
+                    self.server.connection_timeout_secs = parsed(section, key, value)?;
                 }
-                "statement_timeout_secs" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.statement_timeout_secs = v;
-                    }
+                "worker_threads" => self.server.worker_threads = parsed(section, key, value)?,
+                "tls_enabled" => self.server.tls_enabled = parsed(section, key, value)?,
+                "tls_cert_path" => self.server.tls_cert_path = Some(PathBuf::from(value)),
+                "tls_key_path" => self.server.tls_key_path = Some(PathBuf::from(value)),
+                "quic_enabled" => self.server.quic_enabled = parsed(section, key, value)?,
+                "quic_port" => self.server.quic_port = Some(parsed(section, key, value)?),
+                "quic_zero_rtt" => self.server.quic_zero_rtt = parsed(section, key, value)?,
+                "quic_idle_timeout_secs" => {
+                    self.server.quic_idle_timeout_secs = parsed(section, key, value)?;
                 }
-                "worker_threads" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.worker_threads = v;
-                    }
-                }
-                "tls_enabled" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.tls_enabled = v;
-                    }
-                }
-                "dual_stack" => {
-                    if let Ok(v) = value.parse() {
-                        self.server.dual_stack = v;
-                    }
-                }
-                _ => {}
+                "dual_stack" => self.server.dual_stack = parsed(section, key, value)?,
+                _ => return unknown_key(section, key),
             },
             "storage" => match key {
                 "data_dir" => self.storage.data_dir = PathBuf::from(value),
-                "page_size" => {
-                    if let Ok(v) = value.parse() {
-                        self.storage.page_size = v;
-                    }
-                }
+                "page_size" => self.storage.page_size = parsed(section, key, value)?,
                 "buffer_pool_size" => {
-                    if let Ok(v) = parse_size(value) {
-                        self.storage.buffer_pool_size = v;
-                    }
+                    self.storage.buffer_pool_size = parsed_size(section, key, value)?;
                 }
                 "deployment_mode" => self.storage.deployment_mode = value.into(),
-                _ => {}
+                "page_checksum_verify" => self.storage.page_checksum_verify = value.into(),
+                _ => return unknown_key(section, key),
             },
             "wal" => match key {
-                "segment_size" => {
-                    if let Ok(v) = parse_size(value) {
-                        self.wal.segment_size = v;
-                    }
-                }
+                "wal_dir" => self.wal.wal_dir = Some(PathBuf::from(value)),
+                "segment_size" => self.wal.segment_size = parsed_size(section, key, value)?,
                 "sync_mode" => self.wal.sync_mode = value.into(),
                 "ring_buffer_capacity" => {
-                    if let Ok(v) = parse_size(value) {
-                        self.wal.ring_buffer_capacity = v;
-                    }
+                    self.wal.ring_buffer_capacity = parsed_size(section, key, value)?;
                 }
-                _ => {}
+                _ => return unknown_key(section, key),
             },
             "checkpoint" => match key {
                 "wal_bytes_threshold" => {
-                    if let Ok(v) = parse_size_u64(value) {
-                        self.checkpoint.wal_bytes_threshold = v;
-                    }
+                    self.checkpoint.wal_bytes_threshold = parse_size_u64(value).map_err(|_| {
+                        ZyronError::Internal(format!(
+                            "invalid size '{}' for config key {}.{}",
+                            value, section, key
+                        ))
+                    })?;
                 }
                 "max_interval_secs" => {
-                    if let Ok(v) = value.parse() {
-                        self.checkpoint.max_interval_secs = v;
-                    }
+                    self.checkpoint.max_interval_secs = parsed(section, key, value)?;
                 }
                 "min_interval_secs" => {
-                    if let Ok(v) = value.parse() {
-                        self.checkpoint.min_interval_secs = v;
-                    }
+                    self.checkpoint.min_interval_secs = parsed(section, key, value)?;
                 }
-                _ => {}
+                _ => return unknown_key(section, key),
             },
             "auth" => match key {
                 "method" => self.auth.method = value.into(),
-                "tls_required" => {
-                    if let Ok(v) = value.parse() {
-                        self.auth.tls_required = v;
-                    }
+                "password_encryption" => self.auth.password_encryption = value.into(),
+                "balloon_space_cost" => {
+                    self.auth.balloon_space_cost = Some(parsed(section, key, value)?);
                 }
-                _ => {}
+                "balloon_time_cost" => {
+                    self.auth.balloon_time_cost = Some(parsed(section, key, value)?);
+                }
+                "jwt_secret" => self.auth.jwt_secret = Some(value.into()),
+                "jwt_algorithm" => self.auth.jwt_algorithm = Some(value.into()),
+                "jwt_issuer" => self.auth.jwt_issuer = Some(value.into()),
+                "brute_force_enabled" => {
+                    self.auth.brute_force_enabled = Some(parsed(section, key, value)?);
+                }
+                "lockout_threshold" => {
+                    self.auth.lockout_threshold = Some(parsed(section, key, value)?);
+                }
+                "lockout_duration_secs" => {
+                    self.auth.lockout_duration_secs = Some(parsed(section, key, value)?);
+                }
+                "ip_block_threshold" => {
+                    self.auth.ip_block_threshold = Some(parsed(section, key, value)?);
+                }
+                "failure_window_secs" => {
+                    self.auth.failure_window_secs = Some(parsed(section, key, value)?);
+                }
+                "ip_block_duration_secs" => {
+                    self.auth.ip_block_duration_secs = Some(parsed(section, key, value)?);
+                }
+                "min_attempt_interval_ms" => {
+                    self.auth.min_attempt_interval_ms = Some(parsed(section, key, value)?);
+                }
+                "webauthn_rp_id" => self.auth.webauthn_rp_id = Some(value.into()),
+                "webauthn_rp_name" => self.auth.webauthn_rp_name = Some(value.into()),
+                "webauthn_origin" => self.auth.webauthn_origin = Some(value.into()),
+                "webauthn_challenge_timeout" => {
+                    self.auth.webauthn_challenge_timeout = Some(parsed(section, key, value)?);
+                }
+                "tls_required" => self.auth.tls_required = parsed(section, key, value)?,
+                _ => return unknown_key(section, key),
             },
             "logging" => match key {
                 "level" => self.logging.level = value.into(),
                 "format" => self.logging.format = value.into(),
                 "output" => self.logging.output = value.into(),
-                _ => {}
+                "file_path" => self.logging.file_path = Some(PathBuf::from(value)),
+                _ => return unknown_key(section, key),
             },
             "metrics" => match key {
-                "enabled" => {
-                    if let Ok(v) = value.parse() {
-                        self.metrics.enabled = v;
-                    }
-                }
-                "port" => {
-                    if let Ok(v) = value.parse() {
-                        self.metrics.port = v;
-                    }
-                }
+                "enabled" => self.metrics.enabled = parsed(section, key, value)?,
+                "host" => self.metrics.host = value.into(),
+                "port" => self.metrics.port = parsed(section, key, value)?,
                 "path" => self.metrics.path = value.into(),
-                _ => {}
+                "dual_stack" => self.metrics.dual_stack = parsed(section, key, value)?,
+                _ => return unknown_key(section, key),
             },
             "compaction" => match key {
-                "enabled" => {
-                    if let Ok(v) = value.parse() {
-                        self.compaction.enabled = v;
-                    }
-                }
+                "enabled" => self.compaction.enabled = parsed(section, key, value)?,
                 "threshold_rows" => {
-                    if let Ok(v) = value.parse() {
-                        self.compaction.threshold_rows = v;
-                    }
+                    self.compaction.threshold_rows = parsed(section, key, value)?;
                 }
-                "max_concurrent" => {
-                    if let Ok(v) = value.parse() {
-                        self.compaction.max_concurrent = v;
-                    }
-                }
+                "max_concurrent" => self.compaction.max_concurrent = parsed(section, key, value)?,
                 "rate_limit_mbps" => {
-                    if let Ok(v) = value.parse() {
-                        self.compaction.rate_limit_mbps = v;
-                    }
+                    self.compaction.rate_limit_mbps = parsed(section, key, value)?;
                 }
-                _ => {}
+                "interval_secs" => self.compaction.interval_secs = parsed(section, key, value)?,
+                "oltp_p99_threshold_us" => {
+                    self.compaction.oltp_p99_threshold_us = parsed(section, key, value)?;
+                }
+                "max_rows_per_file" => {
+                    self.compaction.max_rows_per_file = parsed(section, key, value)?;
+                }
+                _ => return unknown_key(section, key),
             },
             "vacuum" => match key {
-                "enabled" => {
-                    if let Ok(v) = value.parse() {
-                        self.vacuum.enabled = v;
-                    }
-                }
-                "interval_secs" => {
-                    if let Ok(v) = value.parse() {
-                        self.vacuum.interval_secs = v;
-                    }
-                }
+                "enabled" => self.vacuum.enabled = parsed(section, key, value)?,
+                "interval_secs" => self.vacuum.interval_secs = parsed(section, key, value)?,
                 "dead_tuple_threshold" => {
-                    if let Ok(v) = value.parse() {
-                        self.vacuum.dead_tuple_threshold = v;
-                    }
+                    self.vacuum.dead_tuple_threshold = parsed(section, key, value)?;
                 }
-                _ => {}
+                _ => return unknown_key(section, key),
             },
             "query" => match key {
                 "default_isolation" => self.query.default_isolation = value.into(),
                 "statement_timeout_secs" => {
-                    if let Ok(v) = value.parse() {
-                        self.query.statement_timeout_secs = v;
-                    }
+                    self.query.statement_timeout_secs = parsed(section, key, value)?;
                 }
-                "max_result_rows" => {
-                    if let Ok(v) = value.parse() {
-                        self.query.max_result_rows = v;
-                    }
+                "max_result_rows" => self.query.max_result_rows = parsed(section, key, value)?,
+                "max_memory_bytes" => {
+                    self.query.max_memory_bytes = parse_size_u64(value).map_err(|_| {
+                        ZyronError::Internal(format!(
+                            "invalid size '{}' for config key {}.{}",
+                            value, section, key
+                        ))
+                    })?;
                 }
-                _ => {}
+                _ => return unknown_key(section, key),
             },
-            _ => {}
+            "mesh" => match key {
+                "node_registration_mode" => {
+                    self.mesh.node_registration_mode = value.into();
+                }
+                "warm_pool_max_nodes" => {
+                    self.mesh.warm_pool_max_nodes = parsed(section, key, value)?;
+                }
+                "provision_latency_secs" => {
+                    self.mesh.provision_latency_secs = parsed(section, key, value)?;
+                }
+                "hot_set_pages" => self.mesh.hot_set_pages = parsed(section, key, value)?,
+                "hot_set_queries" => self.mesh.hot_set_queries = parsed(section, key, value)?,
+                _ => return unknown_key(section, key),
+            },
+            _ => {
+                return Err(ZyronError::Internal(format!(
+                    "unknown config section '{}'",
+                    section
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Writes a single key-value override to zyron.auto.conf.
@@ -363,14 +428,8 @@ impl ZyronConfig {
         if let Ok(val) = std::env::var("ZYRON_LOG_LEVEL") {
             self.logging.level = val;
         }
-        if let Ok(val) = std::env::var("ZYRON_MAX_CONNECTIONS") {
-            match val.parse() {
-                Ok(n) => self.server.max_connections = n,
-                Err(_) => tracing::warn!(
-                    "ZYRON_MAX_CONNECTIONS='{}' is not a valid number, ignoring",
-                    val
-                ),
-            }
+        if std::env::var("ZYRON_MAX_CONNECTIONS").is_ok() {
+            tracing::warn!("{}", REMOVED_MAX_CONNECTIONS);
         }
         if let Ok(val) = std::env::var("ZYRON_BUFFER_POOL_SIZE") {
             match parse_size(&val) {
@@ -446,12 +505,22 @@ impl ZyronConfig {
     }
 
     /// Validates the config for logical consistency.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.server.port == 0 {
             return Err(ZyronError::Internal("Server port cannot be 0".into()));
         }
-        if self.server.max_connections == 0 {
-            return Err(ZyronError::Internal("max_connections cannot be 0".into()));
+        if self.server.max_connections.is_some() {
+            return Err(ZyronError::Internal(REMOVED_MAX_CONNECTIONS.into()));
+        }
+        self.mesh.validate()?;
+        if !matches!(
+            self.auth.password_encryption.as_str(),
+            "balloon-sha-256" | "scram-sha-256" | "md5"
+        ) {
+            return Err(ZyronError::Internal(format!(
+                "auth.password_encryption '{}' is not one of 'balloon-sha-256', 'scram-sha-256' or 'md5'",
+                self.auth.password_encryption
+            )));
         }
         if self.server.worker_threads == 0 {
             return Err(ZyronError::Internal("worker_threads cannot be 0".into()));
@@ -483,6 +552,14 @@ impl ZyronConfig {
         }
         if self.wal.segment_size == 0 {
             return Err(ZyronError::Internal("WAL segment_size cannot be 0".into()));
+        }
+        // A ring smaller than a segment can fill with one segment's records
+        // and deadlock rotation against producers waiting for ring space
+        if self.wal.ring_buffer_capacity < self.wal.segment_size {
+            return Err(ZyronError::Internal(format!(
+                "wal.ring_buffer_capacity ({}) must be at least wal.segment_size ({})",
+                self.wal.ring_buffer_capacity, self.wal.segment_size
+            )));
         }
         if self.checkpoint.wal_bytes_threshold == 0 {
             return Err(ZyronError::Internal(
@@ -572,9 +649,7 @@ impl ZyronConfig {
         zyron_common::ServerConfig {
             host: self.server.host.clone(),
             port: self.server.port,
-            max_connections: self.server.max_connections,
             connection_timeout_secs: self.server.connection_timeout_secs,
-            statement_timeout_secs: self.server.statement_timeout_secs,
             worker_threads: self.server.worker_threads,
             tls_enabled: self.server.tls_enabled,
             tls_cert_path: self.server.tls_cert_path.clone(),
@@ -621,11 +696,9 @@ impl ZyronConfig {
             // Server
             "server.host" => Some(self.server.host.clone()),
             "server.port" => Some(self.server.port.to_string()),
-            "server.max_connections" => Some(self.server.max_connections.to_string()),
             "server.connection_timeout_secs" => {
                 Some(self.server.connection_timeout_secs.to_string())
             }
-            "server.statement_timeout_secs" => Some(self.server.statement_timeout_secs.to_string()),
             "server.worker_threads" => Some(self.server.worker_threads.to_string()),
             "server.tls_enabled" => Some(self.server.tls_enabled.to_string()),
             "server.dual_stack" => Some(self.server.dual_stack.to_string()),
@@ -679,10 +752,15 @@ impl ZyronConfig {
             "query.default_isolation" => Some(self.query.default_isolation.clone()),
             "query.statement_timeout_secs" => Some(self.query.statement_timeout_secs.to_string()),
             "query.max_result_rows" => Some(self.query.max_result_rows.to_string()),
+            "query.max_memory_bytes" => Some(self.query.max_memory_bytes.to_string()),
+            "mesh.node_registration_mode" => Some(self.mesh.node_registration_mode.clone()),
+            "mesh.warm_pool_max_nodes" => Some(self.mesh.warm_pool_max_nodes.to_string()),
+            "mesh.provision_latency_secs" => Some(self.mesh.provision_latency_secs.to_string()),
+            "mesh.hot_set_pages" => Some(self.mesh.hot_set_pages.to_string()),
+            "mesh.hot_set_queries" => Some(self.mesh.hot_set_queries.to_string()),
             // Also support shorthand aliases
             "server_version" => Some(env!("CARGO_PKG_VERSION").to_string()),
             "port" => Some(self.server.port.to_string()),
-            "max_connections" => Some(self.server.max_connections.to_string()),
             "data_dir" | "data_directory" => Some(self.storage.data_dir.display().to_string()),
             _ => None,
         }
@@ -707,19 +785,9 @@ impl ZyronConfig {
                 "Listen port".into(),
             ),
             (
-                "server.max_connections".into(),
-                self.server.max_connections.to_string(),
-                "Maximum concurrent connections".into(),
-            ),
-            (
                 "server.connection_timeout_secs".into(),
                 self.server.connection_timeout_secs.to_string(),
                 "Idle connection timeout in seconds".into(),
-            ),
-            (
-                "server.statement_timeout_secs".into(),
-                self.server.statement_timeout_secs.to_string(),
-                "Statement timeout in seconds (0 = no limit)".into(),
             ),
             (
                 "server.worker_threads".into(),
@@ -886,6 +954,38 @@ impl ZyronConfig {
                 self.query.max_result_rows.to_string(),
                 "Maximum result rows per query (0 = no limit)".into(),
             ),
+            (
+                "query.max_memory_bytes".into(),
+                self.query.max_memory_bytes.to_string(),
+                "Maximum bytes one query may materialize (0 = no limit)".into(),
+            ),
+            (
+                "mesh.node_registration_mode".into(),
+                self.mesh.node_registration_mode.clone(),
+                "How this deployment acquires machines: none, static, cloud, hypervisor, \
+                 kubernetes, or ipmi"
+                    .into(),
+            ),
+            (
+                "mesh.warm_pool_max_nodes".into(),
+                self.mesh.warm_pool_max_nodes.to_string(),
+                "Largest pool of idle nodes the operator will pay to keep ready (0 = none)".into(),
+            ),
+            (
+                "mesh.provision_latency_secs".into(),
+                self.mesh.provision_latency_secs.to_string(),
+                "Overrides the measured provision latency (0 = use the measurement)".into(),
+            ),
+            (
+                "mesh.hot_set_pages".into(),
+                self.mesh.hot_set_pages.to_string(),
+                "Page identifiers a draining node hands to its survivors".into(),
+            ),
+            (
+                "mesh.hot_set_queries".into(),
+                self.mesh.hot_set_queries.to_string(),
+                "Query shapes a draining node hands to its survivors".into(),
+            ),
         ]
     }
 }
@@ -901,9 +1001,13 @@ pub struct ServerSection {
     /// `dual_stack = true`)
     pub host: String,
     pub port: u16,
-    pub max_connections: u32,
     pub connection_timeout_secs: u32,
-    pub statement_timeout_secs: u32,
+    /// Present only to refuse a config file that still sets it. Connections
+    /// are bounded by measured memory now, so a configured count would be a
+    /// ceiling the hardware never asked for, and silently ignoring the key
+    /// would leave an operator believing they had set one
+    #[serde(default, skip_serializing)]
+    pub max_connections: Option<toml::Value>,
     pub worker_threads: usize,
     pub tls_enabled: bool,
     pub tls_cert_path: Option<PathBuf>,
@@ -927,9 +1031,8 @@ impl Default for ServerSection {
             // Operators wanting IPv4-only can set host = "0.0.0.0"
             host: "[::]".into(),
             port: 5432,
-            max_connections: 1000,
             connection_timeout_secs: 30,
-            statement_timeout_secs: 0,
+            max_connections: None,
             worker_threads: std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1),
@@ -1202,6 +1305,17 @@ pub struct QuerySection {
     pub statement_timeout_secs: u64,
     /// Maximum rows a single query can return. 0 = no limit.
     pub max_result_rows: u64,
+    /// Maximum bytes one query's materializing operators (sorts, hash
+    /// joins, aggregations, window buffers, set operations, the result
+    /// set) may hold at once. Past it an operator that can spill does, and
+    /// one that cannot fails. 0 = no limit and no spilling.
+    pub max_memory_bytes: u64,
+    /// Maximum bytes every spilling query on this node may hold on disk at
+    /// once. A query that would take the node past it is refused rather than
+    /// filling the disk, because a full disk stops every query rather than
+    /// one. 0 = spilling disabled, and operators fail at the memory budget
+    /// the way they did before spilling existed.
+    pub spill_quota_bytes: u64,
 }
 
 impl Default for QuerySection {
@@ -1210,6 +1324,12 @@ impl Default for QuerySection {
             default_isolation: "snapshot".into(),
             statement_timeout_secs: 300,
             max_result_rows: 1_000_000,
+            max_memory_bytes: 0,
+            // Sixteen gigabytes, which is enough for a sort or a join far
+            // larger than any node's memory and small enough that a runaway
+            // query cannot take the disk the data is on. It only ever applies
+            // when a memory budget is set, because without one nothing spills
+            spill_quota_bytes: 16 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -1217,6 +1337,15 @@ impl Default for QuerySection {
 /// Parses a human-readable size string into bytes.
 /// Supports: "128MB", "1GB", "16KB", "1024" (plain bytes).
 /// Case-insensitive. Allows optional space between number and unit.
+/// The error every unknown-key arm returns, naming the exact key so a typo
+/// in ALTER SYSTEM or a hand edited auto.conf points at itself
+fn unknown_key(section: &str, key: &str) -> Result<()> {
+    Err(ZyronError::Internal(format!(
+        "unknown config key {}.{}",
+        section, key
+    )))
+}
+
 pub fn parse_size(s: &str) -> std::result::Result<usize, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -1410,7 +1539,6 @@ mod tests {
     fn test_default_config() {
         let config = ZyronConfig::default();
         assert_eq!(config.server.port, 5432);
-        assert_eq!(config.server.max_connections, 1000);
         assert_eq!(config.storage.buffer_pool_size, 128 * 1024 * 1024);
         assert_eq!(config.wal.segment_size, 16 * 1024 * 1024);
         assert_eq!(config.wal.ring_buffer_capacity, 16 * 1024 * 1024);
@@ -1468,8 +1596,16 @@ format = "json"
 "#;
         let config: ZyronConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.port, 5433);
-        assert_eq!(config.server.max_connections, 500);
         assert_eq!(config.server.host, "0.0.0.0");
+        // The file still carries the removed connection cap, so it is refused
+        // rather than parsed and forgotten
+        let refused = config.validate().expect_err("stale key must be refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("max_connections has been removed"),
+            "unhelpful refusal: {refused}"
+        );
         assert_eq!(config.storage.data_dir, PathBuf::from("/var/lib/zyron"));
         assert_eq!(config.storage.buffer_pool_size, 1024 * 1024 * 1024);
         assert_eq!(config.wal.segment_size, 32 * 1024 * 1024);
@@ -1490,7 +1626,6 @@ port = 9999
         let config: ZyronConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.port, 9999);
         // All other sections should be defaults
-        assert_eq!(config.server.max_connections, 1000);
         assert_eq!(config.storage.buffer_pool_size, 128 * 1024 * 1024);
         assert_eq!(config.checkpoint.max_interval_secs, 600);
     }
@@ -1521,7 +1656,6 @@ wal_bytes_threshold = 33554432
         assert_eq!(server_cfg.host, "[::]");
         assert!(server_cfg.dual_stack);
         assert_eq!(server_cfg.port, 5432);
-        assert_eq!(server_cfg.max_connections, 1000);
     }
 
     #[test]
@@ -1541,7 +1675,7 @@ wal_bytes_threshold = 33554432
         assert!(config.validate().is_err());
 
         let mut config = ZyronConfig::default();
-        config.server.max_connections = 0;
+        config.server.max_connections = Some(toml::Value::Integer(500));
         assert!(config.validate().is_err());
 
         let mut config = ZyronConfig::default();
@@ -1622,8 +1756,65 @@ deployment_mode = "lake"
 
         // Runtime override path, the one zyron.auto.conf goes through
         let mut config = ZyronConfig::default();
-        config.set_config_value("storage", "deployment_mode", "db");
+        config
+            .set_config_value("storage", "deployment_mode", "db")
+            .unwrap();
         assert_eq!(config.deployment_mode(), zyron_common::DeploymentMode::Db);
+    }
+
+    // ALTER SYSTEM overrides are refused up front instead of being dropped
+    // silently at the next boot
+    #[test]
+    fn test_apply_override_refuses_unknown_and_unparseable() {
+        let mut config = ZyronConfig::default();
+
+        let err = config
+            .apply_override("server.prot", "5433")
+            .expect_err("typo key must be refused");
+        assert!(err.to_string().contains("server.prot"));
+
+        let err = config
+            .apply_override("nosuch.key", "1")
+            .expect_err("unknown section must be refused");
+        assert!(err.to_string().contains("nosuch"));
+
+        let err = config
+            .apply_override("server.port", "not_a_port")
+            .expect_err("unparseable value must be refused");
+        assert!(err.to_string().contains("server.port"));
+
+        let err = config
+            .apply_override("port", "5433")
+            .expect_err("undotted key must be refused");
+        assert!(err.to_string().contains("section.field"));
+
+        config.apply_override("server.port", "5433").unwrap();
+        assert_eq!(config.server.port, 5433);
+        config
+            .apply_override("compaction.interval_secs", "120")
+            .unwrap();
+        assert_eq!(config.compaction.interval_secs, 120);
+        config
+            .apply_override("compaction.max_rows_per_file", "500000")
+            .unwrap();
+        assert_eq!(config.compaction.max_rows_per_file, 500000);
+    }
+
+    // A bad entry in auto.conf names itself in the boot error instead of
+    // vanishing, so the operator knows exactly what to fix
+    #[test]
+    fn test_auto_conf_bad_entry_errors_with_key_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::write(dir.join("zyron.auto.conf"), "[server]\nprot = 5433\n").unwrap();
+
+        let mut config = ZyronConfig::default();
+        let err = config
+            .apply_auto_conf(&dir)
+            .expect_err("unknown persisted key must fail the boot loudly");
+        let msg = err.to_string();
+        assert!(msg.contains("zyron.auto.conf"));
+        assert!(msg.contains("server.prot"));
     }
 
     #[test]
@@ -1763,7 +1954,6 @@ sync_mode = "fdatasync"
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.storage.data_dir, PathBuf::from("/tmp/zyron"));
         assert_eq!(config.logging.level, "debug");
-        assert_eq!(config.server.max_connections, 2000);
 
         // Clean up
         unsafe {

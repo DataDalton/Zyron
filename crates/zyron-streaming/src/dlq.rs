@@ -148,12 +148,14 @@ pub struct DeadLetterQueue {
     table_name: String,
     max_rows: u64,
     rows: Mutex<std::collections::VecDeque<FailedRow>>,
-    local_sink: Arc<dyn LocalSink>,
+    /// Persistent backing when one is configured. None keeps failures in
+    /// the bounded in-memory buffer only
+    local_sink: Option<Arc<dyn LocalSink>>,
     metrics: Arc<DlqMetrics>,
 }
 
 impl DeadLetterQueue {
-    pub fn new(table_name: String, max_rows: u64, local_sink: Arc<dyn LocalSink>) -> Self {
+    pub fn new(table_name: String, max_rows: u64, local_sink: Option<Arc<dyn LocalSink>>) -> Self {
         Self {
             table_name,
             max_rows: max_rows.max(1),
@@ -185,12 +187,15 @@ impl DeadLetterQueue {
             g.push_back(failed_row);
         }
         self.metrics.rows_received.fetch_add(1, Ordering::Relaxed);
-        match self.local_sink.write_rows(&[to_persist]) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.metrics.write_errors.fetch_add(1, Ordering::Relaxed);
-                Err(e)
-            }
+        match &self.local_sink {
+            Some(sink) => match sink.write_rows(&[to_persist]) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.metrics.write_errors.fetch_add(1, Ordering::Relaxed);
+                    Err(e)
+                }
+            },
+            None => Ok(()),
         }
     }
 
@@ -236,6 +241,80 @@ impl DeadLetterQueue {
         let mut g = self.rows.lock();
         g.drain(..).collect()
     }
+
+    /// Drops every row received before the cutoff, returning how many were
+    /// evicted. Rows are not required to be time ordered, callers may stamp
+    /// their own timestamps, so this filters rather than popping from the front.
+    pub fn evict_older_than(&self, cutoff_epoch_ms: i64) -> u64 {
+        let mut g = self.rows.lock();
+        let before = g.len();
+        g.retain(|r| r.received_at >= cutoff_epoch_ms);
+        let evicted = (before - g.len()) as u64;
+        if evicted > 0 {
+            self.metrics
+                .rows_evicted
+                .fetch_add(evicted, Ordering::Relaxed);
+        }
+        evicted
+    }
+
+    /// The receive timestamp of the oldest buffered row, None when empty.
+    pub fn oldest_received_at(&self) -> Option<i64> {
+        self.rows.lock().iter().map(|r| r.received_at).min()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// DlqRegistry
+// -----------------------------------------------------------------------------
+
+/// Process-wide index of live dead letter queues, keyed by queue name.
+/// Sinks register their DLQ at build time so the TTL sweeper and the stat
+/// views see every queue without threading references through each job.
+pub struct DlqRegistry {
+    queues: Mutex<std::collections::HashMap<String, Arc<DeadLetterQueue>>>,
+}
+
+impl DlqRegistry {
+    pub fn new() -> Self {
+        Self {
+            queues: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Registers a queue under its name, replacing any previous queue with
+    /// the same name. A sink rebuilt for the same target re-registers, the
+    /// old queue's rows are dropped with it.
+    pub fn register(&self, queue: Arc<DeadLetterQueue>) {
+        self.queues
+            .lock()
+            .insert(queue.table_name().to_string(), queue);
+    }
+
+    /// Removes a queue by name, returning whether it existed.
+    pub fn unregister(&self, name: &str) -> bool {
+        self.queues.lock().remove(name).is_some()
+    }
+
+    /// Snapshot of every registered queue.
+    pub fn list(&self) -> Vec<Arc<DeadLetterQueue>> {
+        self.queues.lock().values().cloned().collect()
+    }
+
+    /// Evicts rows older than the cutoff from every queue, returning the
+    /// total evicted.
+    pub fn evict_older_than(&self, cutoff_epoch_ms: i64) -> u64 {
+        self.list()
+            .iter()
+            .map(|q| q.evict_older_than(cutoff_epoch_ms))
+            .sum()
+    }
+}
+
+impl Default for DlqRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -247,7 +326,11 @@ impl DeadLetterQueue {
     /// the Arc'd VecLocalSink so tests can inspect captured rows.
     pub fn with_vec_sink(table_name: &str, max_rows: u64) -> (Self, Arc<VecLocalSink>) {
         let sink = Arc::new(VecLocalSink::new());
-        let dlq = DeadLetterQueue::new(table_name.to_string(), max_rows, sink.clone());
+        let dlq = DeadLetterQueue::new(
+            table_name.to_string(),
+            max_rows,
+            Some(sink.clone() as Arc<dyn LocalSink>),
+        );
         (dlq, sink)
     }
 }

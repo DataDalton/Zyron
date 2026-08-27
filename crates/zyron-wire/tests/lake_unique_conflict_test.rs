@@ -18,7 +18,7 @@ use zyron_wire::connection::ServerState;
 /// its lake versions, so a second transaction can observe the pending state
 async fn run_stmt_pending(
     server: &Arc<ServerState>,
-    txn_id: u32,
+    txn_id: u64,
     snapshot: zyron_storage::Snapshot,
     sql: &str,
 ) -> Result<(), zyron_common::ZyronError> {
@@ -105,7 +105,7 @@ async fn overlapping_transactions_cannot_both_insert_one_key() {
     let s1 = t1.snapshot.clone();
     run_stmt_pending(
         &server,
-        t1.txn_id as u32,
+        t1.txn_id,
         s1,
         "INSERT INTO uq_two VALUES (42, 'first')",
     )
@@ -121,7 +121,7 @@ async fn overlapping_transactions_cannot_both_insert_one_key() {
     let s2 = t2.snapshot.clone();
     let second = run_stmt_pending(
         &server,
-        t2.txn_id as u32,
+        t2.txn_id,
         s2,
         "INSERT INTO uq_two VALUES (42, 'second')",
     )

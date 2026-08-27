@@ -176,6 +176,11 @@ pub struct SecurityManager {
     /// Monotonic counter for ABAC policy IDs, recovered from the max existing
     /// policy id at startup.
     next_abac_policy_id: std::sync::atomic::AtomicU32,
+    /// Bumped by every runtime policy mutation that changes which rows or
+    /// columns a plan may see. Plan caches fold it into their keys, so a
+    /// plan bound before a policy change can never serve rows under the old
+    /// visibility.
+    policy_epoch: std::sync::atomic::AtomicU64,
     /// TTL-aware cache shared across dynamic credential providers.
     pub credential_cache: Arc<CredentialCache>,
     /// mTLS certificate fingerprint pinning, subject-id keyed.
@@ -252,6 +257,7 @@ impl SecurityManager {
             next_role_id: std::sync::atomic::AtomicU32::new(1),
             next_user_id: std::sync::atomic::AtomicU32::new(1),
             next_abac_policy_id: std::sync::atomic::AtomicU32::new(1),
+            policy_epoch: std::sync::atomic::AtomicU64::new(0),
             credential_cache: Arc::new(CredentialCache::new()),
             mtls_pinning: CertFingerprintStore::new(),
             crl_ocsp: CrlOcspChecker::new(None)?,
@@ -345,7 +351,44 @@ impl SecurityManager {
             }
             return Err(e);
         }
+        self.bump_policy_epoch();
         Ok(())
+    }
+
+    /// One sweep over every security store that accumulates expirable
+    /// state: expired IP blocks, lapsed break-glass sessions, timed-out
+    /// two-person approvals, and brute-force trackers idle past a day.
+    /// The brute-force maps are keyed by attacker-supplied identifiers, so
+    /// this sweep is what bounds them.
+    pub fn prune_expired_state(&self) {
+        self.ip_manager.cleanup_expired();
+        self.break_glass.cleanup_expired();
+        self.governance.two_person.cleanup_expired();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        const IDLE_TRACKER_MS: u64 = 24 * 60 * 60 * 1000;
+        self.brute_force.prune_idle(now_ms, IDLE_TRACKER_MS);
+        // Privilege usage records for dropped roles and objects stop being
+        // touched, thirty idle days is long past any governance report
+        // window that would still want them
+        const IDLE_USAGE_SECS: u64 = 30 * 24 * 60 * 60;
+        self.governance
+            .analytics
+            .prune_idle(now_ms / 1000, IDLE_USAGE_SECS);
+    }
+
+    /// The current policy epoch, folded into plan cache keys so cached
+    /// plans die when row or column visibility rules change.
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Invalidates every cached plan bound under the previous policy set.
+    fn bump_policy_epoch(&self) {
+        self.policy_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Loads all auth data from persistent storage into in-memory stores.
@@ -800,7 +843,13 @@ impl SecurityManager {
             exempt_roles: rule.role_id.map_or_else(Vec::new, |r| vec![r]),
             enabled: true,
         };
-        let _ = self.masking_policy_store.add_policy(policy);
+        // Re-setting a rule on the same column replaces the previous one,
+        // an add alone would refuse the duplicate name and keep the stale
+        // masking function in force
+        self.masking_policy_store
+            .remove_policy(policy.table_id, policy.column_id, &policy.name);
+        self.masking_policy_store.add_policy(policy)?;
+        self.bump_policy_epoch();
         Ok(())
     }
 
@@ -814,6 +863,7 @@ impl SecurityManager {
             .store_row_ownership_config(&config)
             .await?;
         self.row_ownership_store.enable(table_id, config);
+        self.bump_policy_epoch();
         Ok(())
     }
 

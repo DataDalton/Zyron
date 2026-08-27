@@ -19,10 +19,10 @@ pub mod source_io;
 
 pub use cdc_ingest::{CdcIngestConfig, CdcIngestManager, CdcIngestSource, OnConflict};
 pub use cdc_stream::{
-    CdcOutputStream, CdcSink, CdcSinkConfig, CdcStreamManager, OutputFormat, build_sink,
-    drive_stream_changes, drive_stream_once,
+    CdcOutputStream, CdcSink, CdcSinkConfig, CdcStreamManager, OutputFormat, TxnDecision,
+    build_sink, drive_stream_changes, drive_stream_once,
 };
-pub use change_feed::{CdfRegistry, ChangeDataFeed, ChangeRecord, ChangeType};
+pub use change_feed::{CdfRegistry, ChangeDataFeed, ChangeRecord, ChangeType, CompactionView};
 pub use decoder::{
     AvroDecoder, DebeziumDecoder, DecodedChange, DecoderPlugin, LogicalDecoder, Wal2JsonDecoder,
     ZyronCdcDecoder,

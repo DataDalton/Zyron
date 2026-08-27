@@ -141,10 +141,23 @@ impl GapFillOperator {
             )));
         }
 
-        // Build the dense output via per-column builders.
+        // Build the dense output via per-column builders. A p>6 timestamp
+        // column's physical buffer is i128, so the builder must size for
+        // the physical type or every pushed bucket value would fall to the
+        // Int64 default of zero
         let mut builders: Vec<ColumnBuilder> = cols
             .iter()
-            .map(|c| ColumnBuilder::new(c.type_id, dense as usize))
+            .map(|c| {
+                let phys = zyron_common::TypeId::timestamp_physical_type_id(
+                    c.type_id,
+                    c.fractional_digits,
+                );
+                if phys != c.type_id || c.fractional_digits.is_some() {
+                    ColumnBuilder::new_ts(c.type_id, phys, c.fractional_digits, dense as usize)
+                } else {
+                    ColumnBuilder::new(c.type_id, dense as usize)
+                }
+            })
             .collect();
         let bucket_is_i128 = matches!(cols[self.bucket_col].data, ColumnData::Int128(_));
 

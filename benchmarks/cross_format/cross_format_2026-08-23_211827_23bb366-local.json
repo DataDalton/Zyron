@@ -1,0 +1,557 @@
+{
+  "id": "2026-08-23_211827_23bb366-local",
+  "date": "2026-08-23 21:18:41Z",
+  "ts": 1787519921,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "aggregate": {
+      "Aggregate over one column": {
+        "heap": {
+          "average": 2160.560000,
+          "runs": [2190.80, 2258.90, 1969.90, 2273.30, 2109.90],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 1211.620000,
+          "runs": [1203.20, 1150.10, 1207.50, 1216.90, 1280.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.560790,
+          "of_value": 1211.620000,
+          "to_value": 2160.560000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      },
+      "Bytes read": {
+        "heap": {
+          "average": 8093696.000000,
+          "runs": [8093696.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 212620.000000,
+          "runs": [212620.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.026270,
+          "of_value": 212620.000000,
+          "to_value": 8093696.000000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "bulk_delete": {
+      "Bulk delete": {
+        "heap": {
+          "average": 6159.800000,
+          "runs": [6159.80],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 1704.500000,
+          "runs": [1704.50],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.276714,
+          "of_value": 1704.500000,
+          "to_value": 6159.800000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "bulk_load": {
+      "Bulk load to queryable": {
+        "heap": {
+          "average": 87975.800000,
+          "runs": [87975.80],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 913397.400000,
+          "runs": [913397.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 10.382371,
+          "of_value": 913397.400000,
+          "to_value": 87975.800000,
+          "bound": "<= 14.000000",
+          "passed": true
+        }
+      }
+    },
+    "join": {
+      "Join": {
+        "heap": {
+          "average": 5154.620000,
+          "runs": [5280.20, 5094.70, 5096.80, 5113.50, 5187.90],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 2410.840000,
+          "runs": [2365.30, 2164.10, 2722.30, 2275.70, 2526.80],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.467705,
+          "of_value": 2410.840000,
+          "to_value": 5154.620000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      },
+      "Bytes read": {
+        "heap": {
+          "average": 16187392.000000,
+          "runs": [16187392.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 160800.000000,
+          "runs": [160800.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.009934,
+          "of_value": 160800.000000,
+          "to_value": 16187392.000000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "point_lookup_full": {
+      "Point lookup, full row": {
+        "heap": {
+          "average": 3870.140000,
+          "runs": [3822.60, 3855.10, 3714.50, 3766.10, 4192.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 367.820000,
+          "runs": [355.60, 283.00, 324.90, 528.60, 347.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.095040,
+          "of_value": 367.820000,
+          "to_value": 3870.140000,
+          "bound": "<= 0.250000",
+          "passed": true
+        }
+      },
+      "Bytes read": {
+        "heap": {
+          "average": 8093696.000000,
+          "runs": [8093696.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 117049.000000,
+          "runs": [117049.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.014462,
+          "of_value": 117049.000000,
+          "to_value": 8093696.000000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "point_lookup_narrow": {
+      "Point lookup, narrow projection": {
+        "heap": {
+          "average": 2653.340000,
+          "runs": [2604.50, 2690.80, 2356.60, 2512.40, 3102.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 333.080000,
+          "runs": [448.10, 278.30, 294.30, 389.00, 255.70],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.125532,
+          "of_value": 333.080000,
+          "to_value": 2653.340000,
+          "bound": "<= 0.250000",
+          "passed": true
+        }
+      },
+      "Bytes read": {
+        "heap": {
+          "average": 8093696.000000,
+          "runs": [8093696.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 21302.000000,
+          "runs": [21302.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.002632,
+          "of_value": 21302.000000,
+          "to_value": 8093696.000000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "point_lookup_index": {
+      "Point lookup without an index": {
+        "heap": {
+          "average": 2522.360000,
+          "runs": [2684.40, 2553.50, 2334.00, 2639.90, 2400.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 279.620000,
+          "runs": [302.00, 276.90, 364.00, 238.30, 216.90],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.110856,
+          "of_value": 279.620000,
+          "to_value": 2522.360000,
+          "bound": "<= 0.250000",
+          "passed": true
+        }
+      },
+      "Point lookup with an index": {
+        "heap": {
+          "average": 178.920000,
+          "runs": [367.30, 192.80, 145.00, 94.10, 95.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 261.500000,
+          "runs": [355.60, 193.20, 207.90, 249.20, 301.60],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 1.461547,
+          "of_value": 261.500000,
+          "to_value": 178.920000,
+          "bound": null,
+          "passed": null
+        }
+      },
+      "Bytes read with an index": {
+        "lake": {
+          "average": 21302.000000,
+          "runs": [21302.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "point_update": {
+      "Point update": {
+        "heap": {
+          "average": 5097.520000,
+          "runs": [4979.70, 5110.80, 5222.70, 5335.70, 4838.70],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 2242.480000,
+          "runs": [2133.00, 2285.60, 2352.30, 2241.10, 2200.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.439916,
+          "of_value": 2242.480000,
+          "to_value": 5097.520000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "range_scan": {
+      "Range scan, selective": {
+        "heap": {
+          "average": 2360.440000,
+          "runs": [2288.80, 2311.00, 2572.70, 2334.60, 2295.10],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 1010.560000,
+          "runs": [846.10, 1114.80, 1041.90, 1061.70, 988.30],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.428124,
+          "of_value": 1010.560000,
+          "to_value": 2360.440000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      },
+      "Bytes read": {
+        "heap": {
+          "average": 8093696.000000,
+          "runs": [8093696.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 160400.000000,
+          "runs": [160400.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "heap": {
+          "average": 8093696.000000,
+          "runs": [8093696.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 425240.000000,
+          "runs": [425240.00],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.019818,
+          "of_value": 160400.000000,
+          "to_value": 8093696.000000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      },
+      "Range scan, wide": {
+        "heap": {
+          "average": 2367.540000,
+          "runs": [2682.20, 2388.80, 2288.60, 2211.70, 2266.40],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 1413.020000,
+          "runs": [1387.80, 1289.20, 1422.50, 1396.00, 1569.60],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 0.596830,
+          "of_value": 1413.020000,
+          "to_value": 2367.540000,
+          "bound": "<= 1.000000",
+          "passed": true
+        }
+      }
+    },
+    "trickle_load": {
+      "Trickle load to queryable": {
+        "heap": {
+          "average": 48030.800000,
+          "runs": [48030.80],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "lake": {
+          "average": 1276084.500000,
+          "runs": [1276084.50],
+          "target": null,
+          "passed": null,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "ratio": {
+          "of": "lake",
+          "to": "heap",
+          "value": 26.568046,
+          "of_value": 1276084.500000,
+          "to_value": 48030.800000,
+          "bound": "<= 40.000000",
+          "passed": true
+        }
+      }
+    }
+  }
+}

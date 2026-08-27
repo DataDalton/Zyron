@@ -4330,6 +4330,9 @@ impl Catalog {
             .get_subscription(id)
             .ok_or_else(|| ZyronError::Internal(format!("subscription {} not found", id.0)))?;
         let mut updated = (*current).clone();
+        if new_lsn > current.last_seen_lsn {
+            updated.last_advance_at = current_timestamp();
+        }
         updated.last_seen_lsn = new_lsn;
         updated.last_poll_at = current_timestamp();
         self.log_ddl(DDL_UPDATE_SUBSCRIPTION, &updated.to_bytes())?;

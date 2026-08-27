@@ -86,6 +86,10 @@ pub struct ServerState {
     /// Lock-free legal-hold registry. Reloaded from the catalog at startup and
     /// after each LEGAL HOLD CREATE/DROP/RELEASE so the DML hook enforces holds.
     pub legal_holds: Arc<zyron_lifecycle::legal_hold::LegalHoldRegistry>,
+    /// Live dead letter queues, one per streaming sink target. Sinks register
+    /// their queue at build time, the TTL sweeper evicts aged rows, and
+    /// zyron_stat_dead_letters reads pending counts from here.
+    pub dlq_registry: Arc<zyron_streaming::dlq::DlqRegistry>,
     /// Key store for sealing and opening external-source/sink credentials.
     /// Populated by the server binary from a data-dir-derived master key.
     pub key_store: Arc<dyn zyron_auth::KeyStore>,
@@ -95,6 +99,11 @@ pub struct ServerState {
     pub config_all: Option<Arc<dyn Fn() -> Vec<(String, String, String)> + Send + Sync>>,
     /// Data directory path (for ALTER SYSTEM auto.conf writes).
     pub data_dir: std::path::PathBuf,
+    /// What the node measured about the machine it runs on, read back by
+    /// zyron_sys.pressure.node_capabilities. None in a harness that assembled
+    /// a server without probing, where the view reports no rows rather than
+    /// inventing them
+    pub node_capabilities: Option<std::sync::Arc<zyron_pressure::capability::NodeCapabilities>>,
     /// Session manager for stat view queries.
     pub session_info_collector:
         Option<Arc<dyn Fn() -> Vec<crate::stat_views::SessionRow> + Send + Sync>>,
@@ -303,6 +312,15 @@ pub struct ServerState {
     /// Maximum rows a single query returns. None when query.max_result_rows
     /// is 0
     pub max_result_rows: Option<u64>,
+    /// Byte budget one query's materializing operators share. None when
+    /// query.max_memory_bytes is 0
+    pub max_query_memory: Option<u64>,
+    /// Where a materializing operator puts what does not fit in its budget.
+    ///
+    /// None disables spilling, which is what a node with no spill quota or no
+    /// memory budget runs: the operators then fail at the budget the way they
+    /// did before spilling existed
+    pub spill_directory: Option<Arc<zyron_executor::spill::SpillDirectory>>,
     /// Balloon password-hash cost parameters from the auth config. None when
     /// neither balloon_space_cost nor balloon_time_cost is set, leaving the
     /// hasher on its built-in defaults
@@ -310,6 +328,11 @@ pub struct ServerState {
     /// Authentication method used as the fallback when no auth rule matches,
     /// parsed from auth.method at startup
     pub default_auth_method: zyron_auth::auth_rules::AuthMethod,
+    /// Which credentials a password set derives and stores, from
+    /// auth.password_encryption. "md5" stores balloon, SCRAM, and md5,
+    /// "balloon-sha-256" stores balloon and SCRAM, "scram-sha-256" stores
+    /// the SCRAM secret only.
+    pub password_encryption: String,
 }
 
 impl ServerState {
@@ -573,6 +596,18 @@ pub fn refresh_lake_stats(server: &Arc<ServerState>, logs: &[Arc<zyron_lake::Tra
         if let Ok(manifest) = log.latest_manifest() {
             zyron_executor::lake_stats::publish_manifest_stats(&server.catalog, &entry, &manifest);
         }
+    }
+}
+
+impl<T: WireTransport> Connection<T> {
+    /// The key this connection's work is attributed to.
+    ///
+    /// A tenant identity does not exist yet, and the database is the isolation
+    /// boundary that does: two workloads sharing a node are two databases, and
+    /// attributing pressure to them is what makes a noisy neighbour visible
+    /// and puts the cost of relieving it on whoever caused it.
+    fn admission_tenant(&self) -> Option<String> {
+        self.session.as_ref().map(|s| s.database.clone())
     }
 }
 
@@ -1428,7 +1463,7 @@ impl<T: WireTransport> Connection<T> {
                         self.server.wal.clone(),
                         self.server.buffer_pool.clone(),
                         self.server.disk_manager.clone(),
-                        txn_id as u32,
+                        txn_id,
                         snapshot,
                     );
                     if let Some(ref hook) = self.server.cdc_hook {
@@ -1460,7 +1495,9 @@ impl<T: WireTransport> Connection<T> {
                     self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
 
-                    match execute(plan_clone, &ctx).await {
+                    match execute_admitted(plan_clone, &ctx, self.admission_tenant().as_deref())
+                        .await
+                    {
                         Ok(batches) => {
                             if is_select {
                                 let row_desc = self.build_row_description(&output_schema, &[]);
@@ -1611,13 +1648,15 @@ impl<T: WireTransport> Connection<T> {
                         self.server.wal.clone(),
                         self.server.buffer_pool.clone(),
                         self.server.disk_manager.clone(),
-                        txn_id as u32,
+                        txn_id,
                         snapshot,
                     );
                     self.attach_undo_log(&mut ctx);
                     self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
-                    match execute(plan_clone, &ctx).await {
+                    match execute_admitted(plan_clone, &ctx, self.admission_tenant().as_deref())
+                        .await
+                    {
                         Ok(batches) => {
                             let cursor = self.cursors.get_mut(&cursor_name).unwrap();
                             cursor.rows = batches;
@@ -1835,14 +1874,16 @@ impl<T: WireTransport> Connection<T> {
                                 self.server.wal.clone(),
                                 self.server.buffer_pool.clone(),
                                 self.server.disk_manager.clone(),
-                                txn_id as u32,
+                                txn_id,
                                 snapshot,
                             );
                             self.attach_undo_log(&mut ctx);
                             self.apply_session_limits(&mut ctx);
                             let ctx = Arc::new(ctx);
 
-                            match execute(plan, &ctx).await {
+                            match execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
+                                .await
+                            {
                                 Ok(batches) => {
                                     let copy_format = match parse_copy_format(&copy_stmt.options) {
                                         Ok(f) => f,
@@ -2114,7 +2155,7 @@ impl<T: WireTransport> Connection<T> {
             self.server.wal.clone(),
             self.server.buffer_pool.clone(),
             self.server.disk_manager.clone(),
-            txn_id as u32,
+            txn_id,
             snapshot,
         );
         ctx.security_context = sec_ctx.map(Arc::new);
@@ -2148,7 +2189,9 @@ impl<T: WireTransport> Connection<T> {
         let ctx = Arc::new(ctx);
 
         // Execute
-        let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+        let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
+            .await
+            .map_err(ProtocolError::Database)?;
         self.note_ctx_writes(&ctx);
 
         // Return the security context to the session so subsequent queries
@@ -2283,7 +2326,7 @@ impl<T: WireTransport> Connection<T> {
             self.server.wal.clone(),
             self.server.buffer_pool.clone(),
             self.server.disk_manager.clone(),
-            txn_id as u32,
+            txn_id,
             snapshot,
         );
         ctx.params = params;
@@ -2305,7 +2348,9 @@ impl<T: WireTransport> Connection<T> {
         self.attach_undo_log(&mut ctx);
         self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
-        let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+        let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
+            .await
+            .map_err(ProtocolError::Database)?;
         self.note_ctx_writes(&ctx);
         if let Some(txn) = self.transaction.as_mut() {
             txn.mark_wrote_data();
@@ -2346,7 +2391,11 @@ impl<T: WireTransport> Connection<T> {
                     &session.search_path,
                 ),
                 role_id: session.identity_hash(),
-                rls_policy_hash: 0,
+                rls_policy_hash: self
+                    .server
+                    .security_manager
+                    .as_ref()
+                    .map_or(0, |sm| sm.policy_epoch()),
                 type_kinds_hash: templated.type_kinds_hash,
             };
             (key, self.server.catalog.schema_version())
@@ -2461,7 +2510,7 @@ impl<T: WireTransport> Connection<T> {
             self.server.wal.clone(),
             self.server.buffer_pool.clone(),
             self.server.disk_manager.clone(),
-            txn_id as u32,
+            txn_id,
             snapshot,
         );
         ctx.params = params;
@@ -2499,7 +2548,9 @@ impl<T: WireTransport> Connection<T> {
         let output_schema = cached.output_schema;
         let is_select = !output_schema.is_empty() && is_query_plan(&plan);
 
-        let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+        let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
+            .await
+            .map_err(ProtocolError::Database)?;
         self.note_ctx_writes(&ctx);
 
         if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
@@ -2585,7 +2636,7 @@ impl<T: WireTransport> Connection<T> {
                 self.server.wal.clone(),
                 self.server.buffer_pool.clone(),
                 self.server.disk_manager.clone(),
-                txn_id as u32,
+                txn_id,
                 snapshot,
             );
             self.attach_undo_log(&mut ctx);
@@ -2671,7 +2722,11 @@ impl<T: WireTransport> Connection<T> {
                 &session.search_path,
             ),
             role_id: session.identity_hash(),
-            rls_policy_hash: 0,
+            rls_policy_hash: self
+                .server
+                .security_manager
+                .as_ref()
+                .map_or(0, |sm| sm.policy_epoch()),
             type_kinds_hash: 0,
         };
         let current_version = self.server.catalog.schema_version();
@@ -2938,7 +2993,7 @@ impl<T: WireTransport> Connection<T> {
             self.server.wal.clone(),
             self.server.buffer_pool.clone(),
             self.server.disk_manager.clone(),
-            txn_id as u32,
+            txn_id,
             snapshot,
         );
         ctx_owned.params = params;
@@ -3448,8 +3503,7 @@ impl<T: WireTransport> Connection<T> {
             )
         })?;
         let txn_id = txn.txn_id();
-        let xmax = u32::try_from(txn_id)
-            .map_err(|_| ZyronError::Internal(format!("txn_id {} exceeds u32::MAX", txn_id)))?;
+        let xmax = txn_id;
 
         let rollback = txn.rollback_to_savepoint(name).ok_or_else(|| {
             ZyronError::TransactionAborted(format!("savepoint \"{}\" does not exist", name))
@@ -3488,7 +3542,7 @@ impl<T: WireTransport> Connection<T> {
                         *branch,
                         *file_id,
                         *sys_rowid,
-                        txn_id as u64,
+                        txn_id,
                     )?;
                     continue;
                 }
@@ -3507,7 +3561,7 @@ impl<T: WireTransport> Connection<T> {
                         *file_id,
                         *sys_rowid,
                         *column_id,
-                        txn_id as u64,
+                        txn_id,
                     )?;
                     continue;
                 }
@@ -3615,9 +3669,29 @@ impl<T: WireTransport> Connection<T> {
                     .as_ref()
                     .map(|sm| &sm.role_hierarchy);
 
+                // SET statement_timeout takes effect on the session's
+                // execution deadline, not just the variable map. DEFAULT
+                // restores the server-configured limit, 0 disables it
+                let timeout_change: Option<Option<Option<std::time::Duration>>> =
+                    if key == "statement_timeout" {
+                        if val_str.eq_ignore_ascii_case("default") {
+                            Some(None)
+                        } else {
+                            match parse_statement_timeout(&val_str) {
+                                Ok(parsed) => Some(Some(parsed)),
+                                Err(e) => return Some(Err(ProtocolError::Database(e))),
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                 if let Some(session) = self.session.as_mut() {
                     if let Err(e) = session.set_variable(s.name.clone(), val_str) {
                         return Some(Err(ProtocolError::Database(e)));
+                    }
+                    if let Some(change) = timeout_change {
+                        session.statement_timeout_override = change;
                     }
                     if let Some(target) = role_change {
                         if let Some(hierarchy) = hierarchy {
@@ -3918,14 +3992,14 @@ impl<T: WireTransport> Connection<T> {
                 now_us,
             );
 
-            let is_dead = |xmin: u32, x: u32| {
+            let is_dead = |xmin: u64, x: u64| {
                 status_map.is_aborted(xmin as u64)
                     || (x != 0
                         && status_map.is_committed(x as u64)
                         && (x as u64) < oldest_active
                         && status_map.is_reclaimable_below(x as u64, retention_floor))
             };
-            let is_aborted = |xid: u32| status_map.is_aborted(xid as u64);
+            let is_aborted = |xid: u64| status_map.is_aborted(xid);
 
             for page_id in &page_ids {
                 _total_pages += 1;
@@ -4604,10 +4678,34 @@ impl<T: WireTransport> Connection<T> {
     }
 
     fn apply_session_limits(&self, ctx: &mut ExecutionContext) {
-        if let Some(timeout) = self.server.statement_timeout {
+        // A SET statement_timeout on this session overrides the server
+        // default, including an explicit zero that disables the deadline
+        let timeout = match self
+            .session
+            .as_ref()
+            .and_then(|s| s.statement_timeout_override)
+        {
+            Some(session_override) => session_override,
+            None => self.server.statement_timeout,
+        };
+        if let Some(timeout) = timeout {
             ctx.set_deadline(std::time::Instant::now() + timeout);
         }
         ctx.max_result_rows = self.server.max_result_rows;
+        // Trimmed by the controller when the node is short of memory, so a
+        // query starting under pressure is handed a smaller allowance than one
+        // that started before it. A query already running keeps what it was
+        // promised: tightening under a half-built hash table would fail work
+        // that was inside its limit when it began
+        // Only a budgeted query spills: without a budget there is no point
+        // at which anything is too large, so nothing ever needs to
+        ctx.spill = self.server.spill_directory.clone();
+        ctx.memory_budget = self.server.max_query_memory.map(|configured| {
+            zyron_executor::QueryMemoryBudget::new(
+                zyron_pressure::pressure_control::PressureController::global()
+                    .query_memory_allowance(configured),
+            )
+        });
         // Inside BEGIN ZYRONLAKE TRANSACTION every lake write commits under
         // the intent, so its versions publish when the intent commits rather
         // than when the database commit record lands
@@ -4849,62 +4947,15 @@ impl<T: WireTransport> Connection<T> {
                 buf.put_i32(0); // length placeholder
                 buf.put_i16(num_cols as i16);
 
-                for (col_idx, column) in batch.columns.iter().enumerate() {
-                    let scalar = column.get_scalar(row);
-
-                    // Check NULL first to avoid writing a placeholder then truncating.
-                    if matches!(scalar, ScalarValue::Null) {
-                        buf.put_i32(-1);
-                        continue;
-                    }
-
-                    let val_len_pos = buf.len();
-                    buf.put_i32(0); // value length placeholder
-                    let before = buf.len();
-
-                    // Vector columns are stored as Binary (raw f32 bytes) but
-                    // need special text formatting as bracket notation [0.1,0.2,0.3].
-                    let is_vector = vector_cols[col_idx];
-
-                    if is_vector {
-                        if let ScalarValue::Binary(ref v) = scalar {
-                            if col_formats[col_idx] == 1 {
-                                types::write_vector_binary(v, &mut buf);
-                            } else {
-                                types::write_vector_text(v, &mut buf);
-                            }
-                        } else {
-                            types::scalar_write_text(&scalar, &mut buf);
-                        }
-                    } else if array_cols[col_idx] {
-                        types::write_array_text(&scalar, &mut buf);
-                    } else if let Some(scale) = decimal_scales[col_idx] {
-                        match scalar {
-                            ScalarValue::Int128(v) => {
-                                // A binary-format column gets the numeric
-                                // wire layout at the column's scale, text
-                                // gets the decimal rendering
-                                if col_formats[col_idx] == 1 {
-                                    types::write_numeric_binary(v, scale, &mut buf);
-                                } else {
-                                    buf.extend_from_slice(
-                                        zyron_common::format_decimal(v, scale).as_bytes(),
-                                    );
-                                }
-                            }
-                            ref other => {
-                                types::scalar_write_text(other, &mut buf);
-                            }
-                        }
-                    } else if col_formats[col_idx] == 1 {
-                        types::scalar_write_binary(&scalar, &mut buf);
-                    } else {
-                        types::scalar_write_text(&scalar, &mut buf);
-                    }
-
-                    let val_len = (buf.len() - before) as i32;
-                    buf[val_len_pos..val_len_pos + 4].copy_from_slice(&val_len.to_be_bytes());
-                }
+                types::encode_data_row_cells(
+                    &mut buf,
+                    batch,
+                    row,
+                    col_formats,
+                    &vector_cols,
+                    &array_cols,
+                    &decimal_scales,
+                );
 
                 // Patch the DataRow message length (includes itself but not the type byte).
                 let msg_len = (buf.len() - len_pos) as i32;
@@ -5140,6 +5191,7 @@ impl<T: WireTransport> Connection<T> {
             last_error: None,
             created_at: now_secs,
             source_id: None,
+            last_advance_at: 0,
         };
         // A failed create must abort the subscription. Falling back to id 0
         // would run an untracked pump whose cursor never persists, so the
@@ -5656,6 +5708,28 @@ pub fn audit_subscribe_decision(
     true
 }
 
+/// Runs a plan behind the node's admission gate.
+///
+/// Everything that executes a query goes through here rather than calling the
+/// executor, so a query cannot reach the engine without having been priced,
+/// classified and either admitted or refused. The ticket retires the work when
+/// it drops, so an error or a cancellation gives the node's counters back what
+/// the query was holding.
+///
+/// A query below the bypass threshold costs less to run than to decide about,
+/// and the controller says so, so the gate adds two atomic reads to a point
+/// lookup rather than a queue.
+async fn execute_admitted(
+    plan: PhysicalPlan,
+    ctx: &Arc<zyron_executor::context::ExecutionContext>,
+    tenant_id: Option<&str>,
+) -> std::result::Result<Vec<DataBatch>, ZyronError> {
+    let ticket = crate::admission::admit(&plan, tenant_id, false).await?;
+    let outcome = execute(plan, ctx).await;
+    ticket.complete();
+    outcome
+}
+
 /// Maps ZyronError to ErrorFields with appropriate SQLSTATE codes.
 pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
     let (code, severity) = match err {
@@ -5684,7 +5758,23 @@ pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
         ZyronError::RoleAlreadyExists(_) => ("42710", "ERROR"),
         ZyronError::InvalidCredential(_) => ("28P01", "FATAL"),
         ZyronError::CircularRoleDependency => ("42P27", "ERROR"),
+        // 53400 is configuration_limit_exceeded, the closest standard code for
+        // a node declining work it has the capability but not the capacity to
+        // run. Distinct from an internal error, because nothing is wrong: the
+        // caller can retry or route elsewhere
+        ZyronError::AdmissionShed(_) => ("53400", "ERROR"),
         _ => ("XX000", "ERROR"),
+    };
+
+    let hint = match err {
+        ZyronError::AdmissionShed(_) => Some(
+            concat!(
+                "the node is at its measured capacity for this class of query, ",
+                "so retry, narrow the query, or read zyron_sys.pressure.current"
+            )
+            .to_string(),
+        ),
+        _ => None,
     };
 
     ErrorFields {
@@ -5692,7 +5782,7 @@ pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
         code: code.into(),
         message: err.to_string(),
         detail: None,
-        hint: None,
+        hint,
         position: None,
     }
 }
@@ -5880,6 +5970,40 @@ fn extract_single_from_table(sel: &zyron_parser::SelectStatement) -> Option<Stri
         } => Some(name.clone()),
         _ => None,
     }
+}
+
+/// Parses a SET statement_timeout value into a deadline. A bare integer is
+/// milliseconds, matching Postgres, and the units ms, s, min, and h are
+/// accepted. Zero returns None, disabling the deadline.
+fn parse_statement_timeout(raw: &str) -> Result<Option<std::time::Duration>, ZyronError> {
+    let value = raw.trim().trim_matches('\'').trim();
+    let digits_end = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(digits_end);
+    let amount: u64 = digits.parse().map_err(|_| {
+        ZyronError::Internal(format!(
+            "invalid statement_timeout value '{}', expected a duration like 5000, '30s' or '5min'",
+            raw
+        ))
+    })?;
+    let millis = match unit.trim() {
+        "" | "ms" => amount,
+        "s" => amount.saturating_mul(1000),
+        "min" => amount.saturating_mul(60_000),
+        "h" => amount.saturating_mul(3_600_000),
+        other => {
+            return Err(ZyronError::Internal(format!(
+                "invalid statement_timeout unit '{}', expected ms, s, min or h",
+                other
+            )));
+        }
+    };
+    Ok(if millis == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(millis))
+    })
 }
 
 fn expr_to_string(expr: &zyron_parser::Expr) -> String {

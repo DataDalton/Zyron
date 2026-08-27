@@ -211,15 +211,6 @@ impl ZyronUpsertSink {
         let mut txn = self
             .txn_manager
             .begin(zyron_storage::txn::IsolationLevel::SnapshotIsolation)?;
-        let txn_id_u32 = match u32::try_from(txn.txn_id) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = self.txn_manager.abort(&mut txn);
-                return Err(ZyronError::Internal(
-                    "txn_id exceeds u32::MAX in upsert sink".to_string(),
-                ));
-            }
-        };
 
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -266,7 +257,7 @@ impl ZyronUpsertSink {
                             &mut rebuilt,
                         )?;
                         // Insert the new row.
-                        let tuple = zyron_storage::Tuple::new(change.row_data.clone(), txn_id_u32);
+                        let tuple = zyron_storage::Tuple::new(change.row_data.clone(), txn.txn_id);
                         let new_id =
                             rt.block_on(async { self.heap.insert_batch(&[tuple]).await })?;
                         // insert_batch returns Vec<TupleId>. Use the single id.

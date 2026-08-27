@@ -1312,7 +1312,7 @@ impl Operator for LakeUpdateOperator {
                 }
                 let old_refs: Vec<&[u8]> = old_encoded.iter().map(|v| v.as_slice()).collect();
                 let new_refs: Vec<&[u8]> = new_encoded.iter().map(|v| v.as_slice()).collect();
-                if let Err(e) = hook.on_update(
+                hook.on_update(
                     self.table_id.0,
                     &old_refs,
                     &new_refs,
@@ -1320,9 +1320,8 @@ impl Operator for LakeUpdateOperator {
                     timestamp_us,
                     self.ctx.txn_id,
                     true,
-                ) {
-                    eprintln!("CDC update hook failed: {e}");
-                }
+                )
+                .map_err(|e| ZyronError::ExecutionError(format!("CDC update hook failed: {e}")))?;
             }
             // ON UPDATE actions that need the moved key committed before
             // they can re-check the children against it
@@ -1528,16 +1527,17 @@ impl Operator for LakeDeleteOperator {
                         }
                     }
                     let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
-                    if let Err(e) = hook.on_delete(
+                    hook.on_delete(
                         self.table_id.0,
                         &refs,
                         version,
                         timestamp_us,
                         self.ctx.txn_id,
                         true,
-                    ) {
-                        eprintln!("CDC delete hook failed: {e}");
-                    }
+                    )
+                    .map_err(|e| {
+                        ZyronError::ExecutionError(format!("CDC delete hook failed: {e}"))
+                    })?;
                 }
             }
             // ON DELETE SET DEFAULT re-checks against the parent with these

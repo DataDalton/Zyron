@@ -15,6 +15,12 @@ use zyron_catalog::{Catalog, SubscriptionEntry, SubscriptionState};
 
 pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
 
+/// A subscriber that keeps polling but never confirms progress is reaped
+/// after this many idle thresholds, but only while changes it has not
+/// confirmed exist. A caught-up subscriber with nothing to consume is
+/// never reaped for standing still.
+pub const ADVANCE_STALL_MULTIPLE: u32 = 4;
+
 /// Module-scope flag ensuring at most one reaper pass executes at a time.
 /// CAS-acquired by run_reaper_once and released by the ReaperPassGuard, so
 /// two concurrent invocations do not double-reap the same subscription.
@@ -29,6 +35,7 @@ impl Drop for ReaperPassGuard {
 
 pub async fn dead_subscriber_reaper_loop(
     catalog: Arc<Catalog>,
+    cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
     shutdown: Arc<AtomicBool>,
     interval_secs: u64,
     idle_threshold: Duration,
@@ -40,8 +47,30 @@ pub async fn dead_subscriber_reaper_loop(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        let _ = run_reaper_once(catalog.as_ref(), idle_threshold, metrics.as_deref()).await;
+        let _ = run_reaper_once(
+            catalog.as_ref(),
+            cdc_registry.as_deref(),
+            idle_threshold,
+            metrics.as_deref(),
+        )
+        .await;
     }
+}
+
+/// The newest change version across every table of the subscription's
+/// publication, which is what the subscriber would confirm if it were
+/// making progress. None when no feed holds any change.
+fn publication_head(
+    catalog: &Catalog,
+    cdc_registry: &zyron_cdc::CdfRegistry,
+    publication_id: zyron_catalog::PublicationId,
+) -> Option<u64> {
+    catalog
+        .get_publication_tables(publication_id)
+        .iter()
+        .filter_map(|pt| cdc_registry.get_feed(pt.table_id.0))
+        .filter_map(|feed| feed.latest_version())
+        .max()
 }
 
 /// Performs one reaper pass over all active subscriptions. CAS-acquires the
@@ -51,6 +80,7 @@ pub async fn dead_subscriber_reaper_loop(
 /// zyron_subscription_reap_seconds observation per pass.
 pub async fn run_reaper_once(
     catalog: &Catalog,
+    cdc_registry: Option<&zyron_cdc::CdfRegistry>,
     idle_threshold: Duration,
     metrics: Option<&zyron_common::LabeledMetrics>,
 ) -> usize {
@@ -64,6 +94,7 @@ pub async fn run_reaper_once(
     let start = std::time::Instant::now();
     let now = current_secs();
     let threshold_secs = idle_threshold.as_secs();
+    let stall_secs = threshold_secs.saturating_mul(ADVANCE_STALL_MULTIPLE as u64);
     let mut reaped: usize = 0;
     for sub in catalog.list_subscriptions() {
         if sub.state != SubscriptionState::Active {
@@ -72,17 +103,41 @@ pub async fn run_reaper_once(
         if let Some(m) = metrics {
             m.subLastPollSet(&sub.id.0.to_string(), sub.last_poll_at);
         }
-        if now.saturating_sub(sub.last_poll_at) <= threshold_secs {
+        let idle = now.saturating_sub(sub.last_poll_at) > threshold_secs;
+        // A subscriber can keep the poll fresh while never confirming a
+        // byte of progress, which would pin CDC retention forever. It is
+        // reaped once it has been standing still for several idle windows
+        // WHILE unconfirmed changes exist for it to consume
+        let stalled = if idle {
+            false
+        } else {
+            let last_advance = if sub.last_advance_at > 0 {
+                sub.last_advance_at
+            } else {
+                sub.created_at
+            };
+            now.saturating_sub(last_advance) > stall_secs
+                && cdc_registry
+                    .and_then(|reg| publication_head(catalog, reg, sub.publication_id))
+                    .is_some_and(|head| head > sub.last_seen_lsn)
+        };
+        if !idle && !stalled {
             continue;
         }
+        let reason = if idle {
+            "idle threshold exceeded"
+        } else {
+            "polling without advancing past available changes"
+        };
         info!(
             target: "zyron::reaper",
             subscription_id = sub.id.0,
-            "reaping idle subscription"
+            reason,
+            "reaping subscription"
         );
         let updated = SubscriptionEntry {
             state: SubscriptionState::Failed,
-            last_error: Some("idle threshold exceeded".to_string()),
+            last_error: Some(reason.to_string()),
             ..(*sub).clone()
         };
         if let Some(m) = metrics {
@@ -182,7 +237,7 @@ mod tests {
         let wal = Arc::new(
             WalWriter::new(WalWriterConfig {
                 wal_dir,
-                segment_size: 4 * 1024 * 1024,
+                segment_size: 1024 * 1024,
                 fsync_enabled: false,
                 ring_buffer_capacity: 1 * 1024 * 1024,
             })
@@ -217,6 +272,7 @@ mod tests {
             last_error: None,
             created_at: 0,
             source_id: Some(ExternalSourceId(9)),
+            last_advance_at: 0,
         };
         catalog.create_subscription(sub).await.unwrap();
 
@@ -258,8 +314,15 @@ mod tests {
         let sd = Arc::clone(&shutdown);
         let cat = Arc::clone(&catalog);
         let handle = tokio::spawn(async move {
-            dead_subscriber_reaper_loop(cat, sd, 60, std::time::Duration::from_millis(0), None)
-                .await;
+            dead_subscriber_reaper_loop(
+                cat,
+                None,
+                sd,
+                60,
+                std::time::Duration::from_millis(0),
+                None,
+            )
+            .await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         shutdown.store(true, Ordering::Release);
@@ -297,7 +360,7 @@ mod tests {
         let wal = Arc::new(
             WalWriter::new(WalWriterConfig {
                 wal_dir,
-                segment_size: 4 * 1024 * 1024,
+                segment_size: 1024 * 1024,
                 fsync_enabled: false,
                 ring_buffer_capacity: 1 * 1024 * 1024,
             })
@@ -333,11 +396,19 @@ mod tests {
             last_error: None,
             created_at: 0,
             source_id: None,
+            last_advance_at: 0,
         }
     }
 
+    /// REAPER_PASS_IN_PROGRESS is process global, so two reaper tests
+    /// running in parallel would CAS-fail against each other's passes and
+    /// report zero work. The tests serialize on this lock; the concurrency
+    /// each test exercises lives inside the test, not between tests
+    static REAPER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn reaper_transitions_idle_subscription_to_failed_and_records_metrics() {
+        let _serial = REAPER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let catalog = build_catalog(&tmp).await;
         // Seed the entry as idle from the start; create_subscription auto-
@@ -348,8 +419,13 @@ mod tests {
             .unwrap();
         let metrics = zyron_common::LabeledMetrics::new();
 
-        let reaped =
-            run_reaper_once(&catalog, std::time::Duration::from_secs(60), Some(&metrics)).await;
+        let reaped = run_reaper_once(
+            &catalog,
+            None,
+            std::time::Duration::from_secs(60),
+            Some(&metrics),
+        )
+        .await;
         assert_eq!(reaped, 1, "idle subscription must be reaped");
         assert_eq!(metrics.subscriptionReapSecondsCount(), 1);
 
@@ -363,8 +439,13 @@ mod tests {
 
         // A second pass with no remaining Active subs records another
         // observation but transitions nothing.
-        let reaped2 =
-            run_reaper_once(&catalog, std::time::Duration::from_secs(60), Some(&metrics)).await;
+        let reaped2 = run_reaper_once(
+            &catalog,
+            None,
+            std::time::Duration::from_secs(60),
+            Some(&metrics),
+        )
+        .await;
         assert_eq!(reaped2, 0);
         assert_eq!(metrics.subscriptionReapSecondsCount(), 2);
 
@@ -377,6 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_reaper_passes_do_not_double_reap() {
+        let _serial = REAPER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let catalog = build_catalog(&tmp).await;
         for i in 0..50u64 {
@@ -391,12 +473,24 @@ mod tests {
         let m1 = Arc::clone(&metrics);
         let c1 = Arc::clone(&catalog);
         let h1 = tokio::spawn(async move {
-            run_reaper_once(&c1, std::time::Duration::from_secs(60), Some(m1.as_ref())).await
+            run_reaper_once(
+                &c1,
+                None,
+                std::time::Duration::from_secs(60),
+                Some(m1.as_ref()),
+            )
+            .await
         });
         let m2 = Arc::clone(&metrics);
         let c2 = Arc::clone(&catalog);
         let h2 = tokio::spawn(async move {
-            run_reaper_once(&c2, std::time::Duration::from_secs(60), Some(m2.as_ref())).await
+            run_reaper_once(
+                &c2,
+                None,
+                std::time::Duration::from_secs(60),
+                Some(m2.as_ref()),
+            )
+            .await
         });
         let a = h1.await.unwrap();
         let b = h2.await.unwrap();

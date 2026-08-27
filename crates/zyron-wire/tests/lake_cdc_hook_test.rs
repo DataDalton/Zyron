@@ -31,7 +31,7 @@ impl CdcHook for CountingHook {
         tuples: &[&[u8]],
         _version: u64,
         _timestamp: i64,
-        _txn_id: u32,
+        _txn_id: u64,
         _is_last_in_txn: bool,
     ) -> zyron_common::Result<()> {
         self.inserts.fetch_add(tuples.len(), Ordering::SeqCst);
@@ -48,7 +48,7 @@ impl CdcHook for CountingHook {
         old_data: &[&[u8]],
         _version: u64,
         _timestamp: i64,
-        _txn_id: u32,
+        _txn_id: u64,
         _is_last_in_txn: bool,
     ) -> zyron_common::Result<()> {
         self.deletes.fetch_add(old_data.len(), Ordering::SeqCst);
@@ -62,7 +62,7 @@ impl CdcHook for CountingHook {
         new_data: &[&[u8]],
         _version: u64,
         _timestamp: i64,
-        _txn_id: u32,
+        _txn_id: u64,
         _is_last_in_txn: bool,
     ) -> zyron_common::Result<()> {
         assert_eq!(
@@ -103,7 +103,7 @@ async fn exec_dml_hooked(server: &Arc<ServerState>, hook: &Arc<CountingHook>, sq
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));

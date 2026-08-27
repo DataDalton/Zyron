@@ -9,20 +9,21 @@ use serde::{Deserialize, Serialize};
 use zyron_common::zerocopy::{AsBytes, FromBytes};
 use zyron_common::{Result, ZyronError};
 
-/// Packed 24-byte WAL record header for single-memcpy serialization.
-/// All integer fields stored in little-endian format.
+/// Packed 28-byte WAL record header for single-memcpy serialization.
+/// All integer fields stored in little-endian format. Transaction ids are
+/// full 64-bit values, the allocator never wraps them
 #[repr(C, packed)]
 struct PackedHeader {
     lsn: u64,
     prev_lsn: u64,
-    txn_id: u32,
+    txn_id: u64,
     record_type: u8,
     flags: u8,
     payload_len: u16,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PackedHeader>() == 8 + 8 + 4 + 1 + 1 + 2);
+    assert!(std::mem::size_of::<PackedHeader>() == 8 + 8 + 8 + 1 + 1 + 2);
     assert!(std::mem::align_of::<PackedHeader>() == 1);
 };
 
@@ -175,10 +176,10 @@ impl TryFrom<u8> for LogRecordType {
 /// A single log record in the WAL.
 ///
 /// Record format on disk:
-/// - header (24 bytes):
+/// - header (28 bytes):
 ///   - lsn: 8 bytes
 ///   - prev_lsn: 8 bytes (for transaction chaining)
-///   - txn_id: 4 bytes
+///   - txn_id: 8 bytes
 ///   - record_type: 1 byte
 ///   - flags: 1 byte
 ///   - payload_len: 2 bytes
@@ -191,7 +192,7 @@ pub struct LogRecord {
     /// LSN of the previous record in this transaction.
     pub prev_lsn: Lsn,
     /// Transaction ID.
-    pub txn_id: u32,
+    pub txn_id: u64,
     /// Type of this record.
     pub record_type: LogRecordType,
     /// Record flags.
@@ -211,7 +212,7 @@ impl LogRecord {
     pub fn new(
         lsn: Lsn,
         prev_lsn: Lsn,
-        txn_id: u32,
+        txn_id: u64,
         record_type: LogRecordType,
         payload: Bytes,
     ) -> Self {
@@ -227,7 +228,7 @@ impl LogRecord {
 
     /// Creates a transaction begin record.
     #[inline]
-    pub fn begin(lsn: Lsn, txn_id: u32) -> Self {
+    pub fn begin(lsn: Lsn, txn_id: u64) -> Self {
         Self::new(
             lsn,
             Lsn::INVALID,
@@ -239,13 +240,13 @@ impl LogRecord {
 
     /// Creates a transaction commit record.
     #[inline]
-    pub fn commit(lsn: Lsn, prev_lsn: Lsn, txn_id: u32) -> Self {
+    pub fn commit(lsn: Lsn, prev_lsn: Lsn, txn_id: u64) -> Self {
         Self::new(lsn, prev_lsn, txn_id, LogRecordType::Commit, Bytes::new())
     }
 
     /// Creates a transaction abort record.
     #[inline]
-    pub fn abort(lsn: Lsn, prev_lsn: Lsn, txn_id: u32) -> Self {
+    pub fn abort(lsn: Lsn, prev_lsn: Lsn, txn_id: u64) -> Self {
         Self::new(lsn, prev_lsn, txn_id, LogRecordType::Abort, Bytes::new())
     }
 
@@ -282,7 +283,7 @@ impl LogRecord {
         // Write header
         buf.put_u64_le(self.lsn.0);
         buf.put_u64_le(self.prev_lsn.0);
-        buf.put_u32_le(self.txn_id);
+        buf.put_u64_le(self.txn_id);
         buf.put_u8(self.record_type as u8);
         buf.put_u8(self.flags);
         buf.put_u16_le(payload_len);
@@ -314,10 +315,12 @@ impl LogRecord {
         let prev_lsn = Lsn(u64::from_le_bytes([
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]));
-        let txn_id = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-        let record_type = LogRecordType::try_from(data[20])?;
-        let flags = data[21];
-        let payload_len = u16::from_le_bytes([data[22], data[23]]) as usize;
+        let txn_id = u64::from_le_bytes([
+            data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+        ]);
+        let record_type = LogRecordType::try_from(data[24])?;
+        let flags = data[25];
+        let payload_len = u16::from_le_bytes([data[26], data[27]]) as usize;
 
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(ZyronError::WalCorrupted {
@@ -419,7 +422,7 @@ impl LogRecord {
                 let ptr = base_ptr.add(offset);
                 let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
                 let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
-                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
                 let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
                 let flags = *ptr.add(OFF_FLAGS);
                 let payload_len =
@@ -427,7 +430,7 @@ impl LogRecord {
                 (
                     u64::from_le(lsn_raw),
                     u64::from_le(prev_lsn_raw),
-                    u32::from_le(txn_id),
+                    u64::from_le(txn_id),
                     record_type_byte,
                     flags,
                     payload_len,
@@ -518,7 +521,7 @@ impl LogRecord {
                 let ptr = base_ptr.add(offset);
                 let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
                 let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
-                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
                 let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
                 let flags = *ptr.add(OFF_FLAGS);
                 let payload_len =
@@ -526,7 +529,7 @@ impl LogRecord {
                 (
                     u64::from_le(lsn_raw),
                     u64::from_le(prev_lsn_raw),
-                    u32::from_le(txn_id),
+                    u64::from_le(txn_id),
                     record_type_byte,
                     flags,
                     payload_len,
@@ -586,7 +589,7 @@ impl LogRecord {
                 let ptr = base_ptr.add(offset);
                 let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
                 let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
-                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
                 let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
                 let flags = *ptr.add(OFF_FLAGS);
                 let payload_len =
@@ -594,7 +597,7 @@ impl LogRecord {
                 (
                     u64::from_le(lsn_raw),
                     u64::from_le(prev_lsn_raw),
-                    u32::from_le(txn_id),
+                    u64::from_le(txn_id),
                     record_type_byte,
                     flags,
                     payload_len,
@@ -672,7 +675,7 @@ impl LogRecord {
 pub struct LazyLogRecord {
     pub lsn: Lsn,
     pub prev_lsn: Lsn,
-    pub txn_id: u32,
+    pub txn_id: u64,
     pub record_type: LogRecordType,
     pub flags: u8,
     /// Offset of the payload within the original Bytes buffer.
@@ -714,7 +717,7 @@ pub fn parse_all_lazy(data: Bytes) -> (Bytes, Vec<LazyLogRecord>) {
             let ptr = base_ptr.add(offset);
             let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
             let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
-            let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+            let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
             let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
             let flags = *ptr.add(OFF_FLAGS);
             let payload_len =
@@ -722,7 +725,7 @@ pub fn parse_all_lazy(data: Bytes) -> (Bytes, Vec<LazyLogRecord>) {
             (
                 u64::from_le(lsn_raw),
                 u64::from_le(prev_lsn_raw),
-                u32::from_le(txn_id),
+                u64::from_le(txn_id),
                 record_type_byte,
                 flags,
                 payload_len,
@@ -778,7 +781,7 @@ pub unsafe fn serialize_raw(
     buf: *mut u8,
     lsn: Lsn,
     prev_lsn: Lsn,
-    txn_id: u32,
+    txn_id: u64,
     record_type: u8,
     flags: u8,
     payload: &[u8],
@@ -840,7 +843,7 @@ pub unsafe fn serialize_raw_deferred(
     buf: *mut u8,
     lsn: Lsn,
     prev_lsn: Lsn,
-    txn_id: u32,
+    txn_id: u64,
     record_type: u8,
     flags: u8,
     payload: &[u8],
@@ -857,23 +860,23 @@ pub unsafe fn serialize_raw_deferred(
     // Direct unaligned writes from registers skip the intermediate
     // PackedHeader stack allocation + copy_from_slice that the previous
     // implementation went through. Each write becomes a single MOV on x86.
-    // Header layout: lsn(8) prev_lsn(8) txn_id(4) record_type(1) flags(1) payload_len(2) = 24 bytes.
+    // Header layout: lsn(8) prev_lsn(8) txn_id(8) record_type(1) flags(1) payload_len(2) = 28 bytes.
     unsafe {
         std::ptr::write_unaligned(buf as *mut u64, lsn.0.to_le());
         std::ptr::write_unaligned(buf.add(8) as *mut u64, prev_lsn.0.to_le());
-        std::ptr::write_unaligned(buf.add(16) as *mut u32, txn_id.to_le());
-        *buf.add(20) = record_type;
-        *buf.add(21) = flags;
-        std::ptr::write_unaligned(buf.add(22) as *mut u16, payload_len.to_le());
+        std::ptr::write_unaligned(buf.add(16) as *mut u64, txn_id.to_le());
+        *buf.add(24) = record_type;
+        *buf.add(25) = flags;
+        std::ptr::write_unaligned(buf.add(26) as *mut u16, payload_len.to_le());
 
         // Payload copy. Nonoverlapping because `buf` is writer-owned space in
         // the ring buffer and `payload` is caller-provided input.
         if !payload.is_empty() {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(24), payload.len());
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(28), payload.len());
         }
 
         // Zero checksum placeholder (filled by backfill_checksums in flush thread).
-        std::ptr::write_unaligned(buf.add(24 + payload.len()) as *mut u32, 0u32);
+        std::ptr::write_unaligned(buf.add(HEADER_SIZE + payload.len()) as *mut u32, 0u32);
     }
 
     HEADER_SIZE + payload.len() + CHECKSUM_SIZE

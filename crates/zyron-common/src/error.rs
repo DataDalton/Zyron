@@ -35,6 +35,13 @@ pub enum ZyronError {
     #[error("Buffer pool full, unable to allocate frame")]
     BufferPoolFull,
 
+    /// The node refused a query rather than queueing it past the point where
+    /// running it could still meet the objective. Distinct from a failure:
+    /// nothing is wrong with the query, the node is telling the caller to
+    /// retry or to go elsewhere
+    #[error("admission refused: {0}")]
+    AdmissionShed(String),
+
     // Memory safety errors
     #[error("Memory allocation failed: requested {bytes} bytes")]
     MemoryAllocationFailed { bytes: u64 },
@@ -458,6 +465,28 @@ pub enum ZyronError {
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+impl ZyronError {
+    /// A transaction lost a race with another one.
+    ///
+    /// Built through this rather than as a struct literal, because producing
+    /// one is the event the node's conflict signal is made of. Conflict is the
+    /// one kind of saturation that capacity makes worse: more concurrency
+    /// means more of these, which reads as more load, which asks for more
+    /// concurrency. A controller that cannot see the rate will climb that loop.
+    ///
+    /// A guard test keeps the struct-literal form out of the tree so this
+    /// cannot be bypassed by accident. Where the count lands is decided by
+    /// whatever installed itself into `conflict_signal`, because the crate
+    /// that counts sits above this one.
+    pub fn transaction_conflict(txn_id: u64, reason: impl Into<String>) -> Self {
+        crate::conflict_signal::record_conflict_abort();
+        ZyronError::TransactionConflict {
+            txn_id,
+            reason: reason.into(),
+        }
+    }
 }
 
 #[cfg(test)]

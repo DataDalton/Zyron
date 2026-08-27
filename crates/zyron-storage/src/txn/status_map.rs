@@ -638,6 +638,16 @@ impl TxnStatusMap {
             f.sync_all().map_err(ZyronError::Io)?;
         }
         std::fs::rename(&tmp, &path).map_err(ZyronError::Io)?;
+        // This file is the barrier WAL truncation stands behind: a crash
+        // that loses the rename would leave commit statuses only in the
+        // truncated WAL. The rename itself is metadata, durable only once
+        // the directory entry is synced. Windows has no directory handle
+        // sync, its rename on NTFS is metadata-journaled instead
+        #[cfg(not(windows))]
+        {
+            let dir_handle = std::fs::File::open(dir).map_err(ZyronError::Io)?;
+            dir_handle.sync_all().map_err(ZyronError::Io)?;
+        }
         Ok(())
     }
 

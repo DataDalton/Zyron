@@ -245,20 +245,36 @@ impl LogSegment {
 
         // Scan the record region to find the end of the last checksum-valid
         // record. valid_data_len is the byte length of contiguous good records.
-        let valid_data_len = if data_len == 0 {
-            0
+        let (valid_data_len, data) = if data_len == 0 {
+            (0, Vec::new())
         } else {
             file.seek(std::io::SeekFrom::Start(data_start))?;
             let mut data = vec![0u8; data_len];
             file.read_exact(&mut data)?;
-            Self::scan_valid_extent(&data)
+            (Self::scan_valid_extent(&data), data)
         };
 
         let write_offset = data_start as u32 + valid_data_len as u32;
 
         // Truncate trailing garbage beyond the last valid record so the next
         // append starts on clean ground and the file size matches the data.
+        // Only a torn trailing write may be truncated: when a checksum-valid
+        // record exists ANYWHERE after the bad bytes, this is mid-segment
+        // corruption with durable records beyond it, and truncating would
+        // silently destroy them. That case refuses to open, matching the
+        // readers, which hard-error on the same condition
         if (write_offset as u64) < file_size {
+            if Self::any_valid_record_within(&data[valid_data_len..]) {
+                return Err(ZyronError::WalCorrupted {
+                    lsn: 0,
+                    reason: format!(
+                        "segment {} has corrupt records at byte {} with checksum-valid \
+                         records after them; refusing to truncate durable data",
+                        path.display(),
+                        data_start as usize + valid_data_len
+                    ),
+                });
+            }
             file.set_len(write_offset as u64)?;
             file.sync_all()?;
         }
@@ -309,6 +325,45 @@ impl LogSegment {
         }
 
         offset
+    }
+
+    /// True when a checksum-valid record starts at any byte offset of
+    /// `data`. This is the resynchronization probe that tells a torn
+    /// trailing write (nothing valid follows the tear) from mid-segment
+    /// corruption (durable records follow the damage). Garbage offsets are
+    /// pruned by cheap header sanity checks before any checksum runs
+    fn any_valid_record_within(data: &[u8]) -> bool {
+        use crate::constants::{
+            CHECKSUM_SIZE, HEADER_SIZE, MAX_PAYLOAD_SIZE, OFF_PAYLOAD_LEN, OFF_RECORD_TYPE,
+        };
+        let n = data.len();
+        let mut offset = 0usize;
+        while offset + HEADER_SIZE + CHECKSUM_SIZE <= n {
+            let payload_len = u16::from_le_bytes([
+                data[offset + OFF_PAYLOAD_LEN],
+                data[offset + OFF_PAYLOAD_LEN + 1],
+            ]) as usize;
+            let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+            if payload_len <= MAX_PAYLOAD_SIZE
+                && offset + record_size <= n
+                && crate::record::LogRecordType::try_from(data[offset + OFF_RECORD_TYPE]).is_ok()
+            {
+                let checksum_offset = offset + HEADER_SIZE + payload_len;
+                let stored = u32::from_le_bytes([
+                    data[checksum_offset],
+                    data[checksum_offset + 1],
+                    data[checksum_offset + 2],
+                    data[checksum_offset + 3],
+                ]);
+                let computed =
+                    crate::checksum::wal_checksum(&data[offset..checksum_offset], HEADER_SIZE);
+                if stored == computed {
+                    return true;
+                }
+            }
+            offset += 1;
+        }
+        false
     }
 
     /// Returns the segment ID.
@@ -430,7 +485,10 @@ impl LogSegment {
         let mut header_buf = [0u8; LogRecord::HEADER_SIZE];
         file.read_exact(&mut header_buf)?;
 
-        let payload_len = u16::from_le_bytes([header_buf[22], header_buf[23]]) as usize;
+        let payload_len = u16::from_le_bytes([
+            header_buf[crate::constants::OFF_PAYLOAD_LEN],
+            header_buf[crate::constants::OFF_PAYLOAD_LEN + 1],
+        ]) as usize;
         let total_size = LogRecord::HEADER_SIZE + payload_len + LogRecord::CHECKSUM_SIZE;
 
         // Read full record
@@ -556,6 +614,74 @@ mod tests {
             assert_eq!(segment.segment_id(), segment_id);
             assert_eq!(segment.first_lsn(), first_lsn);
         }
+    }
+
+    /// A torn trailing write truncates at reopen, mid-segment corruption
+    /// with durable records after it refuses to open. Truncating the
+    /// second case would silently destroy acknowledged records
+    #[test]
+    fn test_segment_open_truncates_torn_tail_but_refuses_mid_corruption() {
+        let dir = tempdir().unwrap();
+        let segment_id = SegmentId::FIRST;
+        let first_lsn = Lsn::new(1, SegmentHeader::SIZE as u32);
+        let path = dir.path().join(segment_id.filename());
+
+        let mut offsets = Vec::new();
+        {
+            let mut segment =
+                LogSegment::create(dir.path(), segment_id, first_lsn, LogSegment::DEFAULT_SIZE)
+                    .unwrap();
+            for i in 0..3u64 {
+                let record = LogRecord::new(
+                    Lsn::INVALID,
+                    Lsn::INVALID,
+                    i + 1,
+                    LogRecordType::Insert,
+                    Bytes::from(vec![i as u8; 32]),
+                );
+                offsets.push(segment.append(&record).unwrap().offset());
+            }
+            segment.sync().unwrap();
+            segment.close().unwrap();
+        }
+
+        // Torn tail: garbage bytes after the last record truncate cleanly
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&[0xAB; 17]).unwrap();
+            f.sync_all().unwrap();
+        }
+        {
+            let mut segment = LogSegment::open(&path).unwrap();
+            let record = segment.read_at(offsets[2]).unwrap();
+            assert_eq!(record.txn_id, 3, "all three records survive a torn tail");
+        }
+
+        // Mid-segment corruption: flip a payload byte of the SECOND record
+        // while the third stays valid. Reopen must refuse, not truncate
+        {
+            use std::io::{Seek, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let payload_pos = offsets[1] as u64 + crate::constants::HEADER_SIZE as u64 + 4;
+            f.seek(std::io::SeekFrom::Start(payload_pos)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        let result = LogSegment::open(&path);
+        assert!(
+            result.is_err(),
+            "mid-segment corruption with valid records after it must refuse to open"
+        );
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            before, after,
+            "the refusal must not have truncated anything"
+        );
     }
 
     #[test]

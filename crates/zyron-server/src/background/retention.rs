@@ -391,7 +391,7 @@ impl RetentionWorker {
             .begin(IsolationLevel::ReadCommitted)
             .map_err(|e| format!("begin: {e}"))?;
         let snapshot = txn.snapshot.clone();
-        let txn_id = u32::try_from(txn.txn_id).map_err(|_| "txn id overflow".to_string())?;
+        let txn_id = txn.txn_id;
 
         let mut ctx = zyron_executor::context::ExecutionContext::new(
             Arc::clone(&wc.catalog),
@@ -445,7 +445,7 @@ impl RetentionWorker {
             .begin(IsolationLevel::ReadCommitted)
             .map_err(|e| format!("begin: {e}"))?;
         let snapshot = txn.snapshot.clone();
-        let txn_id = u32::try_from(txn.txn_id).map_err(|_| "txn id overflow".to_string())?;
+        let txn_id = txn.txn_id;
         let ctx = Arc::new(zyron_executor::context::ExecutionContext::new(
             Arc::clone(&wc.catalog),
             Arc::clone(&wc.wal),

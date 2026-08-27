@@ -1,0 +1,13 @@
+[package]
+name = "zyron-mesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zyron-common = { path = "../zyron-common" }
+zyron-pressure = { path = "../zyron-pressure" }

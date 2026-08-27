@@ -38,6 +38,10 @@ pub struct VacuumWorkerConfig {
     pub interval_secs: u64,
     /// Maximum pages to process per vacuum cycle (0 = unlimited).
     pub max_pages_per_cycle: usize,
+    /// Fraction of dead tuples over live tuples before a table is scanned
+    /// (default 0.2). Zero scans on any activity. Every tenth cycle ignores
+    /// the threshold so the commit-status frozen watermark keeps advancing.
+    pub dead_tuple_threshold: f64,
 }
 
 impl Default for VacuumWorkerConfig {
@@ -45,9 +49,15 @@ impl Default for VacuumWorkerConfig {
         Self {
             interval_secs: 60,
             max_pages_per_cycle: 0,
+            dead_tuple_threshold: 0.2,
         }
     }
 }
+
+/// Every this many cycles the dead-tuple threshold is ignored and every
+/// active table is swept, so tables that hover under the threshold cannot
+/// stall the commit-status frozen watermark forever
+const FULL_PASS_EVERY: u64 = 10;
 
 /// Vacuum statistics.
 pub struct VacuumStats {
@@ -146,6 +156,7 @@ impl VacuumWorker {
         // active transaction during a pass keeps the table ungated, so an
         // abort landing after the scan can never be stranded
         let mut clean_at: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut cycle: u64 = 0;
 
         loop {
             thread::park_timeout(interval);
@@ -153,6 +164,13 @@ impl VacuumWorker {
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
+
+            cycle += 1;
+            // Below the dead-tuple threshold a table's scan does not pay for
+            // itself, but a periodic pass sweeps everything regardless so
+            // the frozen watermark keeps advancing
+            let enforce_threshold =
+                config.dead_tuple_threshold > 0.0 && cycle % FULL_PASS_EVERY != 0;
 
             debug!("Vacuum cycle starting");
 
@@ -231,6 +249,21 @@ impl VacuumWorker {
                 let writes_before = io.write_activity();
                 if clean_at.get(&table_entry.id.0).copied() == Some(writes_before) {
                     continue;
+                }
+                if enforce_threshold {
+                    let dead = io.n_dead_tup.load(Ordering::Relaxed);
+                    let live = io
+                        .n_tup_ins
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(io.n_tup_del.load(Ordering::Relaxed))
+                        .max(1);
+                    if (dead as f64) < config.dead_tuple_threshold * live as f64 {
+                        // Skipped without proof of cleanliness, so this
+                        // cycle cannot claim a full sweep, aborted inserts
+                        // never count into n_dead_tup
+                        full_sweep = false;
+                        continue;
+                    }
                 }
                 match Self::vacuum_table(
                     &table_entry,
@@ -393,14 +426,14 @@ impl VacuumWorker {
         // aborted or its committed deleter is older than the oldest active
         // transaction and no retained version still sees the row alive. An
         // aborted-delete stamp on a still-live row is cleared.
-        let is_dead = |xmin: u32, xmax: u32| {
-            status_map.is_aborted(xmin as u64)
+        let is_dead = |xmin: u64, xmax: u64| {
+            status_map.is_aborted(xmin)
                 || (xmax != 0
-                    && status_map.is_committed(xmax as u64)
-                    && (xmax as u64) < oldest_active
-                    && status_map.is_reclaimable_below(xmax as u64, retention_floor))
+                    && status_map.is_committed(xmax)
+                    && xmax < oldest_active
+                    && status_map.is_reclaimable_below(xmax, retention_floor))
         };
-        let is_aborted = |xid: u32| status_map.is_aborted(xid as u64);
+        let is_aborted = |xid: u64| status_map.is_aborted(xid);
         let clean_indexes = !btree.is_empty();
 
         for &page_id in page_ids.iter().take(page_limit) {

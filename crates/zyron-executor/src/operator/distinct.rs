@@ -145,10 +145,10 @@ fn column_values_equal_cross(
         (ColumnData::UInt32(va), ColumnData::UInt32(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::UInt64(va), ColumnData::UInt64(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::Float32(va), ColumnData::Float32(vb)) => {
-            va[a_idx].to_bits() == vb[b_idx].to_bits()
+            crate::compute::f32_key_eq(va[a_idx], vb[b_idx])
         }
         (ColumnData::Float64(va), ColumnData::Float64(vb)) => {
-            va[a_idx].to_bits() == vb[b_idx].to_bits()
+            crate::compute::f64_key_eq(va[a_idx], vb[b_idx])
         }
         (ColumnData::Utf8(va), ColumnData::Utf8(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] == vb[b_idx],

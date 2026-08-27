@@ -133,7 +133,7 @@ async fn setup() -> Env {
             Arc::clone(&wal),
             Arc::clone(&pool),
             Arc::clone(&disk),
-            txn.txn_id as u32,
+            txn.txn_id,
             txn.snapshot.clone(),
         );
         ctx.active_branch_id = branch;

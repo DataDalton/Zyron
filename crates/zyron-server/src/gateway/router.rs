@@ -94,7 +94,7 @@ pub struct CompiledRoute {
     pub max_body_bytes: u32,
     pub sql_body: String,
     pub circuit_breaker: Arc<CircuitBreaker>,
-    pub metrics: EndpointMetrics,
+    pub metrics: Arc<EndpointMetrics>,
     pub enabled: bool,
     // Cached parse of sql_body. Populated at compile time so the per-request
     // hot path can skip the parser when the template has no $ parameters.
@@ -167,7 +167,7 @@ impl CompiledRoute {
             max_body_bytes,
             sql_body,
             circuit_breaker: Arc::new(CircuitBreaker::new(5, Duration::from_secs(30))),
-            metrics: EndpointMetrics::new(),
+            metrics: Arc::new(EndpointMetrics::new()),
             enabled: true,
             pre_parsed,
             template_has_params,
@@ -343,6 +343,12 @@ impl Router {
     /// Removes the route that owns the given catalog endpoint id. Used when a
     /// DROP ENDPOINT or ALTER ENDPOINT DISABLE fires without the path on hand.
     pub fn remove_by_endpoint_id(&self, endpoint_id: EndpointId) -> bool {
+        self.take_by_endpoint_id(endpoint_id).is_some()
+    }
+
+    /// Removes a route by endpoint id, returning it so the caller can also
+    /// unregister its metrics series.
+    pub fn take_by_endpoint_id(&self, endpoint_id: EndpointId) -> Option<Arc<CompiledRoute>> {
         let mut idx = self.routes.write();
         if let Some(pos) = idx.all.iter().position(|r| r.endpoint_id == endpoint_id) {
             let arc = idx.all.remove(pos);
@@ -352,9 +358,9 @@ impl Router {
             } else if let Some(p) = idx.param_routes.iter().position(|r| Arc::ptr_eq(r, &arc)) {
                 idx.param_routes.swap_remove(p);
             }
-            true
+            Some(arc)
         } else {
-            false
+            None
         }
     }
 
@@ -453,18 +459,46 @@ pub fn compile_route_from_entry(entry: &zyron_catalog::EndpointEntry) -> Compile
     route
 }
 
-/// Registrar implementation that keeps an Arc<Router> in sync with catalog DDL.
+/// Registrar implementation that keeps an Arc<Router> in sync with catalog
+/// DDL, and the per-endpoint metric series in sync with the routes, so the
+/// exposition endpoint reports every live endpoint's counters.
 pub struct CatalogEndpointRegistrar {
     router: Arc<Router>,
+    metrics: Option<Arc<super::GatewayMetrics>>,
 }
 
 impl CatalogEndpointRegistrar {
     pub fn new(router: Arc<Router>) -> Self {
-        Self { router }
+        Self {
+            router,
+            metrics: None,
+        }
+    }
+
+    /// Attaches the shared gateway metrics so registered routes surface
+    /// their series on the exposition endpoint.
+    pub fn with_metrics(mut self, metrics: Arc<super::GatewayMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn router(&self) -> &Arc<Router> {
         &self.router
+    }
+
+    fn install(&self, route: CompiledRoute) {
+        if let Some(gm) = &self.metrics {
+            gm.register(route.name.clone(), Arc::clone(&route.metrics));
+        }
+        self.router.insert(route);
+    }
+
+    fn remove(&self, endpoint_id: EndpointId) {
+        if let Some(removed) = self.router.take_by_endpoint_id(endpoint_id) {
+            if let Some(gm) = &self.metrics {
+                gm.unregister(&removed.name);
+            }
+        }
     }
 }
 
@@ -472,16 +506,16 @@ impl CatalogEndpointRegistrar {
 impl zyron_wire::EndpointRegistrar for CatalogEndpointRegistrar {
     async fn register(&self, entry: &zyron_catalog::EndpointEntry) -> zyron_common::Result<()> {
         if !entry.enabled {
-            self.router.remove_by_endpoint_id(entry.id);
+            self.remove(entry.id);
             return Ok(());
         }
         let route = compile_route_from_entry(entry);
-        self.router.insert(route);
+        self.install(route);
         Ok(())
     }
 
     async fn unregister(&self, endpoint_id: zyron_catalog::EndpointId) -> zyron_common::Result<()> {
-        self.router.remove_by_endpoint_id(endpoint_id);
+        self.remove(endpoint_id);
         Ok(())
     }
 
@@ -492,9 +526,9 @@ impl zyron_wire::EndpointRegistrar for CatalogEndpointRegistrar {
     ) -> zyron_common::Result<()> {
         if enabled {
             let route = compile_route_from_entry(entry);
-            self.router.insert(route);
+            self.install(route);
         } else {
-            self.router.remove_by_endpoint_id(entry.id);
+            self.remove(entry.id);
         }
         Ok(())
     }

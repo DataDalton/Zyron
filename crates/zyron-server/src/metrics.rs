@@ -216,7 +216,7 @@ impl MetricsRegistry {
         render_gauge(
             &mut out,
             "zyron_max_connections",
-            "Maximum allowed connections",
+            "Connection ceiling derived from the memory the node measured",
             self.session_mgr.max_connections() as u64,
         );
 
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_metrics_registry_render() {
-        let session_mgr = Arc::new(SessionManager::new(100, 0));
+        let session_mgr = Arc::new(SessionManager::new(0));
         let labeled = Arc::new(zyron_common::LabeledMetrics::new());
         let registry = MetricsRegistry::new(session_mgr, labeled);
 
@@ -299,13 +299,22 @@ mod tests {
         assert!(output.contains("zyron_queries_total 50"));
         assert!(output.contains("zyron_errors_total 2"));
         assert!(output.contains("zyron_active_connections 0"));
-        assert!(output.contains("zyron_max_connections 100"));
+        // The ceiling is what the node's memory affords, not a configured
+        // count, so the metric is checked against the gauge that enforces it
+        let ceiling = zyron_pressure::pressure_control::PressureController::global()
+            .connections()
+            .ceiling();
+        assert!(
+            output.contains(&format!("zyron_max_connections {ceiling}")),
+            "the exported ceiling disagrees with the one being enforced"
+        );
+        assert!(ceiling >= 1);
     }
 
     #[test]
     fn test_labeled_families_render_and_accumulate() {
         use zyron_common::TlsDirection;
-        let session_mgr = Arc::new(SessionManager::new(100, 0));
+        let session_mgr = Arc::new(SessionManager::new(0));
         let labeled = Arc::new(zyron_common::LabeledMetrics::new());
         let registry = MetricsRegistry::new(session_mgr, labeled.clone());
 

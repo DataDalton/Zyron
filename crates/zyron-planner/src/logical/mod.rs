@@ -36,6 +36,15 @@ pub const AGGREGATE_TABLE_IDX: usize = usize::MAX;
 /// `AGGREGATE_TABLE_IDX` so the two never alias.
 pub const WINDOW_TABLE_IDX: usize = usize::MAX - 1;
 
+/// Synthetic `table_idx` the head branch's projection takes when set
+/// operations follow it. A compound query's trailing ORDER BY addresses the
+/// combined result like a derived table: the deferred sort keys become
+/// `ColumnRef`s with this `table_idx` and a `column_id` equal to the output
+/// position, and the projection's output schema carries the same identity.
+/// Distinct from `AGGREGATE_TABLE_IDX` and `WINDOW_TABLE_IDX` so the three
+/// never alias.
+pub const SET_OP_TABLE_IDX: usize = usize::MAX - 2;
+
 /// A column in the output schema of a logical plan node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalColumn {

@@ -1,4 +1,4 @@
-//! Concurrent TCP connection capacity, max_connections rejection, outbound
+//! Concurrent TCP connection capacity, connection ceiling enforcement, outbound
 //! pool stress, and sustained-load leak check. Runs identically on Linux and
 //! Windows; uses sysinfo for cross-platform process resource snapshots and
 //! tokio::net for all I/O. No process kills, no platform signals.
@@ -12,7 +12,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use zyron_server::session::SessionManager;
+use zyron_pressure::pressure_control::ConnectionGauge;
 use zyron_wire::pool::{ConnectionPool, HostRole, PoolConfig};
 
 const CONCURRENT_CONNECTION_TARGET: usize = 1000;
@@ -158,19 +158,52 @@ async fn opens_thousand_concurrent_connections_with_bounded_resources() {
 }
 
 #[tokio::test]
-async fn session_manager_rejects_past_max_connections() {
-    let mgr = SessionManager::new(100, 0);
-    for i in 0..100 {
-        mgr.register(i as i32, format!("user{i}"), "db".to_string())
-            .expect("first 100 must register");
-    }
-    let err = mgr.register(100, "over".to_string(), "db".to_string());
-    assert!(err.is_err(), "101st registration must be refused");
+async fn the_connection_ceiling_refuses_past_what_memory_affords() {
+    // The gate is no longer a configured count kept by the session manager.
+    // A connection costs memory, so the ceiling comes from the memory the
+    // node measured, and this pins that it is actually enforced and that a
+    // closed connection gives its slot back.
+    let gauge = ConnectionGauge::from_memory(64 * 1024 * 64);
+    assert_eq!(
+        gauge.ceiling(),
+        16,
+        "ceiling follows the memory it was given"
+    );
 
-    // Releasing one slot lets a new connection in.
-    mgr.unregister(0);
-    let later = mgr.register(100, "late".to_string(), "db".to_string());
-    assert!(later.is_ok(), "released slot must accept a new registrant");
+    let mut held = Vec::new();
+    for _ in 0..gauge.ceiling() {
+        assert!(
+            gauge.try_accept(),
+            "a slot within the ceiling must be given"
+        );
+        held.push(());
+    }
+    assert!(!gauge.try_accept(), "past the ceiling must be refused");
+    assert_eq!(gauge.refused_total(), 1);
+    assert_eq!(gauge.live(), 16);
+
+    gauge.release();
+    assert!(
+        gauge.try_accept(),
+        "a released slot must accept a new connection"
+    );
+    assert_eq!(gauge.peak(), 16);
+}
+
+#[tokio::test]
+async fn a_bigger_machine_gets_a_bigger_ceiling() {
+    // The failure this replaces was a fixed hundred that no deployment could
+    // raise past its own hardware
+    let small = ConnectionGauge::from_memory(1024 * 1024 * 1024);
+    let large = ConnectionGauge::from_memory(256 * 1024 * 1024 * 1024);
+    assert!(
+        large.ceiling() > small.ceiling() * 100,
+        "256GB gave {} against 1GB giving {}",
+        large.ceiling(),
+        small.ceiling()
+    );
+    // And the smallest machine still gets at least one
+    assert!(ConnectionGauge::from_memory(0).ceiling() >= 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

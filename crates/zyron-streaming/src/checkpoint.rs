@@ -116,6 +116,10 @@ pub struct CheckpointConfig {
     pub min_pause_ms: u64,
     /// Maximum number of concurrent in-flight checkpoints.
     pub max_concurrent: u32,
+    /// Completed checkpoints kept in memory. Recovery restores from the
+    /// newest, one predecessor stays as a fallback. Each checkpoint holds
+    /// full operator state, so unbounded history is unbounded memory.
+    pub retained_checkpoints: usize,
 }
 
 impl CheckpointConfig {
@@ -125,6 +129,7 @@ impl CheckpointConfig {
             timeout_ms: 60_000,
             min_pause_ms: 0,
             max_concurrent: 1,
+            retained_checkpoints: 2,
         }
     }
 }
@@ -219,12 +224,19 @@ impl CheckpointCoordinator {
         prev + 1 >= self.total_operators
     }
 
-    /// Registers a completed checkpoint.
+    /// Registers a completed checkpoint, dropping history past the
+    /// retention count. Recovery restores from the newest checkpoint, so
+    /// old ones only cost the full operator state they hold.
     pub fn complete_checkpoint(&self, checkpoint: StreamCheckpoint) {
         self.last_completed_ms
             .store(checkpoint.timestamp_ms as u64, Ordering::Relaxed);
         let mut completed = self.completed.lock();
         completed.push(checkpoint);
+        let keep = self.config.retained_checkpoints.max(1);
+        if completed.len() > keep {
+            let drop_count = completed.len() - keep;
+            completed.drain(..drop_count);
+        }
     }
 
     /// Returns the list of completed checkpoint IDs.

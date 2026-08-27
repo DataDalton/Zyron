@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::compute::PreHashMap;
-use zyron_common::Result;
+use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::SetOpType;
 
 use crate::batch::DataBatch;
@@ -22,46 +22,92 @@ pub struct SetOpOperator {
     op: SetOpType,
     all: bool,
     state: SetOpState,
-    /// Per-column decimal scales of the first left batch, used by the
+    /// Per-column declared types of the first left batch, used by the
     /// streaming UNION ALL path to align right-branch batches onto the
     /// operation's declared output type
-    stream_scales: Option<Vec<Option<u8>>>,
+    stream_declared: Option<Vec<(TypeId, Option<u8>)>>,
+    /// Query memory budget the materialized row store reserves against,
+    /// approximated by input batch size. The streaming UNION ALL path
+    /// buffers nothing and reserves nothing. None runs unbudgeted.
+    memory_budget: Option<std::sync::Arc<crate::context::QueryMemoryBudget>>,
 }
 
-/// Aligns a batch's decimal columns onto the target scales, which are the
-/// left branch's and therefore the operation's output type. The stored
-/// representation is a scaled integer, so without this equal values written
-/// at different scales hash and compare as different: UNION keeps both,
-/// INTERSECT and EXCEPT miss every cross-branch match. Returns None when
-/// nothing needed converting
-fn align_decimals(scales: &[Option<u8>], batch: &DataBatch) -> Result<Option<DataBatch>> {
+/// Aligns a batch onto the declared per-column output types, which are the
+/// left branch's and therefore the operation's. Merging mixed physical
+/// types is a wrong answer or a panic: a decimal at another scale hashes
+/// and compares as a different value, and a different variant either
+/// panics the row store or pushes a fabricated default. A column that
+/// cannot convert is a loud error. Returns None when nothing needed
+/// converting
+fn align_to_declared(
+    declared: &[(TypeId, Option<u8>)],
+    batch: &DataBatch,
+) -> Result<Option<DataBatch>> {
+    if batch.columns.len() != declared.len() {
+        return Err(ZyronError::ExecutionError(format!(
+            "set operation branch produced {} columns, expected {}",
+            batch.columns.len(),
+            declared.len()
+        )));
+    }
     let mut aligned: Option<Vec<Column>> = None;
     for (ci, col) in batch.columns.iter().enumerate() {
-        if col.type_id != zyron_common::TypeId::Decimal || ci >= scales.len() {
-            continue;
+        let (want_type, want_scale) = declared[ci];
+        if want_type == TypeId::Decimal {
+            let target = want_scale.unwrap_or(0);
+            if col.type_id == TypeId::Decimal && col.fractional_digits.unwrap_or(0) == target {
+                continue;
+            }
+            let cast = compute::cast_column_to_decimal(col, target)?;
+            aligned.get_or_insert_with(|| batch.columns.clone())[ci] = cast;
+        } else if matches!(want_type, TypeId::Timestamp | TypeId::TimestampTz)
+            && col.type_id == want_type
+        {
+            // One TypeId, two physical forms: i64 microseconds for p<=6 and
+            // i128 picoseconds for p>6. The microsecond side scales up
+            // exactly, the reverse would lose information and is refused
+            let want_ps = want_scale.unwrap_or(6) > 6;
+            let have_ps = col.fractional_digits.unwrap_or(6) > 6;
+            if want_ps && !have_ps {
+                let cast = compute::scale_us_to_ps(col, want_scale)?;
+                aligned.get_or_insert_with(|| batch.columns.clone())[ci] = cast;
+            } else if !want_ps && have_ps {
+                return Err(ZyronError::ExecutionError(
+                    "cannot merge a picosecond timestamp branch into a microsecond set \
+                     operation column, put the higher-precision branch first"
+                        .to_string(),
+                ));
+            }
+        } else if col.type_id != want_type && want_type != TypeId::Null {
+            let cast = compute::cast_column(col, want_type)?;
+            aligned.get_or_insert_with(|| batch.columns.clone())[ci] = cast;
         }
-        let target = scales[ci].unwrap_or(0);
-        if col.fractional_digits.unwrap_or(0) == target {
-            continue;
-        }
-        let cast = compute::cast_column_to_decimal(col, target)?;
-        aligned.get_or_insert_with(|| batch.columns.clone())[ci] = cast;
     }
     Ok(aligned.map(DataBatch::new))
 }
 
-/// Aligns a streamed right-branch batch onto the captured left scales,
+/// The declared type of each output column, from the first batch the
+/// operation saw.
+fn declared_of(batch: &DataBatch) -> Vec<(TypeId, Option<u8>)> {
+    batch
+        .columns
+        .iter()
+        .map(|c| (c.type_id, c.fractional_digits))
+        .collect()
+}
+
+/// Aligns a streamed right-branch batch onto the captured left types,
 /// passing everything else through untouched. An absent capture means the
-/// left branch produced no batch, and the schema's declared scales stand
+/// left branch produced no batch, and the branch's own types stand
 fn align_streamed(
     eb: Option<ExecutionBatch>,
-    scales: &Option<Vec<Option<u8>>>,
+    declared: &Option<Vec<(TypeId, Option<u8>)>>,
 ) -> Result<Option<ExecutionBatch>> {
     let Some(eb) = eb else { return Ok(None) };
-    let Some(scales) = scales else {
+    let Some(declared) = declared else {
         return Ok(Some(eb));
     };
-    match align_decimals(scales, &eb.batch)? {
+    match align_to_declared(declared, &eb.batch)? {
         Some(batch) => Ok(Some(ExecutionBatch::new(batch))),
         None => Ok(Some(eb)),
     }
@@ -87,10 +133,10 @@ struct RowStore {
     hash_map: PreHashMap<u64, Vec<usize>>,
     counts: Vec<usize>,
     num_rows: usize,
-    /// Per-column decimal scale of the first batch seen, which is the left
+    /// Per-column declared type of the first batch seen, which is the left
     /// branch and therefore the operation's declared output type. Every
-    /// later batch aligns its decimal columns onto these before hashing
-    scales: Vec<Option<u8>>,
+    /// later batch aligns onto these before hashing
+    declared: Vec<(TypeId, Option<u8>)>,
 }
 
 impl RowStore {
@@ -100,7 +146,7 @@ impl RowStore {
             hash_map: PreHashMap::default(),
             counts: Vec::new(),
             num_rows: 0,
-            scales: Vec::new(),
+            declared: Vec::new(),
         }
     }
 
@@ -117,7 +163,21 @@ impl RowStore {
                     )
                 })
                 .collect();
-            self.scales = batch.columns.iter().map(|c| c.fractional_digits).collect();
+            self.declared = declared_of(batch);
+        }
+        // A column typed NULL says nothing about the operation's type. The
+        // first branch that brings a real type claims it, and the store
+        // column, which holds only nulls so far, rebuilds as that type
+        for (ci, col) in batch.columns.iter().enumerate() {
+            if ci < self.declared.len()
+                && self.declared[ci].0 == TypeId::Null
+                && col.type_id != TypeId::Null
+            {
+                self.declared[ci] = (col.type_id, col.fractional_digits);
+                let held = self.columns[ci].len();
+                self.columns[ci] = Column::null_column(col.type_id, held);
+                self.columns[ci].fractional_digits = col.fractional_digits;
+            }
         }
     }
 
@@ -209,7 +269,24 @@ impl SetOpOperator {
             op,
             all,
             state,
-            stream_scales: None,
+            stream_declared: None,
+            memory_budget: None,
+        }
+    }
+
+    /// Attaches the query memory budget. Set by the operator builder from
+    /// the execution context.
+    pub fn set_memory_budget(
+        &mut self,
+        budget: Option<std::sync::Arc<crate::context::QueryMemoryBudget>>,
+    ) {
+        self.memory_budget = budget;
+    }
+
+    fn reserve_memory(&self, bytes: u64) -> Result<()> {
+        match &self.memory_budget {
+            Some(budget) => budget.reserve(bytes),
+            None => Ok(()),
         }
     }
 
@@ -229,9 +306,10 @@ impl SetOpOperator {
         loop {
             match self.left.next().await? {
                 Some(eb) => {
+                    self.reserve_memory(eb.batch.approx_bytes())?;
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
-                    let realigned = align_decimals(&store.scales, batch)?;
+                    let realigned = align_to_declared(&store.declared, batch)?;
                     let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
@@ -247,9 +325,10 @@ impl SetOpOperator {
         loop {
             match self.right.next().await? {
                 Some(eb) => {
+                    self.reserve_memory(eb.batch.approx_bytes())?;
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
-                    let realigned = align_decimals(&store.scales, batch)?;
+                    let realigned = align_to_declared(&store.declared, batch)?;
                     let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
@@ -276,9 +355,10 @@ impl SetOpOperator {
         loop {
             match self.left.next().await? {
                 Some(eb) => {
+                    self.reserve_memory(eb.batch.approx_bytes())?;
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
-                    let realigned = align_decimals(&store.scales, batch)?;
+                    let realigned = align_to_declared(&store.declared, batch)?;
                     let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
@@ -297,8 +377,9 @@ impl SetOpOperator {
         loop {
             match self.right.next().await? {
                 Some(eb) => {
+                    self.reserve_memory(eb.batch.approx_bytes())?;
                     let batch = &eb.batch;
-                    let realigned = align_decimals(&store.scales, batch)?;
+                    let realigned = align_to_declared(&store.declared, batch)?;
                     let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
@@ -341,9 +422,10 @@ impl SetOpOperator {
         loop {
             match self.left.next().await? {
                 Some(eb) => {
+                    self.reserve_memory(eb.batch.approx_bytes())?;
                     let batch = &eb.batch;
                     store.ensure_columns(batch);
-                    let realigned = align_decimals(&store.scales, batch)?;
+                    let realigned = align_to_declared(&store.declared, batch)?;
                     let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
@@ -361,8 +443,9 @@ impl SetOpOperator {
         loop {
             match self.right.next().await? {
                 Some(eb) => {
+                    self.reserve_memory(eb.batch.approx_bytes())?;
                     let batch = &eb.batch;
-                    let realigned = align_decimals(&store.scales, batch)?;
+                    let realigned = align_to_declared(&store.declared, batch)?;
                     let batch = realigned.as_ref().unwrap_or(batch);
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
@@ -429,24 +512,20 @@ impl Operator for SetOpOperator {
                     // UNION ALL: drain left first, then right.
                     match self.left.next().await? {
                         Some(eb) => {
-                            if self.stream_scales.is_none() {
-                                self.stream_scales = Some(
-                                    eb.batch
-                                        .columns
-                                        .iter()
-                                        .map(|c| c.fractional_digits)
-                                        .collect(),
-                                );
+                            if self.stream_declared.is_none() {
+                                self.stream_declared = Some(declared_of(&eb.batch));
                             }
                             Ok(Some(eb))
                         }
                         None => {
                             self.state = SetOpState::Right;
-                            align_streamed(self.right.next().await?, &self.stream_scales)
+                            align_streamed(self.right.next().await?, &self.stream_declared)
                         }
                     }
                 }
-                SetOpState::Right => align_streamed(self.right.next().await?, &self.stream_scales),
+                SetOpState::Right => {
+                    align_streamed(self.right.next().await?, &self.stream_declared)
+                }
                 SetOpState::Materialized { result, cursor } => {
                     let Some(batch) = result else {
                         self.state = SetOpState::Done;
@@ -486,10 +565,10 @@ fn column_values_equal_cross(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx
         (ColumnData::UInt32(va), ColumnData::UInt32(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::UInt64(va), ColumnData::UInt64(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::Float32(va), ColumnData::Float32(vb)) => {
-            va[a_idx].to_bits() == vb[b_idx].to_bits()
+            crate::compute::f32_key_eq(va[a_idx], vb[b_idx])
         }
         (ColumnData::Float64(va), ColumnData::Float64(vb)) => {
-            va[a_idx].to_bits() == vb[b_idx].to_bits()
+            crate::compute::f64_key_eq(va[a_idx], vb[b_idx])
         }
         (ColumnData::Utf8(va), ColumnData::Utf8(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] == vb[b_idx],

@@ -2,7 +2,8 @@
 //!
 //! Evaluates constant sub-expressions at plan time and simplifies
 //! boolean logic to reduce runtime computation.
-//! Uses a changed-flag pattern to avoid cloning unchanged plan trees.
+//! The fold functions return None for an unchanged subtree, so untouched
+//! nodes allocate nothing and unchanged plan children are reused by Arc.
 
 use crate::binder::BoundExpr;
 use crate::logical::LogicalPlan;
@@ -20,45 +21,72 @@ impl OptimizationRule for ConstantFolding {
     }
 
     fn apply(&self, plan: &LogicalPlan, _catalog: &Catalog) -> Option<LogicalPlan> {
-        let (folded, changed) = fold_plan(plan);
-        if changed { Some(folded) } else { None }
+        fold_plan(plan)
     }
 }
 
-/// Returns (folded_plan, changed). Only clones nodes that actually change.
-fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
+use super::rebuilt_child;
+
+/// Rebuilds a folded child expression, cloning the original only when the
+/// parent is being rebuilt around an unchanged child
+fn child_box(original: &BoundExpr, folded: Option<BoundExpr>) -> Box<BoundExpr> {
+    match folded {
+        Some(e) => Box::new(e),
+        None => Box::new(original.clone()),
+    }
+}
+
+/// Folds a list of expressions. None when every element is unchanged,
+/// otherwise the fully rebuilt list
+fn fold_expr_list(exprs: &[BoundExpr]) -> Option<Vec<BoundExpr>> {
+    let folded: Vec<Option<BoundExpr>> = exprs.iter().map(fold_expr).collect();
+    if folded.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(
+        folded
+            .into_iter()
+            .zip(exprs.iter())
+            .map(|(f, orig)| f.unwrap_or_else(|| orig.clone()))
+            .collect(),
+    )
+}
+
+/// Returns the folded plan, or None when nothing under this node changed.
+fn fold_plan(plan: &LogicalPlan) -> Option<LogicalPlan> {
     match plan {
         LogicalPlan::Filter { predicate, child } => {
-            let (folded_child, child_changed) = fold_plan(child);
-            let (folded_pred, pred_changed) = fold_expr(predicate);
+            let folded_child = fold_plan(child);
+            let folded_pred = fold_expr(predicate);
+            let effective_pred = folded_pred.as_ref().unwrap_or(predicate);
 
             // Filter with TRUE predicate: remove the filter
-            if is_true_literal(&folded_pred) {
-                return (folded_child, true);
+            if is_true_literal(effective_pred) {
+                return Some(match folded_child {
+                    Some(p) => p,
+                    None => (**child).clone(),
+                });
             }
 
             // Filter with FALSE predicate: replace with empty Values
-            if is_false_literal(&folded_pred) {
-                return (
-                    LogicalPlan::Values {
-                        rows: vec![],
-                        schema: folded_child.output_schema(),
-                    },
-                    true,
-                );
+            if is_false_literal(effective_pred) {
+                let schema = match &folded_child {
+                    Some(p) => p.output_schema(),
+                    None => child.output_schema(),
+                };
+                return Some(LogicalPlan::Values {
+                    rows: vec![],
+                    schema,
+                });
             }
 
-            if child_changed || pred_changed {
-                (
-                    LogicalPlan::Filter {
-                        predicate: folded_pred,
-                        child: Arc::new(folded_child),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            if folded_child.is_none() && folded_pred.is_none() {
+                return None;
             }
+            Some(LogicalPlan::Filter {
+                predicate: folded_pred.unwrap_or_else(|| predicate.clone()),
+                child: rebuilt_child(child, folded_child),
+            })
         }
         LogicalPlan::Project {
             expressions,
@@ -66,32 +94,17 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             child,
             output_table_idx,
         } => {
-            let (folded_child, child_changed) = fold_plan(child);
-            let mut any_expr_changed = false;
-            let folded_exprs: Vec<BoundExpr> = expressions
-                .iter()
-                .map(|e| {
-                    let (fe, changed) = fold_expr(e);
-                    if changed {
-                        any_expr_changed = true;
-                    }
-                    fe
-                })
-                .collect();
-
-            if child_changed || any_expr_changed {
-                (
-                    LogicalPlan::Project {
-                        expressions: folded_exprs,
-                        aliases: aliases.clone(),
-                        child: Arc::new(folded_child),
-                        output_table_idx: *output_table_idx,
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            let folded_child = fold_plan(child);
+            let folded_exprs = fold_expr_list(expressions);
+            if folded_child.is_none() && folded_exprs.is_none() {
+                return None;
             }
+            Some(LogicalPlan::Project {
+                expressions: folded_exprs.unwrap_or_else(|| expressions.clone()),
+                aliases: aliases.clone(),
+                child: rebuilt_child(child, folded_child),
+                output_table_idx: *output_table_idx,
+            })
         }
         LogicalPlan::Join {
             left,
@@ -99,104 +112,64 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             join_type,
             condition,
         } => {
-            let (folded_left, left_changed) = fold_plan(left);
-            let (folded_right, right_changed) = fold_plan(right);
-            let (folded_condition, cond_changed) = match condition {
+            let folded_left = fold_plan(left);
+            let folded_right = fold_plan(right);
+            let folded_condition = match condition {
                 crate::logical::JoinCondition::On(expr) => {
-                    let (fe, changed) = fold_expr(expr);
-                    (crate::logical::JoinCondition::On(fe), changed)
+                    fold_expr(expr).map(crate::logical::JoinCondition::On)
                 }
-                other => (other.clone(), false),
+                _ => None,
             };
-            if left_changed || right_changed || cond_changed {
-                (
-                    LogicalPlan::Join {
-                        left: Arc::new(folded_left),
-                        right: Arc::new(folded_right),
-                        join_type: *join_type,
-                        condition: folded_condition,
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            if folded_left.is_none() && folded_right.is_none() && folded_condition.is_none() {
+                return None;
             }
+            Some(LogicalPlan::Join {
+                left: rebuilt_child(left, folded_left),
+                right: rebuilt_child(right, folded_right),
+                join_type: *join_type,
+                condition: folded_condition.unwrap_or_else(|| condition.clone()),
+            })
         }
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
             child,
         } => {
-            let (folded_child, child_changed) = fold_plan(child);
-            let mut any_changed = false;
-            let folded_group_by: Vec<BoundExpr> = group_by
-                .iter()
-                .map(|e| {
-                    let (fe, changed) = fold_expr(e);
-                    if changed {
-                        any_changed = true;
-                    }
-                    fe
-                })
-                .collect();
-            if child_changed || any_changed {
-                (
-                    LogicalPlan::Aggregate {
-                        group_by: folded_group_by,
-                        aggregates: aggregates.clone(),
-                        child: Arc::new(folded_child),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            let folded_child = fold_plan(child);
+            let folded_group_by = fold_expr_list(group_by);
+            if folded_child.is_none() && folded_group_by.is_none() {
+                return None;
             }
+            Some(LogicalPlan::Aggregate {
+                group_by: folded_group_by.unwrap_or_else(|| group_by.clone()),
+                aggregates: aggregates.clone(),
+                child: rebuilt_child(child, folded_child),
+            })
         }
         LogicalPlan::Sort { order_by, child } => {
-            let (folded_child, changed) = fold_plan(child);
-            if changed {
-                (
-                    LogicalPlan::Sort {
-                        order_by: order_by.clone(),
-                        child: Arc::new(folded_child),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let folded_child = fold_plan(child)?;
+            Some(LogicalPlan::Sort {
+                order_by: order_by.clone(),
+                child: Arc::new(folded_child),
+            })
         }
         LogicalPlan::Limit {
             limit,
             offset,
             child,
         } => {
-            let (folded_child, changed) = fold_plan(child);
-            if changed {
-                (
-                    LogicalPlan::Limit {
-                        limit: *limit,
-                        offset: *offset,
-                        child: Arc::new(folded_child),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let folded_child = fold_plan(child)?;
+            Some(LogicalPlan::Limit {
+                limit: *limit,
+                offset: *offset,
+                child: Arc::new(folded_child),
+            })
         }
         LogicalPlan::Distinct { child } => {
-            let (folded_child, changed) = fold_plan(child);
-            if changed {
-                (
-                    LogicalPlan::Distinct {
-                        child: Arc::new(folded_child),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let folded_child = fold_plan(child)?;
+            Some(LogicalPlan::Distinct {
+                child: Arc::new(folded_child),
+            })
         }
         LogicalPlan::SetOp {
             op,
@@ -204,21 +177,17 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             left,
             right,
         } => {
-            let (fl, lc) = fold_plan(left);
-            let (fr, rc) = fold_plan(right);
-            if lc || rc {
-                (
-                    LogicalPlan::SetOp {
-                        op: *op,
-                        all: *all,
-                        left: Arc::new(fl),
-                        right: Arc::new(fr),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            let folded_left = fold_plan(left);
+            let folded_right = fold_plan(right);
+            if folded_left.is_none() && folded_right.is_none() {
+                return None;
             }
+            Some(LogicalPlan::SetOp {
+                op: *op,
+                all: *all,
+                left: rebuilt_child(left, folded_left),
+                right: rebuilt_child(right, folded_right),
+            })
         }
         LogicalPlan::Insert {
             table_id,
@@ -228,22 +197,15 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             expectations,
             source,
         } => {
-            let (fs, changed) = fold_plan(source);
-            if changed {
-                (
-                    LogicalPlan::Insert {
-                        table_id: *table_id,
-                        target_columns: target_columns.clone(),
-                        column_defaults: column_defaults.clone(),
-                        check_constraints: check_constraints.clone(),
-                        expectations: expectations.clone(),
-                        source: Arc::new(fs),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let folded_source = fold_plan(source)?;
+            Some(LogicalPlan::Insert {
+                table_id: *table_id,
+                target_columns: target_columns.clone(),
+                column_defaults: column_defaults.clone(),
+                check_constraints: check_constraints.clone(),
+                expectations: expectations.clone(),
+                source: Arc::new(folded_source),
+            })
         }
         LogicalPlan::Update {
             table_id,
@@ -251,42 +213,28 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             check_constraints,
             child,
         } => {
-            let (fc, changed) = fold_plan(child);
-            if changed {
-                (
-                    LogicalPlan::Update {
-                        table_id: *table_id,
-                        assignments: assignments.clone(),
-                        check_constraints: check_constraints.clone(),
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let folded_child = fold_plan(child)?;
+            Some(LogicalPlan::Update {
+                table_id: *table_id,
+                assignments: assignments.clone(),
+                check_constraints: check_constraints.clone(),
+                child: Arc::new(folded_child),
+            })
         }
         LogicalPlan::Delete { table_id, child } => {
-            let (fc, changed) = fold_plan(child);
-            if changed {
-                (
-                    LogicalPlan::Delete {
-                        table_id: *table_id,
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let folded_child = fold_plan(child)?;
+            Some(LogicalPlan::Delete {
+                table_id: *table_id,
+                child: Arc::new(folded_child),
+            })
         }
         // Leaf nodes: no folding
-        _other => (plan.clone(), false),
+        _other => None,
     }
 }
 
-/// Returns (folded_expr, changed).
-fn fold_expr(expr: &BoundExpr) -> (BoundExpr, bool) {
+/// Returns the folded expression, or None when nothing under it changed.
+fn fold_expr(expr: &BoundExpr) -> Option<BoundExpr> {
     match expr {
         BoundExpr::BinaryOp {
             left,
@@ -294,8 +242,10 @@ fn fold_expr(expr: &BoundExpr) -> (BoundExpr, bool) {
             right,
             type_id,
         } => {
-            let (folded_left, lc) = fold_expr(left);
-            let (folded_right, rc) = fold_expr(right);
+            let folded_left = fold_expr(left);
+            let folded_right = fold_expr(right);
+            let effective_left = folded_left.as_ref().unwrap_or(left);
+            let effective_right = folded_right.as_ref().unwrap_or(right);
 
             // Arithmetic on two integer literals
             if let (
@@ -307,16 +257,13 @@ fn fold_expr(expr: &BoundExpr) -> (BoundExpr, bool) {
                     value: LiteralValue::Integer(r),
                     ..
                 },
-            ) = (&folded_left, &folded_right)
+            ) = (effective_left, effective_right)
             {
                 if let Some(result) = fold_integer_op(*l, *op, *r) {
-                    return (
-                        BoundExpr::Literal {
-                            value: result,
-                            type_id: *type_id,
-                        },
-                        true,
-                    );
+                    return Some(BoundExpr::Literal {
+                        value: result,
+                        type_id: *type_id,
+                    });
                 }
             }
 
@@ -330,187 +277,156 @@ fn fold_expr(expr: &BoundExpr) -> (BoundExpr, bool) {
                     value: LiteralValue::Float(r),
                     ..
                 },
-            ) = (&folded_left, &folded_right)
+            ) = (effective_left, effective_right)
             {
                 if let Some(result) = fold_float_op(*l, *op, *r) {
-                    return (
-                        BoundExpr::Literal {
-                            value: result,
-                            type_id: *type_id,
-                        },
-                        true,
-                    );
+                    return Some(BoundExpr::Literal {
+                        value: result,
+                        type_id: *type_id,
+                    });
                 }
             }
 
             // Boolean simplification: x AND true -> x
             if *op == BinaryOperator::And {
-                if is_true_literal(&folded_right) {
-                    return (folded_left, true);
+                if is_true_literal(effective_right) {
+                    return Some(match folded_left {
+                        Some(e) => e,
+                        None => (**left).clone(),
+                    });
                 }
-                if is_true_literal(&folded_left) {
-                    return (folded_right, true);
+                if is_true_literal(effective_left) {
+                    return Some(match folded_right {
+                        Some(e) => e,
+                        None => (**right).clone(),
+                    });
                 }
-                if is_false_literal(&folded_left) || is_false_literal(&folded_right) {
-                    return (
-                        BoundExpr::Literal {
-                            value: LiteralValue::Boolean(false),
-                            type_id: TypeId::Boolean,
-                        },
-                        true,
-                    );
+                if is_false_literal(effective_left) || is_false_literal(effective_right) {
+                    return Some(BoundExpr::Literal {
+                        value: LiteralValue::Boolean(false),
+                        type_id: TypeId::Boolean,
+                    });
                 }
             }
 
             // Boolean simplification: x OR true -> true
             if *op == BinaryOperator::Or {
-                if is_true_literal(&folded_left) || is_true_literal(&folded_right) {
-                    return (
-                        BoundExpr::Literal {
-                            value: LiteralValue::Boolean(true),
-                            type_id: TypeId::Boolean,
-                        },
-                        true,
-                    );
+                if is_true_literal(effective_left) || is_true_literal(effective_right) {
+                    return Some(BoundExpr::Literal {
+                        value: LiteralValue::Boolean(true),
+                        type_id: TypeId::Boolean,
+                    });
                 }
-                if is_false_literal(&folded_right) {
-                    return (folded_left, true);
+                if is_false_literal(effective_right) {
+                    return Some(match folded_left {
+                        Some(e) => e,
+                        None => (**left).clone(),
+                    });
                 }
-                if is_false_literal(&folded_left) {
-                    return (folded_right, true);
+                if is_false_literal(effective_left) {
+                    return Some(match folded_right {
+                        Some(e) => e,
+                        None => (**right).clone(),
+                    });
                 }
             }
 
-            if lc || rc {
-                (
-                    BoundExpr::BinaryOp {
-                        left: Box::new(folded_left),
-                        op: *op,
-                        right: Box::new(folded_right),
-                        type_id: *type_id,
-                    },
-                    true,
-                )
-            } else {
-                (expr.clone(), false)
+            if folded_left.is_none() && folded_right.is_none() {
+                return None;
             }
+            Some(BoundExpr::BinaryOp {
+                left: child_box(left, folded_left),
+                op: *op,
+                right: child_box(right, folded_right),
+                type_id: *type_id,
+            })
         }
         BoundExpr::UnaryOp {
             op: zyron_parser::ast::UnaryOperator::Not,
             expr: inner,
             type_id,
         } => {
-            let (folded, changed) = fold_expr(inner);
+            let folded = fold_expr(inner);
             if let BoundExpr::Literal {
                 value: LiteralValue::Boolean(b),
                 ..
-            } = &folded
+            } = folded.as_ref().unwrap_or(inner)
             {
-                return (
-                    BoundExpr::Literal {
-                        value: LiteralValue::Boolean(!b),
-                        type_id: TypeId::Boolean,
-                    },
-                    true,
-                );
+                return Some(BoundExpr::Literal {
+                    value: LiteralValue::Boolean(!b),
+                    type_id: TypeId::Boolean,
+                });
             }
-            if changed {
-                (
-                    BoundExpr::UnaryOp {
-                        op: zyron_parser::ast::UnaryOperator::Not,
-                        expr: Box::new(folded),
-                        type_id: *type_id,
-                    },
-                    true,
-                )
-            } else {
-                (expr.clone(), false)
-            }
+            let folded_inner = folded?;
+            Some(BoundExpr::UnaryOp {
+                op: zyron_parser::ast::UnaryOperator::Not,
+                expr: Box::new(folded_inner),
+                type_id: *type_id,
+            })
         }
         BoundExpr::UnaryOp {
             op: zyron_parser::ast::UnaryOperator::Minus,
             expr: inner,
             type_id,
         } => {
-            let (folded, changed) = fold_expr(inner);
+            let folded = fold_expr(inner);
             if let BoundExpr::Literal {
                 value: LiteralValue::Integer(n),
                 ..
-            } = &folded
+            } = folded.as_ref().unwrap_or(inner)
             {
-                return (
-                    BoundExpr::Literal {
-                        value: LiteralValue::Integer(-n),
-                        type_id: *type_id,
-                    },
-                    true,
-                );
+                return Some(BoundExpr::Literal {
+                    value: LiteralValue::Integer(-n),
+                    type_id: *type_id,
+                });
             }
             if let BoundExpr::Literal {
                 value: LiteralValue::Float(n),
                 ..
-            } = &folded
+            } = folded.as_ref().unwrap_or(inner)
             {
-                return (
-                    BoundExpr::Literal {
-                        value: LiteralValue::Float(-n),
-                        type_id: *type_id,
-                    },
-                    true,
-                );
+                return Some(BoundExpr::Literal {
+                    value: LiteralValue::Float(-n),
+                    type_id: *type_id,
+                });
             }
-            if changed {
-                (
-                    BoundExpr::UnaryOp {
-                        op: zyron_parser::ast::UnaryOperator::Minus,
-                        expr: Box::new(folded),
-                        type_id: *type_id,
-                    },
-                    true,
-                )
-            } else {
-                (expr.clone(), false)
-            }
+            let folded_inner = folded?;
+            Some(BoundExpr::UnaryOp {
+                op: zyron_parser::ast::UnaryOperator::Minus,
+                expr: Box::new(folded_inner),
+                type_id: *type_id,
+            })
         }
         BoundExpr::IsNull {
             expr: inner,
             negated,
         } => {
-            let (folded, changed) = fold_expr(inner);
-            if let BoundExpr::Literal {
-                value: LiteralValue::Null,
-                ..
-            } = &folded
+            let folded = fold_expr(inner);
+            let effective = folded.as_ref().unwrap_or(inner);
+            if matches!(
+                effective,
+                BoundExpr::Literal {
+                    value: LiteralValue::Null,
+                    ..
+                }
+            ) {
+                return Some(BoundExpr::Literal {
+                    value: LiteralValue::Boolean(!negated),
+                    type_id: TypeId::Boolean,
+                });
+            }
+            if matches!(effective, BoundExpr::Literal { value, .. } if !matches!(value, LiteralValue::Null))
             {
-                return (
-                    BoundExpr::Literal {
-                        value: LiteralValue::Boolean(!negated),
-                        type_id: TypeId::Boolean,
-                    },
-                    true,
-                );
+                return Some(BoundExpr::Literal {
+                    value: LiteralValue::Boolean(*negated),
+                    type_id: TypeId::Boolean,
+                });
             }
-            if matches!(&folded, BoundExpr::Literal { value, .. } if !matches!(value, LiteralValue::Null))
-            {
-                return (
-                    BoundExpr::Literal {
-                        value: LiteralValue::Boolean(*negated),
-                        type_id: TypeId::Boolean,
-                    },
-                    true,
-                );
-            }
-            if changed {
-                (
-                    BoundExpr::IsNull {
-                        expr: Box::new(folded),
-                        negated: *negated,
-                    },
-                    true,
-                )
-            } else {
-                (expr.clone(), false)
-            }
+            let folded_inner = folded?;
+            Some(BoundExpr::IsNull {
+                expr: Box::new(folded_inner),
+                negated: *negated,
+            })
         }
         BoundExpr::Nested(inner) => fold_expr(inner),
         BoundExpr::Cast {
@@ -518,22 +434,15 @@ fn fold_expr(expr: &BoundExpr) -> (BoundExpr, bool) {
             target_type,
             fractional_digits,
         } => {
-            let (folded, changed) = fold_expr(inner);
-            if changed {
-                (
-                    BoundExpr::Cast {
-                        fractional_digits: *fractional_digits,
-                        expr: Box::new(folded),
-                        target_type: *target_type,
-                    },
-                    true,
-                )
-            } else {
-                (expr.clone(), false)
-            }
+            let folded_inner = fold_expr(inner)?;
+            Some(BoundExpr::Cast {
+                fractional_digits: *fractional_digits,
+                expr: Box::new(folded_inner),
+                target_type: *target_type,
+            })
         }
         // No folding for other expression types
-        _other => (expr.clone(), false),
+        _other => None,
     }
 }
 
@@ -626,8 +535,7 @@ mod tests {
             }),
             type_id: TypeId::Int64,
         };
-        let (folded, changed) = fold_expr(&expr);
-        assert!(changed);
+        let folded = fold_expr(&expr).expect("constant arithmetic folds");
         assert!(matches!(
             folded,
             BoundExpr::Literal {
@@ -654,8 +562,7 @@ mod tests {
             }),
             type_id: TypeId::Boolean,
         };
-        let (folded, changed) = fold_expr(&expr);
-        assert!(changed);
+        let folded = fold_expr(&expr).expect("AND true simplifies");
         assert!(matches!(folded, BoundExpr::ColumnRef(_)));
     }
 
@@ -676,8 +583,7 @@ mod tests {
             }),
             type_id: TypeId::Boolean,
         };
-        let (folded, changed) = fold_expr(&expr);
-        assert!(changed);
+        let folded = fold_expr(&expr).expect("AND false simplifies");
         assert!(matches!(
             folded,
             BoundExpr::Literal {
@@ -696,8 +602,7 @@ mod tests {
             }),
             negated: false,
         };
-        let (folded, changed) = fold_expr(&expr);
-        assert!(changed);
+        let folded = fold_expr(&expr).expect("IS NULL on literal folds");
         assert!(matches!(
             folded,
             BoundExpr::Literal {
@@ -717,8 +622,7 @@ mod tests {
             }),
             type_id: TypeId::Boolean,
         };
-        let (folded, changed) = fold_expr(&expr);
-        assert!(changed);
+        let folded = fold_expr(&expr).expect("NOT literal folds");
         assert!(matches!(
             folded,
             BoundExpr::Literal {
@@ -726,6 +630,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_unchanged_expression_returns_none() {
+        let expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
+            table_idx: 0,
+            column_id: zyron_catalog::ColumnId(0),
+            type_id: TypeId::Int64,
+            nullable: false,
+            fractional_digits: None,
+        });
+        assert!(fold_expr(&expr).is_none());
     }
 
     #[test]

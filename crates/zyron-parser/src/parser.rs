@@ -727,7 +727,7 @@ impl<'a> Parser<'a> {
             return self.parse_external_inline_ref();
         }
 
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         // Table-valued function call: name(args...) [AS alias]
         if self.at_token(&Token::LParen) {
@@ -916,10 +916,27 @@ impl<'a> Parser<'a> {
     // INSERT
     // -----------------------------------------------------------------------
 
+    /// A table name, with its schema and catalog when they are given.
+    ///
+    /// A qualified name arrives as separate identifier and dot tokens, so the
+    /// parts are joined back into one name here. Without this a dotted name is
+    /// a parse error at the dot, and every statement that names a table in
+    /// another schema is unwritable.
+    fn parse_qualified_name(&mut self) -> Result<String> {
+        let mut name = self.parse_ident()?;
+        while self.at_token(&Token::Dot) {
+            self.advance()?;
+            let part = self.parse_ident()?;
+            name.push('.');
+            name.push_str(&part);
+        }
+        Ok(name)
+    }
+
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
 
         // Optional column list
         let columns = if self.at_token(&Token::LParen) {
@@ -995,7 +1012,7 @@ impl<'a> Parser<'a> {
 
     fn parse_update(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Update)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::Set)?;
 
         let assignments = self.parse_comma_separated(|p| p.parse_assignment())?;
@@ -1030,7 +1047,7 @@ impl<'a> Parser<'a> {
     fn parse_delete(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Delete)?;
         self.expect_keyword(Keyword::From)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
 
         let where_clause = if self.consume_keyword(Keyword::Where)? {
             Some(Box::new(self.parse_expr()?))

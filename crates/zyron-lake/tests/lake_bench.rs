@@ -25,6 +25,9 @@
 //! repo used to carry. They are written to the run file so a baseline can
 //! be read off it.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

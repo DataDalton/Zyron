@@ -227,6 +227,9 @@ impl Operator for SeqScanOperator {
             }
             self.ctx.check_cancelled()?;
 
+            let mut timer = crate::calibrate::BatchTimer::start(
+                zyron_pressure::capability::OperatorKind::SeqScan,
+            );
             let batch_size = self.ctx.batch_size;
             let count_only =
                 self.output_columns.is_empty() && self.predicate.is_none() && !self.track_tuple_ids;
@@ -349,6 +352,10 @@ impl Operator for SeqScanOperator {
             if let Some(stats) = &self.io_stats {
                 stats.record_seq_batch(row_count as u64, pages_read * PAGE_SIZE as u64);
             }
+            // Set once, ahead of every return below. The timer records when it
+            // drops, so each exit path reports the rows it actually produced
+            // without a call of its own
+            timer.rows(row_count as u64);
 
             if row_count == 0 {
                 self.finished = true;
@@ -415,6 +422,9 @@ pub struct ParallelSeqScanOperator {
     /// being mistaken for clean end-of-stream, which would silently truncate
     /// the result set.
     workers: Vec<tokio::task::JoinHandle<()>>,
+    /// Parallel work permits held for as long as the workers run. Dropping
+    /// this hands the machine's capacity back to whatever query asks next
+    _grant: crate::parallel_pool::DopGrant,
 }
 
 impl ParallelSeqScanOperator {
@@ -434,13 +444,15 @@ impl ParallelSeqScanOperator {
             stats.record_seq_scan();
         }
 
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(num_pages as usize)
-            .max(1);
+        // The page count is the split the data supports. What the machine can
+        // currently afford is a different question, and the pool answers it:
+        // a scan planned while fifty others are running is handed fewer
+        // workers than the same scan on an idle node
+        let natural_workers = (num_pages as usize).max(1);
+        let grant = crate::parallel_pool::reserve(natural_workers);
+        let num_workers = grant.workers().min(natural_workers).max(1);
 
-        let pages_per_worker = (num_pages + num_workers as u64 - 1) / num_workers as u64;
+        let pages_per_worker = num_pages.div_ceil(num_workers as u64);
 
         // Channel capacity: 2 batches per worker to keep workers busy
         // without unbounded buffering.
@@ -461,7 +473,11 @@ impl ParallelSeqScanOperator {
             let columns = columns.clone();
             let predicate = predicate.clone();
 
-            workers.push(tokio::spawn(async move {
+            // The shared pool, not the current runtime. On the serving path
+            // the current runtime drives one connection, so spawning there
+            // would put every worker on the one thread and the split would
+            // buy nothing
+            workers.push(crate::parallel_pool::spawn(async move {
                 let result = scan_page_range(
                     &ctx,
                     &table_entry,
@@ -484,6 +500,7 @@ impl ParallelSeqScanOperator {
             receiver: rx,
             finished: false,
             workers,
+            _grant: grant,
         })
     }
 }
@@ -802,20 +819,22 @@ fn extract_scan_bounds(
             right,
             ..
         } => {
+            // An exclusive bound scans from the boundary value itself. Byte
+            // arithmetic on the key is wrong for variable-length values
+            // (incrementing 'abc' to 'abd' skips 'abcd'), and the predicate
+            // is always re-applied as a post-filter, so the boundary value's
+            // own rows drop there
             if let Some(bytes) = match_column_op_literal(left, right, index_col_id, params) {
-                // Start just after this key. For integer keys, increment by 1.
-                let start = increment_key(&bytes);
                 return ScanBounds {
-                    start_key: Some(start),
+                    start_key: Some(bytes),
                     end_key: None,
                 };
             }
             // literal > col means col < literal
             if let Some(bytes) = match_literal_op_column(left, right, index_col_id, params) {
-                let end = decrement_key(&bytes);
                 return ScanBounds {
                     start_key: None,
-                    end_key: Some(end),
+                    end_key: Some(bytes),
                 };
             }
         }
@@ -846,17 +865,17 @@ fn extract_scan_bounds(
             right,
             ..
         } => {
+            // Same boundary-value rule as Gt: the bound stays at the value
+            // and the post-filter excludes the value's own rows
             if let Some(bytes) = match_column_op_literal(left, right, index_col_id, params) {
-                let end = decrement_key(&bytes);
                 return ScanBounds {
                     start_key: None,
-                    end_key: Some(end),
+                    end_key: Some(bytes),
                 };
             }
             if let Some(bytes) = match_literal_op_column(left, right, index_col_id, params) {
-                let start = increment_key(&bytes);
                 return ScanBounds {
-                    start_key: Some(start),
+                    start_key: Some(bytes),
                     end_key: None,
                 };
             }
@@ -1108,34 +1127,6 @@ fn pick_earlier_key(a: Option<Vec<u8>>, b: Option<Vec<u8>>) -> Option<Vec<u8>> {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
-}
-
-/// Increments a big-endian byte key by 1. Used for exclusive lower bounds (>).
-fn increment_key(key: &[u8]) -> Vec<u8> {
-    let mut result = key.to_vec();
-    for byte in result.iter_mut().rev() {
-        if *byte < 255 {
-            *byte += 1;
-            return result;
-        }
-        *byte = 0;
-    }
-    // Overflow: push an extra byte (handles max key edge case).
-    result.push(0);
-    result
-}
-
-/// Decrements a big-endian byte key by 1. Used for exclusive upper bounds (<).
-fn decrement_key(key: &[u8]) -> Vec<u8> {
-    let mut result = key.to_vec();
-    for byte in result.iter_mut().rev() {
-        if *byte > 0 {
-            *byte -= 1;
-            return result;
-        }
-        *byte = 255;
-    }
-    result
 }
 
 /// Index-guided scan operator. Uses a B+ tree index to look up matching

@@ -91,51 +91,62 @@ impl CdcRetentionManager {
             .read_sync(&table_id, |_, policy| policy.clone())
     }
 
-    /// Enforces retention for all tables with policies. Called by the background worker.
-    pub fn enforce_all(&self) -> Result<RetentionStats> {
+    /// Enforces age retention for every registered feed, using the explicit
+    /// policy when one is set and the feed's own retention window otherwise.
+    /// The hold LSN is the slowest consumer's confirmed position, records
+    /// above it never age out, so a lagging replication slot or subscriber
+    /// never loses changes it has not confirmed. Failures are collected per
+    /// table so one bad feed never hides the rest
+    pub fn enforce_all(&self, hold_lsn: Option<u64>) -> (RetentionStats, Vec<(u32, ZyronError)>) {
         let mut stats = RetentionStats::default();
+        let mut failures = Vec::new();
 
-        let mut policies = Vec::new();
-        self.policies.iter_sync(|_id, policy| {
-            policies.push(policy.clone());
-            true
-        });
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
 
-        for policy in &policies {
-            if let Some(feed) = self.cdf_registry.get_feed(policy.table_id) {
-                stats.tables_processed += 1;
+        for (table_id, _count, _size, feed_retention_days) in self.cdf_registry.list_feeds() {
+            let policy = self.get_policy(table_id);
+            let retention_days = policy
+                .as_ref()
+                .map(|p| p.retention_days)
+                .unwrap_or(feed_retention_days);
+            // Zero days means the feed keeps everything until an explicit
+            // truncation, there is no age window to enforce
+            if retention_days == 0 {
+                continue;
+            }
+            let Some(feed) = self.cdf_registry.get_feed(table_id) else {
+                continue;
+            };
+            stats.tables_processed += 1;
 
-                // Calculate the minimum version to retain based on retention_days.
-                // For now, use a simple approach: purge records older than
-                // retention_days worth of versions. The actual version cutoff
-                // should be based on timestamps, but this requires scanning
-                // the CDF file. We use the time index for timestamp-based purge.
-                let retention_micros = policy.retention_days as i64 * 24 * 60 * 60 * 1_000_000;
-                let now_micros = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as i64;
-                let cutoff_ts = now_micros - retention_micros;
+            let retention_micros = retention_days as i64 * 24 * 60 * 60 * 1_000_000;
+            let cutoff_ts = now_micros - retention_micros;
 
-                // Find the maximum version before the cutoff timestamp without
-                // materializing all expired records into memory.
-                if let Some(max_version) = feed.max_version_before_time(cutoff_ts) {
-                    let size_before = feed.file_size_bytes();
-                    let purged = feed.purge_before_version(max_version + 1)?;
+            let size_before = feed.file_size_bytes();
+            match feed.purge_retention(cutoff_ts, hold_lsn) {
+                Ok(purged) => {
                     let size_after = feed.file_size_bytes();
                     stats.records_purged += purged;
                     stats.bytes_reclaimed += size_before.saturating_sub(size_after);
                 }
+                Err(e) => {
+                    failures.push((table_id, e));
+                    continue;
+                }
+            }
 
-                // Run compaction if enabled.
-                if policy.compaction_enabled {
-                    let compaction = self.compact_change_log(policy.table_id)?;
-                    stats.records_compacted += compaction.records_removed;
+            if policy.as_ref().is_some_and(|p| p.compaction_enabled) {
+                match self.compact_change_log(table_id) {
+                    Ok(compaction) => stats.records_compacted += compaction.records_removed,
+                    Err(e) => failures.push((table_id, e)),
                 }
             }
         }
 
-        Ok(stats)
+        (stats, failures)
     }
 
     /// Compacts the change log for a single table by removing redundant
@@ -157,7 +168,8 @@ impl CdcRetentionManager {
             .get_feed(table_id)
             .ok_or(ZyronError::CdcFeedNotEnabled { table_id })?;
 
-        let all_records = feed.query_changes(0, u64::MAX)?;
+        let view = feed.snapshot_for_compaction()?;
+        let all_records = view.records;
         if all_records.is_empty() {
             return Ok(CompactionStats::default());
         }
@@ -254,10 +266,13 @@ impl CdcRetentionManager {
             .map(|(_, r)| r)
             .collect();
 
-        // Clear the file entirely, then write back only the kept records.
-        feed.purge_before_version(u64::MAX)?;
-        if !kept_records.is_empty() {
-            feed.append_batch(&kept_records)?;
+        // One atomic rewrite through a temp file, so a crash leaves either
+        // the old log or the complete compacted one, never an empty file.
+        // Records appended since the snapshot survive, and a concurrent
+        // purge aborts the pass, the next cycle recompacts fresh state
+        let applied = feed.replace_compacted(view.epoch, view.record_count, kept_records)?;
+        if !applied {
+            return Ok(CompactionStats::default());
         }
 
         Ok(CompactionStats {

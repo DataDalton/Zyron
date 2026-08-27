@@ -32,7 +32,7 @@ impl CdcHook for CdcHookBridge {
         tuples: &[&[u8]],
         version: u64,
         timestamp: i64,
-        txn_id: u32,
+        txn_id: u64,
         is_last_in_txn: bool,
     ) -> Result<()> {
         // Write change records to CDC feed if enabled for this table
@@ -70,7 +70,7 @@ impl CdcHook for CdcHookBridge {
         old_data: &[&[u8]],
         version: u64,
         timestamp: i64,
-        txn_id: u32,
+        txn_id: u64,
         is_last_in_txn: bool,
     ) -> Result<()> {
         if let Some(feed) = self.cdc_registry.get_feed(table_id) {
@@ -106,7 +106,7 @@ impl CdcHook for CdcHookBridge {
         new_data: &[&[u8]],
         version: u64,
         timestamp: i64,
-        txn_id: u32,
+        txn_id: u64,
         is_last_in_txn: bool,
     ) -> Result<()> {
         if let Some(feed) = self.cdc_registry.get_feed(table_id) {
@@ -163,7 +163,7 @@ impl DmlHookBridge {
 }
 
 impl DmlHook for DmlHookBridge {
-    fn before_insert(&self, table_id: u32, _tuples: &[&[u8]], _txn_id: u32) -> Result<bool> {
+    fn before_insert(&self, table_id: u32, _tuples: &[&[u8]], _txn_id: u64) -> Result<bool> {
         // If no BEFORE INSERT triggers, allow the operation
         if !self
             .trigger_manager
@@ -187,7 +187,7 @@ impl DmlHook for DmlHookBridge {
         Ok(true)
     }
 
-    fn before_delete(&self, table_id: u32, _old_data: &[&[u8]], _txn_id: u32) -> Result<bool> {
+    fn before_delete(&self, table_id: u32, _old_data: &[&[u8]], _txn_id: u64) -> Result<bool> {
         if !self
             .trigger_manager
             .hasTriggers(table_id, TriggerTiming::Before, TriggerEvent::Delete)
@@ -209,7 +209,7 @@ impl DmlHook for DmlHookBridge {
         table_id: u32,
         _old_data: &[&[u8]],
         _new_data: &[&[u8]],
-        _txn_id: u32,
+        _txn_id: u64,
     ) -> Result<bool> {
         if !self
             .trigger_manager

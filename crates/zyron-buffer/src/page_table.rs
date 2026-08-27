@@ -21,6 +21,17 @@ const TOMBSTONE_KEY: u64 = u64::MAX - 1;
 /// reader never sees a real key paired with a stale value.
 const INPROGRESS_KEY: u64 = u64::MAX - 2;
 
+/// What a probe found in the slot it stopped on.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// Free and never used, the slot that ends a run
+    Empty,
+    /// Freed by a remove, reusable but not proof the key is absent
+    Tombstone,
+    /// Already holds the key, carrying this frame id
+    Holds(u32),
+}
+
 /// Result of an atomic insert-if-absent.
 ///
 /// `Inserted` means this call installed the frame. `Existing` means another frame
@@ -150,51 +161,126 @@ impl PageTable {
 
     fn insert_if_absent_hash(&self, page_id: PageId, frame_id: FrameId) -> InsertOutcome {
         let key = page_id.as_u64();
-        let mut idx = self.hash_index(key);
+        let capacity = self.hash_keys.len();
 
+        for _ in 0..capacity {
+            let Some((claim, expect)) = self.probe_for_claim(key) else {
+                return InsertOutcome::TableFull;
+            };
+            if let Slot::Holds(existing) = expect {
+                return InsertOutcome::Existing(FrameId(existing));
+            }
+            if !self.reserve(claim, expect) {
+                // Lost the slot to another inserter. Probe again from the
+                // start, the run has changed and the new occupant may be
+                // this very key
+                continue;
+            }
+            self.publish(claim, key, frame_id);
+
+            // Two inserters can still both publish when a removal turns a
+            // live slot into a tombstone between their reads of it. Each
+            // then looks for the first slot in the run holding the key and
+            // the later one stands down, so exactly one copy survives and
+            // both callers agree on which
+            match self.first_slot_holding(key) {
+                Some(winner) if winner != claim => {
+                    let existing = self.hash_values[winner].load(Ordering::Acquire);
+                    self.stand_down(claim);
+                    return InsertOutcome::Existing(FrameId(existing));
+                }
+                _ => return InsertOutcome::Inserted,
+            }
+        }
+        InsertOutcome::TableFull
+    }
+
+    /// What a probe found in a slot it may claim.
+    fn probe_for_claim(&self, key: u64) -> Option<(usize, Slot)> {
+        let mut idx = self.hash_index(key);
+        let mut first_tomb = None;
         for _ in 0..self.hash_keys.len() {
             // A reserved slot has to be resolved before this slot is judged.
             // The reservation may be about to publish this very key, and
             // probing past it would let both inserters take a slot for the
-            // same key, each getting Inserted, leaving one page id mapped to
-            // two frames and two copies of the page in the pool.
+            // same key, leaving one page id mapped to two frames and two
+            // copies of the page in the pool.
             //
-            // The wait is bounded by two stores in the reserving thread, with
-            // no I/O and no lock in between.
+            // The wait is bounded by two stores in the reserving thread,
+            // with no I/O and no lock in between
             let stored_key = self.await_slot_resolution(idx);
             if stored_key == key {
-                // Another inserter already owns this key
                 let existing = self.hash_values[idx].load(Ordering::Acquire);
-                return InsertOutcome::Existing(FrameId(existing));
+                return Some((idx, Slot::Holds(existing)));
             }
-            if stored_key == EMPTY_KEY || stored_key == TOMBSTONE_KEY {
-                // Reserve the slot exclusively with the in-progress marker before
-                // touching the value, so the staged value is never visible paired
-                // with a real key until this thread publishes it.
-                match self.hash_keys[idx].compare_exchange(
-                    stored_key,
-                    INPROGRESS_KEY,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        // Slot is ours. Stage the value, then publish the real key
-                        // so a reader that loads the key (Acquire) also loads the
-                        // matching value (Acquire).
-                        self.hash_values[idx].store(frame_id.0, Ordering::Release);
-                        self.hash_keys[idx].store(key, Ordering::Release);
-                        return InsertOutcome::Inserted;
-                    }
-                    Err(_) => {
-                        // Lost the slot. Re-examine it on the next loop iteration
-                        // without advancing, the new occupant may be our own key.
-                        continue;
-                    }
+            if stored_key == TOMBSTONE_KEY {
+                // Recorded, not taken. A tombstone is not proof the key is
+                // absent: the key can sit past it, put there while this slot
+                // still held a live one. Only the empty slot that ends the
+                // run proves absence, so the walk continues to it
+                if first_tomb.is_none() {
+                    first_tomb = Some(idx);
                 }
+            } else if stored_key == EMPTY_KEY {
+                // A tombstone is reused ahead of the empty slot, so a table
+                // that has been evicting for a long time does not fill with
+                // dead slots and start reporting itself full
+                return Some(match first_tomb {
+                    Some(tomb) => (tomb, Slot::Tombstone),
+                    None => (idx, Slot::Empty),
+                });
             }
             idx = (idx + 1) & self.hash_mask;
         }
-        InsertOutcome::TableFull
+        first_tomb.map(|tomb| (tomb, Slot::Tombstone))
+    }
+
+    /// Takes a slot exclusively with the in-progress marker.
+    #[inline]
+    fn reserve(&self, idx: usize, expect: Slot) -> bool {
+        let prior = match expect {
+            Slot::Tombstone => TOMBSTONE_KEY,
+            Slot::Empty => EMPTY_KEY,
+            Slot::Holds(_) => return false,
+        };
+        self.hash_keys[idx]
+            .compare_exchange(prior, INPROGRESS_KEY, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Gives up a published slot, always as a tombstone.
+    ///
+    /// Never as an empty slot, even when the claim displaced one. Another
+    /// key can have been placed past this slot while it was published, and
+    /// an empty here would end the run in front of it and lose it
+    #[inline]
+    fn stand_down(&self, idx: usize) {
+        self.hash_keys[idx].store(TOMBSTONE_KEY, Ordering::Release);
+    }
+
+    /// Stages the value under the reservation, then publishes the key, so a
+    /// reader that loads the key also loads the matching value.
+    #[inline]
+    fn publish(&self, idx: usize, key: u64, frame_id: FrameId) {
+        self.hash_values[idx].store(frame_id.0, Ordering::Release);
+        self.hash_keys[idx].store(key, Ordering::Release);
+    }
+
+    /// The first slot in the key's run that holds it, in the same order
+    /// `get` probes, so it names the copy every reader will find.
+    fn first_slot_holding(&self, key: u64) -> Option<usize> {
+        let mut idx = self.hash_index(key);
+        for _ in 0..self.hash_keys.len() {
+            let stored_key = self.await_slot_resolution(idx);
+            if stored_key == key {
+                return Some(idx);
+            }
+            if stored_key == EMPTY_KEY {
+                return None;
+            }
+            idx = (idx + 1) & self.hash_mask;
+        }
+        None
     }
 
     /// Reads a slot's key, waiting out an in-progress reservation so the
@@ -214,27 +300,34 @@ impl PageTable {
 
     fn insert_to_hash(&self, page_id: PageId, frame_id: FrameId) -> bool {
         let key = page_id.as_u64();
-        let mut idx = self.hash_index(key);
+        let capacity = self.hash_keys.len();
 
-        for _ in 0..self.hash_keys.len() {
-            // Same reason insert_if_absent_hash waits: a reservation about to
-            // publish this key must not be probed past, or the key lands in
-            // two slots
-            let stored_key = self.await_slot_resolution(idx);
-            if stored_key == EMPTY_KEY || stored_key == TOMBSTONE_KEY {
-                // Empty or tombstone slot - insert here
-                self.hash_values[idx].store(frame_id.0, Ordering::Release);
-                self.hash_keys[idx].store(key, Ordering::Release);
+        for _ in 0..capacity {
+            let Some((claim, expect)) = self.probe_for_claim(key) else {
+                return false;
+            };
+            if matches!(expect, Slot::Holds(_)) {
+                self.hash_values[claim].store(frame_id.0, Ordering::Release);
                 return true;
             }
-            if stored_key == key {
-                // Update existing entry
-                self.hash_values[idx].store(frame_id.0, Ordering::Release);
-                return true;
+            if !self.reserve(claim, expect) {
+                continue;
             }
-            idx = (idx + 1) & self.hash_mask;
+            self.publish(claim, key, frame_id);
+
+            // Same stand-down rule the insert-if-absent path uses, so a race
+            // cannot leave one page id in two slots. The earlier slot keeps
+            // the mapping and takes this frame id, because a plain insert
+            // overwrites whatever was mapped
+            if let Some(winner) = self.first_slot_holding(key) {
+                if winner != claim {
+                    self.hash_values[winner].store(frame_id.0, Ordering::Release);
+                    self.stand_down(claim);
+                }
+            }
+            return true;
         }
-        false // Table full
+        false
     }
 
     /// Removes a page ID mapping. Returns the frame ID if it was present.
@@ -488,6 +581,144 @@ mod tests {
                     assert_eq!(got, winner, "every caller resolves to the winning frame");
                 }
             }
+        }
+    }
+
+    /// Two page ids that land on the same slot, so the second sits one past
+    /// the first.
+    fn colliding_pair(table: &PageTable) -> (PageId, PageId) {
+        let first = PageId::new(1, 1);
+        let target = table.hash_index(first.as_u64());
+        for n in 2..2_000_000u64 {
+            let candidate = PageId::new(1, n);
+            if table.hash_index(candidate.as_u64()) == target {
+                return (first, candidate);
+            }
+        }
+        panic!("no colliding page id found");
+    }
+
+    /// Every slot in the table that holds this key. The table's whole
+    /// contract is that the answer is never longer than one entry, and the
+    /// pool depends on it: two frames for one page id means a write through
+    /// one is invisible through the other.
+    fn slots_holding(table: &PageTable, page_id: PageId) -> Vec<usize> {
+        let key = page_id.as_u64();
+        (0..table.hash_keys.len())
+            .filter(|&i| table.hash_keys[i].load(Ordering::Relaxed) == key)
+            .collect()
+    }
+
+    /// A tombstone in front of a live key is not proof the key is absent.
+    /// An insert that stops there installs a second frame for a page that
+    /// is already mapped, and the remove that follows tombstones only the
+    /// copy it reaches, leaving the other one answering lookups.
+    #[test]
+    fn insert_if_absent_refuses_a_page_that_sits_behind_a_tombstone() {
+        let table = PageTable::new(64);
+        let (front, behind) = colliding_pair(&table);
+
+        assert!(table.insert(front, FrameId(1)));
+        assert!(matches!(
+            table.insert_if_absent(behind, FrameId(2)),
+            InsertOutcome::Inserted
+        ));
+        assert_eq!(table.remove(front), Some(FrameId(1)));
+
+        match table.insert_if_absent(behind, FrameId(3)) {
+            InsertOutcome::Existing(frame) => assert_eq!(frame, FrameId(2)),
+            InsertOutcome::Inserted => panic!("one page id was mapped to two frames"),
+            InsertOutcome::TableFull => panic!("table reported full with 62 slots free"),
+        }
+        assert_eq!(slots_holding(&table, behind).len(), 1);
+        assert_eq!(table.get(behind), Some(FrameId(2)));
+        assert_eq!(table.remove(behind), Some(FrameId(2)));
+        assert_eq!(table.get(behind), None, "remove left a stale mapping");
+    }
+
+    /// The plain insert has the same run to walk, and updating in place is
+    /// the only outcome that keeps one slot per key.
+    #[test]
+    fn insert_updates_a_page_that_sits_behind_a_tombstone() {
+        let table = PageTable::new(64);
+        let (front, behind) = colliding_pair(&table);
+
+        assert!(table.insert(front, FrameId(1)));
+        assert!(table.insert(behind, FrameId(2)));
+        assert_eq!(table.remove(front), Some(FrameId(1)));
+
+        assert!(table.insert(behind, FrameId(3)));
+        assert_eq!(slots_holding(&table, behind).len(), 1);
+        assert_eq!(table.get(behind), Some(FrameId(3)));
+        assert_eq!(table.remove(behind), Some(FrameId(3)));
+        assert_eq!(table.get(behind), None);
+    }
+
+    /// A pool evicts for as long as it runs, so a table that only ever
+    /// spends slots would report itself full long before it is.
+    #[test]
+    fn tombstones_are_reused_rather_than_accumulated() {
+        let table = PageTable::new(64);
+        for round in 0..10_000u64 {
+            let page = PageId::new(1, round + 1);
+            assert!(
+                matches!(
+                    table.insert_if_absent(page, FrameId(round as u32 % 64)),
+                    InsertOutcome::Inserted
+                ),
+                "round {round} could not install"
+            );
+            assert_eq!(table.get(page), Some(FrameId(round as u32 % 64)));
+            assert!(table.remove(page).is_some());
+        }
+        assert_eq!(table.len(), 0);
+    }
+
+    /// Concurrent installs of one page id resolve to a single winner while
+    /// removals keep turning slots into tombstones underneath them.
+    #[test]
+    fn concurrent_install_and_evict_never_doubles_a_page() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let table = Arc::new(PageTable::new(256));
+        let contested: Vec<PageId> = (1..=8u64).map(|n| PageId::new(1, n * 4099)).collect();
+        let inserted = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for thread in 0..6u32 {
+            let table = Arc::clone(&table);
+            let pages = contested.clone();
+            let inserted = Arc::clone(&inserted);
+            handles.push(std::thread::spawn(move || {
+                for round in 0..4_000u32 {
+                    let page = pages[(round as usize + thread as usize) % pages.len()];
+                    match table.insert_if_absent(page, FrameId(thread)) {
+                        InsertOutcome::Inserted => {
+                            inserted.fetch_add(1, Ordering::Relaxed);
+                            table.remove(page);
+                        }
+                        InsertOutcome::Existing(_) => {}
+                        InsertOutcome::TableFull => panic!("table full at 256 frames"),
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker");
+        }
+        assert!(
+            inserted.load(Ordering::Relaxed) > 0,
+            "nothing was installed"
+        );
+        for page in &contested {
+            let held = slots_holding(&table, *page);
+            assert!(
+                held.len() <= 1,
+                "page {:?} ended up in slots {:?}",
+                page,
+                held
+            );
         }
     }
 }

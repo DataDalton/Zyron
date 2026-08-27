@@ -28,7 +28,14 @@ pub fn build_physical_plan(
     catalog: &Catalog,
     peers: Option<&zyron_common::PeerRegistry>,
 ) -> Result<PhysicalPlan> {
-    let cost_model = CostModel::default();
+    // What a query may hold before it spills is node state, and a plan that
+    // would spill on this node is a different plan from one that would not.
+    // Read here rather than threaded through every caller, because every
+    // caller would be passing this same node-wide figure, and reported by
+    // EXPLAIN so a plan says which figure it was built against
+    let mut cost_model = CostModel::default();
+    cost_model.working_memory_bytes = zyron_pressure::pressure_control::PressureController::global()
+        .working_memory_bytes() as f64;
     PhysicalPlanner::new(catalog, cost_model, peers).plan(logical)
 }
 
@@ -1698,6 +1705,15 @@ impl<'a> PhysicalPlanner<'a> {
         join_type: JoinType,
         condition: JoinCondition,
     ) -> Result<PhysicalPlan> {
+        // Which table indices the left input produces, read before the
+        // logical plans are consumed. Equi-key extraction orients each
+        // equality by membership here, so ON b.id = a.id works the same
+        // as ON a.id = b.id
+        let left_tables: std::collections::HashSet<usize> = left
+            .output_schema()
+            .iter()
+            .filter_map(|c| c.table_idx)
+            .collect();
         let left_plan = self.plan(left)?;
         let right_plan = self.plan(right)?;
         let left_cost = *left_plan.cost();
@@ -1724,7 +1740,9 @@ impl<'a> PhysicalPlanner<'a> {
                     });
                 }
                 // Try to extract equi-join keys
-                if let Some((left_keys, right_keys, remaining)) = extract_equi_keys(expr) {
+                if let Some((left_keys, right_keys, remaining)) =
+                    extract_equi_keys(expr, &left_tables)
+                {
                     // Cost all three strategies
                     let hash_cost = self.cost_model.cost_hash_join(&left_cost, &right_cost);
                     let merge_cost_base = self.cost_model.cost_merge_join(&left_cost, &right_cost);
@@ -2480,13 +2498,27 @@ fn array_literal_to_f32(expr: &BoundExpr) -> Option<Vec<f32>> {
 /// Extracts equi-join keys from a conjunction.
 /// Given `a.x = b.y AND a.z = b.w AND a.q > 5`,
 /// returns (vec![a.x, a.z], vec![b.y, b.w], Some(a.q > 5)).
+///
+/// Each equality orients by which side of the join its columns come from,
+/// so `ON b.id = a.id` produces the same keys as `ON a.id = b.id`. An
+/// equality whose two columns are on the same side, or whose side cannot
+/// be determined, stays in the remaining predicate instead of becoming a
+/// misassigned key
 fn extract_equi_keys(
     expr: &BoundExpr,
+    left_tables: &std::collections::HashSet<usize>,
 ) -> Option<(Vec<BoundExpr>, Vec<BoundExpr>, Option<BoundExpr>)> {
     let conjuncts = split_conjuncts(expr);
     let mut left_keys = Vec::new();
     let mut right_keys = Vec::new();
     let mut remaining = Vec::new();
+
+    let side_of = |e: &BoundExpr| -> Option<bool> {
+        match e {
+            BoundExpr::ColumnRef(cr) => Some(left_tables.contains(&cr.table_idx)),
+            _ => None,
+        }
+    };
 
     for conj in conjuncts {
         if let BoundExpr::BinaryOp {
@@ -2497,9 +2529,21 @@ fn extract_equi_keys(
         } = &conj
         {
             if is_column_ref(left) && is_column_ref(right) {
-                left_keys.push(left.as_ref().clone());
-                right_keys.push(right.as_ref().clone());
-                continue;
+                match (side_of(left), side_of(right)) {
+                    (Some(true), Some(false)) => {
+                        left_keys.push(left.as_ref().clone());
+                        right_keys.push(right.as_ref().clone());
+                        continue;
+                    }
+                    (Some(false), Some(true)) => {
+                        left_keys.push(right.as_ref().clone());
+                        right_keys.push(left.as_ref().clone());
+                        continue;
+                    }
+                    // Both columns on one side, or a side unresolved: not a
+                    // join key, the remaining predicate evaluates it
+                    _ => {}
+                }
             }
         }
         remaining.push(conj);
@@ -3052,12 +3096,24 @@ mod tests {
             type_id: TypeId::Boolean,
         };
 
-        let result = extract_equi_keys(&eq);
+        let left_tables: std::collections::HashSet<usize> = [0].into_iter().collect();
+        let result = extract_equi_keys(&eq, &left_tables);
         assert!(result.is_some());
         let (lk, rk, rem) = result.unwrap();
         assert_eq!(lk.len(), 1);
         assert_eq!(rk.len(), 1);
         assert!(rem.is_none());
+
+        // Reversed spelling orients onto the same sides
+        let reversed = BoundExpr::BinaryOp {
+            left: Box::new(right_col.clone()),
+            op: BinaryOperator::Eq,
+            right: Box::new(left_col.clone()),
+            type_id: TypeId::Boolean,
+        };
+        let (lk2, rk2, _) = extract_equi_keys(&reversed, &left_tables).unwrap();
+        assert_eq!(lk2, lk, "reversed equality yields the same left keys");
+        assert_eq!(rk2, rk, "reversed equality yields the same right keys");
     }
 
     #[test]
@@ -3098,7 +3154,8 @@ mod tests {
             type_id: TypeId::Boolean,
         };
 
-        let result = extract_equi_keys(&combined);
+        let left_tables: std::collections::HashSet<usize> = [0].into_iter().collect();
+        let result = extract_equi_keys(&combined, &left_tables);
         assert!(result.is_some());
         let (lk, rk, rem) = result.unwrap();
         assert_eq!(lk.len(), 1);
@@ -3123,6 +3180,7 @@ mod tests {
             }),
             type_id: TypeId::Boolean,
         };
-        assert!(extract_equi_keys(&expr).is_none());
+        let left_tables: std::collections::HashSet<usize> = [0].into_iter().collect();
+        assert!(extract_equi_keys(&expr, &left_tables).is_none());
     }
 }

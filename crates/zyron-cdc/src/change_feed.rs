@@ -39,11 +39,11 @@ use zyron_common::checksum::hot::hot_hash32;
 /// File header: magic (8) + format_version (4) + table_id (4) + header_checksum (4) = 20 bytes.
 const FILE_HEADER_SIZE: usize = 20;
 const FILE_MAGIC: &[u8; 8] = b"ZYCDF\0\0\0";
-/// Version 2 marks the canonical hot-path checksum for the header and
-/// every record frame. The reader enforces this, so a feed written under
-/// a different version fails with a version error instead of surfacing as
-/// checksum corruption
-const FORMAT_VERSION: u32 = 2;
+/// Version 3 carries 64-bit transaction ids in every record, over the
+/// version 2 canonical hot-path checksums. The reader enforces this, so a
+/// feed written under a different version fails with a version error
+/// instead of surfacing as checksum corruption
+const FORMAT_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // ChangeType
@@ -88,7 +88,7 @@ pub struct ChangeRecord {
     pub commit_version: u64,
     pub commit_timestamp: i64,
     pub table_id: u32,
-    pub txn_id: u32,
+    pub txn_id: u64,
     pub schema_version: u32,
     pub row_data: Vec<u8>,
     pub primary_key_data: Vec<u8>,
@@ -102,18 +102,18 @@ pub struct ChangeRecord {
 //   change_type:      u8
 //   commit_version:   u64  (8 bytes)
 //   commit_timestamp: i64  (8 bytes)
-//   txn_id:           u32  (4 bytes)
+//   txn_id:           u64  (8 bytes)
 //   schema_version:   u32  (4 bytes)
 //   is_last_in_txn:   u8
 //   row_data_len:     u32  (4 bytes)
 //   row_data:         [u8; row_data_len]
 //   pk_data_len:      u32  (4 bytes)
 //   primary_key_data: [u8; pk_data_len]
-// Fixed header = 34 bytes (was 38 before removing table_id).
+// Fixed header = 38 bytes.
 
 const RECORD_FRAME_PREFIX: usize = 4; // u32 length prefix
 const RECORD_FRAME_SUFFIX: usize = 4; // u32 checksum
-const BINARY_FIXED_HEADER: usize = 34;
+const BINARY_FIXED_HEADER: usize = 38;
 
 impl ChangeRecord {
     /// Bytes this record occupies in packed binary form, so a caller can
@@ -174,12 +174,12 @@ impl ChangeRecord {
         );
         off += 8;
 
-        let txn_id = u32::from_le_bytes(
-            data[off..off + 4]
+        let txn_id = u64::from_le_bytes(
+            data[off..off + 8]
                 .try_into()
                 .map_err(|_| ZyronError::CdcDecoderError("bad txn_id".into()))?,
         );
-        off += 4;
+        off += 8;
 
         let schema_version = u32::from_le_bytes(
             data[off..off + 4]
@@ -309,6 +309,111 @@ fn write_record(w: &mut impl Write, data: &[u8], checksum: u32) -> Result<u64> {
     Ok(RECORD_FRAME_PREFIX as u64 + data.len() as u64 + RECORD_FRAME_SUFFIX as u64)
 }
 
+/// Parses and checksum-verifies the records framed at the given offsets.
+/// table_id is supplied from the file header, not from the record bytes
+fn parse_records_at(file_data: &[u8], offsets: &[u64], table_id: u32) -> Result<Vec<ChangeRecord>> {
+    let mut results = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        let o = offset as usize;
+        if o + RECORD_FRAME_PREFIX > file_data.len() {
+            return Err(ZyronError::CdcDecoderError(format!(
+                "offset {offset} beyond file end"
+            )));
+        }
+        let record_len =
+            u32::from_le_bytes(file_data[o..o + 4].try_into().unwrap_or([0; 4])) as usize;
+        let data_start = o + RECORD_FRAME_PREFIX;
+        let data_end = data_start + record_len;
+        if data_end + RECORD_FRAME_SUFFIX > file_data.len() {
+            return Err(ZyronError::CdcDecoderError(format!(
+                "record at offset {offset} truncated"
+            )));
+        }
+        let record_data = &file_data[data_start..data_end];
+        let stored_crc = u32::from_le_bytes(
+            file_data[data_end..data_end + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+        if stored_crc != hot_hash32(record_data) {
+            return Err(ZyronError::CdcDecoderError(format!(
+                "checksum mismatch at offset {offset}"
+            )));
+        }
+        results.push(ChangeRecord::deserialize(record_data, table_id)?);
+    }
+    Ok(results)
+}
+
+/// One contiguous span of matching records: the byte range plus the
+/// record offsets inside it, relative to the run start.
+struct ReadRun {
+    start: u64,
+    len: usize,
+    relative_offsets: Vec<u64>,
+}
+
+/// Collapses matching index entries into contiguous byte runs, so a poll
+/// over a version window reads exactly that window rather than the whole
+/// file. Caller holds the lock, entry frame ends come from the successor
+/// entry's offset or the file size
+fn snapshot_runs(inner: &CdfInner, matches: &impl Fn(&CdfIndexEntry) -> bool) -> Vec<ReadRun> {
+    let mut runs: Vec<ReadRun> = Vec::new();
+    for (i, entry) in inner.index.iter().enumerate() {
+        if !matches(entry) {
+            continue;
+        }
+        let end = inner
+            .index
+            .get(i + 1)
+            .map(|next| next.offset)
+            .unwrap_or(inner.file_size);
+        match runs.last_mut() {
+            Some(run) if run.start + run.len as u64 == entry.offset => {
+                run.relative_offsets.push(entry.offset - run.start);
+                run.len = (end - run.start) as usize;
+            }
+            _ => runs.push(ReadRun {
+                start: entry.offset,
+                len: (end - entry.offset) as usize,
+                relative_offsets: vec![0],
+            }),
+        }
+    }
+    runs
+}
+
+/// Reads each run with one positioned read and parses its records.
+fn read_runs(path: &Path, runs: &[ReadRun], table_id: u32) -> Result<Vec<ChangeRecord>> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = File::open(path)?;
+    let mut records = Vec::with_capacity(runs.iter().map(|r| r.relative_offsets.len()).sum());
+    let mut buf = Vec::new();
+    for run in runs {
+        buf.clear();
+        buf.resize(run.len, 0u8);
+        file.seek(SeekFrom::Start(run.start))?;
+        file.read_exact(&mut buf)?;
+        records.extend(parse_records_at(&buf, &run.relative_offsets, table_id)?);
+    }
+    Ok(records)
+}
+
+/// Makes a rename durable by syncing the containing directory. Windows has
+/// no directory handle to sync, metadata durability rides on the volume
+#[cfg(not(windows))]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CdfIndexEntry - flat, cache-friendly, 24 bytes
 // ---------------------------------------------------------------------------
@@ -328,11 +433,27 @@ struct CdfInner {
     writer: Option<BufWriter<File>>,
     index: Vec<CdfIndexEntry>,
     file_size: u64,
+    /// Bytes already forced to durable storage. Appends flush to the OS
+    /// only, the background sync pushes the tail through the device cache
+    synced_size: u64,
+    /// Bumped every time a purge or compaction rewrites the file. Readers
+    /// that resolved offsets before a rewrite see a different epoch after
+    /// their file read and retry instead of parsing stale offsets
+    rewrite_epoch: u64,
 }
 
 // ---------------------------------------------------------------------------
 // ChangeDataFeed
 // ---------------------------------------------------------------------------
+
+/// Everything a compaction pass needs: the records as they stood at one
+/// instant, plus the epoch and count that let the rewrite detect and
+/// preserve concurrent activity
+pub struct CompactionView {
+    pub records: Vec<ChangeRecord>,
+    pub epoch: u64,
+    pub record_count: usize,
+}
 
 /// Per-table change data feed with append-only file storage.
 pub struct ChangeDataFeed {
@@ -359,27 +480,31 @@ impl ChangeDataFeed {
         let mut valid_end: u64 = FILE_HEADER_SIZE as u64;
 
         if file_path.exists() {
-            let mut data = Vec::new();
-            File::open(&file_path)?.read_to_end(&mut data)?;
+            // Streamed scan: one record buffer at a time, so opening a
+            // large retained feed never materializes the whole file
+            let file = File::open(&file_path)?;
+            let file_len = file.metadata()?.len();
+            let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
 
-            if data.len() >= FILE_HEADER_SIZE {
-                let header_table_id = read_file_header(&data)?;
+            if file_len >= FILE_HEADER_SIZE as u64 {
+                let mut header = [0u8; FILE_HEADER_SIZE];
+                reader.read_exact(&mut header)?;
+                let header_table_id = read_file_header(&header)?;
                 if header_table_id != table_id {
                     return Err(ZyronError::CdcDecoderError(format!(
                         "CDF file table_id mismatch: header has {header_table_id}, expected {table_id}"
                     )));
                 }
 
-                let file_len = data.len() as u64;
                 let mut offset = FILE_HEADER_SIZE as u64;
+                let mut record_buf: Vec<u8> = Vec::new();
 
                 while offset + (RECORD_FRAME_PREFIX + RECORD_FRAME_SUFFIX) as u64 <= file_len {
-                    let o = offset as usize;
-                    if o + 4 > data.len() {
+                    let mut len_bytes = [0u8; RECORD_FRAME_PREFIX];
+                    if reader.read_exact(&mut len_bytes).is_err() {
                         break;
                     }
-                    let record_len =
-                        u32::from_le_bytes(data[o..o + 4].try_into().unwrap_or([0; 4])) as u64;
+                    let record_len = u32::from_le_bytes(len_bytes) as u64;
 
                     if record_len > MAX_RECORD_SIZE {
                         break;
@@ -391,23 +516,20 @@ impl ChangeDataFeed {
                         break;
                     }
 
-                    let record_start = o + RECORD_FRAME_PREFIX;
-                    let record_end = record_start + record_len as usize;
-                    let crc_end = record_end + RECORD_FRAME_SUFFIX;
-
-                    if crc_end > data.len() {
+                    record_buf.clear();
+                    record_buf.resize(record_len as usize, 0u8);
+                    if reader.read_exact(&mut record_buf).is_err() {
+                        break;
+                    }
+                    let mut crc_bytes = [0u8; RECORD_FRAME_SUFFIX];
+                    if reader.read_exact(&mut crc_bytes).is_err() {
+                        break;
+                    }
+                    if u32::from_le_bytes(crc_bytes) != hot_hash32(&record_buf) {
                         break;
                     }
 
-                    let record_data = &data[record_start..record_end];
-                    let stored_crc =
-                        u32::from_le_bytes(data[record_end..crc_end].try_into().unwrap_or([0; 4]));
-                    let computed_crc = hot_hash32(record_data);
-                    if stored_crc != computed_crc {
-                        break;
-                    }
-
-                    match ChangeRecord::peek_version_timestamp(record_data) {
+                    match ChangeRecord::peek_version_timestamp(&record_buf) {
                         Ok((version, timestamp)) => {
                             index.push(CdfIndexEntry {
                                 version,
@@ -423,6 +545,7 @@ impl ChangeDataFeed {
                 }
 
                 if valid_end < file_len {
+                    drop(reader);
                     let file = OpenOptions::new().write(true).open(&file_path)?;
                     file.set_len(valid_end)?;
                 }
@@ -452,6 +575,8 @@ impl ChangeDataFeed {
                 writer: None,
                 index,
                 file_size: valid_end,
+                synced_size: valid_end,
+                rewrite_epoch: 0,
             }),
             record_count_atomic: AtomicU64::new(record_count),
             file_size_atomic: AtomicU64::new(valid_end),
@@ -578,104 +703,67 @@ impl ChangeDataFeed {
 
     /// Queries change records by version range [start_version, end_version].
     pub fn query_changes(&self, start_version: u64, end_version: u64) -> Result<Vec<ChangeRecord>> {
-        let offsets = {
-            let inner = self.inner.lock();
-            let mut result = Vec::new();
-            for entry in &inner.index {
-                if entry.version >= start_version && entry.version <= end_version {
-                    result.push(entry.offset);
-                }
-            }
-            result
-        };
-
-        self.read_records_bulk(&offsets)
+        self.read_matching(|e| e.version >= start_version && e.version <= end_version)
     }
 
     /// Queries change records by timestamp range [start_ts, end_ts].
     pub fn query_changes_by_time(&self, start_ts: i64, end_ts: i64) -> Result<Vec<ChangeRecord>> {
-        let offsets = {
-            let inner = self.inner.lock();
-            let mut result = Vec::new();
-            for entry in &inner.index {
-                if entry.timestamp >= start_ts && entry.timestamp <= end_ts {
-                    result.push(entry.offset);
-                }
-            }
-            result
-        };
-
-        self.read_records_bulk(&offsets)
+        self.read_matching(|e| e.timestamp >= start_ts && e.timestamp <= end_ts)
     }
 
-    /// Returns the maximum version at or below the given timestamp.
-    pub fn max_version_before_time(&self, cutoff_ts: i64) -> Option<u64> {
-        let inner = self.inner.lock();
-        let mut max_ver: Option<u64> = None;
-        for entry in inner.index.iter().rev() {
-            if entry.timestamp <= cutoff_ts {
-                max_ver = Some(entry.version);
-                break;
+    /// Reads every record whose index entry matches. Offsets resolve under
+    /// the lock, the file reads run outside it so appends keep flowing, and
+    /// the rewrite epoch is rechecked after the read. A purge or compaction
+    /// that rewrote the file in between invalidates the offsets, so the
+    /// read retries instead of parsing garbage
+    fn read_matching(&self, matches: impl Fn(&CdfIndexEntry) -> bool) -> Result<Vec<ChangeRecord>> {
+        const MAX_RACE_RETRIES: usize = 8;
+        for _ in 0..MAX_RACE_RETRIES {
+            let (runs, epoch) = {
+                let inner = self.inner.lock();
+                (snapshot_runs(&inner, &matches), inner.rewrite_epoch)
+            };
+            if runs.is_empty() {
+                return Ok(Vec::new());
             }
+            let records = read_runs(&self.file_path, &runs, self.table_id)?;
+            if self.inner.lock().rewrite_epoch != epoch {
+                continue;
+            }
+            return Ok(records);
         }
-        max_ver
-    }
-
-    /// Bulk-reads records by reading the entire file once and parsing at offsets.
-    /// table_id is populated from self.table_id (from the file header).
-    fn read_records_bulk(&self, offsets: &[u64]) -> Result<Vec<ChangeRecord>> {
-        if offsets.is_empty() {
+        // Rewrites keep winning the race. Resolve offsets and read the file
+        // while holding the lock so nothing can move underneath the read
+        let inner = self.inner.lock();
+        let runs = snapshot_runs(&inner, &matches);
+        if runs.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut file_data = Vec::new();
-        File::open(&self.file_path)?.read_to_end(&mut file_data)?;
-
-        let mut results = Vec::with_capacity(offsets.len());
-        for &offset in offsets {
-            let o = offset as usize;
-            if o + 4 > file_data.len() {
-                return Err(ZyronError::CdcDecoderError(format!(
-                    "offset {offset} beyond file end"
-                )));
-            }
-            let record_len =
-                u32::from_le_bytes(file_data[o..o + 4].try_into().unwrap_or([0; 4])) as usize;
-            let data_start = o + RECORD_FRAME_PREFIX;
-            let data_end = data_start + record_len;
-            if data_end + RECORD_FRAME_SUFFIX > file_data.len() {
-                return Err(ZyronError::CdcDecoderError(format!(
-                    "record at offset {offset} truncated"
-                )));
-            }
-
-            let record_data = &file_data[data_start..data_end];
-            let stored_crc = u32::from_le_bytes(
-                file_data[data_end..data_end + 4]
-                    .try_into()
-                    .unwrap_or([0; 4]),
-            );
-            let computed_crc = hot_hash32(record_data);
-            if stored_crc != computed_crc {
-                return Err(ZyronError::CdcDecoderError(format!(
-                    "checksum mismatch at offset {offset}"
-                )));
-            }
-
-            results.push(ChangeRecord::deserialize(record_data, self.table_id)?);
-        }
-
-        Ok(results)
+        read_runs(&self.file_path, &runs, self.table_id)
     }
 
     /// Purges records with commit_version < min_version.
     pub fn purge_before_version(&self, min_version: u64) -> Result<u64> {
+        self.purge_where(|e| e.version < min_version)
+    }
+
+    /// Purges records whose commit timestamp is older than the cutoff. A
+    /// hold LSN keeps records above it regardless of age, so a slow but
+    /// advancing subscriber never loses changes it has not confirmed
+    pub fn purge_retention(&self, cutoff_timestamp: i64, hold_lsn: Option<u64>) -> Result<u64> {
+        self.purge_where(|e| {
+            e.timestamp < cutoff_timestamp && hold_lsn.is_none_or(|hold| e.version <= hold)
+        })
+    }
+
+    /// Rewrites the feed keeping every record the predicate does not purge.
+    fn purge_where(&self, purge: impl Fn(&CdfIndexEntry) -> bool) -> Result<u64> {
         let mut inner = self.inner.lock();
 
         let keep_offsets: Vec<u64> = inner
             .index
             .iter()
-            .filter(|e| e.version >= min_version)
+            .filter(|e| !purge(e))
             .map(|e| e.offset)
             .collect();
 
@@ -690,34 +778,21 @@ impl ChangeDataFeed {
         let records = if !keep_offsets.is_empty() {
             let mut file_data = Vec::new();
             File::open(&self.file_path)?.read_to_end(&mut file_data)?;
-
-            let mut result = Vec::with_capacity(keep_offsets.len());
-            for &offset in &keep_offsets {
-                let o = offset as usize;
-                if o + 4 > file_data.len() {
-                    break;
-                }
-                let record_len =
-                    u32::from_le_bytes(file_data[o..o + 4].try_into().unwrap_or([0; 4])) as usize;
-                let data_start = o + RECORD_FRAME_PREFIX;
-                let data_end = data_start + record_len;
-                if data_end > file_data.len() {
-                    break;
-                }
-                result.push(ChangeRecord::deserialize(
-                    &file_data[data_start..data_end],
-                    self.table_id,
-                )?);
-            }
-            result
+            parse_records_at(&file_data, &keep_offsets, self.table_id)?
         } else {
             Vec::new()
         };
 
-        // Close writer before rewrite.
+        self.rewrite_locked(&mut inner, &records)?;
+        Ok(purged)
+    }
+
+    /// Replaces the file with exactly these records via a temp file and an
+    /// atomic rename, so a crash at any instant leaves either the old file
+    /// or the complete new one. Caller holds the lock
+    fn rewrite_locked(&self, inner: &mut CdfInner, records: &[ChangeRecord]) -> Result<()> {
         inner.writer = None;
 
-        // Write to temp with header, rename.
         let tmp_path = self.file_path.with_extension("zycdf.tmp");
         let mut new_index: Vec<CdfIndexEntry> = Vec::with_capacity(records.len());
         let mut new_file_size: u64 = FILE_HEADER_SIZE as u64;
@@ -728,7 +803,7 @@ impl ChangeDataFeed {
 
             write_file_header(&mut writer, self.table_id)?;
 
-            for record in &records {
+            for record in records {
                 let data = record.serialize();
                 let checksum = hot_hash32(&data);
                 let offset = new_file_size;
@@ -745,16 +820,91 @@ impl ChangeDataFeed {
         }
 
         fs::rename(&tmp_path, &self.file_path)?;
+        sync_parent_dir(&self.file_path)?;
 
         inner.index = new_index;
         inner.file_size = new_file_size;
+        inner.synced_size = new_file_size;
+        inner.rewrite_epoch += 1;
 
         self.file_size_atomic
             .store(new_file_size, Ordering::Release);
         self.record_count_atomic
             .store(inner.index.len() as u64, Ordering::Release);
 
-        Ok(purged)
+        Ok(())
+    }
+
+    /// A consistent view of every record for a compaction pass, taken under
+    /// the lock so the epoch and count describe exactly what was read
+    pub fn snapshot_for_compaction(&self) -> Result<CompactionView> {
+        let inner = self.inner.lock();
+        let offsets: Vec<u64> = inner.index.iter().map(|e| e.offset).collect();
+        let records = if offsets.is_empty() {
+            Vec::new()
+        } else {
+            let mut file_data = Vec::new();
+            File::open(&self.file_path)?.read_to_end(&mut file_data)?;
+            parse_records_at(&file_data, &offsets, self.table_id)?
+        };
+        Ok(CompactionView {
+            records,
+            epoch: inner.rewrite_epoch,
+            record_count: offsets.len(),
+        })
+    }
+
+    /// Atomically replaces the records a compaction view saw with the kept
+    /// subset. Records appended after the view was taken survive verbatim.
+    /// Returns false without changing anything when a purge rewrote the
+    /// file in between, the caller retries on its next cycle
+    pub fn replace_compacted(
+        &self,
+        view_epoch: u64,
+        view_count: usize,
+        mut kept: Vec<ChangeRecord>,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner.rewrite_epoch != view_epoch {
+            return Ok(false);
+        }
+        let tail_offsets: Vec<u64> = inner.index[view_count..].iter().map(|e| e.offset).collect();
+        if !tail_offsets.is_empty() {
+            let mut file_data = Vec::new();
+            File::open(&self.file_path)?.read_to_end(&mut file_data)?;
+            kept.extend(parse_records_at(&file_data, &tail_offsets, self.table_id)?);
+        }
+        self.rewrite_locked(&mut inner, &kept)?;
+        Ok(true)
+    }
+
+    /// Forces every appended record through the device cache. Appends flush
+    /// to the OS on every call, this makes them durable. Returns whether
+    /// anything was pending
+    pub fn sync_to_disk(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner.file_size == inner.synced_size {
+            return Ok(false);
+        }
+        match inner.writer.as_mut() {
+            Some(writer) => {
+                writer.flush()?;
+                writer.get_ref().sync_data()?;
+            }
+            None => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&self.file_path)?
+                    .sync_data()?;
+            }
+        }
+        inner.synced_size = inner.file_size;
+        Ok(true)
+    }
+
+    /// The newest commit version the feed holds, None when empty.
+    pub fn latest_version(&self) -> Option<u64> {
+        self.inner.lock().index.last().map(|e| e.version)
     }
 
     pub fn record_count(&self) -> u64 {
@@ -842,6 +992,46 @@ impl CdfRegistry {
         // minimum retained version is lsn + 1.
         let min_version = lsn.saturating_add(1);
         feed.purge_before_version(min_version)
+    }
+
+    /// Time-based truncation for publication retention: removes records
+    /// whose commit timestamp (microseconds) is older than the cutoff.
+    /// The optional hold LSN keeps every record above it regardless of
+    /// age, so a slow but advancing subscriber never loses changes it has
+    /// not confirmed. Returns the number of records removed, 0 when the
+    /// table has no feed registered.
+    pub async fn truncate_retention(
+        &self,
+        table_id: u32,
+        cutoff_timestamp: i64,
+        hold_lsn: Option<u64>,
+    ) -> Result<u64> {
+        let feed = match self.get_feed(table_id) {
+            Some(f) => f,
+            None => return Ok(0),
+        };
+        feed.purge_retention(cutoff_timestamp, hold_lsn)
+    }
+
+    /// Forces every feed's appended records to durable storage. Returns the
+    /// number of feeds that had pending bytes plus the per-table failures,
+    /// so one bad feed never hides the rest
+    pub fn sync_all_feeds(&self) -> (u64, Vec<(u32, ZyronError)>) {
+        let mut feeds: Vec<(u32, Arc<ChangeDataFeed>)> = Vec::new();
+        self.feeds.iter_sync(|table_id, feed| {
+            feeds.push((*table_id, feed.clone()));
+            true
+        });
+        let mut synced = 0u64;
+        let mut failures = Vec::new();
+        for (table_id, feed) in feeds {
+            match feed.sync_to_disk() {
+                Ok(true) => synced += 1,
+                Ok(false) => {}
+                Err(e) => failures.push((table_id, e)),
+            }
+        }
+        (synced, failures)
     }
 
     pub fn list_feeds(&self) -> Vec<(u32, u64, u64, u32)> {
@@ -1023,6 +1213,48 @@ mod tests {
         assert_eq!(feed.record_count(), 6);
     }
 
+    // Retention purges by commit timestamp. A cutoff carrying an
+    // epoch-scale value must never be read as an LSN: records younger than
+    // the cutoff survive even though their commit versions are tiny
+    #[test]
+    fn test_purge_retention_by_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let feed = ChangeDataFeed::open(tmp.path(), 1, 30).unwrap();
+
+        let records: Vec<ChangeRecord> = (1..=10)
+            .map(|i| make_record(i, i as i64 * 1000, ChangeType::Insert))
+            .collect();
+        feed.append_batch(&records).unwrap();
+
+        let purged = feed.purge_retention(5500, None).unwrap();
+        assert_eq!(purged, 5, "timestamps 1000..=5000 age out");
+        let remaining = feed.query_changes(0, u64::MAX).unwrap();
+        assert_eq!(remaining.len(), 5);
+        assert_eq!(remaining[0].commit_version, 6);
+        assert_eq!(remaining[0].commit_timestamp, 6000);
+    }
+
+    // A hold LSN pins every record a slow subscriber has not confirmed,
+    // even when its age is past the cutoff
+    #[test]
+    fn test_purge_retention_hold_lsn_keeps_unconfirmed() {
+        let tmp = TempDir::new().unwrap();
+        let feed = ChangeDataFeed::open(tmp.path(), 1, 30).unwrap();
+
+        let records: Vec<ChangeRecord> = (1..=10)
+            .map(|i| make_record(i, i as i64 * 1000, ChangeType::Insert))
+            .collect();
+        feed.append_batch(&records).unwrap();
+
+        // Everything is older than the cutoff, but the subscriber has only
+        // confirmed through version 4
+        let purged = feed.purge_retention(1_000_000, Some(4)).unwrap();
+        assert_eq!(purged, 4, "only confirmed records age out");
+        let remaining = feed.query_changes(0, u64::MAX).unwrap();
+        assert_eq!(remaining.len(), 6);
+        assert_eq!(remaining[0].commit_version, 5);
+    }
+
     #[test]
     fn test_disabled_feed_skips_append() {
         let tmp = TempDir::new().unwrap();
@@ -1149,19 +1381,76 @@ mod tests {
         assert_eq!(results[1].change_type, ChangeType::UpdatePostimage);
     }
 
+    // Compaction snapshots the feed, computes outside the lock, then
+    // rewrites atomically. Records appended between snapshot and rewrite
+    // survive verbatim
     #[test]
-    fn test_max_version_before_time() {
+    fn test_replace_compacted_preserves_tail_appends() {
         let tmp = TempDir::new().unwrap();
         let feed = ChangeDataFeed::open(tmp.path(), 1, 30).unwrap();
 
-        let records: Vec<ChangeRecord> = (1..=5)
+        let records: Vec<ChangeRecord> = (1..=4)
             .map(|i| make_record(i, i as i64 * 1000, ChangeType::Insert))
             .collect();
         feed.append_batch(&records).unwrap();
 
-        assert_eq!(feed.max_version_before_time(3000), Some(3));
-        assert_eq!(feed.max_version_before_time(5000), Some(5));
-        assert_eq!(feed.max_version_before_time(500), None);
+        let view = feed.snapshot_for_compaction().unwrap();
+        assert_eq!(view.record_count, 4);
+
+        // A commit lands after the snapshot but before the rewrite
+        feed.append_change(&make_record(5, 5000, ChangeType::Insert))
+            .unwrap();
+
+        // Keep only versions 2 and 4 from the snapshot
+        let kept: Vec<ChangeRecord> = view
+            .records
+            .into_iter()
+            .filter(|r| r.commit_version % 2 == 0)
+            .collect();
+        let applied = feed
+            .replace_compacted(view.epoch, view.record_count, kept)
+            .unwrap();
+        assert!(applied);
+
+        let remaining = feed.query_changes(0, u64::MAX).unwrap();
+        let versions: Vec<u64> = remaining.iter().map(|r| r.commit_version).collect();
+        assert_eq!(versions, vec![2, 4, 5]);
+    }
+
+    // A purge that rewrites the file between snapshot and replace bumps the
+    // epoch, so the replace refuses rather than resurrecting purged records
+    #[test]
+    fn test_replace_compacted_refuses_after_concurrent_purge() {
+        let tmp = TempDir::new().unwrap();
+        let feed = ChangeDataFeed::open(tmp.path(), 1, 30).unwrap();
+
+        let records: Vec<ChangeRecord> = (1..=4)
+            .map(|i| make_record(i, i as i64 * 1000, ChangeType::Insert))
+            .collect();
+        feed.append_batch(&records).unwrap();
+
+        let view = feed.snapshot_for_compaction().unwrap();
+        feed.purge_before_version(3).unwrap();
+
+        let applied = feed
+            .replace_compacted(view.epoch, view.record_count, view.records)
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(feed.record_count(), 2);
+    }
+
+    // The background sync reports pending bytes exactly once per batch of
+    // appends and goes quiet when nothing new arrived
+    #[test]
+    fn test_sync_to_disk_tracks_pending_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let feed = ChangeDataFeed::open(tmp.path(), 1, 30).unwrap();
+
+        assert!(!feed.sync_to_disk().unwrap());
+        feed.append_change(&make_record(1, 1000, ChangeType::Insert))
+            .unwrap();
+        assert!(feed.sync_to_disk().unwrap());
+        assert!(!feed.sync_to_disk().unwrap());
     }
 
     #[test]

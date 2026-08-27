@@ -422,6 +422,19 @@ pub fn build_sink(stream: &CdcOutputStream) -> Box<dyn CdcSink> {
 // Stream driver (pump)
 // ---------------------------------------------------------------------------
 
+/// A transaction's fate as the engine's commit-status authority reports it.
+/// Change records land in the feed at execution time, before their
+/// transaction decides, so delivery consults this per record: only a
+/// committed transaction's changes reach the sink, an aborted one's are
+/// skipped, and an undecided one holds the pass so the slot never advances
+/// past a change that could still roll back
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnDecision {
+    Committed,
+    Aborted,
+    InFlight,
+}
+
 /// Drives one delivery pass for a stream: reads change records committed after
 /// the slot's confirmed version, decodes each into the stream's output format,
 /// delivers them to the sink in batches of `batch_size`, and advances the slot
@@ -430,13 +443,15 @@ pub fn build_sink(stream: &CdcOutputStream) -> Box<dyn CdcSink> {
 ///
 /// The decode closure converts a raw CDF record into a DecodedChange. It is
 /// injected so this crate stays free of the catalog and executor: the server
-/// supplies a closure that decodes row bytes against the table schema.
+/// supplies a closure that decodes row bytes against the table schema. The
+/// txn_decision closure reports each record's transaction fate the same way.
 pub fn drive_stream_once<F>(
     stream: &CdcOutputStream,
     feed: &crate::change_feed::ChangeDataFeed,
     slot_mgr: &crate::replication_slot::SlotManager,
     sink: &dyn CdcSink,
     decode: F,
+    txn_decision: &dyn Fn(u64) -> TxnDecision,
 ) -> Result<u64>
 where
     F: Fn(&crate::change_feed::ChangeRecord) -> Result<crate::decoder::DecodedChange>,
@@ -444,7 +459,15 @@ where
     let slot = slot_mgr.get_slot(&stream.slot_name)?;
     let start_version = slot.confirmed_lsn;
     let changes = feed.query_changes(start_version + 1, u64::MAX)?;
-    drive_stream_changes(stream, changes, start_version, slot_mgr, sink, decode)
+    drive_stream_changes(
+        stream,
+        changes,
+        start_version,
+        slot_mgr,
+        sink,
+        decode,
+        txn_decision,
+    )
 }
 
 /// Delivers change records a caller already has.
@@ -460,6 +483,7 @@ pub fn drive_stream_changes<F>(
     slot_mgr: &crate::replication_slot::SlotManager,
     sink: &dyn CdcSink,
     decode: F,
+    txn_decision: &dyn Fn(u64) -> TxnDecision,
 ) -> Result<u64>
 where
     F: Fn(&crate::change_feed::ChangeRecord) -> Result<crate::decoder::DecodedChange>,
@@ -470,34 +494,65 @@ where
 
     let decoder = crate::decoder::create_decoder(stream.decoder_plugin);
     let mut delivered = 0u64;
-    let mut batch: Vec<Bytes> = Vec::with_capacity(stream.batch_size.max(1));
-    let mut batch_max_version = start_version;
+    let batch_cap = stream.batch_size.max(1);
+    let mut batch: Vec<Bytes> = Vec::with_capacity(batch_cap);
+    // The highest commit version whose records are all enqueued or skipped.
+    // The slot only ever advances to such a boundary: a statement's records
+    // all share one version, so a crash between flushes redelivers a partial
+    // version instead of silently losing its tail, and an undecided
+    // transaction stops the pass before its version begins
+    let mut last_complete_version = start_version;
 
-    let flush =
-        |sink: &dyn CdcSink, batch: &mut Vec<Bytes>, batch_max_version: u64| -> Result<()> {
-            if batch.is_empty() {
-                return Ok(());
+    let flush = |sink: &dyn CdcSink, batch: &mut Vec<Bytes>, complete_version: u64| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        sink.write_batch(batch)?;
+        sink.set_confirmed_lsn(complete_version);
+        slot_mgr.advance_slot(&stream.slot_name, zyron_wal::Lsn(complete_version))?;
+        batch.clear();
+        Ok(())
+    };
+
+    let total = changes.len();
+    let mut idx = 0usize;
+    'versions: while idx < total {
+        let version = changes[idx].commit_version;
+        let mut group_end = idx;
+        while group_end < total && changes[group_end].commit_version == version {
+            group_end += 1;
+        }
+
+        // A version enters the batch all or nothing: every record's
+        // transaction is decided before any of them is enqueued, so an
+        // undecided transaction never leaves half a version at the sink
+        for record in &changes[idx..group_end] {
+            if txn_decision(record.txn_id) == TxnDecision::InFlight {
+                break 'versions;
             }
-            sink.write_batch(batch)?;
-            sink.set_confirmed_lsn(batch_max_version);
-            slot_mgr.advance_slot(&stream.slot_name, zyron_wal::Lsn(batch_max_version))?;
-            batch.clear();
-            Ok(())
-        };
+        }
+        for record in &changes[idx..group_end] {
+            match txn_decision(record.txn_id) {
+                TxnDecision::Committed => {
+                    let decoded = decode(record)?;
+                    let bytes = decoder.serialize(&decoded)?;
+                    batch.push(bytes);
+                }
+                TxnDecision::Aborted => {}
+                TxnDecision::InFlight => break 'versions,
+            }
+        }
+        last_complete_version = version;
+        idx = group_end;
 
-    for change in &changes {
-        let decoded = decode(change)?;
-        let bytes = decoder.serialize(&decoded)?;
-        batch.push(bytes);
-        batch_max_version = batch_max_version.max(change.commit_version);
-        if batch.len() >= stream.batch_size.max(1) {
+        if batch.len() >= batch_cap {
             let n = batch.len() as u64;
-            flush(sink, &mut batch, batch_max_version)?;
+            flush(sink, &mut batch, last_complete_version)?;
             delivered += n;
         }
     }
     let remaining = batch.len() as u64;
-    flush(sink, &mut batch, batch_max_version)?;
+    flush(sink, &mut batch, last_complete_version)?;
     delivered += remaining;
 
     Ok(delivered)

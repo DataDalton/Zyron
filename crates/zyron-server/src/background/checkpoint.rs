@@ -5,7 +5,7 @@
 //! since the last checkpoint exceed the threshold, with a fallback timer
 //! for idle systems and a minimum gap to prevent thrashing.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -41,16 +41,56 @@ pub struct CheckpointWorkerStats {
     pub checkpoints_completed: AtomicU64,
     pub total_segments_deleted: AtomicU64,
     pub last_checkpoint_lsn: AtomicU64,
+    /// Wall clock of the last completed checkpoint, in microseconds.
+    ///
+    /// How stale the checkpoint is decides how long a resumed node takes to
+    /// come back, which is the number scale to zero is judged on. Zero until
+    /// one has completed in this process
+    pub last_checkpoint_at_us: AtomicI64,
+    /// Whether that checkpoint closed cleanly.
+    ///
+    /// A failed checkpoint leaves the previous one standing, so this reports
+    /// the state of the newest attempt: false means the node would replay the
+    /// write-ahead log on resume rather than opening a checkpoint, which is
+    /// the case scale to zero must refuse
+    pub last_checkpoint_clean: AtomicBool,
+}
+
+impl Default for CheckpointWorkerStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CheckpointWorkerStats {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             checkpoints_completed: AtomicU64::new(0),
             total_segments_deleted: AtomicU64::new(0),
             last_checkpoint_lsn: AtomicU64::new(0),
+            last_checkpoint_at_us: AtomicI64::new(0),
+            last_checkpoint_clean: AtomicBool::new(false),
         }
     }
+}
+
+/// Tells the pressure controller what the checkpoint did.
+///
+/// Published rather than read from these stats, because the scale-to-zero
+/// precondition, the view, and the resume estimate all need it and a reader
+/// reaching in here would be a second source of truth for the number an
+/// operator is judged on.
+fn publish_checkpoint(clean: bool) {
+    zyron_pressure::pressure_control::PressureController::global()
+        .record_checkpoint(now_micros(), clean);
+}
+
+/// Wall clock in microseconds, for the checkpoint freshness reading.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Background checkpoint worker that monitors WAL accumulation and fires
@@ -200,6 +240,11 @@ impl CheckpointWorker {
                         stats
                             .last_checkpoint_lsn
                             .store(result.checkpoint_lsn.0, Ordering::Release);
+                        stats
+                            .last_checkpoint_at_us
+                            .store(now_micros(), Ordering::Release);
+                        stats.last_checkpoint_clean.store(true, Ordering::Release);
+                        publish_checkpoint(true);
                         last_checkpoint_time = Instant::now();
                         last_checkpoint_lsn = result.checkpoint_lsn.0;
                         info!(
@@ -210,6 +255,8 @@ impl CheckpointWorker {
                         );
                     }
                     Err(e) => {
+                        stats.last_checkpoint_clean.store(false, Ordering::Release);
+                        publish_checkpoint(false);
                         error!("Forced checkpoint failed: {}", e);
                     }
                 }
@@ -234,6 +281,12 @@ impl CheckpointWorker {
 
             let current_lsn = wal.next_lsn().0;
             let wal_bytes_since = current_lsn.saturating_sub(last_checkpoint_lsn);
+            // Published every pass, not only when a checkpoint fires. How far
+            // the log has run past the checkpoint is what a scale-to-zero
+            // refusal has to be able to name, and by the time a checkpoint
+            // fires the answer is zero
+            zyron_pressure::pressure_control::PressureController::global()
+                .record_wal_since_checkpoint(wal_bytes_since);
             let time_triggered = elapsed.as_secs() >= config.max_interval_secs;
             let bytes_triggered = wal_bytes_since >= config.wal_bytes_threshold;
 
@@ -247,6 +300,11 @@ impl CheckpointWorker {
                         stats
                             .last_checkpoint_lsn
                             .store(result.checkpoint_lsn.0, Ordering::Release);
+                        stats
+                            .last_checkpoint_at_us
+                            .store(now_micros(), Ordering::Release);
+                        stats.last_checkpoint_clean.store(true, Ordering::Release);
+                        publish_checkpoint(true);
 
                         last_checkpoint_time = Instant::now();
                         last_checkpoint_lsn = result.checkpoint_lsn.0;

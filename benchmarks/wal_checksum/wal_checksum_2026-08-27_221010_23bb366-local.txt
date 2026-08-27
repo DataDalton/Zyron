@@ -1,0 +1,72 @@
+# suite:   wal_checksum
+# run:     2026-08-27_221010_23bb366-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Benchmark: data_checksum ===
+  data_checksum 64B p50 (ns) [PASS/OK]:
+    Runs: [2.1484, 2.1484, 2.1484, 2.1484, 2.1484]
+    Average: 2.1484 <= 25 (target)
+    Min/Max: 2.1484 / 2.1484, StdDev: 0
+  data_checksum 64B p90 (ns) [PASS/OK]:
+    Runs: [2.3438, 2.3438, 2.3438, 2.3438, 2.3438]
+    Average: 2.3438 <= 50 (target)
+    Min/Max: 2.3438 / 2.3438, StdDev: 0
+  data_checksum 64B p99 (ns) [PASS/OK]:
+    Runs: [2.3438, 2.3438, 2.3438, 2.3438, 2.3438]
+    Average: 2.3438 <= 100 (target)
+    Min/Max: 2.3438 / 2.3438, StdDev: 0
+
+=== Benchmark: wal_checksum one-shot ===
+  wal_checksum 64B p50 (ns) [PASS/OK]:
+    Runs: [2.7344, 2.7344, 2.7344, 2.7344, 2.7344]
+    Average: 2.7344 <= 25 (target)
+    Min/Max: 2.7344 / 2.7344, StdDev: 0
+  wal_checksum 64B p90 (ns) [PASS/OK]:
+    Runs: [2.9297, 2.7344, 2.7344, 2.7344, 2.7344]
+    Average: 2.7734 <= 50 (target)
+    Min/Max: 2.7344 / 2.9297, StdDev: 0.0781
+  wal_checksum 64B p99 (ns) [PASS/OK]:
+    Runs: [2.9297, 2.9297, 2.9297, 2.9297, 2.9297]
+    Average: 2.9297 <= 100 (target)
+    Min/Max: 2.9297 / 2.9297, StdDev: 0
+  wal_checksum 280B p50 (ns) [PASS/OK]:
+    Runs: [8.9844, 8.7891, 8.9844, 8.9844, 8.9844]
+    Average: 8.9453 <= 60 (target)
+    Min/Max: 8.7891 / 8.9844, StdDev: 0.0781
+  wal_checksum 280B p90 (ns) [PASS/OK]:
+    Runs: [8.9844, 9.1797, 8.9844, 8.9844, 8.9844]
+    Average: 9.0234 <= 120 (target)
+    Min/Max: 8.9844 / 9.1797, StdDev: 0.0781
+  wal_checksum 280B p99 (ns) [PASS/OK]:
+    Runs: [8.9844, 9.3750, 8.9844, 8.9844, 8.9844]
+    Average: 9.0625 <= 240 (target)
+    Min/Max: 8.9844 / 9.3750, StdDev: 0.1562
+  wal_checksum 8KB p50 (ns) [PASS/OK]:
+    Runs: [377.7344, 377.5391, 377.5391, 377.5391, 377.5391]
+    Average: 377.5781 <= 900 (target)
+    Min/Max: 377.5391 / 377.7344, StdDev: 0.0781
+  wal_checksum 8KB p90 (ns) [PASS/OK]:
+    Runs: [381.4453, 381.2500, 381.6406, 380.4688, 382.2266]
+    Average: 381.4062 <= 1,800 (target)
+    Min/Max: 380.4688 / 382.2266, StdDev: 0.5714
+  wal_checksum 8KB p99 (ns) [PASS/OK]:
+    Runs: [402.3438, 387.3047, 412.8906, 392.7734, 400.1953]
+    Average: 399.1016 <= 3,600 (target)
+    Min/Max: 387.3047 / 412.8906, StdDev: 8.7299
+
+=== Benchmark: WalHasher incremental ===
+  WalHasher 280B p50 (ns) [PASS/OK]:
+    Runs: [8.0078, 8.0078, 8.0078, 8.0078, 7.8125]
+    Average: 7.9688 <= 60 (target)
+    Min/Max: 7.8125 / 8.0078, StdDev: 0.0781
+  WalHasher 280B p90 (ns) [PASS/OK]:
+    Runs: [8.0078, 8.0078, 8.0078, 8.0078, 8.0078]
+    Average: 8.0078 <= 120 (target)
+    Min/Max: 8.0078 / 8.0078, StdDev: 0
+  WalHasher 280B p99 (ns) [PASS/OK]:
+    Runs: [8.7891, 8.0078, 9.9609, 8.0078, 8.0078]
+    Average: 8.5547 <= 240 (target)
+    Min/Max: 8.0078 / 9.9609, StdDev: 0.7655

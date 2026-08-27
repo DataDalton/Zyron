@@ -31,6 +31,82 @@ pub fn scale_factor(scale: u8) -> Result<i128> {
         .ok_or_else(|| ZyronError::ExecutionError(format!("decimal scale {scale} overflows")))
 }
 
+/// `(a * b) / 10^scale` with half-away-from-zero rounding, computed
+/// through a 256-bit intermediate.
+///
+/// The product of two scale-`s` values carries scale `2s`, and for large
+/// scales that intermediate overflows an i128 even when the final value
+/// fits comfortably. The magnitudes multiply into a 256-bit (hi, lo) pair,
+/// divide by `10^scale`, and only the final quotient must fit an i128.
+/// The wide path runs only when the plain i128 product overflows
+pub fn mul_rescale(a: i128, b: i128, scale: u8) -> Result<i128> {
+    let negative = (a < 0) != (b < 0);
+    let divisor = scale_factor(scale)? as u128;
+    let (hi, lo) = mul_u128_full(a.unsigned_abs(), b.unsigned_abs());
+    let (q_hi, q_lo, rem) = div_u256_by_u128(hi, lo, divisor);
+    // Half away from zero. rem < divisor <= 10^38, so doubling never
+    // overflows a u128
+    let (q_hi, q_lo) = if rem * 2 >= divisor {
+        let (bumped, carry) = q_lo.overflowing_add(1);
+        (q_hi + u128::from(carry), bumped)
+    } else {
+        (q_hi, q_lo)
+    };
+    if q_hi != 0 || q_lo > i128::MAX as u128 {
+        return Err(ZyronError::ExecutionError(
+            "decimal multiplication overflowed".to_string(),
+        ));
+    }
+    let q = q_lo as i128;
+    Ok(if negative { -q } else { q })
+}
+
+/// Full 128x128 -> 256 bit multiply as a (hi, lo) pair.
+fn mul_u128_full(a: u128, b: u128) -> (u128, u128) {
+    const MASK: u128 = (1u128 << 64) - 1;
+    let (a1, a0) = (a >> 64, a & MASK);
+    let (b1, b0) = (b >> 64, b & MASK);
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    // Each partial is < 2^128 and the mid sum of three 64-bit-bounded
+    // halves is < 3 * 2^64, no carry is lost
+    let mid = (p00 >> 64) + (p01 & MASK) + (p10 & MASK);
+    let lo = (p00 & MASK) | (mid << 64);
+    let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
+    (hi, lo)
+}
+
+/// Divides a 256-bit value by a u128 divisor, returning the 256-bit
+/// quotient and the remainder. Bitwise long division: the divisor is at
+/// most 10^38 < 2^127, so the running remainder never overflows the shift
+fn div_u256_by_u128(hi: u128, lo: u128, divisor: u128) -> (u128, u128, u128) {
+    if hi == 0 {
+        return (0, lo / divisor, lo % divisor);
+    }
+    let mut q_hi = 0u128;
+    let mut q_lo = 0u128;
+    let mut rem = 0u128;
+    for i in (0..256).rev() {
+        let bit = if i >= 128 {
+            (hi >> (i - 128)) & 1
+        } else {
+            (lo >> i) & 1
+        };
+        rem = (rem << 1) | bit;
+        if rem >= divisor {
+            rem -= divisor;
+            if i >= 128 {
+                q_hi |= 1 << (i - 128);
+            } else {
+                q_lo |= 1 << i;
+            }
+        }
+    }
+    (q_hi, q_lo, rem)
+}
+
 /// Moves a scaled value from one scale to another.
 ///
 /// Scaling up is exact. Scaling down rounds half away from zero, which is
@@ -345,5 +421,50 @@ mod tests {
     fn test_a_scale_past_the_maximum_is_refused_rather_than_saturating() {
         assert!(scale_factor(MAX_DECIMAL_SCALE + 1).is_err());
         assert!(scale_factor(MAX_DECIMAL_SCALE).is_ok());
+    }
+
+    #[test]
+    fn test_mul_rescale_agrees_with_the_narrow_path() {
+        // Products that fit an i128 must produce exactly what the narrow
+        // checked_mul + rescale path produces
+        for &(a, b, scale) in &[
+            (1050i128, 200i128, 2u8),
+            (-1050, 200, 2),
+            (123_456_789, 987_654_321, 9),
+            (15, 1, 1),
+            (25, 1, 1),
+            (-25, 1, 1),
+        ] {
+            let narrow = rescale(a * b, scale * 2, scale).unwrap();
+            let wide = mul_rescale(a, b, scale).unwrap();
+            assert_eq!(wide, narrow, "a={a} b={b} scale={scale}");
+        }
+    }
+
+    #[test]
+    fn test_mul_rescale_survives_an_i128_overflowing_intermediate() {
+        // 2.0 * 3.0 at scale 20: raw operands 2e20 and 3e20, product 6e40
+        // overflows an i128, the final 6e20 does not
+        let two = 2 * 10i128.pow(20);
+        let three = 3 * 10i128.pow(20);
+        assert_eq!(mul_rescale(two, three, 20).unwrap(), 6 * 10i128.pow(20));
+        assert_eq!(mul_rescale(-two, three, 20).unwrap(), -6 * 10i128.pow(20));
+        assert_eq!(mul_rescale(two, -three, 20).unwrap(), -6 * 10i128.pow(20));
+        assert_eq!(mul_rescale(-two, -three, 20).unwrap(), 6 * 10i128.pow(20));
+
+        // Rounding half away from zero at the wide width: 1.5 * 1.0 at a
+        // scale where the half digit is the one dropped
+        let a = 15 * 10i128.pow(19);
+        let b = 10i128.pow(19);
+        // product 1.5e39 overflows i128; / 10^20 = 1.5e19, exact
+        assert_eq!(mul_rescale(a, b, 20).unwrap(), 15 * 10i128.pow(18));
+    }
+
+    #[test]
+    fn test_mul_rescale_reports_a_result_that_cannot_fit() {
+        // Both operands near the i128 ceiling at scale 2: the final value
+        // still exceeds an i128 and must report rather than wrap
+        let big = i128::MAX / 2;
+        assert!(mul_rescale(big, big, 2).is_err());
     }
 }

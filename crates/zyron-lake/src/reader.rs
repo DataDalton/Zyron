@@ -17,7 +17,7 @@ use zyron_storage::columnar::{
 };
 use zyron_storage::encoding::Predicate;
 
-use crate::cells::{compare_cell_to_value, compare_cells};
+use crate::cells::{CellFamily, cell_family, compare_cell_to_value, compare_cells};
 use crate::encoded_filter::{ColumnEvidence, StoredFilter, rows_matching};
 use crate::manifest::{ManifestFile, PartitionEntry};
 use crate::paths::LakePaths;
@@ -482,18 +482,19 @@ impl LakeFileReader {
             predicates.push(&del.predicate);
         }
         let columns = self.read_predicate_columns(schema, &predicates)?;
-        // Compiled once per file, the row loop resolves no column ids
-        let compiled: Vec<CompiledPredicate> = predicates
-            .iter()
-            .map(|p| CompiledPredicate::new(p, &columns))
-            .collect();
-        for row in 0..self.row_count {
-            for pred in &compiled {
-                if pred.evaluate(&columns, row) == Some(true) {
-                    keep[row / 8] &= !(1 << (row % 8));
-                    break;
-                }
-            }
+        // Compiled once per file, then each predicate marks the rows it
+        // deletes in one pass over the column rather than being asked about
+        // one row at a time
+        let mut deleted = vec![0u8; keep.len()];
+        for predicate in &predicates {
+            CompiledPredicate::new(predicate, &columns).mark_true(
+                &columns,
+                self.row_count,
+                &mut deleted,
+            );
+        }
+        for (live, gone) in keep.iter_mut().zip(deleted.iter()) {
+            *live &= !*gone;
         }
         Ok(keep)
     }
@@ -556,6 +557,202 @@ impl<'a> CompiledPredicate<'a> {
     pub fn evaluate(&self, columns: &[DecodedColumn], row: usize) -> Option<bool> {
         evaluate_node(&self.node, columns, row)
     }
+
+    /// Sets one bit per row the predicate answers TRUE, leaving FALSE and
+    /// UNKNOWN rows untouched. `out` holds at least `(row_count + 7) / 8`
+    /// bytes, row `r` at bit `r % 8` of byte `r / 8`.
+    ///
+    /// A comparison against a fixed-width column resolves the cell width,
+    /// the literal and the operator once and then reads and compares. The
+    /// row walk it replaces re-matched the physical family, re-decoded the
+    /// cell into a 128-bit integer and re-inspected the literal on every
+    /// row, which is what a whole-file delete-survivor pass and a matched
+    /// row count each pay per row.
+    pub fn mark_true(&self, columns: &[DecodedColumn], row_count: usize, out: &mut [u8]) {
+        if let CompiledNode::Compare {
+            col: Some(idx),
+            op,
+            value,
+        } = &self.node
+        {
+            if let Some(column) = columns.get(*idx) {
+                if mark_true_fixed(column, *op, value, row_count, out) {
+                    return;
+                }
+            }
+        }
+        for row in 0..row_count {
+            if evaluate_node(&self.node, columns, row) == Some(true) {
+                out[row / 8] |= 1 << (row % 8);
+            }
+        }
+    }
+}
+
+/// Reads a fixed-width little-endian cell out of a flat cell buffer.
+macro_rules! cell_le {
+    ($cells:expr, $row:expr, $ty:ty, $width:expr) => {{
+        let mut buf = [0u8; $width];
+        buf.copy_from_slice(&$cells[$row * $width..$row * $width + $width]);
+        <$ty>::from_le_bytes(buf)
+    }};
+}
+
+/// Walks the rows once with the operator already chosen, so the per-row
+/// work is one cell read, one comparison and one bit set.
+#[inline]
+fn mark_ordered(
+    column: &DecodedColumn,
+    row_count: usize,
+    out: &mut [u8],
+    op: CompareOp,
+    cmp_at: impl Fn(usize) -> std::cmp::Ordering,
+) {
+    use std::cmp::Ordering;
+    let has_nulls = !column.null_bitmap.is_empty();
+    macro_rules! walk {
+        ($keep:expr) => {
+            for row in 0..row_count {
+                if has_nulls && column.is_null(row) {
+                    continue;
+                }
+                if $keep(cmp_at(row)) {
+                    out[row / 8] |= 1 << (row % 8);
+                }
+            }
+        };
+    }
+    match op {
+        CompareOp::Eq => walk!(|o: Ordering| o.is_eq()),
+        CompareOp::NotEq => walk!(|o: Ordering| o.is_ne()),
+        CompareOp::Lt => walk!(|o: Ordering| o.is_lt()),
+        CompareOp::LtEq => walk!(|o: Ordering| o.is_le()),
+        CompareOp::Gt => walk!(|o: Ordering| o.is_gt()),
+        CompareOp::GtEq => walk!(|o: Ordering| o.is_ge()),
+    }
+}
+
+/// The literal as a signed 128-bit bound, None when it is not an integer
+/// or does not fit, which sends the caller back to the row walk.
+fn literal_as_i128(value: &LakeValue) -> Option<i128> {
+    match value {
+        LakeValue::Int(v) => Some(*v as i128),
+        LakeValue::Int128(v) => Some(*v),
+        LakeValue::UInt(v) => Some(*v as i128),
+        LakeValue::UInt128(v) => i128::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+/// The literal as an unsigned 128-bit bound. A negative literal has no
+/// unsigned form, so it goes back to the row walk rather than being folded
+/// into a constant answer here.
+fn literal_as_u128(value: &LakeValue) -> Option<u128> {
+    match value {
+        LakeValue::Int(v) if *v >= 0 => Some(*v as u128),
+        LakeValue::Int128(v) if *v >= 0 => Some(*v as u128),
+        LakeValue::UInt(v) => Some(*v as u128),
+        LakeValue::UInt128(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Marks the rows a fixed-width comparison answers TRUE. Returns false
+/// when the column layout or the literal is not a shape this walk covers,
+/// and the caller falls back to per-row evaluation. Ordering matches
+/// `compare_cell_to_value` exactly, floats included, which order by
+/// `total_cmp` rather than by partial order.
+fn mark_true_fixed(
+    column: &DecodedColumn,
+    op: CompareOp,
+    value: &LakeValue,
+    row_count: usize,
+    out: &mut [u8],
+) -> bool {
+    let width = column.value_size;
+    if column.all_null
+        || width == 0
+        || column.base != 0
+        || column.row_count < row_count
+        || column.data.len() < row_count * width
+        || out.len() * 8 < row_count
+    {
+        return false;
+    }
+    let cells = column.data.as_slice();
+    match cell_family(column.physical) {
+        CellFamily::SignedInt => {
+            let Some(rhs) = literal_as_i128(value) else {
+                return false;
+            };
+            match width {
+                1 => mark_ordered(column, row_count, out, op, |r| {
+                    (cells[r] as i8 as i128).cmp(&rhs)
+                }),
+                2 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, i16, 2) as i128).cmp(&rhs)
+                }),
+                4 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, i32, 4) as i128).cmp(&rhs)
+                }),
+                8 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, i64, 8) as i128).cmp(&rhs)
+                }),
+                16 => mark_ordered(column, row_count, out, op, |r| {
+                    cell_le!(cells, r, i128, 16).cmp(&rhs)
+                }),
+                _ => return false,
+            }
+        }
+        CellFamily::UnsignedInt => {
+            let Some(rhs) = literal_as_u128(value) else {
+                return false;
+            };
+            match width {
+                1 => mark_ordered(column, row_count, out, op, |r| (cells[r] as u128).cmp(&rhs)),
+                2 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, u16, 2) as u128).cmp(&rhs)
+                }),
+                4 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, u32, 4) as u128).cmp(&rhs)
+                }),
+                8 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, u64, 8) as u128).cmp(&rhs)
+                }),
+                16 => mark_ordered(column, row_count, out, op, |r| {
+                    cell_le!(cells, r, u128, 16).cmp(&rhs)
+                }),
+                _ => return false,
+            }
+        }
+        CellFamily::Float => {
+            let LakeValue::Float(rhs) = value else {
+                return false;
+            };
+            let rhs = *rhs;
+            match width {
+                4 => mark_ordered(column, row_count, out, op, |r| {
+                    (cell_le!(cells, r, f32, 4) as f64).total_cmp(&rhs)
+                }),
+                8 => mark_ordered(column, row_count, out, op, |r| {
+                    cell_le!(cells, r, f64, 8).total_cmp(&rhs)
+                }),
+                _ => return false,
+            }
+        }
+        CellFamily::Bool => {
+            let LakeValue::Bool(rhs) = value else {
+                return false;
+            };
+            let rhs = *rhs;
+            if width != 1 {
+                return false;
+            }
+            mark_ordered(column, row_count, out, op, |r| (cells[r] != 0).cmp(&rhs));
+        }
+        CellFamily::Str | CellFamily::Bytes | CellFamily::Unordered => return false,
+    }
+    true
 }
 
 fn compile_node<'a>(predicate: &'a LakePredicate, columns: &[DecodedColumn]) -> CompiledNode<'a> {
@@ -1010,5 +1207,188 @@ mod tests {
         };
         assert_eq!(evaluate_row(&in_pred, &cols, 1), None);
         assert_eq!(evaluate_row(&in_pred, &cols, 0), Some(false));
+    }
+
+    /// `mark_true` is only worth having if it answers exactly what the row
+    /// walk answers, so this drives both over every family and cell width
+    /// it claims, with nulls, with a literal type it has to refuse, and
+    /// with NaN, which orders by total_cmp rather than by partial order.
+    #[test]
+    fn mark_true_agrees_with_the_row_walk() {
+        fn decoded(
+            physical: TypeId,
+            value_size: usize,
+            cells: Vec<u8>,
+            nulls: Vec<u8>,
+            rows: usize,
+        ) -> DecodedColumn {
+            DecodedColumn {
+                column_id: 0,
+                physical,
+                value_size,
+                data: cells,
+                null_bitmap: nulls,
+                row_count: rows,
+                recyclable: false,
+                base: 0,
+                all_null: false,
+            }
+        }
+
+        fn check(column: DecodedColumn, rows: usize, literals: &[LakeValue]) {
+            let columns = vec![column];
+            for literal in literals {
+                for op in [
+                    CompareOp::Eq,
+                    CompareOp::NotEq,
+                    CompareOp::Lt,
+                    CompareOp::LtEq,
+                    CompareOp::Gt,
+                    CompareOp::GtEq,
+                ] {
+                    let predicate = LakePredicate::Compare {
+                        column_id: 0,
+                        op,
+                        value: literal.clone(),
+                    };
+                    let compiled = CompiledPredicate::new(&predicate, &columns);
+                    let mut batched = vec![0u8; rows.div_ceil(8)];
+                    compiled.mark_true(&columns, rows, &mut batched);
+                    let mut walked = vec![0u8; rows.div_ceil(8)];
+                    for row in 0..rows {
+                        if compiled.evaluate(&columns, row) == Some(true) {
+                            walked[row / 8] |= 1 << (row % 8);
+                        }
+                    }
+                    assert_eq!(
+                        batched, walked,
+                        "type {:?} op {:?} literal {:?}",
+                        columns[0].physical, op, literal
+                    );
+                }
+            }
+        }
+
+        // Signed widths, every other row NULL
+        macro_rules! signed_case {
+            ($ty:ty, $type_id:expr, $width:expr) => {{
+                let rows = 61usize;
+                let mut cells = Vec::new();
+                let mut nulls = vec![0u8; rows.div_ceil(8)];
+                for row in 0..rows {
+                    let v = ((row as i64 * 7) % 23 - 11) as $ty;
+                    cells.extend_from_slice(&v.to_le_bytes());
+                    if row % 5 == 0 {
+                        nulls[row / 8] |= 1 << (row % 8);
+                    }
+                }
+                check(
+                    decoded($type_id, $width, cells, nulls, rows),
+                    rows,
+                    &[
+                        LakeValue::Int(-11),
+                        LakeValue::Int(0),
+                        LakeValue::Int(11),
+                        LakeValue::Int128(3),
+                        LakeValue::UInt(5),
+                        // A literal the fast walk has to refuse, so the row
+                        // walk answers and both still agree
+                        LakeValue::Str("no".into()),
+                    ],
+                );
+            }};
+        }
+        signed_case!(i8, TypeId::Int8, 1);
+        signed_case!(i16, TypeId::Int16, 2);
+        signed_case!(i32, TypeId::Int32, 4);
+        signed_case!(i64, TypeId::Int64, 8);
+
+        macro_rules! unsigned_case {
+            ($ty:ty, $type_id:expr, $width:expr) => {{
+                let rows = 47usize;
+                let mut cells = Vec::new();
+                let nulls = Vec::new();
+                for row in 0..rows {
+                    let v = ((row as u64 * 11) % 19) as $ty;
+                    cells.extend_from_slice(&v.to_le_bytes());
+                }
+                check(
+                    decoded($type_id, $width, cells, nulls, rows),
+                    rows,
+                    &[
+                        LakeValue::UInt(0),
+                        LakeValue::UInt(9),
+                        LakeValue::UInt(18),
+                        LakeValue::Int(4),
+                        // Negative against unsigned cells, refused by the
+                        // fast walk on purpose
+                        LakeValue::Int(-1),
+                    ],
+                );
+            }};
+        }
+        unsigned_case!(u8, TypeId::UInt8, 1);
+        unsigned_case!(u16, TypeId::UInt16, 2);
+        unsigned_case!(u32, TypeId::UInt32, 4);
+        unsigned_case!(u64, TypeId::UInt64, 8);
+
+        // Floats including NaN, negative zero and the infinities
+        let specials = [
+            0.0f64,
+            -0.0,
+            1.5,
+            -1.5,
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let rows = specials.len();
+        let mut cells = Vec::new();
+        for v in specials {
+            cells.extend_from_slice(&v.to_le_bytes());
+        }
+        check(
+            decoded(TypeId::Float64, 8, cells, Vec::new(), rows),
+            rows,
+            &[
+                LakeValue::Float(0.0),
+                LakeValue::Float(-0.0),
+                LakeValue::Float(1.5),
+                LakeValue::Float(f64::NAN),
+                LakeValue::Float(f64::INFINITY),
+            ],
+        );
+
+        let mut cells = Vec::new();
+        for v in [0.0f32, -0.0, 2.25, f32::NAN, f32::NEG_INFINITY] {
+            cells.extend_from_slice(&v.to_le_bytes());
+        }
+        check(
+            decoded(TypeId::Float32, 4, cells, Vec::new(), 5),
+            5,
+            &[LakeValue::Float(0.0), LakeValue::Float(2.25)],
+        );
+
+        // Booleans
+        let cells = vec![0u8, 1, 1, 0, 1];
+        check(
+            decoded(TypeId::Boolean, 1, cells, Vec::new(), 5),
+            5,
+            &[LakeValue::Bool(true), LakeValue::Bool(false)],
+        );
+
+        // Variable width, which the fast walk refuses outright
+        let mut cells = Vec::new();
+        cells.extend_from_slice(&3u32.to_le_bytes());
+        for off in [0u32, 1, 2, 3] {
+            cells.extend_from_slice(&off.to_le_bytes());
+        }
+        cells.extend_from_slice(b"abc");
+        check(
+            decoded(TypeId::Varchar, 0, cells, Vec::new(), 3),
+            3,
+            &[LakeValue::Str("b".into())],
+        );
     }
 }

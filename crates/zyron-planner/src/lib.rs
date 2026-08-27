@@ -13,6 +13,7 @@ pub mod logical;
 pub mod optimizer;
 pub mod physical;
 pub mod statistics;
+pub mod work_estimate;
 
 pub use binder::{BindContext, Binder, BoundStatement, BoundStreamingJob};
 pub use cost::{CostModel, PlanCost};

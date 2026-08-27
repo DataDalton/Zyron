@@ -1,0 +1,162 @@
+{
+  "id": "2026-08-27_221010_23bb366-local",
+  "date": "2026-08-27 22:10:19Z",
+  "ts": 1787868619,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Data Checksum": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.57 },
+      "util_after": { "cpu_pct": 9.0, "ram_used_gb": 15.55 },
+      "data_checksum 64B p50 (ns)": {
+        "average": 2.148438,
+        "runs": [2.15, 2.15, 2.15, 2.15, 2.15],
+        "target": 25.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "data_checksum 64B p90 (ns)": {
+        "average": 2.343750,
+        "runs": [2.34, 2.34, 2.34, 2.34, 2.34],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "data_checksum 64B p99 (ns)": {
+        "average": 2.343750,
+        "runs": [2.34, 2.34, 2.34, 2.34, 2.34],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      }
+    },
+    "WAL Checksum One-Shot": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.56 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 15.52 },
+      "wal_checksum 64B p50 (ns)": {
+        "average": 2.734375,
+        "runs": [2.73, 2.73, 2.73, 2.73, 2.73],
+        "target": 25.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 64B p90 (ns)": {
+        "average": 2.773438,
+        "runs": [2.93, 2.73, 2.73, 2.73, 2.73],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 64B p99 (ns)": {
+        "average": 2.929688,
+        "runs": [2.93, 2.93, 2.93, 2.93, 2.93],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 280B p50 (ns)": {
+        "average": 8.945312,
+        "runs": [8.98, 8.79, 8.98, 8.98, 8.98],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 280B p90 (ns)": {
+        "average": 9.023438,
+        "runs": [8.98, 9.18, 8.98, 8.98, 8.98],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 280B p99 (ns)": {
+        "average": 9.062500,
+        "runs": [8.98, 9.38, 8.98, 8.98, 8.98],
+        "target": 240.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 8KB p50 (ns)": {
+        "average": 377.578125,
+        "runs": [377.73, 377.54, 377.54, 377.54, 377.54],
+        "target": 900.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 8KB p90 (ns)": {
+        "average": 381.406250,
+        "runs": [381.45, 381.25, 381.64, 380.47, 382.23],
+        "target": 1800.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      },
+      "wal_checksum 8KB p99 (ns)": {
+        "average": 399.101562,
+        "runs": [402.34, 387.30, 412.89, 392.77, 400.20],
+        "target": 3600.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": null
+      }
+    },
+    "WAL Hasher Incremental": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 15.53 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.52 },
+      "WalHasher 280B p50 (ns)": {
+        "average": 7.968750,
+        "runs": [8.01, 8.01, 8.01, 8.01, 7.81],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": null
+      },
+      "WalHasher 280B p90 (ns)": {
+        "average": 8.007812,
+        "runs": [8.01, 8.01, 8.01, 8.01, 8.01],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": null
+      },
+      "WalHasher 280B p99 (ns)": {
+        "average": 8.554688,
+        "runs": [8.79, 8.01, 9.96, 8.01, 8.01],
+        "target": 240.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

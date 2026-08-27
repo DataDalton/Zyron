@@ -14,10 +14,11 @@ pub mod dead_subscriber_reaper;
 pub mod dlq_ttl;
 pub mod feature_materialization;
 pub mod feature_materialization_impl;
-pub mod host_health;
 pub mod lake_clustering;
 pub mod lake_follower;
+pub mod mesh_prefetch;
 pub mod mv_refresh;
+pub mod pressure;
 pub mod publication_retention;
 pub mod quota_gossip;
 pub mod recycle_reaper;
@@ -77,6 +78,7 @@ pub struct BackgroundWorkers {
     quota_gossip: Option<QuotaGossipWorker>,
     lake_clustering: Option<self::lake_clustering::LakeClusteringWorker>,
     lake_follower: Option<self::lake_follower::LakeFollowerWorker>,
+    pressure: Option<self::pressure::PressureWorker>,
 }
 
 impl BackgroundWorkers {
@@ -98,6 +100,7 @@ impl BackgroundWorkers {
         data_dir: PathBuf,
         archive_dir: Option<PathBuf>,
         cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
+        slot_manager: Option<Arc<zyron_cdc::SlotManager>>,
         stream_job_manager: Option<Arc<parking_lot::Mutex<zyron_streaming::job::StreamJobManager>>>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         doc_registry: Arc<zyron_common::DocRegistry>,
@@ -144,6 +147,7 @@ impl BackgroundWorkers {
         );
 
         let catalog_for_mv = catalog.clone();
+        let catalog_for_cdc = catalog.clone();
         let retention = RetentionWorker::start(
             catalog.clone(),
             txn_manager.clone(),
@@ -192,8 +196,12 @@ impl BackgroundWorkers {
             })
         });
 
-        let cdc_writer =
-            CdcWriter::start_with_registry(CdcWriterConfig::default(), cdc_registry.clone());
+        let cdc_writer = CdcWriter::start_with_registry(
+            CdcWriterConfig::default(),
+            cdc_registry.clone(),
+            slot_manager,
+            Some(catalog_for_cdc),
+        );
         let mv_refresh =
             MvRefreshWorker::start_with_catalog(MvRefreshConfig::default(), Some(catalog_for_mv));
         let feature_materialization =
@@ -220,6 +228,7 @@ impl BackgroundWorkers {
             quota_gossip: None,
             lake_clustering: None,
             lake_follower: None,
+            pressure: None,
         }
     }
 
@@ -296,6 +305,20 @@ impl BackgroundWorkers {
 
     /// Convenience: attach with the default no-op transport. Useful when the
     /// server is single-node or peer transport is not yet configured
+    /// Starts the pressure controller's clock.
+    ///
+    /// Given the same registry the quota gossip uses, so this node's pressure
+    /// travels on the transport that already exists rather than needing a
+    /// membership layer of its own.
+    pub fn attach_pressure(&mut self, inputs: self::pressure::PressureInputs) {
+        self.pressure = Some(self::pressure::PressureWorker::start(inputs));
+    }
+
+    /// The pressure worker, for the views and for tests.
+    pub fn pressure(&self) -> Option<&self::pressure::PressureWorker> {
+        self.pressure.as_ref()
+    }
+
     pub fn attach_quota_gossip_default(&mut self, registry: Arc<QuotaRegistry>) {
         self.attach_quota_gossip(
             registry,
@@ -347,7 +370,12 @@ impl BackgroundWorkers {
             );
         }
 
-        // Stop workers in reverse dependency order
+        // Stop workers in reverse dependency order. Pressure goes first:
+        // it writes the calibration cache, and a half-written coefficient is
+        // one the next node of this hardware shape would inherit
+        if let Some(ref mut pressure) = self.pressure {
+            pressure.stop();
+        }
         if let Some(ref mut follower) = self.lake_follower {
             follower.shutdown();
         }

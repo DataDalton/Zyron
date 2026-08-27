@@ -42,7 +42,7 @@ use crate::prune_index::PruneIndex;
 use crate::schema::LakeSchema;
 
 pub const LOG_MAGIC: [u8; 5] = *b"ZYLOG";
-pub const LOG_FORMAT_VERSION: u8 = 1;
+pub const LOG_FORMAT_VERSION: u8 = 2;
 pub const COMMIT_HEADER_LEN: usize = 128;
 
 const MAX_COMMIT_ATTEMPTS: u32 = 16;
@@ -2303,10 +2303,56 @@ impl TransactionLog {
         // oldest pin, and an unreadable pin retains everything, the same
         // rule vacuum applies to the data files those versions name
         let mut retain_min_version = retain_min_version;
-        for (_, version) in crate::clone::clone_pins(&self.paths) {
+        for (id, version) in crate::clone::clone_pins(&self.paths) {
             match version {
                 Some(v) => retain_min_version = retain_min_version.min(v),
-                None => return Ok(0),
+                None => {
+                    // Fail safe, but never silently: every GC pass says
+                    // which pin is holding the whole history so the
+                    // operator can repair or drop the clone
+                    tracing::warn!(
+                        clone_id = id,
+                        log_dir = %self.paths.log_dir().display(),
+                        "clone pin is unreadable, version GC retains everything until it is repaired or the clone is dropped"
+                    );
+                    return Ok(0);
+                }
+            }
+        }
+        // A branch replays main's shared history up to its fork point, so
+        // the floor never passes the oldest fork either: collecting past it
+        // would delete version files the branch's reconstruct needs and
+        // leave the branch permanently unreadable. An unreadable branch
+        // marker retains everything, the same rule an unreadable pin applies
+        let branches_root = self.paths.log_dir().join("branches");
+        if branches_root.exists() {
+            for dirent in fs::read_dir(&branches_root)? {
+                let dirent = dirent?;
+                if !dirent.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = dirent.file_name();
+                let Some(name) = name.to_str() else {
+                    tracing::warn!(
+                        log_dir = %self.paths.log_dir().display(),
+                        "branch directory has a non-UTF8 name, version GC retains everything until it is removed"
+                    );
+                    return Ok(0);
+                };
+                match crate::branch::branch_info(&self.paths, name) {
+                    Ok(info) => {
+                        retain_min_version = retain_min_version.min(info.base_version);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            branch = name,
+                            log_dir = %self.paths.log_dir().display(),
+                            error = %e,
+                            "branch marker is unreadable, version GC retains everything until it is repaired or the branch is dropped"
+                        );
+                        return Ok(0);
+                    }
+                }
             }
         }
         let mut checkpoints = Vec::new();

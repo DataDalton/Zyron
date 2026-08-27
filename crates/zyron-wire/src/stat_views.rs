@@ -77,6 +77,10 @@ pub struct StatViewFilters {
     pub equalities: Vec<(String, String)>,
     pub limit: Option<usize>,
     pub offset: usize,
+    /// Columns the query asked for, in the order it asked for them, with the
+    /// name each is to be returned under. Empty for `SELECT *`, which is
+    /// every column in the view's own order
+    pub projection: Vec<(String, String)>,
 }
 
 impl StatViewFilters {
@@ -91,6 +95,49 @@ impl StatViewFilters {
     /// The literal a column was equated to, parsed as an unsigned integer
     pub fn get_u64(&self, column: &str) -> Option<u64> {
         self.get(column).and_then(|v| v.trim().parse().ok())
+    }
+
+    /// Narrows the schema and every row to the columns the query named.
+    ///
+    /// Returns the fields unchanged for `SELECT *`. A column the view does not
+    /// have is an error rather than a null column, because a view's shape is
+    /// fixed and a name that is not in it is a mistake the client should see.
+    fn project(
+        &self,
+        view: &str,
+        fields: Vec<FieldDescription>,
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+    ) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+        if self.projection.is_empty() {
+            return Ok((fields, rows));
+        }
+        let mut indices = Vec::with_capacity(self.projection.len());
+        let mut projected = Vec::with_capacity(self.projection.len());
+        for (column, alias) in &self.projection {
+            let Some(idx) = fields
+                .iter()
+                .position(|f| f.name.eq_ignore_ascii_case(column))
+            else {
+                return Err(ZyronError::PlanError(format!(
+                    "{} has no column named {}",
+                    view, column
+                )));
+            };
+            indices.push(idx);
+            let mut field = fields[idx].clone();
+            field.name = alias.clone();
+            projected.push(field);
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                indices
+                    .iter()
+                    .map(|&idx| row.get(idx).cloned().flatten())
+                    .collect()
+            })
+            .collect();
+        Ok((projected, rows))
     }
 
     /// Drops rows that do not satisfy every equality, then applies offset
@@ -255,6 +302,30 @@ pub fn parse_stat_view_query(
     }
 
     let mut filters = StatViewFilters::default();
+    // The select list is honoured or refused, never ignored. A view answered
+    // from here does not go through the planner, so an expression has nothing
+    // to evaluate it and returning every column instead would be answering a
+    // different query than the one that was asked
+    for item in &sel.projections {
+        match item {
+            zyron_parser::ast::SelectItem::Wildcard
+            | zyron_parser::ast::SelectItem::QualifiedWildcard(_) => {
+                filters.projection.clear();
+                break;
+            }
+            zyron_parser::ast::SelectItem::Expr(expr, alias) => match expr {
+                zyron_parser::Expr::Identifier(name) => {
+                    let alias = alias.clone().unwrap_or_else(|| name.clone());
+                    filters.projection.push((name.clone(), alias));
+                }
+                zyron_parser::Expr::QualifiedIdentifier { column, .. } => {
+                    let alias = alias.clone().unwrap_or_else(|| column.clone());
+                    filters.projection.push((column.clone(), alias));
+                }
+                _ => refuse("expressions in its select list")?,
+            },
+        }
+    }
     if let Some(where_clause) = &sel.where_clause {
         collect_equalities(where_clause, view, &mut filters.equalities)?;
     }
@@ -268,8 +339,12 @@ pub fn parse_stat_view_query(
 }
 
 /// Returns true if the given name matches a virtual statistics view.
+///
+/// The pressure schema is included: its views are computed on read the same
+/// way, and routing them here is what makes them answer to a plain SELECT
+/// from any client rather than needing a side channel.
 pub fn is_stat_view(name: &str) -> bool {
-    STAT_VIEW_NAMES.contains(&name)
+    STAT_VIEW_NAMES.contains(&name) || crate::pressure_views::is_pressure_view(name)
 }
 
 /// Dispatches to the appropriate view builder and returns the column schema
@@ -282,6 +357,18 @@ pub fn query_stat_view(
     // The history views scope themselves by table and version so they read
     // only the log versions the query asked about, every other view builds
     // its rows and is narrowed afterwards
+    if crate::pressure_views::is_pressure_view(name) {
+        let capabilities = server.node_capabilities.as_deref();
+        let built = crate::pressure_views::query_pressure_view(name, capabilities);
+        return match built {
+            Some((fields, rows)) => {
+                let rows = filters.apply(&fields, rows);
+                filters.project(name, fields, rows).map(Some)
+            }
+            None => Ok(None),
+        };
+    }
+
     let built = match name {
         "zyron_table_history" => Some(build_table_history(server, filters)?),
         "zyron_version_details" => Some(build_version_details(server, filters)?),
@@ -298,10 +385,13 @@ pub fn query_stat_view(
         "zyron_lake_log" => Some(build_lake_log(server, filters)?),
         other => build_stat_view(other, server),
     };
-    Ok(built.map(|(fields, rows)| {
-        let rows = filters.apply(&fields, rows);
-        (fields, rows)
-    }))
+    match built {
+        Some((fields, rows)) => {
+            let rows = filters.apply(&fields, rows);
+            filters.project(name, fields, rows).map(Some)
+        }
+        None => Ok(None),
+    }
 }
 
 fn build_stat_view(
@@ -434,18 +524,29 @@ fn build_stat_endpoints(
     (fields, rows)
 }
 
-/// Builds zyron_stat_dead_letters. Runtime DLQ contents are collected by the
-/// streaming crate, this view reports zero rows until the registry callback is
-/// wired through ServerState in a later phase.
+/// Builds zyron_stat_dead_letters. One row per registered dead letter
+/// queue with its pending row count and the receive time of its oldest row.
 fn build_stat_dead_letters(
-    _server: &ServerState,
+    server: &ServerState,
 ) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("queue", PG_TEXT_OID, -1),
         make_field("pending", PG_INT8_OID, 8),
         make_field("oldest_ts", PG_INT8_OID, 8),
     ];
-    (fields, Vec::new())
+    let mut queues = server.dlq_registry.list();
+    queues.sort_by(|a, b| a.table_name().cmp(b.table_name()));
+    let rows = queues
+        .iter()
+        .map(|q| {
+            vec![
+                Some(q.table_name().as_bytes().to_vec()),
+                Some(q.count().to_string().into_bytes()),
+                q.oldest_received_at().map(|ts| ts.to_string().into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
 }
 
 /// Builds zyron_stat_zyron_sinks. Lists remote Zyron sink entries from the
@@ -500,10 +601,11 @@ fn build_stat_zyron_sources(
     (fields, rows)
 }
 
-/// Builds zyron_stat_credential_cache. Reports zero rows until the credential
-/// cache registry is wired through ServerState.
+/// Builds zyron_stat_credential_cache. Every dynamic credential provider
+/// shares one TTL cache under distinct key namespaces, so this reports one
+/// row of aggregate counters. No row when security is disabled.
 fn build_stat_credential_cache(
-    _server: &ServerState,
+    server: &ServerState,
 ) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("provider", PG_TEXT_OID, -1),
@@ -512,7 +614,21 @@ fn build_stat_credential_cache(
         make_field("misses", PG_INT8_OID, 8),
         make_field("refreshes", PG_INT8_OID, 8),
     ];
-    (fields, Vec::new())
+    let rows = server
+        .security_manager
+        .as_ref()
+        .map(|sm| {
+            let stats = sm.credential_cache.stats();
+            vec![vec![
+                Some(b"shared".to_vec()),
+                Some(stats.size.to_string().into_bytes()),
+                Some(stats.hits.to_string().into_bytes()),
+                Some(stats.misses.to_string().into_bytes()),
+                Some(stats.refreshes.to_string().into_bytes()),
+            ]]
+        })
+        .unwrap_or_default();
+    (fields, rows)
 }
 
 /// Creates a FieldDescription with default values for virtual view columns.
@@ -1798,6 +1914,90 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: the fields and rows a two-column view would produce.
+    fn two_columns() -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+        let named = |name: &str| FieldDescription {
+            name: name.to_string(),
+            table_oid: 0,
+            column_attr: 0,
+            type_oid: 25,
+            type_size: -1,
+            type_modifier: -1,
+            format: 0,
+        };
+        let fields = vec![named("alpha"), named("beta")];
+        let rows = vec![
+            vec![Some(b"a1".to_vec()), Some(b"b1".to_vec())],
+            vec![Some(b"a2".to_vec()), None],
+        ];
+        (fields, rows)
+    }
+
+    /// A named column narrows the answer to it, in the order it was asked
+    /// for. Before this, every view returned all of its columns whatever the
+    /// select list said, so a client reading by position read the wrong value.
+    #[test]
+    fn a_named_column_is_the_only_one_returned() {
+        let filters = StatViewFilters {
+            projection: vec![("beta".into(), "beta".into())],
+            ..StatViewFilters::default()
+        };
+        let (fields, rows) = two_columns();
+        let (fields, rows) = filters.project("v", fields, rows).expect("beta exists");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "beta");
+        assert_eq!(rows[0], vec![Some(b"b1".to_vec())]);
+        assert_eq!(rows[1], vec![None], "a null column lost its nullness");
+    }
+
+    /// The order asked for is the order returned, and an alias renames.
+    #[test]
+    fn the_select_order_and_aliases_are_kept() {
+        let filters = StatViewFilters {
+            projection: vec![
+                ("beta".into(), "second".into()),
+                ("alpha".into(), "first".into()),
+            ],
+            ..StatViewFilters::default()
+        };
+        let (fields, rows) = two_columns();
+        let (fields, rows) = filters.project("v", fields, rows).expect("both exist");
+        assert_eq!(fields[0].name, "second");
+        assert_eq!(fields[1].name, "first");
+        assert_eq!(
+            rows[0],
+            vec![Some(b"b1".to_vec()), Some(b"a1".to_vec())],
+            "the values did not follow their columns"
+        );
+    }
+
+    /// A star leaves the view's own shape alone.
+    #[test]
+    fn a_star_returns_the_whole_view() {
+        let filters = StatViewFilters::default();
+        let (fields, rows) = two_columns();
+        let (fields, rows) = filters
+            .project("v", fields, rows)
+            .expect("a star always works");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(rows[0].len(), 2);
+    }
+
+    /// A column the view does not have is an error, not a null column and
+    /// not a silent fallback to every column.
+    #[test]
+    fn a_column_the_view_lacks_is_refused() {
+        let filters = StatViewFilters {
+            projection: vec![("gamma".into(), "gamma".into())],
+            ..StatViewFilters::default()
+        };
+        let (fields, rows) = two_columns();
+        let error = filters
+            .project("v", fields, rows)
+            .expect_err("gamma is not a column of v");
+        assert!(error.to_string().contains("gamma"), "{error}");
+    }
 
     #[test]
     fn test_lake_log_is_a_stat_view() {

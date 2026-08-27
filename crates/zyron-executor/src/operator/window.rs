@@ -16,7 +16,7 @@ use crate::batch::DataBatch;
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
 use crate::expr::evaluate;
 use crate::operator::aggregate::{
-    build_accumulator, coerce_aggregate_scalar, is_supported_aggregate,
+    Accumulator, build_accumulator, coerce_aggregate_scalar, is_supported_aggregate,
 };
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -29,6 +29,9 @@ pub struct WindowOperator {
     result: Option<DataBatch>,
     output_cursor: usize,
     finished: bool,
+    /// Query memory budget the buffered input reserves against. None runs
+    /// unbudgeted.
+    memory_budget: Option<std::sync::Arc<crate::context::QueryMemoryBudget>>,
 }
 
 impl WindowOperator {
@@ -44,7 +47,17 @@ impl WindowOperator {
             result: None,
             output_cursor: 0,
             finished: false,
+            memory_budget: None,
         }
+    }
+
+    /// Attaches the query memory budget. Set by the operator builder from
+    /// the execution context.
+    pub fn set_memory_budget(
+        &mut self,
+        budget: Option<std::sync::Arc<crate::context::QueryMemoryBudget>>,
+    ) {
+        self.memory_budget = budget;
     }
 
     async fn materialize(&mut self) -> Result<()> {
@@ -53,6 +66,9 @@ impl WindowOperator {
         let mut total_rows = 0usize;
 
         while let Some(eb) = self.child.next().await? {
+            if let Some(budget) = &self.memory_budget {
+                budget.reserve(eb.batch.approx_bytes())?;
+            }
             total_rows += eb.batch.num_rows;
             if combined_columns.is_empty() {
                 combined_columns.resize_with(eb.batch.num_columns(), Vec::new);
@@ -228,9 +244,34 @@ fn compute_sort_indices(
                 return ord;
             }
         }
-        // Then order keys respecting direction.
+        // Then order keys respecting direction and null placement. Null
+        // placement is what the ORDER BY clause declared and is decided
+        // before the direction reversal, the same rule the Sort operator
+        // applies, so a window's frame sees rows in the order the query
+        // said rather than nulls-first regardless
         for (i, col) in order_cols.iter().enumerate() {
-            let ord = compare_col_rows(col, a as usize, b as usize);
+            let (ai, bi) = (a as usize, b as usize);
+            let a_null = col.is_null(ai);
+            let b_null = col.is_null(bi);
+            match (a_null, b_null) {
+                (true, true) => continue,
+                (true, false) => {
+                    return if order_by[i].nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    };
+                }
+                (false, true) => {
+                    return if order_by[i].nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                }
+                (false, false) => {}
+            }
+            let ord = compare_col_values(&col.data, ai, bi);
             let ord = if order_by[i].asc { ord } else { ord.reverse() };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -265,8 +306,8 @@ fn compare_col_values(data: &ColumnData, a: usize, b: usize) -> std::cmp::Orderi
         ColumnData::UInt16(v) => v[a].cmp(&v[b]),
         ColumnData::UInt32(v) => v[a].cmp(&v[b]),
         ColumnData::UInt64(v) => v[a].cmp(&v[b]),
-        ColumnData::Float32(v) => v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal),
-        ColumnData::Float64(v) => v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal),
+        ColumnData::Float32(v) => crate::compute::cmp_f32_total(v[a], v[b]),
+        ColumnData::Float64(v) => crate::compute::cmp_f64_total(v[a], v[b]),
         ColumnData::Utf8(v) => v[a].cmp(&v[b]),
         ColumnData::Binary(v) => v[a].cmp(&v[b]),
         ColumnData::FixedBinary16(v) => v[a].cmp(&v[b]),
@@ -408,28 +449,84 @@ fn compute_window_aggregate(
         let plen = end - start;
 
         if let Some(f) = frame {
-            // Explicit frame: aggregate each row's resolved [lo, hi).
-            let order_values = if matches!(f.mode, WindowFrameMode::Range) {
+            // Explicit frame: aggregate each row's resolved [lo, hi)
+            let range_state = if matches!(f.mode, WindowFrameMode::Range) {
                 let oc = order_cols.first().ok_or_else(|| {
                     ZyronError::ExecutionError("RANGE frame requires ORDER BY".into())
                 })?;
-                Some(extract_order_values(oc, start, end))
+                let axis = build_range_axis(order_by, oc)?;
+                let (values, value_nulls) = extract_order_values(oc, start, end)?;
+                Some((values, value_nulls, axis))
             } else {
                 None
             };
-            for pos in 0..plen {
-                let (lo, hi) = match f.mode {
-                    WindowFrameMode::Rows => resolve_row_frame(pos, plen, f),
-                    WindowFrameMode::Range => {
-                        resolve_range_frame(pos, plen, f, order_values.as_ref().unwrap())
+            let resolve = |pos: usize| -> Result<(usize, usize)> {
+                match (f.mode, &range_state) {
+                    (WindowFrameMode::Rows, _) => Ok(resolve_row_frame(pos, plen, f)),
+                    (WindowFrameMode::Range, Some((values, value_nulls, axis))) => {
+                        resolve_range_frame(pos, plen, f, values, value_nulls, axis)
                     }
-                };
-                let val = if hi > lo {
-                    agg_range(start + lo, start + hi)?
-                } else {
-                    ScalarValue::Null
-                };
-                push(val, &mut data, &mut nulls);
+                    (WindowFrameMode::Range, None) => Err(ZyronError::ExecutionError(
+                        "RANGE frame requires ORDER BY".into(),
+                    )),
+                }
+            };
+            if matches!(
+                f.start,
+                WindowFrameBound::Unbounded(WindowFrameDirection::Preceding)
+            ) {
+                // A frame anchored at UNBOUNDED PRECEDING makes every row a
+                // prefix fold, so one running accumulator absorbs each row
+                // once and finalizes per row. The running fold feeds the same
+                // rows in the same order as a fresh fold of [0, hi), so the
+                // results are identical while the partition cost drops from
+                // quadratic to linear. The refold accumulator covers an upper
+                // edge that steps backward, which only occurs when RANGE
+                // order values are not ascending
+                let mut running = build_accumulator(name, args_len);
+                let mut refold = build_accumulator(name, args_len);
+                let mut absorbed = 0usize;
+                for pos in 0..plen {
+                    let (lo, hi) = resolve(pos)?;
+                    let val = if hi > lo {
+                        if hi >= absorbed {
+                            while absorbed < hi {
+                                if args_len == 0 {
+                                    running.add_count(1);
+                                } else if let Some(col) = arg_col {
+                                    running.update_typed(col, start + absorbed);
+                                }
+                                absorbed += 1;
+                            }
+                            coerce_aggregate_scalar(running.finalize(), out_type)?
+                        } else {
+                            refold.reset();
+                            fold_frame(refold.as_mut(), args_len, arg_col, start + lo, start + hi);
+                            coerce_aggregate_scalar(refold.finalize(), out_type)?
+                        }
+                    } else {
+                        ScalarValue::Null
+                    };
+                    push(val, &mut data, &mut nulls);
+                }
+            } else {
+                // A sliding lower edge refolds each row's own range: float
+                // aggregation is fold-order sensitive, so the overlap between
+                // consecutive frames cannot be reused without changing
+                // results. One reset accumulator keeps the refold free of
+                // per-row allocation
+                let mut acc = build_accumulator(name, args_len);
+                for pos in 0..plen {
+                    let (lo, hi) = resolve(pos)?;
+                    let val = if hi > lo {
+                        acc.reset();
+                        fold_frame(acc.as_mut(), args_len, arg_col, start + lo, start + hi);
+                        coerce_aggregate_scalar(acc.finalize(), out_type)?
+                    } else {
+                        ScalarValue::Null
+                    };
+                    push(val, &mut data, &mut nulls);
+                }
             }
         } else if order_by.is_empty() {
             // Whole partition: one fold, broadcast to every row.
@@ -472,6 +569,23 @@ fn compute_window_aggregate(
     }
 
     Ok(Column::with_nulls(data, nulls, out_type))
+}
+
+/// Folds the absolute row range [lo, hi) into an existing accumulator
+fn fold_frame(
+    acc: &mut dyn Accumulator,
+    args_len: usize,
+    arg_col: Option<&Column>,
+    lo: usize,
+    hi: usize,
+) {
+    if args_len == 0 {
+        acc.add_count(hi - lo);
+    } else if let Some(col) = arg_col {
+        for r in lo..hi {
+            acc.update_typed(col, r);
+        }
+    }
 }
 
 fn window_function_kind(name: &str) -> Result<WindowOutputKind> {
@@ -699,10 +813,18 @@ fn evaluate_window_function(
                                             ));
                                         }
                                     };
-                                    let order_values = extract_order_values(order_col, start, end);
+                                    let axis = build_range_axis(order_by, order_col)?;
+                                    let (order_values, order_nulls) =
+                                        extract_order_values(order_col, start, end)?;
                                     for i in 0..(end - start) {
-                                        let (lo, hi) =
-                                            resolve_range_frame(i, end - start, f, &order_values);
+                                        let (lo, hi) = resolve_range_frame(
+                                            i,
+                                            end - start,
+                                            f,
+                                            &order_values,
+                                            &order_nulls,
+                                            &axis,
+                                        )?;
                                         if hi > lo {
                                             let sum: f64 = values[lo..hi].iter().sum();
                                             result_data[start + i] = sum / (hi - lo) as f64;
@@ -824,11 +946,18 @@ fn evaluate_window_function(
                                 }
                                 WindowFrameMode::Range => {
                                     if let Some(order_col) = time_col.as_ref() {
-                                        let order_values =
-                                            extract_order_values(order_col, start, end);
+                                        let axis = build_range_axis(order_by, order_col)?;
+                                        let (order_values, order_nulls) =
+                                            extract_order_values(order_col, start, end)?;
                                         for i in 0..len {
-                                            let (lo, hi) =
-                                                resolve_range_frame(i, len, f, &order_values);
+                                            let (lo, hi) = resolve_range_frame(
+                                                i,
+                                                len,
+                                                f,
+                                                &order_values,
+                                                &order_nulls,
+                                                &axis,
+                                            )?;
                                             if hi > lo {
                                                 indices[start + i] = (start + hi - 1) as i64;
                                             }
@@ -933,95 +1062,282 @@ fn resolve_row_frame(pos: usize, partition_len: usize, frame: &WindowFrame) -> (
 /// order_values must be the ORDER BY column values in sorted order, indexed relative
 /// to `partition_start`. For each row `pos` in [0, partition_len), find all rows
 /// whose order value falls within the computed bounds.
+/// The value axis a RANGE frame measures on: the ORDER BY key's direction,
+/// the multiplier a plain-number offset scales by (ten to the scale for a
+/// decimal, one million for a picosecond timestamp whose offsets are
+/// microseconds), and the timestamp width interval bounds shift at
+struct RangeAxis {
+    asc: bool,
+    offset_mul: i128,
+    ts_us: bool,
+    ts_ps: bool,
+}
+
+fn build_range_axis(order_by: &[BoundOrderBy], col: &Column) -> Result<RangeAxis> {
+    let asc = order_by.first().map(|o| o.asc).unwrap_or(true);
+    let is_ts = matches!(
+        col.type_id,
+        zyron_common::TypeId::Timestamp | zyron_common::TypeId::TimestampTz
+    );
+    let ps = is_ts && col.fractional_digits.unwrap_or(6) > 6;
+    let offset_mul = if col.type_id == zyron_common::TypeId::Decimal {
+        zyron_common::decimal::scale_factor(col.fractional_digits.unwrap_or(0))?
+    } else if ps {
+        1_000_000
+    } else {
+        1
+    };
+    Ok(RangeAxis {
+        asc,
+        offset_mul,
+        ts_us: is_ts && !ps,
+        ts_ps: ps,
+    })
+}
+
+/// ORDER BY values for one partition, integer or float axis, with per-row
+/// null flags. A non-numeric order key cannot measure a RANGE distance
+/// and errors loudly instead of measuring everything as zero
+enum AxisValues {
+    Int(Vec<i128>),
+    Float(Vec<f64>),
+}
+
+fn extract_order_values(
+    order_col: &Column,
+    start: usize,
+    end: usize,
+) -> Result<(AxisValues, Vec<bool>)> {
+    let mut is_null = Vec::with_capacity(end - start);
+    for i in start..end {
+        is_null.push(order_col.is_null(i));
+    }
+    let values = match &order_col.data {
+        ColumnData::Int64(v) => AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect()),
+        ColumnData::Int32(v) => AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect()),
+        ColumnData::Int16(v) => AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect()),
+        ColumnData::Int8(v) => AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect()),
+        ColumnData::UInt8(v) => AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect()),
+        ColumnData::UInt16(v) => {
+            AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect())
+        }
+        ColumnData::UInt32(v) => {
+            AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect())
+        }
+        ColumnData::UInt64(v) => {
+            AxisValues::Int(v[start..end].iter().map(|&x| x as i128).collect())
+        }
+        ColumnData::Int128(v) => AxisValues::Int(v[start..end].to_vec()),
+        ColumnData::Float32(v) => {
+            AxisValues::Float(v[start..end].iter().map(|&x| x as f64).collect())
+        }
+        ColumnData::Float64(v) => AxisValues::Float(v[start..end].to_vec()),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "RANGE frame requires a numeric or temporal ORDER BY key".into(),
+            ));
+        }
+    };
+    Ok((values, is_null))
+}
+
+/// Shifts an integer-axis anchor by an interval, calendar aware, at the
+/// axis's timestamp width.
+fn shift_anchor_by_interval(
+    anchor: i128,
+    interval: &zyron_common::Interval,
+    add: bool,
+    axis: &RangeAxis,
+) -> Result<i128> {
+    if axis.ts_ps {
+        let us = anchor.div_euclid(1_000_000) as i64;
+        let frac = anchor.rem_euclid(1_000_000);
+        let calendar = zyron_common::Interval {
+            months: interval.months,
+            days: interval.days,
+            nanoseconds: interval.nanoseconds - (interval.nanoseconds % 1_000),
+        };
+        let sub_us_ps = i128::from(interval.nanoseconds % 1_000) * 1_000;
+        let shifted = if add {
+            calendar.add_to_timestamp_micros(us)
+        } else {
+            calendar.subtract_from_timestamp_micros(us)
+        };
+        Ok(i128::from(shifted) * 1_000_000 + frac + if add { sub_us_ps } else { -sub_us_ps })
+    } else if axis.ts_us {
+        let base = anchor as i64;
+        let shifted = if add {
+            interval.add_to_timestamp_micros(base)
+        } else {
+            interval.subtract_from_timestamp_micros(base)
+        };
+        Ok(i128::from(shifted))
+    } else {
+        Err(ZyronError::ExecutionError(
+            "a RANGE INTERVAL bound requires a timestamp ORDER BY key".into(),
+        ))
+    }
+}
+
+/// The value threshold one frame bound resolves to on the axis, None for
+/// unbounded. `toward_start` is true for the frame's lower edge. Under a
+/// descending order the value axis runs backward, so PRECEDING moves
+/// toward larger values and FOLLOWING toward smaller
+fn range_bound_threshold_int(
+    anchor: i128,
+    bound: WindowFrameBound,
+    axis: &RangeAxis,
+) -> Result<Option<i128>> {
+    let scaled = |n: u64| (n as i128).saturating_mul(axis.offset_mul);
+    Ok(match bound {
+        WindowFrameBound::CurrentRow => Some(anchor),
+        WindowFrameBound::Unbounded(_) => None,
+        WindowFrameBound::Offset(n, WindowFrameDirection::Preceding) => Some(if axis.asc {
+            anchor.saturating_sub(scaled(n))
+        } else {
+            anchor.saturating_add(scaled(n))
+        }),
+        WindowFrameBound::Offset(n, WindowFrameDirection::Following) => Some(if axis.asc {
+            anchor.saturating_add(scaled(n))
+        } else {
+            anchor.saturating_sub(scaled(n))
+        }),
+        WindowFrameBound::IntervalBound(interval, WindowFrameDirection::Preceding) => Some(
+            shift_anchor_by_interval(anchor, &interval, !axis.asc, axis)?,
+        ),
+        WindowFrameBound::IntervalBound(interval, WindowFrameDirection::Following) => {
+            Some(shift_anchor_by_interval(anchor, &interval, axis.asc, axis)?)
+        }
+    })
+}
+
+fn range_bound_threshold_float(
+    anchor: f64,
+    bound: WindowFrameBound,
+    axis: &RangeAxis,
+) -> Result<Option<f64>> {
+    Ok(match bound {
+        WindowFrameBound::CurrentRow => Some(anchor),
+        WindowFrameBound::Unbounded(_) => None,
+        WindowFrameBound::Offset(n, WindowFrameDirection::Preceding) => Some(if axis.asc {
+            anchor - n as f64
+        } else {
+            anchor + n as f64
+        }),
+        WindowFrameBound::Offset(n, WindowFrameDirection::Following) => Some(if axis.asc {
+            anchor + n as f64
+        } else {
+            anchor - n as f64
+        }),
+        WindowFrameBound::IntervalBound(..) => {
+            return Err(ZyronError::ExecutionError(
+                "a RANGE INTERVAL bound requires a timestamp ORDER BY key".into(),
+            ));
+        }
+    })
+}
+
+/// Resolves one row's RANGE frame to [lo, hi) partition indices.
+///
+/// The partition's order values are sorted in the query's declared
+/// direction, so the searches run forward under ASC and reversed under
+/// DESC. Nulls sort as one contiguous block at whichever end the null
+/// placement put them: a null anchor's frame is its peer block (extended
+/// by unbounded edges), a value bound from a non-null anchor never
+/// reaches into the null block, and an unbounded edge always does
 fn resolve_range_frame(
     pos: usize,
     partition_len: usize,
     frame: &WindowFrame,
-    order_values: &[i64],
-) -> (usize, usize) {
-    // Current row's order value is the anchor.
-    let anchor = order_values[pos];
-
-    // Resolve lower bound order value
-    let (lo_val, lo_inclusive) = resolve_range_bound(anchor, frame.start, true);
-    // Resolve upper bound. If frame.end is None, use CURRENT ROW.
+    values: &AxisValues,
+    nulls: &[bool],
+    axis: &RangeAxis,
+) -> Result<(usize, usize)> {
     let end_bound = frame.end.unwrap_or(WindowFrameBound::CurrentRow);
-    let (hi_val, hi_inclusive) = resolve_range_bound(anchor, end_bound, false);
-
-    // Binary search for the lo and hi indices (order_values is sorted).
-    let lo_idx = match lo_val {
-        None => 0,
-        Some(v) => {
-            let search =
-                order_values.partition_point(|x| if lo_inclusive { *x < v } else { *x <= v });
-            search.min(partition_len)
-        }
+    // The null block is contiguous at the front or the back of the
+    // partition, whichever the sort placed it at
+    let leading_nulls = nulls.iter().take_while(|&&n| n).count();
+    let trailing_nulls = if leading_nulls == partition_len {
+        0
+    } else {
+        nulls.iter().rev().take_while(|&&n| n).count()
     };
-    let hi_idx = match hi_val {
-        None => partition_len,
-        Some(v) => {
-            let search =
-                order_values.partition_point(|x| if hi_inclusive { *x <= v } else { *x < v });
-            search.min(partition_len)
-        }
-    };
+    let nn_lo = leading_nulls;
+    let nn_hi = partition_len - trailing_nulls;
 
-    (lo_idx, hi_idx)
-}
-
-/// Resolves a RANGE frame bound to an order-value threshold.
-/// Returns (Some(value), inclusive) or (None, _) for unbounded.
-/// When is_start is true, the value is the lower edge; when false, the upper edge.
-fn resolve_range_bound(
-    anchor: i64,
-    bound: WindowFrameBound,
-    is_start: bool,
-) -> (Option<i64>, bool) {
-    match bound {
-        WindowFrameBound::CurrentRow => (Some(anchor), true),
-        WindowFrameBound::Unbounded(_) => (None, true),
-        WindowFrameBound::Offset(n, WindowFrameDirection::Preceding) => {
-            let offset = anchor.saturating_sub(n as i64);
-            let _ = is_start;
-            (Some(offset), true)
-        }
-        WindowFrameBound::Offset(n, WindowFrameDirection::Following) => {
-            let offset = anchor.saturating_add(n as i64);
-            let _ = is_start;
-            (Some(offset), true)
-        }
-        WindowFrameBound::IntervalBound(interval, WindowFrameDirection::Preceding) => {
-            // anchor - interval (calendar-aware timestamp math)
-            let result = interval.subtract_from_timestamp_micros(anchor);
-            (Some(result), true)
-        }
-        WindowFrameBound::IntervalBound(interval, WindowFrameDirection::Following) => {
-            // anchor + interval
-            let result = interval.add_to_timestamp_micros(anchor);
-            (Some(result), true)
-        }
-    }
-}
-
-/// Extracts ORDER BY column values as i64 (microseconds for timestamps, or numeric values).
-/// Partition slice [start..end) of the sorted column.
-fn extract_order_values(order_col: &Column, start: usize, end: usize) -> Vec<i64> {
-    let mut result = Vec::with_capacity(end - start);
-    for i in start..end {
-        let v = match &order_col.data {
-            ColumnData::Int64(v) => v[i],
-            ColumnData::Int32(v) => v[i] as i64,
-            ColumnData::Int16(v) => v[i] as i64,
-            ColumnData::Int8(v) => v[i] as i64,
-            ColumnData::UInt32(v) => v[i] as i64,
-            ColumnData::UInt64(v) => v[i] as i64,
-            ColumnData::Float32(v) => v[i] as i64,
-            ColumnData::Float64(v) => v[i] as i64,
-            _ => 0,
+    if nulls[pos] {
+        let (block_lo, block_hi) = if pos < nn_lo {
+            (0, nn_lo)
+        } else {
+            (nn_hi, partition_len)
         };
-        result.push(v);
+        let lo = match frame.start {
+            WindowFrameBound::Unbounded(WindowFrameDirection::Preceding) => 0,
+            _ => block_lo,
+        };
+        let hi = match end_bound {
+            WindowFrameBound::Unbounded(WindowFrameDirection::Following) => partition_len,
+            _ => block_hi,
+        };
+        return Ok((lo, hi));
     }
-    result
+
+    match values {
+        AxisValues::Int(v) => {
+            let anchor = v[pos];
+            let nonnull = &v[nn_lo..nn_hi];
+            let lo = match range_bound_threshold_int(anchor, frame.start, axis)? {
+                None => 0,
+                Some(t) => {
+                    nn_lo
+                        + if axis.asc {
+                            nonnull.partition_point(|x| *x < t)
+                        } else {
+                            nonnull.partition_point(|x| *x > t)
+                        }
+                }
+            };
+            let hi = match range_bound_threshold_int(anchor, end_bound, axis)? {
+                None => partition_len,
+                Some(t) => {
+                    nn_lo
+                        + if axis.asc {
+                            nonnull.partition_point(|x| *x <= t)
+                        } else {
+                            nonnull.partition_point(|x| *x >= t)
+                        }
+                }
+            };
+            Ok((lo.min(partition_len), hi.min(partition_len)))
+        }
+        AxisValues::Float(v) => {
+            let anchor = v[pos];
+            let nonnull = &v[nn_lo..nn_hi];
+            let lo = match range_bound_threshold_float(anchor, frame.start, axis)? {
+                None => 0,
+                Some(t) => {
+                    nn_lo
+                        + if axis.asc {
+                            nonnull.partition_point(|x| *x < t)
+                        } else {
+                            nonnull.partition_point(|x| *x > t)
+                        }
+                }
+            };
+            let hi = match range_bound_threshold_float(anchor, end_bound, axis)? {
+                None => partition_len,
+                Some(t) => {
+                    nn_lo
+                        + if axis.asc {
+                            nonnull.partition_point(|x| *x <= t)
+                        } else {
+                            nonnull.partition_point(|x| *x >= t)
+                        }
+                }
+            };
+            Ok((lo.min(partition_len), hi.min(partition_len)))
+        }
+    }
 }
 
 /// Converts a WindowFrameBound to an offset within the partition.
@@ -1320,6 +1636,27 @@ mod tests {
 
     // ----- RANGE frame resolution -----
 
+    /// Test axis: ascending, no scaling, microsecond timestamps.
+    fn test_axis() -> RangeAxis {
+        RangeAxis {
+            asc: true,
+            offset_mul: 1,
+            ts_us: true,
+            ts_ps: false,
+        }
+    }
+
+    fn resolve_int(
+        pos: usize,
+        plen: usize,
+        frame: &WindowFrame,
+        order_values: &[i64],
+    ) -> (usize, usize) {
+        let values = AxisValues::Int(order_values.iter().map(|&x| x as i128).collect());
+        let nulls = vec![false; order_values.len()];
+        resolve_range_frame(pos, plen, frame, &values, &nulls, &test_axis()).unwrap()
+    }
+
     #[test]
     fn test_resolve_range_frame_numeric_preceding() {
         // order_values: [10, 20, 30, 40, 50]
@@ -1331,7 +1668,7 @@ mod tests {
             start: WindowFrameBound::Offset(15, WindowFrameDirection::Preceding),
             end: Some(WindowFrameBound::CurrentRow),
         };
-        let (lo, hi) = resolve_range_frame(2, 5, &frame, &order_values);
+        let (lo, hi) = resolve_int(2, 5, &frame, &order_values);
         assert_eq!(lo, 1);
         assert_eq!(hi, 3);
     }
@@ -1344,7 +1681,7 @@ mod tests {
             start: WindowFrameBound::Unbounded(WindowFrameDirection::Preceding),
             end: Some(WindowFrameBound::Unbounded(WindowFrameDirection::Following)),
         };
-        let (lo, hi) = resolve_range_frame(2, 5, &frame, &order_values);
+        let (lo, hi) = resolve_int(2, 5, &frame, &order_values);
         assert_eq!(lo, 0);
         assert_eq!(hi, 5);
     }
@@ -1364,7 +1701,7 @@ mod tests {
             end: Some(WindowFrameBound::CurrentRow),
         };
         // At pos=2 (2h): anchor=2h, lower=1h => rows [1, 2, 3) (1h, 2h)
-        let (lo, hi) = resolve_range_frame(2, 5, &frame, &order_values);
+        let (lo, hi) = resolve_int(2, 5, &frame, &order_values);
         assert_eq!(lo, 1);
         assert_eq!(hi, 3);
     }
@@ -1377,7 +1714,7 @@ mod tests {
             start: WindowFrameBound::CurrentRow,
             end: Some(WindowFrameBound::CurrentRow),
         };
-        let (lo, hi) = resolve_range_frame(2, 5, &frame, &order_values);
+        let (lo, hi) = resolve_int(2, 5, &frame, &order_values);
         assert_eq!(lo, 2);
         assert_eq!(hi, 3);
     }
@@ -1394,7 +1731,7 @@ mod tests {
             start: WindowFrameBound::CurrentRow,
             end: Some(WindowFrameBound::CurrentRow),
         };
-        let (lo, hi) = resolve_range_frame(1, 5, &frame, &order_values);
+        let (lo, hi) = resolve_int(1, 5, &frame, &order_values);
         assert_eq!(lo, 1);
         assert_eq!(hi, 4);
     }

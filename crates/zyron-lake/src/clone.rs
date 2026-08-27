@@ -278,7 +278,16 @@ pub fn clone_source(manifest: &crate::manifest::ManifestFile) -> Option<(u32, u6
 /// is making is the state this is trying to reach
 pub fn release_pin(source: &LakePaths, clone_table_id: u32) -> Result<(), ZyronError> {
     match fs::remove_file(source.clone_ref(clone_table_id)) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Files only the pinned version referenced are unreachable now,
+            // and no commit will ever announce that, so the vacuum is asked
+            // for directly
+            if let Some(table_id) = source.table_id() {
+                crate::maintenance_signal::maintenance_signal()
+                    .mark_vacuum(source.root().to_path_buf(), table_id);
+            }
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }

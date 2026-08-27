@@ -72,7 +72,9 @@ pub fn changes_between(
 
     let mut out = Vec::new();
     for version in first..=last {
-        let path = log.paths().version_file(version);
+        // Resolved through the log so a branch head reads its own version
+        // files after the fork point instead of main's
+        let path = log.version_path(version);
         let bytes = std::fs::read(&path)?;
         let data = VersionFileData::decode(&bytes, &path.to_string_lossy())?;
         let base_version = version - 1;
@@ -174,26 +176,24 @@ pub fn changed_ordinals(
             descriptor.partition_id, descriptor.base_version
         )));
     };
-    let keep = reader.delete_survivors(&base.schema, &base, entry)?;
+    let mut keep = reader.delete_survivors(&base.schema, &base, entry)?;
 
-    let matched = match &descriptor.predicate {
-        None => None,
-        Some(predicate) => {
-            let columns = reader.read_predicate_columns(&base.schema, &[predicate])?;
-            let compiled = crate::reader::CompiledPredicate::new(predicate, &columns);
-            Some((columns, compiled))
+    // A descriptor predicate narrows the live rows before they are listed,
+    // marked in one pass over the column rather than row by row
+    if let Some(predicate) = &descriptor.predicate {
+        let columns = reader.read_predicate_columns(&base.schema, &[predicate])?;
+        let mut hits = vec![0u8; keep.len()];
+        crate::reader::CompiledPredicate::new(predicate, &columns)
+            .mark_true(&columns, row_count, &mut hits);
+        for (live, hit) in keep.iter_mut().zip(hits.iter()) {
+            *live &= *hit;
         }
-    };
+    }
 
     let mut out = Vec::new();
     for row in 0..row_count {
         if keep[row / 8] & (1 << (row % 8)) == 0 {
             continue;
-        }
-        if let Some((columns, compiled)) = &matched {
-            if compiled.evaluate(columns, row) != Some(true) {
-                continue;
-            }
         }
         out.push(row as u64);
     }

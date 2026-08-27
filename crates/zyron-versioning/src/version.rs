@@ -448,6 +448,12 @@ pub struct VersionLog {
     index: VersionIndex,
     /// Next version to assign. Starts at 1 (VersionId(0) is the sentinel).
     next_version: AtomicU64,
+    /// Monotone commit clock. Timestamps come from wall clocks that can
+    /// step backward, and AS OF resolution binary-searches the index by
+    /// timestamp, so every appended entry carries max(caller, previous):
+    /// version order and timestamp order then always agree. Guarded by the
+    /// file mutex on the write path
+    last_timestamp: std::sync::atomic::AtomicI64,
 }
 
 impl VersionLog {
@@ -536,6 +542,11 @@ impl VersionLog {
         // Seek to end for appending
         file.seek(SeekFrom::End(0))?;
 
+        let last_timestamp = entries
+            .iter()
+            .map(|e| e.commit_timestamp)
+            .max()
+            .unwrap_or(i64::MIN);
         let index = VersionIndex::with_entries(entries);
 
         Ok(Self {
@@ -544,6 +555,7 @@ impl VersionLog {
             file: Mutex::new(file),
             index,
             next_version: AtomicU64::new(next_version),
+            last_timestamp: std::sync::atomic::AtomicI64::new(last_timestamp),
         })
     }
 
@@ -554,7 +566,7 @@ impl VersionLog {
     pub fn append(
         &self,
         txn_id: u64,
-        timestamp: i64,
+        raw_timestamp: i64,
         op_type: OperationType,
         row_count_delta: i64,
         metadata: Option<HashMap<String, String>>,
@@ -564,9 +576,14 @@ impl VersionLog {
         // Assign version ID and write to file under the same lock.
         // This ensures file entries are always in version order.
         let version;
+        let timestamp;
         {
             let mut file = self.file.lock();
             version = self.next_version.fetch_add(1, Ordering::Relaxed);
+            // Monotone commit clock: version order and timestamp order must
+            // agree for the AS OF binary search to be sound
+            timestamp = raw_timestamp.max(self.last_timestamp.load(Ordering::Relaxed));
+            self.last_timestamp.store(timestamp, Ordering::Relaxed);
 
             let mut packed = PackedVersionEntry {
                 version_id: version.to_le(),
@@ -589,22 +606,22 @@ impl VersionLog {
                     self.table_id
                 ))
             })?;
+
+            // The index slot is claimed while the version-order lock is
+            // still held, so slot order always equals version order. Two
+            // concurrent appends pushing after release could invert them,
+            // and get_version by index would return the wrong entry
+            self.index.push(VersionEntry {
+                version_id: VersionId(version),
+                commit_timestamp: timestamp,
+                transaction_id: txn_id,
+                operation_type: op_type,
+                row_count_delta,
+                metadata,
+            });
         }
 
-        let version_id = VersionId(version);
-
-        // Update in-memory index
-        let entry = VersionEntry {
-            version_id,
-            commit_timestamp: timestamp,
-            transaction_id: txn_id,
-            operation_type: op_type,
-            row_count_delta,
-            metadata,
-        };
-        self.index.push(entry);
-
-        Ok(version_id)
+        Ok(VersionId(version))
     }
 
     /// Appends multiple version entries in a single batch.
@@ -644,6 +661,9 @@ impl VersionLog {
                 version_ids.push(version_id);
 
                 let meta_bytes = encode_metadata(metadata);
+                // Monotone commit clock, same rule as append()
+                let timestamp = (*timestamp).max(self.last_timestamp.load(Ordering::Relaxed));
+                self.last_timestamp.store(timestamp, Ordering::Relaxed);
 
                 let mut packed = PackedVersionEntry {
                     version_id: version.to_le(),
@@ -667,7 +687,7 @@ impl VersionLog {
 
                 index_entries.push(VersionEntry {
                     version_id,
-                    commit_timestamp: *timestamp,
+                    commit_timestamp: timestamp,
                     transaction_id: *txn_id,
                     operation_type: *op_type,
                     row_count_delta: *row_count_delta,
@@ -681,11 +701,11 @@ impl VersionLog {
                     self.table_id
                 ))
             })?;
-        }
 
-        // Update in-memory index
-        for entry in index_entries {
-            self.index.push(entry);
+            // Inside the lock, so slot order equals version order
+            for entry in index_entries {
+                self.index.push(entry);
+            }
         }
 
         Ok(version_ids)

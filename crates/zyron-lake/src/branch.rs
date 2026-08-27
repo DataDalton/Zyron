@@ -269,6 +269,12 @@ pub fn drop_branch(paths: &LakePaths, name: &str) -> Result<(), ZyronError> {
     // under the same name would get the dropped branch's cached versions
     TransactionLog::remove_registered(&dir);
     fs::remove_dir_all(&dir)?;
+    // Files only the dropped branch referenced are unreachable now, and no
+    // commit will ever announce that, so the vacuum is asked for directly
+    if let Some(table_id) = paths.table_id() {
+        crate::maintenance_signal::maintenance_signal()
+            .mark_vacuum(paths.root().to_path_buf(), table_id);
+    }
     Ok(())
 }
 

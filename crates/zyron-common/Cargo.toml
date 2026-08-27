@@ -8,6 +8,7 @@ rust-version.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 scc.workspace = true
+sysinfo.workspace = true
 
 [features]
 # Compiles in the wall-clock phase profiler (crate::profile). Off by default so
@@ -15,6 +16,7 @@ scc.workspace = true
 profile = []
 
 [dev-dependencies]
+mimalloc.workspace = true
 serde_json = "1.0"
 tempfile = "3"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

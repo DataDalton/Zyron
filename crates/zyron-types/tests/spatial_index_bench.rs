@@ -19,6 +19,9 @@
 //!
 //! Run: cargo test -p zyron-types --test spatial_index_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;

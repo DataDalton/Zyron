@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
 zyron-cdc = { path = "../zyron-cdc" }
 zyron-catalog = { path = "../zyron-catalog" }
@@ -40,5 +41,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+mimalloc.workspace = true
 tempfile = "3"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

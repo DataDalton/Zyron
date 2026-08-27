@@ -24,6 +24,9 @@
 //! | QR encode                   | latency    | 3 ms          |
 //! | DETECT_MIME_TYPE            | latency    | 400 ns        |
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

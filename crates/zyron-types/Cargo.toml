@@ -18,4 +18,5 @@ scc.workspace = true
 crossbeam.workspace = true
 
 [dev-dependencies]
+mimalloc.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }

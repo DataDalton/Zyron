@@ -1,0 +1,215 @@
+{
+  "id": "2026-08-27_221739_23bb366-local",
+  "date": "2026-08-27 22:18:22Z",
+  "ts": 1787869102,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Filter-Project Kernel": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.36 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 14.38 },
+      "Filter-project row kernel (rows/sec)": {
+        "average": 17037320.928140,
+        "runs": [16974182.27, 17078106.72, 17109664.39, 16939103.92, 17085547.34],
+        "target": 3500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Backpressure Monitor": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.37 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 14.34 },
+      "Total time (ms)": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Checkpoint Snapshot": {
+      "Snapshot time (s)": {
+        "average": 0.003204,
+        "runs": [0.01, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Checkpoint Restore": {
+      "Restore time (s)": {
+        "average": 0.003244,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "E2E Exactly Once": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.33 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.30 },
+      "Windows processed": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Late Data Drop": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.31 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 14.31 },
+      "On-time records": {
+        "average": 2.000000,
+        "runs": [2.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Late Data SideOutput": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.32 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.31 },
+      "Side output records": {
+        "average": 2.000000,
+        "runs": [2.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Late Data Update": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 14.32 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.31 },
+      "Records returned": {
+        "average": 5.000000,
+        "runs": [5.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Lookup Join Cached": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 14.31 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.33 },
+      "Events/sec": {
+        "average": 108048873.415012,
+        "runs": [107947062.76, 105701541.13, 108192322.67, 108648413.73, 109755026.78],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Operator Chain": {
+      "Output rows": {
+        "average": 150.000000,
+        "runs": [150.00],
+        "target": 150.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Session Window": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 14.31 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 14.33 },
+      "Events/sec": {
+        "average": 256565235.385780,
+        "runs": [263040218.85, 225815192.85, 263747857.05, 265280135.82, 264942772.36],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Sliding Window": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.32 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 14.31 },
+      "Events/sec": {
+        "average": 94264059.033715,
+        "runs": [96685617.05, 95918660.98, 94764273.87, 91721240.80, 92230502.47],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "State Backend Ops": {
+      "Total entries verified": {
+        "average": 1950.000000,
+        "runs": [1950.00],
+        "target": 1950.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Stream-Stream Join": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.33 },
+      "util_after": { "cpu_pct": 12.0, "ram_used_gb": 14.34 },
+      "Events/sec": {
+        "average": 24753459.630928,
+        "runs": [23945786.74, 24780076.82, 24900398.41, 25057004.69, 25084031.51],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Tumbling Window": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 14.33 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 14.34 },
+      "Events/sec": {
+        "average": 362641504.488828,
+        "runs": [358873138.35, 362673630.00, 364996806.28, 362325404.45, 364338543.37],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Watermark Propagation": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.32 },
+      "util_after": { "cpu_pct": 8.0, "ram_used_gb": 14.33 },
+      "Total time (ms)": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

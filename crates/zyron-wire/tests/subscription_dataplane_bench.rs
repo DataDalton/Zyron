@@ -182,6 +182,7 @@ async fn lifecycle_state_machine_persists_each_transition() {
         last_error: None,
         created_at: 0,
         source_id: None,
+        last_advance_at: 0,
     };
     let id = catalog.create_subscription(entry).await.unwrap();
     assert!(matches!(

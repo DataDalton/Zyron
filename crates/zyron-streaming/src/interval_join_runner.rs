@@ -143,8 +143,20 @@ impl IntervalJoinEngine {
             .as_i64()?;
         let key = encode_key(&values, &key_ords, &key_types)?;
 
+        // A NULL join key equals nothing, itself included. The row never
+        // probes (so two NULL keys cannot meet through their shared byte
+        // encoding), but it still buffers: an outer join emits it with
+        // null padding when the watermark passes it unmatched
+        let null_key = key_ords
+            .iter()
+            .any(|o| matches!(values.get(*o as usize), Some(StreamValue::Null)));
+
         // Probe the opposite side for matches within the window.
-        let matched_count = self.probe_and_emit(side, &key, event_us, &values);
+        let matched_count = if null_key {
+            0
+        } else {
+            self.probe_and_emit(side, &key, event_us, &values)
+        };
 
         // Buffer this row. An inner join still buffers so a later opposite
         // row can match with this one.

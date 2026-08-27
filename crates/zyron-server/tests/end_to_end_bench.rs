@@ -139,6 +139,7 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         Arc::clone(&pool),
         write_fn,
         fsync_fn,
+        Arc::new(|_| Ok(())),
         BackgroundWriterConfig::default(),
     ));
 
@@ -159,6 +160,7 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
+        node_capabilities: None,
         catalog,
         wal,
         buffer_pool: pool,
@@ -216,6 +218,7 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
@@ -226,8 +229,11 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
+        max_query_memory: None,
+        spill_directory: None,
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
+        password_encryption: "balloon-sha-256".into(),
     });
 
     let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));

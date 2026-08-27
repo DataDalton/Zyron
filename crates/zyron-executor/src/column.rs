@@ -54,6 +54,33 @@ impl NullBitmap {
         self.len
     }
 
+    /// The packed words, for a writer that has to put this on disk.
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Rebuilds a bitmap from packed words, for a reader.
+    ///
+    /// Bits past `len` in the final word are cleared, because a caller that
+    /// trusted them would read a row as null that the writer never marked.
+    pub fn from_words(mut words: Vec<u64>, len: usize) -> Self {
+        let need = len.div_ceil(64);
+        words.resize(need, 0);
+        let remainder = len % 64;
+        if remainder > 0 && !words.is_empty() {
+            let last = words.len() - 1;
+            words[last] &= (1u64 << remainder) - 1;
+        }
+        Self { words, len }
+    }
+
+    /// Whether any value is null, so a writer can skip an all-valid bitmap.
+    #[inline]
+    pub fn any_null(&self) -> bool {
+        self.words.iter().any(|w| *w != 0)
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -141,7 +168,17 @@ impl NullBitmap {
         if offset % 64 == 0 {
             let word_start = offset / 64;
             let word_count = (len + 63) / 64;
-            let words = self.words[word_start..word_start + word_count].to_vec();
+            let mut words = self.words[word_start..word_start + word_count].to_vec();
+            // Bits past len in the final word belong to rows outside the
+            // slice. They must be cleared: extend_from copies whole words
+            // and push never clears a stale bit, so a leftover bit would
+            // surface as a phantom NULL on a row appended later
+            let tail_bits = len % 64;
+            if tail_bits != 0 {
+                if let Some(last) = words.last_mut() {
+                    *last &= (1u64 << tail_bits) - 1;
+                }
+            }
             return Self { words, len };
         }
         let mut result = Self::empty();
@@ -228,8 +265,15 @@ impl PartialEq for ScalarValue {
             (ScalarValue::UInt16(a), ScalarValue::UInt16(b)) => a == b,
             (ScalarValue::UInt32(a), ScalarValue::UInt32(b)) => a == b,
             (ScalarValue::UInt64(a), ScalarValue::UInt64(b)) => a == b,
-            (ScalarValue::Float32(a), ScalarValue::Float32(b)) => a.to_bits() == b.to_bits(),
-            (ScalarValue::Float64(a), ScalarValue::Float64(b)) => a.to_bits() == b.to_bits(),
+            // Key equality: negative zero equals positive zero, matching
+            // what the = operator says, and every NaN pair is equal so a
+            // hashed key set holds one NaN. Hash canonicalizes the same way
+            (ScalarValue::Float32(a), ScalarValue::Float32(b)) => {
+                a == b || (a.is_nan() && b.is_nan())
+            }
+            (ScalarValue::Float64(a), ScalarValue::Float64(b)) => {
+                a == b || (a.is_nan() && b.is_nan())
+            }
             (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => a == b,
             (ScalarValue::Binary(a), ScalarValue::Binary(b)) => a == b,
             (ScalarValue::FixedBinary16(a), ScalarValue::FixedBinary16(b)) => a == b,
@@ -256,8 +300,28 @@ impl std::hash::Hash for ScalarValue {
             ScalarValue::UInt16(v) => v.hash(state),
             ScalarValue::UInt32(v) => v.hash(state),
             ScalarValue::UInt64(v) => v.hash(state),
-            ScalarValue::Float32(v) => v.to_bits().hash(state),
-            ScalarValue::Float64(v) => v.to_bits().hash(state),
+            // Canonical bits keep Hash consistent with Eq: one pattern for
+            // every NaN and one for both zeros
+            ScalarValue::Float32(v) => {
+                let bits = if v.is_nan() {
+                    f32::NAN.to_bits()
+                } else if *v == 0.0 {
+                    0
+                } else {
+                    v.to_bits()
+                };
+                bits.hash(state)
+            }
+            ScalarValue::Float64(v) => {
+                let bits = if v.is_nan() {
+                    f64::NAN.to_bits()
+                } else if *v == 0.0 {
+                    0
+                } else {
+                    v.to_bits()
+                };
+                bits.hash(state)
+            }
             ScalarValue::Utf8(v) => v.hash(state),
             ScalarValue::Binary(v) => v.hash(state),
             ScalarValue::FixedBinary16(v) => v.hash(state),
@@ -406,6 +470,36 @@ pub enum ColumnData {
     Binary(Vec<Vec<u8>>),
     FixedBinary16(Vec<[u8; 16]>),
     Interval(Vec<zyron_common::Interval>),
+}
+
+impl ColumnData {
+    /// Approximate heap bytes this column holds, for the query memory
+    /// budget. Fixed-width variants count element size times length,
+    /// variable-width variants add each element's payload plus its vector
+    /// header.
+    pub fn approx_bytes(&self) -> u64 {
+        const VEC_HEADER: u64 = 24;
+        match self {
+            ColumnData::Boolean(v) => v.len() as u64,
+            ColumnData::Int8(v) => v.len() as u64,
+            ColumnData::UInt8(v) => v.len() as u64,
+            ColumnData::Int16(v) => v.len() as u64 * 2,
+            ColumnData::UInt16(v) => v.len() as u64 * 2,
+            ColumnData::Int32(v) => v.len() as u64 * 4,
+            ColumnData::UInt32(v) => v.len() as u64 * 4,
+            ColumnData::Float32(v) => v.len() as u64 * 4,
+            ColumnData::Int64(v) => v.len() as u64 * 8,
+            ColumnData::UInt64(v) => v.len() as u64 * 8,
+            ColumnData::Float64(v) => v.len() as u64 * 8,
+            ColumnData::Int128(v) => v.len() as u64 * 16,
+            ColumnData::FixedBinary16(v) => v.len() as u64 * 16,
+            ColumnData::Interval(v) => {
+                v.len() as u64 * std::mem::size_of::<zyron_common::Interval>() as u64
+            }
+            ColumnData::Utf8(v) => v.iter().map(|s| s.len() as u64 + VEC_HEADER).sum::<u64>(),
+            ColumnData::Binary(v) => v.iter().map(|b| b.len() as u64 + VEC_HEADER).sum::<u64>(),
+        }
+    }
 }
 
 /// Applies an operation to each ColumnData variant, returning a new ColumnData.
@@ -1036,6 +1130,64 @@ impl Column {
         match &self.data {
             ColumnData::Boolean(v) => v,
             _ => panic!("as_bools called on non-boolean column"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Row 100 is null and the slice keeps only the first 70 rows. The
+    // sliced bitmap's final word must not carry row 100's bit: extend_from
+    // copies whole words and push never clears a stale bit, so a leftover
+    // bit would surface as a phantom NULL on whichever row lands at index
+    // 100 after later appends
+    #[test]
+    fn slice_fast_path_masks_bits_past_len() {
+        let mut source = NullBitmap::none(128);
+        source.set_null(100);
+
+        let sliced = source.slice(0, 70);
+        for i in 0..70 {
+            assert!(!sliced.is_null(i), "row {i} of the slice is valid");
+        }
+        assert!(
+            !sliced.has_nulls(),
+            "a slice of valid rows carries no null bits at all"
+        );
+
+        let mut combined = NullBitmap::empty();
+        combined.extend_from(&sliced);
+        for _ in 70..128 {
+            combined.push(false);
+        }
+        assert!(
+            !combined.is_null(100),
+            "no phantom NULL replays from a stale sliced bit"
+        );
+    }
+
+    // The unaligned slow path and the fast path agree on real null positions
+    #[test]
+    fn slice_preserves_null_positions() {
+        let mut source = NullBitmap::none(200);
+        for i in [0usize, 63, 64, 65, 127, 128, 199] {
+            source.set_null(i);
+        }
+        let aligned = source.slice(64, 100);
+        let unaligned = source.slice(63, 100);
+        for i in 0..100 {
+            assert_eq!(
+                aligned.is_null(i),
+                source.is_null(64 + i),
+                "aligned row {i}"
+            );
+            assert_eq!(
+                unaligned.is_null(i),
+                source.is_null(63 + i),
+                "unaligned row {i}"
+            );
         }
     }
 }

@@ -7,7 +7,11 @@
 //!
 //! Run: cargo test -p zyron-planner --test optimizer_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
+
 use std::sync::Mutex;
 use std::time::Instant;
 use zyron_catalog::{ColumnId, ColumnStats, TableId, TableStats};
@@ -28,6 +32,7 @@ use zyron_planner::statistics::hash_bytes;
 use zyron_planner::statistics::histogram::{
     EquiHeightHistogram, MostCommonValues, ReservoirSampler,
 };
+use zyron_pressure::pressure::ParallelCapacity;
 
 use zyron_bench_harness::{tprintln, validate_metric};
 
@@ -504,7 +509,17 @@ fn test_parallel_plan_decisions() {
     tprintln!("  100K pages: {} workers", w3);
     assert!(w1 >= 1);
     assert!(w2 >= w1);
-    assert!(w3 <= 16);
+    // The ceiling is the node's parallel capacity, not a constant. It was a
+    // hardcoded sixteen until the capacity account replaced it, and the
+    // account is what the controller scales down under pressure, so a fixed
+    // number here would be asserting about a rule the planner no longer uses
+    let capacity = ParallelCapacity::global().total() as usize;
+    assert!(
+        w3 <= capacity,
+        "advised {} workers against a node capacity of {}",
+        w3,
+        capacity
+    );
 
     tprintln!("  Parallel plan decisions: PASS");
 }
@@ -948,14 +963,15 @@ fn test_v4_parallel_plan_selection() {
         large_stats.page_count / 1000,
         workers
     );
-    let available_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    // Half the cores was the old rule. What bounds a scan now is the node's
+    // capacity account, which already subtracts what other queries hold, so
+    // this asks the account rather than the machine
+    let capacity = ParallelCapacity::global().total() as usize;
     assert!(
-        workers <= available_cores / 2,
-        "Workers {} > cores/2 {}",
+        workers <= capacity,
+        "Workers {} > node capacity {}",
         workers,
-        available_cores / 2
+        capacity
     );
     assert!(workers >= 1);
 

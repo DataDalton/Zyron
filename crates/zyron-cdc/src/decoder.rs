@@ -80,7 +80,7 @@ pub struct DecodedChange {
     pub new_values: Option<Vec<(String, String)>>,
     pub commit_lsn: u64,
     pub commit_timestamp: i64,
-    pub txn_id: u32,
+    pub txn_id: u64,
     pub is_last_in_txn: bool,
     pub schema_version: u32,
 }
@@ -215,7 +215,7 @@ impl LogicalDecoder for ZyronCdcDecoder {
         off += tlen;
 
         // Fixed fields: table_id(4) + op(1) + lsn(8) + ts(8) + txn(4) + last(1) + ver(4) = 30
-        if off + 30 > data.len() {
+        if off + 34 > data.len() {
             return Err(err("truncated fixed fields"));
         }
 
@@ -233,8 +233,8 @@ impl LogicalDecoder for ZyronCdcDecoder {
         let commit_timestamp = i64::from_le_bytes(data[off..off + 8].try_into().unwrap());
         off += 8;
 
-        let txn_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        off += 4;
+        let txn_id = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
 
         let is_last_in_txn = data[off] != 0;
         off += 1;
@@ -398,7 +398,7 @@ impl LogicalDecoder for DebeziumDecoder {
         let txn_id_str = envelope["transaction"]["id"]
             .as_str()
             .ok_or_else(|| ZyronError::CdcDecoderError("missing transaction.id field".into()))?;
-        let txn_id: u32 = txn_id_str.parse().map_err(|_| {
+        let txn_id: u64 = txn_id_str.parse().map_err(|_| {
             ZyronError::CdcDecoderError(format!("transaction.id is not a u32: {txn_id_str}"))
         })?;
         let schema_version = envelope["source"]["schema_version"].as_u64().unwrap_or(0) as u32;
@@ -560,7 +560,7 @@ impl LogicalDecoder for Wal2JsonDecoder {
             })?,
             txn_id: wrapper["xid"].as_u64().ok_or_else(|| {
                 ZyronError::CdcDecoderError("missing or non-integer xid field".into())
-            })? as u32,
+            })?,
             is_last_in_txn: false,
             schema_version: 0,
         })
@@ -818,8 +818,8 @@ impl AvroDecoder {
         };
 
         let txn_id = match find("txn_id").map(unwrap_union) {
-            Some(AvroValue::Long(n)) => n as u32,
-            Some(AvroValue::Int(n)) => n as u32,
+            Some(AvroValue::Long(n)) => n as u64,
+            Some(AvroValue::Int(n)) => n as u64,
             _ => return Err(missing("txn_id")),
         };
 

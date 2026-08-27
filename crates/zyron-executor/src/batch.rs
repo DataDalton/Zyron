@@ -29,6 +29,15 @@ pub struct DataBatch {
 }
 
 impl DataBatch {
+    /// Approximate heap bytes this batch holds, column payloads plus one
+    /// bit per row per null bitmap. Used by the query memory budget.
+    pub fn approx_bytes(&self) -> u64 {
+        self.columns
+            .iter()
+            .map(|c| c.data.approx_bytes() + (self.num_rows as u64).div_ceil(8))
+            .sum()
+    }
+
     /// Creates a batch from pre-built columns. All columns must have the same length.
     pub fn new(columns: Vec<Column>) -> Self {
         let num_rows = columns.first().map_or(0, |c| c.len());
@@ -444,11 +453,25 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
         } else if is_null {
             buf.extend_from_slice(&0u32.to_le_bytes());
         } else {
-            encode_varlen_scalar(&mut buf, &column.data.get_scalar(row_idx));
+            // Varlen payloads are borrowed straight from the column, the
+            // length prefix and bytes land in buf without a scalar copy
+            match &column.data {
+                ColumnData::Utf8(v) => encode_varlen_bytes(&mut buf, v[row_idx].as_bytes()),
+                ColumnData::Binary(v) => encode_varlen_bytes(&mut buf, &v[row_idx]),
+                other => encode_varlen_scalar(&mut buf, &other.get_scalar(row_idx)),
+            }
         }
     }
 
     buf
+}
+
+/// Writes one length-prefixed variable-length payload, the borrowed
+/// counterpart of `encode_varlen_scalar`
+#[inline]
+fn encode_varlen_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 /// Encodes one scalar into the raw columnar value form: a fixed-width LE
@@ -557,7 +580,7 @@ fn encode_varlen_scalar(buf: &mut Vec<u8>, scalar: &ScalarValue) {
 }
 
 /// Converts an entire DataBatch to storage Tuples.
-pub fn batch_to_tuples(batch: &DataBatch, columns: &[ColumnEntry], xmin: u32) -> Vec<Tuple> {
+pub fn batch_to_tuples(batch: &DataBatch, columns: &[ColumnEntry], xmin: u64) -> Vec<Tuple> {
     let mut tuples = Vec::with_capacity(batch.num_rows);
     for row_idx in 0..batch.num_rows {
         let data = encode_row(batch, row_idx, columns);

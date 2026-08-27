@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use zyron_common::{Result, TypeId};
+use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::JoinType;
 use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
@@ -413,6 +413,25 @@ fn combine_rows_single(
     DataBatch::new(columns)
 }
 
+/// Gathers candidate row pairs into one combined batch for condition
+/// evaluation, left columns then right, the multi-row counterpart of
+/// combine_rows_single. Both index slices must be equal length
+fn combine_rows_gather(
+    left: &DataBatch,
+    left_rows: &[u32],
+    right: &DataBatch,
+    right_rows: &[u32],
+) -> DataBatch {
+    let mut columns = Vec::with_capacity(left.num_columns() + right.num_columns());
+    for col in &left.columns {
+        columns.push(col.take(left_rows));
+    }
+    for col in &right.columns {
+        columns.push(col.take(right_rows));
+    }
+    DataBatch::new(columns)
+}
+
 /// Merges batches into one contiguous DataBatch, None when no rows exist.
 /// A single batch moves through without copying.
 fn merge_batches(mut batches: Vec<DataBatch>, total_rows: usize) -> Option<DataBatch> {
@@ -501,6 +520,13 @@ pub struct HashJoinOperator {
     build_entries: Vec<(u32, u32)>,
     /// Maps hash to head entry index in build_entries.
     build_index: FlatHashTable,
+    /// Match pairs for the probe batch in flight, reused across batches.
+    /// A probe batch is a thousand rows, so a join over a large probe side
+    /// runs these hundreds of times and allocating a fresh pair each time
+    /// puts the operator at the mercy of the allocator's state rather than
+    /// its own work.
+    match_build_rows: Vec<u32>,
+    match_probe_rows: Vec<u32>,
     /// Materialized build key columns, one per join key, indexed by build row.
     /// Used to compare actual key values after the hi32 hash match so a 64-bit
     /// hash collision cannot false-join.
@@ -542,6 +568,35 @@ pub struct HashJoinOperator {
     emitting_unmatched_build: bool,
     unmatched_cursor: usize,
     output_buffer: Option<JoinOutputBuffer>,
+    /// Query memory budget both drained inputs reserve against. None runs
+    /// unbudgeted.
+    memory_budget: Option<Arc<crate::context::QueryMemoryBudget>>,
+    /// Where the join puts what does not fit in its budget. None means it
+    /// fails at the budget the way it did before spilling existed
+    spill: Option<Arc<crate::spill::SpillDirectory>>,
+    /// Bytes the query may hold at once. Zero means never spill
+    spill_threshold_bytes: u64,
+    /// True when the probe side is pulled a batch at a time instead of being
+    /// drained up front. Set when the probe side is too large to hold, so the
+    /// common case still counts both sides before choosing which one builds
+    probe_streaming: bool,
+    /// Position in probe_batches_pending
+    probe_pending_idx: usize,
+    /// Probe batches from somewhere other than this operator's own inputs,
+    /// used when the probe rows are read back from spill files
+    probe_source: Option<Box<dyn Operator>>,
+    /// Which input builds, when the caller has already measured both. The
+    /// partitioned join sets this: it knows the sizes from disk, and draining
+    /// the probe side to count it would undo the partitioning
+    forced_swap: Option<bool>,
+    /// Bits set for probe rows that matched, indexed by their position in the
+    /// probe stream. Set only when one partition is passed over in blocks,
+    /// where a probe row is unmatched only once every block has missed it
+    probe_match_sink: Option<Arc<crate::operator::grace::ProbeMatchBits>>,
+    /// Probe rows consumed so far, which is what indexes probe_match_sink
+    probe_row_ordinal: u64,
+    /// The partitioned join this one became when neither side fit
+    grace: Option<Box<crate::operator::grace::GraceJoin>>,
 }
 
 impl HashJoinOperator {
@@ -575,6 +630,8 @@ impl HashJoinOperator {
             build_batch: None,
             build_entries: Vec::new(),
             build_index: FlatHashTable::with_capacity(0),
+            match_build_rows: Vec::new(),
+            match_probe_rows: Vec::new(),
             build_key_columns: Vec::new(),
             build_matched: Vec::new(),
             total_build_rows: 0,
@@ -593,41 +650,276 @@ impl HashJoinOperator {
             emitting_unmatched_build: false,
             unmatched_cursor: 0,
             output_buffer: None,
+            memory_budget: None,
+            spill: None,
+            spill_threshold_bytes: 0,
+            probe_streaming: false,
+            probe_pending_idx: 0,
+            probe_source: None,
+            forced_swap: None,
+            probe_match_sink: None,
+            probe_row_ordinal: 0,
+            grace: None,
+        }
+    }
+
+    /// Attaches the query memory budget. Set by the operator builder from
+    /// the execution context.
+    pub fn set_memory_budget(&mut self, budget: Option<Arc<crate::context::QueryMemoryBudget>>) {
+        self.memory_budget = budget;
+    }
+
+    /// Gives the join somewhere to put what does not fit in its budget.
+    ///
+    /// The threshold is what the query may hold, not what the machine has: a
+    /// join spills at the point it used to fail.
+    pub fn set_spill(
+        &mut self,
+        directory: Option<Arc<crate::spill::SpillDirectory>>,
+        threshold_bytes: u64,
+    ) {
+        self.spill = directory;
+        self.spill_threshold_bytes = threshold_bytes;
+    }
+
+    /// Fixes which input builds instead of letting row counts decide, and
+    /// streams the other one.
+    pub(crate) fn build_from(&mut self, right_side_builds: bool) {
+        self.forced_swap = Some(right_side_builds);
+    }
+
+    /// Records which probe rows matched, by their position in the probe
+    /// stream. A blocked pass over one partition needs this, because there a
+    /// probe row is unmatched only once every build block has missed it.
+    pub(crate) fn record_probe_matches(
+        &mut self,
+        bits: Arc<crate::operator::grace::ProbeMatchBits>,
+    ) {
+        self.probe_match_sink = Some(bits);
+    }
+
+    /// Notes that a probe row matched, for a blocked pass. Nothing at all when
+    /// the join is not one, which is every join but that
+    #[inline]
+    fn note_probe_match(&self, probe_row: usize) {
+        if let Some(bits) = &self.probe_match_sink {
+            bits.set(self.probe_row_ordinal + probe_row as u64);
         }
     }
 
     async fn build_hash_table(&mut self) -> Result<()> {
-        let mut left = self.left.take().unwrap();
+        // A partition's join was measured on disk before it was built. It
+        // builds the side it was told to and streams the other, because
+        // draining the probe side to count it would put back exactly the
+        // memory the partitioning took out
+        if let Some(swapped) = self.forced_swap {
+            let (build_batches, build_rows) = if swapped {
+                drain_side(self.right.as_mut(), None).await?
+            } else {
+                let mut left = self.left.take().ok_or_else(|| {
+                    ZyronError::ExecutionError("hash join drained its left input twice".into())
+                })?;
+                drain_side(left.as_mut(), None).await?
+            };
+            // With an explicit probe source the operator's own inputs are not
+            // where the probe rows come from
+            self.probe_streaming = self.probe_source.is_none();
+            return self.finish_build(build_batches, build_rows, Vec::new(), swapped);
+        }
 
-        // Phase 1: Drain both inputs. Both sides always materialize in
-        // full before probing, so the build side is chosen by actual row
-        // count instead of plan-time estimates, because hashing the smaller
-        // side shrinks the table every probe row walks.
+        if self.spill.is_some() && self.spill_threshold_bytes > 0 {
+            return self.build_with_spill().await;
+        }
+
+        // Both sides materialize in full before probing, so the build side is
+        // chosen by actual row count instead of plan-time estimates, because
+        // hashing the smaller side shrinks the table every probe row walks.
+        let mut left = self.left.take().ok_or_else(|| {
+            ZyronError::ExecutionError("hash join drained its left input twice".into())
+        })?;
+        let budget = self.memory_budget.clone();
+        let (left_batches, left_rows) = drain_side(left.as_mut(), budget.as_ref()).await?;
+        let (right_batches, right_rows) = drain_side(self.right.as_mut(), budget.as_ref()).await?;
+
+        let swapped = right_rows < left_rows;
+        let (build_batches, build_rows, probe_batches) = if swapped {
+            (right_batches, right_rows, left_batches)
+        } else {
+            (left_batches, left_rows, right_batches)
+        };
+        self.finish_build(build_batches, build_rows, probe_batches, swapped)
+    }
+
+    /// Drains both inputs with somewhere to put what does not fit.
+    ///
+    /// Three outcomes, cheapest first. Both sides fit, and the join is the
+    /// in-memory one unchanged. One side fits, so it builds and the other
+    /// streams past it, and nothing is written at all. Neither fits, so both
+    /// are split by the hash of their join keys and the join runs partition
+    /// by partition.
+    async fn build_with_spill(&mut self) -> Result<()> {
+        use crate::operator::grace::{
+            MultiSpillSource, SidePartitioner, static_align_scales, static_common_types,
+        };
+
+        let directory = Arc::clone(self.spill.as_ref().ok_or_else(|| {
+            ZyronError::ExecutionError("a spilling join has no spill directory".into())
+        })?);
+        let threshold = self.spill_threshold_bytes;
+        let common = static_common_types(&self.left_keys, &self.right_keys);
+        let align = static_align_scales(&self.left_keys, &self.right_keys);
+
+        // The left input, held while it fits and split by key hash once it
+        // stops fitting
+        let mut left_input = self.left.take().ok_or_else(|| {
+            ZyronError::ExecutionError("hash join drained its left input twice".into())
+        })?;
         let mut left_batches: Vec<DataBatch> = Vec::new();
         let mut left_rows = 0usize;
-        loop {
-            match left.next().await? {
-                Some(eb) => {
-                    left_rows += eb.batch.num_rows;
-                    left_batches.push(eb.batch);
+        let mut left_bytes = 0u64;
+        let mut left_parts: Option<SidePartitioner> = None;
+        while let Some(eb) = left_input.next().await? {
+            left_rows += eb.batch.num_rows;
+            if let Some(parts) = left_parts.as_mut() {
+                parts.push(&eb.batch)?;
+                continue;
+            }
+            left_bytes += eb.batch.approx_bytes();
+            left_batches.push(eb.batch);
+            if left_bytes >= threshold {
+                let mut parts = SidePartitioner::new(
+                    Arc::clone(&directory),
+                    self.left_keys.clone(),
+                    self.left_schema.clone(),
+                    common.clone(),
+                    align.clone(),
+                    0,
+                    threshold,
+                );
+                for batch in left_batches.drain(..) {
+                    parts.push(&batch)?;
                 }
-                None => break,
+                left_parts = Some(parts);
             }
         }
+        let left_sides = match left_parts {
+            Some(parts) => Some(parts.finish()?),
+            None => None,
+        };
+
+        // What the right input may hold depends on whether the left is still
+        // resident, because the budget covers both at once. A left side that
+        // took more than half of it can end up building against a smaller
+        // right side, which is the price of not knowing the right side's size
+        // until it has been read
+        let room = match &left_sides {
+            Some(_) => threshold,
+            None => threshold.saturating_sub(left_bytes),
+        };
         let mut right_batches: Vec<DataBatch> = Vec::new();
         let mut right_rows = 0usize;
-        loop {
-            match self.right.next().await? {
-                Some(eb) => {
-                    right_rows += eb.batch.num_rows;
-                    right_batches.push(eb.batch);
-                }
-                None => break,
+        let mut right_bytes = 0u64;
+        let mut right_parts: Option<SidePartitioner> = None;
+        let mut right_streams = false;
+        while let Some(eb) = self.right.next().await? {
+            right_rows += eb.batch.num_rows;
+            if let Some(parts) = right_parts.as_mut() {
+                parts.push(&eb.batch)?;
+                continue;
+            }
+            right_bytes += eb.batch.approx_bytes();
+            right_batches.push(eb.batch);
+            if right_bytes < room {
+                continue;
+            }
+            if left_sides.is_none() {
+                // The left side fits, so it builds and the rest of the right
+                // side streams past it. Nothing is written
+                right_streams = true;
+                break;
+            }
+            let mut parts = SidePartitioner::new(
+                Arc::clone(&directory),
+                self.right_keys.clone(),
+                self.right_schema.clone(),
+                common.clone(),
+                align.clone(),
+                0,
+                threshold,
+            );
+            for batch in right_batches.drain(..) {
+                parts.push(&batch)?;
+            }
+            right_parts = Some(parts);
+        }
+        let right_sides = match right_parts {
+            Some(parts) => Some(parts.finish()?),
+            None => None,
+        };
+
+        match (left_sides, right_sides) {
+            (Some(left_sides), Some(right_sides)) => {
+                self.start_grace(directory, threshold, left_sides, right_sides)
+            }
+            (Some(left_sides), None) => {
+                // The right side turned out to fit, so it builds, and the left
+                // partitions are read back as the one relation they are
+                let readers = left_sides
+                    .into_iter()
+                    .filter_map(|side| side.into_reader())
+                    .collect();
+                self.probe_source = Some(Box::new(MultiSpillSource::new(readers)));
+                self.finish_build(right_batches, right_rows, Vec::new(), true)
+            }
+            (None, _) if right_streams => {
+                self.probe_streaming = true;
+                self.finish_build(left_batches, left_rows, right_batches, false)
+            }
+            (None, _) => {
+                let swapped = right_rows < left_rows;
+                let (build_batches, build_rows, probe_batches) = if swapped {
+                    (right_batches, right_rows, left_batches)
+                } else {
+                    (left_batches, left_rows, right_batches)
+                };
+                self.finish_build(build_batches, build_rows, probe_batches, swapped)
             }
         }
+    }
 
-        self.swapped = right_rows < left_rows;
-        self.internal_join = if self.swapped {
+    /// Hands the join over to the partitioned one.
+    fn start_grace(
+        &mut self,
+        directory: Arc<crate::spill::SpillDirectory>,
+        threshold: u64,
+        left: Vec<crate::operator::grace::PartitionSide>,
+        right: Vec<crate::operator::grace::PartitionSide>,
+    ) -> Result<()> {
+        let spec = crate::operator::grace::JoinSpec {
+            join_type: self.join_type,
+            left_keys: self.left_keys.clone(),
+            right_keys: self.right_keys.clone(),
+            remaining_condition: self.remaining_condition.clone(),
+            left_schema: self.left_schema.clone(),
+            right_schema: self.right_schema.clone(),
+        };
+        self.grace = Some(Box::new(crate::operator::grace::GraceJoin::new(
+            spec, directory, threshold, left, right,
+        )));
+        self.built = true;
+        Ok(())
+    }
+
+    /// Builds the hash table over the chosen side and readies the probe.
+    fn finish_build(
+        &mut self,
+        build_batches: Vec<DataBatch>,
+        build_rows: usize,
+        probe_batches: Vec<DataBatch>,
+        swapped: bool,
+    ) -> Result<()> {
+        self.swapped = swapped;
+        self.internal_join = if swapped {
             match self.join_type {
                 JoinType::Left => JoinType::Right,
                 JoinType::Right => JoinType::Left,
@@ -636,14 +928,9 @@ impl HashJoinOperator {
         } else {
             self.join_type
         };
-        let (build_batches, build_rows, probe_batches, probe_rows) = if self.swapped {
-            (right_batches, right_rows, left_batches, left_rows)
-        } else {
-            (left_batches, left_rows, right_batches, right_rows)
-        };
         self.total_build_rows = build_rows;
-        let _ = probe_rows;
         self.probe_batches_pending = probe_batches;
+        self.probe_pending_idx = 0;
         self.output_buffer = Some(JoinOutputBuffer::new(&self.left_types, &self.right_types));
 
         let track = matches!(self.internal_join, JoinType::Left | JoinType::Full);
@@ -991,9 +1278,15 @@ impl HashJoinOperator {
         let track_right = matches!(self.internal_join, JoinType::Right | JoinType::Full);
         let build = self.build_batch.as_ref().unwrap();
 
-        // Phase 1: Collect all match pairs as flat index arrays.
-        let mut build_idx: Vec<u32> = Vec::new();
-        let mut probe_idx: Vec<u32> = Vec::new();
+        // Phase 1: Collect all match pairs as flat index arrays. The pair
+        // buffers come off the operator so a long probe side does not
+        // allocate one per batch
+        let mut build_idx = std::mem::take(&mut self.match_build_rows);
+        let mut probe_idx = std::mem::take(&mut self.match_probe_rows);
+        build_idx.clear();
+        probe_idx.clear();
+        build_idx.reserve(probe_batch.num_rows);
+        probe_idx.reserve(probe_batch.num_rows);
         let mut unmatched_probe: Vec<u32> = Vec::new();
 
         for probe_row in 0..probe_batch.num_rows {
@@ -1014,6 +1307,7 @@ impl HashJoinOperator {
                 build_idx.push(build_row);
                 probe_idx.push(probe_row as u32);
                 matched = true;
+                self.note_probe_match(probe_row);
                 if !self.build_matched.is_empty() {
                     self.build_matched[build_row as usize] = true;
                 }
@@ -1028,6 +1322,10 @@ impl HashJoinOperator {
         // side built.
         let _ = build;
         self.append_matches(&build_idx, probe_batch, &probe_idx);
+        build_idx.clear();
+        probe_idx.clear();
+        self.match_build_rows = build_idx;
+        self.match_probe_rows = probe_idx;
 
         // Phase 3: Emit unmatched probe rows for probe-outer joins,
         // null-padding the build side in external column order.
@@ -1050,277 +1348,374 @@ impl HashJoinOperator {
 
         results
     }
-}
 
-impl Operator for HashJoinOperator {
-    fn next(&mut self) -> OperatorResult<'_> {
-        Box::pin(async move {
-            // Drain queued output batches first, before any state checks.
-            if self.output_queue_idx < self.output_queue.len() {
-                let batch = std::mem::replace(
-                    &mut self.output_queue[self.output_queue_idx],
-                    DataBatch::new(Vec::new()),
-                );
-                self.output_queue_idx += 1;
-                if self.output_queue_idx >= self.output_queue.len() {
-                    self.output_queue.clear();
-                    self.output_queue_idx = 0;
-                }
-                return Ok(Some(ExecutionBatch::new(batch)));
+    /// Takes the next probe batch from wherever the probe side comes from:
+    /// what was buffered while the build side was drained, then an explicit
+    /// source when the rows are read back off disk, then the input operator
+    /// itself when the probe side is being streamed past a build table that
+    /// fit.
+    async fn next_probe_batch(&mut self) -> Result<Option<DataBatch>> {
+        if self.probe_pending_idx < self.probe_batches_pending.len() {
+            let batch = std::mem::replace(
+                &mut self.probe_batches_pending[self.probe_pending_idx],
+                DataBatch::new(Vec::new()),
+            );
+            self.probe_pending_idx += 1;
+            if self.probe_pending_idx >= self.probe_batches_pending.len() {
+                self.probe_batches_pending.clear();
+                self.probe_pending_idx = 0;
             }
+            return Ok(Some(batch));
+        }
+        if let Some(source) = self.probe_source.as_mut() {
+            return Ok(source.next().await?.map(|eb| eb.batch));
+        }
+        if self.probe_streaming {
+            let input = if self.swapped {
+                self.left.as_mut().ok_or_else(|| {
+                    ZyronError::ExecutionError("a streaming probe lost its left input".into())
+                })?
+            } else {
+                &mut self.right
+            };
+            return Ok(input.next().await?.map(|eb| eb.batch));
+        }
+        Ok(None)
+    }
 
-            if self.finished {
-                return Ok(None);
-            }
-
-            if !self.built {
-                self.build_hash_table().await?;
-            }
-
-            // Emit unmatched build rows for a build-outer join, padded on
-            // the probe side in external column order.
-            if self.emitting_unmatched_build {
+    /// Probes one batch against the build table.
+    fn process_probe_batch(&mut self, merged_probe: &DataBatch) -> Result<()> {
+        if self.build_batch.is_none() {
+            // An empty build side matches nothing. A probe-outer join still
+            // owes every probe row, null-padded on the build side
+            if matches!(self.internal_join, JoinType::Right | JoinType::Full) {
                 let swapped = self.swapped;
-                let buf = self.output_buffer.as_mut().unwrap();
-                let build = self.build_batch.as_ref().unwrap();
-                while self.unmatched_cursor < self.total_build_rows {
-                    let row = self.unmatched_cursor;
-                    self.unmatched_cursor += 1;
-                    if !self.build_matched[row] {
+                if let Some(buf) = self.output_buffer.as_mut() {
+                    for probe_row in 0..merged_probe.num_rows {
                         if swapped {
-                            buf.push_null_left_right(build, row);
+                            buf.push_left_null_right(merged_probe, probe_row);
                         } else {
-                            buf.push_left_null_right(build, row);
+                            buf.push_null_left_right(merged_probe, probe_row);
                         }
                         if buf.is_full() {
-                            return Ok(Some(ExecutionBatch::new(
-                                buf.flush(&self.left_types, &self.right_types),
-                            )));
+                            let batch = buf.flush(&self.left_types, &self.right_types);
+                            self.output_queue.push(batch);
                         }
                     }
                 }
-                self.finished = true;
-                if !buf.is_empty() {
-                    return Ok(Some(ExecutionBatch::new(
-                        buf.flush(&self.left_types, &self.right_types),
-                    )));
-                }
-                return Ok(None);
+            }
+            self.probe_row_ordinal += merged_probe.num_rows as u64;
+            return Ok(());
+        }
+
+        let total_probe_rows = merged_probe.num_rows;
+        // Determine if we can use the fused probe path: single ColumnRef
+        // integer key, no nulls, no remaining condition. This computes
+        // hashes inline and probes the hash table in one pass with
+        // group-prefetch to hide L3 latency, eliminating the separate
+        // hash buffer allocation and extra passes.
+        let use_fused = self.remaining_condition.is_none()
+            && self.probe_key_col_indices.len() == 1
+            && self.probe_key_col_indices[0].is_some();
+
+        let fused_key_idx = if use_fused {
+            self.probe_key_col_indices[0]
+        } else {
+            None
+        };
+
+        let fused_col_no_nulls = fused_key_idx
+            .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
+            .unwrap_or(false);
+
+        // Materialize probe key columns once for value comparison after the
+        // hi32 hash match across every probe path.
+        let probe_keys = self.materialize_probe_keys(merged_probe)?;
+
+        if fused_col_no_nulls {
+            let key_idx = fused_key_idx.unwrap();
+            let track_right = matches!(self.internal_join, JoinType::Right | JoinType::Full);
+            let track_build = !self.build_matched.is_empty();
+
+            // Taken from the operator so the capacity earned by the
+            // previous batch is reused. Taking leaves an empty Vec
+            // behind, which allocates nothing, and the buffers go
+            // back once the matches have been appended
+            let mut build_idx = std::mem::take(&mut self.match_build_rows);
+            let mut probe_idx = std::mem::take(&mut self.match_probe_rows);
+            build_idx.clear();
+            probe_idx.clear();
+            build_idx.reserve(total_probe_rows);
+            probe_idx.reserve(total_probe_rows);
+            let mut unmatched_probe: Vec<u32> = Vec::new();
+
+            // Fused hash + probe with group-prefetch.
+            // Prefetch distance of 16 hides L3 latency for bucket lookups.
+            const PF: usize = 16;
+
+            macro_rules! fused_probe_prefetch {
+                ($v:expr) => {{
+                    let n = $v.len();
+                    let mut pf_buf = [0u64; PF];
+                    let prime = PF.min(n);
+                    for i in 0..prime {
+                        pf_buf[i] = compute::hash_int($v[i] as u64);
+                        self.build_index.prefetch(pf_buf[i]);
+                    }
+
+                    for probe_row in 0..n {
+                        let hash = pf_buf[probe_row % PF];
+
+                        let ahead = probe_row + PF;
+                        if ahead < n {
+                            let h = compute::hash_int($v[ahead] as u64);
+                            pf_buf[ahead % PF] = h;
+                            self.build_index.prefetch(h);
+                        }
+
+                        let mut cursor = self.build_index.get(hash);
+                        let hash_hi32 = (hash >> 32) as u32;
+                        let mut matched = false;
+                        while cursor != u32::MAX {
+                            let (next, stored_hi32) = self.build_entries[cursor as usize];
+                            let build_row = cursor;
+                            cursor = next;
+                            if stored_hi32 != hash_hi32 {
+                                continue;
+                            }
+                            if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
+                                continue;
+                            }
+                            build_idx.push(build_row);
+                            probe_idx.push(probe_row as u32);
+                            matched = true;
+                            self.note_probe_match(probe_row);
+                            if track_build {
+                                self.build_matched[build_row as usize] = true;
+                            }
+                        }
+                        if !matched && track_right {
+                            unmatched_probe.push(probe_row as u32);
+                        }
+                    }
+                }};
             }
 
-            // Probe batches were drained during the build phase, when the
-            // build side was chosen by actual row count. They stay separate,
-            // so the probe side is never copied into one contiguous block.
-            let probe_batches = std::mem::take(&mut self.probe_batches_pending);
-            if probe_batches.is_empty() {
-                // Probe side produced no rows. A build-outer join still
-                // owes every build row, null-padded on the probe side.
-                if matches!(self.internal_join, JoinType::Left | JoinType::Full)
-                    && self.build_batch.is_some()
-                {
-                    self.emitting_unmatched_build = true;
-                    return self.next().await;
+            // The integer-hash probe is only valid when the build side
+            // filled its buckets with the same integer hash. A build key
+            // with NULLs or an expression key hashed generically, and a
+            // probe hashing the same values differently would look up
+            // buckets that were never filled, dropping every match
+            let col = &merged_probe.columns[key_idx];
+            match (&col.data, self.build_used_int_hash) {
+                (ColumnData::Int64(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::Int32(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::Int16(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::Int8(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::UInt64(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::UInt32(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::UInt16(v), true) => fused_probe_prefetch!(v),
+                (ColumnData::UInt8(v), true) => fused_probe_prefetch!(v),
+                _ => {
+                    // Non-integer fused path without prefetch (strings,
+                    // decimals, and any probe whose build side hashed
+                    // generically). Hashes the materialized key column,
+                    // which carries any decimal alignment
+                    let probe_hashes =
+                        compute::hash_column_batch(&[probe_keys[0].as_ref()], total_probe_rows);
+                    for probe_row in 0..total_probe_rows {
+                        let hash = probe_hashes[probe_row];
+                        let mut cursor = self.build_index.get(hash);
+                        let hash_hi32 = (hash >> 32) as u32;
+                        let mut matched = false;
+                        while cursor != u32::MAX {
+                            let (next, stored_hi32) = self.build_entries[cursor as usize];
+                            let build_row = cursor;
+                            cursor = next;
+                            if stored_hi32 != hash_hi32 {
+                                continue;
+                            }
+                            if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
+                                continue;
+                            }
+                            build_idx.push(build_row);
+                            probe_idx.push(probe_row as u32);
+                            matched = true;
+                            self.note_probe_match(probe_row);
+                            if track_build {
+                                self.build_matched[build_row as usize] = true;
+                            }
+                        }
+                        if !matched && track_right {
+                            unmatched_probe.push(probe_row as u32);
+                        }
+                    }
                 }
-                self.finished = true;
-                return Ok(None);
             }
 
-            if self.build_batch.is_none() {
-                // An empty build side can match nothing. A probe-outer join
-                // still owes every probe row, null-padded on the build side.
-                if matches!(self.internal_join, JoinType::Right | JoinType::Full) {
-                    let swapped = self.swapped;
-                    for probe_batch in &probe_batches {
-                        let buf = self.output_buffer.as_mut().unwrap();
-                        for probe_row in 0..probe_batch.num_rows {
+            // Accumulate matches into full-size output batches.
+            self.append_matches(&build_idx, merged_probe, &probe_idx);
+            build_idx.clear();
+            probe_idx.clear();
+            self.match_build_rows = build_idx;
+            self.match_probe_rows = probe_idx;
+
+            // Emit unmatched probe rows for probe-outer joins. Pending
+            // matches flush first so a row's position never depends on
+            // which probe batch it came from.
+            if !unmatched_probe.is_empty() {
+                self.flush_pending_out();
+                let swapped = self.swapped;
+                let buf = self.output_buffer.as_mut().unwrap();
+                for &pr in &unmatched_probe {
+                    if swapped {
+                        buf.push_left_null_right(merged_probe, pr as usize);
+                    } else {
+                        buf.push_null_left_right(merged_probe, pr as usize);
+                    }
+                    if buf.is_full() {
+                        self.output_queue
+                            .push(buf.flush(&self.left_types, &self.right_types));
+                    }
+                }
+            }
+        } else {
+            // Generic path: hash all probe keys, then probe. The
+            // materialized probe key columns carry any decimal
+            // alignment, so hashing them matches the build side
+            let key_refs: Vec<&Column> = probe_keys.iter().map(|c| c.as_ref()).collect();
+            let probe_hashes = if self.build_used_int_hash {
+                // Build used hash_int for single integer key. Compute
+                // matching hashes from the single probe key column.
+                let col = key_refs[0];
+                let mut hashes = Vec::with_capacity(total_probe_rows);
+                macro_rules! hash_int_col {
+                    ($v:expr) => {
+                        for val in $v.iter() {
+                            hashes.push(compute::hash_int(*val as u64));
+                        }
+                    };
+                }
+                match &col.data {
+                    ColumnData::Int64(v) => hash_int_col!(v),
+                    ColumnData::Int32(v) => hash_int_col!(v),
+                    ColumnData::Int16(v) => hash_int_col!(v),
+                    ColumnData::Int8(v) => hash_int_col!(v),
+                    ColumnData::UInt64(v) => hash_int_col!(v),
+                    ColumnData::UInt32(v) => hash_int_col!(v),
+                    ColumnData::UInt16(v) => hash_int_col!(v),
+                    ColumnData::UInt8(v) => hash_int_col!(v),
+                    _ => {
+                        hashes = compute::hash_column_batch(&key_refs, total_probe_rows);
+                    }
+                }
+                hashes
+            } else {
+                compute::hash_column_batch(&key_refs, total_probe_rows)
+            };
+
+            if self.remaining_condition.is_some() {
+                let swapped = self.swapped;
+                let track_right = matches!(self.internal_join, JoinType::Right | JoinType::Full);
+                let build_key_columns = &self.build_key_columns;
+                let build = self.build_batch.as_ref().unwrap();
+
+                // Hash and key matched candidate pairs gather into one
+                // combined batch per chunk and the residual condition
+                // evaluates once over it, instead of building a one-row
+                // batch and running the interpreter per candidate.
+                // Pairs stay in probe-row order and chunks end on row
+                // boundaries, so output order, the unmatched-row
+                // emission points, and buffer flushes are unchanged
+                const RESIDUAL_CHUNK: usize = 1024;
+                let mut pair_probe: Vec<u32> = Vec::with_capacity(RESIDUAL_CHUNK);
+                let mut pair_build: Vec<u32> = Vec::with_capacity(RESIDUAL_CHUNK);
+
+                let mut probe_row = 0usize;
+                while probe_row < total_probe_rows {
+                    pair_probe.clear();
+                    pair_build.clear();
+                    let chunk_start_row = probe_row;
+                    while probe_row < total_probe_rows {
+                        let hash = probe_hashes[probe_row];
+                        let mut cursor = self.build_index.get(hash);
+                        let hash_hi32 = (hash >> 32) as u32;
+                        while cursor != u32::MAX {
+                            let (next, stored_hi32) = self.build_entries[cursor as usize];
+                            let build_row = cursor;
+                            cursor = next;
+                            if stored_hi32 != hash_hi32 {
+                                continue;
+                            }
+                            if !keys_match_columns(
+                                build_key_columns,
+                                &probe_keys,
+                                build_row as usize,
+                                probe_row,
+                            ) {
+                                continue;
+                            }
+                            pair_probe.push(probe_row as u32);
+                            pair_build.push(build_row);
+                        }
+                        probe_row += 1;
+                        if pair_probe.len() >= RESIDUAL_CHUNK {
+                            break;
+                        }
+                    }
+
+                    // The condition schema is external left then
+                    // right, so the combined columns follow that order
+                    let mask = if pair_probe.is_empty() {
+                        None
+                    } else {
+                        let combined = if swapped {
+                            combine_rows_gather(merged_probe, &pair_probe, build, &pair_build)
+                        } else {
+                            combine_rows_gather(build, &pair_build, merged_probe, &pair_probe)
+                        };
+                        Some(evaluate(
+                            self.remaining_condition.as_ref().unwrap(),
+                            &combined,
+                            &self.input_schema,
+                            &[],
+                        )?)
+                    };
+
+                    let mut pair_idx = 0usize;
+                    for row in chunk_start_row..probe_row {
+                        let mut matched = false;
+                        while pair_idx < pair_probe.len() && pair_probe[pair_idx] as usize == row {
+                            let build_row = pair_build[pair_idx] as usize;
+                            let passes = match &mask {
+                                Some(m) => !m.is_null(pair_idx) && m.get_bool(pair_idx),
+                                None => false,
+                            };
+                            if passes {
+                                matched = true;
+                                self.note_probe_match(row);
+                                if !self.build_matched.is_empty() {
+                                    self.build_matched[build_row] = true;
+                                }
+                                let buf = self.output_buffer.as_mut().unwrap();
+                                if swapped {
+                                    buf.push_matched(merged_probe, row, build, build_row);
+                                } else {
+                                    buf.push_matched(build, build_row, merged_probe, row);
+                                }
+                                if buf.is_full() {
+                                    self.output_queue
+                                        .push(buf.flush(&self.left_types, &self.right_types));
+                                }
+                            }
+                            pair_idx += 1;
+                        }
+                        if !matched && track_right {
+                            let buf = self.output_buffer.as_mut().unwrap();
                             if swapped {
-                                buf.push_left_null_right(probe_batch, probe_row);
+                                buf.push_left_null_right(merged_probe, row);
                             } else {
-                                buf.push_null_left_right(probe_batch, probe_row);
-                            }
-                            if buf.is_full() {
-                                let b = buf.flush(&self.left_types, &self.right_types);
-                                self.output_queue.push(b);
-                            }
-                        }
-                    }
-                    let buf = self.output_buffer.as_mut().unwrap();
-                    if !buf.is_empty() {
-                        let b = buf.flush(&self.left_types, &self.right_types);
-                        self.output_queue.push(b);
-                    }
-                }
-                self.finished = true;
-                if !self.output_queue.is_empty() {
-                    self.output_queue_idx = 1;
-                    let batch =
-                        std::mem::replace(&mut self.output_queue[0], DataBatch::new(Vec::new()));
-                    if self.output_queue_idx >= self.output_queue.len() {
-                        self.output_queue.clear();
-                        self.output_queue_idx = 0;
-                    }
-                    return Ok(Some(ExecutionBatch::new(batch)));
-                }
-                return Ok(None);
-            }
-
-            for merged_probe in &probe_batches {
-                let total_probe_rows = merged_probe.num_rows;
-                // Determine if we can use the fused probe path: single ColumnRef
-                // integer key, no nulls, no remaining condition. This computes
-                // hashes inline and probes the hash table in one pass with
-                // group-prefetch to hide L3 latency, eliminating the separate
-                // hash buffer allocation and extra passes.
-                let use_fused = self.remaining_condition.is_none()
-                    && self.probe_key_col_indices.len() == 1
-                    && self.probe_key_col_indices[0].is_some();
-
-                let fused_key_idx = if use_fused {
-                    self.probe_key_col_indices[0]
-                } else {
-                    None
-                };
-
-                let fused_col_no_nulls = fused_key_idx
-                    .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
-                    .unwrap_or(false);
-
-                // Materialize probe key columns once for value comparison after the
-                // hi32 hash match across every probe path.
-                let probe_keys = self.materialize_probe_keys(merged_probe)?;
-
-                if fused_col_no_nulls {
-                    let key_idx = fused_key_idx.unwrap();
-                    let track_right =
-                        matches!(self.internal_join, JoinType::Right | JoinType::Full);
-                    let track_build = !self.build_matched.is_empty();
-
-                    let mut build_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
-                    let mut probe_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
-                    let mut unmatched_probe: Vec<u32> =
-                        if track_right { Vec::new() } else { Vec::new() };
-
-                    // Fused hash + probe with group-prefetch.
-                    // Prefetch distance of 16 hides L3 latency for bucket lookups.
-                    const PF: usize = 16;
-
-                    macro_rules! fused_probe_prefetch {
-                        ($v:expr) => {{
-                            let n = $v.len();
-                            let mut pf_buf = [0u64; PF];
-                            let prime = PF.min(n);
-                            for i in 0..prime {
-                                pf_buf[i] = compute::hash_int($v[i] as u64);
-                                self.build_index.prefetch(pf_buf[i]);
-                            }
-
-                            for probe_row in 0..n {
-                                let hash = pf_buf[probe_row % PF];
-
-                                let ahead = probe_row + PF;
-                                if ahead < n {
-                                    let h = compute::hash_int($v[ahead] as u64);
-                                    pf_buf[ahead % PF] = h;
-                                    self.build_index.prefetch(h);
-                                }
-
-                                let mut cursor = self.build_index.get(hash);
-                                let hash_hi32 = (hash >> 32) as u32;
-                                let mut matched = false;
-                                while cursor != u32::MAX {
-                                    let (next, stored_hi32) = self.build_entries[cursor as usize];
-                                    let build_row = cursor;
-                                    cursor = next;
-                                    if stored_hi32 != hash_hi32 {
-                                        continue;
-                                    }
-                                    if !self.keys_match(&probe_keys, build_row as usize, probe_row)
-                                    {
-                                        continue;
-                                    }
-                                    build_idx.push(build_row);
-                                    probe_idx.push(probe_row as u32);
-                                    matched = true;
-                                    if track_build {
-                                        self.build_matched[build_row as usize] = true;
-                                    }
-                                }
-                                if !matched && track_right {
-                                    unmatched_probe.push(probe_row as u32);
-                                }
-                            }
-                        }};
-                    }
-
-                    // The integer-hash probe is only valid when the build side
-                    // filled its buckets with the same integer hash. A build key
-                    // with NULLs or an expression key hashed generically, and a
-                    // probe hashing the same values differently would look up
-                    // buckets that were never filled, dropping every match
-                    let col = &merged_probe.columns[key_idx];
-                    match (&col.data, self.build_used_int_hash) {
-                        (ColumnData::Int64(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::Int32(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::Int16(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::Int8(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::UInt64(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::UInt32(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::UInt16(v), true) => fused_probe_prefetch!(v),
-                        (ColumnData::UInt8(v), true) => fused_probe_prefetch!(v),
-                        _ => {
-                            // Non-integer fused path without prefetch (strings,
-                            // decimals, and any probe whose build side hashed
-                            // generically). Hashes the materialized key column,
-                            // which carries any decimal alignment
-                            let probe_hashes = compute::hash_column_batch(
-                                &[probe_keys[0].as_ref()],
-                                total_probe_rows,
-                            );
-                            for probe_row in 0..total_probe_rows {
-                                let hash = probe_hashes[probe_row];
-                                let mut cursor = self.build_index.get(hash);
-                                let hash_hi32 = (hash >> 32) as u32;
-                                let mut matched = false;
-                                while cursor != u32::MAX {
-                                    let (next, stored_hi32) = self.build_entries[cursor as usize];
-                                    let build_row = cursor;
-                                    cursor = next;
-                                    if stored_hi32 != hash_hi32 {
-                                        continue;
-                                    }
-                                    if !self.keys_match(&probe_keys, build_row as usize, probe_row)
-                                    {
-                                        continue;
-                                    }
-                                    build_idx.push(build_row);
-                                    probe_idx.push(probe_row as u32);
-                                    matched = true;
-                                    if track_build {
-                                        self.build_matched[build_row as usize] = true;
-                                    }
-                                }
-                                if !matched && track_right {
-                                    unmatched_probe.push(probe_row as u32);
-                                }
-                            }
-                        }
-                    }
-
-                    // Accumulate matches into full-size output batches.
-                    self.append_matches(&build_idx, merged_probe, &probe_idx);
-
-                    // Emit unmatched probe rows for probe-outer joins. Pending
-                    // matches flush first so a row's position never depends on
-                    // which probe batch it came from.
-                    if !unmatched_probe.is_empty() {
-                        self.flush_pending_out();
-                        let swapped = self.swapped;
-                        let buf = self.output_buffer.as_mut().unwrap();
-                        for &pr in &unmatched_probe {
-                            if swapped {
-                                buf.push_left_null_right(merged_probe, pr as usize);
-                            } else {
-                                buf.push_null_left_right(merged_probe, pr as usize);
+                                buf.push_null_left_right(merged_probe, row);
                             }
                             if buf.is_full() {
                                 self.output_queue
@@ -1328,169 +1723,130 @@ impl Operator for HashJoinOperator {
                             }
                         }
                     }
-                } else {
-                    // Generic path: hash all probe keys, then probe. The
-                    // materialized probe key columns carry any decimal
-                    // alignment, so hashing them matches the build side
-                    let key_refs: Vec<&Column> = probe_keys.iter().map(|c| c.as_ref()).collect();
-                    let probe_hashes = if self.build_used_int_hash {
-                        // Build used hash_int for single integer key. Compute
-                        // matching hashes from the single probe key column.
-                        let col = key_refs[0];
-                        let mut hashes = Vec::with_capacity(total_probe_rows);
-                        macro_rules! hash_int_col {
-                            ($v:expr) => {
-                                for val in $v.iter() {
-                                    hashes.push(compute::hash_int(*val as u64));
-                                }
-                            };
-                        }
-                        match &col.data {
-                            ColumnData::Int64(v) => hash_int_col!(v),
-                            ColumnData::Int32(v) => hash_int_col!(v),
-                            ColumnData::Int16(v) => hash_int_col!(v),
-                            ColumnData::Int8(v) => hash_int_col!(v),
-                            ColumnData::UInt64(v) => hash_int_col!(v),
-                            ColumnData::UInt32(v) => hash_int_col!(v),
-                            ColumnData::UInt16(v) => hash_int_col!(v),
-                            ColumnData::UInt8(v) => hash_int_col!(v),
-                            _ => {
-                                hashes = compute::hash_column_batch(&key_refs, total_probe_rows);
-                            }
-                        }
-                        hashes
-                    } else {
-                        compute::hash_column_batch(&key_refs, total_probe_rows)
-                    };
+                }
+            } else {
+                let batches = self.probe_batch_vectorized(merged_probe, &probe_hashes, &probe_keys);
+                self.output_queue.extend(batches);
+            }
+        }
 
-                    if self.remaining_condition.is_some() {
-                        let swapped = self.swapped;
-                        let track_right =
-                            matches!(self.internal_join, JoinType::Right | JoinType::Full);
-                        let build_key_columns = &self.build_key_columns;
-                        let buf = self.output_buffer.as_mut().unwrap();
-                        let build = self.build_batch.as_ref().unwrap();
-                        for probe_row in 0..total_probe_rows {
-                            let hash = probe_hashes[probe_row];
-                            let mut cursor = self.build_index.get(hash);
-                            let hash_hi32 = (hash >> 32) as u32;
-                            let mut matched = false;
-                            while cursor != u32::MAX {
-                                let (next, stored_hi32) = self.build_entries[cursor as usize];
-                                let build_row = cursor;
-                                cursor = next;
-                                if stored_hi32 != hash_hi32 {
-                                    continue;
-                                }
-                                if !keys_match_columns(
-                                    build_key_columns,
-                                    &probe_keys,
-                                    build_row as usize,
-                                    probe_row,
-                                ) {
-                                    continue;
-                                }
-                                // The condition schema is external left then
-                                // right, so the combined row follows that order
-                                let combined = if swapped {
-                                    combine_rows_single(
-                                        merged_probe,
-                                        probe_row,
-                                        build,
-                                        build_row as usize,
-                                    )
-                                } else {
-                                    combine_rows_single(
-                                        build,
-                                        build_row as usize,
-                                        merged_probe,
-                                        probe_row,
-                                    )
-                                };
-                                let mask = evaluate(
-                                    self.remaining_condition.as_ref().unwrap(),
-                                    &combined,
-                                    &self.input_schema,
-                                    &[],
-                                )?;
-                                if !mask.is_null(0) && mask.get_bool(0) {
-                                    matched = true;
-                                    if !self.build_matched.is_empty() {
-                                        self.build_matched[build_row as usize] = true;
-                                    }
-                                    if swapped {
-                                        buf.push_matched(
-                                            merged_probe,
-                                            probe_row,
-                                            build,
-                                            build_row as usize,
-                                        );
-                                    } else {
-                                        buf.push_matched(
-                                            build,
-                                            build_row as usize,
-                                            merged_probe,
-                                            probe_row,
-                                        );
-                                    }
-                                    if buf.is_full() {
-                                        self.output_queue
-                                            .push(buf.flush(&self.left_types, &self.right_types));
-                                    }
-                                }
-                            }
-                            if !matched && track_right {
-                                if swapped {
-                                    buf.push_left_null_right(merged_probe, probe_row);
-                                } else {
-                                    buf.push_null_left_right(merged_probe, probe_row);
-                                }
-                                if buf.is_full() {
-                                    self.output_queue
-                                        .push(buf.flush(&self.left_types, &self.right_types));
-                                }
-                            }
+        self.probe_row_ordinal += merged_probe.num_rows as u64;
+        Ok(())
+    }
+
+    /// Closes out the probe phase once the probe side is exhausted.
+    fn finish_probing(&mut self) {
+        self.flush_pending_out();
+        if let Some(buf) = self.output_buffer.as_mut() {
+            if !buf.is_empty() {
+                let batch = buf.flush(&self.left_types, &self.right_types);
+                self.output_queue.push(batch);
+            }
+        }
+        if matches!(self.internal_join, JoinType::Left | JoinType::Full)
+            && self.build_batch.is_some()
+        {
+            self.emitting_unmatched_build = true;
+        } else {
+            self.finished = true;
+        }
+    }
+
+    /// Emits the next batch of build rows that matched nothing, or None once
+    /// there are none left.
+    fn emit_unmatched_build(&mut self) -> Option<DataBatch> {
+        if self.build_matched.is_empty() {
+            self.finished = true;
+            return None;
+        }
+        let swapped = self.swapped;
+        let Some(build) = self.build_batch.as_ref() else {
+            self.finished = true;
+            return None;
+        };
+        let Some(buf) = self.output_buffer.as_mut() else {
+            self.finished = true;
+            return None;
+        };
+        while self.unmatched_cursor < self.total_build_rows {
+            let row = self.unmatched_cursor;
+            self.unmatched_cursor += 1;
+            if !self.build_matched[row] {
+                if swapped {
+                    buf.push_null_left_right(build, row);
+                } else {
+                    buf.push_left_null_right(build, row);
+                }
+                if buf.is_full() {
+                    return Some(buf.flush(&self.left_types, &self.right_types));
+                }
+            }
+        }
+        self.finished = true;
+        if buf.is_empty() {
+            None
+        } else {
+            Some(buf.flush(&self.left_types, &self.right_types))
+        }
+    }
+}
+
+impl Operator for HashJoinOperator {
+    fn next(&mut self) -> OperatorResult<'_> {
+        Box::pin(async move {
+            loop {
+                // Queued output first, so a batch the last call produced
+                // leaves before any more work starts
+                if self.output_queue_idx < self.output_queue.len() {
+                    let batch = std::mem::replace(
+                        &mut self.output_queue[self.output_queue_idx],
+                        DataBatch::new(Vec::new()),
+                    );
+                    self.output_queue_idx += 1;
+                    if self.output_queue_idx >= self.output_queue.len() {
+                        self.output_queue.clear();
+                        self.output_queue_idx = 0;
+                    }
+                    return Ok(Some(ExecutionBatch::new(batch)));
+                }
+
+                if self.finished {
+                    return Ok(None);
+                }
+
+                if !self.built {
+                    self.build_hash_table().await?;
+                    continue;
+                }
+
+                // Neither side fit, so the answer comes partition by
+                // partition instead
+                if let Some(grace) = self.grace.as_mut() {
+                    return match grace.next().await? {
+                        Some(batch) => Ok(Some(ExecutionBatch::new(batch))),
+                        None => {
+                            self.finished = true;
+                            Ok(None)
                         }
-                    } else {
-                        let batches =
-                            self.probe_batch_vectorized(merged_probe, &probe_hashes, &probe_keys);
-                        self.output_queue.extend(batches);
+                    };
+                }
+
+                if self.emitting_unmatched_build {
+                    match self.emit_unmatched_build() {
+                        Some(batch) => return Ok(Some(ExecutionBatch::new(batch))),
+                        None => continue,
                     }
                 }
-            }
 
-            // Emit whatever matched rows are still accumulating.
-            self.flush_pending_out();
-
-            // Flush remaining buffered rows.
-            let buf = self.output_buffer.as_mut().unwrap();
-            if !buf.is_empty() {
-                self.output_queue
-                    .push(buf.flush(&self.left_types, &self.right_types));
-            }
-
-            if matches!(self.internal_join, JoinType::Left | JoinType::Full) {
-                self.emitting_unmatched_build = true;
-            } else {
-                self.finished = true;
-            }
-
-            // Return first queued batch.
-            if !self.output_queue.is_empty() {
-                self.output_queue_idx = 1;
-                let batch =
-                    std::mem::replace(&mut self.output_queue[0], DataBatch::new(Vec::new()));
-                if self.output_queue_idx >= self.output_queue.len() {
-                    self.output_queue.clear();
-                    self.output_queue_idx = 0;
+                // One probe batch per pass. The output of a join can be far
+                // larger than either input, so holding all of it until the
+                // probe side was exhausted made the operator's memory the
+                // result size rather than the build side
+                match self.next_probe_batch().await? {
+                    Some(batch) => self.process_probe_batch(&batch)?,
+                    None => self.finish_probing(),
                 }
-                return Ok(Some(ExecutionBatch::new(batch)));
             }
-
-            if self.emitting_unmatched_build {
-                return self.next().await;
-            }
-            Ok(None)
         })
     }
 }
@@ -1529,6 +1885,22 @@ impl MergeJoinOperator {
     }
 }
 
+impl MergeJoinOperator {
+    /// Gives the join underneath somewhere to spill.
+    pub fn set_spill(
+        &mut self,
+        directory: Option<Arc<crate::spill::SpillDirectory>>,
+        threshold_bytes: u64,
+    ) {
+        self.inner.set_spill(directory, threshold_bytes);
+    }
+
+    /// Attaches the query memory budget to the join underneath.
+    pub fn set_memory_budget(&mut self, budget: Option<Arc<crate::context::QueryMemoryBudget>>) {
+        self.inner.set_memory_budget(budget);
+    }
+}
+
 impl Operator for MergeJoinOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         self.inner.next()
@@ -1553,6 +1925,12 @@ impl Operator for SingleBatchSource {
 }
 
 /// Total input rows below which partition + task-spawn overhead outweighs the
+/// Most partitions a parallel hash join will split into, whatever the machine
+/// has. Past this the partitioning pass and the per-partition table setup cost
+/// more than the extra concurrency returns, and the pool trims the request
+/// further whenever other queries are already holding capacity.
+const PARALLEL_JOIN_MAX_PARTITIONS: usize = 16;
+
 /// gain, so a single serial hash join runs instead.
 const PARALLEL_JOIN_MIN_ROWS: usize = 8192;
 
@@ -1574,6 +1952,13 @@ pub struct ParallelHashJoinOperator {
     output: Vec<DataBatch>,
     output_idx: usize,
     started: bool,
+    /// Query memory budget, passed to the serial join this becomes when the
+    /// inputs are too large to partition in memory
+    memory_budget: Option<Arc<crate::context::QueryMemoryBudget>>,
+    spill: Option<Arc<crate::spill::SpillDirectory>>,
+    spill_threshold_bytes: u64,
+    /// The serial spilling join that took over, when one did
+    fallback: Option<Box<dyn Operator>>,
 }
 
 impl ParallelHashJoinOperator {
@@ -1600,7 +1985,26 @@ impl ParallelHashJoinOperator {
             output: Vec::new(),
             output_idx: 0,
             started: false,
+            memory_budget: None,
+            spill: None,
+            spill_threshold_bytes: 0,
+            fallback: None,
         }
+    }
+
+    /// Attaches the query memory budget.
+    pub fn set_memory_budget(&mut self, budget: Option<Arc<crate::context::QueryMemoryBudget>>) {
+        self.memory_budget = budget;
+    }
+
+    /// Gives the join somewhere to put what does not fit.
+    pub fn set_spill(
+        &mut self,
+        directory: Option<Arc<crate::spill::SpillDirectory>>,
+        threshold_bytes: u64,
+    ) {
+        self.spill = directory;
+        self.spill_threshold_bytes = threshold_bytes;
     }
 
     /// Builds a serial hash join over two pre-materialized partition batches.
@@ -1624,22 +2028,60 @@ impl ParallelHashJoinOperator {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let left = self.left.take().expect("left taken once");
-        let right = self.right.take().expect("right taken once");
-        let build = merge_drained(left).await?;
-        let probe = merge_drained(right).await?;
+        let mut left = self.left.take().expect("left taken once");
+        let mut right = self.right.take().expect("right taken once");
+
+        // Partitioning happens in memory here, so both inputs have to be held
+        // whole before any of it starts. Past the budget that is the one thing
+        // this join cannot do, and the serial join takes over because it can
+        // partition onto disk instead
+        let cap = match (&self.spill, self.spill_threshold_bytes) {
+            (Some(_), threshold) if threshold > 0 => threshold,
+            _ => u64::MAX,
+        };
+        let (left_batches, left_over) = drain_capped(left.as_mut(), cap).await?;
+        let held: u64 = left_batches.iter().map(|b| b.approx_bytes()).sum();
+        let (right_batches, right_over) =
+            drain_capped(right.as_mut(), cap.saturating_sub(held)).await?;
+        if left_over || right_over {
+            let mut op = HashJoinOperator::new(
+                Box::new(crate::operator::grace::PrefixSource::new(
+                    left_batches,
+                    left,
+                )),
+                Box::new(crate::operator::grace::PrefixSource::new(
+                    right_batches,
+                    right,
+                )),
+                self.join_type,
+                self.left_keys.clone(),
+                self.right_keys.clone(),
+                self.remaining_condition.clone(),
+                self.left_schema.clone(),
+                self.right_schema.clone(),
+            );
+            op.set_memory_budget(self.memory_budget.clone());
+            op.set_spill(self.spill.clone(), self.spill_threshold_bytes);
+            self.fallback = Some(Box::new(op));
+            return Ok(());
+        }
+
+        let build = merge_batch_list(left_batches);
+        let probe = merge_batch_list(right_batches);
 
         let build_rows = build.as_ref().map(|b| b.num_rows).unwrap_or(0);
         let probe_rows = probe.as_ref().map(|b| b.num_rows).unwrap_or(0);
 
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(1, 16);
+        // Partitioning cost rises with the partition count while the benefit
+        // is bounded by what the machine can run at once, so the pool decides
+        // the count rather than the core count deciding it blind to load
+        let grant = crate::parallel_pool::reserve(PARALLEL_JOIN_MAX_PARTITIONS);
+        let workers = grant.workers();
 
         // Small inputs, no build rows, or a single worker: a single serial join
         // is cheaper than partition + spawn overhead.
         if workers <= 1 || build_rows == 0 || build_rows + probe_rows < PARALLEL_JOIN_MIN_ROWS {
+            drop(grant);
             let op = self.build_partition_join(build, probe);
             self.output = drain_operator(op).await?;
             return Ok(());
@@ -1680,7 +2122,9 @@ impl ParallelHashJoinOperator {
                 _ => None,
             };
             let op = self.build_partition_join(build_part, probe_part);
-            handles.push(tokio::spawn(async move { drain_operator(op).await }));
+            handles.push(crate::parallel_pool::spawn(async move {
+                drain_operator(op).await
+            }));
         }
 
         let mut output = Vec::new();
@@ -1695,6 +2139,7 @@ impl ParallelHashJoinOperator {
                 }
             }
         }
+        drop(grant);
         self.output = output;
         Ok(())
     }
@@ -1804,6 +2249,9 @@ impl Operator for ParallelHashJoinOperator {
                 self.started = true;
                 self.run().await?;
             }
+            if let Some(op) = self.fallback.as_mut() {
+                return op.next().await;
+            }
             if self.output_idx < self.output.len() {
                 let batch = std::mem::replace(
                     &mut self.output[self.output_idx],
@@ -1817,6 +2265,26 @@ impl Operator for ParallelHashJoinOperator {
     }
 }
 
+/// Drains one input, charging what it holds against the query's budget.
+///
+/// A free function rather than a method so the caller can hold the operator
+/// and the budget at the same time, which a method taking all of self cannot.
+async fn drain_side(
+    op: &mut dyn Operator,
+    budget: Option<&Arc<crate::context::QueryMemoryBudget>>,
+) -> Result<(Vec<DataBatch>, usize)> {
+    let mut batches = Vec::new();
+    let mut rows = 0usize;
+    while let Some(eb) = op.next().await? {
+        if let Some(budget) = budget {
+            budget.reserve(eb.batch.approx_bytes())?;
+        }
+        rows += eb.batch.num_rows;
+        batches.push(eb.batch);
+    }
+    Ok((batches, rows))
+}
+
 /// Drives an operator to completion, collecting all output batches.
 async fn drain_operator(mut op: Box<dyn Operator>) -> Result<Vec<DataBatch>> {
     let mut out = Vec::new();
@@ -1826,20 +2294,34 @@ async fn drain_operator(mut op: Box<dyn Operator>) -> Result<Vec<DataBatch>> {
     Ok(out)
 }
 
-/// Drains an operator and merges its batches into one contiguous batch, or None
-/// when it produced no rows.
-async fn merge_drained(mut op: Box<dyn Operator>) -> Result<Option<DataBatch>> {
-    let mut batches: Vec<DataBatch> = Vec::new();
-    let mut total = 0usize;
+/// Drains an operator until its batches pass a byte cap, reporting whether
+/// they did.
+///
+/// Stopping at the cap rather than reading to the end is the point: the
+/// caller asks because it cannot hold more than that, so reading past it
+/// would spend the memory the question was about.
+async fn drain_capped(op: &mut dyn Operator, cap: u64) -> Result<(Vec<DataBatch>, bool)> {
+    let mut batches = Vec::new();
+    let mut bytes = 0u64;
     while let Some(eb) = op.next().await? {
-        total += eb.batch.num_rows;
+        bytes += eb.batch.approx_bytes();
         batches.push(eb.batch);
+        if bytes >= cap {
+            return Ok((batches, true));
+        }
     }
+    Ok((batches, false))
+}
+
+/// Merges drained batches into one contiguous batch, or None when there were
+/// no rows.
+fn merge_batch_list(mut batches: Vec<DataBatch>) -> Option<DataBatch> {
+    let total: usize = batches.iter().map(|b| b.num_rows).sum();
     if total == 0 || batches.is_empty() {
-        return Ok(None);
+        return None;
     }
     if batches.len() == 1 {
-        return Ok(Some(batches.pop().unwrap()));
+        return batches.pop();
     }
     let num_cols = batches[0].num_columns();
     let mut cols = Vec::with_capacity(num_cols);
@@ -1860,7 +2342,7 @@ async fn merge_drained(mut op: Box<dyn Operator>) -> Result<Option<DataBatch>> {
             fractional_digits,
         ));
     }
-    Ok(Some(DataBatch::new(cols)))
+    Some(DataBatch::new(cols))
 }
 
 /// Builds a row-subset batch by taking the given row indices from every column.
@@ -1871,7 +2353,7 @@ fn take_rows(batch: &DataBatch, indices: &[u32]) -> DataBatch {
 
 /// Hashes each row's join-key columns after casting them to common_types so
 /// equal values hash identically regardless of declared key width.
-fn hash_keys(
+pub(crate) fn hash_keys(
     batch: &DataBatch,
     keys: &[BoundExpr],
     schema: &[LogicalColumn],
@@ -1901,16 +2383,21 @@ fn hash_keys(
 fn bucket_indices(hashes: &[u64], part_count: usize) -> Vec<Vec<u32>> {
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); part_count];
     for (row, &h) in hashes.iter().enumerate() {
-        let p = (h % part_count as u64) as usize;
-        buckets[p].push(row as u32);
+        buckets[bucket_of(h, part_count)].push(row as u32);
     }
     buckets
+}
+
+/// The bucket a hash falls in.
+#[inline]
+pub(crate) fn bucket_of(hash: u64, part_count: usize) -> usize {
+    (hash % part_count as u64) as usize
 }
 
 /// Common type two join-key columns must share so equal values hash identically.
 /// Equal types pass through; mixed integers widen to Int64; any float pairing
 /// widens to Float64; otherwise the left type is used.
-fn join_key_common_type(a: TypeId, b: TypeId) -> TypeId {
+pub(crate) fn join_key_common_type(a: TypeId, b: TypeId) -> TypeId {
     if a == b {
         return a;
     }

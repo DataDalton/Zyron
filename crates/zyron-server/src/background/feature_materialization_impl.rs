@@ -100,14 +100,13 @@ impl PlannerMaterializationExecutor {
                 .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
                 .map_err(|e| format!("begin txn: {}", e))?;
             let snapshot = read_txn.snapshot.clone();
-            let txn_id_u32 =
-                u32::try_from(read_txn.txn_id).map_err(|_| "txn id overflow".to_string())?;
+            let txn_id = read_txn.txn_id;
             let ctx = Arc::new(zyron_executor::context::ExecutionContext::new(
                 catalog.clone(),
                 wal,
                 bp,
                 dm,
-                txn_id_u32,
+                txn_id,
                 snapshot,
             ));
             let result = zyron_executor::execute(plan, &ctx).await;

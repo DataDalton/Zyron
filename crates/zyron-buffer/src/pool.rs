@@ -8,14 +8,38 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use sysinfo::System;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
+use zyron_pressure::hot_set::PrefetchReport;
+
+/// Fraction of the pool held back from a prefetch, as a divisor of the frame
+/// count.
+///
+/// A survivor absorbing a departing node's traffic needs frames for the
+/// queries it is already serving. Sixteenths leaves that headroom without
+/// making the handover pointless on a pool that is mostly free.
+const PREFETCH_RESERVE_DIVISOR: usize = 16;
 
 /// Write callback invoked to flush a dirty victim during eviction.
 /// Writes the page durably to disk so a dirty frame is never reused while its
 /// contents are unwritten. Wired from the pool construction site.
 /// The buffer is the pool's private copy of the frame, passed mutably so the
 /// writer can stamp integrity fields in place instead of copying the page.
+/// The third argument is the page's dirty LSN, so the writer can hold the
+/// write until the WAL is durable up to it: a data page must never reach
+/// disk ahead of the log records that produced it.
 pub type EvictWriteFn =
-    std::sync::Arc<dyn Fn(PageId, &mut [u8; PAGE_SIZE]) -> Result<()> + Send + Sync>;
+    std::sync::Arc<dyn Fn(PageId, &mut [u8; PAGE_SIZE], u64) -> Result<()> + Send + Sync>;
+
+/// What a flush_all callback did with the page it was offered. A callback
+/// that filters by file id answers Skipped for a page it does not own, and
+/// the pool keeps that page's dirty state instead of marking an unwritten
+/// page clean
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// The page was written durably, the frame may stay clean
+    Written,
+    /// The callback does not own the page and did not write it
+    Skipped,
+}
 
 // ---------------------------------------------------------------------------
 // Lock-free Treiber stack for buffer pool frame allocation
@@ -395,16 +419,24 @@ impl BufferPool {
             if frame.is_dirty() {
                 if let Some(page_id) = frame.page_id() {
                     let mut data = Box::new([0u8; PAGE_SIZE]);
+                    let dirty_lsn = frame.dirty_lsn();
                     let data_guard = frame.read_data();
                     data.copy_from_slice(&**data_guard);
                     drop(data_guard);
 
                     match self.evict_writer.get() {
                         Some(write) => {
-                            // Write through the hook. On failure leave the frame
-                            // dirty and in the page table, and surface the error
-                            // so the dirty page is not silently lost.
-                            write(page_id, &mut data)?;
+                            // Write through the hook. On failure the frame is
+                            // released back to the pool, dirty and in the page
+                            // table, and the error surfaces so the dirty page
+                            // is not silently lost. Leaving it claimed would
+                            // hang every later reader of that page on a claim
+                            // that nothing will ever drop
+                            if let Err(e) = write(page_id, &mut data, dirty_lsn) {
+                                frame.unclaim();
+                                self.replacer.record_access(victim_id);
+                                return Err(e);
+                            }
                             frame.set_dirty(false);
                         }
                         None => {
@@ -658,7 +690,7 @@ impl BufferPool {
     /// the caller knows the flush was incomplete.
     pub fn flush_all<F>(&self, mut flush_fn: F) -> Result<usize>
     where
-        F: FnMut(PageId, &mut [u8]) -> Result<()>,
+        F: FnMut(PageId, &mut [u8]) -> Result<FlushOutcome>,
     {
         let mut flushed = 0;
         let mut failed = 0;
@@ -693,9 +725,18 @@ impl BufferPool {
                 Box::new(**guard)
             };
             match flush_fn(page_id, &mut data[..]) {
-                Ok(()) => {
+                Ok(FlushOutcome::Written) => {
                     frame.unpin();
                     flushed += 1;
+                }
+                Ok(FlushOutcome::Skipped) => {
+                    // The callback does not own this page and wrote nothing.
+                    // The dirty state comes back so the owner's own flush
+                    // still sees the page, a clean-looking frame here would
+                    // let eviction discard the only current copy
+                    frame.set_dirty(true);
+                    frame.set_dirty_lsn(expected_lsn);
+                    frame.unpin();
                 }
                 Err(e) => {
                     // Restore so the page is retried, record the error and
@@ -994,11 +1035,18 @@ impl BufferPool {
     /// write's stamp fail and the post-flush clear mark it clean. The pin
     /// is held across the I/O so the frame cannot be evicted and reused
     /// while its image is being written.
+    /// `keep_pinned` leaves the frame pinned on a successful write, so the
+    /// caller can batch fsync across pages and re-dirty this exact frame if
+    /// that fsync fails. Without the pin the frame could be evicted as clean
+    /// between the write and the fsync, and an fsync failure would then have
+    /// no frame to re-dirty: the page's only current image would be an
+    /// unsynced file write. The caller MUST unpin after its fsync resolves
     pub fn flush_dirty_frame<F>(
         &self,
         page_id: PageId,
         frame_id: FrameId,
         expected_lsn: u64,
+        keep_pinned: bool,
         flush_fn: F,
     ) -> Result<bool>
     where
@@ -1044,7 +1092,9 @@ impl BufferPool {
         drop(flush_order);
         match outcome {
             Ok(()) => {
-                frame.unpin();
+                if !keep_pinned {
+                    frame.unpin();
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -1057,7 +1107,104 @@ impl BufferPool {
         }
     }
 
+    /// Releases the pin `flush_dirty_frame(keep_pinned = true)` held, after
+    /// the caller's batched fsync resolved. `redirty` restores the page's
+    /// dirty state first, for the fsync-failure path, and lands on this
+    /// exact frame because the pin kept it resident
+    pub fn finish_pinned_flush(&self, frame_id: FrameId, dirty_lsn: u64, redirty: bool) {
+        let frame = &self.frames[frame_id.0 as usize];
+        if redirty {
+            frame.set_dirty(true);
+            frame.set_dirty_lsn(dirty_lsn);
+        }
+        frame.unpin();
+    }
+
     /// Returns statistics about the buffer pool.
+    /// The resident pages worth handing to another node, hottest first.
+    ///
+    /// Hotness is the clock's own reference bit, which is the only recency
+    /// signal a buffer pool can produce without paying for it on every page
+    /// access. Pages touched since the hand last passed come first, the rest
+    /// of the resident set follows, and residency alone is already strong
+    /// evidence: these are the pages that survived eviction.
+    ///
+    /// Pinned pages are included. A page pinned at the instant the manifest is
+    /// taken is being used right now, which is the strongest possible reason
+    /// for a survivor to want it.
+    pub fn hot_pages(&self, limit: usize) -> Vec<PageId> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut referenced = Vec::with_capacity(limit.min(self.config.num_frames));
+        let mut resident = Vec::new();
+        self.page_table.for_each(|page_id, frame_id| {
+            if self.replacer.is_referenced(frame_id) {
+                referenced.push(page_id);
+            } else if resident.len() < limit {
+                resident.push(page_id);
+            }
+            // Stop once the referenced set alone fills the manifest, because
+            // nothing found later can outrank what is already held
+            referenced.len() < limit
+        });
+        if referenced.len() >= limit {
+            referenced.truncate(limit);
+            return referenced;
+        }
+        let room = limit - referenced.len();
+        resident.truncate(room);
+        referenced.extend(resident);
+        referenced
+    }
+
+    /// Reads a departing node's working set in, so the traffic that follows it
+    /// lands on a warm pool instead of a cold one.
+    ///
+    /// Never evicts. A prefetch that displaced resident pages would trade a
+    /// survivor's own warm set for a guess about the traffic it is about to
+    /// inherit, and the survivor's set is the one that is definitely being
+    /// used. Pages beyond the free-frame reserve are declined and counted.
+    ///
+    /// `read` supplies page bytes. It returns None for a page that no longer
+    /// exists, which is expected: the manifest was taken before the drain and
+    /// the departing node may have dropped pages since.
+    pub fn prefetch<F>(&self, pages: &[PageId], mut read: F) -> PrefetchReport
+    where
+        F: FnMut(PageId) -> Option<Vec<u8>>,
+    {
+        let reserve = (self.config.num_frames / PREFETCH_RESERVE_DIVISOR).max(1);
+        let mut report = PrefetchReport {
+            requested: pages.len() as u64,
+            ..PrefetchReport::default()
+        };
+        for page_id in pages {
+            if self.page_table.contains(*page_id) {
+                report.already_resident += 1;
+                continue;
+            }
+            if self.free_count() <= reserve {
+                report.declined += 1;
+                continue;
+            }
+            let Some(bytes) = read(*page_id) else {
+                report.failed += 1;
+                continue;
+            };
+            match self.load_page(*page_id, &bytes) {
+                Ok((frame, _evicted)) => {
+                    // Loading pins the frame. A prefetched page has no reader
+                    // yet, so the pin is released immediately and the page is
+                    // evictable from the moment it lands
+                    frame.unpin();
+                    report.loaded += 1;
+                }
+                Err(_) => report.failed += 1,
+            }
+        }
+        report
+    }
+
     pub fn stats(&self) -> BufferPoolStats {
         let mut pinned_count = 0;
         let mut dirty_count = 0;
@@ -1228,7 +1375,7 @@ mod tests {
 
         let frame_id = pool.page_table.get(pid).expect("mapped");
         let flushed = pool
-            .flush_dirty_frame(pid, frame_id, 40, |_, _| {
+            .flush_dirty_frame(pid, frame_id, 40, false, |_, _| {
                 // a foreground write lands while the flush is in flight
                 pool.mark_dirty_with_lsn(pid, 90);
                 Ok(())
@@ -1263,7 +1410,7 @@ mod tests {
             if p == pid {
                 pool.mark_dirty_with_lsn(pid, 90);
             }
-            Ok(())
+            Ok(FlushOutcome::Written)
         })
         .expect("flush all");
 
@@ -1587,11 +1734,51 @@ mod tests {
         let mut flushed_count = 0;
         let result = pool.flush_all(|_pid, _data| {
             flushed_count += 1;
-            Ok(())
+            Ok(FlushOutcome::Written)
         });
 
         assert_eq!(result.unwrap(), 5);
         assert_eq!(flushed_count, 5);
+    }
+
+    // A file-filtered flusher sharing the pool must not mark pages it
+    // declined as clean: the skipped page keeps its dirty bit and dirty
+    // LSN so the owning subsystem's flush and the checkpoint still see it
+    #[test]
+    fn test_flush_all_skipped_pages_stay_dirty() {
+        let pool = create_test_pool(10);
+
+        let owned = PageId::new(0, 1);
+        let foreign = PageId::new(7, 1);
+        for page_id in [owned, foreign] {
+            pool.new_page(page_id).unwrap();
+            pool.unpin_page(page_id, true);
+        }
+        pool.mark_dirty_with_lsn(foreign, 42);
+
+        let flushed = pool
+            .flush_all(|pid, _data| {
+                if pid.file_id == 0 {
+                    Ok(FlushOutcome::Written)
+                } else {
+                    Ok(FlushOutcome::Skipped)
+                }
+            })
+            .expect("flush all");
+        assert_eq!(flushed, 1, "only the owned page counts as flushed");
+
+        let owned_frame = pool.fetch_page(owned).unwrap();
+        assert!(!owned_frame.is_dirty(), "written page is clean");
+        pool.unpin_page(owned, false);
+
+        let foreign_frame = pool.fetch_page(foreign).unwrap();
+        assert!(foreign_frame.is_dirty(), "skipped page keeps its dirty bit");
+        assert_eq!(
+            foreign_frame.dirty_lsn(),
+            42,
+            "skipped page keeps its dirty LSN"
+        );
+        pool.unpin_page(foreign, false);
     }
 
     #[test]
@@ -1835,7 +2022,7 @@ mod tests {
         let pool = create_test_pool(1);
         let written: Arc<Mutex<Vec<(PageId, u8)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&written);
-        let writer: EvictWriteFn = Arc::new(move |pid, data| {
+        let writer: EvictWriteFn = Arc::new(move |pid, data, _lsn| {
             sink.lock().unwrap().push((pid, data[0]));
             Ok(())
         });
@@ -1872,7 +2059,7 @@ mod tests {
             if pid.page_num == 2 {
                 Err(ZyronError::IoError("disk full".to_string()))
             } else {
-                Ok(())
+                Ok(FlushOutcome::Written)
             }
         });
 

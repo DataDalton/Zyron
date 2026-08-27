@@ -628,14 +628,14 @@ fn open_probe(
     // unknown outcome leaves the row in force
     if let Some(predicate) = superseded {
         let columns = reader.read_predicate_columns(&manifest.schema, &[predicate])?;
-        let compiled = crate::reader::CompiledPredicate::new(predicate, &columns);
-        for row in 0..rows {
-            if keep[row / 8] & (1 << (row % 8)) == 0 {
-                continue;
-            }
-            if compiled.evaluate(&columns, row) == Some(true) {
-                keep[row / 8] &= !(1 << (row % 8));
-            }
+        let mut superseded_rows = vec![0u8; keep.len()];
+        crate::reader::CompiledPredicate::new(predicate, &columns).mark_true(
+            &columns,
+            rows,
+            &mut superseded_rows,
+        );
+        for (live, gone) in keep.iter_mut().zip(superseded_rows.iter()) {
+            *live &= !*gone;
         }
     }
 

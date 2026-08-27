@@ -109,19 +109,10 @@ impl ZyronRowSink {
         let mut txn = self
             .txn_manager
             .begin(zyron_storage::txn::IsolationLevel::SnapshotIsolation)?;
-        let txn_id_u32 = match u32::try_from(txn.txn_id) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = self.txn_manager.abort(&mut txn);
-                return Err(ZyronError::Internal(
-                    "txn_id exceeds u32::MAX in streaming sink".to_string(),
-                ));
-            }
-        };
 
         let tuples: Vec<zyron_storage::Tuple> = records
             .iter()
-            .map(|c| zyron_storage::Tuple::new(c.row_data.clone(), txn_id_u32))
+            .map(|c| zyron_storage::Tuple::new(c.row_data.clone(), txn.txn_id))
             .collect();
 
         // The heap insert is async. Block on a small local runtime since the

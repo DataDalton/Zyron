@@ -59,6 +59,22 @@ impl PrivilegeAnalytics {
         }
     }
 
+    /// Drops usage records idle past the window, returning how many were
+    /// removed. Records key on object ids, so entries for dropped objects
+    /// and roles would otherwise linger forever.
+    pub fn prune_idle(&self, now: u64, idle_secs: u64) -> u64 {
+        let cutoff = now.saturating_sub(idle_secs);
+        let mut pruned = 0u64;
+        self.usage.retain_sync(|_, record| {
+            let live = record.last_used.load(Ordering::Relaxed) >= cutoff;
+            if !live {
+                pruned += 1;
+            }
+            live
+        });
+        pruned
+    }
+
     /// Records a privilege usage. Updates atomically if the entry exists, otherwise inserts.
     pub fn record_usage(
         &self,

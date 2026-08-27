@@ -83,6 +83,7 @@ fn make_subscription(pub_id: PublicationId, consumer: &str, last_lsn: u64) -> Su
         last_error: None,
         created_at: 0,
         source_id: None,
+        last_advance_at: 0,
     }
 }
 

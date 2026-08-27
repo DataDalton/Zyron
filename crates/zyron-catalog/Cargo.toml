@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+mimalloc.workspace = true
 tempfile = "3.27.0"
 rand = "0.10"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

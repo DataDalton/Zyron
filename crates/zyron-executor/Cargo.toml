@@ -10,6 +10,7 @@ rust-version.workspace = true
 profile = ["zyron-common/profile"]
 
 [dependencies]
+zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
@@ -30,5 +31,6 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+mimalloc.workspace = true
 rand = "0.10"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

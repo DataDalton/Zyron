@@ -55,6 +55,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     let cdc_registry = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.clone()));
 
     let state = Arc::new(ServerState {
+        node_capabilities: None,
         catalog,
         wal,
         buffer_pool: pool,
@@ -112,6 +113,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
@@ -122,8 +124,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
+        max_query_memory: None,
+        spill_directory: None,
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
+        password_encryption: "balloon-sha-256".into(),
     });
     (state, public_schema, tmp)
 }
@@ -140,7 +145,7 @@ fn build_ctx(server: &Arc<ServerState>, txn: &Transaction) -> Arc<ExecutionConte
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn.txn_id() as u32,
+        txn.txn_id(),
         txn.snapshot.clone(),
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));

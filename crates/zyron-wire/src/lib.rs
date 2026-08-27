@@ -8,6 +8,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod admission;
 pub mod auth;
 pub mod auto_param;
 pub mod codec;
@@ -28,6 +29,7 @@ pub mod pem;
 pub mod pg_client;
 pub mod plan_cache;
 pub mod pool;
+pub mod pressure_views;
 pub mod publication_filter;
 pub mod quic;
 pub mod row_security;
@@ -46,11 +48,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio::task::LocalSet;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use zyron_common::ServerConfig;
+use zyron_pressure::pressure_control::{ConnectionSlot, PressureController};
 
 use crate::connection::{Connection, ServerState};
 
@@ -107,28 +108,6 @@ fn strip_ipv6_brackets(host: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-/// Message sent from the accept loop to a worker thread.
-enum ConnectionTask {
-    Tcp {
-        stream: tokio::net::TcpStream,
-        peer_addr: SocketAddr,
-        state: Arc<ServerState>,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-    },
-    Tls {
-        stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        peer_addr: SocketAddr,
-        state: Arc<ServerState>,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-    },
-    Quic {
-        stream: quic::QuicStream,
-        peer_addr: SocketAddr,
-        state: Arc<ServerState>,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-    },
-}
-
 /// Peeks at the first 8 bytes of a TCP stream and returns true if the client
 /// sent an SSLRequest. Handles partial reads by looping until 8 bytes are
 /// buffered or EOF.
@@ -167,13 +146,24 @@ async fn upgrade_to_tls(
 }
 
 /// Starts the wire protocol server on the configured address.
-/// Pre-spawns a pool of worker threads, each with a persistent tokio runtime
-/// and LocalSet (required for the planner's !Send futures). The accept loop
-/// distributes connections round-robin via a crossbeam channel, so each
-/// connection reuses an existing runtime instead of spawning a new thread.
+///
+/// Every accepted connection becomes one task on the runtime the caller is
+/// already running, which is the work-stealing multi-thread runtime the server
+/// binary builds and sizes from `server.worker_threads`.
+///
+/// There was a pool of dedicated threads here, each with a current-thread
+/// runtime and a LocalSet, on the stated grounds that the planner produced
+/// futures that were not Send. They are Send, and so is the whole of
+/// `Connection::run`, so the pool bought nothing and cost two things: a query
+/// could not move off the thread it started on, and any work an operator
+/// spawned landed on that same single-threaded runtime, which turned
+/// intra-query parallelism into interleaving on one core.
+///
+/// How many clients may connect is not configured. A connection costs memory,
+/// so the ceiling is what memory affords and it rises with the hardware,
+/// rather than being a fixed count no deployment could raise.
 ///
 /// When QUIC is enabled, listens on both TCP and UDP simultaneously.
-/// Both transports feed into the same worker pool.
 pub async fn start_server(
     config: &ServerConfig,
     server_state: Arc<ServerState>,
@@ -183,98 +173,6 @@ pub async fn start_server(
     let addr: SocketAddr = format!("{}:{}", host_clean, config.port).parse()?;
     let std_listener = create_tcp_listener(addr, config.dual_stack)?;
     let listener = TcpListener::from_std(std_listener)?;
-    let semaphore = Arc::new(Semaphore::new(config.max_connections as usize));
-
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    let (sender, receiver) = crossbeam::channel::bounded::<ConnectionTask>(num_workers * 8);
-
-    // Spawn persistent worker threads, each with its own runtime + LocalSet.
-    // LocalSet is created once per thread and reused across connections to
-    // avoid per-connection allocation overhead.
-    for worker_id in 0..num_workers {
-        let rx = receiver.clone();
-        std::thread::Builder::new()
-            .name(format!("zyron-worker-{}", worker_id))
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to create worker runtime");
-                let local = LocalSet::new();
-
-                while let Ok(task) = rx.recv() {
-                    match task {
-                        ConnectionTask::Tcp {
-                            stream,
-                            peer_addr,
-                            state,
-                            _permit,
-                        } => {
-                            local.block_on(&rt, async {
-                                debug!("TCP connection from {} on worker {}", peer_addr, worker_id);
-                                let mut conn = Connection::new(
-                                    stream,
-                                    state,
-                                    Some(peer_addr.ip().to_string()),
-                                );
-                                if let Err(e) = conn.run().await {
-                                    error!("Connection error from {}: {}", peer_addr, e);
-                                }
-                                debug!("Connection closed: {}", peer_addr);
-                                drop(_permit);
-                            });
-                        }
-                        ConnectionTask::Tls {
-                            stream,
-                            peer_addr,
-                            state,
-                            _permit,
-                        } => {
-                            local.block_on(&rt, async {
-                                debug!("TLS connection from {} on worker {}", peer_addr, worker_id);
-                                let mut conn = Connection::new(
-                                    stream,
-                                    state,
-                                    Some(peer_addr.ip().to_string()),
-                                );
-                                if let Err(e) = conn.run().await {
-                                    error!("Connection error from {}: {}", peer_addr, e);
-                                }
-                                debug!("Connection closed: {}", peer_addr);
-                                drop(_permit);
-                            });
-                        }
-                        ConnectionTask::Quic {
-                            stream,
-                            peer_addr,
-                            state,
-                            _permit,
-                        } => {
-                            local.block_on(&rt, async {
-                                debug!(
-                                    "QUIC connection from {} on worker {}",
-                                    peer_addr, worker_id
-                                );
-                                let mut conn = Connection::new(
-                                    stream,
-                                    state,
-                                    Some(peer_addr.ip().to_string()),
-                                );
-                                if let Err(e) = conn.run().await {
-                                    error!("Connection error from {}: {}", peer_addr, e);
-                                }
-                                debug!("Connection closed: {}", peer_addr);
-                                drop(_permit);
-                            });
-                        }
-                    }
-                }
-            })
-            .expect("Failed to spawn worker thread");
-    }
 
     // Start QUIC listener if enabled.
     let mut quic_rx = None;
@@ -287,6 +185,7 @@ pub async fn start_server(
                 cert_path,
                 key_path,
                 config.quic_idle_timeout_secs,
+                config.quic_zero_rtt,
             )
             .await
             {
@@ -303,9 +202,10 @@ pub async fn start_server(
         }
     }
 
+    let connection_ceiling = PressureController::global().connections().ceiling();
     info!(
-        "Zyron listening on {} (TCP) with {} workers",
-        addr, num_workers
+        "Zyron listening on {} (TCP), up to {} concurrent connections from this node's memory",
+        addr, connection_ceiling
     );
 
     // Accept loop: select between TCP and QUIC connections.
@@ -313,61 +213,38 @@ pub async fn start_server(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, peer_addr) = result?;
-                let permit = semaphore.clone().acquire_owned().await?;
+                let Some(slot) = ConnectionSlot::acquire() else {
+                    warn!(
+                        "refusing connection from {}: node memory affords no further connections",
+                        peer_addr
+                    );
+                    drop(stream);
+                    continue;
+                };
 
                 // TLS upgrade: if the client opens with an SSLRequest and the
                 // server has a TLS acceptor, perform the handshake in the
-                // accept loop before handing off to a worker.
-                let task = match (
-                    server_state.tls_acceptor.as_ref(),
-                    server_state.tls_mode,
-                ) {
-                    (Some(acceptor), mode)
-                        if mode != tls::TlsMode::Disabled =>
-                    {
+                // accept loop before handing the connection to a task.
+                match (server_state.tls_acceptor.as_ref(), server_state.tls_mode) {
+                    (Some(acceptor), mode) if mode != tls::TlsMode::Disabled => {
                         let wants_tls = is_ssl_request(&stream).await.unwrap_or(false);
                         if wants_tls {
                             match upgrade_to_tls(stream, acceptor).await {
-                                Ok(tls_stream) => ConnectionTask::Tls {
-                                    stream: tls_stream,
-                                    peer_addr,
-                                    state: server_state.clone(),
-                                    _permit: permit,
-                                },
+                                Ok(tls_stream) => {
+                                    serve(tls_stream, peer_addr, server_state.clone(), slot, "TLS");
+                                }
                                 Err(e) => {
-                                    error!(
-                                        "TLS handshake failed from {}: {}",
-                                        peer_addr, e
-                                    );
-                                    drop(permit);
-                                    continue;
+                                    error!("TLS handshake failed from {}: {}", peer_addr, e);
                                 }
                             }
                         } else if mode == tls::TlsMode::Required {
                             // Plaintext attempts are rejected immediately.
                             error!("rejecting plaintext connection from {}", peer_addr);
-                            drop(permit);
-                            continue;
                         } else {
-                            ConnectionTask::Tcp {
-                                stream,
-                                peer_addr,
-                                state: server_state.clone(),
-                                _permit: permit,
-                            }
+                            serve(stream, peer_addr, server_state.clone(), slot, "TCP");
                         }
                     }
-                    _ => ConnectionTask::Tcp {
-                        stream,
-                        peer_addr,
-                        state: server_state.clone(),
-                        _permit: permit,
-                    },
-                };
-
-                if sender.send(task).is_err() {
-                    error!("All worker threads have exited");
-                    break;
+                    _ => serve(stream, peer_addr, server_state.clone(), slot, "TCP"),
                 }
             }
 
@@ -377,24 +254,42 @@ pub async fn start_server(
                     None => std::future::pending().await,
                 }
             } => {
-                let permit = semaphore.clone().acquire_owned().await?;
-
-                let task = ConnectionTask::Quic {
-                    stream: quic_stream,
-                    peer_addr,
-                    state: server_state.clone(),
-                    _permit: permit,
+                let Some(slot) = ConnectionSlot::acquire() else {
+                    warn!(
+                        "refusing QUIC connection from {}: node memory affords no further connections",
+                        peer_addr
+                    );
+                    continue;
                 };
-
-                if sender.send(task).is_err() {
-                    error!("All worker threads have exited");
-                    break;
-                }
+                serve(quic_stream, peer_addr, server_state.clone(), slot, "QUIC");
             }
         }
     }
+}
 
-    Ok(())
+/// Puts one connection on the runtime and holds its memory slot until it ends.
+///
+/// The slot is moved into the task rather than released here, so a connection
+/// that panics or is cancelled still gives its slot back through the guard's
+/// Drop instead of leaking it out of the ceiling.
+fn serve<T>(
+    stream: T,
+    peer_addr: SocketAddr,
+    state: Arc<ServerState>,
+    slot: ConnectionSlot,
+    transport: &'static str,
+) where
+    T: crate::transport::WireTransport + Send + 'static,
+{
+    tokio::spawn(async move {
+        debug!("{} connection from {}", transport, peer_addr);
+        let mut conn = Connection::new(stream, state, Some(peer_addr.ip().to_string()));
+        if let Err(e) = conn.run().await {
+            error!("Connection error from {}: {}", peer_addr, e);
+        }
+        debug!("Connection closed: {}", peer_addr);
+        drop(slot);
+    });
 }
 
 /// Handles a single TCP connection. Useful for testing and embedding.

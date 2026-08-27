@@ -33,7 +33,7 @@ use crate::predicate::{
 use crate::schema::LakeSchema;
 
 pub const MANIFEST_MAGIC: [u8; 4] = *b"ZYLK";
-pub const MANIFEST_FORMAT_VERSION: u16 = 1;
+pub const MANIFEST_FORMAT_VERSION: u16 = 2;
 
 const HEADER_LEN: usize = 64;
 // Eight section offsets, CRC32, trailing magic. Three more than the
@@ -132,8 +132,9 @@ pub struct ColumnStatsEntry {
     pub column_id: u32,
     pub bounds: ColumnBounds,
     /// Opaque value bloom bytes from the segment writer, probed through
-    /// the segment bloom reader
-    pub bloom: Option<Vec<u8>>,
+    /// the segment bloom reader. Arc-shared so cloning a manifest to apply
+    /// one commit copies pointers, not every bloom's bytes
+    pub bloom: Option<std::sync::Arc<Vec<u8>>>,
     /// Distinct values in this file's column, estimated by the writer's
     /// sketch and within a few percent. None for a file written before
     /// the estimate existed, which reads as evidence the clustering
@@ -943,7 +944,10 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
             buf.extend_from_slice(&size.to_le_bytes());
         }
     }
-    buf.extend_from_slice(&(entry.delete_predicate_ids.len() as u16).to_le_bytes());
+    // u32 length: a small-delete workload can attach tens of thousands of
+    // predicates to one file, a u16 here silently wrapped and corrupted
+    // the checkpoint
+    buf.extend_from_slice(&(entry.delete_predicate_ids.len() as u32).to_le_bytes());
     for id in &entry.delete_predicate_ids {
         buf.extend_from_slice(&id.to_le_bytes());
     }
@@ -981,7 +985,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
         };
         let bloom = if flags & STAT_BLOOM != 0 {
             let len = fr.u32()? as usize;
-            Some(fr.take(len)?.to_vec())
+            Some(std::sync::Arc::new(fr.take(len)?.to_vec()))
         } else {
             None
         };
@@ -1008,7 +1012,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
             size_bytes,
         });
     }
-    let ref_count = fr.u16()? as usize;
+    let ref_count = fr.u32()? as usize;
     fr.check_count(ref_count, 8, "delete predicate reference")?;
     let mut delete_predicate_ids = Vec::with_capacity(ref_count);
     for _ in 0..ref_count {
@@ -1104,6 +1108,11 @@ pub enum CompactionTrigger {
     /// Both crossed in one check. One compaction answers both, so it runs
     /// once
     Both,
+    /// A file carries too many delete predicates. Small deletes each
+    /// removing a handful of rows never move the dead-row ratio, but every
+    /// scan of the file evaluates the whole predicate list, so the list
+    /// length is its own pressure
+    PredicatePressure,
 }
 
 impl CompactionTrigger {
@@ -1112,9 +1121,14 @@ impl CompactionTrigger {
             CompactionTrigger::SmallFiles => "small_files",
             CompactionTrigger::DeadRows => "dead_rows",
             CompactionTrigger::Both => "small_files_and_dead_rows",
+            CompactionTrigger::PredicatePressure => "predicate_pressure",
         }
     }
 }
+
+/// Delete predicates one file carries before the list itself triggers a
+/// compaction, whatever the dead-row ratio says
+pub const MAX_PREDICATES_PER_FILE_BEFORE_COMPACT: usize = 32;
 
 impl std::fmt::Display for CompactionTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1328,11 +1342,16 @@ impl ManifestFile {
             && small_files as f64 / total_files as f64 > self.auto_compact_small_file_ratio();
         let dead_tripped = total_rows > 0
             && pending_deleted_rows as f64 / total_rows as f64 > self.auto_compact_dead_row_ratio();
+        let predicates_tripped = self
+            .entries
+            .iter()
+            .any(|e| e.delete_predicate_ids.len() >= MAX_PREDICATES_PER_FILE_BEFORE_COMPACT);
 
         let trigger = match (small_tripped, dead_tripped) {
             (true, true) => Some(CompactionTrigger::Both),
             (true, false) => Some(CompactionTrigger::SmallFiles),
             (false, true) => Some(CompactionTrigger::DeadRows),
+            (false, false) if predicates_tripped => Some(CompactionTrigger::PredicatePressure),
             (false, false) => None,
         };
         CompactionNeed {
@@ -1443,7 +1462,7 @@ mod tests {
                                 null_count: 12,
                                 row_count: 200,
                             },
-                            bloom: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                            bloom: Some(std::sync::Arc::new(vec![0xDE, 0xAD, 0xBE, 0xEF])),
                             size_bytes: Some(49_152),
                         },
                     ]),
@@ -1496,7 +1515,7 @@ mod tests {
                             null_count: 1,
                             row_count: 6,
                         },
-                        bloom: Some(vec![0x01, 0x02]),
+                        bloom: Some(std::sync::Arc::new(vec![0x01, 0x02])),
                         ndv: Some(5),
                         size_bytes: Some(16_384),
                     }]),
@@ -1566,7 +1585,7 @@ mod tests {
         let e = m.entry_for(0x20).expect("exists");
         assert_eq!(
             e.stats_for(1).and_then(|s| s.bloom.as_deref()),
-            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+            Some(&vec![0xDE, 0xAD, 0xBE, 0xEF])
         );
         assert_eq!(e.stats_for(7), None);
         assert_eq!(m.predicate_by_id(9).map(|p| p.created_version), Some(41));

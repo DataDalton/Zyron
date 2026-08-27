@@ -121,3 +121,55 @@ async fn test_smallint_and_bigint_order_by_agree_with_a_comparison_oracle() {
     let rows = query_values(&server, "SELECT g FROM t ORDER BY g").await;
     assert_eq!(first_col_as_i64(&rows), big);
 }
+
+/// ORDER BY over floats containing NaN neither panics nor misorders: the
+/// sort runs on a total order with NaN after every number, so ascending
+/// output ends with NaN and descending output starts with it.
+#[tokio::test]
+async fn test_order_by_float_with_nan_uses_total_order() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = common::new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE f (x DOUBLE PRECISION, tag BIGINT)",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO f VALUES (3.5, 1), (CAST('NaN' AS DOUBLE PRECISION), 2), (-1.0, 3), \
+         (CAST('NaN' AS DOUBLE PRECISION), 4), (0.0, 5), (2.25, 6)",
+    )
+    .await;
+
+    let floats = |rows: &[Vec<ScalarValue>]| -> Vec<f64> {
+        rows.iter()
+            .map(|r| match r.first() {
+                Some(ScalarValue::Float64(v)) => *v,
+                other => panic!("expected a float, got {other:?}"),
+            })
+            .collect()
+    };
+
+    let asc = floats(&query_values(&server, "SELECT x FROM f ORDER BY x").await);
+    assert_eq!(asc.len(), 6);
+    assert_eq!(&asc[..4], &[-1.0, 0.0, 2.25, 3.5], "numbers sort first");
+    assert!(
+        asc[4].is_nan() && asc[5].is_nan(),
+        "NaN sorts after every number ascending"
+    );
+
+    let desc = floats(&query_values(&server, "SELECT x FROM f ORDER BY x DESC").await);
+    assert!(
+        desc[0].is_nan() && desc[1].is_nan(),
+        "NaN sorts before every number descending"
+    );
+    assert_eq!(&desc[2..], &[3.5, 2.25, 0.0, -1.0]);
+
+    // The multi-column path takes the typed row comparator instead of the
+    // single-column sort, and must agree
+    let asc_multi = floats(&query_values(&server, "SELECT x, tag FROM f ORDER BY x, tag").await);
+    assert_eq!(&asc_multi[..4], &[-1.0, 0.0, 2.25, 3.5]);
+    assert!(asc_multi[4].is_nan() && asc_multi[5].is_nan());
+}

@@ -3,7 +3,7 @@
 // Log record header constants
 
 /// Size of the record header in bytes.
-pub const HEADER_SIZE: usize = 24;
+pub const HEADER_SIZE: usize = 28;
 
 /// Size of the checksum in bytes.
 pub const CHECKSUM_SIZE: usize = 4;
@@ -24,10 +24,10 @@ pub const OFF_PREV_LSN: usize = 8;
 pub const OFF_TXN_ID: usize = 16;
 
 /// Offset of record type field in header.
-pub const OFF_RECORD_TYPE: usize = 20;
+pub const OFF_RECORD_TYPE: usize = 24;
 
 /// Offset of flags field in header.
-pub const OFF_FLAGS: usize = 21;
+pub const OFF_FLAGS: usize = 25;
 
 /// Offset of payload length field in header.
-pub const OFF_PAYLOAD_LEN: usize = 22;
+pub const OFF_PAYLOAD_LEN: usize = 26;

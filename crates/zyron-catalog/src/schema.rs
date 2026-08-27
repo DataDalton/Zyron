@@ -3129,6 +3129,11 @@ pub struct SubscriptionEntry {
     // every external source looking for a matching publication name is used.
     // Older entries serialized before this field was added decode as None.
     pub source_id: Option<ExternalSourceId>,
+    /// Epoch seconds when last_seen_lsn last moved forward. Zero for an
+    /// entry that has never advanced, consumers fall back to created_at.
+    /// The reaper uses this to spot a subscriber that keeps polling but
+    /// never confirms progress, which would pin CDC retention forever.
+    pub last_advance_at: u64,
 }
 
 impl SubscriptionEntry {
@@ -3156,6 +3161,7 @@ impl SubscriptionEntry {
                 write_u8(&mut buf, 0);
             }
         }
+        write_u64(&mut buf, self.last_advance_at);
         buf
     }
 
@@ -3195,6 +3201,12 @@ impl SubscriptionEntry {
         } else {
             None
         };
+        // Append-only trailer, entries written before the field decode zero
+        let last_advance_at = if off < data.len() {
+            read_u64(data, &mut off)?
+        } else {
+            0
+        };
         Ok(Self {
             id,
             publication_id,
@@ -3208,6 +3220,7 @@ impl SubscriptionEntry {
             last_error,
             created_at,
             source_id,
+            last_advance_at,
         })
     }
 }
@@ -4440,6 +4453,7 @@ mod tests {
             last_error: Some("timeout".to_string()),
             created_at: 1_700_000_150,
             source_id: Some(ExternalSourceId(73)),
+            last_advance_at: 0,
         };
         let bytes = entry.to_bytes();
         let decoded = SubscriptionEntry::from_bytes(&bytes).unwrap();

@@ -163,7 +163,14 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     // Distinct above that carry the sorted order through to the result. In an
     // aggregate query the keys reference group results and aggregates, rewritten
     // to aggregate output columns just like the projection and HAVING.
-    if !select.order_by.is_empty() {
+    // A compound query's trailing ORDER BY and LIMIT belong to the entire
+    // set operation result. The parser attaches them to the head SELECT, so
+    // when set operations follow, their nodes are deferred until after the
+    // SetOp chain is built instead of sorting and capping only the first
+    // branch
+    let defer_over_set_ops = !select.set_ops.is_empty();
+
+    if !select.order_by.is_empty() && !defer_over_set_ops {
         let mut order_by = select.order_by.clone();
         if aggregate_pushed {
             for ob in order_by.iter_mut() {
@@ -221,12 +228,26 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
             rewrite_post_aggregate(expr, &select.group_by, &aggregates);
         }
     }
+    // Deferred sort keys match against the head projection's expressions to
+    // become positional references over the set operation result
+    let head_projection_for_set_ops = if defer_over_set_ops && !expressions.is_empty() {
+        Some(expressions.clone())
+    } else {
+        None
+    };
     if !expressions.is_empty() {
         plan = LogicalPlan::Project {
             expressions,
             aliases,
             child: Arc::new(plan),
-            output_table_idx: None,
+            // Above a set operation the combined result is addressed like a
+            // derived table, so the head projection takes the set-op output
+            // identity the deferred ORDER BY keys reference
+            output_table_idx: if defer_over_set_ops {
+                Some(SET_OP_TABLE_IDX)
+            } else {
+                None
+            },
         };
     }
 
@@ -240,7 +261,7 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     // 8. LIMIT/OFFSET -> Limit
     let limit_val = extract_u64_literal(&select.limit);
     let offset_val = extract_u64_literal(&select.offset);
-    if limit_val.is_some() || offset_val.is_some() {
+    if (limit_val.is_some() || offset_val.is_some()) && !defer_over_set_ops {
         plan = LogicalPlan::Limit {
             limit: limit_val,
             offset: offset_val,
@@ -257,6 +278,51 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
             left: Arc::new(plan),
             right: Arc::new(right_plan),
         };
+    }
+
+    // 10. Deferred ORDER BY and LIMIT wrap the whole set operation result.
+    // With a head projection, each key becomes a positional reference into
+    // the set-op output identity; without one the branch exposes its base
+    // columns and the bound keys resolve as they are
+    if defer_over_set_ops {
+        if !select.order_by.is_empty() {
+            let mut order_by = select.order_by.clone();
+            if aggregate_pushed {
+                for ob in order_by.iter_mut() {
+                    rewrite_post_aggregate(&mut ob.expr, &select.group_by, &aggregates);
+                }
+            }
+            if let Some(head_exprs) = &head_projection_for_set_ops {
+                for ob in order_by.iter_mut() {
+                    let Some(pos) = head_exprs.iter().position(|e| e == &ob.expr) else {
+                        return Err(ZyronError::PlanError(
+                            "ORDER BY over a set operation must reference an output column of \
+                             the first branch"
+                                .to_string(),
+                        ));
+                    };
+                    let source = &head_exprs[pos];
+                    ob.expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
+                        table_idx: SET_OP_TABLE_IDX,
+                        column_id: ColumnId(pos as u16),
+                        type_id: source.type_id(),
+                        nullable: source.nullable(),
+                        fractional_digits: source.fractional_digits(),
+                    });
+                }
+            }
+            plan = LogicalPlan::Sort {
+                order_by,
+                child: Arc::new(plan),
+            };
+        }
+        if limit_val.is_some() || offset_val.is_some() {
+            plan = LogicalPlan::Limit {
+                limit: limit_val,
+                offset: offset_val,
+                child: Arc::new(plan),
+            };
+        }
     }
 
     Ok(plan)

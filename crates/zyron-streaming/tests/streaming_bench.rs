@@ -2,6 +2,9 @@
 //!
 //! Run: cargo test -p zyron-streaming --test streaming_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::hint::black_box;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -43,6 +46,7 @@ const LOOKUP_JOIN_EVENTS_PER_SEC: f64 = 5_000_000.0;
 const CHECKPOINT_1GB_STATE_SEC: f64 = 5.0;
 const RECOVERY_1GB_STATE_SEC: f64 = 10.0;
 const BACKPRESSURE_REACTION_MS: f64 = 500.0;
+const FILTER_PROJECT_ROWS_PER_SEC: f64 = 3_500_000.0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1119,12 +1123,14 @@ fn test_sliding_window_correctness() {
 
     let assigner = SlidingWindowAssigner::new(300_000, 60_000);
 
-    // Verify: timestamp 150_000 belongs to multiple overlapping windows.
+    // Verify: every timestamp belongs to exactly size/slide overlapping
+    // windows. Epoch zero is not special, windows whose start precedes it
+    // still exist, so 150000 sits in starts -120k, -60k, 0, 60k, 120k
     let windows_at_150k = assigner.assign_windows(150_000);
     assert_eq!(
         windows_at_150k.len(),
-        3,
-        "Timestamp 150000 should belong to 3 windows"
+        5,
+        "Timestamp 150000 should belong to 5 windows"
     );
     for w in &windows_at_150k {
         assert!(
@@ -1673,4 +1679,100 @@ fn test_stream_join_latency_breakdown() {
 
     let after = take_util_snapshot();
     record_test_util("Stream Join Breakdown", take_util_snapshot(), after);
+}
+
+// ---------------------------------------------------------------------------
+// Filter-project job row kernel throughput
+// ---------------------------------------------------------------------------
+
+/// Measures the per-row kernel the Zyron-to-Zyron job runner applies to each
+/// change record: decode the tuple, evaluate the compiled predicate, and
+/// encode the projected values straight into a fresh tuple
+#[test]
+fn benchmark_filter_project_row_kernel() {
+    zyron_bench_harness::init("streaming");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Benchmark: Filter-Project Row Kernel ===");
+
+    use zyron_common::TypeId;
+    use zyron_streaming::job_runner::{BinaryOpKind, ExprSpec};
+    use zyron_streaming::row_codec::{
+        StreamValue, compile_expr, decode_row, encode_projected_row, encode_row, eval_compiled,
+    };
+
+    const ROWS: usize = 200_000;
+    let source_types = [TypeId::Int64, TypeId::Text, TypeId::Float64];
+    let target_types = [TypeId::Text, TypeId::Int64];
+
+    // Pre-encode the source tuples once, the kernel decodes them per row
+    let encoded: Vec<Vec<u8>> = (0..ROWS)
+        .map(|i| {
+            let row = vec![
+                StreamValue::I64(i as i64),
+                StreamValue::Utf8((if i % 2 == 0 { "active" } else { "inactive" }).to_string()),
+                StreamValue::F64(i as f64 * 0.5),
+            ];
+            encode_row(&row, &source_types).expect("encode source row")
+        })
+        .collect();
+
+    // WHERE status = 'active' SELECT status, id
+    let predicate = compile_expr(&ExprSpec::BinaryOp {
+        op: BinaryOpKind::Eq,
+        left: Box::new(ExprSpec::ColumnRef { ordinal: 1 }),
+        right: Box::new(ExprSpec::LiteralString("active".to_string())),
+    });
+    let projections = vec![
+        compile_expr(&ExprSpec::ColumnRef { ordinal: 1 }),
+        compile_expr(&ExprSpec::ColumnRef { ordinal: 0 }),
+    ];
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        let mut kept = 0usize;
+        let mut out_bytes = 0usize;
+        let start = Instant::now();
+        for bytes in &encoded {
+            let row = decode_row(bytes, &source_types).expect("decode row");
+            let keep = matches!(
+                *eval_compiled(&predicate, &row).expect("predicate"),
+                StreamValue::Bool(true)
+            );
+            if keep {
+                let tuple =
+                    encode_projected_row(&projections, &row, &target_types).expect("project");
+                out_bytes += tuple.len();
+                kept += 1;
+                black_box(&tuple);
+            }
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(kept, ROWS / 2, "predicate keeps the active half");
+        let rows_sec = ROWS as f64 / elapsed.as_secs_f64();
+        tprintln!(
+            "  Run {}/{}: {:.1}M rows/sec ({:?}), {} rows kept, {} bytes out",
+            run + 1,
+            VALIDATION_RUNS,
+            rows_sec / 1e6,
+            elapsed,
+            kept,
+            out_bytes
+        );
+        results.push(rows_sec);
+    }
+    record_test_util("Filter-Project Kernel", util_before, take_util_snapshot());
+
+    let result = validate_metric(
+        "Filter-Project Kernel",
+        "Filter-project row kernel (rows/sec)",
+        results,
+        FILTER_PROJECT_ROWS_PER_SEC,
+        true,
+    );
+    assert!(result.passed, "filter-project kernel below target");
+    assert!(
+        !result.regression_detected,
+        "filter-project kernel regression detected"
+    );
 }

@@ -376,35 +376,48 @@ pub fn write_numeric_parts(abs: u128, negative: bool, dscale: u8, buf: &mut Byte
     let int_part = abs / scale_pow;
     let frac_part = abs % scale_pow;
 
+    // Base 10000 groups on the stack: a u128 integer part fills at most
+    // ten groups and a 38 digit scale at most ten more, so twenty covers
+    // every value this layout can carry
+    let mut groups = [0i16; 20];
+    let mut glen = 0usize;
+
     // Integer groups, most significant first
-    let mut groups: Vec<i16> = Vec::new();
     let mut n = int_part;
     while n > 0 {
-        groups.push((n % 10_000) as i16);
+        groups[glen] = (n % 10_000) as i16;
+        glen += 1;
         n /= 10_000;
     }
-    groups.reverse();
-    let int_groups = groups.len();
+    groups[..glen].reverse();
+    let int_groups = glen;
 
     // Fraction digits with leading zeros out to the declared scale,
     // chunked into base 10000 groups from the decimal point rightward,
-    // the last group padded with trailing zeros. The string walk avoids
+    // the last group padded with trailing zeros. The digit walk avoids
     // multiplying a 38-digit magnitude past what u128 holds
     if dscale > 0 {
-        let s = format!("{:0width$}", frac_part, width = dscale as usize);
-        let bytes = s.as_bytes();
+        let mut digits = [0u8; 40];
+        let mut f = frac_part;
+        let mut idx = dscale as usize;
+        while idx > 0 {
+            idx -= 1;
+            digits[idx] = (f % 10) as u8;
+            f /= 10;
+        }
         let mut i = 0;
-        while i < bytes.len() {
+        while i < dscale as usize {
             let mut group: i16 = 0;
             for j in 0..4 {
-                let d = if i + j < bytes.len() {
-                    (bytes[i + j] - b'0') as i16
+                let d = if i + j < dscale as usize {
+                    digits[i + j] as i16
                 } else {
                     0
                 };
                 group = group * 10 + d;
             }
-            groups.push(group);
+            groups[glen] = group;
+            glen += 1;
             i += 4;
         }
     }
@@ -412,10 +425,10 @@ pub fn write_numeric_parts(abs: u128, negative: bool, dscale: u8, buf: &mut Byte
     // Zero groups at either end carry no value. Each dropped leading
     // group moves the first kept digit one base 10000 place lower
     let mut start = 0;
-    while start < groups.len() && groups[start] == 0 {
+    while start < glen && groups[start] == 0 {
         start += 1;
     }
-    let mut end = groups.len();
+    let mut end = glen;
     while end > start && groups[end - 1] == 0 {
         end -= 1;
     }
@@ -434,6 +447,147 @@ pub fn write_numeric_parts(abs: u128, negative: bool, dscale: u8, buf: &mut Byte
     for g in &groups[start..end] {
         buf.put_i16(*g);
     }
+}
+
+/// Encodes one result row's cells into a DataRow body: per cell either a
+/// -1 null marker, or a 4-byte length prefix followed by the payload in the
+/// column's declared format. Text and binary payloads write straight from
+/// the column's own buffer, fixed-width cells cross through a stack scalar,
+/// so no cell pays a heap copy on its way into the output buffer. This is
+/// the production SELECT result path, exposed so the wire benchmark
+/// measures exactly what connections send
+pub fn encode_data_row_cells(
+    buf: &mut BytesMut,
+    batch: &zyron_executor::batch::DataBatch,
+    row: usize,
+    col_formats: &[i16],
+    vector_cols: &[bool],
+    array_cols: &[bool],
+    decimal_scales: &[Option<u8>],
+) {
+    use zyron_executor::column::ColumnData;
+
+    for (col_idx, column) in batch.columns.iter().enumerate() {
+        // Check NULL first to avoid writing a placeholder then truncating
+        if column.is_null(row) {
+            buf.put_i32(-1);
+            continue;
+        }
+
+        let val_len_pos = buf.len();
+        buf.put_i32(0); // value length placeholder
+        let before = buf.len();
+
+        // Vector columns are stored as Binary (raw f32 bytes) but need
+        // special text formatting as bracket notation [0.1,0.2,0.3]
+        let is_vector = vector_cols[col_idx];
+
+        if is_vector {
+            match &column.data {
+                ColumnData::Binary(cells) => {
+                    if col_formats[col_idx] == 1 {
+                        write_vector_binary(&cells[row], buf);
+                    } else {
+                        write_vector_text(&cells[row], buf);
+                    }
+                }
+                other => {
+                    scalar_write_text(&other.get_scalar(row), buf);
+                }
+            }
+        } else if array_cols[col_idx] {
+            match &column.data {
+                ColumnData::Binary(cells) => match zyron_common::ArrayView::parse(&cells[row]) {
+                    Some(view) => buf.extend_from_slice(view.render_text().as_bytes()),
+                    None => write_bytea_hex(&cells[row], buf),
+                },
+                other => {
+                    write_array_text(&other.get_scalar(row), buf);
+                }
+            }
+        } else if let Some(scale) = decimal_scales[col_idx] {
+            match column.data.get_scalar(row) {
+                ScalarValue::Int128(v) => {
+                    // A binary-format column gets the numeric wire layout
+                    // at the column's scale, text gets the decimal rendering
+                    if col_formats[col_idx] == 1 {
+                        write_numeric_binary(v, scale, buf);
+                    } else {
+                        write_decimal_text(v, scale, buf);
+                    }
+                }
+                ref other => {
+                    scalar_write_text(other, buf);
+                }
+            }
+        } else {
+            match &column.data {
+                ColumnData::Utf8(cells) => {
+                    // Text and binary formats both carry the raw bytes
+                    buf.extend_from_slice(cells[row].as_bytes());
+                }
+                ColumnData::Binary(cells) => {
+                    if col_formats[col_idx] == 1 {
+                        buf.extend_from_slice(&cells[row]);
+                    } else {
+                        write_bytea_hex(&cells[row], buf);
+                    }
+                }
+                other => {
+                    let scalar = other.get_scalar(row);
+                    if col_formats[col_idx] == 1 {
+                        scalar_write_binary(&scalar, buf);
+                    } else {
+                        scalar_write_text(&scalar, buf);
+                    }
+                }
+            }
+        }
+
+        let val_len = (buf.len() - before) as i32;
+        buf[val_len_pos..val_len_pos + 4].copy_from_slice(&val_len.to_be_bytes());
+    }
+}
+
+/// Writes a scaled decimal in text form straight into the buffer, the
+/// allocation free counterpart of zyron_common::format_decimal with the
+/// same rendering for every input
+pub fn write_decimal_text(value: i128, scale: u8, buf: &mut BytesMut) {
+    let mut int_buf = itoa::Buffer::new();
+    if scale == 0 {
+        buf.extend_from_slice(int_buf.format(value).as_bytes());
+        return;
+    }
+    let factor = match zyron_common::decimal::scale_factor(scale) {
+        Ok(f) => f,
+        // A scale past the maximum cannot render as a fixed point, the
+        // unscaled integer is the honest answer rather than a wrong one
+        Err(_) => {
+            buf.extend_from_slice(int_buf.format(value).as_bytes());
+            return;
+        }
+    };
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let unit = factor.unsigned_abs();
+    let whole = magnitude / unit;
+    let frac = magnitude % unit;
+    if negative {
+        buf.put_u8(b'-');
+    }
+    buf.extend_from_slice(int_buf.format(whole).as_bytes());
+    buf.put_u8(b'.');
+    // Fraction digits zero padded out to the scale, filled least
+    // significant first from a stack buffer
+    let mut digits = [b'0'; 39];
+    let mut f = frac;
+    let mut idx = scale as usize;
+    while idx > 0 && f > 0 {
+        idx -= 1;
+        digits[idx] = b'0' + (f % 10) as u8;
+        f /= 10;
+    }
+    buf.extend_from_slice(&digits[..scale as usize]);
 }
 
 /// Writes a float value in PG text format directly into the buffer.
@@ -482,7 +636,7 @@ fn write_uuid(bytes: &[u8; 16], buf: &mut BytesMut) {
 
 /// Writes bytea value as hex format (\\x followed by hex pairs) directly into buf.
 /// Processes 8 bytes at a time to reduce extend_from_slice call count.
-fn write_bytea_hex(bytes: &[u8], buf: &mut BytesMut) {
+pub(crate) fn write_bytea_hex(bytes: &[u8], buf: &mut BytesMut) {
     buf.reserve(2 + bytes.len() * 2);
     buf.extend_from_slice(b"\\x");
 

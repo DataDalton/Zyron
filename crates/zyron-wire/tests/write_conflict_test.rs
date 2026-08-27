@@ -43,7 +43,7 @@ async fn run_stmt(
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn.txn_id as u32,
+        txn.txn_id,
         snapshot,
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));

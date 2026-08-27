@@ -223,7 +223,7 @@ async fn run_sql(
         Arc::clone(&env.wal),
         Arc::clone(&env.pool),
         Arc::clone(&env.disk),
-        txn.txn_id as u32,
+        txn.txn_id,
         txn.snapshot.clone(),
     );
     ctx.heap_files = Some(Arc::new(scc::HashMap::new()));
@@ -264,7 +264,7 @@ async fn run_sql_in_txn(
         Arc::clone(&env.wal),
         Arc::clone(&env.pool),
         Arc::clone(&env.disk),
-        txn.txn_id as u32,
+        txn.txn_id,
         txn.snapshot.clone(),
     );
     ctx.heap_files = Some(Arc::new(scc::HashMap::new()));
@@ -464,7 +464,7 @@ impl CdcHook for CountingHook {
         _tuples: &[&[u8]],
         _version: u64,
         _timestamp: i64,
-        _txn_id: u32,
+        _txn_id: u64,
         _is_last_in_txn: bool,
     ) -> zyron_common::Result<()> {
         Ok(())
@@ -475,7 +475,7 @@ impl CdcHook for CountingHook {
         old_data: &[&[u8]],
         _version: u64,
         _timestamp: i64,
-        _txn_id: u32,
+        _txn_id: u64,
         _is_last_in_txn: bool,
     ) -> zyron_common::Result<()> {
         self.deletes.fetch_add(1, Ordering::SeqCst);
@@ -489,7 +489,7 @@ impl CdcHook for CountingHook {
         new_data: &[&[u8]],
         _version: u64,
         _timestamp: i64,
-        _txn_id: u32,
+        _txn_id: u64,
         _is_last_in_txn: bool,
     ) -> zyron_common::Result<()> {
         assert_eq!(old_data.len(), new_data.len());
@@ -1521,7 +1521,7 @@ async fn reindex_rebuild_covers_folded_rows() {
         Arc::clone(&env.wal),
         Arc::clone(&env.pool),
         Arc::clone(&env.disk),
-        txn.txn_id as u32,
+        txn.txn_id,
         txn.snapshot.clone(),
     ));
     let logical: Vec<zyron_planner::logical::LogicalColumn> = te

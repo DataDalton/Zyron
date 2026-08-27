@@ -66,7 +66,7 @@ pub fn lake_change_records(
                 commit_version: descriptor.version,
                 commit_timestamp: descriptor.timestamp_us,
                 table_id: table.id.0,
-                txn_id: descriptor.db_txn_id as u32,
+                txn_id: descriptor.db_txn_id,
                 schema_version: manifest.schema.schema_id as u32,
                 row_data: encode_row(&batch, row, &table.columns),
                 primary_key_data: Vec::new(),

@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod health;
 pub mod hooks;
 pub mod lake_recovery;
+pub mod mesh_node;
 pub mod metrics;
 pub mod session;
 pub mod signal;
@@ -186,6 +187,10 @@ pub struct Server {
     /// When true, skip WAL replay on startup. Set by --skip-recovery for
     /// emergency boots only.
     skip_recovery: bool,
+    /// When true, the connection ceiling is pinned to one regardless of what
+    /// the machine could afford. Carried from the CLI because the ceiling is
+    /// set where the node's identity is established, not where options parse
+    single_user: bool,
 }
 
 impl Server {
@@ -204,9 +209,6 @@ impl Server {
         }
         if let Some(ref level) = opts.log_level {
             config.logging.level = level.clone();
-        }
-        if opts.single_user {
-            config.server.max_connections = 1;
         }
 
         // Initialize tracing. The level comes from logging.level, the writer
@@ -258,13 +260,20 @@ impl Server {
             }
         }
 
-        let session_mgr = Arc::new(SessionManager::new(
-            config.server.max_connections,
-            config.server.connection_timeout_secs,
-        ));
+        let session_mgr = Arc::new(SessionManager::new(config.server.connection_timeout_secs));
         let labeled_metrics = Arc::new(zyron_common::LabeledMetrics::new());
         let metrics = Arc::new(MetricsRegistry::new(session_mgr.clone(), labeled_metrics));
-        let health_state = Arc::new(HealthState::new(Arc::clone(&metrics)));
+        // Router and per-endpoint metrics created before the health state
+        // so the HTTP listener and the endpoint registrar share them, a
+        // route registered into any other router is never served
+        let gateway_router = Arc::new(crate::gateway::router::Router::new());
+        let gateway_metrics = Arc::new(crate::gateway::GatewayMetrics::new());
+        let health_state = Arc::new(HealthState::with_gateway(
+            Arc::clone(&metrics),
+            &config.metrics.path,
+            Arc::clone(&gateway_router),
+            Arc::clone(&gateway_metrics),
+        ));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
@@ -273,6 +282,7 @@ impl Server {
             health_state,
             shutdown,
             skip_recovery: opts.skip_recovery,
+            single_user: opts.single_user,
         })
     }
 
@@ -314,43 +324,23 @@ impl Server {
         let disk_manager = Arc::new(
             DiskManager::new(DiskManagerConfig {
                 data_dir: data_dir.clone(),
-                fsync_enabled: self.config.wal.sync_mode == "fsync",
+                fsync_enabled: matches!(self.config.wal.sync_mode.as_str(), "fsync" | "fdatasync"),
                 page_checksum_verify,
             })
             .await?,
         );
 
-        // 3. Create BufferPool + BackgroundWriter
+        // 3. Create BufferPool
         let buffer_pool = Arc::new(BufferPool::new(BufferPoolConfig {
             num_frames: self.config.storage.buffer_pool_size / self.config.storage.page_size,
         }));
 
-        // Flush a dirty victim to disk during eviction so the write is never lost
-        // by a caller that drops the evicted page. Uses a fsync write because the
-        // eviction path has no batched fsync follow-up.
-        let dm_for_evict = Arc::clone(&disk_manager);
-        let evict_writer: zyron_buffer::EvictWriteFn =
-            Arc::new(move |page_id, data| dm_for_evict.write_page_sync(page_id, data));
-        buffer_pool.set_evict_writer(evict_writer)?;
-
-        let dm_for_bg = Arc::clone(&disk_manager);
-        let write_fn: WriteFn =
-            Arc::new(move |page_id, data| dm_for_bg.write_page_sync_no_fsync(page_id, data));
-        let dm_for_fsync = Arc::clone(&disk_manager);
-        let fsync_fn: zyron_buffer::FsyncFn =
-            Arc::new(move |file_id| dm_for_fsync.fsync_file(file_id));
-        let background_writer = Arc::new(BackgroundWriter::new(
-            Arc::clone(&buffer_pool),
-            write_fn,
-            fsync_fn,
-            BackgroundWriterConfig::default(),
-        ));
-
-        // 4. Create WalWriter
+        // 4. Create WalWriter, before the page-write hooks so both can hold
+        // data-page writes behind WAL durability
         let wal = Arc::new(WalWriter::new(WalWriterConfig {
             wal_dir: wal_dir.clone(),
             segment_size: self.config.wal.segment_size as u32,
-            fsync_enabled: self.config.wal.sync_mode == "fsync",
+            fsync_enabled: matches!(self.config.wal.sync_mode.as_str(), "fsync" | "fdatasync"),
             // Floor the configured ring buffer at 256 KB so a small or
             // mis-set value cannot starve the flush pipeline.
             ring_buffer_capacity: self.config.wal.ring_buffer_capacity.max(256 * 1024),
@@ -365,6 +355,45 @@ impl Server {
                 .min_retained()
                 .map(zyron_wal::Lsn)
         }));
+
+        // WAL-before-data barrier: a data page never reaches disk ahead of
+        // the log records that produced it. The fast path is one atomic load
+        // when the WAL has already flushed past the page's dirty LSN
+        let wal_for_barrier = Arc::clone(&wal);
+        let wal_barrier: zyron_buffer::WalBarrierFn = Arc::new(move |lsn| {
+            if wal_for_barrier.flushed_lsn().0 >= lsn {
+                return Ok(());
+            }
+            wal_for_barrier.wait_for_flush(zyron_wal::Lsn(lsn))
+        });
+
+        // Flush a dirty victim to disk during eviction so the write is never lost
+        // by a caller that drops the evicted page. Uses a fsync write because the
+        // eviction path has no batched fsync follow-up. The WAL barrier runs
+        // first: an evicted page's log must be durable before its bytes land
+        let dm_for_evict = Arc::clone(&disk_manager);
+        let barrier_for_evict = Arc::clone(&wal_barrier);
+        let evict_writer: zyron_buffer::EvictWriteFn = Arc::new(move |page_id, data, dirty_lsn| {
+            if dirty_lsn > 0 {
+                barrier_for_evict(dirty_lsn)?;
+            }
+            dm_for_evict.write_page_sync(page_id, data)
+        });
+        buffer_pool.set_evict_writer(evict_writer)?;
+
+        let dm_for_bg = Arc::clone(&disk_manager);
+        let write_fn: WriteFn =
+            Arc::new(move |page_id, data| dm_for_bg.write_page_sync_no_fsync(page_id, data));
+        let dm_for_fsync = Arc::clone(&disk_manager);
+        let fsync_fn: zyron_buffer::FsyncFn =
+            Arc::new(move |file_id| dm_for_fsync.fsync_file(file_id));
+        let background_writer = Arc::new(BackgroundWriter::new(
+            Arc::clone(&buffer_pool),
+            write_fn,
+            fsync_fn,
+            Arc::clone(&wal_barrier),
+            BackgroundWriterConfig::default(),
+        ));
 
         // 5. WAL recovery
         let recovery_result = if self.skip_recovery {
@@ -464,10 +493,10 @@ impl Server {
             // Mark committed transactions and date them by their commit-record
             // LSN, reconstructing the post-checkpoint commit-LSN map.
             for &(txn_id, commit_lsn) in &rr.committed_txns {
-                status_map.record_committed_at(txn_id as u64, commit_lsn);
+                status_map.record_committed_at(txn_id, commit_lsn);
             }
             for &t in &rr.undo_txns {
-                status_map.record_aborted(t as u64);
+                status_map.record_aborted(t);
             }
         }
 
@@ -860,6 +889,57 @@ impl Server {
                 )),
                 Err(_) => None,
             };
+        // Read the machine, then install the process pressure controller
+        // under this node's identity. Both happen before the listener exists,
+        // so no connection is ever admitted against an unmeasured ceiling.
+        // The probe is counts, sizes and feature bits, no timing loop and no
+        // file written, so it costs nothing measurable at startup
+        let mut probed = zyron_pressure::capability::NodeCapabilities::probe(
+            node_identity.node_id,
+            Some(data_dir),
+        );
+        // If this hardware shape has been measured before, start from what it
+        // cost rather than from an assumption. A shape nobody has measured
+        // serves immediately on cold start values and replaces them from real
+        // traffic, so neither path waits on a benchmark
+        let inherited =
+            background::pressure::FileCalibrationStore::adopt_into(data_dir, &mut probed);
+        let capabilities = std::sync::Arc::new(probed);
+        zyron_pressure::pressure_control::PressureController::init(
+            node_identity.node_id,
+            capabilities.mem_total_bytes,
+        );
+        if self.single_user {
+            // The one case that overrides the measured ceiling: the flag is
+            // about exclusivity, not about how much the hardware affords
+            zyron_pressure::pressure_control::PressureController::global()
+                .connections()
+                .set_ceiling(1);
+        }
+        zyron_executor::parallel_pool::ParallelPool::init(
+            zyron_executor::parallel_pool::ParallelPoolConfig::from_machine()
+                .with_overrides(self.config.server.worker_threads, 0),
+        );
+        tracing::info!(
+            fingerprint = %capabilities.fingerprint,
+            cores = capabilities.core_count,
+            memory_gb = capabilities.mem_total_bytes / (1024 * 1024 * 1024),
+            simd = capabilities.simd_level.as_str(),
+            mounts = capabilities.mounts.len(),
+            connection_ceiling = zyron_pressure::pressure_control::PressureController::global()
+                .connections()
+                .ceiling(),
+            calibration_inherited = inherited,
+            "node capabilities probed"
+        );
+        // The health listener answers /pressure with the hardware the numbers
+        // were measured on, so it gets the probe as soon as there is one
+        self.health_state
+            .set_node_capabilities(std::sync::Arc::clone(&capabilities));
+        // And where the working set manifest is written, so a survivor taking
+        // over for this node can fetch what it was holding
+        self.health_state
+            .set_data_dir(self.config.storage.data_dir.clone());
         zyron_lake::set_local_node(node_identity.node_id);
         tracing::info!(
             node_id = node_identity.node_id,
@@ -890,7 +970,15 @@ impl Server {
             min_interval_secs: self.config.checkpoint.min_interval_secs as u64,
         };
         let vacuum_config = VacuumWorkerConfig {
-            interval_secs: self.config.vacuum.interval_secs,
+            // Disabled: an interval too large to ever fire. The worker
+            // still exists so shutdown ordering stays uniform, matching
+            // how compaction handles its enabled flag
+            interval_secs: if self.config.vacuum.enabled {
+                self.config.vacuum.interval_secs
+            } else {
+                u32::MAX as u64
+            },
+            dead_tuple_threshold: self.config.vacuum.dead_tuple_threshold,
             ..VacuumWorkerConfig::default()
         };
         let compaction_config = crate::background::compaction::CompactionWorkerConfig {
@@ -905,6 +993,7 @@ impl Server {
             max_encoding_threads: self.config.compaction.max_concurrent.max(1),
             merge_min_churn_ratio: 0.10,
             registry_persist_every: 16,
+            rate_limit_mbps: self.config.compaction.rate_limit_mbps,
         };
         let compaction_metrics = if self.config.compaction.enabled {
             Some(Arc::clone(&self.health_state.metrics))
@@ -963,6 +1052,7 @@ impl Server {
             self.config.storage.data_dir.clone(),
             None, // WAL archiving disabled unless configured
             Some(Arc::clone(&cdc_registry_arc)),
+            slot_mgr_arc.clone(),
             Some(Arc::clone(&stream_mgr_arc)),
             Arc::clone(&btree_indexes),
             Arc::clone(&doc_registry_arc),
@@ -974,6 +1064,22 @@ impl Server {
         // BackgroundWorkers::attach_quota_gossip with their peer transport
         let server_quota_registry = Arc::new(zyron_types::scheduling::QuotaRegistry::new());
         background.attach_quota_gossip_default(Arc::clone(&server_quota_registry));
+
+        // The pressure controller's clock, publishing onto the registry the
+        // gossip worker already carries. The node's own knee detection is the
+        // mesh's scale-out trigger, so both read one signal rather than two
+        // heuristics that would disagree about whether the node is busy
+        background.attach_pressure(background::pressure::PressureInputs {
+            capabilities: (*capabilities).clone(),
+            quota_registry: Some(Arc::clone(&server_quota_registry)),
+            store: Some(Arc::new(background::pressure::FileCalibrationStore::new(
+                data_dir,
+                node_identity.node_id,
+            ))),
+            buffer_pool: Some(Arc::clone(&buffer_pool)),
+            data_dir: self.config.storage.data_dir.clone(),
+            mesh: self.config.mesh.clone(),
+        });
 
         // Adaptive Clustering maintenance, gated on the deployment mode so a
         // db node starts no thread for it. It finishes or unwinds any pass a
@@ -1010,6 +1116,7 @@ impl Server {
         let config_for_lookup = self.config.clone();
         let config_for_all = self.config.clone();
         let data_dir_for_alter = data_dir.clone();
+        let config_for_alter = self.config.clone();
 
         // Config-derived session and auth defaults exposed on ServerState. The
         // validator restricts the source strings, so parsing here maps a known
@@ -1030,6 +1137,52 @@ impl Server {
         } else {
             Some(self.config.query.max_result_rows)
         };
+        // Spilling needs both a budget to exceed and a quota to spill within.
+        // Without either, a materializing operator has nothing to decide and
+        // fails at the budget the way it always did
+        let spill_directory = if self.config.query.max_memory_bytes == 0
+            || self.config.query.spill_quota_bytes == 0
+        {
+            None
+        } else {
+            match zyron_executor::spill::SpillDirectory::open(
+                &self.config.storage.data_dir,
+                self.config.query.spill_quota_bytes,
+            ) {
+                Ok(dir) => Some(std::sync::Arc::new(dir)),
+                Err(e) => {
+                    // A node that cannot open its spill directory still
+                    // serves. It serves without spilling, which is the
+                    // behaviour it had before, and it says so
+                    tracing::warn!(error = %e, "spilling disabled, the spill directory would not open");
+                    None
+                }
+            }
+        };
+        let max_query_memory = if self.config.query.max_memory_bytes == 0 {
+            None
+        } else {
+            Some(self.config.query.max_memory_bytes)
+        };
+        // The planner reads this to decide whether the plan it is costing
+        // would spill, which it has to know before any query has a budget
+        zyron_pressure::pressure_control::PressureController::global()
+            .set_configured_query_memory(self.config.query.max_memory_bytes);
+        // Conflict aborts are produced by the error type, which sits below
+        // the crate that counts them, so the counter installs itself
+        zyron_pressure::pressure_control::PressureController::install_signals();
+        // The mesh answers the two ladder rungs this node cannot perform on
+        // its own. Registered before the scheduler exists, so a node with no
+        // peers still gets a reason that names the mesh rather than leaving
+        // an operator to infer it from a rung that never fires
+        zyron_mesh::register();
+        let mesh_node = install_mesh(&self.config, &node_identity, &peers.read());
+        if let Some(mesh_node) = mesh_node.clone() {
+            // The health listener is where the mesh paths are served, for the
+            // same reason /pressure and the hot set are there: they are about
+            // the node rather than about data
+            self.health_state.set_mesh_node(mesh_node);
+        }
         // Balloon cost params are exposed only when at least one is set, so the
         // hasher keeps its built-in defaults otherwise. A missing partner value
         // falls back to the BalloonParams default for that field.
@@ -1065,9 +1218,10 @@ impl Server {
         // a trait object so ddl_dispatch can mutate it without depending on
         // zyron-server. Startup recovery below populates it from the catalog.
         // -------------------------------------------------------------------
-        let gateway_router = Arc::new(crate::gateway::router::Router::new());
+        let gateway_router = Arc::clone(&self.health_state.gateway_router);
         let endpoint_registrar: Arc<dyn zyron_wire::EndpointRegistrar> = Arc::new(
-            crate::gateway::router::CatalogEndpointRegistrar::new(Arc::clone(&gateway_router)),
+            crate::gateway::router::CatalogEndpointRegistrar::new(Arc::clone(&gateway_router))
+                .with_metrics(Arc::clone(&self.health_state.gateway_metrics)),
         );
 
         // Wrap the SecurityManager in an Arc once so both ServerState and the
@@ -1080,10 +1234,50 @@ impl Server {
             legal_hold_registry.reload(&holds);
         }
 
+        // TLS acceptor for the wire listener. A bad certificate or key fails
+        // startup instead of silently serving plaintext. auth.tls_required
+        // escalates the mode so plaintext startups are rejected outright
+        let (tls_mode, tls_acceptor) = if self.config.server.tls_enabled {
+            let mut acceptor =
+                zyron_wire::tls::ServerTlsAcceptor::from_config(&zyron_wire::tls::TlsConfig {
+                    cert_pem_path: self.config.server.tls_cert_path.clone(),
+                    key_pem_path: self.config.server.tls_key_path.clone(),
+                    client_ca_pem_path: None,
+                    require_client_cert: false,
+                    min_version: zyron_wire::tls::TlsVersion::Tls13,
+                })
+                .map_err(|e| {
+                    zyron_common::ZyronError::Internal(format!("TLS acceptor setup failed: {}", e))
+                })?;
+            acceptor.attachMetrics(Arc::clone(&self.health_state.metrics.labeled));
+            let mode = if self.config.auth.tls_required {
+                zyron_wire::tls::TlsMode::Required
+            } else {
+                zyron_wire::tls::TlsMode::Optional
+            };
+            info!(
+                "TLS enabled for the wire listener (mode {})",
+                if self.config.auth.tls_required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            );
+            (mode, Some(Arc::new(acceptor)))
+        } else {
+            (zyron_wire::tls::TlsMode::Disabled, None)
+        };
+
+        // Live dead letter queues, shared between the sinks that register
+        // them, the TTL sweeper, and the stat views
+        let dlq_registry_arc = Arc::new(zyron_streaming::dlq::DlqRegistry::new());
+
         // Build ServerState for zyron-wire
         let server_state = Arc::new(ServerState {
+            node_capabilities: Some(std::sync::Arc::clone(&capabilities)),
             catalog: Arc::clone(&catalog),
             legal_holds: Arc::clone(&legal_hold_registry),
+            dlq_registry: Arc::clone(&dlq_registry_arc),
             wal: Arc::clone(&wal),
             buffer_pool: Arc::clone(&buffer_pool),
             disk_manager: Arc::clone(&disk_manager),
@@ -1164,6 +1358,19 @@ impl Server {
             checkpoint_wake: ckpt_wake,
             alter_system_set: Some(Arc::new(
                 move |key: &str, value: &str| -> std::result::Result<(), String> {
+                    // Rehearse the exact state the next boot will load, the
+                    // running config plus every persisted override plus this
+                    // one, so an unknown key, a bad value, or a combination
+                    // that fails validation is refused here instead of
+                    // stopping the next boot
+                    let mut candidate = config_for_alter.clone();
+                    candidate
+                        .apply_auto_conf(&data_dir_for_alter)
+                        .map_err(|e| e.to_string())?;
+                    candidate
+                        .apply_override(key, value)
+                        .map_err(|e| e.to_string())?;
+                    candidate.validate().map_err(|e| e.to_string())?;
                     crate::config::ZyronConfig::write_auto_conf(&data_dir_for_alter, key, value)
                         .map_err(|e| e.to_string())
                 },
@@ -1176,20 +1383,26 @@ impl Server {
             },
             cdc_slot_stats: {
                 let mgr = slot_mgr_arc.clone();
+                let wal_for_slots = Arc::clone(&wal);
                 Some(Arc::new(
                     move || -> Vec<(String, String, u64, u64, bool, u64)> {
+                        // Lag is the distance from the WAL head to the
+                        // slot's confirmed position. A slot that has never
+                        // confirmed reports the full WAL span
+                        let head = wal_for_slots.next_lsn().0;
                         mgr.as_ref()
                             .map(|m| {
                                 m.list_slots()
                                     .into_iter()
                                     .map(|s| {
+                                        let lag = head.saturating_sub(s.confirmed_lsn);
                                         (
                                             s.name,
                                             format!("{:?}", s.plugin),
                                             s.confirmed_lsn,
                                             s.restart_lsn,
                                             s.active,
-                                            0u64,
+                                            lag,
                                         )
                                     })
                                     .collect()
@@ -1218,7 +1431,16 @@ impl Server {
                         .map(|m| {
                             m.list_ingests()
                                 .into_iter()
-                                .map(|i| (i.name, i.target_table_id, i.active, 0u64, 0u64))
+                                .map(|i| {
+                                    // Applied and failed counts live in the
+                                    // ingest checkpoint, zero before the
+                                    // first checkpoint is written
+                                    let (applied, failed) = m
+                                        .get_ingest_status(&i.name)
+                                        .map(|s| (s.records_applied, s.records_failed))
+                                        .unwrap_or((0, 0));
+                                    (i.name, i.target_table_id, i.active, applied, failed)
+                                })
                                 .collect()
                         })
                         .unwrap_or_default()
@@ -1263,9 +1485,8 @@ impl Server {
             ])) as Arc<dyn zyron_executor::context::DmlHook>),
             // Notification channels
             notification_channels: Some(notif_arc),
-            // TLS upgrade support (disabled by default; enable via config).
-            tls_mode: zyron_wire::tls::TlsMode::Disabled,
-            tls_acceptor: None,
+            tls_mode,
+            tls_acceptor,
             endpoint_registrar: Some(Arc::clone(&endpoint_registrar)),
             subscription_runtimes: Arc::new(scc::HashMap::new()),
             pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
@@ -1285,8 +1506,11 @@ impl Server {
             peers,
             statement_timeout,
             max_result_rows,
+            max_query_memory,
+            spill_directory,
             balloon_params,
             default_auth_method,
+            password_encryption: self.config.auth.password_encryption.clone(),
         });
 
         // The retention worker's age-tiering pass drives the wire
@@ -1410,6 +1634,7 @@ impl Server {
             spawned_workers.push(tokio::spawn(async move {
                 background::dead_subscriber_reaper::dead_subscriber_reaper_loop(
                     catalog_reap,
+                    Some(Arc::clone(&cdc_registry_arc)),
                     sh_reap,
                     background::dead_subscriber_reaper::DEFAULT_INTERVAL_SECS,
                     Duration::from_secs(3600),
@@ -1419,6 +1644,7 @@ impl Server {
             }));
 
             let sh_cred = Arc::clone(&self.shutdown);
+            let sm_for_maintenance = Arc::clone(&security_manager_arc);
             spawned_workers.push(tokio::spawn(async move {
                 background::credential_refresh::credential_refresh_loop(
                     sh_cred,
@@ -1426,7 +1652,21 @@ impl Server {
                     Duration::from_secs(
                         background::credential_refresh::DEFAULT_REFRESH_WINDOW_SECS,
                     ),
-                    |_win| {},
+                    // Proactive refresh happens on access through
+                    // get_or_fetch, which re-fetches any entry inside the
+                    // refresh window. The periodic tick purges credential
+                    // cache entries whose TTL lapsed without another access
+                    // and sweeps the expirable security state (IP blocks,
+                    // break-glass sessions, two-person approvals, idle
+                    // brute-force trackers), which bounds maps keyed by
+                    // attacker-supplied identifiers
+                    move |_window| {
+                        let purged = sm_for_maintenance.credential_cache.purge_expired();
+                        if purged > 0 {
+                            tracing::debug!("credential cache purged {} expired entries", purged);
+                        }
+                        sm_for_maintenance.prune_expired_state();
+                    },
                 )
                 .await;
             }));
@@ -1453,23 +1693,39 @@ impl Server {
                 .await;
             }));
 
+            // A handover queues page ids from a request handler and returns.
+            // This is what reads them, so the pages land before the traffic
+            // that wants them does
+            if let Some(mesh_node) = mesh_node.clone() {
+                let pool_warm = Arc::clone(&buffer_pool);
+                let disk_warm = Arc::clone(&disk_manager);
+                let sh_warm = Arc::clone(&self.shutdown);
+                spawned_workers.push(tokio::spawn(async move {
+                    background::mesh_prefetch::mesh_prefetch_loop(
+                        mesh_node,
+                        pool_warm,
+                        disk_warm,
+                        sh_warm,
+                        background::mesh_prefetch::DEFAULT_INTERVAL_MS,
+                    )
+                    .await;
+                }));
+            }
+
             let sh_dlq = Arc::clone(&self.shutdown);
+            let dlq_registry_for_ttl = Arc::clone(&dlq_registry_arc);
             spawned_workers.push(tokio::spawn(async move {
                 background::dlq_ttl::dlq_ttl_loop(
                     sh_dlq,
                     background::dlq_ttl::DEFAULT_INTERVAL_SECS,
                     30,
-                    |_cutoff| {},
-                )
-                .await;
-            }));
-
-            let sh_host = Arc::clone(&self.shutdown);
-            spawned_workers.push(tokio::spawn(async move {
-                background::host_health::host_health_monitor_loop(
-                    sh_host,
-                    background::host_health::DEFAULT_INTERVAL_SECS,
-                    || {},
+                    move |cutoff_secs| {
+                        let cutoff_ms = (cutoff_secs as i64).saturating_mul(1000);
+                        let evicted = dlq_registry_for_ttl.evict_older_than(cutoff_ms);
+                        if evicted > 0 {
+                            info!("DLQ TTL sweep evicted {} aged rows", evicted);
+                        }
+                    },
                 )
                 .await;
             }));
@@ -2297,7 +2553,7 @@ pub async fn rebuild_spatial_index_from_table(
                 Arc::clone(wal),
                 Arc::clone(buffer_pool),
                 Arc::clone(disk),
-                txn.txn_id as u32,
+                txn.txn_id,
                 txn.snapshot.clone(),
             ));
             let logical: Vec<zyron_planner::logical::LogicalColumn> = table
@@ -2358,6 +2614,82 @@ pub async fn rebuild_spatial_index_from_table(
         count
     );
     Ok(())
+}
+
+/// Brings this node into a mesh, if the operator declared one.
+///
+/// Everything comes from what is already configured. The peer registry is the
+/// operator's statement of which machines belong to this deployment, so it is
+/// both the address book the transport dials and, for a static pool, the
+/// capacity the provisioner claims from. A node with no peers gets no
+/// scheduler, which is not a failure: it is a single node, and the ladder
+/// reports its mesh rungs as unreachable, which is true.
+fn install_mesh(
+    config: &config::ZyronConfig,
+    identity: &zyron_common::NodeIdentity,
+    peers: &zyron_common::PeerRegistry,
+) -> Option<std::sync::Arc<mesh_node::ServerMeshNode>> {
+    use zyron_mesh::{HttpMeshRpc, MeshDirectory, MeshScheduler, NodeRef, WarmPool};
+
+    let local = NodeRef::new(identity.node_id, identity.name.clone());
+    if peers.peers().is_empty() {
+        tracing::debug!("no peers are declared, so this node runs without a mesh");
+        return None;
+    }
+
+    // The address book. A peer that has been contacted is keyed by the id it
+    // reported as well as by its name, so a rename does not lose it
+    let mut directory = MeshDirectory::new();
+    for peer in peers.peers() {
+        directory.insert(
+            &NodeRef::new(peer.node_id.unwrap_or(0), peer.name.clone()),
+            peer.address.clone(),
+        );
+    }
+
+    // A static pool claims from the machines the operator declared and never
+    // creates one. Every other mode needs a control plane client this process
+    // does not carry, and the registry hands those an unreachable driver that
+    // says so, which masks the provisioning rung rather than publishing a
+    // request nothing will answer
+    if config.mesh.node_registration_mode == "static" {
+        let members: Vec<zyron_mesh::PoolMember> = peers
+            .peers()
+            .iter()
+            .map(|peer| zyron_mesh::PoolMember {
+                node_id: peer.node_id.unwrap_or(0),
+                name: peer.name.clone(),
+                address: peer.address.clone(),
+            })
+            .collect();
+        let size = members.len();
+        zyron_mesh::provisioner::ProvisionerRegistry::global().install(std::sync::Arc::new(
+            zyron_mesh::StaticPoolProvisioner::new(members),
+        ));
+        tracing::info!(machines = size, "static pool provisioner installed");
+    }
+
+    let pool = std::sync::Arc::new(WarmPool::new(config.mesh.warm_pool_max_nodes));
+    let scheduler = std::sync::Arc::new(MeshScheduler::new(
+        local.clone(),
+        std::sync::Arc::new(HttpMeshRpc::new(directory)),
+        pool,
+    ));
+    if !zyron_mesh::install_scheduler(scheduler) {
+        tracing::warn!("a mesh scheduler was already installed, keeping the first");
+    }
+    tracing::info!(
+        peers = peers.peers().len(),
+        mode = %config.mesh.node_registration_mode,
+        "mesh scheduler installed"
+    );
+
+    Some(std::sync::Arc::new(mesh_node::ServerMeshNode::new(
+        local,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(mesh_node::InFlight::default()),
+        std::sync::Arc::new(parking_lot::RwLock::new(config.storage.data_dir.clone())),
+    )))
 }
 
 /// Extracts the raw bytes of the column at `ordinal` from an NSM-encoded

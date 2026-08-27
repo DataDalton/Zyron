@@ -6960,8 +6960,9 @@ dependencies = [
 
 [[package]]
 name = "zyron-analytics"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "mimalloc",
  "parking_lot",
  "serde",
  "zyron-bench-harness",
@@ -6971,7 +6972,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-auth"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -7009,7 +7010,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-bench-harness"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "zyron-buffer",
  "zyron-common",
@@ -7019,20 +7020,22 @@ dependencies = [
 
 [[package]]
 name = "zyron-buffer"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "parking_lot",
  "sysinfo",
  "tempfile",
  "zyron-common",
+ "zyron-pressure",
 ]
 
 [[package]]
 name = "zyron-catalog"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "mimalloc",
  "parking_lot",
  "rand 0.10.0",
  "scc",
@@ -7049,12 +7052,13 @@ dependencies = [
 
 [[package]]
 name = "zyron-cdc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "apache-avro",
  "bytes",
  "chrono",
  "hex",
+ "mimalloc",
  "parking_lot",
  "reqwest",
  "rskafka",
@@ -7076,7 +7080,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "ctrlc",
@@ -7089,11 +7093,13 @@ dependencies = [
 
 [[package]]
 name = "zyron-common"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "mimalloc",
  "scc",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "zyron-bench-harness",
@@ -7101,7 +7107,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-ctl"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "zyron-common",
  "zyron-server",
@@ -7110,9 +7116,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-executor"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "mimalloc",
  "parking_lot",
  "rand 0.10.0",
  "scc",
@@ -7128,6 +7135,7 @@ dependencies = [
  "zyron-lake",
  "zyron-parser",
  "zyron-planner",
+ "zyron-pressure",
  "zyron-search",
  "zyron-storage",
  "zyron-types",
@@ -7136,9 +7144,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-lake"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
+ "mimalloc",
  "scc",
  "tempfile",
  "tracing",
@@ -7149,7 +7158,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-lifecycle"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -7172,19 +7181,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "zyron-parser"
-version = "0.5.0"
+name = "zyron-mesh"
+version = "0.6.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "zyron-common",
+ "zyron-pressure",
+]
+
+[[package]]
+name = "zyron-parser"
+version = "0.6.0"
+dependencies = [
+ "mimalloc",
  "zyron-bench-harness",
  "zyron-common",
 ]
 
 [[package]]
 name = "zyron-pipeline"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crossbeam",
  "hashbrown 0.16.1",
+ "mimalloc",
  "parking_lot",
  "scc",
  "serde",
@@ -7200,8 +7223,9 @@ dependencies = [
 
 [[package]]
 name = "zyron-planner"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "mimalloc",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -7213,15 +7237,27 @@ dependencies = [
  "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
+ "zyron-pressure",
  "zyron-storage",
  "zyron-types",
  "zyron-wal",
 ]
 
 [[package]]
-name = "zyron-search"
-version = "0.5.0"
+name = "zyron-pressure"
+version = "0.6.0"
 dependencies = [
+ "serde",
+ "sysinfo",
+ "tempfile",
+ "zyron-common",
+]
+
+[[package]]
+name = "zyron-search"
+version = "0.6.0"
+dependencies = [
+ "mimalloc",
  "parking_lot",
  "scc",
  "serde",
@@ -7232,9 +7268,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "crossbeam",
  "parking_lot",
  "scc",
@@ -7258,9 +7295,11 @@ dependencies = [
  "zyron-executor",
  "zyron-lake",
  "zyron-lifecycle",
+ "zyron-mesh",
  "zyron-parser",
  "zyron-pipeline",
  "zyron-planner",
+ "zyron-pressure",
  "zyron-search",
  "zyron-storage",
  "zyron-streaming",
@@ -7272,7 +7311,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-server-bin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tokio",
  "zyron-server",
@@ -7280,7 +7319,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-storage"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -7295,12 +7334,13 @@ dependencies = [
  "zyron-bench-harness",
  "zyron-buffer",
  "zyron-common",
+ "zyron-pressure",
  "zyron-wal",
 ]
 
 [[package]]
 name = "zyron-streaming"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -7313,6 +7353,7 @@ dependencies = [
  "globset",
  "hashbrown 0.16.1",
  "hex",
+ "mimalloc",
  "opendal",
  "parking_lot",
  "parquet",
@@ -7328,21 +7369,23 @@ dependencies = [
  "zyron-catalog",
  "zyron-cdc",
  "zyron-common",
+ "zyron-pressure",
  "zyron-storage",
  "zyron-wal",
 ]
 
 [[package]]
 name = "zyron-tpc"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "zyron-types"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "crc32fast",
  "crossbeam",
+ "mimalloc",
  "parking_lot",
  "rand 0.10.0",
  "scc",
@@ -7356,8 +7399,9 @@ dependencies = [
 
 [[package]]
 name = "zyron-versioning"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "mimalloc",
  "parking_lot",
  "scc",
  "tempfile",
@@ -7372,22 +7416,26 @@ dependencies = [
 
 [[package]]
 name = "zyron-wal"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
+ "libc",
+ "mimalloc",
  "parking_lot",
  "parking_lot_core",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "windows-sys 0.61.2",
  "zyron-bench-harness",
  "zyron-common",
+ "zyron-pressure",
 ]
 
 [[package]]
 name = "zyron-wire"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7431,6 +7479,7 @@ dependencies = [
  "zyron-parser",
  "zyron-pipeline",
  "zyron-planner",
+ "zyron-pressure",
  "zyron-search",
  "zyron-storage",
  "zyron-streaming",

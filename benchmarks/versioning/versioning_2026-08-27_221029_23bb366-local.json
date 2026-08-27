@@ -1,0 +1,202 @@
+{
+  "id": "2026-08-27_221029_23bb366-local",
+  "date": "2026-08-27 22:10:40Z",
+  "ts": 1787868640,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "branch_create_overhead": {
+      "us_per_branch": {
+        "average": 1.874200,
+        "runs": [2.03, 1.88, 1.79, 1.83, 1.83],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "branch_page_resolution": {
+      "ns_per_resolve": {
+        "average": 54.805960,
+        "runs": [55.08, 54.85, 54.87, 54.71, 54.51],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "page_version_map_skip_check": {
+      "skip_check_ops_per_sec": {
+        "average": 4266035598.216128,
+        "runs": [4144218814.75, 4297378599.05, 4288164665.52, 4284490145.67, 4315925766.08],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "page_version_map_update": {
+      "update_ops_per_sec": {
+        "average": 574625098.569114,
+        "runs": [568117259.40, 578770691.05, 576070050.12, 573000229.20, 577167263.07],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "branch_merge_10k": {
+      "ms_per_merge": {
+        "average": 1.368540,
+        "runs": [1.49, 1.36, 1.34, 1.35, 1.31],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "diff_adjacent_versions": {
+      "ms_per_diff": {
+        "average": 0.415440,
+        "runs": [0.43, 0.41, 0.42, 0.41, 0.42],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "scd_type2_merge_throughput": {
+      "rows_per_sec": {
+        "average": 156603801.938301,
+        "runs": [157405949.94, 161108425.97, 159667890.79, 153045607.59, 151791135.40],
+        "target": 150000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "time_travel_scan_overhead": {
+      "overhead_percent": {
+        "average": 24.418547,
+        "runs": [31.85, 16.42, 27.11, 30.47, 16.23],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "timestamp_resolution": {
+      "us_per_resolution": {
+        "average": 0.041342,
+        "runs": [0.04, 0.04, 0.04, 0.04, 0.04],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "version_log_append_planning": {
+      "batch_ops_per_sec": {
+        "average": 10115090.905515,
+        "runs": [9451795.84, 9771359.95, 10409954.41, 10228410.64, 10713933.69],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "version_overhead_per_tuple": {
+      "ns_per_check": {
+        "average": 0.000002,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "scd_type2_action_generation": {
+      "ns_per_action": {
+        "average": 11.281660,
+        "runs": [11.25, 11.23, 11.21, 11.50, 11.22],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "surrogate_key_generation": {
+      "keys_per_sec": {
+        "average": 162625895.313433,
+        "runs": [162394869.62, 161824081.04, 163046225.24, 162869897.90, 162994402.77],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "version_log_append_throughput": {
+      "append_ops_per_sec": {
+        "average": 725458.789151,
+        "runs": [726901.88, 708724.05, 733995.00, 735107.48, 722565.54],
+        "target": 400000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "version_log_batch_append": {
+      "batch_append_ops_per_sec": {
+        "average": 11186733.266923,
+        "runs": [9696602.99, 10986053.21, 11634454.74, 11911284.75, 11705270.65],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "version_log_lookup_by_id": {
+      "ns_per_lookup": {
+        "average": 13.240840,
+        "runs": [13.16, 13.29, 13.24, 13.29, 13.23],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "version_log_timestamp_search": {
+      "ns_per_search": {
+        "average": 42.450800,
+        "runs": [42.20, 42.44, 42.20, 42.62, 42.79],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

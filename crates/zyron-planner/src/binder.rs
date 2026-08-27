@@ -1177,6 +1177,42 @@ pub enum BoundSelectItem {
     Wildcard,
 }
 
+/// Whether two set-operation column types can merge into one output
+/// column. Equal types always can, a NULL side takes the other's type,
+/// and members of one family (numeric, text, temporal) convert onto the
+/// head's type at execution. Anything else is a bind-time error rather
+/// than a merge that panics or fabricates default values
+pub fn set_op_column_types_compatible(a: TypeId, b: TypeId) -> bool {
+    if a == b || a == TypeId::Null || b == TypeId::Null {
+        return true;
+    }
+    let numeric = |t: TypeId| {
+        matches!(
+            t,
+            TypeId::Int8
+                | TypeId::Int16
+                | TypeId::Int32
+                | TypeId::Int64
+                | TypeId::Int128
+                | TypeId::UInt8
+                | TypeId::UInt16
+                | TypeId::UInt32
+                | TypeId::UInt64
+                | TypeId::Float32
+                | TypeId::Float64
+                | TypeId::Decimal
+        )
+    };
+    let text = |t: TypeId| matches!(t, TypeId::Text | TypeId::Varchar | TypeId::Char);
+    let temporal = |t: TypeId| {
+        matches!(
+            t,
+            TypeId::Timestamp | TypeId::TimestampTz | TypeId::Date | TypeId::Time
+        )
+    };
+    (numeric(a) && numeric(b)) || (text(a) && text(b)) || (temporal(a) && temporal(b))
+}
+
 /// Constant-folded time-travel qualifier carried on a base-table reference.
 /// Set by the binder from `TableRef::Table.as_of` and consumed by the logical
 /// builder when emitting `LogicalPlan::Scan`. Branch is parsed but not yet
@@ -2787,11 +2823,36 @@ impl<'a> Binder<'a> {
                 None
             };
 
-            // Bind set operations
+            // Bind set operations. Every branch must match the head's column
+            // count and each column pair must be mergeable, because the
+            // executor merges branch rows into head-typed buffers and a
+            // mismatch there is a wrong answer or a panic, never a coercion
             let mut set_ops = Vec::new();
             for set_op in &stmt.set_ops {
                 let mut right_ctx = BindContext::new();
                 let right = self.bind_select(&mut right_ctx, &set_op.right).await?;
+                if right.output_schema.len() != output_schema.len() {
+                    return Err(ZyronError::PlanError(format!(
+                        "each branch of a set operation must return the same number of \
+                         columns: {} vs {}",
+                        output_schema.len(),
+                        right.output_schema.len()
+                    )));
+                }
+                for (i, (head, branch)) in output_schema
+                    .iter()
+                    .zip(right.output_schema.iter())
+                    .enumerate()
+                {
+                    if !set_op_column_types_compatible(head.type_id, branch.type_id) {
+                        return Err(ZyronError::PlanError(format!(
+                            "set operation column {} has incompatible types {:?} and {:?}",
+                            i + 1,
+                            head.type_id,
+                            branch.type_id
+                        )));
+                    }
+                }
                 set_ops.push(BoundSetOp {
                     op: set_op.op,
                     all: set_op.all,

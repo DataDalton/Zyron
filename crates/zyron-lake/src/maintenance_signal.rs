@@ -53,16 +53,29 @@ pub struct DirtyHeads {
     /// True when marks were dropped because the map was full, so the reader
     /// has to enumerate rather than trust the list to be complete
     pub overflowed: bool,
+    /// Table roots whose data directory has files no manifest references
+    /// anymore, from a dropped branch or a released clone pin. Neither
+    /// event commits a version, so without this request the files would
+    /// wait for the next log collapse that may never come
+    pub vacuum: Vec<(PathBuf, u32)>,
+    /// True when vacuum requests were dropped because their map was full,
+    /// so the reader vacuums every table it holds rather than trusting the
+    /// list to be complete
+    pub vacuum_overflowed: bool,
 }
 
 /// Heads that committed, and the hook that tells a worker one did.
 pub struct MaintenanceSignal {
     heads: Mutex<HashMap<PathBuf, (u32, bool)>>,
+    /// Table roots asking for a data-file vacuum with no commit behind it
+    vacuum: Mutex<HashMap<PathBuf, u32>>,
     /// Bumped by every mark, so a reader can tell whether anything arrived
     /// without taking the lock
     generation: AtomicU64,
     /// Raised when a mark found the map full
     overflowed: AtomicBool,
+    /// Raised when a vacuum request found its map full
+    vacuum_overflowed: AtomicBool,
     /// Called after a mark lands. One worker per process installs it, and a
     /// process with no worker pays nothing for the absent call
     waker: OnceLock<Box<dyn Fn() + Send + Sync>>,
@@ -78,8 +91,10 @@ impl MaintenanceSignal {
     pub fn new() -> Self {
         Self {
             heads: Mutex::new(HashMap::new()),
+            vacuum: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
+            vacuum_overflowed: AtomicBool::new(false),
             waker: OnceLock::new(),
         }
     }
@@ -114,11 +129,36 @@ impl MaintenanceSignal {
         }
     }
 
-    /// Takes every recorded head and clears the record.
+    /// Records that a table's data directory holds files no manifest
+    /// references anymore, from a dropped branch or a released clone pin.
+    /// Neither event commits a version, so it asks for a vacuum directly
+    pub fn mark_vacuum(&self, key: PathBuf, table_id: u32) {
+        {
+            let mut vacuum = self.vacuum.lock().unwrap_or_else(|e| e.into_inner());
+            let room = vacuum.len() < MAX_TRACKED_HEADS;
+            match vacuum.get_mut(&key) {
+                Some(slot) => *slot = table_id,
+                None if room => {
+                    vacuum.insert(key, table_id);
+                }
+                None => self.vacuum_overflowed.store(true, Ordering::Release),
+            }
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        if let Some(waker) = self.waker.get() {
+            waker();
+        }
+    }
+
+    /// Takes every recorded head and vacuum request and clears the record.
     pub fn drain(&self) -> DirtyHeads {
         let taken = {
             let mut heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *heads)
+        };
+        let vacuum_taken = {
+            let mut vacuum = self.vacuum.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *vacuum)
         };
         DirtyHeads {
             heads: taken
@@ -130,14 +170,20 @@ impl MaintenanceSignal {
                 })
                 .collect(),
             overflowed: self.overflowed.swap(false, Ordering::AcqRel),
+            vacuum: vacuum_taken.into_iter().collect(),
+            vacuum_overflowed: self.vacuum_overflowed.swap(false, Ordering::AcqRel),
         }
     }
 
     /// Drops every head under one table root, used when the table goes away
     /// so a dropped table's marks do not hold a slot against the bound
     pub fn forget_under(&self, root: &Path) {
-        let mut heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
-        heads.retain(|key, _| !key.starts_with(root));
+        {
+            let mut heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+            heads.retain(|key, _| !key.starts_with(root));
+        }
+        let mut vacuum = self.vacuum.lock().unwrap_or_else(|e| e.into_inner());
+        vacuum.retain(|key, _| !key.starts_with(root));
     }
 
     /// Installs the hook that wakes a worker when a head commits. Returns

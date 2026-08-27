@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod calibrate;
 pub mod column;
 pub mod compute;
 pub mod context;
@@ -8,7 +9,10 @@ pub mod executor;
 pub mod expr;
 pub mod lake_stats;
 pub mod operator;
+pub mod parallel_pool;
+pub mod probe;
 pub mod sequence;
+pub mod spill;
 pub mod subquery;
 pub mod table_convert;
 pub mod tier_move;
@@ -16,6 +20,6 @@ pub mod trigger;
 pub mod types_bridge;
 
 pub use batch::evaluate_row_filter;
-pub use context::ExecutionContext;
+pub use context::{ExecutionContext, QueryMemoryBudget};
 pub use executor::{execute, execute_analyze};
 pub use operator::OperatorMetrics;

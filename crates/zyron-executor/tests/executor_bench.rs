@@ -23,6 +23,13 @@
 //! | Aggregate         | throughput | 150M rows/sec     |
 //! | Sort (in-mem)     | throughput | 30M rows/sec      |
 //! | Limit             | throughput | 200M rows/sec     |
+//! | String equality   | throughput | 80M rows/sec      |
+//! | LIKE prefix       | throughput | 7M rows/sec       |
+//! | LIKE general      | throughput | 5M rows/sec       |
+//! | ILIKE contains    | throughput | 4.5M rows/sec     |
+//! | IN-list           | throughput | 35M rows/sec      |
+//! | Window frame      | throughput | 9M rows/sec       |
+//! | Residual join     | throughput | 20M rows/sec      |
 //!
 //! Validation Requirements:
 //! - Each benchmark runs 5 iterations
@@ -30,6 +37,12 @@
 //! - Pass/fail determined by average performance
 //! - Individual runs logged for variance analysis
 //! - Test FAILS if any single run is >2x worse than target
+
+// The allocator the server actually runs. Without this the suite measured
+// the platform allocator, which production never uses, and the alloc-bound
+// metrics carried its variance rather than the engine's behaviour
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Mutex;
 
@@ -66,6 +79,13 @@ const HASH_BUILD_TARGET_ROWS_SEC: f64 = 50_000_000.0;
 const AGGREGATE_TARGET_ROWS_SEC: f64 = 150_000_000.0;
 const SORT_TARGET_ROWS_SEC: f64 = 100_000_000.0;
 const LIMIT_TARGET_ROWS_SEC: f64 = 200_000_000.0;
+const STRING_EQ_TARGET_ROWS_SEC: f64 = 80_000_000.0;
+const LIKE_PREFIX_TARGET_ROWS_SEC: f64 = 7_000_000.0;
+const LIKE_GENERAL_TARGET_ROWS_SEC: f64 = 5_000_000.0;
+const ILIKE_CONTAINS_TARGET_ROWS_SEC: f64 = 4_500_000.0;
+const IN_LIST_TARGET_ROWS_SEC: f64 = 35_000_000.0;
+const WINDOW_FRAME_TARGET_ROWS_SEC: f64 = 9_000_000.0;
+const RESIDUAL_JOIN_TARGET_ROWS_SEC: f64 = 20_000_000.0;
 
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1472,5 +1492,469 @@ async fn test_hash_build_throughput() {
     assert!(
         !result.regression_detected,
         "Hash Build regression detected"
+    );
+}
+
+// =============================================================================
+// String predicate throughput: equality, LIKE, ILIKE (5-run validation)
+// =============================================================================
+
+/// Builds BATCH_SIZE chunks of two text columns: col 0 is a distinct name per
+/// row for pattern matching, col 1 cycles through 1000 categories for equality
+fn build_text_dataset(total_rows: usize) -> Vec<DataBatch> {
+    let mut batches = Vec::new();
+    let mut remaining = total_rows;
+    let mut row_offset = 0;
+    while remaining > 0 {
+        let chunk = remaining.min(BATCH_SIZE);
+        let names: Vec<String> = (0..chunk)
+            .map(|r| format!("user_{}", row_offset + r))
+            .collect();
+        let categories: Vec<String> = (0..chunk)
+            .map(|r| format!("value_{}", (row_offset + r) % 1000))
+            .collect();
+        batches.push(DataBatch::new(vec![
+            Column::new(ColumnData::Utf8(names), TypeId::Text),
+            Column::new(ColumnData::Utf8(categories), TypeId::Text),
+        ]));
+        row_offset += chunk;
+        remaining -= chunk;
+    }
+    batches
+}
+
+/// Creates a BoundExpr::Literal for a text value.
+fn lit_text(val: &str) -> BoundExpr {
+    BoundExpr::Literal {
+        value: LiteralValue::String(val.to_string()),
+        type_id: TypeId::Text,
+    }
+}
+
+/// Evaluates a predicate over every batch and returns rows/sec for the run,
+/// asserting the match count so the work cannot be optimized away
+fn time_predicate(
+    predicate: &BoundExpr,
+    batches: &[DataBatch],
+    schema: &[LogicalColumn],
+    total_rows: usize,
+    expected_matches: usize,
+) -> f64 {
+    let start = Instant::now();
+    let mut matches = 0usize;
+    for batch in batches {
+        let mask = evaluate(predicate, batch, schema, &[]).expect("predicate evaluates");
+        let ColumnData::Boolean(bits) = &mask.data else {
+            panic!("predicate must produce a boolean column");
+        };
+        matches += bits.iter().filter(|b| **b).count();
+    }
+    let duration = start.elapsed();
+    assert_eq!(matches, expected_matches, "predicate match count");
+    total_rows as f64 / duration.as_secs_f64()
+}
+
+#[tokio::test]
+async fn test_string_predicate_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 500_000;
+
+    tprintln!("\n=== String Predicate Throughput Test ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let schema = make_schema(&[("name", TypeId::Text), ("category", TypeId::Text)]);
+    let batches = build_text_dataset(ROW_COUNT);
+
+    // category = 'value_500': 1 in 1000 rows match
+    let eq_pred = BoundExpr::BinaryOp {
+        left: Box::new(col_ref(0, 1, TypeId::Text)),
+        op: BinaryOperator::Eq,
+        right: Box::new(lit_text("value_500")),
+        type_id: TypeId::Boolean,
+    };
+    // name LIKE 'user_1%': names beginning user_1
+    let like_prefix = BoundExpr::Like {
+        expr: Box::new(col_ref(0, 0, TypeId::Text)),
+        pattern: Box::new(lit_text("user_1%")),
+        negated: false,
+    };
+    // name LIKE 'user_1___9': underscore wildcards drive the general matcher
+    let like_general = BoundExpr::Like {
+        expr: Box::new(col_ref(0, 0, TypeId::Text)),
+        pattern: Box::new(lit_text("user_1___9")),
+        negated: false,
+    };
+    // name ILIKE '%USER_42%': case folding plus substring search
+    let ilike_contains = BoundExpr::ILike {
+        expr: Box::new(col_ref(0, 0, TypeId::Text)),
+        pattern: Box::new(lit_text("%USER_42%")),
+        negated: false,
+    };
+
+    // Expected counts over user_0..user_499999
+    let eq_expected = ROW_COUNT / 1000;
+    let like_prefix_expected = (0..ROW_COUNT)
+        .filter(|i| format!("user_{i}").starts_with("user_1"))
+        .count();
+    let like_general_expected = (0..ROW_COUNT)
+        .filter(|i| {
+            let name = format!("user_{i}");
+            name.len() == 10 && name.starts_with("user_1") && name.ends_with('9')
+        })
+        .count();
+    let ilike_expected = (0..ROW_COUNT)
+        .filter(|i| format!("user_{i}").contains("user_42"))
+        .count();
+
+    let mut eq_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut prefix_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut general_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut ilike_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+        let eq = time_predicate(&eq_pred, &batches, &schema, ROW_COUNT, eq_expected);
+        let prefix = time_predicate(
+            &like_prefix,
+            &batches,
+            &schema,
+            ROW_COUNT,
+            like_prefix_expected,
+        );
+        let general = time_predicate(
+            &like_general,
+            &batches,
+            &schema,
+            ROW_COUNT,
+            like_general_expected,
+        );
+        let ilike = time_predicate(
+            &ilike_contains,
+            &batches,
+            &schema,
+            ROW_COUNT,
+            ilike_expected,
+        );
+        tprintln!(
+            "  eq {} rows/sec, LIKE prefix {} rows/sec, LIKE general {} rows/sec, ILIKE {} rows/sec",
+            format_with_commas(eq),
+            format_with_commas(prefix),
+            format_with_commas(general),
+            format_with_commas(ilike),
+        );
+        eq_results.push(eq);
+        prefix_results.push(prefix);
+        general_results.push(general);
+        ilike_results.push(ilike);
+    }
+    record_test_util("String Predicate", util_before, take_util_snapshot());
+
+    tprintln!("\n=== String Predicate Validation Results ===");
+    let eq_result = validate_metric(
+        "String Equality",
+        "String equality predicate (rows/sec)",
+        eq_results,
+        STRING_EQ_TARGET_ROWS_SEC,
+        true,
+    );
+    let prefix_result = validate_metric(
+        "LIKE Prefix",
+        "LIKE prefix predicate (rows/sec)",
+        prefix_results,
+        LIKE_PREFIX_TARGET_ROWS_SEC,
+        true,
+    );
+    let general_result = validate_metric(
+        "LIKE General",
+        "LIKE underscore predicate (rows/sec)",
+        general_results,
+        LIKE_GENERAL_TARGET_ROWS_SEC,
+        true,
+    );
+    let ilike_result = validate_metric(
+        "ILIKE Contains",
+        "ILIKE contains predicate (rows/sec)",
+        ilike_results,
+        ILIKE_CONTAINS_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(eq_result.passed, "String equality below target");
+    assert!(prefix_result.passed, "LIKE prefix below target");
+    assert!(general_result.passed, "LIKE general below target");
+    assert!(ilike_result.passed, "ILIKE contains below target");
+}
+
+// =============================================================================
+// IN-list predicate throughput (5-run validation)
+// =============================================================================
+
+#[tokio::test]
+async fn test_in_list_predicate_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 1_000_000;
+
+    tprintln!("\n=== IN-List Predicate Throughput Test ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let schema = make_schema(&[("id", TypeId::Int64), ("val", TypeId::Int64)]);
+    let batches = build_large_dataset(ROW_COUNT, 2);
+
+    // Column 0 holds row_index * 2, so even list values each match one row
+    let list: Vec<BoundExpr> = [
+        4i64, 100, 4096, 65536, 250_000, 777_770, 1_400_000, 1_999_998,
+    ]
+    .iter()
+    .map(|v| lit_int(*v))
+    .collect();
+    let expected = 8usize;
+    let predicate = BoundExpr::InList {
+        expr: Box::new(col_ref(0, 0, TypeId::Int64)),
+        list,
+        negated: false,
+    };
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+        let rows_sec = time_predicate(&predicate, &batches, &schema, ROW_COUNT, expected);
+        tprintln!("  IN-list: {} rows/sec", format_with_commas(rows_sec));
+        results.push(rows_sec);
+    }
+    record_test_util("IN-List Predicate", util_before, take_util_snapshot());
+
+    tprintln!("\n=== IN-List Validation Results ===");
+    let result = validate_metric(
+        "IN-List Predicate",
+        "IN-list predicate (rows/sec)",
+        results,
+        IN_LIST_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(result.passed, "IN-list predicate below target");
+    assert!(!result.regression_detected, "IN-list regression detected");
+}
+
+// =============================================================================
+// Window explicit-frame aggregate throughput (5-run validation)
+// =============================================================================
+
+#[tokio::test]
+async fn test_window_frame_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 200_000;
+
+    tprintln!("\n=== Window Explicit Frame Throughput Test ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let schema = make_schema(&[("id", TypeId::Int64), ("val", TypeId::Int64)]);
+    let batches = build_large_dataset(ROW_COUNT, 2);
+
+    // SUM(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND
+    // CURRENT ROW), the explicitly written cumulative frame
+    let window_expr = BoundExpr::WindowFunction {
+        function: Box::new(BoundExpr::AggregateFunction {
+            name: "sum".to_string(),
+            args: vec![col_ref(0, 1, TypeId::Int64)],
+            distinct: false,
+            return_type: TypeId::Int64,
+            uda: None,
+        }),
+        partition_by: vec![],
+        order_by: vec![BoundOrderBy {
+            expr: col_ref(0, 0, TypeId::Int64),
+            asc: true,
+            nulls_first: false,
+        }],
+        frame: Some(zyron_parser::ast::WindowFrame {
+            mode: zyron_parser::ast::WindowFrameMode::Rows,
+            start: zyron_parser::ast::WindowFrameBound::Unbounded(
+                zyron_parser::ast::WindowFrameDirection::Preceding,
+            ),
+            end: Some(zyron_parser::ast::WindowFrameBound::CurrentRow),
+        }),
+        type_id: TypeId::Int64,
+    };
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+        let child = MemoryOperator::boxed(batches.clone());
+        let mut window_op = zyron_executor::operator::window::WindowOperator::new(
+            child,
+            vec![window_expr.clone()],
+            schema.clone(),
+        );
+        let start = Instant::now();
+        let total_rows = drain_operator(&mut window_op).await;
+        let duration = start.elapsed();
+        assert_eq!(total_rows, ROW_COUNT, "window emits one row per input row");
+        let rows_sec = ROW_COUNT as f64 / duration.as_secs_f64();
+        tprintln!(
+            "  Window frame: {} rows/sec ({:?})",
+            format_with_commas(rows_sec),
+            duration
+        );
+        results.push(rows_sec);
+    }
+    record_test_util("Window Frame", util_before, take_util_snapshot());
+
+    tprintln!("\n=== Window Frame Validation Results ===");
+    let result = validate_metric(
+        "Window Frame",
+        "Window explicit frame throughput (rows/sec)",
+        results,
+        WINDOW_FRAME_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(result.passed, "Window frame throughput below target");
+    assert!(
+        !result.regression_detected,
+        "Window frame regression detected"
+    );
+}
+
+// =============================================================================
+// Residual-condition hash join throughput (5-run validation)
+// =============================================================================
+
+/// Schema builder that stamps a caller-chosen table index, so a join's two
+/// sides stay addressable in the concatenated condition schema
+fn make_schema_at(table_idx: usize, cols: &[(&str, TypeId)]) -> Vec<LogicalColumn> {
+    cols.iter()
+        .enumerate()
+        .map(|(i, (name, tid))| LogicalColumn {
+            table_idx: Some(table_idx),
+            column_id: ColumnId(i as u16),
+            name: name.to_string(),
+            type_id: *tid,
+            nullable: true,
+            fractional_digits: None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_residual_join_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const LEFT_ROWS: usize = 200_000;
+    const RIGHT_ROWS: usize = 20_000;
+
+    tprintln!("\n=== Residual-Condition Hash Join Throughput Test ===");
+    tprintln!("Left rows: {}, Right rows: {}", LEFT_ROWS, RIGHT_ROWS);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let left_schema = make_schema_at(0, &[("k", TypeId::Int64), ("a", TypeId::Int64)]);
+    let right_schema = make_schema_at(1, &[("k", TypeId::Int64), ("b", TypeId::Int64)]);
+
+    // Left keys cycle through the right key space so every left row finds
+    // hash candidates, and the residual a < b passes for about half of them
+    let left_batches = {
+        let mut batches = Vec::new();
+        let mut remaining = LEFT_ROWS;
+        let mut row_offset = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let keys: Vec<i64> = (0..chunk)
+                .map(|r| ((row_offset + r) % RIGHT_ROWS) as i64)
+                .collect();
+            // 97 is coprime to the right side's modulus so a and b differ
+            // across the key space and the residual passes for about half
+            // of the candidate pairs
+            let a_vals: Vec<i64> = (0..chunk).map(|r| ((row_offset + r) % 97) as i64).collect();
+            batches.push(DataBatch::new(vec![
+                Column::new(ColumnData::Int64(keys), TypeId::Int64),
+                Column::new(ColumnData::Int64(a_vals), TypeId::Int64),
+            ]));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+    let right_batches = {
+        let mut batches = Vec::new();
+        let mut remaining = RIGHT_ROWS;
+        let mut row_offset = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let keys: Vec<i64> = (0..chunk).map(|r| (row_offset + r) as i64).collect();
+            let b_vals: Vec<i64> = (0..chunk)
+                .map(|r| ((row_offset + r) % 100) as i64)
+                .collect();
+            batches.push(DataBatch::new(vec![
+                Column::new(ColumnData::Int64(keys), TypeId::Int64),
+                Column::new(ColumnData::Int64(b_vals), TypeId::Int64),
+            ]));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+
+    // ON l.k = r.k AND l.a < r.b
+    let residual = BoundExpr::BinaryOp {
+        left: Box::new(col_ref(0, 1, TypeId::Int64)),
+        op: BinaryOperator::Lt,
+        right: Box::new(col_ref(1, 1, TypeId::Int64)),
+        type_id: TypeId::Boolean,
+    };
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+        let left_op = MemoryOperator::boxed(left_batches.clone());
+        let right_op = MemoryOperator::boxed(right_batches.clone());
+        let mut join_op = HashJoinOperator::new(
+            left_op,
+            right_op,
+            JoinType::Inner,
+            vec![col_ref(0, 0, TypeId::Int64)],
+            vec![col_ref(1, 0, TypeId::Int64)],
+            Some(residual.clone()),
+            left_schema.clone(),
+            right_schema.clone(),
+        );
+        let start = Instant::now();
+        let total_rows = drain_operator(&mut join_op).await;
+        let duration = start.elapsed();
+        assert!(
+            total_rows > 0,
+            "Run {}: residual join returned 0 rows",
+            run + 1
+        );
+        let input_rows = LEFT_ROWS + RIGHT_ROWS;
+        let rows_sec = input_rows as f64 / duration.as_secs_f64();
+        tprintln!(
+            "  Residual join: {} rows/sec ({:?}), {} output rows",
+            format_with_commas(rows_sec),
+            duration,
+            total_rows
+        );
+        results.push(rows_sec);
+    }
+    record_test_util("Residual Join", util_before, take_util_snapshot());
+
+    tprintln!("\n=== Residual Join Validation Results ===");
+    let result = validate_metric(
+        "Residual Join",
+        "Residual-condition join throughput (rows/sec)",
+        results,
+        RESIDUAL_JOIN_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(result.passed, "Residual join throughput below target");
+    assert!(
+        !result.regression_detected,
+        "Residual join regression detected"
     );
 }

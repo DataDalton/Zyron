@@ -77,8 +77,8 @@ pub fn evaluate(
             pattern,
             negated,
         } => {
-            let col = evaluate(inner, batch, schema, params)?;
-            let pat = evaluate(pattern, batch, schema, params)?;
+            let col = evaluate_borrowed(inner, batch, schema, params)?;
+            let pat = evaluate_pattern_operand(pattern, batch, schema, params)?;
             compute::like(&col, &pat, *negated)
         }
         BoundExpr::ILike {
@@ -86,8 +86,8 @@ pub fn evaluate(
             pattern,
             negated,
         } => {
-            let col = evaluate(inner, batch, schema, params)?;
-            let pat = evaluate(pattern, batch, schema, params)?;
+            let col = evaluate_borrowed(inner, batch, schema, params)?;
+            let pat = evaluate_pattern_operand(pattern, batch, schema, params)?;
             compute::ilike(&col, &pat, *negated)
         }
         BoundExpr::Function { name, args, .. } => {
@@ -350,6 +350,9 @@ fn common_numeric_type(a: TypeId, b: TypeId) -> Option<TypeId> {
         6 => TypeId::Float32,
         7 => TypeId::Float64,
         5 => TypeId::Int128,
+        // A u64 above i64::MAX has no i64 twin, so a pair mixing UInt64
+        // with a signed type widens to Int128, which holds both exactly
+        4 if a == TypeId::UInt64 || b == TypeId::UInt64 => TypeId::Int128,
         _ => TypeId::Int64,
     })
 }
@@ -394,22 +397,6 @@ fn next_hlc() -> u64 {
 /// Casts two numeric columns to their common type so a comparison sees matching
 /// types, mirroring the coercion the binary-comparison path applies. Non-numeric
 /// or already-equal pairs are left untouched.
-fn coerce_numeric_pair(left: &mut Column, right: &mut Column) -> Result<()> {
-    let lt = left.type_id;
-    let rt = right.type_id;
-    if lt != rt {
-        if let Some(common) = common_numeric_type(lt, rt) {
-            if lt != common {
-                *left = compute::cast_column(left, common)?;
-            }
-            if rt != common {
-                *right = compute::cast_column(right, common)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[inline]
 fn is_ts_col(col: &Column) -> bool {
     matches!(col.type_id, TypeId::Timestamp | TypeId::TimestampTz)
@@ -441,6 +428,182 @@ fn normalize_ts_pair(left: &mut Column, right: &mut Column) -> Result<()> {
     Ok(())
 }
 
+/// Cow-aware counterpart of normalize_ts_pair. A side is replaced only when
+/// it actually rescales, so a borrowed operand stays borrowed otherwise
+fn normalize_ts_pair_cow(left: &mut Cow<'_, Column>, right: &mut Cow<'_, Column>) -> Result<()> {
+    if !(is_ts_col(left) && is_ts_col(right)) {
+        return Ok(());
+    }
+    let lps = ts_col_is_ps(left);
+    let rps = ts_col_is_ps(right);
+    if lps == rps {
+        return Ok(());
+    }
+    if lps {
+        *right = Cow::Owned(crate::compute::scale_us_to_ps(
+            right,
+            left.fractional_digits,
+        )?);
+    } else {
+        *left = Cow::Owned(crate::compute::scale_us_to_ps(
+            left,
+            right.fractional_digits,
+        )?);
+    }
+    Ok(())
+}
+
+#[inline]
+fn is_temporal_cmp_col(col: &Column) -> bool {
+    matches!(
+        col.type_id,
+        TypeId::Timestamp | TypeId::TimestampTz | TypeId::Date
+    )
+}
+
+#[inline]
+fn is_text_col(col: &Column) -> bool {
+    matches!(col.type_id, TypeId::Text | TypeId::Varchar | TypeId::Char)
+}
+
+/// Parses every row of a text column into the representation of the
+/// temporal column it compares against: DATE days for a date, epoch
+/// microseconds for a TIMESTAMP, scaled to picoseconds for p>6. Matches
+/// the INSERT literal path exactly, so sub-microsecond text against a
+/// microsecond column is a hard error rather than a truncation
+fn parse_text_col_as_temporal(text: &Column, temporal: &Column) -> Result<Column> {
+    let ColumnData::Utf8(values) = &text.data else {
+        return Err(ZyronError::ExecutionError(
+            "text comparison operand does not hold string data".to_string(),
+        ));
+    };
+    let len = values.len();
+    let mut nulls = NullBitmap::none(len);
+    let data = if temporal.type_id == TypeId::Date {
+        let mut out = Vec::with_capacity(len);
+        for (i, value) in values.iter().enumerate() {
+            if text.is_null(i) {
+                nulls.set_null(i);
+                out.push(0);
+            } else {
+                out.push(zyron_common::parse_date_days(value)?);
+            }
+        }
+        ColumnData::Int32(out)
+    } else if ts_col_is_ps(temporal) {
+        let mut out = Vec::with_capacity(len);
+        for (i, value) in values.iter().enumerate() {
+            if text.is_null(i) {
+                nulls.set_null(i);
+                out.push(0);
+            } else {
+                out.push(zyron_common::parse_timestamp_micros(value)? as i128 * 1_000_000);
+            }
+        }
+        ColumnData::Int128(out)
+    } else {
+        let mut out = Vec::with_capacity(len);
+        for (i, value) in values.iter().enumerate() {
+            if text.is_null(i) {
+                nulls.set_null(i);
+                out.push(0);
+            } else {
+                out.push(zyron_common::parse_timestamp_micros(value)?);
+            }
+        }
+        ColumnData::Int64(out)
+    };
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        temporal.type_id,
+        temporal.fractional_digits,
+    ))
+}
+
+/// When exactly one comparison operand is a temporal column (TIMESTAMP,
+/// TIMESTAMPTZ, DATE) and the other is text, the text side parses into the
+/// temporal side's representation, so `ts_col >= '2026-01-01'` compares
+/// instants instead of falling to the cross-variant fallback that never
+/// matches. An unparseable string is a hard error, never an empty result
+fn coerce_temporal_text_pair_cow(
+    left: &mut Cow<'_, Column>,
+    right: &mut Cow<'_, Column>,
+) -> Result<()> {
+    if is_temporal_cmp_col(left) && is_text_col(right) {
+        *right = Cow::Owned(parse_text_col_as_temporal(right, left)?);
+    } else if is_temporal_cmp_col(right) && is_text_col(left) {
+        *left = Cow::Owned(parse_text_col_as_temporal(left, right)?);
+    }
+    Ok(())
+}
+
+/// Cow-aware counterpart of coerce_numeric_pair. Casting produces a fresh
+/// column, so a side that keeps its type never pays a clone
+fn coerce_numeric_pair_cow(left: &mut Cow<'_, Column>, right: &mut Cow<'_, Column>) -> Result<()> {
+    let lt = left.type_id;
+    let rt = right.type_id;
+    if lt != rt {
+        if let Some(common) = common_numeric_type(lt, rt) {
+            if lt != common {
+                *left = Cow::Owned(compute::cast_column(left, common)?);
+            }
+            if rt != common {
+                *right = Cow::Owned(compute::cast_column(right, common)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for operands whose value is one scalar broadcast across the batch
+fn is_scalar_expr(expr: &BoundExpr) -> bool {
+    matches!(
+        expr,
+        BoundExpr::Literal { .. } | BoundExpr::Parameter { .. }
+    )
+}
+
+/// Evaluates a literal or parameter as a one-row column, the broadcast
+/// counterpart of its full-width evaluation
+fn evaluate_scalar_operand(expr: &BoundExpr, params: &[ScalarValue]) -> Result<Column> {
+    match expr {
+        BoundExpr::Literal { value, type_id } => evaluate_literal(value, *type_id, 1),
+        BoundExpr::Parameter { index, .. } => evaluate_parameter(*index, params, 1),
+        other => Err(ZyronError::ExecutionError(format!(
+            "scalar operand expected a literal or parameter, found {other:?}"
+        ))),
+    }
+}
+
+/// Evaluates a LIKE/ILIKE pattern operand. A literal or parameter pattern
+/// stays one row wide, the matcher broadcasts it across every input row
+/// instead of matching against a full column of identical strings
+fn evaluate_pattern_operand<'a>(
+    pattern: &BoundExpr,
+    batch: &'a DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Cow<'a, Column>> {
+    if is_scalar_expr(pattern) {
+        return Ok(Cow::Owned(evaluate_scalar_operand(pattern, params)?));
+    }
+    evaluate_borrowed(pattern, batch, schema, params)
+}
+
+/// The comparison kind of a binary operator, None for non-comparisons
+fn cmp_op_of(op: BinaryOperator) -> Option<CmpOp> {
+    match op {
+        BinaryOperator::Eq => Some(CmpOp::Eq),
+        BinaryOperator::Neq => Some(CmpOp::Neq),
+        BinaryOperator::Lt => Some(CmpOp::Lt),
+        BinaryOperator::Gt => Some(CmpOp::Gt),
+        BinaryOperator::LtEq => Some(CmpOp::LtEq),
+        BinaryOperator::GtEq => Some(CmpOp::GtEq),
+        _ => None,
+    }
+}
+
 fn evaluate_binary_op(
     left: &BoundExpr,
     op: BinaryOperator,
@@ -449,14 +612,67 @@ fn evaluate_binary_op(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
-    let mut left_col = evaluate(left, batch, schema, params)?;
-    let mut right_col = evaluate(right, batch, schema, params)?;
+    // A comparison with a literal or parameter operand keeps that operand
+    // one row wide: the same normalization and coercion run over the one-row
+    // column, since their decisions depend only on types and scales, and the
+    // broadcast kernel then compares every row against the single value.
+    // This removes the per-batch materialization of the scalar operand
+    if let Some(cmp) = cmp_op_of(op) {
+        let scalar_on_left = match (is_scalar_expr(left), is_scalar_expr(right)) {
+            (false, true) => Some(false),
+            (true, false) => Some(true),
+            _ => None,
+        };
+        if let Some(scalar_on_left) = scalar_on_left {
+            let (col_expr, scalar_expr) = if scalar_on_left {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            let col_eval = evaluate_borrowed(col_expr, batch, schema, params)?;
+            let scalar_col = Cow::Owned(evaluate_scalar_operand(scalar_expr, params)?);
+            let (mut l, mut r) = if scalar_on_left {
+                (scalar_col, col_eval)
+            } else {
+                (col_eval, scalar_col)
+            };
+            coerce_temporal_text_pair_cow(&mut l, &mut r)?;
+            normalize_ts_pair_cow(&mut l, &mut r)?;
+            if l.type_id == TypeId::Decimal || r.type_id == TypeId::Decimal {
+                if let Some((a, b)) = compute::align_decimal_operands(&l, &r)? {
+                    l = Cow::Owned(a);
+                    r = Cow::Owned(b);
+                }
+            } else {
+                coerce_numeric_pair_cow(&mut l, &mut r)?;
+            }
+            return if scalar_on_left {
+                compute::compare_scalar(&r, &l, cmp, true)
+            } else {
+                compute::compare_scalar(&l, &r, cmp, false)
+            };
+        }
+    }
+
+    let mut left_col = evaluate_borrowed(left, batch, schema, params)?;
+    let mut right_col = evaluate_borrowed(right, batch, schema, params)?;
 
     // Cross-precision timestamp normalization (B5): when the two operands are
     // timestamps stored in different units (one i64 microseconds for p<=6, the
     // other i128 picoseconds for p>6), scale the microsecond side up to
     // picoseconds (exact x1_000_000) so the same instant compares equal.
     // Never the reverse - downcasting ps->us would lose information.
+    if matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::Neq
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::LtEq
+            | BinaryOperator::GtEq
+    ) {
+        coerce_temporal_text_pair_cow(&mut left_col, &mut right_col)?;
+    }
     if matches!(
         op,
         BinaryOperator::Plus
@@ -468,7 +684,7 @@ fn evaluate_binary_op(
             | BinaryOperator::LtEq
             | BinaryOperator::GtEq
     ) {
-        normalize_ts_pair(&mut left_col, &mut right_col)?;
+        normalize_ts_pair_cow(&mut left_col, &mut right_col)?;
     }
 
     // Numeric coercion: comparisons and arithmetic between different numeric
@@ -495,22 +711,11 @@ fn evaluate_binary_op(
         // as a plain number, so `v > 10.00` would compare 1050 against 10
         if left_col.type_id == TypeId::Decimal || right_col.type_id == TypeId::Decimal {
             if let Some((l, r)) = compute::align_decimal_operands(&left_col, &right_col)? {
-                left_col = l;
-                right_col = r;
+                left_col = Cow::Owned(l);
+                right_col = Cow::Owned(r);
             }
         } else {
-            let lt = left_col.type_id;
-            let rt = right_col.type_id;
-            if lt != rt {
-                if let Some(common) = common_numeric_type(lt, rt) {
-                    if lt != common {
-                        left_col = compute::cast_column(&left_col, common)?;
-                    }
-                    if rt != common {
-                        right_col = compute::cast_column(&right_col, common)?;
-                    }
-                }
-            }
+            coerce_numeric_pair_cow(&mut left_col, &mut right_col)?;
         }
     }
 
@@ -566,7 +771,13 @@ fn try_interval_arithmetic(
         };
         let n = la.len().min(ra.len());
         let mut out: Vec<Interval> = Vec::with_capacity(n);
+        let mut nulls = NullBitmap::none(n);
         for i in 0..n {
+            if left.is_null(i) || right.is_null(i) {
+                nulls.set_null(i);
+                out.push(Interval::ZERO);
+                continue;
+            }
             let v = match op {
                 BinaryOperator::Plus => la[i].add(ra[i]),
                 BinaryOperator::Minus => la[i].subtract(ra[i]),
@@ -574,7 +785,11 @@ fn try_interval_arithmetic(
             };
             out.push(v);
         }
-        return Ok(Some(Column::new(ColumnData::Interval(out), TI::Interval)));
+        return Ok(Some(Column::with_nulls(
+            ColumnData::Interval(out),
+            nulls,
+            TI::Interval,
+        )));
     }
 
     // timestamp +/- interval -> timestamp (micros-based i64 columns)
@@ -606,44 +821,6 @@ fn timestamp_interval_op(
     op: BinaryOperator,
     iv_on_left: bool,
 ) -> Result<Column> {
-    let ts_values: &[i64] = match &ts.data {
-        ColumnData::Int64(v) => v,
-        ColumnData::Int32(v) => {
-            // Date column: rare, but promote to timestamp-micros by scaling days -> us
-            let promoted: Vec<i64> = v.iter().map(|&d| (d as i64) * 86_400_000_000).collect();
-            let mut result: Vec<i64> = Vec::with_capacity(promoted.len());
-            let iv_values = match &iv.data {
-                ColumnData::Interval(v) => v,
-                _ => {
-                    return Err(zyron_common::ZyronError::ExecutionError(
-                        "Interval column expected".into(),
-                    ));
-                }
-            };
-            let n = promoted.len().min(iv_values.len());
-            for i in 0..n {
-                let base = promoted[i];
-                let adjusted = match (op, iv_on_left) {
-                    (BinaryOperator::Plus, _) => iv_values[i].add_to_timestamp_micros(base),
-                    (BinaryOperator::Minus, false) => {
-                        iv_values[i].subtract_from_timestamp_micros(base)
-                    }
-                    _ => base,
-                };
-                result.push(adjusted);
-            }
-            return Ok(Column::new(
-                ColumnData::Int64(result),
-                zyron_common::TypeId::Timestamp,
-            ));
-        }
-        _ => {
-            return Err(zyron_common::ZyronError::ExecutionError(
-                "Timestamp column must be Int64 or Int32".into(),
-            ));
-        }
-    };
-
     let iv_values = match &iv.data {
         ColumnData::Interval(v) => v,
         _ => {
@@ -652,20 +829,94 @@ fn timestamp_interval_op(
             ));
         }
     };
+    let minus = matches!((op, iv_on_left), (BinaryOperator::Minus, false));
+    let shift_us = |base: i64, interval: &zyron_common::Interval| -> i64 {
+        if minus {
+            interval.subtract_from_timestamp_micros(base)
+        } else {
+            interval.add_to_timestamp_micros(base)
+        }
+    };
 
-    let n = ts_values.len().min(iv_values.len());
-    let mut result: Vec<i64> = Vec::with_capacity(n);
-    for i in 0..n {
-        let base = ts_values[i];
-        let adjusted = match (op, iv_on_left) {
-            (BinaryOperator::Plus, _) => iv_values[i].add_to_timestamp_micros(base),
-            (BinaryOperator::Minus, false) => iv_values[i].subtract_from_timestamp_micros(base),
-            _ => base,
-        };
-        result.push(adjusted);
+    match &ts.data {
+        ColumnData::Int64(v) => {
+            let n = v.len().min(iv_values.len());
+            let mut result: Vec<i64> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for i in 0..n {
+                if ts.is_null(i) || iv.is_null(i) {
+                    nulls.set_null(i);
+                    result.push(0);
+                    continue;
+                }
+                result.push(shift_us(v[i], &iv_values[i]));
+            }
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int64(result),
+                nulls,
+                ts.type_id,
+                ts.fractional_digits,
+            ))
+        }
+        // Date column promotes to timestamp microseconds
+        ColumnData::Int32(v) => {
+            let n = v.len().min(iv_values.len());
+            let mut result: Vec<i64> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for i in 0..n {
+                if ts.is_null(i) || iv.is_null(i) {
+                    nulls.set_null(i);
+                    result.push(0);
+                    continue;
+                }
+                result.push(shift_us((v[i] as i64) * 86_400_000_000, &iv_values[i]));
+            }
+            Ok(Column::with_nulls(
+                ColumnData::Int64(result),
+                nulls,
+                zyron_common::TypeId::Timestamp,
+            ))
+        }
+        // TIMESTAMP(p>6): i128 picoseconds. The calendar part (months,
+        // days) shifts the microsecond half through the same calendar
+        // arithmetic, the sub-microsecond remainder rides along unchanged,
+        // and the interval's sub-microsecond nanoseconds apply exactly at
+        // picosecond width instead of being truncated
+        ColumnData::Int128(v) => {
+            let n = v.len().min(iv_values.len());
+            let mut result: Vec<i128> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for i in 0..n {
+                if ts.is_null(i) || iv.is_null(i) {
+                    nulls.set_null(i);
+                    result.push(0);
+                    continue;
+                }
+                let base_ps = v[i];
+                let base_us = base_ps.div_euclid(1_000_000) as i64;
+                let frac_ps = base_ps.rem_euclid(1_000_000);
+                let interval = &iv_values[i];
+                let calendar = zyron_common::Interval {
+                    months: interval.months,
+                    days: interval.days,
+                    nanoseconds: interval.nanoseconds - (interval.nanoseconds % 1_000),
+                };
+                let sub_us_ps = i128::from(interval.nanoseconds % 1_000) * 1_000;
+                let shifted_us = shift_us(base_us, &calendar);
+                let signed_sub = if minus { -sub_us_ps } else { sub_us_ps };
+                result.push(i128::from(shifted_us) * 1_000_000 + frac_ps + signed_sub);
+            }
+            Ok(Column::with_nulls_ts(
+                ColumnData::Int128(result),
+                nulls,
+                ts.type_id,
+                ts.fractional_digits,
+            ))
+        }
+        _ => Err(zyron_common::ZyronError::ExecutionError(
+            "Timestamp column must be Int64, Int32, or Int128".into(),
+        )),
     }
-
-    Ok(Column::new(ColumnData::Int64(result), ts.type_id))
 }
 
 fn interval_scalar_mul(iv: &Column, scalar: &Column) -> Result<Column> {
@@ -677,17 +928,53 @@ fn interval_scalar_mul(iv: &Column, scalar: &Column) -> Result<Column> {
             ));
         }
     };
-    let scalar_as_i64: Vec<i64> = match &scalar.data {
-        ColumnData::Int8(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::Int16(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::Int32(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::Int64(v) => v.clone(),
-        ColumnData::UInt8(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::UInt16(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::UInt32(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::UInt64(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::Float32(v) => v.iter().map(|&x| x as i64).collect(),
-        ColumnData::Float64(v) => v.iter().map(|&x| x as i64).collect(),
+
+    // A float factor scales exactly instead of truncating to an integer:
+    // fractional months spill into days at thirty days per month and
+    // fractional days into time at twenty four hours per day, the
+    // Postgres rule, so INTERVAL '1 day' * 0.5 is twelve hours, not zero
+    let mul_f64 = |interval: &zyron_common::Interval, f: f64| -> Result<zyron_common::Interval> {
+        if !f.is_finite() {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "cannot multiply an interval by {f}"
+            )));
+        }
+        let months_f = interval.months as f64 * f;
+        let months = months_f.trunc();
+        let days_f = interval.days as f64 * f + (months_f - months) * 30.0;
+        let days = days_f.trunc();
+        let nanos_f = interval.nanoseconds as f64 * f + (days_f - days) * 86_400_000_000_000.0;
+        if months.abs() > i32::MAX as f64
+            || days.abs() > i32::MAX as f64
+            || nanos_f.abs() > i64::MAX as f64
+        {
+            return Err(zyron_common::ZyronError::ExecutionError(
+                "interval multiplication overflowed".to_string(),
+            ));
+        }
+        Ok(zyron_common::Interval {
+            months: months as i32,
+            days: days as i32,
+            nanoseconds: nanos_f.round() as i64,
+        })
+    };
+
+    enum Factor<'a> {
+        Int(Vec<i64>),
+        F32(&'a [f32]),
+        F64(&'a [f64]),
+    }
+    let factor = match &scalar.data {
+        ColumnData::Int8(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::Int16(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::Int32(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::Int64(v) => Factor::Int(v.clone()),
+        ColumnData::UInt8(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::UInt16(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::UInt32(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::UInt64(v) => Factor::Int(v.iter().map(|&x| x as i64).collect()),
+        ColumnData::Float32(v) => Factor::F32(v),
+        ColumnData::Float64(v) => Factor::F64(v),
         _ => {
             return Err(zyron_common::ZyronError::ExecutionError(
                 "Scalar must be numeric for interval multiplication".into(),
@@ -695,13 +982,30 @@ fn interval_scalar_mul(iv: &Column, scalar: &Column) -> Result<Column> {
         }
     };
 
-    let n = iv_values.len().min(scalar_as_i64.len());
+    let factor_len = match &factor {
+        Factor::Int(v) => v.len(),
+        Factor::F32(v) => v.len(),
+        Factor::F64(v) => v.len(),
+    };
+    let n = iv_values.len().min(factor_len);
     let mut out: Vec<zyron_common::Interval> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
     for i in 0..n {
-        out.push(iv_values[i].multiply_by(scalar_as_i64[i]));
+        if iv.is_null(i) || scalar.is_null(i) {
+            nulls.set_null(i);
+            out.push(zyron_common::Interval::ZERO);
+            continue;
+        }
+        let v = match &factor {
+            Factor::Int(f) => iv_values[i].multiply_by(f[i]),
+            Factor::F32(f) => mul_f64(&iv_values[i], f[i] as f64)?,
+            Factor::F64(f) => mul_f64(&iv_values[i], f[i])?,
+        };
+        out.push(v);
     }
-    Ok(Column::new(
+    Ok(Column::with_nulls(
         ColumnData::Interval(out),
+        nulls,
         zyron_common::TypeId::Interval,
     ))
 }
@@ -755,7 +1059,7 @@ fn evaluate_in_list(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
-    let expr_col = evaluate(expr, batch, schema, params)?;
+    let expr_col = evaluate_borrowed(expr, batch, schema, params)?;
     let num_rows = batch.num_rows;
 
     if list.is_empty() {
@@ -766,23 +1070,65 @@ fn evaluate_in_list(
         ));
     }
 
-    let first = evaluate(&list[0], batch, schema, params)?;
-    let mut e0 = expr_col.clone();
-    let mut f0 = first;
-    normalize_ts_pair(&mut e0, &mut f0)?;
-    coerce_numeric_pair(&mut e0, &mut f0)?;
-    let mut combined = compare(&e0, &f0, CmpOp::Eq)?;
-
-    for item in &list[1..] {
-        let item_col = evaluate(item, batch, schema, params)?;
-        let mut e = expr_col.clone();
-        let mut it = item_col;
-        normalize_ts_pair(&mut e, &mut it)?;
-        coerce_numeric_pair(&mut e, &mut it)?;
-        let cmp_result = compare(&e, &it, CmpOp::Eq)?;
-        combined = bool_or(&combined, &cmp_result)?;
+    // Each list item pairs with the probe column independently. A literal or
+    // parameter item stays one row wide through coercion and compares through
+    // the broadcast kernel. The probe column is borrowed rather than cloned,
+    // and when a width mismatch forces a cast the result is cached so a list
+    // of same-typed items casts the probe once instead of once per item
+    let mut cast_cache: Option<(TypeId, Column)> = None;
+    let mut combined: Option<Column> = None;
+    for item in list {
+        let scalar_item = is_scalar_expr(item);
+        let mut it: Cow<'_, Column> = if scalar_item {
+            Cow::Owned(evaluate_scalar_operand(item, params)?)
+        } else {
+            Cow::Owned(evaluate(item, batch, schema, params)?)
+        };
+        let mut e: Cow<'_, Column> = Cow::Borrowed(expr_col.as_ref());
+        coerce_temporal_text_pair_cow(&mut e, &mut it)?;
+        normalize_ts_pair_cow(&mut e, &mut it)?;
+        let lt = e.type_id;
+        let rt = it.type_id;
+        if lt != rt {
+            if let Some(common) = common_numeric_type(lt, rt) {
+                if lt != common {
+                    if matches!(e, Cow::Borrowed(_)) {
+                        // The cache only serves the unmodified probe column,
+                        // a normalized probe casts directly
+                        let cached_matches = matches!(&cast_cache, Some((t, _)) if *t == common);
+                        if !cached_matches {
+                            cast_cache = Some((common, compute::cast_column(&e, common)?));
+                        }
+                        if let Some((_, cached)) = &cast_cache {
+                            e = Cow::Borrowed(cached);
+                        }
+                    } else {
+                        e = Cow::Owned(compute::cast_column(&e, common)?);
+                    }
+                }
+                if rt != common {
+                    it = Cow::Owned(compute::cast_column(&it, common)?);
+                }
+            }
+        }
+        let cmp_result = if scalar_item {
+            compute::compare_scalar(&e, &it, CmpOp::Eq, false)?
+        } else {
+            compare(&e, &it, CmpOp::Eq)?
+        };
+        combined = Some(match combined {
+            Some(prev) => bool_or(&prev, &cmp_result)?,
+            None => cmp_result,
+        });
     }
 
+    let combined = match combined {
+        Some(c) => c,
+        None => Column::new(
+            ColumnData::Boolean(vec![negated; num_rows]),
+            TypeId::Boolean,
+        ),
+    };
     if negated {
         bool_not(&combined)
     } else {
@@ -803,19 +1149,37 @@ fn evaluate_between(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
-    let expr_col = evaluate(expr, batch, schema, params)?;
-    let low_col = evaluate(low, batch, schema, params)?;
-    let high_col = evaluate(high, batch, schema, params)?;
+    let expr_col = evaluate_borrowed(expr, batch, schema, params)?;
 
-    // Cross-precision timestamp normalization (B5) per comparison.
-    let mut e_lo = expr_col.clone();
-    let mut lo = low_col.clone();
-    normalize_ts_pair(&mut e_lo, &mut lo)?;
-    let gte_low = compare(&e_lo, &lo, CmpOp::GtEq)?;
-    let mut e_hi = expr_col.clone();
-    let mut hi = high_col.clone();
-    normalize_ts_pair(&mut e_hi, &mut hi)?;
-    let lte_high = compare(&e_hi, &hi, CmpOp::LtEq)?;
+    // Each bound pairs with the probe column exactly like a standalone
+    // comparison: cross-precision timestamp normalization (B5), then
+    // numeric width coercion so an INT32 column against an INT64 literal
+    // compares in the common type instead of falling to the cross-variant
+    // fallback that never matches. Decimal pairs align by scale inside the
+    // compare kernels. The probe column is borrowed, and a literal or
+    // parameter bound stays one row wide through the broadcast kernel
+    let bound_cmp = |bound_expr: &BoundExpr, op: CmpOp| -> Result<Column> {
+        let mut e: Cow<'_, Column> = Cow::Borrowed(expr_col.as_ref());
+        if is_scalar_expr(bound_expr) {
+            let mut bound = Cow::Owned(evaluate_scalar_operand(bound_expr, params)?);
+            coerce_temporal_text_pair_cow(&mut e, &mut bound)?;
+            normalize_ts_pair_cow(&mut e, &mut bound)?;
+            if e.type_id != TypeId::Decimal && bound.type_id != TypeId::Decimal {
+                coerce_numeric_pair_cow(&mut e, &mut bound)?;
+            }
+            compute::compare_scalar(&e, &bound, op, false)
+        } else {
+            let mut bound = Cow::Owned(evaluate(bound_expr, batch, schema, params)?);
+            coerce_temporal_text_pair_cow(&mut e, &mut bound)?;
+            normalize_ts_pair_cow(&mut e, &mut bound)?;
+            if e.type_id != TypeId::Decimal && bound.type_id != TypeId::Decimal {
+                coerce_numeric_pair_cow(&mut e, &mut bound)?;
+            }
+            compare(&e, &bound, op)
+        }
+    };
+    let gte_low = bound_cmp(low, CmpOp::GtEq)?;
+    let lte_high = bound_cmp(high, CmpOp::LtEq)?;
     let result = bool_and(&gte_low, &lte_high)?;
 
     if negated {
@@ -863,8 +1227,30 @@ fn evaluate_case(
     // Process conditions in reverse so first match wins.
     for when in conditions.iter().rev() {
         let condition_bool = if let Some(ref op_col) = operand_col {
-            let cond_col = evaluate(&when.condition, batch, schema, params)?;
-            compare(op_col, &cond_col, CmpOp::Eq)?
+            // The operand pairs with each WHEN value like a standalone
+            // equality: timestamp normalization, then numeric width
+            // coercion so CASE int_col WHEN 1 matches instead of comparing
+            // distinct variants that are never equal. Decimal pairs align
+            // by scale inside the compare kernels. A literal WHEN value
+            // stays one row wide through the broadcast kernel
+            let mut e: Cow<'_, Column> = Cow::Borrowed(op_col);
+            if is_scalar_expr(&when.condition) {
+                let mut cond = Cow::Owned(evaluate_scalar_operand(&when.condition, params)?);
+                coerce_temporal_text_pair_cow(&mut e, &mut cond)?;
+                normalize_ts_pair_cow(&mut e, &mut cond)?;
+                if e.type_id != TypeId::Decimal && cond.type_id != TypeId::Decimal {
+                    coerce_numeric_pair_cow(&mut e, &mut cond)?;
+                }
+                compute::compare_scalar(&e, &cond, CmpOp::Eq, false)?
+            } else {
+                let mut cond = Cow::Owned(evaluate(&when.condition, batch, schema, params)?);
+                coerce_temporal_text_pair_cow(&mut e, &mut cond)?;
+                normalize_ts_pair_cow(&mut e, &mut cond)?;
+                if e.type_id != TypeId::Decimal && cond.type_id != TypeId::Decimal {
+                    coerce_numeric_pair_cow(&mut e, &mut cond)?;
+                }
+                compare(&e, &cond, CmpOp::Eq)?
+            }
         } else {
             evaluate(&when.condition, batch, schema, params)?
         };
@@ -906,7 +1292,15 @@ fn evaluate_case(
             }
         }
 
-        result = Column::with_nulls(new_data, new_nulls, result.type_id);
+        // The merged column keeps the running scale. Dropping
+        // fractional_digits here would make the next iteration's decimal
+        // alignment read the already-scaled values as scale zero and
+        // rescale them again, and a picosecond timestamp would lose its
+        // precision marker the same way
+        let merged_scale = result.fractional_digits;
+        let mut merged = Column::with_nulls(new_data, new_nulls, result.type_id);
+        merged.fractional_digits = merged_scale;
+        result = merged;
     }
 
     Ok(result)
@@ -1198,11 +1592,19 @@ fn evaluate_function(
         }
         "ceil" | "ceiling" => {
             let col = evaluate(&args[0], batch, schema, params)?;
-            eval_float_unary(&col, f64::ceil, f32::ceil)
+            if col.type_id == TypeId::Decimal {
+                eval_decimal_ceil_floor(&col, true)
+            } else {
+                eval_float_unary(&col, f64::ceil, f32::ceil)
+            }
         }
         "floor" => {
             let col = evaluate(&args[0], batch, schema, params)?;
-            eval_float_unary(&col, f64::floor, f32::floor)
+            if col.type_id == TypeId::Decimal {
+                eval_decimal_ceil_floor(&col, false)
+            } else {
+                eval_float_unary(&col, f64::floor, f32::floor)
+            }
         }
         // round and trunc accept an optional per row digit count, positive
         // digits keep fractional places, negative digits zero places left of
@@ -1355,11 +1757,12 @@ fn eval_array_subscript(
     let rows = batch.num_rows.max(1);
 
     // The element type comes from the encoded value rather than the plan, so
-    // a column whose element type was not known at bind time still decodes
+    // a column whose element type was not known at bind time still decodes.
+    // Payloads are borrowed straight from the column, no per-row copy
     let element_type = (0..rows.min(arrays.len()))
-        .find_map(|row| match arrays.get_scalar(row) {
-            ScalarValue::Binary(bytes) => {
-                zyron_common::ArrayView::parse(&bytes).map(|v| v.element_type())
+        .find_map(|row| match &arrays.data {
+            ColumnData::Binary(v) if !arrays.nulls.is_null(row) => {
+                zyron_common::ArrayView::parse(&v[row]).map(|view| view.element_type())
             }
             _ => None,
         })
@@ -1386,10 +1789,12 @@ fn subscript_one(
     if row >= arrays.len() || arrays.nulls.is_null(row) {
         return ScalarValue::Null;
     }
-    let ScalarValue::Binary(bytes) = arrays.get_scalar(row) else {
+    // Borrow the encoded array bytes in place, the view parses over the
+    // column's own buffer without materializing a scalar copy
+    let ColumnData::Binary(payloads) = &arrays.data else {
         return ScalarValue::Null;
     };
-    let Some(view) = zyron_common::ArrayView::parse(&bytes) else {
+    let Some(view) = zyron_common::ArrayView::parse(&payloads[row]) else {
         return ScalarValue::Null;
     };
     let index_row = if row < indexes.len() { row } else { 0 };
@@ -2321,6 +2726,47 @@ fn eval_octet_length(col: &Column) -> Result<Column> {
 }
 
 /// ceil and floor, integers pass through, floats apply the op per lane
+/// CEIL/FLOOR over a DECIMAL column. The stored value is an integer scaled
+/// by ten to the column's digits, so passing it through an integer arm
+/// would leave the fractional part in place. The result keeps the column's
+/// scale, so 2.10 at scale 2 becomes 3.00 under CEIL
+fn eval_decimal_ceil_floor(col: &Column, ceil: bool) -> Result<Column> {
+    let ColumnData::Int128(v) = &col.data else {
+        return Err(ZyronError::ExecutionError(
+            "decimal ceil/floor expects a scaled operand".to_string(),
+        ));
+    };
+    let scale = col.fractional_digits.unwrap_or(0);
+    if scale == 0 {
+        return Ok(col.clone());
+    }
+    let factor = zyron_common::decimal::scale_factor(scale)?;
+    let mut out = Vec::with_capacity(v.len());
+    for (i, &raw) in v.iter().enumerate() {
+        if col.is_null(i) {
+            out.push(0);
+            continue;
+        }
+        let unit = if ceil {
+            raw.div_euclid(factor) + i128::from(raw.rem_euclid(factor) != 0)
+        } else {
+            raw.div_euclid(factor)
+        };
+        let value = unit.checked_mul(factor).ok_or_else(|| {
+            ZyronError::ExecutionError(format!(
+                "ceil/floor result overflows a decimal at scale {scale}"
+            ))
+        })?;
+        out.push(value);
+    }
+    Ok(Column::with_nulls_ts(
+        ColumnData::Int128(out),
+        col.nulls.clone(),
+        TypeId::Decimal,
+        Some(scale),
+    ))
+}
+
 fn eval_float_unary(col: &Column, op64: fn(f64) -> f64, op32: fn(f32) -> f32) -> Result<Column> {
     match &col.data {
         ColumnData::Float64(v) => Ok(Column::with_nulls(
@@ -3187,22 +3633,52 @@ fn eval_greatest_least(
             "greatest/least requires at least 1 argument".to_string(),
         ));
     }
-    let first = evaluate(&args[0], batch, schema, params)?;
-    let target = first.type_id;
-    let mut fractional_digits = first.fractional_digits;
     let mut cols: Vec<Column> = Vec::with_capacity(args.len());
-    for (idx, a) in args.iter().enumerate() {
-        let c = if idx == 0 {
-            first.clone()
+    for a in args {
+        cols.push(evaluate(a, batch, schema, params)?);
+    }
+    // The result type is the common type across every argument, the same
+    // promotion a comparison applies. Casting everything onto the first
+    // argument's type would truncate a wider later argument, turning
+    // GREATEST(1, 2.5) into an integer compare over 1 and 2
+    let text_family = |t: TypeId| matches!(t, TypeId::Text | TypeId::Varchar | TypeId::Char);
+    let mut target = cols[0].type_id;
+    let mut fractional_digits = cols[0].fractional_digits;
+    for c in &cols[1..] {
+        if c.type_id == target || c.type_id == TypeId::Null {
+            continue;
+        }
+        if target == TypeId::Null {
+            target = c.type_id;
+            fractional_digits = c.fractional_digits;
+        } else if target == TypeId::Decimal || c.type_id == TypeId::Decimal {
+            if common_numeric_type(target, c.type_id).is_none() {
+                return Err(ZyronError::ExecutionError(format!(
+                    "greatest/least arguments mix incompatible types {:?} and {:?}",
+                    target, c.type_id
+                )));
+            }
+            target = TypeId::Decimal;
+        } else if text_family(target) && text_family(c.type_id) {
+            target = TypeId::Text;
         } else {
-            evaluate(a, batch, schema, params)?
-        };
-        let c = if c.type_id == target {
-            c
-        } else {
-            crate::compute::cast_column(&c, target)?
-        };
-        cols.push(c);
+            match common_numeric_type(target, c.type_id) {
+                Some(t) => target = t,
+                None => {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "greatest/least arguments mix incompatible types {:?} and {:?}",
+                        target, c.type_id
+                    )));
+                }
+            }
+        }
+    }
+    for c in cols.iter_mut() {
+        // Decimal targets align by scale below, everything else casts onto
+        // the unified type by value
+        if c.type_id != target && target != TypeId::Decimal && c.type_id != TypeId::Null {
+            *c = crate::compute::cast_column(c, target)?;
+        }
     }
     // Decimal operands land on the widest scale and mixed-precision
     // timestamps in one unit before rows are compared, so the winner is

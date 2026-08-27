@@ -33,8 +33,10 @@ pub struct HealthState {
     pub startup_complete: AtomicBool,
     /// Set to true once the server is accepting client connections.
     pub accepting_connections: AtomicBool,
-    /// Metrics registry for the /metrics endpoint.
+    /// Metrics registry for the exposition endpoint.
     pub metrics: Arc<MetricsRegistry>,
+    /// Route the Prometheus exposition answers on, from metrics.path.
+    pub metrics_path: String,
     /// Dynamic endpoint router populated by the catalog DDL path.
     pub gateway_router: Arc<GatewayRouter>,
     /// Per-endpoint Prometheus metrics.
@@ -45,6 +47,11 @@ pub struct HealthState {
     /// instance wired to the live catalog, buffer pool, disk manager, WAL,
     /// transaction manager, and security manager.
     pub endpoint_executor: parking_lot::RwLock<Option<Arc<EndpointExecutor>>>,
+    /// What the node measured about its machine, reported by /pressure. None
+    /// in a harness that assembled a health server without probing, where the
+    /// document omits the hardware section rather than inventing one
+    pub node_capabilities:
+        parking_lot::RwLock<Option<Arc<zyron_pressure::capability::NodeCapabilities>>>,
     /// Catalog endpoint list provider used by OpenAPI emission. Returns the
     /// current live list of registered endpoints each call.
     pub endpoint_catalog:
@@ -54,22 +61,91 @@ pub struct HealthState {
     /// Wrapped in an atomic cell so startup can install the executor after
     /// the HealthState Arc has already been shared with the HTTP listener.
     pub admin_executor: parking_lot::RwLock<Option<Arc<AdminExecutor>>>,
+    /// Where this node's working-set manifest is written, so a survivor
+    /// taking over for it can fetch what it was holding. Empty in a harness
+    /// that never had a data directory, where the route reports that no
+    /// manifest exists rather than reading somebody else's
+    pub data_dir: parking_lot::RwLock<std::path::PathBuf>,
+    /// What answers the mesh calls, when this node is part of a mesh. None on
+    /// a single node, where the mesh paths report that nothing serves them
+    /// rather than answering for a mesh that does not exist
+    pub mesh_node: parking_lot::RwLock<Option<Arc<crate::mesh_node::ServerMeshNode>>>,
 }
 
 impl HealthState {
-    /// Creates a new health state, initially not ready.
-    pub fn new(metrics: Arc<MetricsRegistry>) -> Self {
+    /// Attaches what answers the mesh calls.
+    ///
+    /// Set at startup when the node has a mesh. Until it is, the mesh paths
+    /// answer that nothing on this node serves them, which is the honest
+    /// answer to a scheduler that reached the wrong node.
+    pub fn set_mesh_node(&self, node: Arc<crate::mesh_node::ServerMeshNode>) {
+        *self.mesh_node.write() = Some(node);
+    }
+
+    /// What answers the mesh calls, if a mesh has been attached.
+    pub fn mesh_node(&self) -> Option<Arc<crate::mesh_node::ServerMeshNode>> {
+        self.mesh_node.read().clone()
+    }
+
+    /// Attaches what the node measured about its machine, so /pressure can
+    /// report the hardware the numbers were measured on.
+    pub fn set_node_capabilities(
+        &self,
+        capabilities: Arc<zyron_pressure::capability::NodeCapabilities>,
+    ) {
+        *self.node_capabilities.write() = Some(capabilities);
+    }
+
+    /// What the node measured, if the probe has been attached.
+    pub fn node_capabilities(&self) -> Option<Arc<zyron_pressure::capability::NodeCapabilities>> {
+        self.node_capabilities.read().clone()
+    }
+
+    /// Creates a new health state, initially not ready. The metrics path is
+    /// the configured exposition route, normalized to a leading slash.
+    pub fn new(metrics: Arc<MetricsRegistry>, metrics_path: &str) -> Self {
+        Self::with_gateway(
+            metrics,
+            metrics_path,
+            Arc::new(GatewayRouter::new()),
+            Arc::new(GatewayMetrics::new()),
+        )
+    }
+
+    /// Creates a health state serving the given gateway router and metric
+    /// set. The endpoint registrar must share these same instances, a
+    /// route registered into any other router is never served.
+    pub fn with_gateway(
+        metrics: Arc<MetricsRegistry>,
+        metrics_path: &str,
+        gateway_router: Arc<GatewayRouter>,
+        gateway_metrics: Arc<GatewayMetrics>,
+    ) -> Self {
+        let metrics_path = if metrics_path.starts_with('/') {
+            metrics_path.to_string()
+        } else {
+            format!("/{}", metrics_path)
+        };
         Self {
             startup_complete: AtomicBool::new(false),
             accepting_connections: AtomicBool::new(false),
             metrics,
-            gateway_router: Arc::new(GatewayRouter::new()),
-            gateway_metrics: Arc::new(GatewayMetrics::new()),
+            metrics_path,
+            gateway_router,
+            gateway_metrics,
             rate_limiter: Arc::new(RateLimiter::new()),
             endpoint_executor: parking_lot::RwLock::new(None),
+            node_capabilities: parking_lot::RwLock::new(None),
             endpoint_catalog: None,
             admin_executor: parking_lot::RwLock::new(None),
+            data_dir: parking_lot::RwLock::new(std::path::PathBuf::new()),
+            mesh_node: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Points the working-set route at the node's data directory.
+    pub fn set_data_dir(&self, data_dir: std::path::PathBuf) {
+        *self.data_dir.write() = data_dir;
     }
 
     /// Installs the admin executor after the Catalog and other managers have
@@ -167,6 +243,7 @@ pub async fn start_health_server(
         };
 
         let state = Arc::clone(&state);
+        let stream_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let n = match stream.read(&mut buf).await {
@@ -184,10 +261,47 @@ pub async fn start_health_server(
             // headers survive. Built-in health, metrics, and admin routes
             // use direct dispatch and do not consult the dynamic gateway
             // router.
+            // The live stream keeps the socket for its lifetime, so it is
+            // taken before the request/response path, which writes a body and
+            // closes. A request to the stream path that is not a valid
+            // upgrade falls through and is answered as ordinary HTTP
+            if path == crate::gateway::pressure_endpoint::PRESSURE_STREAM_PATH {
+                if let Some(parsed) = crate::gateway::request::parse_request(&raw_bytes, None) {
+                    let served = crate::gateway::pressure_endpoint::serve_stream(
+                        &mut stream,
+                        &parsed,
+                        state.node_capabilities(),
+                        Arc::clone(&stream_shutdown),
+                    )
+                    .await;
+                    if served {
+                        debug!("Pressure stream from {} ended", peer);
+                        return;
+                    }
+                }
+            }
+
             if is_dynamic_endpoint_path(&path, &state) {
                 let response_bytes = handle_dynamic_endpoint(&raw_bytes, &state).await;
                 let _ = stream.write_all(&response_bytes).await;
                 debug!("Health request from {}: {} -> dynamic", peer, path);
+                return;
+            }
+
+            // A mesh call carries a JSON body and answers with one, so it is
+            // routed before the path-only handlers, which never read a body
+            if zyron_mesh::is_mesh_path(&path) {
+                let (status, body) = handle_mesh_request(&path, &request, &state);
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text(status),
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                debug!("Mesh call from {}: {} -> {}", peer, path, status);
                 return;
             }
 
@@ -215,6 +329,37 @@ pub async fn start_health_server(
                 status
             );
         });
+    }
+}
+
+/// The reason phrase for a status code the mesh handler returns.
+fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        409 => "Conflict",
+        503 => "Service Unavailable",
+        _ => "Error",
+    }
+}
+
+/// Runs one mesh call against whatever answers for this node.
+///
+/// A node with no mesh attached answers that nothing here serves the path,
+/// which is a 404 the caller reads as the node not being part of a mesh
+/// rather than as a transient fault worth retrying.
+fn handle_mesh_request(path: &str, request: &str, state: &HealthState) -> (u16, String) {
+    let Some(node) = state.mesh_node() else {
+        return (
+            404,
+            "{\"Unknown\":{\"what\":\"this node is not part of a mesh\"}}".to_string(),
+        );
+    };
+    let body = request.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    match zyron_mesh::dispatch(node.as_ref(), path, body) {
+        Some(answer) => (answer.status, answer.body),
+        None => (404, format!("{{\"Unknown\":{{\"what\":\"{path}\"}}}}")),
     }
 }
 
@@ -251,11 +396,30 @@ fn route_request(request: &str, state: &HealthState) -> (&'static str, &'static 
                 )
             }
         }
-        "/metrics" => {
+        p if p == state.metrics_path => {
             let mut body = state.metrics.render_prometheus();
             body.push_str(&state.gateway_metrics.render_prometheus());
             ("200 OK", "text/plain; version=0.0.4; charset=utf-8", body)
         }
+        crate::gateway::pressure_endpoint::HOT_SET_PATH => {
+            let data_dir = state.data_dir.read().clone();
+            let (status, body) = crate::gateway::pressure_endpoint::render_hot_set(&data_dir);
+            (status, "application/json", body)
+        }
+        crate::gateway::pressure_endpoint::PRESSURE_PATH => (
+            "200 OK",
+            "application/json",
+            crate::gateway::pressure_endpoint::render_snapshot(
+                state.node_capabilities().as_deref(),
+            ),
+        ),
+        // Reached only when the upgrade handshake was absent or malformed,
+        // because a valid one never returns to this router
+        crate::gateway::pressure_endpoint::PRESSURE_STREAM_PATH => (
+            "426 Upgrade Required",
+            "application/json",
+            r#"{"error":"/pressure/stream requires a WebSocket upgrade"}"#.into(),
+        ),
         "/openapi.json" => {
             let endpoints = state
                 .endpoint_catalog
@@ -324,7 +488,7 @@ fn route_request(request: &str, state: &HealthState) -> (&'static str, &'static 
 /// the dynamic gateway router.
 fn is_dynamic_endpoint_path(path: &str, state: &HealthState) -> bool {
     if path.starts_with("/health/")
-        || path == "/metrics"
+        || path == state.metrics_path
         || path == "/openapi.json"
         || path == "/openapi.html"
         || path == "/_endpoints"
@@ -675,10 +839,10 @@ mod tests {
     use crate::session::SessionManager;
 
     fn test_state() -> Arc<HealthState> {
-        let session_mgr = Arc::new(SessionManager::new(100, 0));
+        let session_mgr = Arc::new(SessionManager::new(0));
         let labeled = Arc::new(zyron_common::LabeledMetrics::new());
         let metrics = Arc::new(MetricsRegistry::new(session_mgr, labeled));
-        Arc::new(HealthState::new(metrics))
+        Arc::new(HealthState::new(metrics, "/metrics"))
     }
 
     #[test]

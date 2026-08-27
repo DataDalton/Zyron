@@ -108,7 +108,7 @@ async fn query(
     .await?;
     let mut txn = e.txn.begin(IsolationLevel::ReadCommitted)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let ctx = Arc::new(ExecutionContext::new(
         Arc::clone(&e.catalog),
         Arc::clone(&e.wal),

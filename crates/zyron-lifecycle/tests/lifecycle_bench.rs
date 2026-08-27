@@ -111,7 +111,7 @@ async fn run(e: &Engine, sql: &str, dml: bool) -> zyron_common::Result<u64> {
     .await?;
     let mut txn = e.txn.begin(IsolationLevel::ReadCommitted)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         Arc::clone(&e.catalog),
         Arc::clone(&e.wal),
@@ -394,7 +394,7 @@ fn test_archive_restore() {
             Arc::clone(&e.wal),
             Arc::clone(&e.pool),
             Arc::clone(&e.disk),
-            t.txn_id as u32,
+            t.txn_id,
             t.snapshot.clone(),
         ));
         let batches = zyron_executor::execute(plan, &ctx).await.unwrap();

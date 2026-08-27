@@ -54,6 +54,7 @@ const PARSE_MESSAGE_TARGET_US: f64 = 8.0;
 const BIND_MESSAGE_TARGET_US: f64 = 4.0;
 const EXECUTE_MESSAGE_TARGET_US: f64 = 20.0;
 const ROW_SERIALIZATION_TARGET_OPS: f64 = 8_000_000.0;
+const RESULT_CELL_ENCODE_TARGET_ROWS_SEC: f64 = 8_000_000.0;
 const COPY_FROM_TARGET_OPS: f64 = 3_000_000.0;
 const COPY_TO_TARGET_OPS: f64 = 5_000_000.0;
 #[allow(dead_code)]
@@ -109,6 +110,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
+        node_capabilities: None,
         catalog,
         wal,
         buffer_pool: pool,
@@ -166,6 +168,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
@@ -176,8 +179,11 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
+        max_query_memory: None,
+        spill_directory: None,
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
+        password_encryption: "balloon-sha-256".into(),
     });
 
     (state, tmp)
@@ -2578,7 +2584,7 @@ fn test_quic_handshake_latency() {
         drop(udp_sock);
 
         let mut quic_rx =
-            zyron_wire::quic::setup_quic_listener(server_addr, &cert_path, &key_path, 30)
+            zyron_wire::quic::setup_quic_listener(server_addr, &cert_path, &key_path, 30, false)
                 .await
                 .expect("Failed to setup QUIC listener");
 
@@ -3765,5 +3771,110 @@ fn test_wire_jwt_auth_throughput() {
     assert!(
         !result.regression_detected,
         "Regression detected in JWT auth"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Result cell encode throughput (production SELECT send path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_wire_result_cell_encode_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Result Cell Encode Throughput Test ===");
+
+    let num_rows = 2_000_000;
+    let batch_size = 1024;
+    let num_batches = num_rows / batch_size;
+
+    // Five columns covering the send path's cell shapes: fixed width int,
+    // text, float, boolean, and a scaled decimal rendered in text form
+    let decimals: Vec<i128> = (0..batch_size).map(|i| (i as i128) * 100 + 50).collect();
+    let batch = DataBatch::new(vec![
+        make_column(
+            TypeId::Int32,
+            (0..batch_size)
+                .map(|i| ScalarValue::Int32(i as i32))
+                .collect(),
+        ),
+        make_column(
+            TypeId::Text,
+            (0..batch_size)
+                .map(|i| ScalarValue::Utf8(format!("name_{}", i)))
+                .collect(),
+        ),
+        make_column(
+            TypeId::Float64,
+            (0..batch_size)
+                .map(|i| ScalarValue::Float64(i as f64 * 1.1))
+                .collect(),
+        ),
+        make_column(
+            TypeId::Boolean,
+            (0..batch_size)
+                .map(|i| ScalarValue::Boolean(i % 2 == 0))
+                .collect(),
+        ),
+        Column::new_ts(ColumnData::Int128(decimals), TypeId::Decimal, Some(2)),
+    ]);
+
+    let col_formats: Vec<i16> = vec![0; 5];
+    let vector_cols = vec![false; 5];
+    let array_cols = vec![false; 5];
+    let decimal_scales = vec![None, None, None, None, Some(2u8)];
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+        let mut buf = BytesMut::with_capacity(256 * 1024);
+        let mut total_bytes: usize = 0;
+
+        let start = Instant::now();
+        for _ in 0..num_batches {
+            for row in 0..batch.num_rows {
+                types::encode_data_row_cells(
+                    &mut buf,
+                    &batch,
+                    row,
+                    &col_formats,
+                    &vector_cols,
+                    &array_cols,
+                    &decimal_scales,
+                );
+                if buf.len() >= 64 * 1024 {
+                    total_bytes += buf.len();
+                    buf.clear();
+                }
+            }
+        }
+        total_bytes += buf.len();
+        let elapsed = start.elapsed();
+
+        let rows_sec = num_rows as f64 / elapsed.as_secs_f64();
+        results.push(rows_sec);
+        tprintln!(
+            "  {} rows ({} bytes) in {:.2?}, {} rows/sec\n",
+            format_with_commas(num_rows as f64),
+            format_with_commas(total_bytes as f64),
+            elapsed,
+            format_with_commas(rows_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "Result Cell Encode",
+        "Result cell encode throughput (rows/sec)",
+        results,
+        RESULT_CELL_ENCODE_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(
+        result.passed,
+        "Result cell encode throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in result cell encode"
     );
 }

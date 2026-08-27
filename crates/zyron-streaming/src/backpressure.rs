@@ -1,9 +1,13 @@
-//! Backpressure monitoring, load shedding, rate limiting, and auto-scaling.
+//! Backpressure monitoring, load shedding, and rate limiting.
+//!
+//! Scaling decisions are not made here. They belong to the node pressure
+//! controller in `zyron_pressure::pressure_control`, which measures where
+//! throughput actually stops improving instead of comparing a queue ratio
+//! against a threshold somebody guessed.
 //!
 //! BackpressureMonitor tracks per-operator queue fill ratios using atomic
 //! counters. LoadShedder applies inline policies (priority, sampling, age)
 //! with zero allocation. RateLimiter uses a lock-free token bucket.
-//! AutoScaling provides threshold-based scaling hints with cooldown.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -289,69 +293,6 @@ impl RateLimiter {
 }
 
 // ---------------------------------------------------------------------------
-// AutoScaling
-// ---------------------------------------------------------------------------
-
-/// Threshold-based auto-scaling hints with cooldown.
-/// Does not perform actual scaling but emits ScaleUp/ScaleDown/Steady signals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalingDecision {
-    ScaleUp,
-    ScaleDown,
-    Steady,
-}
-
-pub struct AutoScaling {
-    /// Backpressure ratio above which to scale up.
-    scale_up_threshold: f64,
-    /// Backpressure ratio below which to scale down.
-    scale_down_threshold: f64,
-    /// Minimum time between scaling decisions in milliseconds.
-    cooldown_ms: u64,
-    /// Timestamp of the last scaling decision.
-    last_decision_time_ms: u64,
-}
-
-impl AutoScaling {
-    pub fn new(scale_up_threshold: f64, scale_down_threshold: f64, cooldown_ms: u64) -> Self {
-        Self {
-            scale_up_threshold,
-            scale_down_threshold,
-            cooldown_ms,
-            last_decision_time_ms: 0,
-        }
-    }
-
-    /// Evaluates current backpressure and returns a scaling decision.
-    /// `current_ratio` is the maximum backpressure ratio across operators.
-    /// `current_time_ms` is the current wall-clock time in milliseconds.
-    pub fn evaluate(&mut self, current_ratio: f64, current_time_ms: u64) -> ScalingDecision {
-        if current_time_ms < self.last_decision_time_ms + self.cooldown_ms {
-            return ScalingDecision::Steady;
-        }
-
-        let decision = if current_ratio > self.scale_up_threshold {
-            ScalingDecision::ScaleUp
-        } else if current_ratio < self.scale_down_threshold {
-            ScalingDecision::ScaleDown
-        } else {
-            ScalingDecision::Steady
-        };
-
-        if decision != ScalingDecision::Steady {
-            self.last_decision_time_ms = current_time_ms;
-        }
-
-        decision
-    }
-
-    /// Returns the configured thresholds.
-    pub fn thresholds(&self) -> (f64, f64) {
-        (self.scale_up_threshold, self.scale_down_threshold)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -431,23 +372,6 @@ mod tests {
 
         limiter.refill();
         assert!(limiter.try_acquire(1)); // Should have tokens again.
-    }
-
-    #[test]
-    fn test_auto_scaling() {
-        let mut scaler = AutoScaling::new(0.8, 0.2, 5000);
-
-        // High backpressure should trigger scale up.
-        let decision = scaler.evaluate(0.9, 10_000);
-        assert_eq!(decision, ScalingDecision::ScaleUp);
-
-        // Within cooldown, should be steady.
-        let decision = scaler.evaluate(0.9, 12_000);
-        assert_eq!(decision, ScalingDecision::Steady);
-
-        // After cooldown, low backpressure should trigger scale down.
-        let decision = scaler.evaluate(0.1, 20_000);
-        assert_eq!(decision, ScalingDecision::ScaleDown);
     }
 
     #[test]

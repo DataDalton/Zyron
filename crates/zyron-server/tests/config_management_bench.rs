@@ -74,9 +74,7 @@ fn test_config_load_valid_toml() {
 [server]
 host = "0.0.0.0"
 port = 5433
-max_connections = 500
 connection_timeout_secs = 60
-statement_timeout_secs = 300
 worker_threads = 8
 tls_enabled = false
 health_port = 9091
@@ -142,7 +140,6 @@ max_result_rows = 2000000
         // Verify all values parsed correctly
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 5433);
-        assert_eq!(config.server.max_connections, 500);
         assert_eq!(config.storage.buffer_pool_size, 256 * 1024 * 1024);
         assert_eq!(config.wal.segment_size, 32 * 1024 * 1024);
         assert_eq!(config.wal.ring_buffer_capacity, 32 * 1024 * 1024);
@@ -1044,7 +1041,6 @@ fn test_config_introspection_comprehensive() {
         // server.host defaults to [::] for dual-stack IPv6 wildcard
         ("server.host", "[::]"),
         ("server.port", "5432"),
-        ("server.max_connections", "1000"),
         ("storage.buffer_pool_size", "134217728"),
         ("wal.sync_mode", "fsync"),
         ("checkpoint.max_interval_secs", "600"),
@@ -1093,12 +1089,11 @@ fn test_config_introspection_comprehensive() {
 
     // Verify shorthand aliases
     assert_eq!(config.get_config_value("port"), Some("5432".into()));
-    assert_eq!(
-        config.get_config_value("max_connections"),
-        Some("1000".into())
-    );
+    // The removed key resolves to nothing, which is what an operator asking
+    // for it should see rather than a number that no longer governs anything
+    assert_eq!(config.get_config_value("max_connections"), None);
     assert!(config.get_config_value("server_version").is_some());
-    tprintln!("  Shorthand aliases (port, max_connections, server_version): PASS");
+    tprintln!("  Shorthand aliases (port, server_version): PASS");
 
     // Verify unknown key returns None
     assert!(config.get_config_value("nonexistent").is_none());

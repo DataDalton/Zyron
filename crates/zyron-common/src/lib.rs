@@ -6,6 +6,7 @@ pub mod array_value;
 pub mod checksum;
 pub mod cluster;
 pub mod config;
+pub mod conflict_signal;
 pub mod curve;
 pub mod decimal;
 pub mod doc_registry;
@@ -33,6 +34,7 @@ pub use checksum::{
 };
 pub use cluster::{ClusterDecision, ClusterKey, ClusterMode, ClusterStrategy, ClusteringSchedule};
 pub use config::{DeploymentMode, ServerConfig, StorageConfig};
+pub use conflict_signal::{ConflictSink, install_conflict_sink};
 pub use curve::{CellFamily, cell_family, normalize_component, ordering_key};
 pub use decimal::{
     MAX_DECIMAL_SCALE, check_precision, decimal_from_f64, decimal_to_f64, format_decimal,

@@ -37,7 +37,7 @@ async fn aborted_insert_invisible_committed_insert_visible() {
     // Transaction A inserts a row, then aborts. No physical undo runs.
     let mut a = txnm.begin(IsolationLevel::ReadCommitted).unwrap();
     let a_tid = heap
-        .insert_batch(&[Tuple::new(b"aborted-row".to_vec(), a.txn_id as u32)])
+        .insert_batch(&[Tuple::new(b"aborted-row".to_vec(), a.txn_id)])
         .await
         .unwrap()
         .remove(0);
@@ -46,7 +46,7 @@ async fn aborted_insert_invisible_committed_insert_visible() {
     // Transaction C inserts a row, then commits.
     let mut c = txnm.begin(IsolationLevel::ReadCommitted).unwrap();
     let c_tid = heap
-        .insert_batch(&[Tuple::new(b"committed-row".to_vec(), c.txn_id as u32)])
+        .insert_batch(&[Tuple::new(b"committed-row".to_vec(), c.txn_id)])
         .await
         .unwrap()
         .remove(0);

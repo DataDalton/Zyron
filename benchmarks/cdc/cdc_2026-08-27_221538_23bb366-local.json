@@ -1,0 +1,262 @@
+{
+  "id": "2026-08-27_221538_23bb366-local",
+  "date": "2026-08-27 22:16:30Z",
+  "ts": 1787868990,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Decoder Formats": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 14.38 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.36 },
+      "Formats validated": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CDF Insert Overhead": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.36 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 14.36 },
+      "Insert overhead (ns/row)": {
+        "average": 34.936200,
+        "runs": [42.44, 36.92, 31.77, 29.19, 34.36],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CDF Query 100K": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.33 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.38 },
+      "Query latency (ms)": {
+        "average": 3.800000,
+        "runs": [11.00, 2.00, 2.00, 2.00, 2.00],
+        "target": 25.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Debezium Encoding": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 14.36 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 14.45 },
+      "Encoding throughput (rec/sec)": {
+        "average": 1819076.544389,
+        "runs": [1816692.79, 1826539.40, 1824626.40, 1806285.95, 1821238.19],
+        "target": 200000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Logical Decoding": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 14.45 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.56 },
+      "Decoding throughput (rec/sec)": {
+        "average": 33317074.030372,
+        "runs": [33283962.12, 33139247.81, 33269566.66, 33393776.07, 33498817.49],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Retention Purge 1M": {
+      "util_before": { "cpu_pct": 10.0, "ram_used_gb": 14.46 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.54 },
+      "Purge latency (s)": {
+        "average": 0.069958,
+        "runs": [0.08, 0.06, 0.08, 0.07, 0.06],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "RETURNING Overhead": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.50 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 14.50 },
+      "RETURNING clause overhead (ns/row)": {
+        "average": 4.104120,
+        "runs": [4.14, 4.08, 4.11, 4.10, 4.09],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Slot Advance": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 14.50 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.50 },
+      "Slot advance latency (us/op)": {
+        "average": 0.037120,
+        "runs": [0.04, 0.04, 0.04, 0.04, 0.04],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CDC Retention": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.50 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.50 },
+      "Records purged": {
+        "average": 50.000000,
+        "runs": [50.00],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CDF Basic": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 14.51 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.52 },
+      "Records stored": {
+        "average": 150.000000,
+        "runs": [150.00],
+        "target": 150.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CDF Time Range": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.50 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.50 },
+      "Queries correct": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Debezium Format": {
+      "util_before": { "cpu_pct": 11.0, "ram_used_gb": 14.48 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.49 },
+      "Formats validated": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.49 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.48 },
+      "Metric types rendered": {
+        "average": 14.000000,
+        "runs": [14.00],
+        "target": 14.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Publication": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.49 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.50 },
+      "Operations validated": {
+        "average": 5.000000,
+        "runs": [5.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Replication Slot": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 14.50 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 14.50 },
+      "Checks passed": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "RETURNING Clause": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 14.51 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.50 },
+      "Tests passed": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "RETURNING CTE": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.50 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.50 },
+      "Audit rows": {
+        "average": 50.000000,
+        "runs": [50.00],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Snapshot": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 14.51 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.51 },
+      "Rows exported": {
+        "average": 1000.000000,
+        "runs": [1000.00],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Stream/Ingest": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.51 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.49 },
+      "Components validated": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

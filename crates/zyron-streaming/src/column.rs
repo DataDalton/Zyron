@@ -280,13 +280,28 @@ impl StreamColumnData {
         dispatch_column!(self, v => v.is_empty())
     }
 
-    /// Filter rows by boolean mask.
+    /// Filter rows by boolean mask. Counts the surviving rows first so the
+    /// result allocates once instead of growing through the filtered scan.
     pub fn filter(&self, mask: &[bool]) -> Self {
+        let keep_count = mask.iter().filter(|&&b| b).count();
         dispatch_column_rebuild!(self, v => {
-            v.iter()
-                .zip(mask.iter())
-                .filter_map(|(val, &keep)| if keep { Some(val.clone()) } else { None })
-                .collect()
+            let mut out = Vec::with_capacity(keep_count);
+            for (val, &keep) in v.iter().zip(mask.iter()) {
+                if keep {
+                    out.push(val.clone());
+                }
+            }
+            out
+        })
+    }
+
+    /// Removes the first `count` rows in place, shifting the rest down.
+    /// Used by operators that retire a leading run of expired rows without
+    /// rebuilding the column.
+    pub fn drain_front(&mut self, count: usize) {
+        dispatch_column!(self, v => {
+            let n = count.min(v.len());
+            v.drain(..n);
         })
     }
 

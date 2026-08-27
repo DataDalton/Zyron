@@ -50,20 +50,24 @@ pub async fn run_retention_sweep(
     let mut grand_total: u64 = 0;
     let publications = catalog.list_publications();
     for pub_entry in publications {
-        let retention_point = compute_retention_point(catalog, &pub_entry);
+        let (cutoff_secs, hold_lsn) = compute_retention_bounds(catalog, &pub_entry);
+        // Records older than this commit-timestamp cutoff age out. Change
+        // records stamp commit_timestamp in microseconds
+        let cutoff_micros = cutoff_secs as i64 * 1_000_000;
         if let Some(m) = metrics {
-            // Lag is how far behind wall-clock now the truncation horizon
-            // sits. compute_retention_point returns an epoch-seconds cutoff
-            // (capped by the slowest active subscriber when subscriber-lag
-            // holding is enabled).
-            let lag = current_secs().saturating_sub(retention_point);
+            // Lag is how far behind wall-clock now the age-based truncation
+            // horizon sits
+            let lag = current_secs().saturating_sub(cutoff_secs);
             m.pubRetentionLagSet(&pub_entry.id.0.to_string(), lag);
         }
         let mut total_removed: u64 = 0;
         if let Some(reg) = cdc_registry {
             let tables = catalog.get_publication_tables(pub_entry.id);
             for pt in tables {
-                match reg.truncate_before(pt.table_id.0, retention_point).await {
+                match reg
+                    .truncate_retention(pt.table_id.0, cutoff_micros, hold_lsn)
+                    .await
+                {
                     Ok(removed) => {
                         total_removed = total_removed.saturating_add(removed);
                     }
@@ -83,7 +87,8 @@ pub async fn run_retention_sweep(
         info!(
             target: "zyron::retention",
             publication = %pub_entry.name,
-            retention_point,
+            cutoff_secs,
+            hold_lsn,
             records_removed = total_removed,
             "publication retention sweep complete"
         );
@@ -91,14 +96,18 @@ pub async fn run_retention_sweep(
     grand_total
 }
 
-/// Returns the lower bound the CDF is free to truncate behind. When the
-/// publication enables subscriber-lag holding the point is the minimum of
-/// (retention_days cutoff, slowest subscriber last_seen_lsn). Otherwise it is
-/// just the time-based cutoff.
-fn compute_retention_point(catalog: &Catalog, pub_entry: &zyron_catalog::PublicationEntry) -> u64 {
-    let cutoff_ts = current_secs().saturating_sub(pub_entry.retention_days as u64 * 86400);
+/// Returns the age cutoff in epoch seconds plus the hold LSN. Records older
+/// than the cutoff age out of the CDF. When the publication holds records
+/// until subscribers advance, the hold LSN is the slowest active
+/// subscriber's confirmed position: records above it stay regardless of
+/// age, in the LSN units the feed's commit versions actually use.
+fn compute_retention_bounds(
+    catalog: &Catalog,
+    pub_entry: &zyron_catalog::PublicationEntry,
+) -> (u64, Option<u64>) {
+    let cutoff_secs = current_secs().saturating_sub(pub_entry.retention_days as u64 * 86400);
     if !pub_entry.retain_until_advance {
-        return cutoff_ts;
+        return (cutoff_secs, None);
     }
     let mut min_lsn = u64::MAX;
     for sub in catalog.list_publication_subscribers(pub_entry.id) {
@@ -107,9 +116,9 @@ fn compute_retention_point(catalog: &Catalog, pub_entry: &zyron_catalog::Publica
         }
     }
     if min_lsn == u64::MAX {
-        cutoff_ts
+        (cutoff_secs, None)
     } else {
-        cutoff_ts.min(min_lsn)
+        (cutoff_secs, Some(min_lsn))
     }
 }
 
@@ -158,7 +167,7 @@ mod tests {
         let wal = Arc::new(
             WalWriter::new(WalWriterConfig {
                 wal_dir,
-                segment_size: 4 * 1024 * 1024,
+                segment_size: 1024 * 1024,
                 fsync_enabled: false,
                 ring_buffer_capacity: 1 * 1024 * 1024,
             })

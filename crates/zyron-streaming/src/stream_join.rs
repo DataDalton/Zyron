@@ -22,23 +22,40 @@ use crate::watermark::Watermark;
 // ---------------------------------------------------------------------------
 
 /// Stores ALL rows for one side of a join in a single set of column Vecs.
-/// A separate FlatU64Map maps key_hash -> list of row indices.
-/// Zero per-key allocation. Appending a row pushes into the shared columns
-/// and adds the row index to the key's index list.
+/// A separate FlatU64Map maps key_hash -> the newest row holding that key,
+/// and a per-row link array chains the rest. Zero per-key allocation.
+///
+/// Rows carry a logical id that only ever increases. Physical position is
+/// `id - base`, so retiring a leading run of expired rows is a head bump
+/// plus an occasional block move, and the ids already recorded in the index
+/// and the chains stay valid. Nothing is renumbered on the eviction path.
 struct JoinStore {
     columns: Vec<StreamColumnData>,
     event_times: Vec<i64>,
-    /// key_hash -> start of linked list in `next` array.
+    /// key_hash -> logical id of the newest row with that key.
     index: FlatU64Map<u64>,
-    /// Per-row linked list: next[row] = next row with same key, or sentinel.
+    /// Per-row link: next[physical] = logical id of the next older row with
+    /// the same key, or the sentinel.
     next: Vec<u64>,
-    len: usize,
+    /// Logical id of physical row 0.
+    base: u64,
+    /// Physical index of the first live row. Rows below it are evicted but
+    /// still resident until the next block move.
+    head: usize,
+    /// Live row count at the last compaction, the reference point for the
+    /// doubling rule that schedules the next one.
+    compact_watermark: usize,
     initialized: bool,
 }
 
 /// Sentinel for end of linked list. Uses u64::MAX - 1 to avoid collision
 /// with FlatU64Map's empty sentinel (u64::MAX).
 const JOIN_STORE_NULL: u64 = u64::MAX - 1;
+
+/// Floor under the doubling rules that schedule the block move, the index
+/// prune, and the compaction, so a small store does not rebuild itself on
+/// every eviction pass.
+const JOIN_STORE_MIN_ROWS: usize = 4096;
 
 impl JoinStore {
     fn new() -> Self {
@@ -47,9 +64,23 @@ impl JoinStore {
             event_times: Vec::new(),
             index: FlatU64Map::new(),
             next: Vec::new(),
-            len: 0,
+            base: 0,
+            head: 0,
+            compact_watermark: 0,
             initialized: false,
         }
+    }
+
+    /// Rows a probe can still reach.
+    #[inline]
+    fn live_len(&self) -> usize {
+        self.event_times.len() - self.head
+    }
+
+    /// Lowest logical id that is still live.
+    #[inline]
+    fn live_floor(&self) -> u64 {
+        self.base + self.head as u64
     }
 
     /// Initializes column schema from the first batch. Called once.
@@ -64,7 +95,7 @@ impl JoinStore {
     /// Appends a single row.
     #[inline]
     fn append_row(&mut self, record: &StreamRecord, row: usize, key_hash: u64) {
-        let row_idx = self.len as u64;
+        let row_id = self.base + self.event_times.len() as u64;
         // Push column values using typed fast paths.
         for (col_buf, src_col) in self.columns.iter_mut().zip(record.batch.columns.iter()) {
             match (col_buf, &src_col.data) {
@@ -84,20 +115,21 @@ impl JoinStore {
         }
         self.event_times.push(record.event_times[row]);
 
-        // Link into the key's chain.
+        // Link into the key's chain, newest first.
         let prev_head = self.index.get(key_hash).copied().unwrap_or(JOIN_STORE_NULL);
         self.next.push(prev_head);
-        self.index.insert(key_hash, row_idx);
-        self.len += 1;
+        self.index.insert(key_hash, row_id);
     }
 
-    /// Iterates all row indices for a given key hash.
+    /// Iterates the live physical row indices for a key hash, newest first.
     #[inline]
     fn rows_for_key(&self, key_hash: u64) -> JoinStoreIter<'_> {
-        let head = self.index.get(key_hash).copied().unwrap_or(JOIN_STORE_NULL);
+        let chain_head = self.index.get(key_hash).copied().unwrap_or(JOIN_STORE_NULL);
         JoinStoreIter {
             store: self,
-            cursor: head,
+            cursor: chain_head,
+            base: self.base,
+            floor: self.live_floor(),
         }
     }
 
@@ -105,21 +137,79 @@ impl JoinStore {
         for col in &mut self.columns {
             *col = col.empty_like();
         }
+        // Push the base past every id handed out so far, so no chain link
+        // that outlives this call can alias a future row.
+        self.base += self.event_times.len() as u64;
         self.event_times.clear();
         self.index.clear();
         self.next.clear();
-        self.len = 0;
+        self.head = 0;
+        self.compact_watermark = 0;
     }
 
-    /// Evicts rows older than cutoff by rebuilding the store.
+    /// Evicts rows older than cutoff.
+    ///
+    /// Rows arrive in near event-time order, so the common case advances the
+    /// head over a leading run of expired rows and copies nothing. Three
+    /// doubling rules keep the hidden state bounded without paying more than
+    /// a constant per appended row: a block move reclaims the retired
+    /// prefix, an index prune drops keys whose rows are all gone, and a full
+    /// compaction removes the out-of-order stragglers the head cannot pass.
     fn evict_before(&mut self, cutoff: i64) {
-        if self.len == 0 {
+        let total = self.event_times.len();
+        if total == self.head {
             return;
         }
 
+        let mut h = self.head;
+        while h < total && self.event_times[h] < cutoff {
+            h += 1;
+        }
+        self.head = h;
+        if self.head == total {
+            self.clear();
+            return;
+        }
+
+        let live = self.live_len();
+        if self.head >= live {
+            self.drop_retired_prefix();
+        }
+        if self.index.len() >= 2 * live.max(JOIN_STORE_MIN_ROWS) {
+            let floor = self.live_floor();
+            self.index.retain(|_, id| *id >= floor);
+        }
+        if live > 2 * self.compact_watermark.max(JOIN_STORE_MIN_ROWS) {
+            self.compact(cutoff);
+        }
+    }
+
+    /// Moves the live rows down over the retired prefix and raises the base
+    /// by the same amount, which leaves every recorded logical id valid.
+    fn drop_retired_prefix(&mut self) {
+        let k = self.head;
+        if k == 0 {
+            return;
+        }
+        for col in &mut self.columns {
+            col.drain_front(k);
+        }
+        self.event_times.drain(..k);
+        self.next.drain(..k);
+        self.base += k as u64;
+        self.head = 0;
+    }
+
+    /// Rebuilds the store from the live rows at or after cutoff. This is the
+    /// only path that drops a row the head cannot reach, so it is what bounds
+    /// state when events arrive far out of order.
+    fn compact(&mut self, cutoff: i64) {
+        self.drop_retired_prefix();
+        let live = self.event_times.len();
         let mask: Vec<bool> = self.event_times.iter().map(|&t| t >= cutoff).collect();
         let keep_count = mask.iter().filter(|&&b| b).count();
-        if keep_count == self.len {
+        if keep_count == live {
+            self.compact_watermark = live;
             return;
         }
         if keep_count == 0 {
@@ -127,39 +217,45 @@ impl JoinStore {
             return;
         }
 
-        // Build index mapping: old_row -> new_row.
-        let mut new_columns: Vec<StreamColumnData> =
+        // Ids restart past every id handed out so far, so a stale link can
+        // never alias a row that survives the rebuild.
+        let new_base = self.base + live as u64;
+        let new_columns: Vec<StreamColumnData> =
             self.columns.iter().map(|c| c.filter(&mask)).collect();
         let mut new_times = Vec::with_capacity(keep_count);
+        let mut old_to_new: Vec<u64> = vec![JOIN_STORE_NULL; live];
+        let mut assigned = 0u64;
         for (i, &keep) in mask.iter().enumerate() {
             if keep {
+                old_to_new[i] = new_base + assigned;
                 new_times.push(self.event_times[i]);
+                assigned += 1;
             }
         }
 
-        // Rebuild index and next chains.
-        let mut new_index = FlatU64Map::new();
-        let mut new_next: Vec<u64> = Vec::with_capacity(keep_count);
-        let mut old_row_to_new: Vec<u64> = vec![JOIN_STORE_NULL; self.len];
-        let mut new_row = 0u64;
-        for i in 0..self.len {
-            if mask[i] {
-                old_row_to_new[i] = new_row;
-                new_row += 1;
-            }
-        }
-
-        new_next.resize(keep_count, JOIN_STORE_NULL);
-        self.index.iter(|key_hash, &head| {
-            let mut cursor = head;
+        // Relink each chain in its original newest-first order. Probes stop
+        // at the first id below the floor, so a chain that came out reversed
+        // would hide its live rows.
+        let mut new_index = FlatU64Map::with_capacity(keep_count);
+        let mut new_next: Vec<u64> = vec![JOIN_STORE_NULL; keep_count];
+        let base = self.base;
+        let next = &self.next;
+        self.index.iter(|key_hash, &chain_head| {
+            let mut cursor = chain_head;
             let mut new_head = JOIN_STORE_NULL;
-            while cursor != JOIN_STORE_NULL {
-                let mapped = old_row_to_new[cursor as usize];
+            let mut prev_mapped = JOIN_STORE_NULL;
+            while cursor != JOIN_STORE_NULL && cursor >= base {
+                let phys = (cursor - base) as usize;
+                let mapped = old_to_new[phys];
                 if mapped != JOIN_STORE_NULL {
-                    new_next[mapped as usize] = new_head;
-                    new_head = mapped;
+                    if prev_mapped == JOIN_STORE_NULL {
+                        new_head = mapped;
+                    } else {
+                        new_next[(prev_mapped - new_base) as usize] = mapped;
+                    }
+                    prev_mapped = mapped;
                 }
-                cursor = self.next[cursor as usize];
+                cursor = next[phys];
             }
             if new_head != JOIN_STORE_NULL {
                 new_index.insert(key_hash, new_head);
@@ -170,25 +266,120 @@ impl JoinStore {
         self.event_times = new_times;
         self.index = new_index;
         self.next = new_next;
-        self.len = keep_count;
+        self.base = new_base;
+        self.head = 0;
+        self.compact_watermark = keep_count;
     }
+}
+
+/// One key column pair with its slices already resolved, so the probe
+/// loop compares values with a single discriminant switch instead of
+/// re-resolving the columns and matching a pair of data enums on every
+/// candidate row it walks.
+enum KeyCmp<'a> {
+    Int64(&'a [i64], &'a [i64]),
+    Int32(&'a [i32], &'a [i32]),
+    Float64(&'a [f64], &'a [f64]),
+    Utf8(&'a [String], &'a [String]),
+    Boolean(&'a [bool], &'a [bool]),
+    Other(&'a StreamColumnData, &'a StreamColumnData),
+}
+
+impl KeyCmp<'_> {
+    #[inline(always)]
+    fn eq(&self, probe_row: usize, store_row: usize) -> bool {
+        match self {
+            KeyCmp::Int64(x, y) => x[probe_row] == y[store_row],
+            KeyCmp::Int32(x, y) => x[probe_row] == y[store_row],
+            KeyCmp::Float64(x, y) => x[probe_row] == y[store_row],
+            KeyCmp::Utf8(x, y) => x[probe_row] == y[store_row],
+            KeyCmp::Boolean(x, y) => x[probe_row] == y[store_row],
+            KeyCmp::Other(x, y) => x.get_scalar(probe_row) == y.get_scalar(store_row),
+        }
+    }
+}
+
+/// Resolves every key column pair once per probe batch. A store that has
+/// not taken a schema yet holds no columns and no rows, so it yields no
+/// candidates and the empty result is never consulted.
+fn build_key_cmps<'a>(
+    probe: &'a StreamBatch,
+    probe_keys: &[usize],
+    store: &'a JoinStore,
+    store_keys: &[usize],
+) -> Vec<KeyCmp<'a>> {
+    if !store.initialized || store.columns.is_empty() {
+        return Vec::new();
+    }
+    probe_keys
+        .iter()
+        .zip(store_keys.iter())
+        .map(|(&pc, &sc)| {
+            let p = &probe.column(pc).data;
+            let s = &store.columns[sc];
+            match (p, s) {
+                (StreamColumnData::Int64(x), StreamColumnData::Int64(y)) => KeyCmp::Int64(x, y),
+                (StreamColumnData::Int32(x), StreamColumnData::Int32(y)) => KeyCmp::Int32(x, y),
+                (StreamColumnData::Float64(x), StreamColumnData::Float64(y)) => {
+                    KeyCmp::Float64(x, y)
+                }
+                (StreamColumnData::Utf8(x), StreamColumnData::Utf8(y)) => KeyCmp::Utf8(x, y),
+                (StreamColumnData::Boolean(x), StreamColumnData::Boolean(y)) => {
+                    KeyCmp::Boolean(x, y)
+                }
+                (x, y) => KeyCmp::Other(x, y),
+            }
+        })
+        .collect()
+}
+
+/// True when every resolved key pair agrees. The single-key case, which
+/// is the common one, skips the iterator entirely.
+#[inline(always)]
+fn key_cmps_match(cmps: &[KeyCmp<'_>], probe_row: usize, store_row: usize) -> bool {
+    match cmps {
+        [one] => one.eq(probe_row, store_row),
+        many => many.iter().all(|c| c.eq(probe_row, store_row)),
+    }
+}
+
+/// Per-row flags for rows whose join key holds a NULL in any key column.
+/// Such a row can never match anything and is excluded from both the probe
+/// and the store, instead of all NULL keys hashing to one sentinel and
+/// joining each other
+fn null_key_rows(batch: &StreamBatch, key_cols: &[usize], num_rows: usize) -> Vec<bool> {
+    let mut out = vec![false; num_rows];
+    for &kc in key_cols {
+        let col = batch.column(kc);
+        for (row, slot) in out.iter_mut().enumerate() {
+            if !*slot && col.is_null(row) {
+                *slot = true;
+            }
+        }
+    }
+    out
 }
 
 struct JoinStoreIter<'a> {
     store: &'a JoinStore,
     cursor: u64,
+    /// Logical id of physical row 0.
+    base: u64,
+    /// Lowest live logical id. Chains descend, so reaching an id below this
+    /// means every remaining row in the chain is evicted.
+    floor: u64,
 }
 
 impl Iterator for JoinStoreIter<'_> {
-    type Item = usize; // row index
+    type Item = usize; // physical row index
     #[inline]
     fn next(&mut self) -> Option<usize> {
-        if self.cursor == JOIN_STORE_NULL {
+        if self.cursor == JOIN_STORE_NULL || self.cursor < self.floor {
             return None;
         }
-        let row = self.cursor as usize;
-        self.cursor = self.store.next[row];
-        Some(row)
+        let phys = (self.cursor - self.base) as usize;
+        self.cursor = self.store.next[phys];
+        Some(phys)
     }
 }
 
@@ -214,6 +405,11 @@ pub struct StreamStreamJoin {
     current_watermark: i64,
     is_left_input: bool,
     hash_buf: Vec<u64>,
+    /// Highest event time observed, the safety clock for eviction when
+    /// watermarks stall or never arrive.
+    max_event_time_seen: i64,
+    /// Event time of the last safety eviction pass.
+    last_safety_evict: i64,
 }
 
 impl StreamStreamJoin {
@@ -234,11 +430,38 @@ impl StreamStreamJoin {
             current_watermark: i64::MIN,
             is_left_input: true,
             hash_buf: Vec::new(),
+            max_event_time_seen: i64::MIN,
+            last_safety_evict: i64::MIN,
         }
     }
 
     pub fn set_input_side(&mut self, is_left: bool) {
         self.is_left_input = is_left;
+    }
+
+    /// Eviction driven by event time instead of watermarks, so a source
+    /// that never delivers a watermark cannot grow join state without
+    /// bound. The cutoff trails the newest event by several windows, which
+    /// keeps every row a plausible late watermark could still match, and
+    /// the pass runs at most once per window of event-time progress.
+    fn safety_evict(&mut self, batch_max_event_time: i64) {
+        if batch_max_event_time > self.max_event_time_seen {
+            self.max_event_time_seen = batch_max_event_time;
+        }
+        let stride = self.window_ms.max(1);
+        if self
+            .max_event_time_seen
+            .saturating_sub(self.last_safety_evict)
+            < stride
+        {
+            return;
+        }
+        self.last_safety_evict = self.max_event_time_seen;
+        let cutoff = self
+            .max_event_time_seen
+            .saturating_sub(self.window_ms.saturating_mul(4));
+        self.left_state.evict_before(cutoff);
+        self.right_state.evict_before(cutoff);
     }
 }
 
@@ -269,11 +492,14 @@ impl StreamOperator for StreamStreamJoin {
             hash_multi_column_batch_into(&cols, num_rows, &mut self.hash_buf);
         }
 
+        // Rows whose key contains a NULL can never match and never store
+        let null_keys = null_key_rows(&record.batch, key_cols, num_rows);
+
         // Probe the other side. Build output columns inline.
-        let other = if self.is_left_input {
-            &self.right_state
+        let (other, other_keys) = if self.is_left_input {
+            (&self.right_state, &self.right_key_cols)
         } else {
-            &self.left_state
+            (&self.left_state, &self.left_key_cols)
         };
         let build_col_count = other.columns.len();
 
@@ -282,9 +508,20 @@ impl StreamOperator for StreamStreamJoin {
         let mut build_out_cols: Vec<StreamColumnData> =
             other.columns.iter().map(|c| c.empty_like()).collect();
 
+        // Key column pairs resolved once for the whole batch, so walking a
+        // hash chain costs one discriminant switch per key per candidate
+        // instead of two column lookups and a paired enum match
+        let key_cmps = build_key_cmps(&record.batch, key_cols, other, other_keys);
+
         for (row_idx, &key_hash) in self.hash_buf.iter().enumerate() {
+            if null_keys[row_idx] {
+                continue;
+            }
             let probe_time = record.event_times[row_idx];
             for br in other.rows_for_key(key_hash) {
+                if !key_cmps_match(&key_cmps, row_idx, br) {
+                    continue;
+                }
                 if (probe_time - other.event_times[br]).abs() <= self.window_ms {
                     probe_rows.push(row_idx as u32);
                     out_event_times.push(probe_time.max(other.event_times[br]));
@@ -332,6 +569,7 @@ impl StreamOperator for StreamStreamJoin {
         };
 
         // Insert into our side. Single shared store, zero per-key allocation.
+        // Null-key rows are skipped, they can never match a future probe
         let my = if self.is_left_input {
             &mut self.left_state
         } else {
@@ -339,7 +577,14 @@ impl StreamOperator for StreamStreamJoin {
         };
         my.init_schema(&record.batch);
         for (row_idx, &key_hash) in self.hash_buf.iter().enumerate() {
+            if null_keys[row_idx] {
+                continue;
+            }
             my.append_row(&record, row_idx, key_hash);
+        }
+
+        if let Some(&batch_max) = record.event_times.iter().max() {
+            self.safety_evict(batch_max);
         }
 
         let out_rows: usize = output.iter().map(|r| r.num_rows()).sum();
@@ -397,6 +642,11 @@ pub struct IntervalJoin {
     current_watermark: i64,
     is_left_input: bool,
     hash_buf: Vec<u64>,
+    /// Highest event time observed, the safety clock for eviction when
+    /// watermarks stall or never arrive.
+    max_event_time_seen: i64,
+    /// Event time of the last safety eviction pass.
+    last_safety_evict: i64,
 }
 
 impl IntervalJoin {
@@ -419,11 +669,46 @@ impl IntervalJoin {
             current_watermark: i64::MIN,
             is_left_input: true,
             hash_buf: Vec::new(),
+            max_event_time_seen: i64::MIN,
+            last_safety_evict: i64::MIN,
         }
     }
 
     pub fn set_input_side(&mut self, is_left: bool) {
         self.is_left_input = is_left;
+    }
+
+    /// Eviction driven by event time instead of watermarks, so a source
+    /// that never delivers a watermark cannot grow join state without
+    /// bound. The cutoffs trail the newest event by several interval
+    /// spans, mirroring the side-specific watermark eviction bounds.
+    fn safety_evict(&mut self, batch_max_event_time: i64) {
+        if batch_max_event_time > self.max_event_time_seen {
+            self.max_event_time_seen = batch_max_event_time;
+        }
+        let span = self
+            .upper_bound_ms
+            .saturating_sub(self.lower_bound_ms)
+            .max(1);
+        if self
+            .max_event_time_seen
+            .saturating_sub(self.last_safety_evict)
+            < span
+        {
+            return;
+        }
+        self.last_safety_evict = self.max_event_time_seen;
+        let slack = span.saturating_mul(3);
+        self.left_state.evict_before(
+            self.max_event_time_seen
+                .saturating_sub(self.upper_bound_ms)
+                .saturating_sub(slack),
+        );
+        self.right_state.evict_before(
+            self.max_event_time_seen
+                .saturating_add(self.lower_bound_ms)
+                .saturating_sub(slack),
+        );
     }
 }
 
@@ -454,18 +739,32 @@ impl StreamOperator for IntervalJoin {
             hash_multi_column_batch_into(&cols, num_rows, &mut self.hash_buf);
         }
 
-        let other = if self.is_left_input {
-            &self.right_state
+        // Rows whose key contains a NULL can never match and never store
+        let null_keys = null_key_rows(&record.batch, key_cols, num_rows);
+
+        let (other, other_keys) = if self.is_left_input {
+            (&self.right_state, &self.right_key_cols)
         } else {
-            &self.left_state
+            (&self.left_state, &self.left_key_cols)
         };
 
         let mut probe_indices: Vec<u32> = Vec::with_capacity(num_rows);
         let mut build_times = Vec::with_capacity(num_rows);
 
+        // Key column pairs resolved once for the whole batch, so walking a
+        // hash chain costs one discriminant switch per key per candidate
+        // instead of two column lookups and a paired enum match
+        let key_cmps = build_key_cmps(&record.batch, key_cols, other, other_keys);
+
         for (row_idx, &key_hash) in self.hash_buf.iter().enumerate() {
+            if null_keys[row_idx] {
+                continue;
+            }
             let probe_time = record.event_times[row_idx];
             for br in other.rows_for_key(key_hash) {
+                if !key_cmps_match(&key_cmps, row_idx, br) {
+                    continue;
+                }
                 let bt = other.event_times[br];
                 let (left_time, right_time) = if self.is_left_input {
                     (probe_time, bt)
@@ -510,7 +809,14 @@ impl StreamOperator for IntervalJoin {
         };
         my.init_schema(&record.batch);
         for (row_idx, &key_hash) in self.hash_buf.iter().enumerate() {
+            if null_keys[row_idx] {
+                continue;
+            }
             my.append_row(&record, row_idx, key_hash);
+        }
+
+        if let Some(&batch_max) = record.event_times.iter().max() {
+            self.safety_evict(batch_max);
         }
 
         let out_rows: usize = output.iter().map(|r| r.num_rows()).sum();
@@ -521,10 +827,18 @@ impl StreamOperator for IntervalJoin {
     fn on_watermark(&mut self, watermark: Watermark) -> Result<Vec<StreamRecord>> {
         self.current_watermark = watermark.timestamp_ms;
         self.op_metrics.update_watermark(watermark.timestamp_ms);
-        let window_ms = self.upper_bound_ms - self.lower_bound_ms;
-        let cutoff = watermark.timestamp_ms - window_ms;
-        self.left_state.evict_before(cutoff);
-        self.right_state.evict_before(cutoff);
+        // The match condition is left + lower <= right <= left + upper.
+        // A left row stays joinable while a future right row (arriving at
+        // or after the watermark) could satisfy left + upper >= right, so
+        // it dies when left < wm - upper. A right row stays joinable while
+        // a future left row could satisfy left + lower <= right, so it
+        // dies when right < wm + lower. One symmetric cutoff was wrong in
+        // both directions: for positive lower bounds it evicted right rows
+        // that could still join (silent missed joins), for negative it
+        // over-retained
+        let wm = watermark.timestamp_ms;
+        self.left_state.evict_before(wm - self.upper_bound_ms);
+        self.right_state.evict_before(wm + self.lower_bound_ms);
         Ok(Vec::new())
     }
 
@@ -653,6 +967,13 @@ impl StreamOperator for LookupJoin {
             }
             matched_probe_indices.push(row_idx as u32);
             matched_build_hashes.push(key_hash);
+        }
+
+        // The cap holds on the insert path too, a stream that never
+        // delivers a watermark would otherwise grow the cache without
+        // bound on high-cardinality keys
+        if self.cache.len() > self.max_entries {
+            self.evict_expired();
         }
 
         let output = if !matched_probe_indices.is_empty() {
@@ -925,6 +1246,19 @@ impl StreamOperator for TemporalJoin {
 
     fn on_watermark(&mut self, watermark: Watermark) -> Result<Vec<StreamRecord>> {
         self.op_metrics.update_watermark(watermark.timestamp_ms);
+        // A probe at or past the watermark resolves to the newest version
+        // at or below its timestamp, and probes below the watermark no
+        // longer arrive. So per key everything older than the newest
+        // version at or below the watermark is unreachable and dropped,
+        // which is what bounds the map on both axes
+        let wm = watermark.timestamp_ms;
+        self.versions.retain(|_key, versions| {
+            let newest_at_or_below = versions.partition_point(|(t, _)| *t <= wm);
+            if newest_at_or_below > 1 {
+                versions.drain(..newest_at_or_below - 1);
+            }
+            !versions.is_empty()
+        });
         Ok(Vec::new())
     }
 

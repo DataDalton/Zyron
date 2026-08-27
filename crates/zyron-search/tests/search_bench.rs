@@ -36,6 +36,9 @@
 //!
 //! Run: cargo test -p zyron-search --test search_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 use std::time::Instant;
 

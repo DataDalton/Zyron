@@ -20,6 +20,28 @@ pub enum RowLocator {
 }
 
 impl RowLocator {
+    /// A hash identifying the storage extent this row lives in, for the
+    /// hot-partition sketch.
+    ///
+    /// The extent rather than the row, for two reasons. An update under
+    /// multi-version storage writes a new version at a new address, so the row
+    /// identity a lock is taken on moves every time the row is written and a
+    /// row-level key would see a stream of distinct keys where there is one
+    /// contended row. And the extent is what actually does not spread: writers
+    /// serialize on a page latch and on a file's commit, which is exactly the
+    /// saturation that more nodes cannot relieve.
+    ///
+    /// Distinct per storage form, so a heap page and a columnar file that
+    /// happen to share numbers are two extents rather than one.
+    pub fn contention_hash(&self) -> u64 {
+        let (tag, extent) = match *self {
+            RowLocator::Heap { page, .. } => (1u64, page.as_u64()),
+            RowLocator::Columnar { file_id, .. } => (2, file_id),
+            RowLocator::Lake { file_id, .. } => (3, file_id),
+        };
+        crate::hash_combine(tag, extent)
+    }
+
     /// Widest payload form, one tag byte plus two u64 words. Every locator
     /// can be written this wide, so it is also the buffer size a caller needs
     pub const MAX_PAYLOAD_LEN: usize = 17;

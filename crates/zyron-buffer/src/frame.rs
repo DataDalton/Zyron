@@ -53,8 +53,6 @@ pub struct BufferFrame {
     /// LSN of the first modification since last flush. 0 = clean.
     /// Stamped via CAS from 0 on first dirty, so it always reflects the oldest unflushed change.
     dirty_lsn: AtomicU64,
-    /// Reference bit for clock replacement algorithm.
-    reference_bit: AtomicBool,
 }
 
 impl BufferFrame {
@@ -67,7 +65,6 @@ impl BufferFrame {
             pin_count: AtomicU32::new(0),
             is_dirty: AtomicBool::new(false),
             dirty_lsn: AtomicU64::new(0),
-            reference_bit: AtomicBool::new(false),
         }
     }
 
@@ -126,16 +123,16 @@ impl BufferFrame {
 
     /// Increments the pin count and returns the previous pin count.
     /// Returns 0 if the frame was unpinned before this call.
-    /// Only sets reference bit on 0->1 transition to reduce atomic stores.
     /// Acquire so the pin is ordered before any later eviction-time pin_count
     /// read, an evictor that observes this pin cannot reorder its check ahead of it.
+    ///
+    /// Recency belongs to the replacer, which is the only thing that reads it
+    /// and the only thing that clears it. A second bit on the frame would say
+    /// the page had been touched at some point since the frame was reused,
+    /// which is true of every resident page and therefore says nothing.
     #[inline(always)]
     pub fn pin(&self) -> u32 {
-        let prev = self.pin_count.fetch_add(1, Ordering::Acquire);
-        if prev == 0 {
-            self.reference_bit.store(true, Ordering::Relaxed);
-        }
-        prev
+        self.pin_count.fetch_add(1, Ordering::Acquire)
     }
 
     /// Decrements the pin count.
@@ -207,18 +204,6 @@ impl BufferFrame {
         self.dirty_lsn
             .compare_exchange(expected, 0, Ordering::Release, Ordering::Relaxed)
             .is_ok()
-    }
-
-    /// Returns the reference bit value.
-    #[inline]
-    pub fn reference_bit(&self) -> bool {
-        self.reference_bit.load(Ordering::Relaxed)
-    }
-
-    /// Sets the reference bit.
-    #[inline]
-    pub fn set_reference_bit(&self, value: bool) {
-        self.reference_bit.store(value, Ordering::Relaxed);
     }
 
     /// Returns true if this frame is empty (no page loaded).
@@ -305,7 +290,6 @@ impl BufferFrame {
         self.page_id.store(NO_PAGE, Ordering::Release);
         self.is_dirty.store(false, Ordering::Release);
         self.dirty_lsn.store(0, Ordering::Release);
-        self.reference_bit.store(false, Ordering::Relaxed);
         // Zero out data for security
         let mut data = self.data.write();
         data.fill(0);
@@ -323,14 +307,9 @@ impl BufferFrame {
     /// whose identity is being replaced.
     #[inline]
     pub fn try_claim(&self) -> bool {
-        let claimed = self
-            .pin_count
+        self.pin_count
             .compare_exchange(0, CLAIM, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if claimed {
-            self.reference_bit.store(true, Ordering::Relaxed);
-        }
-        claimed
+            .is_ok()
     }
 
     /// Pins the frame unless it is claimed. A claimed frame is mid
@@ -344,9 +323,6 @@ impl BufferFrame {
         if prev & CLAIM != 0 {
             self.unpin();
             return false;
-        }
-        if prev == 0 {
-            self.reference_bit.store(true, Ordering::Relaxed);
         }
         true
     }
@@ -385,7 +361,6 @@ impl std::fmt::Debug for BufferFrame {
             .field("page_id", &self.page_id())
             .field("pin_count", &self.pin_count())
             .field("is_dirty", &self.is_dirty())
-            .field("reference_bit", &self.reference_bit())
             .finish()
     }
 }
@@ -417,7 +392,6 @@ mod tests {
         assert!(frame.page_id().is_none());
         assert_eq!(frame.pin_count(), 0);
         assert!(!frame.is_dirty());
-        assert!(!frame.reference_bit());
         assert!(frame.is_empty());
     }
 
@@ -430,7 +404,6 @@ mod tests {
         frame.pin();
         assert!(frame.is_pinned());
         assert_eq!(frame.pin_count(), 1);
-        assert!(frame.reference_bit());
 
         frame.pin();
         assert_eq!(frame.pin_count(), 2);
@@ -523,7 +496,6 @@ mod tests {
         frame.set_page_id(Some(PageId::new(1, 1)));
         frame.pin();
         frame.set_dirty(true);
-        frame.set_reference_bit(true);
         {
             let mut data = frame.write_data();
             data[0] = 0xFF;
@@ -536,24 +508,10 @@ mod tests {
         assert!(frame.page_id().is_none());
         assert_eq!(frame.pin_count(), 0);
         assert!(!frame.is_dirty());
-        assert!(!frame.reference_bit());
         assert!(frame.is_empty());
 
         let data = frame.read_data();
         assert_eq!(data[0], 0);
-    }
-
-    #[test]
-    fn test_buffer_frame_reference_bit() {
-        let frame = BufferFrame::new(FrameId(0));
-
-        assert!(!frame.reference_bit());
-
-        frame.set_reference_bit(true);
-        assert!(frame.reference_bit());
-
-        frame.set_reference_bit(false);
-        assert!(!frame.reference_bit());
     }
 
     #[test]
@@ -590,15 +548,6 @@ mod tests {
 
         frame.reset();
         assert_eq!(frame.dirty_lsn(), 0);
-    }
-
-    #[test]
-    fn test_buffer_frame_pin_sets_reference() {
-        let frame = BufferFrame::new(FrameId(0));
-
-        assert!(!frame.reference_bit());
-        frame.pin();
-        assert!(frame.reference_bit());
     }
 
     #[test]

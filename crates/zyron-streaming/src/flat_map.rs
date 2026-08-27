@@ -288,10 +288,17 @@ impl<V> FlatU64Map<V> {
         }
         self.keys[idx] = U64MAP_EMPTY;
         self.len -= 1;
-        // Backward-shift deletion to maintain probe chains.
+        // Backward-shift deletion to maintain probe chains. Probing is
+        // linear and lookups stop at the first empty slot, so the run that
+        // follows the hole has to stay reachable: every entry whose ideal
+        // slot is at or before the hole moves down into it, and an entry
+        // that must stay put is stepped over rather than ending the scan.
+        // Breaking out at the first such entry would strand everything
+        // after it behind the hole.
         let mut prev = idx;
         let mut cur = (idx + 1) & self.mask;
-        loop {
+        let mut scanned = 0usize;
+        while scanned < self.capacity {
             let ck = self.keys[cur];
             if ck == U64MAP_EMPTY {
                 break;
@@ -302,14 +309,14 @@ impl<V> FlatU64Map<V> {
             } else {
                 ideal <= prev && ideal > cur
             };
-            if !should_shift {
-                break;
+            if should_shift {
+                self.keys[prev] = ck;
+                self.values.swap(prev, cur);
+                self.keys[cur] = U64MAP_EMPTY;
+                prev = cur;
             }
-            self.keys[prev] = self.keys[cur];
-            self.values.swap(prev, cur);
-            self.keys[cur] = U64MAP_EMPTY;
-            prev = cur;
             cur = (cur + 1) & self.mask;
+            scanned += 1;
         }
         true
     }
@@ -564,6 +571,41 @@ mod tests {
         assert!(map.remove(hash_int(42)));
         assert_eq!(map.get(hash_int(42)), None);
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn bulk_remove_leaves_every_surviving_key_reachable() {
+        // Removals collide often enough here that most holes land inside a
+        // probe run. A backward shift that stops at the first entry it may
+        // not move strands everything behind the hole, so the survivors go
+        // missing and reinserting them creates a second copy of the key.
+        for round in 0..40u64 {
+            let mut map: FlatU64Map<u64> = FlatU64Map::new();
+            let n = 5_000u64;
+            for i in 0..n {
+                map.insert(hash_int(i), i);
+            }
+            let cutoff = round * 97 % n;
+            map.retain(|_, v| *v >= cutoff);
+            assert_eq!(map.len(), (n - cutoff) as usize);
+            for i in 0..n {
+                let got = map.get(hash_int(i)).copied();
+                let want = if i >= cutoff { Some(i) } else { None };
+                assert_eq!(got, want, "round {round}, key {i}");
+            }
+
+            // Refilling must overwrite in place, not add a shadowed copy.
+            for i in 0..n {
+                map.insert(hash_int(i), i + 1_000_000);
+            }
+            assert_eq!(map.len(), n as usize);
+            let mut visited = 0usize;
+            map.iter(|_, _| visited += 1);
+            assert_eq!(visited, n as usize, "round {round}: duplicate entries");
+            for i in 0..n {
+                assert_eq!(map.get(hash_int(i)).copied(), Some(i + 1_000_000));
+            }
+        }
     }
 
     #[test]

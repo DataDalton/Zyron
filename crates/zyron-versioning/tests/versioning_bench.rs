@@ -24,6 +24,9 @@
 //! | branch_create              | latency    | < 10us per branch                        |
 //! | branch_page_resolution     | latency    | < 5ns for unmodified pages               |
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
@@ -1128,7 +1131,7 @@ fn perf_time_travel_scan_overhead() {
 
     // Build 1M versioned headers: all created at version 1, live
     let headers: Vec<VersionedTupleHeader> = (0..row_count)
-        .map(|i| VersionedTupleHeader::new(100, (i as u32) + 1, 1))
+        .map(|i| VersionedTupleHeader::new(100, i + 1, 1))
         .collect();
 
     let target_version: u64 = 2;
@@ -1139,7 +1142,7 @@ fn perf_time_travel_scan_overhead() {
         let start_baseline = std::time::Instant::now();
         let mut baseline_visible = 0u64;
         for h in &headers {
-            if h.base.is_visible(u32::MAX) {
+            if h.base.is_visible(u64::MAX) {
                 baseline_visible += 1;
             }
         }

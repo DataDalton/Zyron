@@ -45,6 +45,14 @@ pub type WriteFn = Arc<dyn Fn(PageId, &mut [u8; PAGE_SIZE]) -> Result<()> + Send
 /// turns 64 fsyncs into 1-3 per cycle and unblocks the buffer pool.
 pub type FsyncFn = Arc<dyn Fn(u32) -> Result<()> + Send + Sync>;
 
+/// WAL durability barrier. Given the highest dirty LSN of a page batch,
+/// returns once the WAL is durable at least up to it. A data page must
+/// never reach disk ahead of the log records that produced it: with the
+/// next transaction ids allocated past the recovered maximum, an orphan
+/// page whose log was lost would resurrect rows as committed state no log
+/// record explains.
+pub type WalBarrierFn = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
+
 /// Background writer that continuously flushes dirty pages to disk.
 ///
 /// Follows the same thread lifecycle pattern as the WAL flush thread:
@@ -70,6 +78,13 @@ pub struct BackgroundWriter {
     /// writer has actually done another pass rather than sleeping for a
     /// guessed interval and rescanning the pool on a fixed cadence
     cycles: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar)>,
+    /// Sequence counters bracketing each cycle: started increments before a
+    /// cycle's first write, finished after its fsyncs resolve. A checkpoint
+    /// trusts a clean pool scan only when both agree and did not move during
+    /// the scan, because a cycle clears dirty bits at write time, before the
+    /// batched fsync makes those writes durable
+    cycle_started: Arc<AtomicU64>,
+    cycle_finished: Arc<AtomicU64>,
 }
 
 impl BackgroundWriter {
@@ -81,6 +96,7 @@ impl BackgroundWriter {
         pool: Arc<BufferPool>,
         write_fn: WriteFn,
         fsync_fn: FsyncFn,
+        wal_barrier: WalBarrierFn,
         config: BackgroundWriterConfig,
     ) -> Self {
         let target_lsn = Arc::new(AtomicU64::new(0));
@@ -89,6 +105,8 @@ impl BackgroundWriter {
         let shutdown = Arc::new(AtomicBool::new(false));
         let writer_thread_waker = Arc::new(OnceLock::new());
         let pages_flushed = Arc::new(AtomicU64::new(0));
+        let cycle_started = Arc::new(AtomicU64::new(0));
+        let cycle_finished = Arc::new(AtomicU64::new(0));
 
         let thread_pool = Arc::clone(&pool);
         let thread_target = Arc::clone(&target_lsn);
@@ -100,6 +118,8 @@ impl BackgroundWriter {
         let cycles: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar)> =
             Arc::new((parking_lot::Mutex::new(0), parking_lot::Condvar::new()));
         let thread_cycles = Arc::clone(&cycles);
+        let thread_started = Arc::clone(&cycle_started);
+        let thread_finished = Arc::clone(&cycle_finished);
         let thread_config = config.clone();
 
         let handle = thread::Builder::new()
@@ -112,12 +132,15 @@ impl BackgroundWriter {
                     &thread_pool,
                     &write_fn,
                     &fsync_fn,
+                    &wal_barrier,
                     &thread_target,
                     &thread_min_dirty,
                     &thread_durable_error,
                     &thread_shutdown,
                     &thread_flushed,
                     &thread_cycles,
+                    &thread_started,
+                    &thread_finished,
                     &thread_config,
                 );
             })
@@ -132,35 +155,44 @@ impl BackgroundWriter {
             writer_thread: Some(handle),
             pages_flushed,
             cycles,
+            cycle_started,
+            cycle_finished,
         }
     }
 
     /// Main loop for the background writer thread.
+    #[allow(clippy::too_many_arguments)]
     fn writer_loop(
         pool: &BufferPool,
         write_fn: &WriteFn,
         fsync_fn: &FsyncFn,
+        wal_barrier: &WalBarrierFn,
         target_lsn: &AtomicU64,
         min_dirty_lsn: &AtomicU64,
         durable_error: &AtomicBool,
         shutdown: &AtomicBool,
         pages_flushed: &AtomicU64,
         cycles: &Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar)>,
+        cycle_started: &AtomicU64,
+        cycle_finished: &AtomicU64,
         config: &BackgroundWriterConfig,
     ) {
         loop {
             if shutdown.load(Ordering::Acquire) {
                 // Final flush before exiting
+                cycle_started.fetch_add(1, Ordering::AcqRel);
                 Self::flush_cycle(
                     pool,
                     write_fn,
                     fsync_fn,
+                    wal_barrier,
                     u64::MAX,
                     min_dirty_lsn,
                     durable_error,
                     pages_flushed,
                     config.pages_per_cycle,
                 );
+                cycle_finished.fetch_add(1, Ordering::AcqRel);
                 return;
             }
 
@@ -180,16 +212,19 @@ impl BackgroundWriter {
                 config.pages_per_cycle
             };
 
+            cycle_started.fetch_add(1, Ordering::AcqRel);
             let flushed = Self::flush_cycle(
                 pool,
                 write_fn,
                 fsync_fn,
+                wal_barrier,
                 threshold,
                 min_dirty_lsn,
                 durable_error,
                 pages_flushed,
                 limit,
             );
+            cycle_finished.fetch_add(1, Ordering::AcqRel);
 
             // Publish the completed cycle before sleeping, so a checkpoint
             // waiting on the writer learns a pass finished as soon as it
@@ -214,12 +249,15 @@ impl BackgroundWriter {
         }
     }
 
-    /// Executes one flush cycle: collect dirty pages, flush them, update min_dirty_lsn.
-    /// Returns the number of pages flushed.
+    /// Executes one flush cycle: WAL barrier, collect dirty pages, flush
+    /// them pinned, fsync per file, release the pins. Returns the number of
+    /// pages flushed.
+    #[allow(clippy::too_many_arguments)]
     fn flush_cycle(
         pool: &BufferPool,
         write_fn: &WriteFn,
         fsync_fn: &FsyncFn,
+        wal_barrier: &WalBarrierFn,
         threshold: u64,
         min_dirty_lsn: &AtomicU64,
         durable_error: &AtomicBool,
@@ -236,20 +274,42 @@ impl BackgroundWriter {
             return 0;
         }
 
+        // WAL-before-data: the log covering every page in this batch must be
+        // durable before any of the pages reaches disk. One barrier at the
+        // batch maximum covers the whole cycle. On failure the pages stay
+        // dirty and the cycle retries later
+        let batch_max_lsn = dirty_pages.iter().map(|&(_, _, l)| l).max().unwrap_or(0);
+        if batch_max_lsn > 0 && wal_barrier(batch_max_lsn).is_err() {
+            durable_error.store(true, Ordering::Release);
+            let batch_min = dirty_pages
+                .iter()
+                .map(|&(_, _, l)| l)
+                .min()
+                .unwrap_or(u64::MAX);
+            min_dirty_lsn.store(batch_min, Ordering::Release);
+            return 0;
+        }
+
         let mut flushed = 0;
         let mut new_min = u64::MAX;
-        // Per-file record of pages written this cycle. fsync is batched per file,
-        // so a fsync failure must re-dirty exactly the pages whose durability it
-        // covered. Each entry is (file_id, [(page_id, dirty_lsn)]).
-        let mut written: Vec<(u32, Vec<(PageId, u64)>)> = Vec::with_capacity(8);
+        // Per-file record of pages written this cycle, PINNED until their
+        // fsync resolves. fsync is batched per file, so a fsync failure must
+        // re-dirty exactly the pages whose durability it covered, and the
+        // pin guarantees each of those frames is still resident to take the
+        // re-dirty: an evicted "clean" page whose fsync failed would have no
+        // recoverable image anywhere. Each entry is
+        // (file_id, [(frame_id, dirty_lsn)]).
+        let mut written: Vec<(u32, Vec<(crate::frame::FrameId, u64)>)> = Vec::with_capacity(8);
 
         for &(page_id, frame_id, dlsn) in &dirty_pages {
-            match pool.flush_dirty_frame(page_id, frame_id, dlsn, |pid, data| write_fn(pid, data)) {
+            match pool.flush_dirty_frame(page_id, frame_id, dlsn, true, |pid, data| {
+                write_fn(pid, data)
+            }) {
                 Ok(true) => {
                     flushed += 1;
                     match written.iter_mut().find(|(fid, _)| *fid == page_id.file_id) {
-                        Some((_, pages)) => pages.push((page_id, dlsn)),
-                        None => written.push((page_id.file_id, vec![(page_id, dlsn)])),
+                        Some((_, pages)) => pages.push((frame_id, dlsn)),
+                        None => written.push((page_id.file_id, vec![(frame_id, dlsn)])),
                     }
                 }
                 Ok(false) => {
@@ -271,17 +331,20 @@ impl BackgroundWriter {
             }
         }
 
-        // One fsync per touched file replaces one fsync per page. A fsync failure
-        // means the file's just-written pages are not durable, so re-dirty them
-        // for a later retry, hold the floor at their lsn, and flag the error.
+        // One fsync per touched file replaces one fsync per page. A fsync
+        // failure means the file's just-written pages are not durable, so
+        // re-dirty them for a later retry (the held pin guarantees the frame
+        // is still theirs), hold the floor at their lsn, and flag the error.
+        // Success or failure, every pin taken above is released here.
         for (file_id, pages) in &written {
-            if fsync_fn(*file_id).is_err() {
+            let failed = fsync_fn(*file_id).is_err();
+            if failed {
                 durable_error.store(true, Ordering::Release);
-                for &(page_id, dlsn) in pages {
-                    pool.mark_dirty_with_lsn(page_id, dlsn);
-                    if dlsn < new_min {
-                        new_min = dlsn;
-                    }
+            }
+            for &(frame_id, dlsn) in pages {
+                pool.finish_pinned_flush(frame_id, dlsn, failed);
+                if failed && dlsn < new_min {
+                    new_min = dlsn;
                 }
             }
         }
@@ -321,6 +384,19 @@ impl BackgroundWriter {
     /// a caller can rescan only when the writer has actually done more work
     pub fn cycles_completed(&self) -> u64 {
         *self.cycles.0.lock()
+    }
+
+    /// Cycles the writer has begun. Paired with `cycles_finished` this lets
+    /// a checkpoint trust a clean pool scan: dirty bits clear at write time,
+    /// before the cycle's batched fsync, so a scan is only meaningful when
+    /// no cycle was in flight around it
+    pub fn cycles_started_seq(&self) -> u64 {
+        self.cycle_started.load(Ordering::Acquire)
+    }
+
+    /// Cycles whose writes AND fsyncs have fully resolved.
+    pub fn cycles_finished_seq(&self) -> u64 {
+        self.cycle_finished.load(Ordering::Acquire)
     }
 
     /// Blocks until the writer completes a cycle numbered above `seen`, or
@@ -413,6 +489,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 100,
@@ -459,6 +536,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 100,
@@ -496,6 +574,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 100,
@@ -539,6 +618,7 @@ mod tests {
             Arc::clone(&pool),
             write_fn,
             fsync_fn,
+            Arc::new(|_| Ok(())),
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 500_000, // Very long idle so it doesn't flush before shutdown

@@ -203,7 +203,7 @@ pub async fn merge_branch_table_into_main(
                 b
             })
             .collect();
-        let recs: Vec<(u32, &[u8])> = payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
+        let recs: Vec<(u64, &[u8])> = payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
         let lsns = ctx.wal.log_delete_batch(&recs)?;
         ctx.mark_wrote_wal();
         let last = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);

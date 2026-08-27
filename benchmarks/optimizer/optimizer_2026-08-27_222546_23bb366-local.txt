@@ -1,0 +1,191 @@
+# suite:   optimizer
+# run:     2026-08-27_222546_23bb366-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+=== Cardinality Estimator: Equality ===
+  NDV=100, equality selectivity: 0.0100 (expected 0.01)
+  MCV hit (freq=0.25): selectivity=0.2500 (expected 0.25)
+  Cardinality estimator equality: PASS
+=== Cardinality Estimator: Join ===
+  Inner join 1000x500, ndv 100x50: 5000 rows (expected 5000)
+  Left join 1000x10: 1000 rows (expected >= 1000)
+  Cardinality estimator join: PASS
+=== Cost Model Extensions ===
+  SeqScan: io=10000.0 cpu=10000.0 rows=1000000
+  ParallelScan(4w): io=2500.0 cpu=103500.0
+  EncodedScan(50% skip): io=1500.0 cpu=5050.0
+  Weighted total: 10100.00
+  Cost model extensions: PASS
+=== Encoding Hint Analysis ===
+  Equality: zone_map=true, bloom=true, dict=true
+  Range: zone_map=true, rle=true, fastlanes=true
+  Zone+Bloom skip rate: 0.50 (expected 0.50)
+  Encoding hint analysis: PASS
+=== EXPLAIN Rendering ===
+--- Text Output ---
+  HashJoin join_type=Inner (cost=152.00 rows=10000)
+    -> SeqScan table_id=1 columns=5 (cost=100.50 rows=50000)
+    -> IndexScan table_id=2 index_id=3 (cost=20.10 rows=500)
+--- JSON Output ---
+  497 bytes
+--- YAML Output ---
+  303 bytes
+  EXPLAIN rendering: PASS
+=== Histogram Build Performance ===
+  Build time (100K values, 100 buckets): 137.1 us/build
+  Total: 13 ms for 100 iterations
+  Histogram correctness: PASS
+=== Histogram Selectivity Accuracy ===
+  Full range selectivity: 1.0000 (expected ~1.0)
+  Half range selectivity: 0.5001 (expected ~0.5)
+  Equality selectivity: 0.000100 (expected ~0.000100)
+  Selectivity accuracy: PASS
+=== HyperLogLog Accuracy Benchmark ===
+  n=       100: estimate=       100, error=0.00%
+  n=      1000: estimate=      1006, error=0.60%
+  n=     10000: estimate=      9968, error=0.32%
+  n=    100000: estimate=     99345, error=0.66%
+  n=   1000000: estimate=   1011733, error=1.17%
+  HLL accuracy: PASS
+=== HyperLogLog Insert Throughput ===
+  1000000 inserts in 1 ms
+  Throughput: 887.8M ops/sec
+  HLL throughput: PASS
+=== MCV Build and Lookup ===
+  MCV build: 10 entries in 13 us
+  Value 0 frequency: Some(0.5117707267144319) (expected ~0.5118)
+  Missing value lookup: None (correct)
+  MCV: PASS
+=== Parallel Plan Decisions ===
+  50K rows: no parallel (correct)
+  200K rows: parallel (correct)
+  100 pages: 1 workers
+  1000 pages: 15 workers
+  100K pages: 24 workers
+  Parallel plan decisions: PASS
+=== PERF: ANALYZE (1M Rows) ===
+  analyze_1m_ms [PASS/OK]:
+    Runs: [10.5081, 10.6605, 10.8108, 10.4959, 10.6005]
+    Average: 10.6152 <= 400 (target)
+    Min/Max: 10.4959 / 10.8108, StdDev: 0.1151
+=== PERF: Auto-Analyze Trigger Latency ===
+  auto_analyze_trigger_ms [PASS/OK]:
+    Runs: [3.7285, 3.9026, 3.6267, 3.7576, 3.7219]
+    Average: 3.7475 <= 1,000 (target)
+    Min/Max: 3.6267 / 3.9026, StdDev: 0.0892
+=== PERF: Cardinality Accuracy ===
+  cardinality_accuracy_ratio [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 2 (target)
+    Min/Max: 1 / 1, StdDev: 0
+=== PERF: Encoding Pushdown Gain ===
+  encoding_pushdown_speedup_x [PASS/OK]:
+    Runs: [30.5783, 30.5783, 30.5783, 30.5783, 30.5783]
+    Average: 30.5783 >= 3 (target)
+    Min/Max: 30.5783 / 30.5783, StdDev: 0
+=== PERF: EXPLAIN ANALYZE Overhead ===
+  explain_analyze_overhead_pct [FAIL/REGR!]:
+    Runs: [18.3452, 21.3768, 20.3334, 22.0762, 21.5351]
+    Average: 20.7333 <= 3 (target)
+    Min/Max: 18.3452 / 22.0762, StdDev: 1.3209
+  (This measures explain rendering overhead, not executor atomic counters)
+  NOTE: Rendering overhead can exceed 3% due to extra string formatting.
+  The executor-level ANALYZE overhead (atomic counters) is negligible.
+=== PERF: EXPLAIN Latency ===
+  explain_latency_us [PASS/OK]:
+    Runs: [0.7723, 0.7689, 0.7707, 0.7698, 0.7663]
+    Average: 0.7696 <= 20 (target)
+    Min/Max: 0.7663 / 0.7723, StdDev: 0.0020
+=== PERF: Histogram Build (1M) ===
+  histogram_build_1m_ms [PASS/OK]:
+    Runs: [0.4379, 0.3769, 0.3745, 0.3764, 0.3717]
+    Average: 0.3875 <= 200 (target)
+    Min/Max: 0.3717 / 0.4379, StdDev: 0.0253
+=== PERF: Parallel Plan Selection Latency ===
+  parallel_plan_selection_us [PASS/OK]:
+    Runs: [0.0018, 0.0018, 0.0018, 0.0018, 0.0018]
+    Average: 0.0018 <= 50 (target)
+    Min/Max: 0.0018 / 0.0018, StdDev: 0.0000
+=== PERF: Selectivity Estimate Latency ===
+  selectivity_estimate_ns [PASS/OK]:
+    Runs: [99.1535, 99.4714, 99.4698, 99.1387, 99.1374]
+    Average: 99.2742 <= 200 (target)
+    Min/Max: 99.1374 / 99.4714, StdDev: 0.1605
+=== Reservoir Sampler Performance ===
+  1000000 inserts, capacity 10000
+  Time: 6 ms
+  Reservoir size: 10000
+  Reservoir sampler: PASS
+=== V1: Histogram Accuracy (1M Uniform) ===
+  A > 500000: estimated=0.4987, actual=0.5000, error=0.3%
+  A = 42: estimated=0.00010000, actual=0.000001
+  A BETWEEN 100 AND 200: estimated=0.000100, actual=0.000101
+  V1 Histogram Accuracy: PASS
+=== V2: MCV Skewed Distribution ===
+  MCV entries: 10
+  'active': freq=0.4000, expected=0.4000, error=0.0%
+  'rare': freq=0.005000, expected=0.0050, error=0.0%
+  CardinalityEstimator 'active': sel=0.4000
+  Direct MCV freq for 'active': Some(0.4)
+  V2 MCV Skewed Distribution: PASS
+=== V3: Join Cardinality (FK) ===
+  orders(1M) JOIN customers(100K)
+  Estimated: 1000000, Actual: 1000000, Ratio: 1.00x
+  Hash join cost: io=11000.0, cpu=13750.0, rows=316228
+  Build/probe symmetry: PASS
+  Skewed FK estimate: 1000000 (independence assumption applies)
+  Left outer join: 1000000 (should be >= 1000000)
+  V3 Join Cardinality: PASS
+=== V4: Parallel Plan Selection ===
+  10M rows, 100K pages: 24 workers
+  SeqScan cost: 101000.00
+  ParallelScan(24 workers) cost: 14218.33
+  100 rows: sequential (correct)
+  Boundary check: PASS
+  Serial HashJoin cost: 16537.50
+  Parallel HashJoin(4w) cost: 18019.38
+  Parallel hash join: worker count valid, cost computed
+  V4 Parallel Plan Selection: PASS
+=== V5: Encoding Pushdown Speedup ===
+  Dictionary pushdown:
+    SeqScan cost: 101000.00
+    Dict+Bloom cost: 3303.00
+    Speedup: 30.6x
+  RLE pushdown:
+    RLE cost: 3002.50
+    Speedup: 33.6x
+  FastLanes pushdown:
+    FastLanes cost: 11210.50
+    Speedup: 9.0x
+  Equality hint skip rate: 0.50
+  V5 Encoding Pushdown Speedup: PASS
+=== V6: EXPLAIN ANALYZE ===
+--- EXPLAIN (no analyze) ---
+  Filter predicate=status = 'pending' (cost=100.50 rows=1000)
+    -> SeqScan table=orders (cost=100.50 rows=100000)
+--- EXPLAIN ANALYZE ---
+  Filter predicate=status = 'pending' (cost=100.50 rows=1000) (actual rows=982 time=3.200ms)
+    -> SeqScan table=orders (cost=100.50 rows=100000) (actual rows=100000 time=15.700ms)
+  Filter estimate/actual ratio: 1.02x
+  Bad estimate ratio: 0.000020x (flagged: true)
+  JSON ANALYZE format: PASS
+  COSTS OFF: PASS
+  V6 EXPLAIN ANALYZE: PASS
+=== V7: Index Advisor ===
+  Recorded 100 scans on column 5 of table 10
+  Recorded 50 scans on column 3 of table 10
+  Recorded 25 scans on column 1 of table 20
+  Walked 10 plans, recorded column 7 of table 30 from Filter predicates
+  Index advisor accumulation and walk: verified
+  V7 Index Advisor: PASS
+=== V8: Auto-Analyze Trigger ===
+  Initial state: should_analyze=false (correct)
+  After 500 inserts (5%): should_analyze=false (correct)
+  After 1001 total mutations (10.01%): should_analyze=true (correct)
+  Mixed ops (300i + 400u + 301d = 1001): should_analyze=true (correct)
+  After reset(10500): should_analyze=false, mutations=0 (correct)
+  New threshold after reset: 1051/10500 triggers (correct)
+  Empty table edge case: PASS
+  V8 Auto-Analyze Trigger: PASS

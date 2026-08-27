@@ -313,6 +313,15 @@ struct CorrelatedSub {
     /// Outer column references in plan order; the j-th maps to the subquery
     /// parameter at index base_len + j + 1.
     outer_refs: Vec<ColumnRef>,
+    /// Scale of the subquery's decimal output column, None when the output
+    /// is not a decimal. A decimal's raw i128 only means its value together
+    /// with this, so the per-row result carries it back through its text
+    /// form instead of a bare integer a later comparison rescales again
+    output_scale: Option<u8>,
+    /// Scale of a decimal IN probe, None when the probe is not a decimal.
+    /// Membership compares raw i128s, so probe and list are moved onto one
+    /// scale first
+    probe_scale: Option<u8>,
 }
 
 /// State threaded through expression rewriting: the enclosing query's table
@@ -492,19 +501,51 @@ fn extract(
     slot_type: TypeId,
     prep: &mut Prep,
 ) -> Result<BoundExpr> {
+    // A decimal output column's raw i128 only means its value together with
+    // its scale, which the parameter channel cannot carry, so the scale is
+    // captured here and the value folds through its text form per row
+    let output_scale = plan
+        .output_schema
+        .first()
+        .filter(|c| c.type_id == TypeId::Decimal)
+        .map(|c| c.fractional_digits.unwrap_or(0));
+    let probe_scale = match &kind {
+        SubKind::In { probe, .. } if probe.type_id() == TypeId::Decimal => {
+            Some(probe.fractional_digits().unwrap_or(0))
+        }
+        _ => None,
+    };
     let (template, outer_refs) =
         parameterize_subquery(plan, prep.input_set, prep.base_len, prep.ctx)?;
 
     let slot = prep.base_len + prep.subs.len() + 1;
+    let scalar_decimal =
+        matches!(kind, SubKind::Scalar) && slot_type == TypeId::Decimal && output_scale.is_some();
     prep.subs.push(CorrelatedSub {
         kind,
         template,
         outer_refs,
+        output_scale,
+        probe_scale,
     });
-    Ok(BoundExpr::Parameter {
-        index: slot,
-        type_id: slot_type,
-    })
+    if scalar_decimal {
+        // The per-row value arrives as decimal text and the cast parses it
+        // back onto the subquery's own scale, so comparisons see a decimal
+        // column instead of a raw scaled integer
+        Ok(BoundExpr::Cast {
+            expr: Box::new(BoundExpr::Parameter {
+                index: slot,
+                type_id: TypeId::Text,
+            }),
+            target_type: TypeId::Decimal,
+            fractional_digits: output_scale,
+        })
+    } else {
+        Ok(BoundExpr::Parameter {
+            index: slot,
+            type_id: slot_type,
+        })
+    }
 }
 
 /// Turns a subquery's references to outer columns into query parameters and
@@ -545,10 +586,26 @@ pub fn parameterize_subquery(
     map_refs_in_select(&mut parameterized, &|cr| {
         if !owned_for_map.contains(&cr.table_idx) && outer_for_map.contains(&cr.table_idx) {
             let idx = pos[&(cr.table_idx, cr.column_id.0)];
-            Some(BoundExpr::Parameter {
+            let param = BoundExpr::Parameter {
                 index: base_len + idx + 1,
-                type_id: cr.type_id,
-            })
+                type_id: if cr.type_id == TypeId::Decimal {
+                    TypeId::Text
+                } else {
+                    cr.type_id
+                },
+            };
+            // A decimal outer value binds as its text form because the
+            // parameter channel cannot carry its scale, and the cast parses
+            // it back onto the column's own scale inside the subquery
+            if cr.type_id == TypeId::Decimal {
+                Some(BoundExpr::Cast {
+                    expr: Box::new(param),
+                    target_type: TypeId::Decimal,
+                    fractional_digits: cr.fractional_digits,
+                })
+            } else {
+                Some(param)
+            }
         } else {
             None
         }
@@ -623,7 +680,7 @@ async fn eval_rows(
         for (i, s) in subs.iter().enumerate() {
             let mut child_params = base_params.to_vec();
             for col in &sub_outer_cols[i] {
-                child_params.push(col.get_scalar(row));
+                child_params.push(bind_param_scalar(col, row));
             }
             let child = Arc::new(ctx.child_with_params(child_params));
             let probe_val = sub_probe_cols[i].as_ref().map(|c| c.get_scalar(row));
@@ -658,7 +715,18 @@ async fn run_sub(
             let mut values = first_column_scalars(&batches);
             match values.len() {
                 0 => Ok(ScalarValue::Null),
-                1 => Ok(values.pop().unwrap()),
+                1 => {
+                    let value = values.pop().unwrap();
+                    // A decimal result folds through its text form so the
+                    // cast wrapping the parameter slot parses it back onto
+                    // its own scale
+                    Ok(match (sub.output_scale, value) {
+                        (Some(scale), ScalarValue::Int128(raw)) => {
+                            ScalarValue::Utf8(zyron_common::format_decimal(raw, scale))
+                        }
+                        (_, other) => other,
+                    })
+                }
                 k => Err(ZyronError::ExecutionError(format!(
                     "scalar subquery returned {k} rows, expected at most one"
                 ))),
@@ -667,9 +735,28 @@ async fn run_sub(
         SubKind::In { negated, .. } => {
             let probe = probe_val.unwrap_or(ScalarValue::Null);
             let values = first_column_scalars(&batches);
+            let (probe, values) =
+                align_in_decimals(probe, values, sub.probe_scale, sub.output_scale)?;
             Ok(in_membership(&probe, &values, *negated))
         }
     }
+}
+
+/// Reads one row of an outer-reference column as the scalar bound to a
+/// subquery parameter. A decimal value binds as its text form because the
+/// parameter channel cannot carry its scale, and the parameterized plan
+/// wraps the slot in a cast that parses it back onto the column's scale
+fn bind_param_scalar(col: &Column, row: usize) -> ScalarValue {
+    let scalar = col.get_scalar(row);
+    if col.type_id == TypeId::Decimal {
+        if let ScalarValue::Int128(raw) = scalar {
+            return ScalarValue::Utf8(zyron_common::format_decimal(
+                raw,
+                col.fractional_digits.unwrap_or(0),
+            ));
+        }
+    }
+    scalar
 }
 
 /// Flattens the first output column of every batch into a scalar vector.
@@ -683,6 +770,56 @@ fn first_column_scalars(batches: &[DataBatch]) -> Vec<ScalarValue> {
         }
     }
     out
+}
+
+/// Moves an IN probe and its membership list onto one decimal scale when
+/// either side is a decimal. Membership compares raw i128s, so a decimal at
+/// scale a against one at scale b, or against a whole number, would compare
+/// scaled integer against plain integer and answer from the wrong values.
+/// Both sides move to the widest scale involved: decimals rescale exactly,
+/// whole numbers scale up, and floats convert onto the target scale
+fn align_in_decimals(
+    probe: ScalarValue,
+    values: Vec<ScalarValue>,
+    probe_scale: Option<u8>,
+    list_scale: Option<u8>,
+) -> Result<(ScalarValue, Vec<ScalarValue>)> {
+    if probe_scale.is_none() && list_scale.is_none() {
+        return Ok((probe, values));
+    }
+    let target = probe_scale.unwrap_or(0).max(list_scale.unwrap_or(0));
+    let convert = |scalar: ScalarValue, own_scale: Option<u8>| -> Result<ScalarValue> {
+        Ok(match scalar {
+            ScalarValue::Null => ScalarValue::Null,
+            ScalarValue::Int128(raw) if own_scale.is_some() => {
+                ScalarValue::Int128(zyron_common::rescale(raw, own_scale.unwrap_or(0), target)?)
+            }
+            ScalarValue::Float32(f) => ScalarValue::Int128(
+                crate::operator::modify::decimal_from_float(f as f64, target)?,
+            ),
+            ScalarValue::Float64(f) => {
+                ScalarValue::Int128(crate::operator::modify::decimal_from_float(f, target)?)
+            }
+            other => match as_i128(&other) {
+                Some(whole) => ScalarValue::Int128(
+                    whole
+                        .checked_mul(zyron_common::decimal::scale_factor(target)?)
+                        .ok_or_else(|| {
+                            ZyronError::ExecutionError(format!(
+                                "value {whole} overflows a decimal at scale {target}"
+                            ))
+                        })?,
+                ),
+                None => other,
+            },
+        })
+    };
+    let probe = convert(probe, probe_scale)?;
+    let values = values
+        .into_iter()
+        .map(|v| convert(v, list_scale))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((probe, values))
 }
 
 /// Applies SQL three-valued IN semantics. An empty list is false for IN and
@@ -1097,7 +1234,7 @@ impl Operator for LateralJoinOperator {
                 for row in 0..n {
                     let mut child_params = self.base_params.clone();
                     for col in &outer_cols {
-                        child_params.push(col.get_scalar(row));
+                        child_params.push(bind_param_scalar(col, row));
                     }
                     let child = Arc::new(self.ctx.child_with_params(child_params));
                     let right_batches =

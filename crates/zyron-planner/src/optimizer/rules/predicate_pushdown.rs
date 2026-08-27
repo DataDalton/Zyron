@@ -3,8 +3,10 @@
 //! Pushes filter predicates closer to table scans to reduce the number
 //! of rows processed by upstream operators. Splits conjuncts across
 //! join sides when possible.
-//! Uses a changed-flag pattern to avoid cloning unchanged plan trees.
+//! push_predicates returns None for an unchanged subtree, so untouched
+//! nodes allocate nothing and unchanged plan children are reused by Arc.
 
+use super::rebuilt_child;
 use crate::binder::{BoundExpr, ColumnRef};
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
@@ -25,8 +27,7 @@ impl OptimizationRule for PredicatePushdown {
         if !has_filter(plan) {
             return None;
         }
-        let (pushed, changed) = push_predicates(plan);
-        if changed { Some(pushed) } else { None }
+        push_predicates(plan)
     }
 }
 
@@ -38,13 +39,15 @@ fn has_filter(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// Returns (pushed_plan, changed).
-fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
+/// Returns the rewritten plan, or None when no predicate moved and no
+/// child changed.
+fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
     match plan {
         // Filter above Join: try to push predicates into join sides
         LogicalPlan::Filter { predicate, child } => {
-            let (child_plan, child_changed) = push_predicates(child);
-            match &child_plan {
+            let pushed_child = push_predicates(child);
+            let effective_child = pushed_child.as_ref().unwrap_or(child);
+            match effective_child {
                 LogicalPlan::Join {
                     left,
                     right,
@@ -95,50 +98,56 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                         }
                     }
 
-                    // If nothing was pushed down and child didn't change, skip clone.
-                    if left_preds.is_empty() && right_preds.is_empty() && !child_changed {
-                        return (plan.clone(), false);
+                    // Nothing pushed and the child kept its shape: unchanged
+                    if left_preds.is_empty() && right_preds.is_empty() && pushed_child.is_none() {
+                        return None;
                     }
 
+                    // A side that receives predicates gets a Filter over the
+                    // existing subtree by Arc and pushes again so the new
+                    // filter cascades toward the scans. A side receiving
+                    // nothing is already fully pushed and is reused as is
                     let new_left = if left_preds.is_empty() {
-                        left.as_ref().clone()
+                        Arc::clone(left)
                     } else {
-                        LogicalPlan::Filter {
+                        let filtered = LogicalPlan::Filter {
                             predicate: combine_conjuncts(left_preds),
-                            child: Arc::new(left.as_ref().clone()),
-                        }
+                            child: Arc::clone(left),
+                        };
+                        Arc::new(match push_predicates(&filtered) {
+                            Some(p) => p,
+                            None => filtered,
+                        })
                     };
 
                     let new_right = if right_preds.is_empty() {
-                        right.as_ref().clone()
+                        Arc::clone(right)
                     } else {
-                        LogicalPlan::Filter {
+                        let filtered = LogicalPlan::Filter {
                             predicate: combine_conjuncts(right_preds),
-                            child: Arc::new(right.as_ref().clone()),
-                        }
+                            child: Arc::clone(right),
+                        };
+                        Arc::new(match push_predicates(&filtered) {
+                            Some(p) => p,
+                            None => filtered,
+                        })
                     };
 
-                    let (pushed_left, _) = push_predicates(&new_left);
-                    let (pushed_right, _) = push_predicates(&new_right);
-
                     let join = LogicalPlan::Join {
-                        left: Arc::new(pushed_left),
-                        right: Arc::new(pushed_right),
+                        left: new_left,
+                        right: new_right,
                         join_type: *join_type,
                         condition: condition.clone(),
                     };
 
-                    if remaining.is_empty() {
-                        (join, true)
+                    Some(if remaining.is_empty() {
+                        join
                     } else {
-                        (
-                            LogicalPlan::Filter {
-                                predicate: combine_conjuncts(remaining),
-                                child: Arc::new(join),
-                            },
-                            true,
-                        )
-                    }
+                        LogicalPlan::Filter {
+                            predicate: combine_conjuncts(remaining),
+                            child: Arc::new(join),
+                        }
+                    })
                 }
                 // Filter above Project: push down conjuncts that reference only
                 // columns the projection passes through verbatim. ColumnRef is a
@@ -176,57 +185,42 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     }
 
                     if pushable.is_empty() {
-                        let (pushed_proj_child, _) = push_predicates(proj_child);
-                        (
-                            LogicalPlan::Filter {
-                                predicate: predicate.clone(),
-                                child: Arc::new(LogicalPlan::Project {
-                                    expressions: expressions.clone(),
-                                    aliases: aliases.clone(),
-                                    child: Arc::new(pushed_proj_child),
-                                    output_table_idx: *output_table_idx,
-                                }),
-                            },
-                            child_changed,
-                        )
+                        // No conjunct crosses the projection, the filter only
+                        // moves when the subtree underneath changed
+                        let changed_child = pushed_child?;
+                        return Some(LogicalPlan::Filter {
+                            predicate: predicate.clone(),
+                            child: Arc::new(changed_child),
+                        });
+                    }
+
+                    let filtered_child = LogicalPlan::Filter {
+                        predicate: combine_conjuncts(pushable),
+                        child: Arc::clone(proj_child),
+                    };
+                    let pushed_inner = match push_predicates(&filtered_child) {
+                        Some(p) => p,
+                        None => filtered_child,
+                    };
+                    let project = LogicalPlan::Project {
+                        expressions: expressions.clone(),
+                        aliases: aliases.clone(),
+                        child: Arc::new(pushed_inner),
+                        output_table_idx: *output_table_idx,
+                    };
+                    Some(if keep_above.is_empty() {
+                        project
                     } else {
-                        let filtered_child = LogicalPlan::Filter {
-                            predicate: combine_conjuncts(pushable),
-                            child: Arc::new(proj_child.as_ref().clone()),
-                        };
-                        let (pushed_child, _) = push_predicates(&filtered_child);
-                        let project = LogicalPlan::Project {
-                            expressions: expressions.clone(),
-                            aliases: aliases.clone(),
-                            child: Arc::new(pushed_child),
-                            output_table_idx: *output_table_idx,
-                        };
-                        if keep_above.is_empty() {
-                            (project, true)
-                        } else {
-                            (
-                                LogicalPlan::Filter {
-                                    predicate: combine_conjuncts(keep_above),
-                                    child: Arc::new(project),
-                                },
-                                true,
-                            )
+                        LogicalPlan::Filter {
+                            predicate: combine_conjuncts(keep_above),
+                            child: Arc::new(project),
                         }
-                    }
+                    })
                 }
-                _ => {
-                    if child_changed {
-                        (
-                            LogicalPlan::Filter {
-                                predicate: predicate.clone(),
-                                child: Arc::new(child_plan),
-                            },
-                            true,
-                        )
-                    } else {
-                        (plan.clone(), false)
-                    }
-                }
+                _ => pushed_child.map(|changed_child| LogicalPlan::Filter {
+                    predicate: predicate.clone(),
+                    child: Arc::new(changed_child),
+                }),
             }
         }
         // Recursively apply to all other node types
@@ -236,20 +230,13 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             child,
             output_table_idx,
         } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Project {
-                        expressions: expressions.clone(),
-                        aliases: aliases.clone(),
-                        child: Arc::new(fc),
-                        output_table_idx: *output_table_idx,
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Project {
+                expressions: expressions.clone(),
+                aliases: aliases.clone(),
+                child: Arc::new(pushed),
+                output_table_idx: *output_table_idx,
+            })
         }
         LogicalPlan::Join {
             left,
@@ -257,86 +244,54 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             join_type,
             condition,
         } => {
-            let (fl, lc) = push_predicates(left);
-            let (fr, rc) = push_predicates(right);
-            if lc || rc {
-                (
-                    LogicalPlan::Join {
-                        left: Arc::new(fl),
-                        right: Arc::new(fr),
-                        join_type: *join_type,
-                        condition: condition.clone(),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            let pushed_left = push_predicates(left);
+            let pushed_right = push_predicates(right);
+            if pushed_left.is_none() && pushed_right.is_none() {
+                return None;
             }
+            Some(LogicalPlan::Join {
+                left: rebuilt_child(left, pushed_left),
+                right: rebuilt_child(right, pushed_right),
+                join_type: *join_type,
+                condition: condition.clone(),
+            })
         }
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
             child,
         } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Aggregate {
-                        group_by: group_by.clone(),
-                        aggregates: aggregates.clone(),
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Aggregate {
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+                child: Arc::new(pushed),
+            })
         }
         LogicalPlan::Sort { order_by, child } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Sort {
-                        order_by: order_by.clone(),
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Sort {
+                order_by: order_by.clone(),
+                child: Arc::new(pushed),
+            })
         }
         LogicalPlan::Limit {
             limit,
             offset,
             child,
         } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Limit {
-                        limit: *limit,
-                        offset: *offset,
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Limit {
+                limit: *limit,
+                offset: *offset,
+                child: Arc::new(pushed),
+            })
         }
         LogicalPlan::Distinct { child } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Distinct {
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Distinct {
+                child: Arc::new(pushed),
+            })
         }
         LogicalPlan::SetOp {
             op,
@@ -344,21 +299,17 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             left,
             right,
         } => {
-            let (fl, lc) = push_predicates(left);
-            let (fr, rc) = push_predicates(right);
-            if lc || rc {
-                (
-                    LogicalPlan::SetOp {
-                        op: *op,
-                        all: *all,
-                        left: Arc::new(fl),
-                        right: Arc::new(fr),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
+            let pushed_left = push_predicates(left);
+            let pushed_right = push_predicates(right);
+            if pushed_left.is_none() && pushed_right.is_none() {
+                return None;
             }
+            Some(LogicalPlan::SetOp {
+                op: *op,
+                all: *all,
+                left: rebuilt_child(left, pushed_left),
+                right: rebuilt_child(right, pushed_right),
+            })
         }
         LogicalPlan::Insert {
             table_id,
@@ -368,22 +319,15 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             expectations,
             source,
         } => {
-            let (fs, changed) = push_predicates(source);
-            if changed {
-                (
-                    LogicalPlan::Insert {
-                        table_id: *table_id,
-                        target_columns: target_columns.clone(),
-                        column_defaults: column_defaults.clone(),
-                        check_constraints: check_constraints.clone(),
-                        expectations: expectations.clone(),
-                        source: Arc::new(fs),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(source)?;
+            Some(LogicalPlan::Insert {
+                table_id: *table_id,
+                target_columns: target_columns.clone(),
+                column_defaults: column_defaults.clone(),
+                check_constraints: check_constraints.clone(),
+                expectations: expectations.clone(),
+                source: Arc::new(pushed),
+            })
         }
         LogicalPlan::Update {
             table_id,
@@ -391,36 +335,22 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             check_constraints,
             child,
         } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Update {
-                        table_id: *table_id,
-                        assignments: assignments.clone(),
-                        check_constraints: check_constraints.clone(),
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Update {
+                table_id: *table_id,
+                assignments: assignments.clone(),
+                check_constraints: check_constraints.clone(),
+                child: Arc::new(pushed),
+            })
         }
         LogicalPlan::Delete { table_id, child } => {
-            let (fc, changed) = push_predicates(child);
-            if changed {
-                (
-                    LogicalPlan::Delete {
-                        table_id: *table_id,
-                        child: Arc::new(fc),
-                    },
-                    true,
-                )
-            } else {
-                (plan.clone(), false)
-            }
+            let pushed = push_predicates(child)?;
+            Some(LogicalPlan::Delete {
+                table_id: *table_id,
+                child: Arc::new(pushed),
+            })
         }
-        other => (other.clone(), false),
+        _other => None,
     }
 }
 
@@ -645,13 +575,9 @@ mod tests {
             predicate: make_is_null(1, 0),
             child: Arc::new(join),
         };
-        let (pushed, changed) = push_predicates(&plan);
         assert!(
-            !changed,
+            push_predicates(&plan).is_none(),
             "right-side predicate must not move below a LEFT join"
-        );
-        assert!(
-            matches!(pushed, LogicalPlan::Filter { child, .. } if matches!(*child, LogicalPlan::Join { .. }))
         );
     }
 
@@ -678,11 +604,8 @@ mod tests {
             },
             child: Arc::new(join),
         };
-        let (pushed, changed) = push_predicates(&plan);
-        assert!(
-            changed,
-            "left-side predicate should push into the preserved side"
-        );
+        let pushed = push_predicates(&plan)
+            .expect("left-side predicate should push into the preserved side");
         assert!(
             matches!(pushed, LogicalPlan::Join { .. }),
             "filter dissolves into the join"

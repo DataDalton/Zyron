@@ -368,15 +368,18 @@ impl TemporalQuery {
     /// Returns true if a row with the given period is visible for this query.
     ///
     /// For AS OF: start_col <= point AND end_col > point
-    /// For BETWEEN: start_col < range_end AND end_col > range_start
+    /// For BETWEEN: start_col <= range_end AND end_col > range_start, the
+    /// SQL:2011 rule where the upper bound is INCLUSIVE (a row whose period
+    /// starts exactly at the bound is in the answer)
+    /// For FOR PORTION OF: half-open period overlap, exclusive upper
     pub fn is_row_visible(&self, row_start: i64, row_end: i64) -> bool {
         match self {
             Self::AsOfSystemTime(ts) | Self::AsOfApplicationTime(ts) => {
                 row_start <= *ts && row_end > *ts
             }
             Self::BetweenSystemTime { start, end }
-            | Self::BetweenApplicationTime { start, end }
-            | Self::ForPortionOf { start, end, .. } => row_start < *end && row_end > *start,
+            | Self::BetweenApplicationTime { start, end } => row_start <= *end && row_end > *start,
+            Self::ForPortionOf { start, end, .. } => row_start < *end && row_end > *start,
         }
     }
 }
@@ -515,12 +518,15 @@ mod tests {
             end: 300,
         };
 
-        // Row [50, 150) overlaps [100, 300)
+        // Row [50, 150) overlaps [100, 300]
         assert!(q.is_row_visible(50, 150));
-        // Row [200, 400) overlaps [100, 300)
+        // Row [200, 400) overlaps [100, 300]
         assert!(q.is_row_visible(200, 400));
-        // Row [300, 400) does not overlap (start >= end of range)
-        assert!(!q.is_row_visible(300, 400));
+        // Row [300, 400) starts exactly at the upper bound, and SQL:2011
+        // BETWEEN includes the bound
+        assert!(q.is_row_visible(300, 400));
+        // Row [301, 400) starts past the inclusive bound
+        assert!(!q.is_row_visible(301, 400));
         // Row [50, 100) does not overlap (end <= start of range)
         assert!(!q.is_row_visible(50, 100));
     }

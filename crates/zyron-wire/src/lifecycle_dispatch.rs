@@ -387,8 +387,7 @@ async fn run_sql(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let mut ctx = zyron_executor::context::ExecutionContext::new(
         std::sync::Arc::clone(&server.catalog),
         std::sync::Arc::clone(&server.wal),
@@ -1123,8 +1122,7 @@ pub(crate) async fn relocate_covered_segments(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let snapshot = txn.snapshot.clone();
-    let txn_id = u32::try_from(txn.txn_id)
-        .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
+    let txn_id = txn.txn_id;
     let ctx = Arc::new(zyron_executor::context::ExecutionContext::new(
         Arc::clone(&server.catalog),
         Arc::clone(&server.wal),

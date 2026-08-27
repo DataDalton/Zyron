@@ -123,7 +123,7 @@ async fn rows_affected(server: &Arc<ServerState>, sql: &str) -> i64 {
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
@@ -234,7 +234,7 @@ async fn test_lake_scan_reads_appended_rows_and_sql_insert_publishes_on_commit()
             server.wal.clone(),
             server.buffer_pool.clone(),
             server.disk_manager.clone(),
-            txn_id as u32,
+            txn_id,
             snapshot,
         );
         ctx.heap_files = Some(Arc::clone(&server.heap_files));
@@ -810,7 +810,7 @@ async fn test_explain_analyze_reports_measured_lake_pruning() {
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
@@ -2448,7 +2448,7 @@ async fn exec_dml_result(server: &Arc<ServerState>, sql: &str) -> Result<(), Str
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
@@ -2738,7 +2738,7 @@ async fn exec_dml_in_lake_txn(server: &Arc<ServerState>, sql: &str, lake_txn_id:
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
     ctx.heap_files = Some(Arc::clone(&server.heap_files));

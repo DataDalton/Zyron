@@ -192,18 +192,6 @@ impl Transaction {
         self.status == TransactionStatus::Active
     }
 
-    /// Returns the transaction's txn_id as u32 for WAL/TupleHeader writes.
-    /// Errors if txn_id exceeds u32::MAX, which the sequencer does not permit.
-    #[inline]
-    pub fn txn_id_u32(&self) -> Result<u32> {
-        u32::try_from(self.txn_id).map_err(|_| {
-            ZyronError::Internal(format!(
-                "txn_id {} exceeds u32::MAX, on-disk format widening required",
-                self.txn_id
-            ))
-        })
-    }
-
     /// Returns the shared undo log handle. The execution context clones this so
     /// DML operators record reversible writes into the same log this transaction
     /// reverses on ROLLBACK TO SAVEPOINT.
@@ -407,17 +395,7 @@ impl TransactionManager {
         self.proc_array.snapshot_into(txn_id, &mut active_ids);
         let snapshot = Snapshot::new(txn_id, active_ids, Arc::clone(&self.status_map));
 
-        let txn_id_u32 = match u32::try_from(txn_id) {
-            Ok(v) => v,
-            Err(_) => {
-                self.proc_array.release(slot_idx);
-                return Err(ZyronError::Internal(format!(
-                    "txn_id {} exceeds u32::MAX",
-                    txn_id
-                )));
-            }
-        };
-        let lsn = match self.wal.log_begin(txn_id_u32) {
+        let lsn = match self.wal.log_begin(txn_id) {
             Ok(lsn) => lsn,
             Err(e) => {
                 self.proc_array.release(slot_idx);
@@ -475,10 +453,9 @@ impl TransactionManager {
             )));
         }
 
-        let txn_id_u32 = txn.txn_id_u32()?;
         let lsn = {
             let _s = profile::scope(Phase::CommitRecordAppend);
-            self.wal.log_commit(txn_id_u32, txn.last_lsn)?
+            self.wal.log_commit(txn.txn_id, txn.last_lsn)?
         };
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Committed;
@@ -496,6 +473,14 @@ impl TransactionManager {
         // transaction for time-travel; it is stored only while commit-LSN
         // tracking is enabled.
         self.status_map.record_committed_at(txn.txn_id, lsn.0);
+
+        // The other half of the conflict rate. Only write commits are counted:
+        // a read-only commit is not an outcome concurrency competed for, and
+        // including them would hide real write contention behind read volume
+        // on a read-mostly node
+        zyron_pressure::pressure_control::PressureController::global()
+            .contention()
+            .record_commit();
 
         {
             let _s = profile::scope(Phase::LockRelease);
@@ -600,8 +585,7 @@ impl TransactionManager {
             )));
         }
 
-        let txn_id_u32 = txn.txn_id_u32()?;
-        let lsn = self.wal.log_abort(txn_id_u32, txn.last_lsn)?;
+        let lsn = self.wal.log_abort(txn.txn_id, txn.last_lsn)?;
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Aborted;
 
@@ -688,7 +672,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = WalWriterConfig {
             wal_dir: dir.path().to_path_buf(),
-            segment_size: LogSegment::DEFAULT_SIZE,
+            segment_size: 1024 * 1024,
             fsync_enabled: false,
             ring_buffer_capacity: 1024 * 1024,
         };
@@ -796,7 +780,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = WalWriterConfig {
             wal_dir: dir.path().to_path_buf(),
-            segment_size: LogSegment::DEFAULT_SIZE,
+            segment_size: 1024 * 1024,
             fsync_enabled: true,
             ring_buffer_capacity: 1024 * 1024,
         };
@@ -894,13 +878,6 @@ mod tests {
         // Refresh again, txn2 is no longer active
         let refreshed2 = mgr.refresh_snapshot(&txn1);
         assert!(!refreshed2.is_txn_active(txn2.txn_id));
-    }
-
-    #[test]
-    fn test_txn_id_u32_conversion() {
-        let (mgr, _dir) = create_test_manager();
-        let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-        assert_eq!(txn.txn_id_u32().unwrap(), 1u32);
     }
 
     #[test]

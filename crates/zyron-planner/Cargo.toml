@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
@@ -16,6 +17,7 @@ tokio.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+mimalloc.workspace = true
 zyron-buffer = { path = "../zyron-buffer" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-wal = { path = "../zyron-wal" }

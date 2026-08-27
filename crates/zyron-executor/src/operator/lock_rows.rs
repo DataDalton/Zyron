@@ -88,12 +88,9 @@ impl Operator for LockRowsOperator {
                             if self.wait == RowLockWait::Nowait {
                                 locks
                                     .lock_row_or_holder(txn_id, table_id, *loc, self.mode)
-                                    .map_err(|holder| ZyronError::TransactionConflict {
-                                        txn_id,
-                                        reason: format!(
+                                    .map_err(|holder| ZyronError::transaction_conflict(txn_id, format!(
                                             "could not lock row {loc}, held by txn {holder} (NOWAIT)"
-                                        ),
-                                    })?;
+                                        )))?;
                             } else if locks
                                 .lock_row_or_holder(txn_id, table_id, *loc, self.mode)
                                 .is_err()
@@ -104,13 +101,13 @@ impl Operator for LockRowsOperator {
                                 if row_changed_since_snapshot(&self.ctx, self.table_id, *loc)
                                     .await?
                                 {
-                                    return Err(ZyronError::TransactionConflict {
+                                    return Err(ZyronError::transaction_conflict(
                                         txn_id,
-                                        reason: format!(
+                                        format!(
                                             "row {loc} was changed by a concurrently committed \
                                              transaction, retry the transaction"
                                         ),
-                                    });
+                                    ));
                                 }
                             }
                         }

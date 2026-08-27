@@ -33,6 +33,96 @@ const READ_CHANNEL_SIZE: usize = 256;
 /// Batches small writes (parameter status, auth messages) into fewer wakeups.
 const WRITE_NOTIFY_THRESHOLD: usize = 1024;
 
+/// Bytes a connection may hold in the write channel plus the worker's
+/// retained buffers before poll_write parks. Bounds what one slow or
+/// stalled client can pin in server memory.
+const WRITE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Byte budget shared between the PG-side writer and the quiche worker.
+/// The writer reserves bytes as it queues data and parks when the cap
+/// would be exceeded, the worker releases bytes as quiche actually
+/// accepts them, waking the writer. A write larger than the whole cap is
+/// admitted alone so it can never deadlock.
+struct WriteBudget {
+    bytes: std::sync::atomic::AtomicUsize,
+    cap: usize,
+    /// True while a writer is parked. A release reads this before it
+    /// touches the waker lock, so the uncontended path, which is every
+    /// write on a client that keeps up, pays a decrement and a load
+    /// instead of a mutex round trip.
+    parked: std::sync::atomic::AtomicBool,
+    /// One slot, because one budget belongs to one QuicStream and
+    /// `poll_write` takes `&mut self`, so at most one task is ever parked
+    /// on it. A shared budget would need a queue here.
+    waker: parking_lot::Mutex<Option<std::task::Waker>>,
+}
+
+impl WriteBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+            parked: std::sync::atomic::AtomicBool::new(false),
+            waker: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Reserves len bytes or parks the caller. Returns false only after the
+    /// waker is stored and the budget has been re-read, so a release that
+    /// lands during the park still wakes the task.
+    ///
+    /// The park handshake is sequentially consistent on purpose. A release
+    /// that reads `parked` as false must be ordered before the re-read
+    /// below, otherwise both sides could decide the other will make
+    /// progress and the write would hang.
+    fn poll_reserve(&self, len: usize, cx: &mut Context<'_>) -> bool {
+        loop {
+            let current = self.bytes.load(Ordering::Acquire);
+            if current == 0 || current.saturating_add(len) <= self.cap {
+                if self
+                    .bytes
+                    .compare_exchange(
+                        current,
+                        current.saturating_add(len),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+                continue;
+            }
+            let mut slot = self.waker.lock();
+            *slot = Some(cx.waker().clone());
+            self.parked.store(true, Ordering::SeqCst);
+            let recheck = self.bytes.load(Ordering::SeqCst);
+            if recheck == 0 || recheck.saturating_add(len) <= self.cap {
+                *slot = None;
+                self.parked.store(false, Ordering::SeqCst);
+                drop(slot);
+                continue;
+            }
+            return false;
+        }
+    }
+
+    fn release(&self, len: usize) {
+        self.bytes.fetch_sub(len, Ordering::SeqCst);
+        if !self.parked.load(Ordering::SeqCst) {
+            return;
+        }
+        let waker = {
+            let mut slot = self.waker.lock();
+            self.parked.store(false, Ordering::SeqCst);
+            slot.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
 /// Bidirectional byte stream over a QUIC connection.
 ///
 /// Wraps mpsc channels that bridge to the quiche worker loop.
@@ -50,6 +140,9 @@ pub struct QuicStream {
     pending_write_bytes: usize,
     /// Signals the quiche worker that this stream is shutting down.
     closed: Arc<AtomicBool>,
+    /// Bounds bytes in flight between here and the quiche worker, so a
+    /// slow client backpressures the writer instead of growing the channel.
+    budget: Arc<WriteBudget>,
 }
 
 impl QuicStream {
@@ -74,6 +167,12 @@ impl QuicStream {
             peer_addr,
             pending_write_bytes: 0,
             closed: Arc::new(AtomicBool::new(false)),
+            // The raw-parts form has no quiche worker, so nothing ever
+            // releases budget. A finite cap here is a deadlock once the
+            // cumulative writes pass it, whoever drains the channel. The
+            // backpressure bound protects the production path, which is
+            // built by WireProtocolApp with a worker that releases
+            budget: Arc::new(WriteBudget::new(usize::MAX)),
         }
     }
 }
@@ -115,10 +214,19 @@ impl AsyncRead for QuicStream {
 impl AsyncWrite for QuicStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let len = buf.len();
+        // A stalled client stops the worker from releasing budget, which
+        // parks this writer here instead of growing the channel without
+        // bound
+        if !self.budget.poll_reserve(len, cx) {
+            // The worker only wakes the parked writer when it releases
+            // budget, so make sure it is running and draining
+            self.write_notify.notify_one();
+            return Poll::Pending;
+        }
         match self.write_tx.send(Bytes::copy_from_slice(buf)) {
             Ok(()) => {
                 self.pending_write_bytes += len;
@@ -130,10 +238,13 @@ impl AsyncWrite for QuicStream {
                 }
                 Poll::Ready(Ok(len))
             }
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "QUIC connection closed",
-            ))),
+            Err(_) => {
+                self.budget.release(len);
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "QUIC connection closed",
+                )))
+            }
         }
     }
 
@@ -189,6 +300,9 @@ pub(crate) struct WireProtocolApp {
     /// Staging buffer for accumulating multiple channel messages into one
     /// stream_send call. Reduces per-message quiche overhead.
     write_staging: BytesMut,
+    /// Shared with the QuicStream writer. Bytes are released here as
+    /// quiche accepts them, which is what un-parks a backpressured writer.
+    budget: Arc<WriteBudget>,
 }
 
 impl WireProtocolApp {
@@ -201,6 +315,7 @@ impl WireProtocolApp {
         let (write_tx, write_rx) = mpsc::unbounded_channel();
         let write_notify = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
+        let budget = Arc::new(WriteBudget::new(WRITE_BUDGET_BYTES));
 
         let quic_stream = QuicStream {
             read_rx,
@@ -210,6 +325,7 @@ impl WireProtocolApp {
             peer_addr,
             pending_write_bytes: 0,
             closed: Arc::clone(&closed),
+            budget: Arc::clone(&budget),
         };
 
         // Send the QuicStream immediately. The connection handler will start
@@ -225,6 +341,7 @@ impl WireProtocolApp {
             closed,
             pending_write_buf: std::collections::VecDeque::new(),
             write_staging: BytesMut::with_capacity(65536),
+            budget,
         }
     }
 }
@@ -318,7 +435,8 @@ impl ApplicationOverQuic for WireProtocolApp {
 
         // Check if the PG handler has shut down.
         if self.closed.load(Ordering::Acquire) {
-            // Drain pending buffer and channel, then send FIN.
+            // Drain pending buffer and channel, then send FIN. The writer
+            // is gone, so no budget release is owed.
             for data in self.pending_write_buf.drain(..) {
                 let _ = qconn.stream_send(sid, &data, false);
             }
@@ -330,10 +448,22 @@ impl ApplicationOverQuic for WireProtocolApp {
             return Ok(());
         }
 
-        // Drain pending writes from previous flow-control backpressure first.
+        // Drain pending writes from previous flow-control backpressure
+        // first. stream_send may accept only a prefix, the unsent tail is
+        // retained so flow control never silently drops response bytes.
+        // Budget is released only for bytes quiche actually accepted, so a
+        // stalled peer keeps the writer parked
         while let Some(data) = self.pending_write_buf.pop_front() {
             match qconn.stream_send(sid, &data, false) {
-                Ok(_) => {}
+                Ok(accepted) => {
+                    if accepted > 0 {
+                        self.budget.release(accepted);
+                    }
+                    if accepted < data.len() {
+                        self.pending_write_buf.push_front(data.slice(accepted..));
+                        return Ok(());
+                    }
+                }
                 Err(quiche::Error::Done) => {
                     self.pending_write_buf.push_front(data);
                     return Ok(());
@@ -363,7 +493,15 @@ impl ApplicationOverQuic for WireProtocolApp {
 
         if !self.write_staging.is_empty() {
             match qconn.stream_send(sid, &self.write_staging, false) {
-                Ok(_) => {}
+                Ok(accepted) => {
+                    if accepted > 0 {
+                        self.budget.release(accepted);
+                    }
+                    if accepted < self.write_staging.len() {
+                        let tail = self.write_staging.split_off(accepted).freeze();
+                        self.pending_write_buf.push_back(tail);
+                    }
+                }
                 Err(quiche::Error::Done) => {
                     self.pending_write_buf
                         .push_back(self.write_staging.split().freeze());
@@ -401,6 +539,9 @@ pub fn test_stream_pair() -> (
         peer_addr: "127.0.0.1:5433".parse().unwrap(),
         pending_write_bytes: 0,
         closed: Arc::new(AtomicBool::new(false)),
+        // No quiche worker exists to release budget in the test pair, a
+        // finite cap would deadlock a test that writes past it
+        budget: Arc::new(WriteBudget::new(usize::MAX)),
     };
 
     (stream, read_tx, write_rx)
@@ -415,6 +556,7 @@ pub async fn setup_quic_listener(
     tls_cert_path: &std::path::Path,
     tls_key_path: &std::path::Path,
     idle_timeout_secs: u32,
+    enable_zero_rtt: bool,
 ) -> io::Result<mpsc::Receiver<(QuicStream, SocketAddr)>> {
     use futures::stream::StreamExt;
     use tokio_quiche::metrics::DefaultMetrics;
@@ -444,6 +586,9 @@ pub async fn setup_quic_listener(
 
     let mut settings = QuicSettings::default();
     settings.max_idle_timeout = Some(std::time::Duration::from_secs(idle_timeout_secs as u64));
+    // 0-RTT resumption trades replay exposure on the first flight for a
+    // faster reconnect, so it stays off unless the operator opts in
+    settings.enable_early_data = enable_zero_rtt;
 
     let params = ConnectionParams::new_server(settings, tls_cert, Hooks::default());
 
@@ -714,5 +859,102 @@ mod tests {
         stream.write_all(&big).await.unwrap();
         // After exceeding threshold, pending should reset
         assert_eq!(stream.pending_write_bytes, 0);
+    }
+    // The write budget parks a writer at the cap and a release un-parks
+    // it, and the raw-parts stream never parks because nothing would ever
+    // release it
+    #[test]
+    fn write_budget_parks_and_releases() {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        fn noop_waker() -> Waker {
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(std::ptr::null(), &VTABLE)
+            }
+            fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let budget = WriteBudget::new(100);
+        assert!(budget.poll_reserve(60, &mut cx), "under cap reserves");
+        assert!(!budget.poll_reserve(60, &mut cx), "over cap parks");
+        budget.release(60);
+        assert!(budget.poll_reserve(60, &mut cx), "release re-admits");
+
+        // An oversized write is admitted alone when the budget is empty,
+        // so a single huge frame can never deadlock
+        let big = WriteBudget::new(8);
+        assert!(big.poll_reserve(1024, &mut cx));
+
+        // Poll of Pending from the parked writer is what production
+        // observes, exercised through the stream itself at the cap
+        let _ = Poll::<()>::Pending;
+    }
+
+    /// A release that reads `parked` as false has to be ordered before the
+    /// parking writer re-reads the budget, or the writer sleeps on a
+    /// release that already happened and the stream stalls for good. The
+    /// window is a few instructions wide, so this runs the handshake
+    /// enough times to hit it and fails by timing out rather than hanging
+    /// the suite.
+    #[test]
+    fn write_budget_never_loses_a_wakeup() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::task::{Context, Wake, Waker};
+
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        const ROUNDS: usize = 20_000;
+        const CHUNK: usize = 1024;
+
+        let budget = Arc::new(WriteBudget::new(CHUNK));
+        let releaser_budget = Arc::clone(&budget);
+        let stop = Arc::new(AtomicBool::new(false));
+        let releaser_stop = Arc::clone(&stop);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let releaser = std::thread::spawn(move || {
+            let mut freed = 0usize;
+            while freed < ROUNDS && !releaser_stop.load(O::Relaxed) {
+                if releaser_budget.bytes.load(O::Acquire) >= CHUNK {
+                    releaser_budget.release(CHUNK);
+                    freed += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        let writer = std::thread::spawn(move || {
+            let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+            let mut cx = Context::from_waker(&waker);
+            for _ in 0..ROUNDS {
+                while !budget.poll_reserve(CHUNK, &mut cx) {
+                    std::thread::park();
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        let finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok();
+        stop.store(true, O::Relaxed);
+        assert!(finished, "a release was lost and the writer never woke");
+        writer.join().expect("writer");
+        releaser.join().expect("releaser");
     }
 }

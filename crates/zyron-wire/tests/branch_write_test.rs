@@ -60,6 +60,7 @@ async fn create_harness() -> Harness {
     ));
 
     let state = Arc::new(ServerState {
+        node_capabilities: None,
         catalog,
         wal,
         buffer_pool: pool,
@@ -117,6 +118,7 @@ async fn create_harness() -> Harness {
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
@@ -127,8 +129,11 @@ async fn create_harness() -> Harness {
         peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
+        max_query_memory: None,
+        spill_directory: None,
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
+        password_encryption: "balloon-sha-256".into(),
     });
 
     let mut session = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
@@ -183,7 +188,7 @@ async fn exec(h: &mut Harness, sql: &str) -> Vec<DataBatch> {
         .begin(IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         h.server.catalog.clone(),
         h.server.wal.clone(),
@@ -236,7 +241,7 @@ async fn exec_err(h: &mut Harness, sql: &str) -> String {
         .begin(IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = ExecutionContext::new(
         h.server.catalog.clone(),
         h.server.wal.clone(),

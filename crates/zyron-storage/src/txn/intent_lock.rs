@@ -44,10 +44,10 @@ impl IntentLockTable {
                     // Already held by same txn (idempotent)
                     Ok(())
                 } else {
-                    Err(ZyronError::TransactionConflict {
+                    Err(ZyronError::transaction_conflict(
                         txn_id,
-                        reason: format!("index key in table {} locked by txn {}", table_id, holder),
-                    })
+                        format!("index key in table {} locked by txn {}", table_id, holder),
+                    ))
                 }
             }
             scc::hash_map::Entry::Vacant(entry) => {

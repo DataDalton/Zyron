@@ -921,7 +921,9 @@ async fn build_index_scan(
             None,
         )
         .await?;
-        let op = crate::operator::sort::SortOperator::new(Box::new(child), order_by, columns, None);
+        let mut op =
+            crate::operator::sort::SortOperator::new(Box::new(child), order_by, columns, None);
+        op.set_memory_budget(ctx.memory_budget.clone());
         let br = BuildResult::new(Box::new(op));
         return Ok(br.with_metrics("Sort", analyze, vec![]));
     }
@@ -1375,7 +1377,7 @@ async fn build_hash_join(
     let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
     let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
     let remaining_condition = crate::subquery::materialize_opt(remaining_condition, ctx).await?;
-    let br = BuildResult::new(Box::new(HashJoinOperator::new(
+    let mut join_op = HashJoinOperator::new(
         left_br.op,
         right_br.op,
         join_type,
@@ -1384,7 +1386,10 @@ async fn build_hash_join(
         remaining_condition,
         left_schema,
         right_schema,
-    )));
+    );
+    join_op.set_memory_budget(ctx.memory_budget.clone());
+    join_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+    let br = BuildResult::new(Box::new(join_op));
     Ok(br.with_metrics("HashJoin", analyze, child_m))
 }
 
@@ -1407,7 +1412,7 @@ async fn build_merge_join(
     let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
     let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
     let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
-    let br = BuildResult::new(Box::new(MergeJoinOperator::new(
+    let mut join_op = MergeJoinOperator::new(
         left_br.op,
         right_br.op,
         join_type,
@@ -1415,7 +1420,10 @@ async fn build_merge_join(
         right_keys,
         left_schema,
         right_schema,
-    )));
+    );
+    join_op.set_memory_budget(ctx.memory_budget.clone());
+    join_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+    let br = BuildResult::new(Box::new(join_op));
     Ok(br.with_metrics("MergeJoin", analyze, child_m))
 }
 
@@ -1496,13 +1504,16 @@ async fn build_hash_aggregate(
     } else {
         let child_br = build_operator_tree(*child, ctx).await?;
         let child_m = collect_metrics(&[&child_br.metrics]);
-        let br = BuildResult::new(Box::new(HashAggregateOperator::new(
+        let mut agg_op = HashAggregateOperator::new(
             child_br.op,
             group_by,
             aggregates,
             input_schema,
             output_schema,
-        )));
+        );
+        agg_op.set_memory_budget(ctx.memory_budget.clone());
+        agg_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+        let br = BuildResult::new(Box::new(agg_op));
         Ok(br.with_metrics("HashAggregate", analyze, child_m))
     }
 }
@@ -1543,13 +1554,16 @@ async fn build_sort_aggregate(
     let aggregates = materialize_aggregate_args(aggregates, ctx).await?;
     let child_br = build_operator_tree(*child, ctx).await?;
     let child_m = collect_metrics(&[&child_br.metrics]);
-    let br = BuildResult::new(Box::new(SortAggregateOperator::new(
+    let mut agg_op = SortAggregateOperator::new(
         child_br.op,
         group_by,
         aggregates,
         input_schema,
         output_schema,
-    )));
+    );
+    agg_op.set_memory_budget(ctx.memory_budget.clone());
+    agg_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+    let br = BuildResult::new(Box::new(agg_op));
     Ok(br.with_metrics("SortAggregate", analyze, child_m))
 }
 
@@ -1576,12 +1590,10 @@ async fn build_sort(
         });
     }
     let order_by = materialized_order;
-    let br = BuildResult::new(Box::new(SortOperator::new(
-        child_br.op,
-        order_by,
-        input_schema,
-        limit,
-    )));
+    let mut sort_op = SortOperator::new(child_br.op, order_by, input_schema, limit);
+    sort_op.set_memory_budget(ctx.memory_budget.clone());
+    sort_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+    let br = BuildResult::new(Box::new(sort_op));
     Ok(br.with_metrics("Sort", analyze, child_m))
 }
 
@@ -1656,12 +1668,9 @@ async fn build_set_op(
     let left_br = build_operator_tree(*left, ctx).await?;
     let right_br = build_operator_tree(*right, ctx).await?;
     let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
-    let br = BuildResult::new(Box::new(SetOpOperator::new(
-        left_br.op,
-        right_br.op,
-        op,
-        all,
-    )));
+    let mut setop = SetOpOperator::new(left_br.op, right_br.op, op, all);
+    setop.set_memory_budget(ctx.memory_budget.clone());
+    let br = BuildResult::new(Box::new(setop));
     Ok(br.with_metrics("SetOp", analyze, child_m))
 }
 
@@ -1849,7 +1858,7 @@ async fn build_parallel_hash_join(
     let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
     let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
     let remaining_condition = crate::subquery::materialize_opt(remaining_condition, ctx).await?;
-    let br = BuildResult::new(Box::new(ParallelHashJoinOperator::new(
+    let mut join_op = ParallelHashJoinOperator::new(
         left_br.op,
         right_br.op,
         join_type,
@@ -1858,7 +1867,10 @@ async fn build_parallel_hash_join(
         remaining_condition,
         left_schema,
         right_schema,
-    )));
+    );
+    join_op.set_memory_budget(ctx.memory_budget.clone());
+    join_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+    let br = BuildResult::new(Box::new(join_op));
     Ok(br.with_metrics("ParallelHashJoin", analyze, child_m))
 }
 
@@ -1916,7 +1928,9 @@ async fn build_window(
     // Fold uncorrelated subqueries inside window function args,
     // PARTITION BY, and ORDER BY keys to constants.
     let window_exprs = crate::subquery::materialize_vec(window_exprs, ctx).await?;
-    let op = crate::operator::window::WindowOperator::new(child_br.op, window_exprs, input_schema);
+    let mut op =
+        crate::operator::window::WindowOperator::new(child_br.op, window_exprs, input_schema);
+    op.set_memory_budget(ctx.memory_budget.clone());
     Ok(BuildResult::new(Box::new(op)).with_metrics("Window", analyze, child_m))
 }
 
@@ -2172,10 +2186,12 @@ fn build_scan_with_tuple_ids(
                         nulls_first: o.nulls_first,
                     });
                 }
-                let br = BuildResult::new(Box::new(
+                let mut sort_op =
                     SortOperator::new(child_br.op, materialized_order, input_schema, limit)
-                        .with_locator_tracking(),
-                ));
+                        .with_locator_tracking();
+                sort_op.set_memory_budget(ctx.memory_budget.clone());
+                sort_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+                let br = BuildResult::new(Box::new(sort_op));
                 Ok(br.with_metrics("Sort", analyze, child_m))
             }
 
@@ -2244,6 +2260,7 @@ pub async fn execute(plan: PhysicalPlan, ctx: &Arc<ExecutionContext>) -> Result<
                         )));
                     }
                 }
+                ctx.reserve_memory(exec_batch.batch.approx_bytes())?;
                 results.push(exec_batch.batch);
             }
             None => break,

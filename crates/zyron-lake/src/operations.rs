@@ -263,6 +263,11 @@ pub fn create_index(
     let mut attempt = attempt;
     attempt.operation = OperationKind::SchemaChange;
     let mut staged: Vec<PathBuf> = Vec::new();
+    // Partition ids registered before their files exist, held until the
+    // commit resolves either way, so a concurrent vacuum never reclaims a
+    // file this commit is about to name
+    let staging_guards: std::cell::RefCell<Vec<crate::transaction_log::StagedPartition<'_>>> =
+        std::cell::RefCell::new(Vec::new());
     let mut built_rows = 0u64;
     let mut built_index_id = 0u32;
     let result = log.commit(attempt, |base| {
@@ -298,6 +303,10 @@ pub fn create_index(
         let built = index::build_entries(log.paths(), base, &spec, table_id, &mut || {
             let id = allocate_unused_partition_id(base, &used);
             used.push(id);
+            // Registered before the file exists and held until the commit
+            // resolves, so a concurrent vacuum never reclaims a file this
+            // commit is about to name
+            staging_guards.borrow_mut().push(log.stage_partition(id));
             id
         })?;
         let mut rows = 0u64;
@@ -366,6 +375,11 @@ pub fn rebuild_indexes(
     let mut attempt = attempt;
     attempt.operation = OperationKind::SchemaChange;
     let mut staged: Vec<PathBuf> = Vec::new();
+    // Partition ids registered before their files exist, held until the
+    // commit resolves either way, so a concurrent vacuum never reclaims a
+    // file this commit is about to name
+    let staging_guards: std::cell::RefCell<Vec<crate::transaction_log::StagedPartition<'_>>> =
+        std::cell::RefCell::new(Vec::new());
     let result = log.commit(attempt, |base| {
         for path in staged.drain(..) {
             discard_staged_file(&path);
@@ -382,6 +396,7 @@ pub fn rebuild_indexes(
             let built = index::build_entries(log.paths(), base, spec, table_id, &mut || {
                 let id = allocate_unused_partition_id(base, &used);
                 used.push(id);
+                staging_guards.borrow_mut().push(log.stage_partition(id));
                 id
             })?;
             for entry in &built {
@@ -494,8 +509,17 @@ pub fn delete_where(
                         partition_id: file.partition_id,
                     });
                     files_removed += 1;
-                    rows_removed += file.row_count;
-                    rows_matched += file.row_count;
+                    // The manifest row count includes rows earlier delete
+                    // predicates already removed logically. A file carrying
+                    // predicates counts its LIVE matches by scan, so a row
+                    // deleted twice is never reported twice
+                    let live = if file.delete_predicate_ids.is_empty() {
+                        file.row_count
+                    } else {
+                        count_matching_rows(log, base, file, predicate)?
+                    };
+                    rows_removed += live;
+                    rows_matched += live;
                 }
                 PruneDecision::MayMatch => {
                     partial = true;
@@ -563,16 +587,17 @@ fn count_matching_rows(
     }
     let keep = reader.delete_survivors(&base.schema, base, file)?;
     let columns = reader.read_predicate_columns(&base.schema, &[predicate])?;
-    let compiled = crate::reader::CompiledPredicate::new(predicate, &columns);
-    let mut matched = 0u64;
-    for row in 0..row_count {
-        if keep[row / 8] & (1 << (row % 8)) == 0 {
-            continue;
-        }
-        if compiled.evaluate(&columns, row) == Some(true) {
-            matched += 1;
-        }
-    }
+    // Mark the matching rows in one pass, then count the ones still live.
+    // Both masks are trimmed past the last row, so the popcount over their
+    // intersection is exact without a per-row bound check
+    let mut hits = vec![0u8; keep.len()];
+    crate::reader::CompiledPredicate::new(predicate, &columns)
+        .mark_true(&columns, row_count, &mut hits);
+    let matched: u64 = hits
+        .iter()
+        .zip(keep.iter())
+        .map(|(&hit, &live)| (hit & live).count_ones() as u64)
+        .sum();
     Ok(matched)
 }
 
@@ -618,6 +643,11 @@ pub fn update_where(
     attempt.operation = OperationKind::Update;
     attempt.read_predicate = predicate;
     let mut staged: Vec<PathBuf> = Vec::new();
+    // Partition ids registered before their files exist, held until the
+    // commit resolves either way, so a concurrent vacuum never reclaims a
+    // file this commit is about to name
+    let staging_guards: std::cell::RefCell<Vec<crate::transaction_log::StagedPartition<'_>>> =
+        std::cell::RefCell::new(Vec::new());
     let mut files_removed = 0usize;
     let mut predicate_recorded = false;
     // The file the new images landed in, so the caller can address them
@@ -680,6 +710,9 @@ pub fn update_where(
         }
         // The new file is added last so it inherits no delete predicate
         let partition_id = allocate_partition_id(base);
+        staging_guards
+            .borrow_mut()
+            .push(log.stage_partition(partition_id));
         let sort_keys: Vec<u32> = base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
         // The declared curve per key, so a file is laid out the way the
         // spec asked rather than always ascending
@@ -717,6 +750,7 @@ pub fn update_where(
             &mut || {
                 let id = allocate_unused_partition_id(base, &used);
                 used.push(id);
+                staging_guards.borrow_mut().push(log.stage_partition(id));
                 id
             },
         )?;
@@ -1054,6 +1088,11 @@ pub fn optimize(
     let mut attempt = attempt;
     attempt.operation = OperationKind::Optimize;
     let mut staged: Vec<PathBuf> = Vec::new();
+    // Partition ids registered before their files exist, held until the
+    // commit resolves either way, so a concurrent vacuum never reclaims a
+    // file this commit is about to name
+    let staging_guards: std::cell::RefCell<Vec<crate::transaction_log::StagedPartition<'_>>> =
+        std::cell::RefCell::new(Vec::new());
     let mut files_removed = 0usize;
     let mut files_written = 0usize;
     let mut rows_written = 0u64;
@@ -1109,6 +1148,9 @@ pub fn optimize(
         let survivor_rows = batch.first().map(|c| c.len()).unwrap_or(0);
         if survivor_rows > 0 {
             let partition_id = allocate_partition_id(base);
+            staging_guards
+                .borrow_mut()
+                .push(log.stage_partition(partition_id));
             let sort_keys: Vec<u32> = base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
             let sort_strategies: Vec<ClusterStrategy> =
                 base.cluster_spec.keys.iter().map(|k| k.strategy).collect();
@@ -1164,6 +1206,7 @@ pub fn optimize(
                     &mut || {
                         let id = allocate_unused_partition_id(base, &used);
                         used.push(id);
+                        staging_guards.borrow_mut().push(log.stage_partition(id));
                         id
                     },
                 )? {
@@ -1223,11 +1266,42 @@ pub fn optimize(
 
 /// Deletes data files no reachable version references anymore, orphans
 /// from failed commits and files removed before the retention floor.
-/// Returns how many files were deleted
+/// Returns how many files were deleted.
+///
+/// Runs against the table's main log only. Branch writes land in the same
+/// data directory, so every branch's replayable history joins the reference
+/// set and a branch's in-flight staged writes are honored the same way as
+/// main's
 pub fn vacuum_data_files(
     log: &TransactionLog,
     retain_min_version: u64,
 ) -> Result<usize, ZyronError> {
+    if log.branch_name().is_some() {
+        return Err(ZyronError::BranchConflict(
+            "vacuum runs on the table's main log, branches share its data directory".into(),
+        ));
+    }
+
+    // Branch heads opened before the listing so a file a branch writer is
+    // producing is already visible as staged when the listing sees it. The
+    // shared registry hands back the instance the writers use, which is the
+    // one whose staging set means anything
+    let mut branch_logs: Vec<std::sync::Arc<TransactionLog>> = Vec::new();
+    let mut branch_names: BTreeSet<String> = BTreeSet::new();
+    for info in crate::branch::list_branches(log.paths())? {
+        match crate::branch::open_branch_shared(log.paths(), &info.name) {
+            Ok(blog) => {
+                branch_names.insert(info.name);
+                branch_logs.push(blog);
+            }
+            // Dropped between the listing and the open. Its unmerged files
+            // are unreferenced by every surviving manifest and are exactly
+            // what vacuum reclaims
+            Err(ZyronError::BranchNotFound(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
     // The directory is listed before the reference set is built, never the
     // other way round.
     //
@@ -1240,6 +1314,9 @@ pub fn vacuum_data_files(
     // manifest. Reading the manifest first leaves exactly the gap those two
     // close: the file is written, its commit has not landed, and the
     // reference set that would have named it was taken before it existed
+    let staged_anywhere = |branches: &[std::sync::Arc<TransactionLog>], partition_id: u64| {
+        log.is_staging(partition_id) || branches.iter().any(|b| b.is_staging(partition_id))
+    };
     let mut data_candidates: Vec<(PathBuf, u64)> = Vec::new();
     let mut index_candidates: Vec<(PathBuf, (u32, u64))> = Vec::new();
     for dirent in fs::read_dir(log.paths().data_dir())? {
@@ -1247,7 +1324,7 @@ pub fn vacuum_data_files(
         let name = dirent.file_name();
         let Some(name) = name.to_str() else { continue };
         if let Some(key) = parse_index_file_name(name) {
-            if !log.is_staging(key.1) {
+            if !staged_anywhere(&branch_logs, key.1) {
                 index_candidates.push((dirent.path(), key));
             }
             continue;
@@ -1255,8 +1332,27 @@ pub fn vacuum_data_files(
         let Some(partition_id) = parse_data_file_name(name) else {
             continue;
         };
-        if !log.is_staging(partition_id) {
+        if !staged_anywhere(&branch_logs, partition_id) {
             data_candidates.push((dirent.path(), partition_id));
+        }
+    }
+
+    // A branch created after the pre-listing enumeration writes through a
+    // shared head this pass has not seen. Enumerating again after the
+    // listing closes it: such a branch's commits are either named by the
+    // manifests walked below or still held in a staging set checked at
+    // removal time
+    for info in crate::branch::list_branches(log.paths())? {
+        if branch_names.contains(&info.name) {
+            continue;
+        }
+        match crate::branch::open_branch_shared(log.paths(), &info.name) {
+            Ok(blog) => {
+                branch_names.insert(info.name);
+                branch_logs.push(blog);
+            }
+            Err(ZyronError::BranchNotFound(_)) => continue,
+            Err(e) => return Err(e),
         }
     }
 
@@ -1268,21 +1364,36 @@ pub fn vacuum_data_files(
     // the index they belong to. A dropped index leaves its files behind
     // and this is what collects them
     let mut referenced_index: BTreeSet<(u32, u64)> = BTreeSet::new();
+    let mut collect = |manifest: &ManifestFile| {
+        for entry in &manifest.entries {
+            referenced.insert(entry.partition_id);
+        }
+        for file in &manifest.index_files {
+            referenced_index.insert((file.index_id, file.file.partition_id));
+        }
+    };
     for version in floor..=head {
         match log.manifest_at(version) {
-            Ok(manifest) => {
-                for entry in &manifest.entries {
-                    referenced.insert(entry.partition_id);
-                }
-                for file in &manifest.index_files {
-                    referenced_index.insert((file.index_id, file.file.partition_id));
-                }
-            }
+            Ok(manifest) => collect(&manifest),
             // Versions below the surviving checkpoint chain are gone,
             // their files are exactly what vacuum reclaims
             Err(_) => continue,
         }
     }
+    // A branch is a live head, not history: its whole replayable span stays
+    // readable however far main's retention floor has advanced, including
+    // the fork-point manifest an unwritten branch still serves
+    for blog in &branch_logs {
+        let base = blog.branch_base().max(1);
+        let bhead = blog.head_version();
+        for version in base..=bhead {
+            match blog.manifest_at(version) {
+                Ok(manifest) => collect(&manifest),
+                Err(_) => continue,
+            }
+        }
+    }
+    drop(collect);
     // A clone holds a version of this table, and the source has to stay
     // able to serve it. The pins name versions rather than files, so this
     // costs one manifest reconstruction per clone and no directory walk
@@ -1298,13 +1409,13 @@ pub fn vacuum_data_files(
 
     let mut removed = 0usize;
     for (path, key) in index_candidates {
-        if !referenced_index.contains(&key) {
+        if !referenced_index.contains(&key) && !staged_anywhere(&branch_logs, key.1) {
             fs::remove_file(path)?;
             removed += 1;
         }
     }
     for (path, partition_id) in data_candidates {
-        if !referenced.contains(&partition_id) {
+        if !referenced.contains(&partition_id) && !staged_anywhere(&branch_logs, partition_id) {
             fs::remove_file(path)?;
             removed += 1;
         }
@@ -1728,6 +1839,58 @@ mod tests {
         let removed = vacuum_data_files(&log, log.latest_version()).expect("vacuum head");
         assert_eq!(removed, 1);
         assert!(!log.paths().data_file(old_pid).exists());
+    }
+
+    /// Branch writes land in the shared data directory under their own
+    /// partition ids, referenced only by the branch's manifests. The vacuum
+    /// keeps them while the branch lives and reclaims them once it is
+    /// dropped
+    #[test]
+    fn test_vacuum_keeps_branch_files_until_the_branch_is_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = new_log(dir.path());
+        append_rows(&log, attempt(), 7, &batch(&[1], &[Some("main")])).expect("append main");
+
+        crate::branch::create_branch(&log, "dev", None, 1).expect("create branch");
+        let blog = crate::branch::open_branch_shared(log.paths(), "dev").expect("open branch");
+        append_rows(&blog, attempt(), 7, &batch(&[2], &[Some("branch")])).expect("append branch");
+
+        // The branch head manifest names both main's inherited file and the
+        // branch's own append, so the branch-only file is the one main's
+        // manifest does not know
+        let main_pids: BTreeSet<u64> = log
+            .latest_manifest()
+            .expect("main manifest")
+            .entries
+            .iter()
+            .map(|e| e.partition_id)
+            .collect();
+        let branch_pid = blog
+            .latest_manifest()
+            .expect("branch manifest")
+            .entries
+            .iter()
+            .map(|e| e.partition_id)
+            .find(|pid| !main_pids.contains(pid))
+            .expect("the branch append produced its own file");
+        let branch_file = log.paths().data_file(branch_pid);
+        assert!(branch_file.exists(), "the branch write landed on disk");
+
+        // The vacuum runs against main, whose manifests never name the
+        // branch's file, and must still keep it
+        let removed = vacuum_data_files(&log, log.latest_version()).expect("vacuum");
+        assert_eq!(removed, 0, "a live branch's file is not reclaimed");
+        assert!(branch_file.exists());
+
+        // A branch log cannot host the vacuum, main owns the shared data
+        // directory
+        assert!(vacuum_data_files(&blog, 1).is_err());
+
+        drop(blog);
+        crate::branch::drop_branch(log.paths(), "dev").expect("drop branch");
+        let removed = vacuum_data_files(&log, log.latest_version()).expect("vacuum after drop");
+        assert_eq!(removed, 1, "the dropped branch's file is an orphan now");
+        assert!(!branch_file.exists());
     }
 
     /// A data file is written under the name it will be read by, so the

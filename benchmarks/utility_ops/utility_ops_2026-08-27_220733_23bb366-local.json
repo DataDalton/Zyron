@@ -1,0 +1,107 @@
+{
+  "id": "2026-08-27_220733_23bb366-local",
+  "date": "2026-08-27 22:07:36Z",
+  "ts": 1787868456,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Performance": {
+      "CRC32C 1 GB (GB/sec)": {
+        "average": 12.303010,
+        "runs": [12.18, 12.41, 12.39, 12.13, 12.40],
+        "target": 12.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "xxHash64 1 GB (GB/sec)": {
+        "average": 19.111412,
+        "runs": [18.96, 19.66, 19.55, 19.42, 17.97],
+        "target": 16.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "DETECT_MIME_TYPE (ns)": {
+        "average": 5.589800,
+        "runs": [5.58, 5.59, 5.61, 5.58, 5.58],
+        "target": 400.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "JSON Diff 1 KB (us)": {
+        "average": 5.549332,
+        "runs": [5.56, 5.57, 5.55, 5.54, 5.53],
+        "target": 12.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "JSON Patch 1 KB (us)": {
+        "average": 2.677680,
+        "runs": [2.69, 2.68, 2.68, 2.68, 2.66],
+        "target": 6.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "MARKDOWN_TO_HTML 10 KB (us)": {
+        "average": 32.085800,
+        "runs": [32.81, 31.90, 31.89, 32.06, 31.77],
+        "target": 300.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "natural_sort_key (ns)": {
+        "average": 18.060000,
+        "runs": [18.20, 18.00, 18.00, 18.00, 18.10],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "QR encode (ms)": {
+        "average": 0.042580,
+        "runs": [0.05, 0.04, 0.04, 0.04, 0.04],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Rate limit check (ns)": {
+        "average": 63.310000,
+        "runs": [63.56, 63.40, 63.29, 63.09, 63.21],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Text Diff 10K lines (ms)": {
+        "average": 0.253360,
+        "runs": [0.30, 0.24, 0.24, 0.24, 0.25],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

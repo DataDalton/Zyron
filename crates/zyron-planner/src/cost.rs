@@ -25,6 +25,17 @@ const MIN_REMOTE_WORK: f64 = 0.01;
 /// figure matters less than the ratio between projections.
 const AVG_COLUMN_BYTES: f64 = 16.0;
 
+/// Bytes a row of unknown width is assumed to hold when deciding whether an
+/// operator would spill.
+///
+/// Four columns at the average above. Every alternative the planner compares
+/// is measured with the same figure, so it shifts where spilling starts
+/// rather than which of two spilling plans looks cheaper.
+pub const ASSUMED_ROW_BYTES: f64 = AVG_COLUMN_BYTES * 4.0;
+
+/// Bytes a page holds, for turning spilled bytes into page reads and writes.
+const SPILL_PAGE_BYTES: f64 = 8192.0;
+
 // ---------------------------------------------------------------------------
 // Plan cost
 // ---------------------------------------------------------------------------
@@ -190,6 +201,10 @@ pub struct CostModel {
     pub parallel_tuple_cost: f64,
     /// Fixed startup cost for launching parallel workers.
     pub parallel_setup_cost: f64,
+    /// Bytes one query's materializing operators may hold before they start
+    /// writing to disk. Zero means nothing bounds them, which is the default
+    /// and means no plan is costed as spilling.
+    pub working_memory_bytes: f64,
 }
 
 impl Default for CostModel {
@@ -204,6 +219,7 @@ impl Default for CostModel {
             memory_cost_per_byte: 0.00001,
             parallel_tuple_cost: 0.1,
             parallel_setup_cost: 1000.0,
+            working_memory_bytes: 0.0,
         }
     }
 }
@@ -305,8 +321,19 @@ impl CostModel {
             (right, left)
         };
 
-        // IO from both sides
-        let io_cost = left.io_cost + right.io_cost;
+        // IO from both sides. This join partitions in memory, so both inputs
+        // are held whole before any of it starts: past the budget it hands
+        // the work to the serial join, which partitions onto disk and gives
+        // up the parallelism this cost was granted for. Charged as the serial
+        // join is charged, so the plan that fits wins where it should
+        let build_bytes = Self::working_bytes(build.row_count);
+        let spill = if build_bytes > self.working_memory_bytes && self.working_memory_bytes > 0.0 {
+            self.spill_io(build_bytes, 2.0)
+                + self.spill_io(Self::working_bytes(probe.row_count), 2.0)
+        } else {
+            0.0
+        };
+        let io_cost = left.io_cost + right.io_cost + spill;
 
         // CPU: build and probe divided by workers, plus coordination overhead
         let build_cpu = (build.row_count / workers) * self.cpu_operator_cost;
@@ -435,6 +462,31 @@ impl CostModel {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Spilling
+    // -----------------------------------------------------------------------
+
+    /// IO an operator pays for the part of its working set that does not fit.
+    ///
+    /// `passes` is how many times the spilled bytes cross the device: two for
+    /// a sort, which writes runs and reads them back once, and four for a
+    /// partitioned join, which writes and reads both sides. Only the excess is
+    /// charged, so an operator that fits pays nothing and one that is just
+    /// over pays a little, which is what keeps the model from treating the
+    /// budget as a cliff.
+    fn spill_io(&self, working_bytes: f64, passes: f64) -> f64 {
+        if self.working_memory_bytes <= 0.0 || working_bytes <= self.working_memory_bytes {
+            return 0.0;
+        }
+        let excess = working_bytes - self.working_memory_bytes;
+        (excess / SPILL_PAGE_BYTES) * passes * self.seq_page_cost
+    }
+
+    /// Bytes an operator holds for a given number of rows.
+    fn working_bytes(rows: f64) -> f64 {
+        rows.max(0.0) * ASSUMED_ROW_BYTES
+    }
+
     /// Estimates the cost of a hash join.
     pub fn cost_hash_join(&self, left: &PlanCost, right: &PlanCost) -> PlanCost {
         // Build hash table on the smaller side, probe with larger
@@ -443,8 +495,20 @@ impl CostModel {
         } else {
             (right, left)
         };
+        // A build side past the budget partitions both inputs to disk and
+        // reads both back, so the excess crosses the device four times. The
+        // probe side is charged only when the build side spilled, because a
+        // build side that fits means the probe side streams past it and is
+        // never written
+        let build_bytes = Self::working_bytes(build.row_count);
+        let spill = if build_bytes > self.working_memory_bytes && self.working_memory_bytes > 0.0 {
+            self.spill_io(build_bytes, 2.0)
+                + self.spill_io(Self::working_bytes(probe.row_count), 2.0)
+        } else {
+            0.0
+        };
         PlanCost {
-            io_cost: left.io_cost + right.io_cost,
+            io_cost: left.io_cost + right.io_cost + spill,
             cpu_cost: build.row_count * self.cpu_operator_cost  // hash build
                 + probe.row_count * self.cpu_operator_cost      // hash probe
                 + left.cpu_cost + right.cpu_cost,
@@ -464,6 +528,10 @@ impl CostModel {
     }
 
     /// Estimates the cost of a merge join (both sides assumed sorted).
+    ///
+    /// A merge join over sorted inputs holds only the rows sharing the current
+    /// key, so nothing here spills. What it costs is in the sorts the planner
+    /// prices separately, and those do.
     pub fn cost_merge_join(&self, left: &PlanCost, right: &PlanCost) -> PlanCost {
         PlanCost {
             io_cost: left.io_cost + right.io_cost,
@@ -475,11 +543,16 @@ impl CostModel {
     }
 
     /// Estimates the cost of a sort operation.
+    ///
+    /// Past the budget the sort writes sorted runs and merges them back, so
+    /// the excess crosses the device twice. Cheaper per byte than a
+    /// partitioned join, which is what makes a sort-based plan worth
+    /// considering when a hash plan would not fit.
     pub fn cost_sort(&self, input: &PlanCost) -> PlanCost {
         let n = input.row_count.max(1.0);
         let comparisons = n * n.log2();
         PlanCost {
-            io_cost: input.io_cost,
+            io_cost: input.io_cost + self.spill_io(Self::working_bytes(input.row_count), 2.0),
             cpu_cost: input.cpu_cost + comparisons * self.cpu_operator_cost,
             row_count: input.row_count,
         }
@@ -487,8 +560,12 @@ impl CostModel {
 
     /// Estimates the cost of a hash aggregation.
     pub fn cost_hash_aggregate(&self, input: &PlanCost, group_count: f64) -> PlanCost {
+        // The table holds one entry per group, not one per input row, so a
+        // grouping that collapses its input costs nothing here however large
+        // that input is. Past the budget the groups are partitioned to disk
+        // and read back, which is two crossings
         PlanCost {
-            io_cost: input.io_cost,
+            io_cost: input.io_cost + self.spill_io(Self::working_bytes(group_count), 2.0),
             cpu_cost: input.cpu_cost + input.row_count * self.cpu_operator_cost,
             row_count: group_count.max(1.0),
         }
@@ -963,5 +1040,118 @@ mod tests {
         assert!(parallel_build_probe < serial_build_probe);
         // IO cost is the same
         assert_eq!(parallel.io_cost, serial.io_cost);
+    }
+
+    // -----------------------------------------------------------------------
+    // Spilling
+    // -----------------------------------------------------------------------
+
+    /// A plan cost with a row count and nothing else, for comparing shapes.
+    fn rows(count: f64) -> PlanCost {
+        PlanCost {
+            io_cost: 0.0,
+            cpu_cost: 0.0,
+            row_count: count,
+        }
+    }
+
+    /// A model that lets a query hold the given number of rows.
+    fn bounded(row_capacity: f64) -> CostModel {
+        CostModel {
+            working_memory_bytes: row_capacity * ASSUMED_ROW_BYTES,
+            ..CostModel::default()
+        }
+    }
+
+    /// With no configured limit nothing spills, so no plan pays for it
+    /// however large it is. This is the default and the behaviour every plan
+    /// had before spilling was costed.
+    #[test]
+    fn an_unbounded_model_charges_nothing_for_size() {
+        let model = make_cost_model();
+        assert_eq!(model.working_memory_bytes, 0.0);
+        let small = model.cost_hash_join(&rows(10.0), &rows(10.0));
+        let huge = model.cost_hash_join(&rows(100_000_000.0), &rows(10.0));
+        assert_eq!(small.io_cost, 0.0);
+        assert_eq!(huge.io_cost, 0.0, "an unbounded model invented spill IO");
+    }
+
+    /// A join whose build side does not fit pays for writing both sides out
+    /// and reading them back. One that fits pays nothing.
+    #[test]
+    fn a_join_past_the_budget_costs_more_than_one_inside_it() {
+        let model = bounded(1_000.0);
+        let fits = model.cost_hash_join(&rows(900.0), &rows(50_000.0));
+        let spills = model.cost_hash_join(&rows(1_100.0), &rows(50_000.0));
+        assert_eq!(fits.io_cost, 0.0, "a join inside the budget paid spill IO");
+        assert!(
+            spills.io_cost > 0.0,
+            "a join past the budget paid nothing for spilling"
+        );
+        assert!(spills.total() > fits.total());
+    }
+
+    /// Only the excess is charged, so passing the budget is a slope rather
+    /// than a cliff. A cliff would make the planner treat a plan one row over
+    /// as equal to one a thousand times over.
+    #[test]
+    fn the_charge_grows_with_the_excess() {
+        let model = bounded(1_000.0);
+        let barely = model.cost_hash_join(&rows(1_010.0), &rows(1_010.0));
+        let far = model.cost_hash_join(&rows(100_000.0), &rows(100_000.0));
+        assert!(barely.io_cost > 0.0);
+        assert!(
+            far.io_cost > barely.io_cost * 50.0,
+            "a join far past the budget cost {} against {} for one barely past",
+            far.io_cost,
+            barely.io_cost
+        );
+    }
+
+    /// Sorting the excess is cheaper per byte than partitioning it, because a
+    /// sort writes runs and reads them back while a join writes and reads both
+    /// of its sides. That difference is what lets a sort-based plan win where
+    /// a hash plan would not fit.
+    #[test]
+    fn a_sort_pays_less_for_the_same_excess_than_a_join() {
+        let model = bounded(1_000.0);
+        let sort = model.cost_sort(&rows(100_000.0));
+        let join = model.cost_hash_join(&rows(100_000.0), &rows(100_000.0));
+        assert!(sort.io_cost > 0.0);
+        assert!(
+            sort.io_cost < join.io_cost,
+            "sorting {} cost as much as partitioning {}",
+            sort.io_cost,
+            join.io_cost
+        );
+    }
+
+    /// A grouping that collapses its input holds one entry per group, so a
+    /// huge input that produces few groups does not spill.
+    #[test]
+    fn an_aggregate_is_measured_by_its_groups_not_its_input() {
+        let model = bounded(1_000.0);
+        let collapsing = model.cost_hash_aggregate(&rows(10_000_000.0), 12.0);
+        let sprawling = model.cost_hash_aggregate(&rows(10_000_000.0), 5_000_000.0);
+        assert_eq!(
+            collapsing.io_cost, 0.0,
+            "an aggregate with twelve groups was costed as spilling"
+        );
+        assert!(sprawling.io_cost > 0.0);
+    }
+
+    /// The parallel join holds both inputs whole to partition them, so past
+    /// the budget it is charged what the serial spilling join is charged
+    /// rather than looking free because it has workers.
+    #[test]
+    fn the_parallel_join_pays_for_spilling_too() {
+        let model = bounded(1_000.0);
+        let serial = model.cost_hash_join(&rows(100_000.0), &rows(100_000.0));
+        let parallel = model.cost_parallel_hash_join(&rows(100_000.0), &rows(100_000.0), 8);
+        assert!(parallel.io_cost > 0.0);
+        assert_eq!(
+            parallel.io_cost, serial.io_cost,
+            "the parallel join was costed as if partitioning were free"
+        );
     }
 }

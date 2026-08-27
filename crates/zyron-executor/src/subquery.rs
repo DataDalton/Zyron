@@ -359,13 +359,16 @@ async fn materialize_scalar(
     type_id: TypeId,
     ctx: &Arc<ExecutionContext>,
 ) -> Result<BoundExpr> {
+    // A decimal result's raw i128 only means its value together with the
+    // column's scale, which the subquery output schema carries
+    let fractional_digits = plan.output_schema.first().and_then(|c| c.fractional_digits);
     let values = run_first_column(plan, ctx).await?;
     match values.len() {
         0 => Ok(BoundExpr::Literal {
             value: LiteralValue::Null,
             type_id,
         }),
-        1 => scalar_to_bound_expr(&values[0], type_id),
+        1 => scalar_to_bound_expr(&values[0], type_id, fractional_digits),
         n => Err(ZyronError::ExecutionError(format!(
             "scalar subquery returned {n} rows, expected at most one"
         ))),
@@ -394,6 +397,7 @@ async fn materialize_in(
     // Type the list literals as the probe so the IN comparison matches the
     // probe's column type instead of a widened literal type.
     let probe_type = probe.type_id();
+    let probe_scale = probe.fractional_digits();
     let values = run_first_column(plan, ctx).await?;
     let mut list = Vec::with_capacity(values.len());
     for v in &values {
@@ -404,7 +408,7 @@ async fn materialize_in(
         } else {
             probe_type
         };
-        list.push(scalar_to_bound_expr(v, type_id)?);
+        list.push(scalar_to_bound_expr(v, type_id, probe_scale)?);
     }
     Ok(BoundExpr::InList {
         expr: Box::new(probe),
@@ -418,7 +422,11 @@ async fn materialize_in(
 /// `Literal`; 128-bit integers, full-width unsigned values, and binary values
 /// that exceed the literal carriers are spliced as a `Cast` over their exact
 /// text form so the substituted constant carries the real value.
-fn scalar_to_bound_expr(s: &ScalarValue, type_id: TypeId) -> Result<BoundExpr> {
+fn scalar_to_bound_expr(
+    s: &ScalarValue,
+    type_id: TypeId,
+    fractional_digits: Option<u8>,
+) -> Result<BoundExpr> {
     let lit = |value: LiteralValue| BoundExpr::Literal { value, type_id };
     Ok(match s {
         ScalarValue::Null => lit(LiteralValue::Null),
@@ -437,7 +445,22 @@ fn scalar_to_bound_expr(s: &ScalarValue, type_id: TypeId) -> Result<BoundExpr> {
         // Values whose magnitude or representation exceeds an i64 literal are
         // carried as their exact text and cast back to the column type. The
         // cast path parses decimal text for 128-bit/unsigned and hex for binary.
-        ScalarValue::Int128(v) => cast_text_to(v.to_string(), TypeId::Int128, None),
+        ScalarValue::Int128(v) => {
+            // A decimal's i128 is the value times ten to its scale. It folds
+            // back through its rendered form so the substituted constant
+            // parses onto the same scale, instead of the raw scaled integer
+            // reading as a plain number that later comparisons rescale again
+            if type_id == TypeId::Decimal {
+                let scale = fractional_digits.unwrap_or(0);
+                cast_text_to(
+                    zyron_common::format_decimal(*v, scale),
+                    TypeId::Decimal,
+                    Some(scale),
+                )
+            } else {
+                cast_text_to(v.to_string(), TypeId::Int128, None)
+            }
+        }
         ScalarValue::UInt64(v) => cast_text_to(v.to_string(), TypeId::UInt64, None),
         ScalarValue::Binary(b) => cast_text_to(encode_hex(b), TypeId::Bytea, None),
         ScalarValue::FixedBinary16(b) => cast_text_to(encode_hex(b), TypeId::Uuid, None),

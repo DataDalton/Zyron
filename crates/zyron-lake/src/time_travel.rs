@@ -57,6 +57,13 @@ pub fn manifest_as_of(
 
 fn resolve_timestamp(log: &TransactionLog, target_us: i64) -> Result<u64, ZyronError> {
     let published = log.latest_version();
+    // On a branch, only main versions at or below the fork point are on
+    // this head's chain. Main commits after the fork belong to a history
+    // the branch never saw, so they are not candidates here
+    let shared_ceiling = match log.branch_name() {
+        Some(_) => log.branch_base().min(published),
+        None => published,
+    };
     // Every version still on disk with its commit timestamp, version
     // files by header read, checkpoints by their manifest header
     let mut candidates: Vec<(u64, i64)> = Vec::new();
@@ -65,15 +72,32 @@ fn resolve_timestamp(log: &TransactionLog, target_us: i64) -> Result<u64, ZyronE
         let name = dirent.file_name();
         let Some(name) = name.to_str() else { continue };
         match parse_version_file_name(name) {
-            Some((v, VersionFileKind::Version)) if v <= published => {
+            Some((v, VersionFileKind::Version)) if v <= shared_ceiling => {
                 let header = read_commit_header(&log.paths().version_file(v))?;
                 candidates.push((v, header.timestamp_us));
             }
-            Some((v, VersionFileKind::Checkpoint)) if v <= published => {
+            Some((v, VersionFileKind::Checkpoint)) if v <= shared_ceiling => {
                 let ts = read_checkpoint_timestamp(log, v)?;
                 candidates.push((v, ts));
             }
             _ => {}
+        }
+    }
+    if let Some(branch) = log.branch_name() {
+        let dir = log.paths().branch_dir(branch);
+        if dir.exists() {
+            for dirent in fs::read_dir(&dir)? {
+                let dirent = dirent?;
+                let name = dirent.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if let Some((v, VersionFileKind::Version)) = parse_version_file_name(name) {
+                    if v > log.branch_base() && v <= published {
+                        let header =
+                            read_commit_header(&log.paths().branch_version_file(branch, v))?;
+                        candidates.push((v, header.timestamp_us));
+                    }
+                }
+            }
         }
     }
     candidates.sort_unstable_by_key(|(v, _)| *v);

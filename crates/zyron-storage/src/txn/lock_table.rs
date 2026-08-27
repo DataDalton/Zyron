@@ -35,6 +35,19 @@ struct RowLockKey {
     locator: RowLocator,
 }
 
+impl RowLockKey {
+    /// A hash identifying this row for the hot-key sketch.
+    ///
+    /// Its own hash rather than the map's, because the sketch compares keys
+    /// for equality across tables and a per-map hash carries no such promise.
+    fn contention_hash(&self) -> u64 {
+        zyron_common::hash_combine(
+            zyron_common::hash64(&self.table_id.to_le_bytes()),
+            self.locator.contention_hash(),
+        )
+    }
+}
+
 /// Current holders of one row lock. A Shared entry never persists empty,
 /// release removes the map entry when the last holder leaves
 #[derive(Debug)]
@@ -100,10 +113,10 @@ impl LockTable {
         let key = RowLockKey { table_id, locator };
         match self.try_acquire(txn_id, key, mode) {
             Ok(()) => Ok(()),
-            Err(holder) => Err(ZyronError::TransactionConflict {
+            Err(holder) => Err(ZyronError::transaction_conflict(
                 txn_id,
-                reason: format!("row {locator} in table {table_id} locked by txn {holder}"),
-            }),
+                format!("row {locator} in table {table_id} locked by txn {holder}"),
+            )),
         }
     }
 
@@ -170,21 +183,21 @@ impl LockTable {
             // replace an existing edge so the stale one is removed first
             self.wait_graph.remove_edge(txn_id);
             if self.wait_graph.add_edge(txn_id, holder).is_some() {
-                return Err(ZyronError::TransactionConflict {
+                return Err(ZyronError::transaction_conflict(
                     txn_id,
-                    reason: format!(
+                    format!(
                         "deadlock detected, txn {txn_id} waiting on row {locator} in table {table_id} held by txn {holder} closes a wait cycle"
                     ),
-                });
+                ));
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 self.wait_graph.remove_edge(txn_id);
-                return Err(ZyronError::TransactionConflict {
+                return Err(ZyronError::transaction_conflict(
                     txn_id,
-                    reason: format!(
+                    format!(
                         "lock wait timeout on row {locator} in table {table_id} held by txn {holder}"
                     ),
-                });
+                ));
             }
         }
     }
@@ -199,6 +212,15 @@ impl LockTable {
         key: RowLockKey,
         mode: LockMode,
     ) -> std::result::Result<(), u64> {
+        // Every row a transaction writes passes through here, which makes this
+        // the one place that sees the write key distribution. Skew is what
+        // decides whether adding a node would help: a hot key does not spread,
+        // so provisioning against one buys hardware that sits behind the same
+        // contended row. Sampled inside, so the cost here is one relaxed add
+        zyron_pressure::pressure_control::PressureController::global()
+            .contention()
+            .record_key(key.contention_hash());
+
         match self.locks.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();

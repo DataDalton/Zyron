@@ -28,6 +28,9 @@
 //! - Individual runs logged for variance analysis
 //! - Test FAILS if any single run is >2x worse than target
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 
 use zyron_bench_harness::*;

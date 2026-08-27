@@ -1,0 +1,13 @@
+[package]
+name = "zyron-pressure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+sysinfo.workspace = true
+zyron-common = { path = "../zyron-common" }
+
+[dev-dependencies]
+tempfile = "3"

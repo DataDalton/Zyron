@@ -110,6 +110,10 @@ pub struct LabeledMetrics {
     clusteringMode: SccHashMap<String, AtomicU64>,
     clusteringSchedule: SccHashMap<String, AtomicU64>,
     clusteringLastPassSeconds: SccHashMap<String, AtomicU64>,
+    /// Updates refused because a label family hit its series cap. Non-zero
+    /// means some label source has unbounded cardinality and its newest
+    /// labels are not being recorded.
+    seriesOverflowTotal: AtomicU64,
 }
 
 impl LabeledMetrics {
@@ -141,6 +145,7 @@ impl LabeledMetrics {
             clusteringMode: SccHashMap::new(),
             clusteringSchedule: SccHashMap::new(),
             clusteringLastPassSeconds: SccHashMap::new(),
+            seriesOverflowTotal: AtomicU64::new(0),
         }
     }
 
@@ -148,7 +153,7 @@ impl LabeledMetrics {
     /// subscription. result is "success" when the catalog update lands,
     /// "persist_error" when it fails.
     pub fn subscriptionReap(&self, result: &str) {
-        Self::addBy(&self.subscriptionReapsTotal, result, 1);
+        self.addBy(&self.subscriptionReapsTotal, result, 1);
     }
 
     /// Observes one full reaper pass on the zyron_subscription_reap_seconds
@@ -187,13 +192,31 @@ impl LabeledMetrics {
 
     // ----- shared map operations -----
 
-    fn addBy(map: &SccHashMap<String, AtomicU64>, key: &str, delta: u64) {
+    /// New series a single label family accepts. Existing series keep
+    /// updating past the cap, refused creations count into
+    /// zyron_metric_series_overflow_total so the saturation is itself
+    /// visible on the metrics endpoint instead of growing it forever.
+    const MAX_SERIES_PER_FAMILY: usize = 10_000;
+
+    fn overflowed(&self, map: &SccHashMap<String, AtomicU64>) -> bool {
+        if map.len() >= Self::MAX_SERIES_PER_FAMILY {
+            self.seriesOverflowTotal.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn addBy(&self, map: &SccHashMap<String, AtomicU64>, key: &str, delta: u64) {
         if map
             .read_sync(key, |_, v| {
                 v.fetch_add(delta, Ordering::Relaxed);
             })
             .is_some()
         {
+            return;
+        }
+        if self.overflowed(map) {
             return;
         }
         // Cold path: another writer may have created the key between the read
@@ -209,13 +232,16 @@ impl LabeledMetrics {
         }
     }
 
-    fn setValue(map: &SccHashMap<String, AtomicU64>, key: &str, value: u64) {
+    fn setValue(&self, map: &SccHashMap<String, AtomicU64>, key: &str, value: u64) {
         if map
             .read_sync(key, |_, v| {
                 v.store(value, Ordering::Relaxed);
             })
             .is_some()
         {
+            return;
+        }
+        if self.overflowed(map) {
             return;
         }
         if map
@@ -228,7 +254,7 @@ impl LabeledMetrics {
         }
     }
 
-    fn subSaturating(map: &SccHashMap<String, AtomicU64>, key: &str, delta: u64) {
+    fn subSaturating(&self, map: &SccHashMap<String, AtomicU64>, key: &str, delta: u64) {
         if map
             .read_sync(key, |_, v| {
                 let mut cur = v.load(Ordering::Relaxed);
@@ -244,55 +270,58 @@ impl LabeledMetrics {
         {
             return;
         }
+        if self.overflowed(map) {
+            return;
+        }
         let _ = map.insert_sync(key.to_string(), AtomicU64::new(0));
     }
 
     // ----- typed entry points -----
 
     pub fn pubSubscribersInc(&self, publication: &str) {
-        Self::addBy(&self.publicationActiveSubscribers, publication, 1);
+        self.addBy(&self.publicationActiveSubscribers, publication, 1);
     }
 
     pub fn pubSubscribersDec(&self, publication: &str) {
-        Self::subSaturating(&self.publicationActiveSubscribers, publication, 1);
+        self.subSaturating(&self.publicationActiveSubscribers, publication, 1);
     }
 
     pub fn pubBytesSent(&self, publication: &str, bytes: u64) {
-        Self::addBy(&self.publicationBytesSentTotal, publication, bytes);
+        self.addBy(&self.publicationBytesSentTotal, publication, bytes);
     }
 
     pub fn pubRetentionLagSet(&self, publication: &str, secs: u64) {
-        Self::setValue(&self.publicationRetentionLagSeconds, publication, secs);
+        self.setValue(&self.publicationRetentionLagSeconds, publication, secs);
     }
 
     pub fn subLagLsnSet(&self, subscription: &str, lag: u64) {
-        Self::setValue(&self.subscriptionLagLsn, subscription, lag);
+        self.setValue(&self.subscriptionLagLsn, subscription, lag);
     }
 
     pub fn subLastPollSet(&self, subscription: &str, unixSecs: u64) {
-        Self::setValue(&self.subscriptionLastPollTimestamp, subscription, unixSecs);
+        self.setValue(&self.subscriptionLastPollTimestamp, subscription, unixSecs);
     }
 
     pub fn subReconnectInc(&self, subscription: &str) {
-        Self::addBy(&self.subscriptionReconnectsTotal, subscription, 1);
+        self.addBy(&self.subscriptionReconnectsTotal, subscription, 1);
     }
 
     pub fn credCacheHit(&self, provider: &str) {
-        Self::addBy(&self.credentialCacheHitsTotal, provider, 1);
+        self.addBy(&self.credentialCacheHitsTotal, provider, 1);
     }
 
     pub fn credCacheMiss(&self, provider: &str) {
-        Self::addBy(&self.credentialCacheMissesTotal, provider, 1);
+        self.addBy(&self.credentialCacheMissesTotal, provider, 1);
     }
 
     pub fn credRefresh(&self, provider: &str) {
-        Self::addBy(&self.credentialRefreshesTotal, provider, 1);
+        self.addBy(&self.credentialRefreshesTotal, provider, 1);
     }
 
     pub fn tlsHandshake(&self, direction: TlsDirection, ok: bool) {
         let result = if ok { "ok" } else { "fail" };
         let key = format!("{}{}{}", direction.as_str(), TLS_KEY_SEP, result);
-        Self::addBy(&self.tlsHandshakesTotal, &key, 1);
+        self.addBy(&self.tlsHandshakesTotal, &key, 1);
     }
 
     pub fn tlsSessionResumed(&self) {
@@ -319,13 +348,13 @@ impl LabeledMetrics {
         duration_us: u64,
     ) {
         let key = format!("{}{}{}", table, CLUSTER_KEY_SEP, decision.as_str());
-        Self::addBy(&self.clusteringProposalsTotal, &key, 1);
-        Self::addBy(&self.clusteringFilesRewrittenTotal, table, files_in);
-        Self::addBy(&self.clusteringBytesRewrittenTotal, table, bytes_written);
+        self.addBy(&self.clusteringProposalsTotal, &key, 1);
+        self.addBy(&self.clusteringFilesRewrittenTotal, table, files_in);
+        self.addBy(&self.clusteringBytesRewrittenTotal, table, bytes_written);
         if decision == ClusterDecision::Accepted {
-            Self::addBy(&self.clusteringFilesClusteredTotal, table, files_out);
+            self.addBy(&self.clusteringFilesClusteredTotal, table, files_out);
         }
-        Self::setValue(
+        self.setValue(
             &self.clusteringLastPassSeconds,
             table,
             duration_us / 1_000_000,
@@ -335,6 +364,10 @@ impl LabeledMetrics {
             .read_sync(table, |_, h| h.observe(skiprate_delta))
             .is_none()
         {
+            if self.clusteringSkiprateDelta.len() >= Self::MAX_SERIES_PER_FAMILY {
+                self.seriesOverflowTotal.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let fresh = DeltaHistogram::default();
             fresh.observe(skiprate_delta);
             if self
@@ -353,17 +386,17 @@ impl LabeledMetrics {
     /// thousandths so the gauge stays an integer counter
     pub fn clusteringSkipRateSet(&self, table: &str, rate: f64) {
         let milli = (rate.clamp(0.0, 1.0) * 1000.0).round() as u64;
-        Self::setValue(&self.clusteringSkipRate, table, milli);
+        self.setValue(&self.clusteringSkipRate, table, milli);
     }
 
     pub fn clusteringPendingProposalsSet(&self, table: &str, pending: u64) {
-        Self::setValue(&self.clusteringPendingProposals, table, pending);
+        self.setValue(&self.clusteringPendingProposals, table, pending);
     }
 
     /// Number of distinct predicate terms the observer currently holds
     /// for this table, which is how much evidence the gate has to judge on
     pub fn clusteringWorkloadWindowSet(&self, table: &str, terms: u64) {
-        Self::setValue(&self.clusteringWorkloadWindowSize, table, terms);
+        self.setValue(&self.clusteringWorkloadWindowSize, table, terms);
     }
 
     pub fn clusteringPolicySet(
@@ -372,8 +405,8 @@ impl LabeledMetrics {
         mode: ClusterMode,
         schedule: ClusteringSchedule,
     ) {
-        Self::setValue(&self.clusteringMode, table, mode.to_u8() as u64);
-        Self::setValue(&self.clusteringSchedule, table, schedule.to_u8() as u64);
+        self.setValue(&self.clusteringMode, table, mode.to_u8() as u64);
+        self.setValue(&self.clusteringSchedule, table, schedule.to_u8() as u64);
     }
 
     /// Returns the proposal count for one table and decision, so a test
@@ -413,6 +446,14 @@ impl LabeledMetrics {
 
     /// Appends every labeled family to the Prometheus text buffer.
     pub fn render_prometheus(&self, out: &mut String) {
+        out.push_str(
+            "# HELP zyron_metric_series_overflow_total Updates refused because a label family hit its series cap\n",
+        );
+        out.push_str("# TYPE zyron_metric_series_overflow_total counter\n");
+        out.push_str(&format!(
+            "zyron_metric_series_overflow_total {}\n",
+            self.seriesOverflowTotal.load(Ordering::Relaxed)
+        ));
         Self::renderSingleLabel(
             out,
             "zyron_publication_active_subscribers",

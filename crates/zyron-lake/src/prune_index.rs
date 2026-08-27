@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn test_a_bloomed_equality_prunes_on_bounds_but_reports_itself_incomplete() {
         let mut stats = bounded(0, Some(LakeValue::Int(0)), Some(LakeValue::Int(99)), 0, 100);
-        stats.bloom = Some(vec![0u8; 16]);
+        stats.bloom = Some(std::sync::Arc::new(vec![0u8; 16]));
         let manifest = manifest_of(
             schema(&[TypeId::Int64]),
             vec![

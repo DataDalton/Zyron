@@ -100,7 +100,7 @@ async fn test_wal_write_replay_10k_records() {
 
             let start = Instant::now();
             for i in 0..RECORD_COUNT {
-                let txn_id = (i % 100 + 1) as u32;
+                let txn_id = (i % 100 + 1) as u64;
                 let lsn = writer
                     .log_insert(txn_id, Lsn::INVALID, &written_payloads[i])
                     .unwrap();
@@ -475,7 +475,7 @@ async fn test_heap_file_100k_tuples() {
             .map(|i| {
                 let size = rng.random_range(10..=500);
                 let data: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
-                Tuple::new(data, i as u32)
+                Tuple::new(data, i as u64)
             })
             .collect();
 
@@ -595,7 +595,7 @@ async fn test_heap_file_delete_and_scan() {
     let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
         .map(|i| {
             let data = format!("tuple_{}", i).into_bytes();
-            Tuple::new(data, i as u32)
+            Tuple::new(data, i as u64)
         })
         .collect();
     let tuple_ids = heap.insert_batch(&tuples).await.unwrap();
@@ -660,7 +660,7 @@ async fn test_heap_file_space_reuse() {
     let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
         .map(|i| {
             let data = vec![i as u8; TUPLE_DATA_SIZE];
-            Tuple::new(data, i as u32)
+            Tuple::new(data, i as u64)
         })
         .collect();
 
@@ -693,7 +693,7 @@ async fn test_heap_file_space_reuse() {
     let tuples2: Vec<Tuple> = (0..TUPLE_COUNT)
         .map(|i| {
             let data = vec![(i + 100) as u8; TUPLE_DATA_SIZE];
-            Tuple::new(data, (i + TUPLE_COUNT) as u32)
+            Tuple::new(data, (i + TUPLE_COUNT) as u64)
         })
         .collect();
 
@@ -1031,7 +1031,7 @@ async fn test_wal_heap_recovery() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     const TUPLE_COUNT: usize = 1000;
-    let mut committed_data: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut committed_data: Vec<(u64, Vec<u8>)> = Vec::new();
 
     // Phase 1: Write tuples with WAL logging
     let wal_size_bytes: usize;
@@ -1045,7 +1045,7 @@ async fn test_wal_heap_recovery() {
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
         for i in 0..TUPLE_COUNT {
-            let txn_id = (i + 1) as u32;
+            let txn_id = (i + 1) as u64;
             let data = format!("committed_tuple_{}", i);
 
             let begin_lsn = writer.log_begin(txn_id).unwrap();
@@ -1098,7 +1098,7 @@ async fn test_wal_heap_recovery() {
             TUPLE_COUNT
         );
 
-        let redo_txns: HashSet<u32> = result.redo_records.iter().map(|r| r.txn_id).collect();
+        let redo_txns: HashSet<u64> = result.redo_records.iter().map(|r| r.txn_id).collect();
         for (txn_id, _) in &committed_data {
             assert!(
                 redo_txns.contains(txn_id),
@@ -1171,8 +1171,8 @@ async fn test_wal_recovery_with_uncommitted() {
     let recovery = RecoveryManager::new(dir.path()).unwrap();
     let result = recovery.recover().unwrap();
 
-    let committed_txns: HashSet<u32> = (1..=10).collect();
-    let redo_txns: HashSet<u32> = result.redo_records.iter().map(|r| r.txn_id).collect();
+    let committed_txns: HashSet<u64> = (1..=10).collect();
+    let redo_txns: HashSet<u64> = result.redo_records.iter().map(|r| r.txn_id).collect();
 
     for txn in &committed_txns {
         assert!(
@@ -1182,8 +1182,8 @@ async fn test_wal_recovery_with_uncommitted() {
         );
     }
 
-    let uncommitted_txns: HashSet<u32> = (11..=15).collect();
-    let undo_set: HashSet<u32> = result.undo_txns.iter().copied().collect();
+    let uncommitted_txns: HashSet<u64> = (11..=15).collect();
+    let undo_set: HashSet<u64> = result.undo_txns.iter().copied().collect();
 
     for txn in &uncommitted_txns {
         assert!(
@@ -1661,7 +1661,7 @@ async fn test_recovery_with_checkpoint() {
 
             // Phase 2: Insert 500 more keys with WAL logging (post-checkpoint)
             for i in PRE_CHECKPOINT_KEYS..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) {
-                let txn_id = (i + 1) as u32;
+                let txn_id = (i + 1) as u64;
                 let begin_lsn = writer.log_begin(txn_id).unwrap();
                 let payload = format!("key:{}", i);
                 let insert_lsn = writer
@@ -1798,7 +1798,7 @@ async fn test_recovery_without_checkpoint() {
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         for i in 0..KEY_COUNT {
-            let txn_id = (i + 1) as u32;
+            let txn_id = (i + 1) as u64;
             let begin_lsn = writer.log_begin(txn_id).unwrap();
             let payload = format!("key:{}", i);
             let insert_lsn = writer
@@ -1899,7 +1899,7 @@ async fn test_wal_segment_cleanup() {
         // Write enough data to create 5+ segments (each ~64KB, write ~500KB total)
         let payload = vec![0xABu8; 200];
         for i in 0..2000 {
-            let txn_id = (i + 1) as u32;
+            let txn_id = (i + 1) as u64;
             let begin_lsn = writer.log_begin(txn_id).unwrap();
             let insert_lsn = writer.log_insert(txn_id, begin_lsn, &payload).unwrap();
             let _ = writer.log_commit(txn_id, insert_lsn).unwrap();
@@ -1973,7 +1973,7 @@ async fn test_wal_segment_cleanup() {
         );
 
         // Verify post-cleanup WAL still works: write more data
-        let txn_id = 9999u32;
+        let txn_id = 9999u64;
         let begin_lsn = writer.log_begin(txn_id).unwrap();
         let insert_lsn = writer
             .log_insert(txn_id, begin_lsn, b"post_cleanup")
@@ -2318,7 +2318,7 @@ async fn test_checkpoint_scale_10m() {
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         for i in KEY_COUNT..(KEY_COUNT + POST_KEYS) {
-            let txn_id = (i + 1) as u32;
+            let txn_id = (i + 1) as u64;
             let begin_lsn = writer.log_begin(txn_id).unwrap();
             let payload = format!("key:{}", i);
             let insert_lsn = writer
@@ -2589,6 +2589,7 @@ async fn test_checkpoint_integration() {
         Arc::clone(&pool),
         write_fn,
         fsync_fn,
+        Arc::new(|_| Ok(())),
         BackgroundWriterConfig::default(),
     ));
 
@@ -2635,10 +2636,10 @@ async fn test_checkpoint_integration() {
     let insert_start = Instant::now();
     for batch_start in (0..pre_checkpoint_count).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(pre_checkpoint_count);
-        let txn_id = (batch_start / batch_size + 1) as u32;
+        let txn_id = (batch_start / batch_size + 1) as u64;
         let _begin_lsn = wal.log_begin(txn_id).unwrap();
 
-        let wal_records: Vec<(u32, &[u8])> = all_payloads[batch_start..batch_end]
+        let wal_records: Vec<(u64, &[u8])> = all_payloads[batch_start..batch_end]
             .iter()
             .map(|p| (txn_id, p.as_slice()))
             .collect();
@@ -2731,13 +2732,13 @@ async fn test_checkpoint_integration() {
     }
 
     let post_insert_start = Instant::now();
-    let txn_base = (pre_checkpoint_count / batch_size + 2) as u32;
+    let txn_base = (pre_checkpoint_count / batch_size + 2) as u64;
     for batch_start in (0..post_checkpoint_count).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(post_checkpoint_count);
-        let txn_id = txn_base + (batch_start / batch_size) as u32;
+        let txn_id = txn_base + (batch_start / batch_size) as u64;
         let _begin_lsn = wal.log_begin(txn_id).unwrap();
 
-        let wal_records: Vec<(u32, &[u8])> = post_payloads[batch_start..batch_end]
+        let wal_records: Vec<(u64, &[u8])> = post_payloads[batch_start..batch_end]
             .iter()
             .map(|p| (txn_id, p.as_slice()))
             .collect();
@@ -2838,6 +2839,7 @@ async fn test_checkpoint_integration() {
         Arc::clone(&pool2),
         write_fn2,
         fsync_fn2,
+        Arc::new(|_| Ok(())),
         BackgroundWriterConfig::default(),
     ));
     let tracker2 = Arc::new(CheckpointTracker::new());
@@ -2868,10 +2870,10 @@ async fn test_checkpoint_integration() {
 
     for batch_start in (0..setup_count).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(setup_count);
-        let txn_id = (batch_start / batch_size + 1) as u32;
+        let txn_id = (batch_start / batch_size + 1) as u64;
         let _begin_lsn = wal2.log_begin(txn_id).unwrap();
 
-        let wal_records: Vec<(u32, &[u8])> = setup_payloads[batch_start..batch_end]
+        let wal_records: Vec<(u64, &[u8])> = setup_payloads[batch_start..batch_end]
             .iter()
             .map(|p| (txn_id, p.as_slice()))
             .collect();
@@ -2920,10 +2922,10 @@ async fn test_checkpoint_integration() {
 
         for batch_start in (0..concurrent_writes).step_by(1000) {
             let batch_end = (batch_start + 1000).min(concurrent_writes);
-            let txn_id = (100_000 + batch_start / 1000) as u32;
+            let txn_id = (100_000 + batch_start / 1000) as u64;
             let _begin_lsn = wal2_clone.log_begin(txn_id).unwrap();
 
-            let wal_records: Vec<(u32, &[u8])> = concurrent_payloads[batch_start..batch_end]
+            let wal_records: Vec<(u64, &[u8])> = concurrent_payloads[batch_start..batch_end]
                 .iter()
                 .map(|p| (txn_id, p.as_slice()))
                 .collect();
@@ -3057,6 +3059,7 @@ async fn test_checkpoint_scheduler_integration() {
         Arc::clone(&pool),
         write_fn,
         fsync_fn,
+        Arc::new(|_| Ok(())),
         BackgroundWriterConfig::default(),
     ));
 
@@ -3140,10 +3143,10 @@ async fn test_checkpoint_scheduler_integration() {
 
     for batch_start in (0..row_count).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(row_count);
-        let txn_id = (batch_start / batch_size + 1) as u32;
+        let txn_id = (batch_start / batch_size + 1) as u64;
 
         // WAL log the batch
-        let wal_records: Vec<(u32, &[u8])> = all_payloads[batch_start..batch_end]
+        let wal_records: Vec<(u64, &[u8])> = all_payloads[batch_start..batch_end]
             .iter()
             .map(|p| (txn_id, p.as_slice()))
             .collect();

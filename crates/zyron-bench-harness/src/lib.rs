@@ -1432,6 +1432,17 @@ fn collected_ratios() -> &'static Mutex<Vec<RatioRecord>> {
 // JSON output
 // =============================================================================
 
+/// Formats one f64 for JSON. Infinity and NaN have no JSON literal, so a
+/// non-finite value writes `null` rather than the bare `inf`/`NaN` tokens
+/// Rust's formatter produces, which make the whole run file unparseable.
+fn json_number(v: f64, decimals: usize) -> String {
+    if v.is_finite() {
+        format!("{:.*}", decimals, v)
+    } else {
+        "null".to_string()
+    }
+}
+
 fn json_str_array(items: &[String]) -> String {
     let inner = items
         .iter()
@@ -1447,21 +1458,24 @@ fn push_metric_body(out: &mut String, m: &MetricRecord, indent: &str, trailing: 
     let runs_json = m
         .runs
         .iter()
-        .map(|v| format!("{:.2}", v))
+        .map(|v| json_number(*v, 2))
         .collect::<Vec<_>>()
         .join(", ");
     // A number recorded without a target is not a pass and not a failure,
     // so both fields read null rather than a value that would be taken
     // for a judgement nobody made
     let target = match m.target {
-        Some(v) => format!("{:.6}", v),
+        Some(v) => json_number(v, 6),
         None => "null".to_string(),
     };
     let passed = match m.passed {
         Some(v) => v.to_string(),
         None => "null".to_string(),
     };
-    out.push_str(&format!("{indent}\"average\": {:.6},\n", m.average));
+    out.push_str(&format!(
+        "{indent}\"average\": {},\n",
+        json_number(m.average, 6)
+    ));
     out.push_str(&format!("{indent}\"runs\": [{runs_json}],\n"));
     out.push_str(&format!("{indent}\"target\": {target},\n"));
     out.push_str(&format!("{indent}\"passed\": {passed},\n"));

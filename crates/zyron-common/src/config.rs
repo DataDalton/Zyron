@@ -13,12 +13,8 @@ pub struct ServerConfig {
     pub host: String,
     /// Port number to listen on.
     pub port: u16,
-    /// Maximum number of concurrent connections.
-    pub max_connections: u32,
     /// Connection timeout in seconds.
     pub connection_timeout_secs: u32,
-    /// Statement timeout in seconds (0 = no timeout).
-    pub statement_timeout_secs: u32,
     /// Number of worker threads for query execution.
     pub worker_threads: usize,
     /// Enable TLS for connections.
@@ -56,9 +52,7 @@ impl Default for ServerConfig {
             // wanting IPv4-only can set host = "0.0.0.0"
             host: "[::]".to_string(),
             port: 5432,
-            max_connections: 100,
             connection_timeout_secs: 30,
-            statement_timeout_secs: 0,
             worker_threads: num_cpus(),
             tls_enabled: false,
             tls_cert_path: None,
@@ -210,9 +204,7 @@ mod tests {
         assert_eq!(config.host, "[::]");
         assert!(config.dual_stack);
         assert_eq!(config.port, 5432);
-        assert_eq!(config.max_connections, 100);
         assert_eq!(config.connection_timeout_secs, 30);
-        assert_eq!(config.statement_timeout_secs, 0);
         assert!(config.worker_threads >= 1);
         assert!(!config.tls_enabled);
         assert!(config.tls_cert_path.is_none());
@@ -229,9 +221,7 @@ mod tests {
         let config = ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 5433,
-            max_connections: 500,
             connection_timeout_secs: 60,
-            statement_timeout_secs: 300,
             worker_threads: 8,
             tls_enabled: true,
             tls_cert_path: Some(PathBuf::from("/etc/ssl/cert.pem")),
@@ -245,7 +235,6 @@ mod tests {
 
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 5433);
-        assert_eq!(config.max_connections, 500);
         assert!(config.tls_enabled);
         assert!(config.tls_cert_path.is_some());
     }
@@ -266,7 +255,6 @@ mod tests {
 
         assert_eq!(original.host, deserialized.host);
         assert_eq!(original.port, deserialized.port);
-        assert_eq!(original.max_connections, deserialized.max_connections);
         assert_eq!(original.tls_enabled, deserialized.tls_enabled);
     }
 

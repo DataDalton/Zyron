@@ -58,6 +58,9 @@ pub struct CompactionWorkerConfig {
     /// catalog write amplification; the WAL CompactionEnd records cover the
     /// gap on crash.
     pub registry_persist_every: u64,
+    /// Segment write IO ceiling in megabytes per second, paced between
+    /// folds. Zero disables pacing.
+    pub rate_limit_mbps: u64,
 }
 
 impl Default for CompactionWorkerConfig {
@@ -72,6 +75,7 @@ impl Default for CompactionWorkerConfig {
             max_encoding_threads: 4,
             merge_min_churn_ratio: 0.10,
             registry_persist_every: 16,
+            rate_limit_mbps: 100,
         }
     }
 }
@@ -98,14 +102,14 @@ impl CompactionStats {
 /// One folded heap slot: (page, slot, folded tuple xmin). The xmin is the
 /// identity used before zeroing so a slot reused by a different tuple after
 /// the fold committed is never destroyed by a redo from the sidecar.
-type FoldedRid = (zyron_common::page::PageId, u16, u32);
+type FoldedRid = (zyron_common::page::PageId, u16, u64);
 
 /// True when `slot` on `page` still holds the folded tuple and that tuple is
 /// still fold-eligible: the slot is non-empty, its offsets are in range, its
 /// xmin equals the folded identity, it is not flagged deleted, and xmax is
 /// unset. One pass over the slot, no full-page copy. `page` is any view of
 /// the page bytes (a buffer-frame guard or an owned read).
-fn slot_still_folded(page: &[u8], slot: u16, folded_xmin: u32) -> bool {
+fn slot_still_folded(page: &[u8], slot: u16, folded_xmin: u64) -> bool {
     let Some(slot) = HeapPage::live_slot_in_slice(page, slot) else {
         return false;
     };
@@ -115,11 +119,11 @@ fn slot_still_folded(page: &[u8], slot: u16, folded_xmin: u32) -> bool {
     xmin == folded_xmin && flags & 0x0001 == 0 && xmax == 0
 }
 
-/// Identity a fold uses in the row lock table. Executor transactions carry
-/// u32 ids widened to u64, so identities at or above 2^32 can never collide
-/// with a real transaction, and each fold takes a fresh one so two folds
-/// exclude each other on shared rows
-static FOLD_LOCK_ID: AtomicU64 = AtomicU64::new(1 << 32);
+/// Identity a fold uses in the row lock table. The WAL allocates transaction
+/// ids sequentially from 1, so ids at or above 2^63 can never belong to a
+/// real transaction, and each fold takes a fresh one so two folds exclude
+/// each other on shared rows
+static FOLD_LOCK_ID: AtomicU64 = AtomicU64::new(1 << 63);
 
 /// Exclusive row locks held by one fold from eligibility revalidation until
 /// the folded heap slots are zeroed. An UPDATE or DELETE stamping xmax on a
@@ -447,6 +451,7 @@ impl CompactionWorker {
                 }
                 cycle_state.insert(table.id.0, (writes, false));
             }
+            let fold_started = std::time::Instant::now();
             match Self::compact_table(
                 rt,
                 catalog,
@@ -460,12 +465,13 @@ impl CompactionWorker {
                 doc_registry,
                 btree_indexes,
             ) {
-                Ok(Some(rows)) => {
+                Ok(Some((rows, segment_bytes))) => {
                     total_rows += rows;
                     total_segments += 1;
                     if let Some(state) = cycle_state.get_mut(&table.id.0) {
                         state.1 = true;
                     }
+                    Self::pace_fold_io(config, segment_bytes, fold_started, shutdown);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -641,6 +647,7 @@ impl CompactionWorker {
             doc_registry,
             btree_indexes,
         )?
+        .map(|(rows, _bytes)| rows)
         .unwrap_or(0))
     }
 
@@ -1118,8 +1125,34 @@ impl CompactionWorker {
         Ok(did_work)
     }
 
-    /// Folds one table. Returns Ok(Some(rows)) when a segment was written and
-    /// the heap rows handed off, Ok(None) when nothing was eligible.
+    /// Holds the cycle back after a fold so segment write IO averages at or
+    /// under the configured rate. A fold that already took longer than its
+    /// byte budget sleeps zero. Sleeps in short slices so shutdown stays
+    /// responsive.
+    fn pace_fold_io(
+        config: &CompactionWorkerConfig,
+        segment_bytes: u64,
+        fold_started: std::time::Instant,
+        shutdown: Option<&AtomicBool>,
+    ) {
+        if config.rate_limit_mbps == 0 || segment_bytes == 0 {
+            return;
+        }
+        let budget = std::time::Duration::from_secs_f64(
+            segment_bytes as f64 / (config.rate_limit_mbps as f64 * 1024.0 * 1024.0),
+        );
+        while fold_started.elapsed() < budget {
+            if shutdown.map(|s| s.load(Ordering::Acquire)).unwrap_or(false) {
+                return;
+            }
+            let remaining = budget.saturating_sub(fold_started.elapsed());
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
+        }
+    }
+
+    /// Folds one table. Returns Ok(Some((rows, segment bytes))) when a
+    /// segment was written and the heap rows handed off, Ok(None) when
+    /// nothing was eligible.
     #[allow(clippy::too_many_arguments)]
     fn compact_table(
         rt: &tokio::runtime::Runtime,
@@ -1133,7 +1166,7 @@ impl CompactionWorker {
         config: &CompactionWorkerConfig,
         doc_registry: Option<&Arc<zyron_common::DocRegistry>>,
         btree_indexes: Option<&Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>>,
-    ) -> std::result::Result<Option<u64>, String> {
+    ) -> std::result::Result<Option<(u64, u64)>, String> {
         // Columns ordered by ordinal. The heap payload is laid out in this
         // exact order, so materialization must walk it identically.
         let mut columns: Vec<_> = table.columns.clone();
@@ -1283,7 +1316,7 @@ impl CompactionWorker {
                 for (i, sl) in row_slices.iter().enumerate() {
                     arenas[i].push(sl.map(|(o, l)| &payload[o..o + l]));
                 }
-                sys_xmin.push(xmin as u64);
+                sys_xmin.push(xmin);
                 folded_rids.push((page_id, slot, xmin));
 
                 if folded_rids.len() >= max_rows {
@@ -1683,16 +1716,16 @@ impl CompactionWorker {
             "Folded {} rows of table {} into {} (file_id {})",
             row_count, table.name, path_str, file_id
         );
-        Ok(Some(row_count as u64))
+        Ok(Some((row_count as u64, result.file_size)))
     }
 
     /// Writes the folded RID list to a sidecar file and fsyncs it. Format:
-    /// rid_count(u64 LE) then [file_id(u32) page_num(u64) slot(u16) xmin(u32)].
+    /// rid_count(u64 LE) then [file_id(u32) page_num(u64) slot(u16) xmin(u64)].
     /// The xmin is the folded tuple identity checked before a redo zeroes the
     /// slot, so a slot reused after the fold committed is never destroyed.
     fn write_rid_sidecar(path: &std::path::Path, rids: &[FoldedRid]) -> std::io::Result<()> {
         use std::io::Write;
-        let mut buf = Vec::with_capacity(8 + rids.len() * 18);
+        let mut buf = Vec::with_capacity(8 + rids.len() * 22);
         buf.extend_from_slice(&(rids.len() as u64).to_le_bytes());
         for (pid, slot, xmin) in rids {
             buf.extend_from_slice(&pid.file_id.to_le_bytes());
@@ -1720,15 +1753,15 @@ impl CompactionWorker {
         let mut out = Vec::with_capacity(n);
         let mut p = 8;
         for _ in 0..n {
-            if p + 18 > buf.len() {
+            if p + 22 > buf.len() {
                 break;
             }
             let fid = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
             let pnum = u64::from_le_bytes(buf[p + 4..p + 12].try_into().unwrap());
             let slot = u16::from_le_bytes(buf[p + 12..p + 14].try_into().unwrap());
-            let xmin = u32::from_le_bytes(buf[p + 14..p + 18].try_into().unwrap());
+            let xmin = u64::from_le_bytes(buf[p + 14..p + 22].try_into().unwrap());
             out.push((zyron_common::page::PageId::new(fid, pnum), slot, xmin));
-            p += 18;
+            p += 22;
         }
         Ok(out)
     }
@@ -1744,7 +1777,7 @@ impl CompactionWorker {
         rids: &[FoldedRid],
     ) -> std::result::Result<bool, String> {
         use std::collections::HashMap;
-        let mut by_page: HashMap<zyron_common::page::PageId, Vec<(u16, u32)>> = HashMap::new();
+        let mut by_page: HashMap<zyron_common::page::PageId, Vec<(u16, u64)>> = HashMap::new();
         for &(pid, slot, xmin) in rids {
             by_page.entry(pid).or_default().push((slot, xmin));
         }
@@ -1795,7 +1828,7 @@ impl CompactionWorker {
         rids: &[FoldedRid],
     ) -> std::result::Result<(), String> {
         use std::collections::HashMap;
-        let mut by_page: HashMap<zyron_common::page::PageId, Vec<(u16, u32)>> = HashMap::new();
+        let mut by_page: HashMap<zyron_common::page::PageId, Vec<(u16, u64)>> = HashMap::new();
         for &(pid, slot, xmin) in rids {
             by_page.entry(pid).or_default().push((slot, xmin));
         }
@@ -1937,7 +1970,7 @@ mod tests {
 
         let mut total_violations = 0u64;
         for i in 0..200u32 {
-            let xmin = 5u32;
+            let xmin = 5u64;
             let tuples = vec![
                 Tuple::new(vec![i as u8; 64], xmin),
                 Tuple::new(vec![i as u8; 64], xmin),
@@ -1957,7 +1990,7 @@ mod tests {
             let violations = std::sync::atomic::AtomicU64::new(0);
             thread::scope(|s| {
                 s.spawn(|| {
-                    let mut expected: u32 = 0;
+                    let mut expected: u64 = 0;
                     while !stop.load(Ordering::Acquire) {
                         let Some(frame) = pool.fetch_page(page_id) else {
                             break;
@@ -1970,7 +2003,7 @@ mod tests {
                                     SlotId(victim_tid.slot_id),
                                 )
                                 .map(|v| v.header.xmax)
-                                .unwrap_or(u32::MAX);
+                                .unwrap_or(u64::MAX);
                                 if seen != expected {
                                     violations.fetch_add(1, Ordering::Relaxed);
                                 }

@@ -98,6 +98,7 @@ fn sample_subscription(id: u32, publication_id: u32) -> SubscriptionEntry {
         last_error: None,
         created_at: 0,
         source_id: None,
+        last_advance_at: 0,
     }
 }
 
@@ -372,12 +373,12 @@ async fn start_admin_server(
     security_manager: Option<Arc<SecurityManager>>,
 ) -> (u16, Arc<std::sync::atomic::AtomicBool>, Arc<HealthState>) {
     let (_tmp, catalog) = make_catalog().await;
-    let session_mgr = Arc::new(SessionManager::new(100, 0));
+    let session_mgr = Arc::new(SessionManager::new(0));
     let metrics = Arc::new(MetricsRegistry::new(
         session_mgr,
         Arc::new(zyron_common::LabeledMetrics::new()),
     ));
-    let health_state = Arc::new(HealthState::new(metrics));
+    let health_state = Arc::new(HealthState::new(metrics, "/metrics"));
     let executor = Arc::new(AdminExecutor::new(
         Arc::clone(&catalog),
         security_manager.clone(),

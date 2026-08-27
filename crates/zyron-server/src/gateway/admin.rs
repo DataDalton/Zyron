@@ -1361,7 +1361,7 @@ mod tests {
         let wal = Arc::new(
             WalWriter::new(WalWriterConfig {
                 wal_dir,
-                segment_size: 4 * 1024 * 1024,
+                segment_size: 1024 * 1024,
                 fsync_enabled: false,
                 ring_buffer_capacity: 1 * 1024 * 1024,
             })

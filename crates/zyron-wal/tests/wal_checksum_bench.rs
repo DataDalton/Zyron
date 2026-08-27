@@ -6,6 +6,9 @@
 //! zyron-common: post-consolidation p50/p90/p99 must hold within 1% of the
 //! recorded baseline
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 use zyron_bench_harness::*;
 use zyron_wal::WalHasher;

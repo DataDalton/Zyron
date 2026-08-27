@@ -14,6 +14,9 @@
 //!
 //! Run: cargo test -p zyron-storage --test columnar_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use zyron_bench_harness::*;
 
 use rand::RngExt;
@@ -1055,12 +1058,17 @@ fn test_bloom_filter() {
         BLOOM_BATCH_PROBE_TARGET_NS,
         false,
     );
-    assert!(
-        batchResult.average < sequentialResult.average,
-        "batched probe must beat sequential probes: batch {:.2} ns/key vs sequential {:.2} ns/key",
-        batchResult.average,
-        sequentialResult.average
-    );
+    // Relative timing is only meaningful in an optimized build, a debug run
+    // keeps the correctness coverage and skips the judgment like the
+    // harness's own targets do
+    if measuring() {
+        assert!(
+            batchResult.average < sequentialResult.average,
+            "batched probe must beat sequential probes: batch {:.2} ns/key vs sequential {:.2} ns/key",
+            batchResult.average,
+            sequentialResult.average
+        );
+    }
     tprintln!(
         "  Batch speedup: {:.2}x over sequential",
         sequentialResult.average / batchResult.average

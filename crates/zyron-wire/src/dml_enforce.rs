@@ -22,7 +22,7 @@ impl CompositeDmlHook {
 }
 
 impl DmlHook for CompositeDmlHook {
-    fn before_insert(&self, table_id: u32, tuples: &[&[u8]], txn_id: u32) -> Result<bool> {
+    fn before_insert(&self, table_id: u32, tuples: &[&[u8]], txn_id: u64) -> Result<bool> {
         for h in &self.hooks {
             if !h.before_insert(table_id, tuples, txn_id)? {
                 return Ok(false);
@@ -31,7 +31,7 @@ impl DmlHook for CompositeDmlHook {
         Ok(true)
     }
 
-    fn before_delete(&self, table_id: u32, old_data: &[&[u8]], txn_id: u32) -> Result<bool> {
+    fn before_delete(&self, table_id: u32, old_data: &[&[u8]], txn_id: u64) -> Result<bool> {
         for h in &self.hooks {
             if !h.before_delete(table_id, old_data, txn_id)? {
                 return Ok(false);
@@ -45,7 +45,7 @@ impl DmlHook for CompositeDmlHook {
         table_id: u32,
         old_data: &[&[u8]],
         new_data: &[&[u8]],
-        txn_id: u32,
+        txn_id: u64,
     ) -> Result<bool> {
         for h in &self.hooks {
             if !h.before_update(table_id, old_data, new_data, txn_id)? {
@@ -125,11 +125,11 @@ impl LegalHoldDmlHook {
 }
 
 impl DmlHook for LegalHoldDmlHook {
-    fn before_insert(&self, _table_id: u32, _tuples: &[&[u8]], _txn_id: u32) -> Result<bool> {
+    fn before_insert(&self, _table_id: u32, _tuples: &[&[u8]], _txn_id: u64) -> Result<bool> {
         Ok(true)
     }
 
-    fn before_delete(&self, table_id: u32, old_data: &[&[u8]], _txn_id: u32) -> Result<bool> {
+    fn before_delete(&self, table_id: u32, old_data: &[&[u8]], _txn_id: u64) -> Result<bool> {
         self.worm_check(table_id)?;
         self.hold_check(table_id, old_data)?;
         Ok(true)
@@ -140,7 +140,7 @@ impl DmlHook for LegalHoldDmlHook {
         table_id: u32,
         old_data: &[&[u8]],
         _new_data: &[&[u8]],
-        _txn_id: u32,
+        _txn_id: u64,
     ) -> Result<bool> {
         self.worm_check(table_id)?;
         self.hold_check(table_id, old_data)?;

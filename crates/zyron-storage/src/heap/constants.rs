@@ -12,5 +12,7 @@ pub const HEAP_HEADER_OFFSET: usize = PageHeader::SIZE;
 pub const DATA_START: usize = PageHeader::SIZE + HEAP_HEADER_SIZE;
 
 /// Size of a tuple slot entry in bytes. Each slot holds the tuple offset and
-/// the tuple header, so a scan reads one dense array
-pub const TUPLE_SLOT_SIZE: usize = 16;
+/// the tuple header, so a scan reads one dense array. The transaction ids
+/// are full 64-bit values: the allocator never wraps, so tuple visibility
+/// stays exact for the lifetime of the database
+pub const TUPLE_SLOT_SIZE: usize = 24;

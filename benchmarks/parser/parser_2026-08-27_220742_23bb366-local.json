@@ -1,0 +1,91 @@
+{
+  "id": "2026-08-27_220742_23bb366-local",
+  "date": "2026-08-27 22:07:58Z",
+  "ts": 1787868478,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Error Recovery": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.47 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.46 },
+      "Latency (us/error)": {
+        "average": 0.172496,
+        "runs": [0.17, 0.17, 0.17, 0.17, 0.17],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Lexer Throughput": {
+      "util_before": { "cpu_pct": 12.0, "ram_used_gb": 15.48 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 15.49 },
+      "Throughput (MB/sec)": {
+        "average": 316.940050,
+        "runs": [316.88, 317.55, 315.44, 317.37, 317.45],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Memory": {
+      "Estimated per-parse (bytes)": {
+        "average": 856.000000,
+        "runs": [856.00],
+        "target": 1024.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parser Batch": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 15.46 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.47 },
+      "Throughput (stmts/sec)": {
+        "average": 2682488.727238,
+        "runs": [2689071.29, 2691824.82, 2681665.40, 2673646.67, 2676235.46],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parser Complex": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.47 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.48 },
+      "Latency (us/parse)": {
+        "average": 5.514490,
+        "runs": [5.55, 5.51, 5.50, 5.49, 5.52],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parser Simple": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 15.48 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.48 },
+      "Latency (ns/parse)": {
+        "average": 674.853200,
+        "runs": [678.17, 685.21, 670.25, 670.19, 670.45],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

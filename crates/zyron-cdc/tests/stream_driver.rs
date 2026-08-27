@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use zyron_cdc::cdc_stream::{
-    CdcOutputStream, CdcSink, CdcSinkConfig, SinkCheckpoint, StreamRetryPolicy, drive_stream_once,
+    CdcOutputStream, CdcSink, CdcSinkConfig, SinkCheckpoint, StreamRetryPolicy, TxnDecision,
+    drive_stream_once,
 };
 use zyron_cdc::decoder::{DecodedChange, DecoderPlugin};
 use zyron_cdc::{ChangeDataFeed, ChangeRecord, ChangeType, SlotLagConfig, SlotManager};
@@ -59,7 +60,7 @@ fn record(version: u64, payload: &str) -> ChangeRecord {
         commit_version: version,
         commit_timestamp: 1_000 + version as i64,
         table_id: 7,
-        txn_id: version as u32,
+        txn_id: version,
         schema_version: 1,
         row_data: payload.as_bytes().to_vec(),
         primary_key_data: Vec::new(),
@@ -124,7 +125,10 @@ fn driver_delivers_batches_and_advances_slot() {
     let stream = make_stream();
     let sink = CollectingSink::new();
 
-    let delivered = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record).unwrap();
+    let delivered = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|_| {
+        TxnDecision::Committed
+    })
+    .unwrap();
     assert_eq!(delivered, 3, "all three records delivered");
 
     // batch_size = 2, so the three records arrive as batches of 2 then 1.
@@ -139,7 +143,10 @@ fn driver_delivers_batches_and_advances_slot() {
     assert_eq!(sink.checkpoint().unwrap().last_confirmed_lsn, 3);
 
     // A second pass with no new records delivers nothing.
-    let again = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record).unwrap();
+    let again = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|_| {
+        TxnDecision::Committed
+    })
+    .unwrap();
     assert_eq!(again, 0, "no redelivery of already-confirmed records");
 }
 
@@ -161,7 +168,10 @@ fn driver_resumes_from_confirmed_version() {
     let sink = CollectingSink::new();
 
     assert_eq!(
-        drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record).unwrap(),
+        drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|_| {
+            TxnDecision::Committed
+        },)
+        .unwrap(),
         1
     );
 
@@ -169,9 +179,154 @@ fn driver_resumes_from_confirmed_version() {
     feed.append_change(&record(2, "r2")).unwrap();
     feed.append_change(&record(3, "r3")).unwrap();
     assert_eq!(
-        drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record).unwrap(),
+        drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|_| {
+            TxnDecision::Committed
+        },)
+        .unwrap(),
         2,
         "only the new records are delivered"
     );
     assert_eq!(slot_mgr.get_slot("s_slot").unwrap().confirmed_lsn, 3);
+}
+
+// Change records land in the feed at execution time, before their
+// transaction decides. A rolled back transaction's records must never reach
+// the sink, and the slot still advances past them so they never redeliver
+#[test]
+fn driver_skips_aborted_transactions() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("cdf")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("slots")).unwrap();
+    let mut feed = ChangeDataFeed::open(&tmp.path().join("cdf"), 7, 7).unwrap();
+    feed.enable();
+    feed.append_change(&record(1, "r1")).unwrap();
+    feed.append_change(&record(2, "rolled-back")).unwrap();
+    feed.append_change(&record(3, "r3")).unwrap();
+
+    let slot_mgr = SlotManager::open(&tmp.path().join("slots"), SlotLagConfig::default()).unwrap();
+    slot_mgr
+        .create_slot("s_slot", DecoderPlugin::ZyronCdc, Some(vec![7]))
+        .unwrap();
+
+    let stream = make_stream();
+    let sink = CollectingSink::new();
+
+    let delivered = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|txn| {
+        if txn == 2 {
+            TxnDecision::Aborted
+        } else {
+            TxnDecision::Committed
+        }
+    })
+    .unwrap();
+
+    assert_eq!(delivered, 2, "the aborted transaction's record is skipped");
+    assert_eq!(
+        slot_mgr.get_slot("s_slot").unwrap().confirmed_lsn,
+        3,
+        "the slot advances past the aborted record"
+    );
+    let batches = sink.batches.lock().unwrap();
+    let all: Vec<&[u8]> = batches.iter().flatten().map(|b| b.as_slice()).collect();
+    assert_eq!(all.len(), 2);
+    for payload in &all {
+        let text = String::from_utf8_lossy(payload);
+        assert!(
+            !text.contains("rolled-back"),
+            "a rolled back change must never reach the sink"
+        );
+    }
+}
+
+// An undecided transaction holds delivery: nothing at or past its version
+// moves, the slot stops at the last fully decided version, and the next
+// pass delivers the rest once the transaction commits
+#[test]
+fn driver_holds_at_in_flight_transaction() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("cdf")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("slots")).unwrap();
+    let mut feed = ChangeDataFeed::open(&tmp.path().join("cdf"), 7, 7).unwrap();
+    feed.enable();
+    feed.append_change(&record(1, "r1")).unwrap();
+    feed.append_change(&record(2, "pending")).unwrap();
+    feed.append_change(&record(3, "r3")).unwrap();
+
+    let slot_mgr = SlotManager::open(&tmp.path().join("slots"), SlotLagConfig::default()).unwrap();
+    slot_mgr
+        .create_slot("s_slot", DecoderPlugin::ZyronCdc, Some(vec![7]))
+        .unwrap();
+
+    let stream = make_stream();
+    let sink = CollectingSink::new();
+
+    let delivered = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|txn| {
+        if txn == 2 {
+            TxnDecision::InFlight
+        } else {
+            TxnDecision::Committed
+        }
+    })
+    .unwrap();
+    assert_eq!(delivered, 1, "delivery holds at the undecided transaction");
+    assert_eq!(
+        slot_mgr.get_slot("s_slot").unwrap().confirmed_lsn,
+        1,
+        "the slot never advances past an undecided change"
+    );
+
+    // The transaction commits, the next pass delivers the held records
+    let delivered = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|_| {
+        TxnDecision::Committed
+    })
+    .unwrap();
+    assert_eq!(delivered, 2);
+    assert_eq!(slot_mgr.get_slot("s_slot").unwrap().confirmed_lsn, 3);
+}
+
+// All records of one commit version move together: a batch boundary in the
+// middle of a multi-row statement must not advance the slot past records
+// that have not been handed to the sink, or a crash between flushes loses
+// the statement's tail
+#[test]
+fn driver_advances_slot_only_at_version_boundaries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("cdf")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("slots")).unwrap();
+    let mut feed = ChangeDataFeed::open(&tmp.path().join("cdf"), 7, 7).unwrap();
+    feed.enable();
+    // One statement wrote three rows, all sharing commit version 5, then a
+    // later transaction is still undecided
+    feed.append_change(&record(5, "r5a")).unwrap();
+    feed.append_change(&record(5, "r5b")).unwrap();
+    feed.append_change(&record(5, "r5c")).unwrap();
+    feed.append_change(&record(6, "pending")).unwrap();
+
+    let slot_mgr = SlotManager::open(&tmp.path().join("slots"), SlotLagConfig::default()).unwrap();
+    slot_mgr
+        .create_slot("s_slot", DecoderPlugin::ZyronCdc, Some(vec![7]))
+        .unwrap();
+
+    let stream = make_stream();
+    let sink = CollectingSink::new();
+
+    // batch_size is 2, so the three-row version crosses a batch boundary
+    let delivered = drive_stream_once(&stream, &feed, &slot_mgr, &sink, decode_record, &|txn| {
+        if txn == 6 {
+            TxnDecision::InFlight
+        } else {
+            TxnDecision::Committed
+        }
+    })
+    .unwrap();
+
+    assert_eq!(delivered, 3, "the whole statement is delivered");
+    assert_eq!(
+        slot_mgr.get_slot("s_slot").unwrap().confirmed_lsn,
+        5,
+        "the slot lands on the completed version, not inside or past it"
+    );
+    let batches = sink.batches.lock().unwrap();
+    let total: usize = batches.iter().map(|b| b.len()).sum();
+    assert_eq!(total, 3, "every row of the statement reached the sink");
 }

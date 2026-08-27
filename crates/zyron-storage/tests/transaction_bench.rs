@@ -13,6 +13,9 @@
 //!
 //! Run: cargo test -p zyron-storage --test transaction_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use zyron_bench_harness::*;
 
 use std::collections::HashSet;
@@ -75,7 +78,7 @@ fn test_snapshot_isolation() {
 
     // Txn A: BEGIN, "INSERT" row with value=100
     let mut txn_a = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-    let xmin_a = txn_a.txn_id_u32().unwrap();
+    let xmin_a = txn_a.txn_id;
 
     // Simulate insert: create a tuple header with xmin=txn_a, xmax=0
     let header_inserted = TupleHeader::new(8, xmin_a);
@@ -184,7 +187,7 @@ fn test_rollback_abort() {
 
     // Txn A: BEGIN, insert 10 rows
     let mut txn_a = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-    let xmin_a = txn_a.txn_id_u32().unwrap();
+    let xmin_a = txn_a.txn_id;
 
     let mut headers = Vec::new();
     for i in 0..10 {
@@ -281,7 +284,7 @@ fn test_mvcc_gc() {
     for i in 0..total_rows {
         if i < deleted_rows {
             // Simulate deleted by txn (i / 50 + 101) which is < 201
-            let xmax = ((i / 50) + 101) as u32;
+            let xmax = ((i / 50) + 101) as u64;
             // No active txns, so all deleted are reclaimable
             assert!(MvccGc::is_reclaimable_no_active(xmax));
             reclaimed += 1;
@@ -485,7 +488,7 @@ fn test_isolation_levels() {
     // Snapshot Isolation
     // -----------------------------------------------------------------------
     let mut txn_writer = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-    let xmin_w = txn_writer.txn_id_u32().unwrap();
+    let xmin_w = txn_writer.txn_id;
     let header = TupleHeader::new(8, xmin_w);
 
     // SI reader starts before writer commits
@@ -584,7 +587,7 @@ fn test_wal_transaction_integration() {
 
     // Verify committed transactions' data would be present
     // (their Begin + Commit records exist in WAL)
-    let committed_txn_ids: Vec<u32> = txns[0..3].iter().map(|t| t.txn_id_u32().unwrap()).collect();
+    let committed_txn_ids: Vec<u64> = txns[0..3].iter().map(|t| t.txn_id).collect();
     for tid in &committed_txn_ids {
         let has_begin = records
             .iter()
@@ -600,7 +603,7 @@ fn test_wal_transaction_integration() {
     }
 
     // Verify aborted transactions have Begin + Abort
-    let aborted_txn_ids: Vec<u32> = txns[3..5].iter().map(|t| t.txn_id_u32().unwrap()).collect();
+    let aborted_txn_ids: Vec<u64> = txns[3..5].iter().map(|t| t.txn_id).collect();
     for tid in &aborted_txn_ids {
         let has_begin = records
             .iter()
@@ -1379,7 +1382,7 @@ fn test_transaction_microbenchmarks() {
 
         let start = Instant::now();
         for i in 0..TUPLES {
-            let xmax = if i % 2 == 0 { (i / 2) as u32 } else { 0 };
+            let xmax = if i % 2 == 0 { (i / 2) as u64 } else { 0 };
             std::hint::black_box(MvccGc::is_reclaimable(xmax, oldest_active));
         }
         let duration = start.elapsed();

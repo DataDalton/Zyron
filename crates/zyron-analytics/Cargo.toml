@@ -11,4 +11,5 @@ parking_lot.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+mimalloc.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }

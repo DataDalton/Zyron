@@ -395,7 +395,7 @@ fn encode_btree_index_key_from_cells(
 /// cell bytes per folded row, aligned with `folded`, whose position i holds
 /// sys_rowid `base_rowid + i` by construction
 pub fn fold_rekey_btree_entries(
-    folded: &[(zyron_common::page::PageId, u16, u32)],
+    folded: &[(zyron_common::page::PageId, u16, u64)],
     indexed_cells: &[(zyron_catalog::ColumnId, TypeId, Vec<Option<&[u8]>>)],
     file_id: u64,
     base_rowid: u64,
@@ -707,7 +707,7 @@ async fn insert_branch_batch(
     index_snap: &zyron_catalog::TableIndexSnapshot,
     branch_id: u64,
     heap_file_id: u32,
-    txn_id: u32,
+    txn_id: u64,
     mut batch: DataBatch,
 ) -> zyron_common::Result<i64> {
     crate::trigger::fire_row_triggers(
@@ -1475,7 +1475,7 @@ async fn write_quarantine(
     batch: &DataBatch,
     rows: &[usize],
     names: &[String],
-    txn_id: u32,
+    txn_id: u64,
 ) -> zyron_common::Result<()> {
     let q_table_id = zyron_catalog::TableId(quarantine_table_id);
     let q_entry = ctx.get_table_entry(q_table_id)?;
@@ -1497,7 +1497,7 @@ async fn write_quarantine(
     ));
 
     let tuples = batch_to_tuples(&q_batch, &q_entry.columns, txn_id);
-    let mut records: Vec<(u32, &[u8])> = Vec::with_capacity(tuples.len());
+    let mut records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
     for t in &tuples {
         records.push((txn_id, t.data()));
     }
@@ -1527,7 +1527,7 @@ async fn divert_quarantined(
     ctx: &Arc<ExecutionContext>,
     batch: &DataBatch,
     violations: &crate::operator::fk::FkViolations,
-    txn_id: u32,
+    txn_id: u64,
 ) -> zyron_common::Result<DataBatch> {
     for (quarantine_id, rows, names) in violations.by_table() {
         write_quarantine(ctx, quarantine_id, batch, &rows, &names, txn_id).await?;
@@ -2362,7 +2362,7 @@ impl Operator for InsertOperator {
                     let batch = if violations.is_empty() {
                         exec_batch.batch
                     } else {
-                        divert_quarantined(&self.ctx, &exec_batch.batch, &violations, txn_id as u32)
+                        divert_quarantined(&self.ctx, &exec_batch.batch, &violations, txn_id)
                             .await?
                     };
                     if batch.num_rows == 0 {
@@ -2410,13 +2410,9 @@ impl Operator for InsertOperator {
                 )
                 .await?;
                 if !fk_violations.is_empty() {
-                    exec_batch.batch = divert_quarantined(
-                        &self.ctx,
-                        &exec_batch.batch,
-                        &fk_violations,
-                        txn_id as u32,
-                    )
-                    .await?;
+                    exec_batch.batch =
+                        divert_quarantined(&self.ctx, &exec_batch.batch, &fk_violations, txn_id)
+                            .await?;
                     if exec_batch.batch.num_rows == 0 {
                         continue;
                     }
@@ -2444,7 +2440,7 @@ impl Operator for InsertOperator {
                 // common-case OLTP single-row insert does not heap-allocate
                 // a fresh Vec for the trigger payload, the WAL record list,
                 // or the dirty-page set on every call.
-                let mut batch_records: Vec<(u32, &[u8])> = Vec::with_capacity(tuples.len());
+                let mut batch_records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
                 for t in &tuples {
                     batch_records.push((txn_id, t.data()));
                 }
@@ -2661,11 +2657,15 @@ impl Operator for InsertOperator {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_micros() as i64;
-                    if let Err(e) =
-                        hook.on_insert(self.table_id.0, &tuple_refs, last_lsn.0, now, txn_id, true)
-                    {
-                        eprintln!("CDC insert hook failed: {e}");
-                    }
+                    // A hook failure fails the statement: the change feed
+                    // must carry every committed row, and a silent gap is
+                    // undetectable downstream. Failing here aborts the
+                    // transaction, so any records the hook did append are
+                    // filtered out by delivery's commit check
+                    hook.on_insert(self.table_id.0, &tuple_refs, last_lsn.0, now, txn_id, true)
+                        .map_err(|e| {
+                            ZyronError::ExecutionError(format!("CDC insert hook failed: {e}"))
+                        })?;
                 }
 
                 // Fire AFTER INSERT row/statement triggers in the same txn.
@@ -2747,16 +2747,10 @@ impl Operator for InsertOperator {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_micros() as i64;
-                        if let Err(e) = hook.on_insert(
-                            self.table_id.0,
-                            &refs,
-                            outcome.version,
-                            now,
-                            txn_id,
-                            true,
-                        ) {
-                            eprintln!("CDC insert hook failed: {e}");
-                        }
+                        hook.on_insert(self.table_id.0, &refs, outcome.version, now, txn_id, true)
+                            .map_err(|e| {
+                                ZyronError::ExecutionError(format!("CDC insert hook failed: {e}"))
+                            })?;
                     }
                 }
                 // AFTER INSERT fires once the rows are committed, because a
@@ -3158,13 +3152,15 @@ async fn ensure_locked_rows_unchanged(
 
     let own_txn = ctx.txn_id as u64;
     let status_map = ctx.snapshot.status_map();
-    let conflict = |loc: RowLocator| ZyronError::TransactionConflict {
-        txn_id: own_txn,
-        reason: format!(
-            "row {loc} in table {} was changed by a concurrently committed \
-             transaction, retry the transaction",
-            table_id.0
-        ),
+    let conflict = |loc: RowLocator| {
+        ZyronError::transaction_conflict(
+            own_txn,
+            format!(
+                "row {loc} in table {} was changed by a concurrently committed \
+                 transaction, retry the transaction",
+                table_id.0
+            ),
+        )
     };
 
     let mut heap_pages: std::collections::HashMap<zyron_common::PageId, Vec<u16>> =
@@ -3491,11 +3487,12 @@ impl Operator for DeleteOperator {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_micros() as i64;
-                            if let Err(e) =
-                                hook.on_delete(self.table_id.0, &refs, last_lsn, now, txn_id, true)
-                            {
-                                eprintln!("CDC delete hook failed: {e}");
-                            }
+                            hook.on_delete(self.table_id.0, &refs, last_lsn, now, txn_id, true)
+                                .map_err(|e| {
+                                    ZyronError::ExecutionError(format!(
+                                        "CDC delete hook failed: {e}"
+                                    ))
+                                })?;
                         }
                     }
 
@@ -3605,7 +3602,7 @@ impl Operator for DeleteOperator {
 
                 // Batch WAL log: one CAS + commit for all deletes in this batch.
                 let payloads: Vec<Vec<u8>> = tuple_ids.iter().map(tuple_id_payload).collect();
-                let batch_records: Vec<(u32, &[u8])> =
+                let batch_records: Vec<(u64, &[u8])> =
                     payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
                 let lsns = self.ctx.wal.log_delete_batch(&batch_records)?;
                 self.ctx.mark_wrote_wal();
@@ -3726,11 +3723,10 @@ impl Operator for DeleteOperator {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_micros() as i64;
-                        if let Err(e) =
-                            hook.on_delete(self.table_id.0, &refs, last_lsn.0, now, txn_id, true)
-                        {
-                            eprintln!("CDC delete hook failed: {e}");
-                        }
+                        hook.on_delete(self.table_id.0, &refs, last_lsn.0, now, txn_id, true)
+                            .map_err(|e| {
+                                ZyronError::ExecutionError(format!("CDC delete hook failed: {e}"))
+                            })?;
                     }
                 }
 
@@ -4233,7 +4229,7 @@ impl Operator for UpdateOperator {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_micros() as i64;
-                        if let Err(e) = hook.on_update(
+                        hook.on_update(
                             self.table_id.0,
                             &old_refs,
                             &new_refs,
@@ -4241,9 +4237,10 @@ impl Operator for UpdateOperator {
                             now,
                             txn_id,
                             true,
-                        ) {
-                            eprintln!("CDC update hook failed: {e}");
-                        }
+                        )
+                        .map_err(|e| {
+                            ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
+                        })?;
                     }
 
                     // Fire AFTER UPDATE row/statement triggers (NEW image).
@@ -4433,7 +4430,7 @@ impl Operator for UpdateOperator {
                 // Batch WAL log deletes: one CAS + commit for all.
                 let delete_payloads: Vec<Vec<u8>> =
                     tuple_ids.iter().map(tuple_id_payload).collect();
-                let delete_records: Vec<(u32, &[u8])> = delete_payloads
+                let delete_records: Vec<(u64, &[u8])> = delete_payloads
                     .iter()
                     .map(|p| (txn_id, p.as_slice()))
                     .collect();
@@ -4479,7 +4476,7 @@ impl Operator for UpdateOperator {
                 }
 
                 // Batch WAL log inserts: one CAS + commit for all.
-                let insert_records: Vec<(u32, &[u8])> =
+                let insert_records: Vec<(u64, &[u8])> =
                     new_tuples.iter().map(|t| (txn_id, t.data())).collect();
                 let ins_lsns = self.ctx.wal.log_insert_batch(&insert_records)?;
                 let ins_last_lsn = ins_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
@@ -4640,7 +4637,7 @@ impl Operator for UpdateOperator {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_micros() as i64;
-                    if let Err(e) = hook.on_update(
+                    hook.on_update(
                         self.table_id.0,
                         &old_slices,
                         &new_refs_data,
@@ -4648,9 +4645,10 @@ impl Operator for UpdateOperator {
                         now,
                         txn_id,
                         true,
-                    ) {
-                        eprintln!("CDC update hook failed: {e}");
-                    }
+                    )
+                    .map_err(|e| {
+                        ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
+                    })?;
                 }
 
                 // Fire AFTER UPDATE row/statement triggers (NEW image) in txn.

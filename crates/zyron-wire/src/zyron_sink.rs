@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use zyron_catalog::schema::CatalogStreamingWriteMode;
 use zyron_common::{Result, TypeId, ZyronError};
-use zyron_streaming::dlq::{DeadLetterQueue, make_failed_row};
+use zyron_streaming::dlq::{DeadLetterQueue, FailedRow, LocalSink, make_failed_row};
 use zyron_streaming::retry::{
     CircuitBreaker, CircuitState, ErrorClass, RetryConfig, classify_message,
 };
@@ -883,6 +883,126 @@ pub async fn build_sink_client_from_entry(
         idempotency_key_columns,
     };
     Ok(Arc::new(ZyronSinkClient::new(cfg)))
+}
+
+// -----------------------------------------------------------------------------
+// Heap-backed DLQ persistence
+// -----------------------------------------------------------------------------
+
+/// LocalSink that lands failed rows in a local heap table through the same
+/// transactional append path streaming jobs use, so the admin replay
+/// endpoint can walk the table and re-ship the rows later.
+pub struct HeapDlqSink {
+    row_sink: zyron_streaming::sink_connector::ZyronRowSink,
+    columns: Vec<zyron_catalog::ColumnEntry>,
+}
+
+impl HeapDlqSink {
+    /// Wraps an append sink into the DLQ table. Refuses a table missing the
+    /// columns the replay path reads, or holding them at incompatible
+    /// types, so a misdeclared DLQ table fails at job creation instead of
+    /// at the first failure it should have captured.
+    pub fn new(
+        row_sink: zyron_streaming::sink_connector::ZyronRowSink,
+        columns: Vec<zyron_catalog::ColumnEntry>,
+    ) -> Result<Self> {
+        let require = |name: &str, fixed: bool| -> Result<()> {
+            let col = columns.iter().find(|c| c.name == name).ok_or_else(|| {
+                ZyronError::StreamingError(format!("DLQ table is missing column '{}'", name))
+            })?;
+            let is_fixed = col.physical_type_id().fixed_size().is_some();
+            if is_fixed != fixed {
+                return Err(ZyronError::StreamingError(format!(
+                    "DLQ table column '{}' has type {:?}, which the replay path cannot read",
+                    name, col.type_id
+                )));
+            }
+            Ok(())
+        };
+        require("source_table_id", true)?;
+        require("source_commit_version", true)?;
+        require("source_row_bytes", false)?;
+        Ok(Self { row_sink, columns })
+    }
+}
+
+impl LocalSink for HeapDlqSink {
+    fn write_rows(&self, rows: &[FailedRow]) -> Result<()> {
+        let changes = rows
+            .iter()
+            .map(|r| {
+                Ok(CdfChange {
+                    commit_version: r.source_commit_version,
+                    // FailedRow stamps milliseconds, the change stream
+                    // carries microseconds
+                    commit_timestamp: r.failed_at.saturating_mul(1000),
+                    change_type: zyron_cdc::ChangeType::Insert,
+                    row_data: encode_failed_row(r, &self.columns)?,
+                    primary_key_data: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.row_sink.write_batch(changes)
+    }
+}
+
+/// Encodes one FailedRow into the DLQ table's NSM tuple layout, matching
+/// fields to columns by name. Columns the row has no value for are null.
+fn encode_failed_row(row: &FailedRow, columns: &[zyron_catalog::ColumnEntry]) -> Result<Vec<u8>> {
+    enum Field<'a> {
+        Int(i128),
+        Text(&'a str),
+        Bytes(&'a [u8]),
+        Absent,
+    }
+
+    let num_cols = columns.len();
+    let bitmap_len = num_cols.div_ceil(8);
+    let mut buf = vec![0u8; bitmap_len];
+
+    for (i, col) in columns.iter().enumerate() {
+        let field = match col.name.as_str() {
+            "received_at" => Field::Int(row.received_at as i128),
+            "failed_at" => Field::Int(row.failed_at as i128),
+            "error_class" => Field::Text(&row.error_class),
+            "error_message" => Field::Text(&row.error_message),
+            "source_table_id" => Field::Int(row.source_table_id as i128),
+            "source_commit_version" => Field::Int(row.source_commit_version as i128),
+            "source_row_bytes" => Field::Bytes(&row.source_row_bytes),
+            "attempt_count" => Field::Int(row.attempt_count as i128),
+            _ => Field::Absent,
+        };
+        let fixed = col.physical_type_id().fixed_size();
+        match (field, fixed) {
+            (Field::Absent, Some(size)) => {
+                buf[i / 8] |= 1 << (i % 8);
+                buf.extend(std::iter::repeat(0u8).take(size));
+            }
+            (Field::Absent, None) => {
+                buf[i / 8] |= 1 << (i % 8);
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+            (Field::Int(v), Some(size)) if size <= 16 => {
+                buf.extend_from_slice(&v.to_le_bytes()[..size]);
+            }
+            (Field::Text(s), None) => {
+                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            (Field::Bytes(b), None) => {
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+            _ => {
+                return Err(ZyronError::StreamingError(format!(
+                    "DLQ table column '{}' has type {:?}, which cannot hold the field of the same name",
+                    col.name, col.type_id
+                )));
+            }
+        }
+    }
+
+    Ok(buf)
 }
 
 // -----------------------------------------------------------------------------

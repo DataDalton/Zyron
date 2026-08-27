@@ -80,6 +80,11 @@ pub(crate) trait Accumulator: std::any::Any + Send {
     fn finalize_checked(&self) -> Result<ScalarValue> {
         Ok(self.finalize())
     }
+
+    /// Returns the accumulator to its freshly built state so one allocation
+    /// serves many folds. Window frames refold each row's range through this
+    /// instead of building a new boxed accumulator per row
+    fn reset(&mut self);
 }
 
 /// Downcasts a partial accumulator to its concrete type for merging. Safe
@@ -115,6 +120,9 @@ impl Accumulator for CountAccumulator {
     fn supports_parallel_merge(&self) -> bool {
         true
     }
+    fn reset(&mut self) {
+        self.count = 0;
+    }
 }
 
 struct CountStarAccumulator {
@@ -136,6 +144,9 @@ impl Accumulator for CountStarAccumulator {
     }
     fn merge(&mut self, other: &dyn Accumulator) {
         self.count += merge_peer::<CountStarAccumulator>(other).count;
+    }
+    fn reset(&mut self) {
+        self.count = 0;
     }
     fn supports_parallel_merge(&self) -> bool {
         true
@@ -247,6 +258,13 @@ impl Accumulator for SumAccumulator {
     fn supports_parallel_merge(&self) -> bool {
         true
     }
+    fn reset(&mut self) {
+        self.int_sum = 0;
+        self.float_sum = 0.0;
+        self.saw_float = false;
+        self.has_value = false;
+        self.overflowed = false;
+    }
 }
 
 /// The numeric value at (col, row) as an f64, dividing a decimal's raw
@@ -323,8 +341,28 @@ impl Accumulator for AvgAccumulator {
         self.sum += o.sum;
         self.count += o.count;
     }
+    fn reset(&mut self) {
+        self.sum = 0.0;
+        self.count = 0;
+    }
     fn supports_parallel_merge(&self) -> bool {
         true
+    }
+}
+
+/// Compares two non-null scalars for MIN/MAX with the float total order,
+/// NaN greater than every number and equal to itself. partial_cmp returns
+/// None for a NaN pair, which made the running extreme depend on the order
+/// values arrived in
+fn cmp_scalar_total(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (ScalarValue::Float32(x), ScalarValue::Float32(y)) => {
+            Some(crate::compute::cmp_f32_total(*x, *y))
+        }
+        (ScalarValue::Float64(x), ScalarValue::Float64(y)) => {
+            Some(crate::compute::cmp_f64_total(*x, *y))
+        }
+        _ => a.partial_cmp(b),
     }
 }
 
@@ -340,10 +378,7 @@ impl Accumulator for MinAccumulator {
         self.min = Some(match &self.min {
             None => value.clone(),
             Some(current) => {
-                if value
-                    .partial_cmp(current)
-                    .is_some_and(|o| o == std::cmp::Ordering::Less)
-                {
+                if cmp_scalar_total(value, current).is_some_and(|o| o == std::cmp::Ordering::Less) {
                     value.clone()
                 } else {
                     current.clone()
@@ -358,6 +393,9 @@ impl Accumulator for MinAccumulator {
         if let Some(v) = &merge_peer::<MinAccumulator>(other).min {
             self.update(v);
         }
+    }
+    fn reset(&mut self) {
+        self.min = None;
     }
     fn supports_parallel_merge(&self) -> bool {
         true
@@ -376,8 +414,7 @@ impl Accumulator for MaxAccumulator {
         self.max = Some(match &self.max {
             None => value.clone(),
             Some(current) => {
-                if value
-                    .partial_cmp(current)
+                if cmp_scalar_total(value, current)
                     .is_some_and(|o| o == std::cmp::Ordering::Greater)
                 {
                     value.clone()
@@ -395,6 +432,9 @@ impl Accumulator for MaxAccumulator {
             self.update(v);
         }
     }
+    fn reset(&mut self) {
+        self.max = None;
+    }
     fn supports_parallel_merge(&self) -> bool {
         true
     }
@@ -410,9 +450,24 @@ struct DistinctAccumulator {
     inner: Box<dyn Accumulator>,
 }
 
+/// True for variants whose clone allocates. These check set membership
+/// before cloning so a repeated value never pays an allocation, while
+/// fixed-size values keep the single-hash insert whose clone is a copy
+fn scalar_owns_heap(value: &ScalarValue) -> bool {
+    matches!(value, ScalarValue::Utf8(_) | ScalarValue::Binary(_))
+}
+
 impl Accumulator for DistinctAccumulator {
     fn update(&mut self, value: &ScalarValue) {
-        if !value.is_null() && self.seen.insert(value.clone()) {
+        if value.is_null() {
+            return;
+        }
+        if scalar_owns_heap(value) {
+            if !self.seen.contains(value) {
+                self.inner.update(value);
+                self.seen.insert(value.clone());
+            }
+        } else if self.seen.insert(value.clone()) {
             self.inner.update(value);
         }
     }
@@ -420,16 +475,32 @@ impl Accumulator for DistinctAccumulator {
         if col.is_null(row) {
             return;
         }
+        // The scalar is only the dedup key. The fold goes through the
+        // typed path so the inner accumulator keeps the column context a
+        // bare scalar loses, a decimal's scale above all
         let value = col.get_scalar(row);
-        if self.seen.insert(value.clone()) {
-            self.inner.update(&value);
+        if scalar_owns_heap(&value) {
+            if !self.seen.contains(&value) {
+                self.inner.update_typed(col, row);
+                self.seen.insert(value);
+            }
+        } else if self.seen.insert(value) {
+            self.inner.update_typed(col, row);
         }
     }
     fn finalize(&self) -> ScalarValue {
         self.inner.finalize()
     }
     fn update_checked(&mut self, value: &ScalarValue) -> Result<()> {
-        if !value.is_null() && self.seen.insert(value.clone()) {
+        if value.is_null() {
+            return Ok(());
+        }
+        if scalar_owns_heap(value) {
+            if !self.seen.contains(value) {
+                self.inner.update_checked(value)?;
+                self.seen.insert(value.clone());
+            }
+        } else if self.seen.insert(value.clone()) {
             self.inner.update_checked(value)?;
         }
         Ok(())
@@ -439,13 +510,22 @@ impl Accumulator for DistinctAccumulator {
             return Ok(());
         }
         let value = col.get_scalar(row);
-        if self.seen.insert(value.clone()) {
-            self.inner.update_checked(&value)?;
+        if scalar_owns_heap(&value) {
+            if !self.seen.contains(&value) {
+                self.inner.update_typed_checked(col, row)?;
+                self.seen.insert(value);
+            }
+        } else if self.seen.insert(value) {
+            self.inner.update_typed_checked(col, row)?;
         }
         Ok(())
     }
     fn finalize_checked(&self) -> Result<ScalarValue> {
         self.inner.finalize_checked()
+    }
+    fn reset(&mut self) {
+        self.seen.clear();
+        self.inner.reset();
     }
 }
 
@@ -506,6 +586,10 @@ struct UdaAccumulator {
     sfunc_schema: Vec<LogicalColumn>,
     final_schema: Vec<LogicalColumn>,
     error: Option<String>,
+    /// The evaluated init state and any init evaluation failure, kept so
+    /// reset restores exactly the freshly built condition
+    initial_state: ScalarValue,
+    initial_error: Option<String>,
 }
 
 impl UdaAccumulator {
@@ -524,6 +608,8 @@ impl UdaAccumulator {
             finalfunc: uda.finalfunc.clone(),
             state_type,
             input_type,
+            initial_state: state.clone(),
+            initial_error: error.clone(),
             state,
             sfunc_schema: vec![uda_column(0, state_type), uda_column(1, input_type)],
             final_schema: vec![uda_column(0, state_type)],
@@ -602,6 +688,10 @@ impl Accumulator for UdaAccumulator {
     }
     fn finalize_checked(&self) -> Result<ScalarValue> {
         self.finalize_inner()
+    }
+    fn reset(&mut self) {
+        self.state = self.initial_state.clone();
+        self.error = self.initial_error.clone();
     }
 }
 
@@ -717,6 +807,9 @@ impl Accumulator for FirstAccumulator {
     fn finalize(&self) -> ScalarValue {
         self.value.clone().unwrap_or(ScalarValue::Null)
     }
+    fn reset(&mut self) {
+        self.value = None;
+    }
 }
 
 /// Last value seen (in input order).
@@ -732,6 +825,9 @@ impl Accumulator for LastAccumulator {
     }
     fn finalize(&self) -> ScalarValue {
         self.value.clone().unwrap_or(ScalarValue::Null)
+    }
+    fn reset(&mut self) {
+        self.value = None;
     }
 }
 
@@ -783,6 +879,11 @@ impl Accumulator for StddevAccumulator {
         let variance = self.m2 / (self.count - 1) as f64;
         ScalarValue::Float64(variance.sqrt())
     }
+    fn reset(&mut self) {
+        self.count = 0;
+        self.mean = 0.0;
+        self.m2 = 0.0;
+    }
 }
 
 /// Sample variance via Welford's online algorithm.
@@ -832,6 +933,11 @@ impl Accumulator for VarianceAccumulator {
         }
         ScalarValue::Float64(self.m2 / (self.count - 1) as f64)
     }
+    fn reset(&mut self) {
+        self.count = 0;
+        self.mean = 0.0;
+        self.m2 = 0.0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +957,27 @@ pub struct HashAggregateOperator {
     finished: bool,
     result: Option<DataBatch>,
     output_cursor: usize,
+    /// Query memory budget the accumulated group state reserves against,
+    /// approximated by input batch size. None runs unbudgeted.
+    memory_budget: Option<Arc<crate::context::QueryMemoryBudget>>,
+    /// Where rows for groups that did not fit are put. None means the
+    /// aggregate fails at the budget the way it did before spilling existed
+    spill: Option<Arc<crate::spill::SpillDirectory>>,
+    /// Bytes of group state the aggregate may hold. Zero means never spill
+    spill_threshold_bytes: u64,
+    /// Partitions of rows still to be aggregated, taken from the back so a
+    /// partition split again is finished before its siblings are started
+    pending: Vec<PendingPartition>,
+    /// True once the input has been read and the resident groups emitted
+    input_drained: bool,
+}
+
+/// One partition of input rows waiting to be aggregated on its own.
+struct PendingPartition {
+    reader: crate::spill::SpillReader,
+    /// How many times the rows in it have already been re-partitioned, which
+    /// decides the hash seed the next split uses
+    depth: u32,
 }
 
 impl HashAggregateOperator {
@@ -870,7 +997,113 @@ impl HashAggregateOperator {
             finished: false,
             result: None,
             output_cursor: 0,
+            memory_budget: None,
+            spill: None,
+            spill_threshold_bytes: 0,
+            pending: Vec::new(),
+            input_drained: false,
         }
+    }
+
+    /// Gives the aggregate somewhere to put the groups that do not fit.
+    ///
+    /// The threshold is what the query may hold, which is the point the
+    /// aggregate used to fail at.
+    pub fn set_spill(
+        &mut self,
+        directory: Option<Arc<crate::spill::SpillDirectory>>,
+        threshold_bytes: u64,
+    ) {
+        self.spill = directory;
+        self.spill_threshold_bytes = threshold_bytes;
+    }
+
+    /// Attaches the query memory budget. Set by the operator builder from
+    /// the execution context.
+    pub fn set_memory_budget(&mut self, budget: Option<Arc<crate::context::QueryMemoryBudget>>) {
+        self.memory_budget = budget;
+    }
+
+    /// A place to route the groups that will not fit, or None when this
+    /// aggregate has nowhere to put them.
+    fn new_router(&self) -> Option<crate::operator::grace::PartitionWriterSet> {
+        let directory = self.spill.as_ref()?;
+        if self.spill_threshold_bytes == 0 {
+            return None;
+        }
+        Some(crate::operator::grace::PartitionWriterSet::new(
+            Arc::clone(directory),
+            self.spill_threshold_bytes,
+        ))
+    }
+
+    /// Closes a router and queues whatever it wrote.
+    fn queue_partitions(
+        &mut self,
+        router: crate::operator::grace::PartitionWriterSet,
+        depth: u32,
+    ) -> Result<()> {
+        if router.routed() == 0 {
+            return Ok(());
+        }
+        if depth == 1 {
+            crate::spill::SpillStats::global()
+                .aggregates_spilled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        for side in router.finish()? {
+            if let Some(reader) = side.into_reader() {
+                self.pending.push(PendingPartition { reader, depth });
+            }
+        }
+        Ok(())
+    }
+
+    /// Aggregates one partition on its own.
+    ///
+    /// Its groups are disjoint from every other partition's and from the
+    /// resident table's, so this is a whole aggregation over a subset of the
+    /// rows and its output needs nothing done to it. If it does not fit
+    /// either, it splits again under a different seed, which is the same
+    /// mechanism one level down.
+    fn aggregate_partition(&mut self, partition: PendingPartition) -> Result<Option<DataBatch>> {
+        let mut state = GroupAccumulatorState::new();
+        let mut router = if partition.depth < MAX_AGGREGATE_SPILL_DEPTH {
+            self.new_router()
+        } else {
+            // Deep enough that splitting again is not what is wrong. What is
+            // left is aggregated in memory, and the budget answers for it
+            None
+        };
+        let seed = zyron_common::checksum::splitmix64(partition.depth as u64 + 1);
+        let mut reader = partition.reader;
+        while let Some(batch) = reader.read_batch()? {
+            state.ingest_bounded(
+                &batch,
+                &self.group_by,
+                &self.aggregates,
+                &self.input_schema,
+                router.as_mut(),
+                seed,
+                self.spill_threshold_bytes,
+            )?;
+        }
+        // The file goes before its children are closed, so the rows it held
+        // are never counted against the spill quota twice
+        drop(reader);
+        if let Some(router) = router.take() {
+            self.queue_partitions(router, partition.depth + 1)?;
+        }
+        if state.num_groups == 0 {
+            return Ok(None);
+        }
+        Ok(Some(finalize_groups(
+            &state.group_key_store,
+            &state.group_accumulators,
+            state.num_groups,
+            self.group_by.len(),
+            &self.output_schema,
+        )?))
     }
 
     async fn materialize(&mut self) -> Result<()> {
@@ -947,18 +1180,35 @@ impl HashAggregateOperator {
             // so the serial path and the parallel partial-aggregate path use one
             // grouping and one find-or-create implementation.
             let mut state = GroupAccumulatorState::new();
+            let mut router = self.new_router();
             loop {
                 match self.child.next().await? {
                     Some(eb) => {
-                        state.ingest(
+                        // Without somewhere to put the overflow the budget is
+                        // the hard limit it always was. Group state grows by
+                        // at most the batch it ingests, and a high-cardinality
+                        // GROUP BY approaches that bound, so the batch size is
+                        // the reservation proxy
+                        if router.is_none() {
+                            if let Some(budget) = &self.memory_budget {
+                                budget.reserve(eb.batch.approx_bytes())?;
+                            }
+                        }
+                        state.ingest_bounded(
                             &eb.batch,
                             &self.group_by,
                             &self.aggregates,
                             &self.input_schema,
+                            router.as_mut(),
+                            0,
+                            self.spill_threshold_bytes,
                         )?;
                     }
                     None => break,
                 }
+            }
+            if let Some(router) = router {
+                self.queue_partitions(router, 1)?;
             }
             group_key_store = state.group_key_store;
             group_accumulators = state.group_accumulators;
@@ -966,7 +1216,6 @@ impl HashAggregateOperator {
         }
 
         if num_groups == 0 {
-            self.finished = true;
             return Ok(());
         }
 
@@ -1095,7 +1344,35 @@ struct GroupAccumulatorState {
     hash_to_groups: PreHashMap<u64, Vec<usize>>,
     group_accumulators: Vec<Vec<Box<dyn Accumulator>>>,
     num_groups: usize,
+    /// Bytes the grouping keys hold, counted as they are stored rather than
+    /// measured afterwards: measuring a text key store means walking every
+    /// group, and the answer is wanted once per batch
+    key_bytes: u64,
+    /// True once the table has reached its budget and stopped taking new
+    /// groups. Rows for groups already here still fold into them
+    frozen: bool,
+    /// Rows of the batch in hand whose group is not resident, reused across
+    /// batches so a routed aggregate does not allocate one per batch
+    unresident: Vec<u32>,
 }
+
+/// Bytes one group costs beyond its key: the hash entry, its place in the
+/// collision list, and the vector of accumulator boxes.
+const GROUP_OVERHEAD_BYTES: u64 = 64;
+
+/// Bytes one accumulator costs: the box, and the state of the widest
+/// fixed-size accumulator there is.
+const ACCUMULATOR_BYTES: u64 = 48;
+
+/// Times a partition may be split again before it is aggregated in memory
+/// whatever its size.
+///
+/// Each level absorbs at least one group into its resident table before it
+/// routes anything, so the recursion ends on its own. The cap is for file
+/// descriptors: sixteen to the eighth is more partitions than any real
+/// grouping produces, and a threshold small enough to keep splitting past
+/// that is a threshold too small to hold one group.
+const MAX_AGGREGATE_SPILL_DEPTH: u32 = 8;
 
 impl GroupAccumulatorState {
     fn new() -> Self {
@@ -1104,7 +1381,29 @@ impl GroupAccumulatorState {
             hash_to_groups: PreHashMap::default(),
             group_accumulators: Vec::new(),
             num_groups: 0,
+            key_bytes: 0,
+            frozen: false,
+            unresident: Vec::new(),
         }
+    }
+
+    /// What the table holds, near enough to decide when to stop growing.
+    ///
+    /// The keys are counted exactly. The accumulators are estimated, because
+    /// their state sits behind a trait object with no size to ask for, and a
+    /// count times a fixed figure is right for every accumulator whose state
+    /// is fixed, which is all of them but DISTINCT and a user-defined one.
+    /// Those two keep growing after the table is frozen, and there is nothing
+    /// to do about it without writing accumulator state to disk, which would
+    /// need a merge that those two do not have.
+    fn resident_bytes(&self) -> u64 {
+        let per_group = self
+            .group_accumulators
+            .first()
+            .map(|a| a.len())
+            .unwrap_or(0) as u64;
+        self.key_bytes
+            + self.num_groups as u64 * (GROUP_OVERHEAD_BYTES + per_group * ACCUMULATOR_BYTES)
     }
 
     /// Folds one input batch into the partition's group state.
@@ -1114,6 +1413,25 @@ impl GroupAccumulatorState {
         group_by: &[BoundExpr],
         aggregates: &[AggregateExpr],
         input_schema: &[LogicalColumn],
+    ) -> Result<()> {
+        self.ingest_bounded(batch, group_by, aggregates, input_schema, None, 0, 0)
+    }
+
+    /// Folds one input batch in, sending the rows it has no room for to disk.
+    ///
+    /// With no router and no threshold this is the unbounded ingest above, and
+    /// the two share one implementation so the grouping and the find-or-create
+    /// cannot drift apart between the path that spills and the path that does
+    /// not.
+    fn ingest_bounded(
+        &mut self,
+        batch: &DataBatch,
+        group_by: &[BoundExpr],
+        aggregates: &[AggregateExpr],
+        input_schema: &[LogicalColumn],
+        router: Option<&mut crate::operator::grace::PartitionWriterSet>,
+        seed: u64,
+        threshold_bytes: u64,
     ) -> Result<()> {
         let num_rows = batch.num_rows;
         if num_rows == 0 {
@@ -1160,19 +1478,47 @@ impl GroupAccumulatorState {
             hash_to_groups,
             group_accumulators,
             num_groups,
+            key_bytes,
+            frozen,
+            unresident,
         } = self;
 
+        // Taken so the routing pass below can hand the batch to the writer
+        // while the table's own fields are still borrowed
+        let mut routed = std::mem::take(unresident);
+        routed.clear();
+
         for row in 0..num_rows {
-            let gidx = find_or_create_group(
-                hash_to_groups,
-                group_key_store,
-                group_accumulators,
-                num_groups,
-                &group_refs,
-                row,
-                hashes[row],
-                || aggregates.iter().map(create_accumulator).collect(),
-            );
+            let gidx = if *frozen {
+                match find_group(
+                    hash_to_groups,
+                    group_key_store,
+                    &group_refs,
+                    row,
+                    hashes[row],
+                ) {
+                    Some(gidx) => gidx,
+                    None => {
+                        // A group this table has no room for. Its rows go to
+                        // a partition, all of them, so the group is whole
+                        // wherever it ends up
+                        routed.push(row as u32);
+                        continue;
+                    }
+                }
+            } else {
+                find_or_create_group(
+                    hash_to_groups,
+                    group_key_store,
+                    group_accumulators,
+                    num_groups,
+                    key_bytes,
+                    &group_refs,
+                    row,
+                    hashes[row],
+                    || aggregates.iter().map(create_accumulator).collect(),
+                )
+            };
             let accs = &mut group_accumulators[gidx];
             for (i, acc) in accs.iter_mut().enumerate() {
                 match &agg_arg_cols[i] {
@@ -1180,6 +1526,22 @@ impl GroupAccumulatorState {
                     None => acc.update_checked(&ScalarValue::Int64(1))?,
                 }
             }
+        }
+
+        if let Some(router) = router {
+            router.push_selected(batch, &hashes, &routed, seed)?;
+        } else if !routed.is_empty() {
+            return Err(ZyronError::ExecutionError(
+                "the aggregate stopped taking groups with nowhere to put them".into(),
+            ));
+        }
+        self.unresident = routed;
+
+        // Checked once per batch rather than per row: the table grows by at
+        // most one group per row, and a batch of overshoot is a batch of rows
+        // worth of state, not a multiple of the budget
+        if !self.frozen && threshold_bytes > 0 && self.resident_bytes() >= threshold_bytes {
+            self.frozen = true;
         }
         Ok(())
     }
@@ -1208,6 +1570,8 @@ impl GroupAccumulatorState {
             hash_to_groups,
             group_accumulators,
             num_groups,
+            key_bytes,
+            ..
         } = self;
 
         for ogidx in 0..other.num_groups {
@@ -1216,6 +1580,7 @@ impl GroupAccumulatorState {
                 group_key_store,
                 group_accumulators,
                 num_groups,
+                key_bytes,
                 &other_refs,
                 ogidx,
                 hashes[ogidx],
@@ -1229,9 +1594,67 @@ impl GroupAccumulatorState {
     }
 }
 
-/// Finds the group matching `key_cols[.. ][row]` by hash and equality, or
-/// creates it (copying the key into the store and building fresh
-/// accumulators). The disjoint `&mut` parameters let one implementation serve
+/// Whether a stored group's key equals the key at a row of the input.
+#[inline]
+fn group_key_equals(
+    group_key_store: &[Column],
+    key_cols: &[&Column],
+    row: usize,
+    gidx: usize,
+) -> bool {
+    for (ci, kc) in key_cols.iter().enumerate() {
+        let store_col = &group_key_store[ci];
+        let a_null = kc.is_null(row);
+        let b_null = store_col.is_null(gidx);
+        if a_null != b_null {
+            return false;
+        }
+        if a_null {
+            continue;
+        }
+        if !column_values_equal_cross(&kc.data, row, &store_col.data, gidx) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Finds a row's group, without creating one.
+///
+/// What a frozen table does: a hit folds the row in for free, and a miss is a
+/// group this table is not going to hold.
+#[inline]
+fn find_group(
+    hash_to_groups: &PreHashMap<u64, Vec<usize>>,
+    group_key_store: &[Column],
+    key_cols: &[&Column],
+    row: usize,
+    hash: u64,
+) -> Option<usize> {
+    let candidates = hash_to_groups.get(&hash)?;
+    candidates
+        .iter()
+        .copied()
+        .find(|&gidx| group_key_equals(group_key_store, key_cols, row, gidx))
+}
+
+/// Bytes one row of a key column contributes to the group key store.
+#[inline]
+fn key_row_bytes(col: &Column, row: usize) -> u64 {
+    match &col.data {
+        ColumnData::Utf8(v) => v.get(row).map(|s| s.len() as u64 + 24).unwrap_or(24),
+        ColumnData::Binary(v) => v.get(row).map(|b| b.len() as u64 + 24).unwrap_or(24),
+        ColumnData::Boolean(_) | ColumnData::Int8(_) | ColumnData::UInt8(_) => 1,
+        ColumnData::Int16(_) | ColumnData::UInt16(_) => 2,
+        ColumnData::Int32(_) | ColumnData::UInt32(_) | ColumnData::Float32(_) => 4,
+        ColumnData::Int64(_) | ColumnData::UInt64(_) | ColumnData::Float64(_) => 8,
+        ColumnData::Int128(_) | ColumnData::FixedBinary16(_) | ColumnData::Interval(_) => 16,
+    }
+}
+
+/// Finds the group matching `key_cols[..][row]` by hash and equality, or
+/// creates it, copying the key into the store and building fresh
+/// accumulators. The disjoint `&mut` parameters let one implementation serve
 /// both batch ingest and partition merge without a borrow conflict.
 #[allow(clippy::too_many_arguments)]
 fn find_or_create_group(
@@ -1239,6 +1662,7 @@ fn find_or_create_group(
     group_key_store: &mut [Column],
     group_accumulators: &mut Vec<Vec<Box<dyn Accumulator>>>,
     num_groups: &mut usize,
+    key_bytes: &mut u64,
     key_cols: &[&Column],
     row: usize,
     hash: u64,
@@ -1246,24 +1670,7 @@ fn find_or_create_group(
 ) -> usize {
     let candidates = hash_to_groups.entry(hash).or_default();
     for &gidx in candidates.iter() {
-        let mut eq = true;
-        for (ci, kc) in key_cols.iter().enumerate() {
-            let store_col = &group_key_store[ci];
-            let a_null = kc.is_null(row);
-            let b_null = store_col.is_null(gidx);
-            if a_null != b_null {
-                eq = false;
-                break;
-            }
-            if a_null {
-                continue;
-            }
-            if !column_values_equal_cross(&kc.data, row, &store_col.data, gidx) {
-                eq = false;
-                break;
-            }
-        }
-        if eq {
+        if group_key_equals(group_key_store, key_cols, row, gidx) {
             return gidx;
         }
     }
@@ -1272,6 +1679,7 @@ fn find_or_create_group(
     candidates.push(gidx);
     for (ci, kc) in key_cols.iter().enumerate() {
         group_key_store[ci].push_row_from(kc, row);
+        *key_bytes += key_row_bytes(kc, row);
     }
     group_accumulators.push(make_accs());
     gidx
@@ -1292,10 +1700,10 @@ fn column_values_equal_cross(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx
         (ColumnData::UInt32(va), ColumnData::UInt32(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::UInt64(va), ColumnData::UInt64(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::Float32(va), ColumnData::Float32(vb)) => {
-            va[a_idx].to_bits() == vb[b_idx].to_bits()
+            crate::compute::f32_key_eq(va[a_idx], vb[b_idx])
         }
         (ColumnData::Float64(va), ColumnData::Float64(vb)) => {
-            va[a_idx].to_bits() == vb[b_idx].to_bits()
+            crate::compute::f64_key_eq(va[a_idx], vb[b_idx])
         }
         (ColumnData::Utf8(va), ColumnData::Utf8(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] == vb[b_idx],
@@ -1311,30 +1719,50 @@ fn column_values_equal_cross(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx
 impl Operator for HashAggregateOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         Box::pin(async move {
-            if self.finished {
-                return Ok(None);
+            loop {
+                if self.finished {
+                    return Ok(None);
+                }
+
+                // Whatever stage produced the batch in hand, it leaves a slice
+                // at a time so a partition holding millions of groups is not
+                // one output batch
+                if let Some(result) = self.result.as_ref() {
+                    if self.output_cursor < result.num_rows {
+                        let remaining = result.num_rows - self.output_cursor;
+                        let chunk = remaining.min(crate::batch::BATCH_SIZE);
+                        let batch = result.slice(self.output_cursor, chunk);
+                        self.output_cursor += chunk;
+                        return Ok(Some(ExecutionBatch::new(batch)));
+                    }
+                    self.result = None;
+                    self.output_cursor = 0;
+                }
+
+                if !self.input_drained {
+                    let mut timer = crate::calibrate::BatchTimer::start(
+                        zyron_pressure::capability::OperatorKind::Aggregate,
+                    );
+                    self.materialize().await?;
+                    self.input_drained = true;
+                    timer.rows(self.result.as_ref().map(|b| b.num_rows).unwrap_or(0) as u64);
+                    continue;
+                }
+
+                // Then the groups that did not fit, one partition at a time.
+                // Taken from the back, so a partition that split again is
+                // finished before its siblings start and its files are freed
+                match self.pending.pop() {
+                    Some(partition) => {
+                        self.result = self.aggregate_partition(partition)?;
+                        self.output_cursor = 0;
+                    }
+                    None => {
+                        self.finished = true;
+                        return Ok(None);
+                    }
+                }
             }
-
-            if self.result.is_none() && self.output_cursor == 0 {
-                self.materialize().await?;
-            }
-
-            let Some(ref result) = self.result else {
-                self.finished = true;
-                return Ok(None);
-            };
-
-            if self.output_cursor >= result.num_rows {
-                self.finished = true;
-                return Ok(None);
-            }
-
-            let remaining = result.num_rows - self.output_cursor;
-            let chunk = remaining.min(crate::batch::BATCH_SIZE);
-            let batch = result.slice(self.output_cursor, chunk);
-            self.output_cursor += chunk;
-
-            Ok(Some(ExecutionBatch::new(batch)))
         })
     }
 }
@@ -1365,6 +1793,22 @@ impl SortAggregateOperator {
                 output_schema,
             ),
         }
+    }
+}
+
+impl SortAggregateOperator {
+    /// Attaches the query memory budget to the aggregate underneath.
+    pub fn set_memory_budget(&mut self, budget: Option<Arc<crate::context::QueryMemoryBudget>>) {
+        self.inner.set_memory_budget(budget);
+    }
+
+    /// Gives the aggregate underneath somewhere to spill.
+    pub fn set_spill(
+        &mut self,
+        directory: Option<Arc<crate::spill::SpillDirectory>>,
+        threshold_bytes: u64,
+    ) {
+        self.inner.set_spill(directory, threshold_bytes);
     }
 }
 
@@ -1496,11 +1940,12 @@ impl ParallelHashAggregateOperator {
             stats.record_seq_scan();
         }
 
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(num_pages.max(1) as usize)
-            .max(1);
+        // The pages bound the split the data supports; the pool bounds what
+        // the machine can spare for it right now. The grant is held until
+        // every worker has been joined
+        let natural_workers = num_pages.max(1) as usize;
+        let grant = crate::parallel_pool::reserve(natural_workers);
+        let num_workers = grant.workers().min(natural_workers).max(1);
         let pages_per_worker = num_pages.div_ceil(num_workers as u64);
 
         let mut handles = Vec::with_capacity(num_workers);
@@ -1510,7 +1955,7 @@ impl ParallelHashAggregateOperator {
             if start_page >= end_page {
                 continue;
             }
-            handles.push(tokio::spawn(aggregate_page_range(
+            handles.push(crate::parallel_pool::spawn(aggregate_page_range(
                 self.ctx.clone(),
                 table_entry.clone(),
                 self.columns.clone(),
@@ -1530,6 +1975,7 @@ impl ParallelHashAggregateOperator {
             })??;
             merged.merge(state, &self.aggregates);
         }
+        drop(grant);
 
         if merged.num_groups == 0 {
             self.finished = true;

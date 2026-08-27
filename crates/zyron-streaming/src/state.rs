@@ -51,37 +51,6 @@ impl StateSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// StateTtl
-// ---------------------------------------------------------------------------
-
-/// TTL update strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TtlUpdateType {
-    /// TTL refreshed on any read or write.
-    OnReadAndWrite,
-    /// TTL only set on create and updated on write (not on read).
-    OnCreateAndWrite,
-}
-
-/// TTL configuration for state entries.
-#[derive(Debug, Clone)]
-pub struct StateTtl {
-    pub ttl_ms: u64,
-    pub cleanup_interval_ms: u64,
-    pub update_type: TtlUpdateType,
-}
-
-impl StateTtl {
-    pub fn new(ttl_ms: u64) -> Self {
-        Self {
-            ttl_ms,
-            cleanup_interval_ms: ttl_ms / 2,
-            update_type: TtlUpdateType::OnReadAndWrite,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // StateBackend trait
 // ---------------------------------------------------------------------------
 
@@ -114,30 +83,34 @@ pub trait StateBackend: Send + Sync {
 // Slot metadata for FlatStateMap
 // ---------------------------------------------------------------------------
 
-/// Per-slot metadata byte.
-/// Bits 0-6: probe distance from ideal slot (0-127).
-/// Bit 7: occupied flag (1 = occupied, 0 = empty).
-const SLOT_EMPTY: u8 = 0;
-const SLOT_OCCUPIED_BIT: u8 = 0x80;
+/// Per-slot metadata word.
+/// Bits 0-30: probe distance from the ideal slot.
+/// Bit 31: occupied flag (1 = occupied, 0 = empty).
+/// A single byte capped the distance at 127; a probe chain past that
+/// aliased distances through the mask and broke every lookup invariant,
+/// so the word is wide enough for any distance a table can produce
+const SLOT_EMPTY: u32 = 0;
+const SLOT_OCCUPIED_BIT: u32 = 0x8000_0000;
 
 #[inline(always)]
-fn slot_is_empty(meta: u8) -> bool {
+fn slot_is_empty(meta: u32) -> bool {
     meta == SLOT_EMPTY
 }
 
 #[inline(always)]
-fn slot_is_occupied(meta: u8) -> bool {
+fn slot_is_occupied(meta: u32) -> bool {
     meta & SLOT_OCCUPIED_BIT != 0
 }
 
 #[inline(always)]
-fn slot_distance(meta: u8) -> u8 {
-    meta & 0x7F
+fn slot_distance(meta: u32) -> u32 {
+    meta & !SLOT_OCCUPIED_BIT
 }
 
 #[inline(always)]
-fn make_meta(distance: u8) -> u8 {
-    SLOT_OCCUPIED_BIT | (distance & 0x7F)
+fn make_meta(distance: u32) -> u32 {
+    debug_assert!(distance < SLOT_OCCUPIED_BIT);
+    SLOT_OCCUPIED_BIT | distance
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +127,7 @@ const MIN_CAPACITY: usize = 16;
 /// Open-addressing hash table with Robin Hood probing.
 ///
 /// Layout uses four parallel arrays for cache-optimal access:
-/// - `meta`: 1 byte per slot (occupied flag + probe distance)
+/// - `meta`: 4 bytes per slot (occupied flag + probe distance)
 /// - `hashes`: pre-computed u64 hash per slot (avoids re-hashing on probe)
 /// - `keys`: (namespace, key) pair per slot
 /// - `values`: value bytes per slot
@@ -165,7 +138,7 @@ const MIN_CAPACITY: usize = 16;
 ///
 /// Single-threaded. No locks, no atomics on the hot path.
 pub struct FlatStateMap {
-    meta: Vec<u8>,
+    meta: Vec<u32>,
     hashes: Vec<u64>,
     keys: Vec<(Vec<u8>, Vec<u8>)>,
     values: Vec<Vec<u8>>,
@@ -207,7 +180,7 @@ impl FlatStateMap {
     pub fn get(&self, namespace: &[u8], key: &[u8]) -> Option<&Vec<u8>> {
         let hash = Self::compute_hash(namespace, key);
         let mut idx = (hash as usize) & self.mask;
-        let mut dist: u8 = 0;
+        let mut dist: u32 = 0;
 
         loop {
             let m = self.meta[idx];
@@ -231,7 +204,7 @@ impl FlatStateMap {
     pub fn put(&mut self, namespace: &[u8], key: &[u8], value: &[u8]) {
         let hash = Self::compute_hash(namespace, key);
         let mut idx = (hash as usize) & self.mask;
-        let mut dist: u8 = 0;
+        let mut dist: u32 = 0;
 
         // Single probe loop: find existing key or the Robin Hood insertion point.
         loop {
@@ -315,7 +288,7 @@ impl FlatStateMap {
     /// probe distances along the way.
     fn insert_inner(&mut self, mut hash: u64, mut key: (Vec<u8>, Vec<u8>), mut value: Vec<u8>) {
         let mut idx = (hash as usize) & self.mask;
-        let mut dist: u8 = 0;
+        let mut dist: u32 = 0;
 
         loop {
             let m = self.meta[idx];
@@ -347,7 +320,7 @@ impl FlatStateMap {
     pub fn delete(&mut self, namespace: &[u8], key: &[u8]) -> bool {
         let hash = Self::compute_hash(namespace, key);
         let mut idx = (hash as usize) & self.mask;
-        let mut dist: u8 = 0;
+        let mut dist: u32 = 0;
 
         loop {
             let m = self.meta[idx];
@@ -605,7 +578,17 @@ impl StateBackend for HeapStateBackend {
 // ---------------------------------------------------------------------------
 
 /// Disk-backed state backend for large state that exceeds memory.
-/// Uses the same FlatStateMap as a write buffer, flushing to sorted files.
+///
+/// A FlatStateMap write buffer absorbs writes and flushes to timestamped
+/// segment files once it crosses the byte cap. Reads merge the buffer over
+/// the segments newest first, deletes write tombstones so a flushed value
+/// stays dead, and a flush that leaves too many segments compacts them all
+/// into one, dropping tombstones. Everything runs under the single state
+/// mutex, matching the one-operator-thread ownership model.
+///
+/// Segment record layout, all little-endian:
+///   [ns_len u32][ns][key_len u32][key][tag u8][val_len u32][val]
+/// where tag 1 is a live value and tag 0 a tombstone.
 pub struct DiskStateBackend {
     data_dir: PathBuf,
     write_buffer: parking_lot::Mutex<FlatStateMap>,
@@ -613,6 +596,12 @@ pub struct DiskStateBackend {
     max_write_buffer_bytes: usize,
     next_snapshot_id: AtomicU64,
 }
+
+/// Segments a flush leaves behind before the next flush compacts them all.
+const DISK_STATE_COMPACT_AT: usize = 4;
+
+const TAG_VALUE: u8 = 1;
+const TAG_TOMBSTONE: u8 = 0;
 
 impl DiskStateBackend {
     pub fn new(data_dir: &Path, max_write_buffer_bytes: usize) -> Result<Self> {
@@ -627,11 +616,127 @@ impl DiskStateBackend {
         })
     }
 
+    /// Segment paths sorted oldest first by their timestamp names.
+    fn segment_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        let dir = std::fs::read_dir(&self.data_dir)
+            .map_err(|e| ZyronError::StreamingError(format!("state dir read failed: {e}")))?;
+        for entry in dir {
+            let entry =
+                entry.map_err(|e| ZyronError::StreamingError(format!("state dir entry: {e}")))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("state_") && name.ends_with(".dat") {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// Walks one segment's records in file order.
+    fn walk_segment(path: &Path, mut f: impl FnMut(&[u8], &[u8], u8, &[u8])) -> Result<()> {
+        let data = std::fs::read(path)
+            .map_err(|e| ZyronError::StreamingError(format!("state segment read failed: {e}")))?;
+        let mut off = 0usize;
+        let read_len = |data: &[u8], off: &mut usize| -> Result<usize> {
+            if *off + 4 > data.len() {
+                return Err(ZyronError::StreamingError(format!(
+                    "state segment {} truncated",
+                    path.display()
+                )));
+            }
+            let n = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap_or([0; 4])) as usize;
+            *off += 4;
+            Ok(n)
+        };
+        while off < data.len() {
+            let ns_len = read_len(&data, &mut off)?;
+            let ns_end = off + ns_len;
+            let key_len_off = ns_end;
+            if key_len_off > data.len() {
+                return Err(ZyronError::StreamingError(format!(
+                    "state segment {} truncated",
+                    path.display()
+                )));
+            }
+            let ns_range = off..ns_end;
+            off = key_len_off;
+            let key_len = read_len(&data, &mut off)?;
+            let key_end = off + key_len;
+            if key_end + 1 > data.len() {
+                return Err(ZyronError::StreamingError(format!(
+                    "state segment {} truncated",
+                    path.display()
+                )));
+            }
+            let key_range = off..key_end;
+            let tag = data[key_end];
+            off = key_end + 1;
+            let val_len = read_len(&data, &mut off)?;
+            let val_end = off + val_len;
+            if val_end > data.len() {
+                return Err(ZyronError::StreamingError(format!(
+                    "state segment {} truncated",
+                    path.display()
+                )));
+            }
+            f(
+                &data[ns_range.clone()],
+                &data[key_range.clone()],
+                tag,
+                &data[off..val_end],
+            );
+            off = val_end;
+        }
+        Ok(())
+    }
+
+    /// The full merged view: every segment oldest first, buffer last, so a
+    /// newer write or tombstone always wins. Tombstoned keys are dropped.
+    fn merged_view(
+        &self,
+        buffer: &FlatStateMap,
+    ) -> Result<std::collections::BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>> {
+        let mut merged: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for path in self.segment_paths()? {
+            Self::walk_segment(&path, |ns, key, tag, val| {
+                let k = (ns.to_vec(), key.to_vec());
+                if tag == TAG_VALUE {
+                    merged.insert(k, val.to_vec());
+                } else {
+                    merged.remove(&k);
+                }
+            })?;
+        }
+        buffer.iter(|ns, key, val| {
+            let k = (ns.to_vec(), key.to_vec());
+            match val.split_first() {
+                Some((&TAG_VALUE, rest)) => {
+                    merged.insert(k, rest.to_vec());
+                }
+                _ => {
+                    merged.remove(&k);
+                }
+            }
+        });
+        Ok(merged)
+    }
+
     fn flush_if_needed(&self) -> Result<()> {
         if self.write_buffer_bytes.load(Ordering::Relaxed) >= self.max_write_buffer_bytes {
             self.flush()?;
         }
         Ok(())
+    }
+
+    fn segment_file_name(&self) -> PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        self.data_dir.join(format!("state_{timestamp:032}.dat"))
     }
 
     fn flush(&self) -> Result<()> {
@@ -640,35 +745,71 @@ impl DiskStateBackend {
             return Ok(());
         }
 
-        // Collect sorted entries.
+        // Collect sorted entries, tag byte already inside the stored value.
         let mut entries: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(guard.len());
         guard.iter(|ns, key, val| {
             entries.push((ns.to_vec(), key.to_vec(), val.to_vec()));
         });
         entries.sort();
 
-        guard.clear();
-        self.write_buffer_bytes.store(0, Ordering::Relaxed);
-        drop(guard);
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = self.data_dir.join(format!("state_{timestamp}.dat"));
-
         let mut data = Vec::new();
-        for (ns, key, val) in &entries {
+        for (ns, key, tagged) in &entries {
+            let (tag, val) = tagged
+                .split_first()
+                .map(|(t, rest)| (*t, rest))
+                .unwrap_or((TAG_TOMBSTONE, &[][..]));
             data.extend_from_slice(&(ns.len() as u32).to_le_bytes());
             data.extend_from_slice(ns);
             data.extend_from_slice(&(key.len() as u32).to_le_bytes());
             data.extend_from_slice(key);
+            data.push(tag);
             data.extend_from_slice(&(val.len() as u32).to_le_bytes());
             data.extend_from_slice(val);
         }
 
-        std::fs::write(&path, &data)
+        std::fs::write(self.segment_file_name(), &data)
             .map_err(|e| ZyronError::StreamingError(format!("state flush failed: {e}")))?;
+
+        // The buffer clears only after the segment is durable on disk, a
+        // failed write keeps the state readable in memory
+        guard.clear();
+        self.write_buffer_bytes.store(0, Ordering::Relaxed);
+
+        // Compaction folds every segment into one, dropping tombstones, so
+        // segment count and dead data stay bounded
+        let paths = self.segment_paths()?;
+        if paths.len() >= DISK_STATE_COMPACT_AT {
+            let merged = self.merged_view(&guard)?;
+            let mut data = Vec::new();
+            for ((ns, key), val) in &merged {
+                data.extend_from_slice(&(ns.len() as u32).to_le_bytes());
+                data.extend_from_slice(ns);
+                data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                data.extend_from_slice(key);
+                data.push(TAG_VALUE);
+                data.extend_from_slice(&(val.len() as u32).to_le_bytes());
+                data.extend_from_slice(val);
+            }
+            std::fs::write(self.segment_file_name(), &data).map_err(|e| {
+                ZyronError::StreamingError(format!("state compaction write failed: {e}"))
+            })?;
+            for path in paths {
+                std::fs::remove_file(&path).map_err(|e| {
+                    ZyronError::StreamingError(format!("state segment remove failed: {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes every segment file. Used when a restore or namespace clear
+    /// replaces the merged state wholesale.
+    fn remove_all_segments(&self) -> Result<()> {
+        for path in self.segment_paths()? {
+            std::fs::remove_file(&path).map_err(|e| {
+                ZyronError::StreamingError(format!("state segment remove failed: {e}"))
+            })?;
+        }
         Ok(())
     }
 }
@@ -676,14 +817,36 @@ impl DiskStateBackend {
 impl StateBackend for DiskStateBackend {
     fn get(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         let guard = self.write_buffer.lock();
-        Ok(guard.get(namespace, key).cloned())
+        if let Some(tagged) = guard.get(namespace, key) {
+            return Ok(match tagged.split_first() {
+                Some((&TAG_VALUE, rest)) => Some(rest.to_vec()),
+                _ => None,
+            });
+        }
+        // Miss in the buffer: newest segment holding the key decides
+        let mut found: Option<Option<Vec<u8>>> = None;
+        for path in self.segment_paths()? {
+            Self::walk_segment(&path, |ns, k, tag, val| {
+                if ns == namespace && k == key {
+                    found = Some(if tag == TAG_VALUE {
+                        Some(val.to_vec())
+                    } else {
+                        None
+                    });
+                }
+            })?;
+        }
+        Ok(found.flatten())
     }
 
     fn put(&self, namespace: &[u8], key: &[u8], value: &[u8]) -> Result<()> {
-        let entry_size = namespace.len() + key.len() + value.len();
+        let entry_size = namespace.len() + key.len() + value.len() + 1;
         {
             let mut guard = self.write_buffer.lock();
-            guard.put(namespace, key, value);
+            let mut tagged = Vec::with_capacity(value.len() + 1);
+            tagged.push(TAG_VALUE);
+            tagged.extend_from_slice(value);
+            guard.put(namespace, key, &tagged);
         }
         self.write_buffer_bytes
             .fetch_add(entry_size, Ordering::Relaxed);
@@ -692,31 +855,50 @@ impl StateBackend for DiskStateBackend {
     }
 
     fn delete(&self, namespace: &[u8], key: &[u8]) -> Result<()> {
+        // A tombstone rather than a buffer removal, so a value already
+        // flushed to a segment stays dead
         let mut guard = self.write_buffer.lock();
-        guard.delete(namespace, key);
+        guard.put(namespace, key, &[TAG_TOMBSTONE]);
         Ok(())
     }
 
     fn prefix_scan(&self, namespace: &[u8], prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let guard = self.write_buffer.lock();
-        let mut results = Vec::new();
-        guard.iter(|ns, key, val| {
-            if ns == namespace && key.starts_with(prefix) {
-                results.push((key.to_vec(), val.to_vec()));
-            }
-        });
-        Ok(results)
+        let merged = self.merged_view(&guard)?;
+        Ok(merged
+            .into_iter()
+            .filter(|((ns, key), _)| ns == namespace && key.starts_with(prefix))
+            .map(|((_, key), val)| (key, val))
+            .collect())
     }
 
     fn snapshot(&self) -> Result<StateSnapshot> {
         let snapshot_id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
         let guard = self.write_buffer.lock();
-        Ok(guard.to_snapshot(snapshot_id))
+        let merged = self.merged_view(&guard)?;
+        let mut full = FlatStateMap::with_capacity(merged.len());
+        for ((ns, key), val) in &merged {
+            full.put(ns, key, val);
+        }
+        Ok(full.to_snapshot(snapshot_id))
     }
 
     fn restore(&self, snapshot: &StateSnapshot) -> Result<()> {
         let mut guard = self.write_buffer.lock();
+        self.remove_all_segments()?;
         guard.from_snapshot(snapshot);
+        // Snapshot values are raw, re-tag them as live buffer values
+        let mut entries: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(guard.len());
+        guard.iter(|ns, key, val| {
+            entries.push((ns.to_vec(), key.to_vec(), val.to_vec()));
+        });
+        guard.clear();
+        for (ns, key, val) in &entries {
+            let mut tagged = Vec::with_capacity(val.len() + 1);
+            tagged.push(TAG_VALUE);
+            tagged.extend_from_slice(val);
+            guard.put(ns, key, &tagged);
+        }
         self.write_buffer_bytes
             .store(guard.total_bytes(), Ordering::Relaxed);
         Ok(())
@@ -724,14 +906,24 @@ impl StateBackend for DiskStateBackend {
 
     fn clear_namespace(&self, namespace: &[u8]) -> Result<()> {
         let mut guard = self.write_buffer.lock();
+        // Flushed entries of this namespace must die too, so every merged
+        // key in the namespace gets a tombstone before the buffer copy of
+        // the namespace is dropped
+        let merged = self.merged_view(&guard)?;
         guard.clear_namespace(namespace);
+        for (ns, key) in merged.keys() {
+            if ns == namespace {
+                guard.put(ns, key, &[TAG_TOMBSTONE]);
+            }
+        }
         self.write_buffer_bytes
             .store(guard.total_bytes(), Ordering::Relaxed);
         Ok(())
     }
 
     fn entry_count(&self) -> usize {
-        self.write_buffer.lock().len()
+        let guard = self.write_buffer.lock();
+        self.merged_view(&guard).map(|m| m.len()).unwrap_or(0)
     }
 
     fn size_bytes(&self) -> usize {
@@ -982,6 +1174,55 @@ mod tests {
 
         backend.restore(&snapshot).unwrap();
         assert_eq!(backend.entry_count(), 2);
+    }
+
+    // A value flushed to a segment must stay readable, a delete of it must
+    // stick through the tombstone, and compaction must not lose either
+    #[test]
+    fn test_disk_backend_reads_survive_flush_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny buffer cap so every few puts trigger a flush
+        let backend = DiskStateBackend::new(dir.path(), 32).unwrap();
+
+        for i in 0..20u32 {
+            let key = format!("k{i:02}");
+            let val = format!("v{i:02}");
+            backend.put(b"ns", key.as_bytes(), val.as_bytes()).unwrap();
+        }
+        // Every key readable although the buffer flushed many times over
+        for i in 0..20u32 {
+            let key = format!("k{i:02}");
+            let val = format!("v{i:02}");
+            assert_eq!(
+                backend.get(b"ns", key.as_bytes()).unwrap(),
+                Some(val.into_bytes()),
+                "flushed key {key} must stay readable"
+            );
+        }
+
+        // Overwrite one flushed key and delete another, both must stick
+        backend.put(b"ns", b"k03", b"updated").unwrap();
+        backend.delete(b"ns", b"k05").unwrap();
+        // Force more flushes so the tombstone and update land in segments
+        for i in 20..40u32 {
+            let key = format!("k{i:02}");
+            backend.put(b"ns", key.as_bytes(), b"pad").unwrap();
+        }
+        assert_eq!(
+            backend.get(b"ns", b"k03").unwrap(),
+            Some(b"updated".to_vec())
+        );
+        assert_eq!(backend.get(b"ns", b"k05").unwrap(), None);
+
+        let scanned = backend.prefix_scan(b"ns", b"k0").unwrap();
+        let keys: Vec<String> = scanned
+            .iter()
+            .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+            .collect();
+        assert!(keys.contains(&"k03".to_string()));
+        assert!(!keys.contains(&"k05".to_string()));
+
+        assert_eq!(backend.entry_count(), 39, "40 keys minus one deleted");
     }
 
     #[test]

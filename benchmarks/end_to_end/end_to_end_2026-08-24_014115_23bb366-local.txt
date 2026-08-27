@@ -1,0 +1,94 @@
+# suite:   end_to_end
+# run:     2026-08-24_014115_23bb366-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Zyron End-to-End Consumer Deployment ===
+
+  Scenario simulates: cold boot -> schema -> seed -> OLTP -> analytics -> gateway -> shutdown
+
+=== Cold startup ===
+  Listener ready at 127.0.0.1:51653 in 44.90 ms
+
+=== Bootstrap (handshake, schema, seed) ===
+  First ReadyForQuery 0.58 ms, schema DDL 8.37 ms, seed 250476 rows/sec
+
+=== Pre-OLTP analytics probe ===
+  app schema id = Ok(SchemaId(10001))
+  orders_0 heap_file_id=200 num_pages BEFORE OLTP = 34
+  [diag] single-shot per-query timing (20-sample distribution)
+    COUNT(*)            min=    88 us  med=   107 us  max=   147 us
+    status group        min=   361 us  med=   422 us  max=   584 us
+    customer_id sum     min=   506 us  med=   583 us  max=   744 us
+  [diag] 100 sequential COUNT(*) queries, bucketed median latency
+    iter   0-9    med=   135 us  COUNT(*)=10000
+    iter  10-19   med=    87 us  COUNT(*)=10000
+    iter  20-29   med=    87 us  COUNT(*)=10000
+    iter  30-39   med=   112 us  COUNT(*)=10000
+    iter  40-49   med=   104 us  COUNT(*)=10000
+    iter  50-59   med=    87 us  COUNT(*)=10000
+    iter  60-69   med=    87 us  COUNT(*)=10000
+    iter  70-79   med=    97 us  COUNT(*)=10000
+    iter  80-89   med=    96 us  COUNT(*)=10000
+    iter  90-99   med=    97 us  COUNT(*)=10000
+
+=== OLTP workload (5s at each concurrency) ===
+  c= 1  tps=     11592  ok=   57964  fail=     0 ( 0.0%)  p50=  45 us  p95= 216 us  p99=  282 us  p999=   395 us  max=   862 us
+  c= 4  tps=     32940  ok=  164728  fail=     0 ( 0.0%)  p50=  78 us  p95= 290 us  p99=  372 us  p999=   487 us  max=  1640 us
+  c=16  tps=     61677  ok=  308446  fail=     0 ( 0.0%)  p50= 239 us  p95= 437 us  p99=  529 us  p999=   662 us  max= 15797 us
+  c=64  tps=     57910  ok=  289628  fail=     0 ( 0.0%)  p50=1075 us  p95=1616 us  p99= 1871 us  p999=  2259 us  max= 16335 us
+  c=256  tps=     51484  ok=  257623  fail=     0 ( 0.0%)  p50=4626 us  p95=7607 us  p99= 8922 us  p999= 13818 us  max= 21603 us
+
+=== Analytical queries (5-run average) ===
+  orders_0 heap_file_id=200 reported_num_pages=895 actual_file_pages=0
+  [diag] single-shot per-query timing (20-sample distribution)
+    COUNT(*)            min=   247 us  med=   320 us  max=   579 us
+    status group        min=  1028 us  med=  1107 us  max=  1302 us
+    customer_id sum     min=  2039 us  med=  2361 us  max=  2713 us
+  [diag] 100 sequential COUNT(*) queries, bucketed median latency
+    iter   0-9    med=   408 us  COUNT(*)=225467
+    iter  10-19   med=   359 us  COUNT(*)=225467
+    iter  20-29   med=   308 us  COUNT(*)=225467
+    iter  30-39   med=   314 us  COUNT(*)=225467
+    iter  40-49   med=   300 us  COUNT(*)=225467
+    iter  50-59   med=   354 us  COUNT(*)=225467
+    iter  60-69   med=   310 us  COUNT(*)=225467
+    iter  70-79   med=   331 us  COUNT(*)=225467
+    iter  80-89   med=   334 us  COUNT(*)=225467
+    iter  90-99   med=   299 us  COUNT(*)=225467
+  run 1/5  mean=1272.0 us  p50=1206 us  p95=2342 us  p99=2422 us  (n=200)
+  run 2/5  mean=1253.8 us  p50=1190 us  p95=2342 us  p99=2483 us  (n=200)
+  run 3/5  mean=1267.8 us  p50=1193 us  p95=2408 us  p99=2626 us  (n=200)
+  run 4/5  mean=1243.4 us  p50=1159 us  p95=2308 us  p99=2508 us  (n=200)
+  run 5/5  mean=1273.3 us  p50=1215 us  p95=2339 us  p99=2567 us  (n=200)
+  median (5-run) avg 1193 min 1159 max 1215 us
+
+=== Gateway routing and middleware ===
+  pipeline throughput 20243735 ops/sec
+
+=== Shutdown ===
+  teardown complete in 65.78 ms
+
+=== SLO Validation ===
+  cold boot latency (ms) [PASS]: 44.9007 <= 500 (target)
+  first ReadyForQuery (ms) [PASS]: 0.5795 <= 50 (target)
+  schema DDL total (ms) [PASS]: 8.3691 <= 200 (target)
+  seed insert (rows/sec) [PASS]: 250,476 >= 50,000 (target)
+  c1 tps [PASS]: 11,592 >= 1 (target)
+  c1 p99 us [PASS]: 282 <= inf (target)
+  c4 tps [PASS]: 32,940 >= 1 (target)
+  c4 p99 us [PASS]: 372 <= inf (target)
+  c16 tps [PASS]: 61,677 >= 30,000 (target)
+  c16 p99 us [PASS]: 529 <= 5,000 (target)
+  c64 tps [PASS]: 57,910 >= 1 (target)
+  c64 p99 us [PASS]: 1,871 <= inf (target)
+  c256 tps [PASS]: 51,484 >= 1 (target)
+  c256 p99 us [PASS]: 8,922 <= inf (target)
+  median query us [PASS]: 1,159 <= 1,500 (target)
+  pipeline ops/sec [PASS]: 20,243,735 >= 300,000 (target)
+  teardown (ms) [PASS]: 65.7827 <= 250 (target)
+
+=== End-to-End complete ===
+

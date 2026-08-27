@@ -20,10 +20,233 @@ use zyron_catalog::schema::{CatalogStreamingWriteMode, StreamingJobStatus};
 use zyron_catalog::{Catalog, StreamingJobEntry, StreamingJobId};
 use zyron_common::{Result, TypeId, ZyronError};
 
-use crate::row_codec::{StreamValue, decode_row, encode_row, eval_expr};
+use crate::interval_join_runner::{
+    IntervalJoinEngine, IntervalJoinEngineConfig, JoinSide, temporal_left_null_right,
+};
+use crate::row_codec::{
+    CompiledExpr, StreamValue, compile_expr, decode_row, encode_projected_row, encode_row,
+    eval_compiled,
+};
 use crate::sink_connector::ZyronRowSink;
 use crate::source_connector::{CdfChange, ZyronTableSource};
 use crate::upsert_sink::ZyronUpsertSink;
+
+// -----------------------------------------------------------------------------
+// Join runtime
+// -----------------------------------------------------------------------------
+
+/// Live join state a joining runner drives each poll cycle. Built from the
+/// spec's JoinSpec at spawn, so a job whose right side has no feed fails at
+/// spawn instead of silently running unjoined.
+pub(crate) enum JoinRuntime {
+    Interval {
+        right: ZyronTableSource,
+        engine: IntervalJoinEngine,
+        cfg: IntervalJoinConfig,
+        /// Highest event time seen per side, the punctual watermark inputs.
+        left_high: i64,
+        right_high: i64,
+    },
+    Temporal {
+        right: ZyronTableSource,
+        cfg: TemporalJoinConfig,
+        /// Right-table image keyed by encoded primary key, maintained from
+        /// the right CDF: inserts and update postimages upsert, deletes
+        /// remove.
+        cache: std::collections::HashMap<Vec<u8>, Vec<StreamValue>>,
+    },
+}
+
+impl JoinRuntime {
+    /// Builds the runtime for a spec's join, resolving the right-side feed.
+    pub(crate) fn build(
+        join: &JoinSpec,
+        cdc_registry: &Arc<zyron_cdc::CdfRegistry>,
+    ) -> Result<Self> {
+        match join {
+            JoinSpec::Interval(cfg) => Ok(JoinRuntime::Interval {
+                right: ZyronTableSource::new(cfg.right_source_table_id, Arc::clone(cdc_registry))?,
+                engine: IntervalJoinEngine::new(IntervalJoinEngineConfig {
+                    left_types: cfg.left_types.clone(),
+                    right_types: cfg.right_types.clone(),
+                    left_key_ordinals: cfg.left_key_ordinals.clone(),
+                    right_key_ordinals: cfg.right_key_ordinals.clone(),
+                    left_event_ordinal: cfg.left_event_time_ordinal,
+                    right_event_ordinal: cfg.right_event_time_ordinal,
+                    within_us: cfg.within_us,
+                    join_kind: cfg.join_kind,
+                }),
+                cfg: cfg.clone(),
+                left_high: i64::MIN,
+                right_high: i64::MIN,
+            }),
+            JoinSpec::Temporal(cfg) => Ok(JoinRuntime::Temporal {
+                right: ZyronTableSource::new(cfg.right_table_id, Arc::clone(cdc_registry))?,
+                cfg: cfg.clone(),
+                cache: std::collections::HashMap::new(),
+            }),
+        }
+    }
+
+    /// Runs one join step: consumes the right side's new changes, feeds the
+    /// left batch through, and returns the combined rows encoded on the
+    /// join's output schema.
+    fn step(&mut self, left: Vec<CdfChange>) -> Result<Vec<CdfChange>> {
+        match self {
+            JoinRuntime::Interval {
+                right,
+                engine,
+                cfg,
+                left_high,
+                right_high,
+            } => {
+                // A joined row synthesizes its commit stamp from the newest
+                // input seen this cycle, so downstream ordering stays sane
+                let mut version = 0u64;
+                let mut timestamp = 0i64;
+
+                let right_records = right.read_batch(RUNNER_BATCH)?;
+                for rec in &right_records {
+                    if !matches!(
+                        rec.change_type,
+                        zyron_cdc::ChangeType::Insert | zyron_cdc::ChangeType::UpdatePostimage
+                    ) {
+                        continue;
+                    }
+                    version = version.max(rec.commit_version);
+                    timestamp = timestamp.max(rec.commit_timestamp);
+                    let row = decode_row(&rec.row_data, &cfg.right_types)?;
+                    if let Some(v) = row.get(cfg.right_event_time_ordinal as usize) {
+                        if let Ok(t) = v.as_i64() {
+                            *right_high = (*right_high).max(t);
+                        }
+                    }
+                    engine.feed_row(JoinSide::Right, row)?;
+                }
+                for rec in &left {
+                    if !matches!(
+                        rec.change_type,
+                        zyron_cdc::ChangeType::Insert | zyron_cdc::ChangeType::UpdatePostimage
+                    ) {
+                        continue;
+                    }
+                    version = version.max(rec.commit_version);
+                    timestamp = timestamp.max(rec.commit_timestamp);
+                    let row = decode_row(&rec.row_data, &cfg.left_types)?;
+                    if let Some(v) = row.get(cfg.left_event_time_ordinal as usize) {
+                        if let Ok(t) = v.as_i64() {
+                            *left_high = (*left_high).max(t);
+                        }
+                    }
+                    engine.feed_row(JoinSide::Left, row)?;
+                }
+
+                // Punctual watermark: the slower side bounds how far time
+                // has provably advanced on both inputs
+                let wm = (*left_high).min(*right_high);
+                if wm > i64::MIN {
+                    engine.advance_watermark(wm);
+                }
+
+                let mut out = Vec::new();
+                for row in engine.pop_emissions() {
+                    out.push(CdfChange {
+                        commit_version: version,
+                        commit_timestamp: timestamp,
+                        change_type: zyron_cdc::ChangeType::Insert,
+                        row_data: encode_row(&row, &cfg.output_types)?,
+                        primary_key_data: Vec::new(),
+                    });
+                }
+                Ok(out)
+            }
+            JoinRuntime::Temporal { right, cfg, cache } => {
+                // Maintain the right-table image first, so a left row looks
+                // up the newest state the feed has published
+                let right_records = right.read_batch(RUNNER_BATCH)?;
+                let pk_types: Vec<TypeId> = cfg
+                    .right_pk_ordinals
+                    .iter()
+                    .map(|&o| cfg.right_types[o as usize])
+                    .collect();
+                for rec in &right_records {
+                    match rec.change_type {
+                        zyron_cdc::ChangeType::Insert | zyron_cdc::ChangeType::UpdatePostimage => {
+                            let row = decode_row(&rec.row_data, &cfg.right_types)?;
+                            let key_values: Vec<StreamValue> = cfg
+                                .right_pk_ordinals
+                                .iter()
+                                .map(|&o| row[o as usize].clone())
+                                .collect();
+                            let key = encode_row(&key_values, &pk_types)?;
+                            cache.insert(key, row);
+                        }
+                        zyron_cdc::ChangeType::Delete => {
+                            let row = decode_row(&rec.row_data, &cfg.right_types)?;
+                            let key_values: Vec<StreamValue> = cfg
+                                .right_pk_ordinals
+                                .iter()
+                                .map(|&o| row[o as usize].clone())
+                                .collect();
+                            let key = encode_row(&key_values, &pk_types)?;
+                            cache.remove(&key);
+                        }
+                        _ => {}
+                    }
+                }
+
+                let right_width = cfg.right_types.len();
+                let mut out = Vec::with_capacity(left.len());
+                for rec in &left {
+                    if !matches!(
+                        rec.change_type,
+                        zyron_cdc::ChangeType::Insert | zyron_cdc::ChangeType::UpdatePostimage
+                    ) {
+                        continue;
+                    }
+                    let row = decode_row(&rec.row_data, &cfg.left_types)?;
+                    // A NULL lookup key matches nothing, so it takes the
+                    // outer-miss path directly instead of encoding a null
+                    // key that could collide with a real one
+                    let null_key = cfg
+                        .left_key_ordinals
+                        .iter()
+                        .any(|&o| matches!(row.get(o as usize), Some(StreamValue::Null)));
+                    let hit = if null_key {
+                        None
+                    } else {
+                        let key_values: Vec<StreamValue> = cfg
+                            .left_key_ordinals
+                            .iter()
+                            .map(|&o| row[o as usize].clone())
+                            .collect();
+                        cache.get(&encode_row(&key_values, &pk_types)?)
+                    };
+                    let combined = match (hit, cfg.join_kind) {
+                        (Some(right_row), _) => {
+                            let mut c = Vec::with_capacity(row.len() + right_row.len());
+                            c.extend(row.iter().cloned());
+                            c.extend(right_row.iter().cloned());
+                            c
+                        }
+                        (None, StreamingJoinKind::Left) => {
+                            temporal_left_null_right(&row, right_width)
+                        }
+                        (None, _) => continue,
+                    };
+                    out.push(CdfChange {
+                        commit_version: rec.commit_version,
+                        commit_timestamp: rec.commit_timestamp,
+                        change_type: zyron_cdc::ChangeType::Insert,
+                        row_data: encode_row(&combined, &cfg.output_types)?,
+                        primary_key_data: Vec::new(),
+                    });
+                }
+                Ok(out)
+            }
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Sink dispatch
@@ -334,10 +557,21 @@ fn run_loop(
     entry: StreamingJobEntry,
     spec: StreamingJobSpec,
     source: ZyronTableSource,
+    mut join_runtime: Option<JoinRuntime>,
     sink: RunnerSink,
     catalog: Arc<Catalog>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    // Joined rows carry the join's combined output schema, which is what
+    // the predicate and projections were bound against, so the post-join
+    // decode uses it instead of the left source's own shape
+    let mut spec = spec;
+    if let Some(rt) = &join_runtime {
+        spec.source_types = match rt {
+            JoinRuntime::Interval { cfg, .. } => cfg.output_types.clone(),
+            JoinRuntime::Temporal { cfg, .. } => cfg.output_types.clone(),
+        };
+    }
     // Build a single runtime per thread for async catalog updates.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -379,6 +613,21 @@ fn run_loop(
                 break;
             }
         };
+
+        // A joining job runs its join step even on an empty left batch: the
+        // right side may have new rows or the watermark may release buffered
+        // outer emissions
+        let records = match join_runtime.as_mut() {
+            Some(join) => match join.step(records) {
+                Ok(v) => v,
+                Err(e) => {
+                    mark_failed(&rt, &catalog, entry.id, format!("join error: {e}"));
+                    break;
+                }
+            },
+            None => records,
+        };
+
         if records.is_empty() {
             // The source has nothing more right now, so anything the sink is
             // still coalescing has no later batch to join and goes out now
@@ -485,23 +734,25 @@ fn apply_filter_project(records: &[CdfChange], spec: &StreamingJobSpec) -> Resul
         return Ok(records.to_vec());
     }
 
+    // Compile once per record batch: literals materialize a single time, so
+    // per-row evaluation borrows every leaf and the projected values encode
+    // straight into the output tuple without an intermediate vector
+    let compiled_predicate = spec.predicate.as_ref().map(compile_expr);
+    let compiled_projections: Vec<CompiledExpr> =
+        spec.projections.iter().map(compile_expr).collect();
+
     let mut out = Vec::with_capacity(records.len());
     for rec in records {
         let row = decode_row(&rec.row_data, &spec.source_types)?;
 
-        if let Some(pred) = &spec.predicate {
-            let keep = eval_expr(pred, &row)?;
-            match keep {
+        if let Some(pred) = &compiled_predicate {
+            match eval_compiled(pred, &row)?.as_ref() {
                 StreamValue::Bool(true) => {}
                 _ => continue,
             }
         }
 
-        let mut projected = Vec::with_capacity(spec.projections.len());
-        for p in &spec.projections {
-            projected.push(eval_expr(p, &row)?);
-        }
-        let new_bytes = encode_row(&projected, &spec.target_types)?;
+        let new_bytes = encode_projected_row(&compiled_projections, &row, &spec.target_types)?;
 
         out.push(CdfChange {
             commit_version: rec.commit_version,
@@ -543,6 +794,20 @@ impl StreamJobManager {
         // Build source and sink. Branch on the write mode so UPSERT jobs are
         // driven by ZyronUpsertSink and APPEND jobs stay on ZyronRowSink.
         let source = ZyronTableSource::new(spec.source_table_id, Arc::clone(&cdc_registry))?;
+        // A joining job resolves its right-side feed here, so a missing feed
+        // fails the spawn loudly instead of the runner silently producing
+        // unjoined rows
+        // The aggregating loop does not consume a join, so the combination
+        // is refused loudly instead of silently dropping the join
+        if spec.join.is_some() && spec.aggregate.is_some() {
+            return Err(ZyronError::StreamingError(
+                "a streaming job cannot combine a join with a windowed aggregate".into(),
+            ));
+        }
+        let join_runtime = match &spec.join {
+            Some(join) => Some(JoinRuntime::build(join, &cdc_registry)?),
+            None => None,
+        };
         let ctx_arc = Arc::new(PlMutex::new(security_ctx));
         let sink = match spec.write_mode {
             CatalogStreamingWriteMode::Upsert => {
@@ -599,6 +864,7 @@ impl StreamJobManager {
                             entry_for_thread,
                             spec_for_thread,
                             source,
+                            join_runtime,
                             sink,
                             catalog_for_thread,
                             stop_for_thread,
@@ -976,17 +1242,24 @@ fn apply_external_filter_project(
         return Ok(rows.to_vec());
     }
 
+    // Compile once per call so predicate evaluation borrows its leaves. The
+    // projected output rows are owned, so each projected value pays exactly
+    // one clone when it leaves the borrowed evaluation
+    let compiled_predicate = spec.predicate.as_ref().map(compile_expr);
+    let compiled_projections: Vec<CompiledExpr> =
+        spec.projections.iter().map(compile_expr).collect();
+
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if let Some(pred) = &spec.predicate {
-            match eval_expr(pred, row)? {
+        if let Some(pred) = &compiled_predicate {
+            match eval_compiled(pred, row)?.as_ref() {
                 StreamValue::Bool(true) => {}
                 _ => continue,
             }
         }
-        let mut projected = Vec::with_capacity(spec.projections.len());
-        for p in &spec.projections {
-            projected.push(eval_expr(p, row)?);
+        let mut projected = Vec::with_capacity(compiled_projections.len());
+        for p in &compiled_projections {
+            projected.push(eval_compiled(p, row)?.into_owned());
         }
         out.push(projected);
     }
@@ -1438,7 +1711,19 @@ impl StreamJobManager {
         source: ZyronTableSource,
         sink: RunnerSink,
         catalog: Arc<Catalog>,
+        cdc_registry: Arc<zyron_cdc::CdfRegistry>,
     ) -> Result<()> {
+        // The aggregating loop does not consume a join, so the combination
+        // is refused loudly instead of silently dropping the join
+        if spec.join.is_some() && spec.aggregate.is_some() {
+            return Err(ZyronError::StreamingError(
+                "a streaming job cannot combine a join with a windowed aggregate".into(),
+            ));
+        }
+        let join_runtime = match &spec.join {
+            Some(join) => Some(JoinRuntime::build(join, &cdc_registry)?),
+            None => None,
+        };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop_flag);
         let entry_for_thread = entry.clone();
@@ -1466,6 +1751,7 @@ impl StreamJobManager {
                             entry_for_thread,
                             spec_for_thread,
                             source,
+                            join_runtime,
                             sink,
                             catalog_for_thread,
                             stop_for_thread,

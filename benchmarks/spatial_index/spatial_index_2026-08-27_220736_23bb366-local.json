@@ -1,0 +1,89 @@
+{
+  "id": "2026-08-27_220736_23bb366-local",
+  "date": "2026-08-27 22:07:42Z",
+  "ts": 1787868462,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Performance": {
+      "bulk_load 100K points/sec": {
+        "average": 5500445.455933,
+        "runs": [5123633.27, 5651505.56, 5785329.56, 5440785.21, 5500973.67],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "bulk_load 1M points/sec (parallel STR)": {
+        "average": 4492287.387238,
+        "runs": [3626327.28, 3715103.57, 4343997.70, 5420303.92, 5355704.47],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "delete_by_data/sec": {
+        "average": 791290.549964,
+        "runs": [862217.62, 633460.66, 889948.92, 714081.69, 856743.86],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "dwithin 100K r=500 (us)": {
+        "average": 5.317360,
+        "runs": [5.67, 5.27, 5.20, 5.21, 5.24],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "insert points/sec": {
+        "average": 188966.716173,
+        "runs": [191418.63, 191124.05, 186475.67, 189177.53, 186637.71],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "KNN 100K k=10 (us)": {
+        "average": 3.860578,
+        "runs": [3.89, 3.84, 3.89, 3.87, 3.81],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "range 100K 1% area (us)": {
+        "average": 6.122072,
+        "runs": [6.25, 5.94, 6.29, 6.13, 6.00],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "snapshot roundtrip 100K (ms)": {
+        "average": 17.841500,
+        "runs": [20.51, 15.72, 18.04, 18.09, 16.86],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

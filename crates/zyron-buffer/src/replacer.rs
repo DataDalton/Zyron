@@ -56,6 +56,18 @@ impl ClockReplacer {
     pub fn capacity(&self) -> usize {
         self.num_frames
     }
+
+    /// Whether a frame has been touched since the clock hand last passed it.
+    ///
+    /// The one recency signal the pool maintains, and it is maintained for
+    /// free because the replacement algorithm needs it anyway. Reading it does
+    /// not clear it: a caller ranking pages must not consume the evidence the
+    /// next eviction sweep depends on.
+    #[inline]
+    pub fn is_referenced(&self, frame_id: FrameId) -> bool {
+        let idx = frame_id.0 as usize;
+        idx < self.num_frames && self.reference_bits[idx].load(Ordering::Relaxed)
+    }
 }
 
 impl Replacer for ClockReplacer {

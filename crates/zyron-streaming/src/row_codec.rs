@@ -13,6 +13,8 @@
 // Integer widening to i64 is done at decode time so BinaryOp can operate
 // on a uniform type.
 
+use std::borrow::Cow;
+
 use zyron_common::{Result, TypeId, ZyronError};
 
 use crate::job_runner::{BinaryOpKind, ExprSpec};
@@ -206,28 +208,61 @@ pub fn encode_row(values: &[StreamValue], types: &[TypeId]) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; bitmap_len];
 
     for (i, ty) in types.iter().enumerate() {
-        let v = &values[i];
-        let is_null = matches!(v, StreamValue::Null);
-        if is_null {
-            buf[i / 8] |= 1 << (i % 8);
-        }
-        if let Some(size) = ty.fixed_size() {
-            if is_null {
-                buf.extend(std::iter::repeat_n(0u8, size));
-            } else {
-                encode_fixed(&mut buf, *ty, v)?;
-            }
-        } else {
-            let body = if is_null {
-                Vec::new()
-            } else {
-                encode_varlen(*ty, v)?
-            };
-            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&body);
-        }
+        encode_cell(&mut buf, i, *ty, &values[i])?;
     }
     Ok(buf)
+}
+
+/// Evaluates each projection against the row and encodes the result straight
+/// into a fresh tuple, so no intermediate value vector or varlen staging
+/// buffer is allocated per row
+pub fn encode_projected_row(
+    projections: &[CompiledExpr],
+    row: &[StreamValue],
+    types: &[TypeId],
+) -> Result<Vec<u8>> {
+    if projections.len() != types.len() {
+        return Err(ZyronError::StreamingError(format!(
+            "projection arity mismatch: got {} values, expected {}",
+            projections.len(),
+            types.len()
+        )));
+    }
+    let num_cols = types.len();
+    let bitmap_len = num_cols.div_ceil(8);
+    let mut buf = vec![0u8; bitmap_len];
+
+    for (i, (p, ty)) in projections.iter().zip(types.iter()).enumerate() {
+        let value = eval_compiled(p, row)?;
+        encode_cell(&mut buf, i, *ty, value.as_ref())?;
+    }
+    Ok(buf)
+}
+
+/// Encodes one cell at column position `i`: the null bit, then a fixed-width
+/// value or a length-prefixed varlen payload written in place
+fn encode_cell(buf: &mut Vec<u8>, i: usize, ty: TypeId, v: &StreamValue) -> Result<()> {
+    let is_null = matches!(v, StreamValue::Null);
+    if is_null {
+        buf[i / 8] |= 1 << (i % 8);
+    }
+    if let Some(size) = ty.fixed_size() {
+        if is_null {
+            buf.extend(std::iter::repeat_n(0u8, size));
+        } else {
+            encode_fixed(buf, ty, v)?;
+        }
+    } else {
+        let len_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        if !is_null {
+            let start = buf.len();
+            encode_varlen_into(buf, ty, v)?;
+            let written = ((buf.len() - start) as u32).to_le_bytes();
+            buf[len_pos..len_pos + 4].copy_from_slice(&written);
+        }
+    }
+    Ok(())
 }
 
 fn encode_fixed(buf: &mut Vec<u8>, ty: TypeId, v: &StreamValue) -> Result<()> {
@@ -276,55 +311,94 @@ fn encode_fixed(buf: &mut Vec<u8>, ty: TypeId, v: &StreamValue) -> Result<()> {
     Ok(())
 }
 
-fn encode_varlen(ty: TypeId, v: &StreamValue) -> Result<Vec<u8>> {
+fn encode_varlen_into(buf: &mut Vec<u8>, ty: TypeId, v: &StreamValue) -> Result<()> {
     // Encode by the value's representation. Every variable-length type is
     // string or byte backed, a type enumeration here rejected unlisted
     // byte-backed types (geometry, matrix, range, the sketch family)
     match v {
-        StreamValue::Utf8(s) => Ok(s.as_bytes().to_vec()),
-        StreamValue::Binary(b) => Ok(b.clone()),
-        _ => Err(ZyronError::StreamingError(format!(
-            "cannot encode {v:?} as varlen {ty:?}"
-        ))),
+        StreamValue::Utf8(s) => buf.extend_from_slice(s.as_bytes()),
+        StreamValue::Binary(b) => buf.extend_from_slice(b),
+        _ => {
+            return Err(ZyronError::StreamingError(format!(
+                "cannot encode {v:?} as varlen {ty:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
 // Expression evaluator
 // -----------------------------------------------------------------------------
 
-/// Evaluates an ExprSpec against a decoded source row. Returns the computed
-/// StreamValue. Handles Null propagation: any operand that is Null produces
-/// Null except in boolean AND/OR which follow SQL three-valued logic.
-pub fn eval_expr(expr: &ExprSpec, row: &[StreamValue]) -> Result<StreamValue> {
+/// An ExprSpec with literal operands materialized once, so per-row
+/// evaluation borrows every leaf instead of cloning it
+pub enum CompiledExpr {
+    Literal(StreamValue),
+    ColumnRef(usize),
+    Not(Box<CompiledExpr>),
+    BinaryOp {
+        op: BinaryOpKind,
+        left: Box<CompiledExpr>,
+        right: Box<CompiledExpr>,
+    },
+}
+
+/// Materializes an ExprSpec's literals into evaluable StreamValues. Compile
+/// once per record batch, evaluate per row
+pub fn compile_expr(expr: &ExprSpec) -> CompiledExpr {
     match expr {
-        ExprSpec::LiteralBool(b) => Ok(StreamValue::Bool(*b)),
-        ExprSpec::LiteralI64(v) => Ok(StreamValue::I64(*v)),
-        ExprSpec::LiteralF64(v) => Ok(StreamValue::F64(*v)),
-        ExprSpec::LiteralString(s) => Ok(StreamValue::Utf8(s.clone())),
-        ExprSpec::ColumnRef { ordinal } => row.get(*ordinal as usize).cloned().ok_or_else(|| {
+        ExprSpec::LiteralBool(b) => CompiledExpr::Literal(StreamValue::Bool(*b)),
+        ExprSpec::LiteralI64(v) => CompiledExpr::Literal(StreamValue::I64(*v)),
+        ExprSpec::LiteralF64(v) => CompiledExpr::Literal(StreamValue::F64(*v)),
+        ExprSpec::LiteralString(s) => CompiledExpr::Literal(StreamValue::Utf8(s.clone())),
+        ExprSpec::ColumnRef { ordinal } => CompiledExpr::ColumnRef(*ordinal as usize),
+        ExprSpec::Not(inner) => CompiledExpr::Not(Box::new(compile_expr(inner))),
+        ExprSpec::BinaryOp { op, left, right } => CompiledExpr::BinaryOp {
+            op: *op,
+            left: Box::new(compile_expr(left)),
+            right: Box::new(compile_expr(right)),
+        },
+    }
+}
+
+/// Evaluates a compiled expression against a decoded source row. Literal and
+/// column leaves come back borrowed, only computed results are owned. Handles
+/// Null propagation: any operand that is Null produces Null except in boolean
+/// AND/OR which follow SQL three-valued logic
+pub fn eval_compiled<'a>(
+    expr: &'a CompiledExpr,
+    row: &'a [StreamValue],
+) -> Result<Cow<'a, StreamValue>> {
+    match expr {
+        CompiledExpr::Literal(v) => Ok(Cow::Borrowed(v)),
+        CompiledExpr::ColumnRef(ordinal) => row.get(*ordinal).map(Cow::Borrowed).ok_or_else(|| {
             ZyronError::StreamingError(format!(
                 "column ordinal {} out of range (row has {} cols)",
                 ordinal,
                 row.len()
             ))
         }),
-        ExprSpec::Not(inner) => {
-            let v = eval_expr(inner, row)?;
-            match v {
-                StreamValue::Null => Ok(StreamValue::Null),
-                StreamValue::Bool(b) => Ok(StreamValue::Bool(!b)),
-                _ => Err(ZyronError::StreamingError(
-                    "NOT applied to non-boolean".to_string(),
-                )),
-            }
-        }
-        ExprSpec::BinaryOp { op, left, right } => {
-            let l = eval_expr(left, row)?;
-            let r = eval_expr(right, row)?;
-            eval_binary(*op, &l, &r)
+        CompiledExpr::Not(inner) => match eval_compiled(inner, row)?.as_ref() {
+            StreamValue::Null => Ok(Cow::Owned(StreamValue::Null)),
+            StreamValue::Bool(b) => Ok(Cow::Owned(StreamValue::Bool(!*b))),
+            _ => Err(ZyronError::StreamingError(
+                "NOT applied to non-boolean".to_string(),
+            )),
+        },
+        CompiledExpr::BinaryOp { op, left, right } => {
+            let l = eval_compiled(left, row)?;
+            let r = eval_compiled(right, row)?;
+            eval_binary(*op, l.as_ref(), r.as_ref()).map(Cow::Owned)
         }
     }
+}
+
+/// Evaluates an ExprSpec against a decoded source row. Returns the computed
+/// StreamValue. Compiles on every call, so repeated evaluation should compile
+/// once and go through eval_compiled instead.
+pub fn eval_expr(expr: &ExprSpec, row: &[StreamValue]) -> Result<StreamValue> {
+    Ok(eval_compiled(&compile_expr(expr), row)?.into_owned())
 }
 
 fn eval_binary(op: BinaryOpKind, l: &StreamValue, r: &StreamValue) -> Result<StreamValue> {

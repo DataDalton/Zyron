@@ -109,6 +109,61 @@ pub trait StreamOperator: Send + Sync {
 // WindowAggregateOperator
 // ---------------------------------------------------------------------------
 
+/// One distinct group key living under a hash bucket. `keys` holds the
+/// group's actual key values captured on first sight (None marks a NULL
+/// cell, and NULL keys group together per SQL GROUP BY semantics), which
+/// is what tells two colliding keys apart.
+struct KeyGroup {
+    keys: Vec<Option<crate::column::ScalarValue>>,
+    windows: Vec<(WindowRange, Box<dyn StreamAccumulator>)>,
+}
+
+impl KeyGroup {
+    /// True when this group's captured keys equal the key cells of `row`.
+    /// A group restored from a snapshot has no captured keys yet and never
+    /// matches here; the resolver adopts it instead.
+    fn matches(&self, batch: &StreamBatch, key_columns: &[usize], row: usize) -> bool {
+        if self.keys.len() != key_columns.len() {
+            return false;
+        }
+        for (stored, &kc) in self.keys.iter().zip(key_columns.iter()) {
+            let col = batch.column(kc);
+            match stored {
+                None => {
+                    if !col.is_null(row) {
+                        return false;
+                    }
+                }
+                Some(v) => {
+                    if col.is_null(row) || *v != col.data.get_scalar(row) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Captures the key cells of `row` as this group's identity.
+    fn capture(
+        batch: &StreamBatch,
+        key_columns: &[usize],
+        row: usize,
+    ) -> Vec<Option<crate::column::ScalarValue>> {
+        key_columns
+            .iter()
+            .map(|&kc| {
+                let col = batch.column(kc);
+                if col.is_null(row) {
+                    None
+                } else {
+                    Some(col.data.get_scalar(row))
+                }
+            })
+            .collect()
+    }
+}
+
 /// Window aggregate operator that accumulates values per (group_key, window)
 /// and fires results when the watermark passes window end.
 /// Uses FlatU64Map for O(1) lookup with pre-computed hash keys.
@@ -121,8 +176,11 @@ pub struct WindowAggregateOperator {
     agg_column: usize,
     /// Factory function to create accumulators.
     accumulator_factory: Box<dyn Fn() -> Box<dyn StreamAccumulator> + Send + Sync>,
-    /// Per-group-key accumulator state: key_hash -> [(window, accumulator)].
-    state: FlatU64Map<Vec<(WindowRange, Box<dyn StreamAccumulator>)>>,
+    /// Per-hash accumulator state: key_hash -> distinct key groups. The
+    /// hash only buckets candidates; each group carries its actual key
+    /// values so a 64-bit collision keeps two keys' accumulators separate
+    /// instead of merging them
+    state: FlatU64Map<Vec<KeyGroup>>,
     /// Window assigner (determines which windows an event belongs to).
     window_assigner: Box<dyn crate::window::WindowAssigner>,
     /// Current watermark.
@@ -163,19 +221,22 @@ impl WindowAggregateOperator {
 
         let mut keys_to_clean = Vec::new();
 
-        self.state.iter_mut(|key_hash, windows| {
-            let mut i = 0;
-            while i < windows.len() {
-                if windows[i].0.end_ms <= watermark_ms {
-                    let (window, acc) = windows.swap_remove(i);
-                    output_keys.push(key_hash);
-                    output_windows.push(window);
-                    output_values.push(acc.finalize());
-                } else {
-                    i += 1;
+        self.state.iter_mut(|key_hash, groups| {
+            for group in groups.iter_mut() {
+                let mut i = 0;
+                while i < group.windows.len() {
+                    if group.windows[i].0.end_ms <= watermark_ms {
+                        let (window, acc) = group.windows.swap_remove(i);
+                        output_keys.push(key_hash);
+                        output_windows.push(window);
+                        output_values.push(acc.finalize());
+                    } else {
+                        i += 1;
+                    }
                 }
             }
-            if windows.is_empty() {
+            groups.retain(|g| !g.windows.is_empty());
+            if groups.is_empty() {
                 keys_to_clean.push(key_hash);
             }
         });
@@ -260,25 +321,54 @@ impl StreamOperator for WindowAggregateOperator {
 
             let entry = self.state.get_or_insert_with(key_hash, Vec::new);
 
+            // Resolve the row's key GROUP by value, not by hash alone: the
+            // common case is one group per bucket and the match check is a
+            // handful of typed compares. A snapshot-restored group carries
+            // no key values, the first row arriving for its hash adopts it
+            let group_idx = entry
+                .iter()
+                .position(|g| g.matches(&record.batch, &self.key_columns, row))
+                .or_else(|| {
+                    entry
+                        .iter()
+                        .position(|g| g.keys.len() != self.key_columns.len())
+                });
+            let group = match group_idx {
+                Some(i) => {
+                    let group = &mut entry[i];
+                    if group.keys.len() != self.key_columns.len() {
+                        group.keys = KeyGroup::capture(&record.batch, &self.key_columns, row);
+                    }
+                    group
+                }
+                None => {
+                    entry.push(KeyGroup {
+                        keys: KeyGroup::capture(&record.batch, &self.key_columns, row),
+                        windows: Vec::new(),
+                    });
+                    entry.last_mut().expect("just pushed")
+                }
+            };
+
             for window in &self.window_buf {
                 // Find or create accumulator for this (key, window).
                 // Search from end. Most recently added window is most likely to match.
                 let mut found_idx = None;
-                for j in (0..entry.len()).rev() {
-                    if entry[j].0 == *window {
+                for j in (0..group.windows.len()).rev() {
+                    if group.windows[j].0 == *window {
                         found_idx = Some(j);
                         break;
                     }
                 }
                 match found_idx {
                     Some(j) => {
-                        entry[j].1.update_typed(agg_col, row);
+                        group.windows[j].1.update_typed(agg_col, row);
                     }
                     None => {
                         let acc = (self.accumulator_factory)();
-                        entry.push((*window, acc));
+                        group.windows.push((*window, acc));
                         // Update after insertion to avoid mut binding.
-                        let last = entry.last_mut().expect("just pushed");
+                        let last = group.windows.last_mut().expect("just pushed");
                         last.1.update_typed(agg_col, row);
                     }
                 }
@@ -304,14 +394,16 @@ impl StreamOperator for WindowAggregateOperator {
     fn on_barrier(&mut self, _barrier: CheckpointBarrier) -> Result<StateSnapshot> {
         // Serialize accumulator state for checkpointing.
         let mut data = Vec::new();
-        self.state.iter(|key_hash, windows| {
-            for (window, acc) in windows {
-                let mut key_bytes = Vec::with_capacity(24);
-                key_bytes.extend_from_slice(&key_hash.to_le_bytes());
-                key_bytes.extend_from_slice(&window.start_ms.to_le_bytes());
-                key_bytes.extend_from_slice(&window.end_ms.to_le_bytes());
-                let val_bytes = acc.serialize();
-                data.push((b"window_agg".to_vec(), key_bytes, val_bytes));
+        self.state.iter(|key_hash, groups| {
+            for group in groups {
+                for (window, acc) in &group.windows {
+                    let mut key_bytes = Vec::with_capacity(24);
+                    key_bytes.extend_from_slice(&key_hash.to_le_bytes());
+                    key_bytes.extend_from_slice(&window.start_ms.to_le_bytes());
+                    key_bytes.extend_from_slice(&window.end_ms.to_le_bytes());
+                    let val_bytes = acc.serialize();
+                    data.push((b"window_agg".to_vec(), key_bytes, val_bytes));
+                }
             }
         });
         Ok(StateSnapshot {
@@ -360,8 +452,19 @@ impl StreamOperator for WindowAggregateOperator {
             let mut acc = (self.accumulator_factory)();
             // Restore accumulator state from the serialized checkpoint bytes.
             acc.deserialize(val_bytes);
+            // The snapshot format carries only the key hash, so restored
+            // state lands in one group per hash with no captured key
+            // values. The first row that arrives for the hash matches by
+            // capture below, and true collisions re-separate as their rows
+            // arrive; the snapshot cannot tell colliding keys apart
             let entry = self.state.get_or_insert_with(key_hash, Vec::new);
-            entry.push((window, acc));
+            match entry.first_mut() {
+                Some(group) => group.windows.push((window, acc)),
+                None => entry.push(KeyGroup {
+                    keys: Vec::new(),
+                    windows: vec![(window, acc)],
+                }),
+            }
         }
         Ok(())
     }

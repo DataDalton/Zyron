@@ -46,6 +46,9 @@
 //!
 //! Run: cargo test -p zyron-types --test types_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;

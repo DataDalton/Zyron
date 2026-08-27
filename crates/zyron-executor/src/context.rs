@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zyron_buffer::BufferPool;
 use zyron_catalog::{Catalog, IndexId, TableEntry, TableId, TableIndexSnapshot};
 use zyron_common::{Result, ZyronError};
@@ -27,7 +27,7 @@ pub trait CdcHook: Send + Sync {
         tuples: &[&[u8]],
         version: u64,
         timestamp: i64,
-        txn_id: u32,
+        txn_id: u64,
         is_last_in_txn: bool,
     ) -> zyron_common::Result<()>;
 
@@ -38,7 +38,7 @@ pub trait CdcHook: Send + Sync {
         old_data: &[&[u8]],
         version: u64,
         timestamp: i64,
-        txn_id: u32,
+        txn_id: u64,
         is_last_in_txn: bool,
     ) -> zyron_common::Result<()>;
 
@@ -50,7 +50,7 @@ pub trait CdcHook: Send + Sync {
         new_data: &[&[u8]],
         version: u64,
         timestamp: i64,
-        txn_id: u32,
+        txn_id: u64,
         is_last_in_txn: bool,
     ) -> zyron_common::Result<()>;
 }
@@ -63,7 +63,7 @@ pub trait DmlHook: Send + Sync {
         &self,
         table_id: u32,
         tuples: &[&[u8]],
-        txn_id: u32,
+        txn_id: u64,
     ) -> zyron_common::Result<bool>;
 
     /// Called before rows are deleted. Returns false to cancel the delete.
@@ -71,7 +71,7 @@ pub trait DmlHook: Send + Sync {
         &self,
         table_id: u32,
         old_data: &[&[u8]],
-        txn_id: u32,
+        txn_id: u64,
     ) -> zyron_common::Result<bool>;
 
     /// Called before rows are updated. Returns false to cancel the update.
@@ -80,8 +80,72 @@ pub trait DmlHook: Send + Sync {
         table_id: u32,
         old_data: &[&[u8]],
         new_data: &[&[u8]],
-        txn_id: u32,
+        txn_id: u64,
     ) -> zyron_common::Result<bool>;
+}
+
+/// Byte budget one query's materializing operators share. Sorts, hash
+/// joins, aggregations, window buffers, set operation stores, and the
+/// final result collection all reserve against it, so a query that would
+/// exhaust server memory fails itself with a clear error instead.
+#[derive(Debug)]
+pub struct QueryMemoryBudget {
+    limit: std::sync::atomic::AtomicU64,
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl QueryMemoryBudget {
+    pub fn new(limit_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit: std::sync::atomic::AtomicU64::new(limit_bytes),
+            used: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Reserves bytes against the budget, failing the query loudly once
+    /// the limit would be exceeded. Reservations are never released, the
+    /// budget's lifetime is the query's.
+    pub fn reserve(&self, bytes: u64) -> Result<()> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        let prev = self.used.fetch_add(bytes, Ordering::Relaxed);
+        if prev.saturating_add(bytes) > limit {
+            self.used.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(ZyronError::ExecutionError(format!(
+                "query exceeds its memory budget of {} bytes, raise query.max_memory_bytes or narrow the query",
+                limit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bytes reserved so far.
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// What this query may hold at once.
+    ///
+    /// Read by the materializing operators to decide when to spill, which is
+    /// the same number that used to decide when to fail.
+    pub fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
+    }
+}
+
+/// Gives the node back what this context charged it.
+///
+/// A query that errors, is cancelled, or panics releases the same way one that
+/// finished does. Without this the node would believe it was full of work that
+/// ended hours ago and would refuse everything.
+impl Drop for ExecutionContext {
+    fn drop(&mut self) {
+        let held = self.node_memory_held.swap(0, Ordering::Relaxed);
+        if held > 0 {
+            zyron_pressure::pressure_control::PressureController::global()
+                .memory()
+                .release(held);
+        }
+    }
 }
 
 /// Per-query execution context with access to storage and transaction state.
@@ -91,7 +155,7 @@ pub struct ExecutionContext {
     pub buffer_pool: Arc<BufferPool>,
     pub disk_manager: Arc<DiskManager>,
     pub batch_size: usize,
-    pub txn_id: u32,
+    pub txn_id: u64,
     /// Transaction id lake commits run under, when it differs from
     /// `txn_id`. Set for a `BEGIN ZYRONLAKE TRANSACTION`, whose lake writes
     /// commit through a cross-table intent rather than the database commit
@@ -108,6 +172,16 @@ pub struct ExecutionContext {
     /// disables the cap. Set from the session max_result_rows by wire so a
     /// runaway query is bounded before its full result set lands in memory.
     pub max_result_rows: Option<u64>,
+    /// Byte budget shared by every materializing operator of this query.
+    /// None disables the budget. Set from query.max_memory_bytes by wire so
+    /// one sort, hash join, aggregation, or result set cannot take the
+    /// whole server down instead of failing its own query.
+    pub memory_budget: Option<Arc<QueryMemoryBudget>>,
+    /// Where materializing operators put what does not fit. None means they
+    /// have nowhere to go and fail at the budget the way they used to
+    pub spill: Option<Arc<crate::spill::SpillDirectory>>,
+    /// Bytes charged to the node gauge by this context, released when it drops
+    node_memory_held: AtomicU64,
     /// Set by DML operators when they append a WAL data record. The server
     /// reads it after execution to decide whether the transaction must commit
     /// durably; a transaction that wrote nothing commits without a WAL commit
@@ -238,7 +312,7 @@ impl ExecutionContext {
         wal: Arc<WalWriter>,
         buffer_pool: Arc<BufferPool>,
         disk_manager: Arc<DiskManager>,
-        txn_id: u32,
+        txn_id: u64,
         snapshot: Snapshot,
     ) -> Self {
         Self {
@@ -253,6 +327,9 @@ impl ExecutionContext {
             cancelled: AtomicBool::new(false),
             deadline: None,
             max_result_rows: None,
+            memory_budget: None,
+            spill: None,
+            node_memory_held: AtomicU64::new(0),
             wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: None,
@@ -303,6 +380,11 @@ impl ExecutionContext {
             cancelled: AtomicBool::new(false),
             deadline: self.deadline,
             max_result_rows: self.max_result_rows,
+            memory_budget: self.memory_budget.clone(),
+            spill: self.spill.clone(),
+            // A child context charges and releases its own bytes. Inheriting
+            // the parent's total would release it twice
+            node_memory_held: AtomicU64::new(0),
             wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: self.cdc_hook.clone(),
@@ -379,6 +461,55 @@ impl ExecutionContext {
     /// Operators observe it through check_cancelled at batch boundaries.
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
         self.deadline = Some(deadline);
+    }
+
+    /// Reserves bytes against the node and against this query's budget.
+    ///
+    /// Two counters answering two questions. The node gauge asks whether this
+    /// machine is about to run out, so it is charged even when the session has
+    /// no per-query limit, and it is given back when the query ends. The query
+    /// budget asks whether this one query has asked for more than it may, so
+    /// it never gives anything back.
+    ///
+    /// The node is charged first because it is the one that can be refunded.
+    /// Charging the query budget first and then failing on the node would
+    /// leave the query permanently charged for memory it never received, and
+    /// a later reservation inside its own limit would be refused.
+    #[inline]
+    pub fn reserve_memory(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let gauge = zyron_pressure::pressure_control::PressureController::global().memory();
+        if !gauge.try_reserve(bytes) {
+            return Err(ZyronError::MemoryAllocationFailed { bytes });
+        }
+        if let Some(budget) = &self.memory_budget {
+            if let Err(e) = budget.reserve(bytes) {
+                gauge.release(bytes);
+                return Err(e);
+            }
+        }
+        self.node_memory_held.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// How much a materializing operator may hold before it spills.
+    ///
+    /// The query's own budget, so an operator spills at exactly the point it
+    /// used to fail. Without a budget there is nothing to exceed and nothing
+    /// spills, which is the unbudgeted behaviour that was always there.
+    pub fn spill_threshold_bytes(&self) -> u64 {
+        match &self.memory_budget {
+            Some(budget) => zyron_pressure::pressure_control::PressureController::global()
+                .spill_threshold(budget.limit()),
+            None => 0,
+        }
+    }
+
+    /// Bytes this context is currently holding against the node gauge.
+    pub fn node_memory_held(&self) -> u64 {
+        self.node_memory_held.load(Ordering::Relaxed)
     }
 
     /// Returns true if this query has been cancelled.

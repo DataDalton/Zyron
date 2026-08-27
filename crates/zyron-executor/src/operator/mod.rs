@@ -15,6 +15,7 @@ pub mod fk;
 pub mod foreign_scan;
 pub mod fts_scan;
 pub mod gapfill;
+pub mod grace;
 pub mod graph_scan;
 pub mod join;
 pub mod lake_scan;

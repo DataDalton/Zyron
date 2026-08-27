@@ -152,14 +152,15 @@ impl WindowAssigner for SlidingWindowAssigner {
     #[inline(always)]
     fn assign_windows(&self, event_time_ms: i64) -> Vec<WindowRange> {
         // Walk forward from the earliest window that contains this event.
-        // Earliest start = last_start - (windows_per_event - 1) * slide.
-        // But clamped to >= 0.
         let last_start = event_time_ms - event_time_ms.rem_euclid(self.slide_ms);
 
         // Find the earliest window start that still contains event_time.
         // A window [s, s+size) contains event_time when s + size > event_time,
         // i.e. s > event_time - size.
-        let earliest = (event_time_ms - self.size_ms + 1).max(0);
+        // No clamp at zero: an event before the epoch still belongs to
+        // every sliding window that covers it, rem_euclid keeps the slide
+        // alignment correct for negative times
+        let earliest = event_time_ms - self.size_ms + 1;
         // Align earliest up to a slide boundary.
         let first_start =
             earliest + (self.slide_ms - earliest.rem_euclid(self.slide_ms)) % self.slide_ms;
@@ -184,7 +185,10 @@ impl WindowAssigner for SlidingWindowAssigner {
     fn assign_windows_into(&self, event_time_ms: i64, buf: &mut Vec<WindowRange>) -> usize {
         buf.clear();
         let last_start = event_time_ms - event_time_ms.rem_euclid(self.slide_ms);
-        let earliest = (event_time_ms - self.size_ms + 1).max(0);
+        // No clamp at zero: an event before the epoch still belongs to
+        // every sliding window that covers it, rem_euclid keeps the slide
+        // alignment correct for negative times
+        let earliest = event_time_ms - self.size_ms + 1;
         let first_start =
             earliest + (self.slide_ms - earliest.rem_euclid(self.slide_ms)) % self.slide_ms;
 

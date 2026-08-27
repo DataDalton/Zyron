@@ -100,14 +100,14 @@ impl MvccGc {
     /// - xmax < oldest_active (the deleting transaction committed and is no longer
     ///   visible to any active transaction)
     #[inline]
-    pub fn is_reclaimable(xmax: u32, oldest_active: u64) -> bool {
-        xmax != 0 && (xmax as u64) < oldest_active
+    pub fn is_reclaimable(xmax: u64, oldest_active: u64) -> bool {
+        xmax != 0 && xmax < oldest_active
     }
 
     /// Determines if a tuple is reclaimable when no transactions are active.
     /// All deleted tuples are reclaimable.
     #[inline]
-    pub fn is_reclaimable_no_active(xmax: u32) -> bool {
+    pub fn is_reclaimable_no_active(xmax: u64) -> bool {
         xmax != 0
     }
 
@@ -159,7 +159,7 @@ mod tests {
     fn test_is_reclaimable_no_active() {
         // No active transactions means all deleted tuples are reclaimable
         assert!(MvccGc::is_reclaimable_no_active(1));
-        assert!(MvccGc::is_reclaimable_no_active(u32::MAX));
+        assert!(MvccGc::is_reclaimable_no_active(u64::MAX));
         assert!(!MvccGc::is_reclaimable_no_active(0)); // Not deleted
     }
 

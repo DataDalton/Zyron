@@ -86,6 +86,25 @@ impl CredentialCache {
         let _ = self.metrics.set(metrics);
     }
 
+    /// Drops every entry whose TTL has lapsed, returning how many were
+    /// removed. An expired entry can never be served, so the periodic purge
+    /// only keeps the map bounded when keys stop being requested.
+    pub fn purge_expired(&self) -> u64 {
+        let now = Instant::now();
+        let mut purged = 0u64;
+        self.entries.retain_sync(|_, entry| {
+            let live = entry.expires_at > now;
+            if !live {
+                purged += 1;
+            }
+            live
+        });
+        if purged > 0 {
+            self.invalidations.fetch_add(purged, Ordering::Relaxed);
+        }
+        purged
+    }
+
     /// Returns cached credentials if still fresh, otherwise fetches through the
     /// provider, stores the result with the provider-supplied TTL, and returns
     /// the material. If the cached entry has less remaining life than

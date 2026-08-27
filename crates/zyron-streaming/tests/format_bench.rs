@@ -12,6 +12,9 @@
 //!
 //! Run: cargo test -p zyron-streaming --test format_bench --release -- --nocapture --test-threads=1
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Mutex;
 
 use zyron_common::TypeId;

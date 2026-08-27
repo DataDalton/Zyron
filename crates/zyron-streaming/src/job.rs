@@ -241,9 +241,17 @@ impl StreamJob {
         self.status.store(3, Ordering::Release);
     }
 
-    /// Adds a completed checkpoint.
+    /// Adds a completed checkpoint, dropping history past the configured
+    /// retention. Each checkpoint holds full operator state, recovery only
+    /// ever restores from the newest.
     pub fn add_checkpoint(&self, checkpoint: StreamCheckpoint) {
-        self.checkpoints.lock().push(checkpoint);
+        let mut checkpoints = self.checkpoints.lock();
+        checkpoints.push(checkpoint);
+        let keep = self.config.checkpoint_config.retained_checkpoints.max(1);
+        if checkpoints.len() > keep {
+            let drop_count = checkpoints.len() - keep;
+            checkpoints.drain(..drop_count);
+        }
     }
 
     /// Returns the latest checkpoint ID, if any.

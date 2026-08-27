@@ -71,59 +71,81 @@ pub struct ExecOutput {
 //
 // The planner's binder holds non-Send boxed futures, so the bind and execute
 // path cannot run directly on the outer multi-thread runtime. Instead of
-// constructing a fresh current-thread runtime per HTTP request, a single
-// dedicated OS thread owns a current-thread runtime with a LocalSet and
-// receives closures over an mpsc channel. Each request pays the cost of an
-// enqueue + oneshot wake instead of a thread-pool wake plus runtime build.
+// constructing a fresh current-thread runtime per HTTP request, a small pool
+// of dedicated OS threads each own a current-thread runtime with a LocalSet
+// and receive closures over bounded mpsc channels. Requests round-robin over
+// the threads, and when every queue is full submission fails loudly so a
+// request flood backpressures at the HTTP layer instead of growing an
+// unbounded queue.
 
 type LocalBoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>;
 type PlanExecTask = Box<dyn FnOnce() -> LocalBoxFut + Send + 'static>;
 
+/// Queued tasks each worker thread accepts before submissions spill to the
+/// next worker, and fail once every worker is full.
+const PLAN_EXEC_QUEUE_DEPTH: usize = 256;
+
 struct PlanExecWorker {
-    sender: PlMutex<Option<tokio::sync::mpsc::UnboundedSender<PlanExecTask>>>,
+    senders: Vec<tokio::sync::mpsc::Sender<PlanExecTask>>,
+    next: std::sync::atomic::AtomicUsize,
 }
 
 impl PlanExecWorker {
     fn new() -> Arc<Self> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanExecTask>();
-        let worker = Arc::new(Self {
-            sender: PlMutex::new(Some(tx)),
-        });
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get() / 4)
+            .unwrap_or(1)
+            .clamp(2, 8);
+        let mut senders = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<PlanExecTask>(PLAN_EXEC_QUEUE_DEPTH);
+            senders.push(tx);
+            std::thread::Builder::new()
+                .name(format!("zyron-endpoint-exec-{i}"))
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    let local = tokio::task::LocalSet::new();
+                    rt.block_on(local.run_until(async move {
+                        while let Some(task) = rx.recv().await {
+                            let fut = task();
+                            tokio::task::spawn_local(fut);
+                        }
+                    }));
+                })
+                .expect("spawn endpoint exec worker thread");
+        }
 
-        std::thread::Builder::new()
-            .name("zyron-endpoint-exec".to_string())
-            .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-                let local = tokio::task::LocalSet::new();
-                rt.block_on(local.run_until(async move {
-                    while let Some(task) = rx.recv().await {
-                        let fut = task();
-                        tokio::task::spawn_local(fut);
-                    }
-                }));
-            })
-            .expect("spawn endpoint exec worker thread");
-
-        worker
+        Arc::new(Self {
+            senders,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     fn submit<F>(&self, task: F) -> Result<(), &'static str>
     where
         F: FnOnce() -> LocalBoxFut + Send + 'static,
     {
-        let guard = self.sender.lock();
-        match guard.as_ref() {
-            Some(tx) => tx
-                .send(Box::new(task))
-                .map_err(|_| "endpoint exec worker closed"),
-            None => Err("endpoint exec worker closed"),
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut boxed: PlanExecTask = Box::new(task);
+        for i in 0..self.senders.len() {
+            let tx = &self.senders[(start + i) % self.senders.len()];
+            match tx.try_send(boxed) {
+                Ok(()) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(t)) => {
+                    boxed = t;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err("endpoint exec worker closed");
+                }
+            }
         }
+        Err("endpoint executors saturated, retry later")
     }
 }
 
@@ -270,19 +292,13 @@ impl EndpointExecutor {
                         return;
                     }
                 };
-                let txn_id_u32 = match u32::try_from(txn.txn_id) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let _ = tx.send(PlanExec::ExecError("txn id overflow".to_string()));
-                        return;
-                    }
-                };
+                let txn_id = txn.txn_id;
                 let mut ctx = ExecutionContext::new(
                     catalog,
                     wal,
                     buffer_pool,
                     disk_manager,
-                    txn_id_u32,
+                    txn_id,
                     txn.snapshot.clone(),
                 );
                 if let Some(sm) = security_manager {

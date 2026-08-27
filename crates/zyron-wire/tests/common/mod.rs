@@ -117,6 +117,7 @@ async fn create_test_server_configured(
     };
 
     let state = Arc::new(ServerState {
+        node_capabilities: None,
         catalog,
         wal,
         buffer_pool: pool,
@@ -184,6 +185,7 @@ async fn create_test_server_configured(
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
@@ -194,8 +196,11 @@ async fn create_test_server_configured(
         peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
+        max_query_memory: None,
+        spill_directory: None,
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
+        password_encryption: "balloon-sha-256".into(),
     });
     (state, public_schema, security_manager, tmp)
 }
@@ -273,9 +278,37 @@ pub async fn exec_dml_script(
             server.wal.clone(),
             server.buffer_pool.clone(),
             server.disk_manager.clone(),
-            txn_id as u32,
+            txn_id,
             snapshot,
         );
+        // The server sets this on every DML context, so the harness does
+        // too. Without it a write takes no row lock, and every test using
+        // this helper exercises an engine that cannot detect two writers
+        // of the same row
+        ctx.spill = server.spill_directory.clone();
+        ctx.memory_budget = server
+            .max_query_memory
+            .map(zyron_executor::QueryMemoryBudget::new);
+        ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+        // The server sets both of these on every query context. Without them the
+        // harness runs an engine with no memory budget and nowhere to spill, so
+        // no test through it can reach either path
+        ctx.spill = server.spill_directory.clone();
+        ctx.memory_budget = server
+            .max_query_memory
+            .map(zyron_executor::QueryMemoryBudget::new);
+        ctx.spill = server.spill_directory.clone();
+        ctx.memory_budget = server
+            .max_query_memory
+            .map(zyron_executor::QueryMemoryBudget::new);
+        ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+        // The server sets both of these on every query context. Without them the
+        // harness runs an engine with no memory budget and nowhere to spill, so
+        // no test through it can reach either path
+        ctx.spill = server.spill_directory.clone();
+        ctx.memory_budget = server
+            .max_query_memory
+            .map(zyron_executor::QueryMemoryBudget::new);
         ctx.heap_files = Some(Arc::clone(&server.heap_files));
         ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
         ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -323,9 +356,17 @@ pub async fn exec_dml_result(
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
@@ -377,7 +418,7 @@ pub async fn query_rows(server: &Arc<ServerState>, sql: &str) -> usize {
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = zyron_executor::context::ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -386,6 +427,14 @@ pub async fn query_rows(server: &Arc<ServerState>, sql: &str) -> usize {
         txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
@@ -432,7 +481,7 @@ pub async fn query_error(server: &Arc<ServerState>, sql: &str) -> String {
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = zyron_executor::context::ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -441,6 +490,14 @@ pub async fn query_error(server: &Arc<ServerState>, sql: &str) -> String {
         txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -482,7 +539,7 @@ pub async fn query_result(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = zyron_executor::context::ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -491,6 +548,14 @@ pub async fn query_result(
         txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -535,7 +600,7 @@ pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<Scala
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .expect("begin");
     let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id as u32;
+    let txn_id = txn.txn_id;
     let mut ctx = zyron_executor::context::ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -544,6 +609,14 @@ pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<Scala
         txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
@@ -569,6 +642,70 @@ pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<Scala
         }
     }
     rows
+}
+
+/// Fallible counterpart of query_values, for tests asserting that a query
+/// errors loudly instead of returning an empty or wrong result.
+#[allow(dead_code)]
+pub async fn try_query_values(
+    server: &Arc<ServerState>,
+    sql: &str,
+) -> Result<Vec<Vec<ScalarValue>>, zyron_common::ZyronError> {
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await?;
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id;
+    let mut ctx = zyron_executor::context::ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn_id,
+        snapshot,
+    );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
+    ctx.heap_files = Some(Arc::clone(&server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    let ctx = Arc::new(ctx);
+    let result = zyron_executor::execute(plan, &ctx).await;
+    match result {
+        Ok(batches) => {
+            server.txn_manager.commit(&mut txn).await.expect("commit");
+            let mut rows = Vec::new();
+            for batch in &batches {
+                for r in 0..batch.num_rows {
+                    rows.push(batch.columns.iter().map(|c| c.get_scalar(r)).collect());
+                }
+            }
+            Ok(rows)
+        }
+        Err(e) => {
+            let _ = server.txn_manager.abort(&mut txn);
+            Err(e)
+        }
+    }
 }
 
 /// Runs one statement with the session bound to a branch, the way a
@@ -605,9 +742,17 @@ pub async fn run_on_branch(
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
@@ -826,9 +971,17 @@ pub async fn analyze(
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn_id as u32,
+        txn_id,
         snapshot,
     );
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    // The server sets both of these on every query context. Without them the
+    // harness runs an engine with no memory budget and nowhere to spill, so
+    // no test through it can reach either path
+    ctx.spill = server.spill_directory.clone();
+    ctx.memory_budget = server
+        .max_query_memory
+        .map(zyron_executor::QueryMemoryBudget::new);
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
     // The only thing that makes the executor wrap its operators in metrics

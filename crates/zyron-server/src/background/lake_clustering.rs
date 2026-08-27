@@ -152,6 +152,8 @@ pub struct LakeClusteringStats {
     /// Rewrites the byte budget held back, so a node that is metering its
     /// own maintenance says so rather than looking idle
     pub budget_deferrals: AtomicU64,
+    /// Unreferenced data and index files the vacuum deleted
+    pub vacuumed_files: AtomicU64,
 }
 
 pub struct LakeClusteringWorker {
@@ -232,6 +234,10 @@ struct TableState {
     /// rises, so the next evaluation walks up from here rather than down
     /// from the head over history it already judged
     retain_min: Option<u64>,
+    /// A dropped branch or released clone pin left files no manifest
+    /// references, so the next evaluation vacuums whether or not the log
+    /// collapsed
+    vacuum_requested: bool,
     /// When the table was last evaluated, what fair share orders on
     last_evaluated: Instant,
 }
@@ -246,6 +252,7 @@ impl TableState {
             quiet_rounds: 0,
             last_checkpoint: None,
             retain_min: None,
+            vacuum_requested: false,
             last_evaluated: now,
         }
     }
@@ -460,6 +467,26 @@ async fn clustering_loop(
                     .or_insert_with(|| TableState::new(now))
                     .dirty = true;
             }
+            // A vacuum request has no commit behind it, so the table is
+            // brought back explicitly and the unchanged-version shortcut is
+            // told not to swallow the evaluation
+            if drained.vacuum_overflowed {
+                debug!("lake vacuum requests overflowed, vacuuming every open table");
+                for (_, log) in lake_tables(&catalog, &config.data_dir) {
+                    if let Some(id) = log.paths().table_id() {
+                        let state = states.entry(id).or_insert_with(|| TableState::new(now));
+                        state.vacuum_requested = true;
+                        state.dirty = true;
+                    }
+                }
+            }
+            for (_, table_id) in drained.vacuum {
+                let state = states
+                    .entry(table_id)
+                    .or_insert_with(|| TableState::new(now));
+                state.vacuum_requested = true;
+                state.dirty = true;
+            }
         }
 
         if now.saturating_duration_since(evidence_checked) >= evidence_period {
@@ -609,7 +636,11 @@ async fn evaluate_table(
     stats.evaluations.fetch_add(1, Ordering::Relaxed);
 
     let version = log.latest_version();
-    if version == state.seen_version && state.retain_min.is_some() && !deadline_fired {
+    if version == state.seen_version
+        && state.retain_min.is_some()
+        && !deadline_fired
+        && !state.vacuum_requested
+    {
         // Nothing published since the last evaluation and the retention
         // floor was already established, so every answer this evaluation
         // could reach is the answer the last one reached. This is the whole
@@ -627,7 +658,7 @@ async fn evaluate_table(
     // it is brought back on the backoff rather than left waiting for a
     // commit that may never come
     let mut failed = false;
-    match collapse_log(catalog, log, state) {
+    match collapse_log(catalog, log, state, stats) {
         Ok(gc_in) => verdict.gc_in = gc_in,
         Err(e) => {
             warn!(table = %name, error = %e, "lake log maintenance failed");
@@ -732,6 +763,7 @@ fn collapse_log(
     catalog: &Catalog,
     log: &TransactionLog,
     state: &mut TableState,
+    stats: &LakeClusteringStats,
 ) -> Result<Option<Duration>, zyron_common::ZyronError> {
     let latest = log.latest_version();
     if latest == 0 {
@@ -776,6 +808,25 @@ fn collapse_log(
             retain_min,
             "collected lake log versions"
         );
+    }
+    // Data files become unreferenced exactly when history collapses, or on
+    // the explicit request a dropped branch or released clone pin raises.
+    // The flag survives a vacuum error so the retry the backoff schedules
+    // asks again
+    if removed > 0 || state.vacuum_requested {
+        let reclaimed = zyron_lake::vacuum_data_files(log, retain_min)?;
+        state.vacuum_requested = false;
+        if reclaimed > 0 {
+            stats
+                .vacuumed_files
+                .fetch_add(reclaimed as u64, Ordering::Relaxed);
+            debug!(
+                table_root = %log.paths().root().display(),
+                reclaimed,
+                retain_min,
+                "vacuumed unreferenced lake data files"
+            );
+        }
     }
     Ok(next_gc_deadline(
         log,

@@ -254,12 +254,12 @@ pub async fn collect_live_rows(
         server.txn_manager.retention_clock(),
         now_us,
     );
-    let is_dead = |xmin: u32, x: u32| {
-        status_map.is_aborted(xmin as u64)
+    let is_dead = |xmin: u64, x: u64| {
+        status_map.is_aborted(xmin)
             || (x != 0
-                && status_map.is_committed(x as u64)
-                && (x as u64) < oldest_active
-                && status_map.is_reclaimable_below(x as u64, retention_floor))
+                && status_map.is_committed(x)
+                && x < oldest_active
+                && status_map.is_reclaimable_below(x, retention_floor))
     };
 
     // A lake table has no heap file, and opening the handle would materialize
@@ -313,7 +313,7 @@ pub async fn collect_live_rows(
 }
 
 /// Live rows on one heap page, as (slot, row image).
-fn live_rows_in_page(data: &[u8], is_dead: &impl Fn(u32, u32) -> bool) -> Vec<(u16, Vec<u8>)> {
+fn live_rows_in_page(data: &[u8], is_dead: &impl Fn(u64, u64) -> bool) -> Vec<(u16, Vec<u8>)> {
     let header = HeapPage::heap_header_from_slice(data);
     let mut live = Vec::new();
     for slot in 0..header.slot_count {
@@ -400,7 +400,7 @@ async fn collect_columnar_rows(
         server.wal.clone(),
         server.buffer_pool.clone(),
         server.disk_manager.clone(),
-        txn.txn_id as u32,
+        txn.txn_id,
         txn.snapshot.clone(),
     ));
     let logical: Vec<zyron_planner::logical::LogicalColumn> = table

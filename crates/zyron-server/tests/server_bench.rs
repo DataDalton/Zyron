@@ -107,6 +107,7 @@ async fn create_test_state(
         Arc::clone(&pool),
         write_fn,
         fsync_fn,
+        Arc::new(|_| Ok(())),
         BackgroundWriterConfig::default(),
     ));
 
@@ -183,6 +184,7 @@ async fn create_test_state(
     let cdc_ingest_view_mgr = Arc::clone(&cdc_ingest_mgr_arc);
 
     let state = Arc::new(ServerState {
+        node_capabilities: None,
         catalog: Arc::clone(&catalog),
         wal: Arc::clone(&wal),
         buffer_pool: Arc::clone(&pool),
@@ -282,6 +284,7 @@ async fn create_test_state(
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
@@ -292,8 +295,11 @@ async fn create_test_state(
         peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
+        max_query_memory: None,
+        spill_directory: None,
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
+        password_encryption: "balloon-sha-256".into(),
     });
 
     (state, wal, pool, disk, bg_writer, catalog)
@@ -522,7 +528,6 @@ fn test_02_configuration() {
     // Test default config
     let config = ZyronConfig::default();
     assert_eq!(config.server.port, 5432);
-    assert_eq!(config.server.max_connections, 1000);
     assert_eq!(config.storage.buffer_pool_size, 128 * 1024 * 1024);
     tprintln!("  Default config: PASS");
 
@@ -530,7 +535,6 @@ fn test_02_configuration() {
     let toml_str = r#"
 [server]
 port = 5433
-max_connections = 500
 
 [storage]
 buffer_pool_size = "256MB"
@@ -545,7 +549,6 @@ min_interval_secs = 3
 "#;
     let config: ZyronConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.server.port, 5433);
-    assert_eq!(config.server.max_connections, 500);
     assert_eq!(config.storage.buffer_pool_size, 256 * 1024 * 1024);
     assert_eq!(config.wal.segment_size, 32 * 1024 * 1024);
     assert_eq!(config.checkpoint.wal_bytes_threshold, 128 * 1024 * 1024);
@@ -603,7 +606,7 @@ fn test_03_concurrent_connections() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Concurrent Connections Test ===");
 
-    let session_mgr = Arc::new(SessionManager::new(100, 300));
+    let session_mgr = Arc::new(SessionManager::new(300));
 
     // Register 100 connections
     let start = Instant::now();
@@ -616,11 +619,24 @@ fn test_03_concurrent_connections() {
     assert_eq!(session_mgr.active_count(), 100);
     tprintln!("  Registered 100 sessions in {:.2?}", reg_elapsed);
 
-    // 101st should be rejected
-    let result = session_mgr.register(100, "overflow".into(), "testdb".into());
-    assert!(result.is_err(), "101st connection should be rejected");
-    assert!(result.unwrap_err().contains("too many connections"));
-    tprintln!("  101st connection rejected: PASS");
+    // Registering is no longer where connections are limited. The gate is at
+    // accept, against a ceiling derived from the memory the node measured, so
+    // the refusal is asserted where it actually happens
+    let over = session_mgr.register(100, "overflow".into(), "testdb".into());
+    assert!(over.is_ok(), "the session map does not cap registrations");
+
+    let gauge = zyron_pressure::pressure_control::ConnectionGauge::from_memory(64 * 1024 * 100);
+    assert_eq!(gauge.ceiling(), 25, "the ceiling follows the memory given");
+    for _ in 0..gauge.ceiling() {
+        assert!(gauge.try_accept());
+    }
+    assert!(!gauge.try_accept(), "past the ceiling must be refused");
+    assert_eq!(gauge.refused_total(), 1);
+    gauge.release();
+    assert!(gauge.try_accept(), "a closed connection frees its slot");
+    tprintln!("  Connection ceiling enforced at {}: PASS", gauge.ceiling());
+
+    session_mgr.unregister(100);
 
     // Close one and open new
     session_mgr.unregister(50);
@@ -638,8 +654,10 @@ fn test_03_concurrent_connections() {
     session_mgr.unregister(101);
     assert_eq!(session_mgr.active_count(), 0);
 
-    // Capacity scaling test: register up to 100K to test max_connections capacity
-    let large_mgr = Arc::new(SessionManager::new(100_000, 0));
+    // Capacity scaling: the session map has to hold a hundred thousand
+    // registrations, which is the shape a connection ceiling on a large
+    // machine asks of it
+    let large_mgr = Arc::new(SessionManager::new(0));
     let scale_start = Instant::now();
     for i in 0..100_000i32 {
         large_mgr
@@ -678,7 +696,7 @@ fn test_04_session_timeout() {
     tprintln!("\n=== Session Timeout Test ===");
 
     // Configure idle timeout of 1 second (accelerated for testing)
-    let mgr = SessionManager::new(100, 1);
+    let mgr = SessionManager::new(1);
 
     mgr.register(1, "idle_user".into(), "testdb".into())
         .unwrap();
@@ -829,7 +847,7 @@ fn test_06_checkpoint() {
             // Write WAL records to generate checkpoint workload
             let record_count = 10_000;
             for i in 0..record_count {
-                let txn_id = (i + 1) as u32;
+                let txn_id = (i + 1) as u64;
                 let _ = wal.log_begin(txn_id);
                 let data = vec![0u8; 100];
                 let lsn = wal
@@ -913,7 +931,7 @@ fn test_07_graceful_shutdown() {
             let (_state, wal, pool, _disk, bg_writer, _catalog) = create_test_state(&tmp).await;
 
             // Write some data so there is something to checkpoint
-            for i in 0..1000u32 {
+            for i in 0..1000u64 {
                 let _ = wal.log_begin(i + 1);
                 let data = vec![0u8; 50];
                 let lsn = wal
@@ -988,7 +1006,7 @@ fn test_08_crash_recovery() {
 
             // Write ~1MB of WAL
             let record_data = vec![0u8; 200];
-            for i in 0..5000u32 {
+            for i in 0..5000u64 {
                 let _ = wal.log_begin(i + 1);
                 let lsn = wal
                     .log_insert(i + 1, zyron_wal::record::Lsn(0), &record_data)
@@ -1117,7 +1135,7 @@ fn test_09_adaptive_checkpoint() {
 
     // Write ~1MB of WAL
     let record_data = vec![0u8; 200];
-    for i in 0..5000u32 {
+    for i in 0..5000u64 {
         let _ = wal.log_begin(i + 1);
         let lsn = wal
             .log_insert(i + 1, zyron_wal::record::Lsn(0), &record_data)
@@ -1157,7 +1175,7 @@ fn test_10_metrics() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Metrics Test ===");
 
-    let session_mgr = Arc::new(SessionManager::new(1000, 0));
+    let session_mgr = Arc::new(SessionManager::new(0));
     let registry = Arc::new(MetricsRegistry::new(
         session_mgr.clone(),
         Arc::new(zyron_common::LabeledMetrics::new()),
@@ -1212,7 +1230,16 @@ fn test_10_metrics() {
                 output.contains("zyron_active_connections 2"),
                 "active gauge"
             );
-            assert!(output.contains("zyron_max_connections 1000"), "max gauge");
+            // The exported ceiling is the memory-derived one, so it is
+            // checked against the gauge that enforces it rather than a
+            // number a config once set
+            let ceiling = zyron_pressure::pressure_control::PressureController::global()
+                .connections()
+                .ceiling();
+            assert!(
+                output.contains(&format!("zyron_max_connections {ceiling}")),
+                "max gauge disagrees with the enforced ceiling"
+            );
             assert!(output.contains("zyron_query_duration_seconds"), "histogram");
             assert!(output.contains("# TYPE"), "Prometheus TYPE annotation");
             assert!(output.contains("# HELP"), "Prometheus HELP annotation");
@@ -1252,12 +1279,12 @@ fn test_11_health_checks() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Health Check Test ===");
 
-    let session_mgr = Arc::new(SessionManager::new(100, 0));
+    let session_mgr = Arc::new(SessionManager::new(0));
     let metrics = Arc::new(MetricsRegistry::new(
         session_mgr,
         Arc::new(zyron_common::LabeledMetrics::new()),
     ));
-    let health = Arc::new(HealthState::new(metrics));
+    let health = Arc::new(HealthState::new(metrics, "/metrics"));
 
     // Before startup: startup endpoint returns 503
     assert!(!health.is_startup_complete());
@@ -1576,7 +1603,7 @@ fn test_14_memory_baseline() {
     tprintln!("\n=== Memory Baseline Test ===");
 
     // Measure session manager memory
-    let mgr = SessionManager::new(1000, 0);
+    let mgr = SessionManager::new(0);
     let size_of_mgr = std::mem::size_of::<SessionManager>();
     tprintln!("  SessionManager struct: {} bytes", size_of_mgr);
 

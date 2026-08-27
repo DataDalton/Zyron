@@ -552,10 +552,11 @@ impl PgClient {
                         match self.recv_message().await? {
                             BackendMessage::ReadyForQuery(s) => {
                                 self.ready_state = s.into();
-                                return Err(ProtocolError::Malformed(format!(
-                                    "server error: {}",
-                                    e.message
-                                )));
+                                return Err(ProtocolError::Server {
+                                    code: e.code.clone(),
+                                    message: e.message.clone(),
+                                    hint: e.hint.clone(),
+                                });
                             }
                             _ => continue,
                         }
@@ -598,10 +599,11 @@ impl PgClient {
                 BackendMessage::ErrorResponse(e) => loop {
                     if let BackendMessage::ReadyForQuery(s) = self.recv_message().await? {
                         self.ready_state = s.into();
-                        return Err(ProtocolError::Malformed(format!(
-                            "server error: {}",
-                            e.message
-                        )));
+                        return Err(ProtocolError::Server {
+                            code: e.code.clone(),
+                            message: e.message.clone(),
+                            hint: e.hint.clone(),
+                        });
                     }
                 },
                 BackendMessage::ReadyForQuery(s) => {

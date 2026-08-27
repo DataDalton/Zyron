@@ -139,6 +139,22 @@ impl DurabilityNotifier {
                 }
             }
         }
+        // How many commits one device write satisfied. One is a commit that
+        // paid for a round trip by itself, which is what fsync-bound means:
+        // the writers are queued on the device rather than on each other, and
+        // adding compute would not move any of them.
+        //
+        // Reported here rather than at the waiter, because this thread is the
+        // only place that knows how many were satisfied together.
+        if !to_wake.is_empty() {
+            let batched = to_wake.len() > 1;
+            let contention =
+                zyron_pressure::pressure_control::PressureController::global().contention();
+            for _ in 0..to_wake.len() {
+                contention.record_group_commit(batched);
+            }
+        }
+
         // Unpark outside the lock so a woken committer re-registering does not
         // contend with this drain.
         for t in to_wake {
@@ -181,6 +197,11 @@ impl DurabilityNotifier {
             std::hint::spin_loop();
         }
 
+        // Past the pre-spin, so this writer is genuinely queued on the device.
+        // Counted from here rather than from entry, because a commit the
+        // pre-spin satisfies never waited on anything
+        let _waiting = WriteWaitGuard::enter();
+
         // Register under the lock. The notifier reads flushed_lsn under this same
         // lock when it drains, so the recheck here closes the lost-wakeup window.
         let seq = {
@@ -212,6 +233,30 @@ impl DurabilityNotifier {
         // entry, if still present, is skipped on pop because its seq is gone.
         self.inner.lock().threads.remove(&seq);
         result
+    }
+}
+
+/// Counts one writer as queued on the device for as long as it is.
+///
+/// A guard rather than a pair of calls, because `wait` has several exits and
+/// one that forgot to decrement would leave the node permanently classified as
+/// fsync bound, which masks every rung that adds compute.
+struct WriteWaitGuard;
+
+impl WriteWaitGuard {
+    fn enter() -> Self {
+        zyron_pressure::pressure_control::PressureController::global()
+            .contention()
+            .enter_write_wait();
+        Self
+    }
+}
+
+impl Drop for WriteWaitGuard {
+    fn drop(&mut self) {
+        zyron_pressure::pressure_control::PressureController::global()
+            .contention()
+            .leave_write_wait();
     }
 }
 

@@ -4,18 +4,19 @@ use crate::txn::Snapshot;
 use zyron_common::page::PageId;
 use zyron_common::zerocopy::{AsBytes, FromBytes};
 
-/// Packed 12-byte tuple header for single-memcpy serialization.
-/// All fields stored in little-endian format.
+/// Packed 20-byte tuple header for single-memcpy serialization.
+/// All fields stored in little-endian format. Transaction ids are full
+/// 64-bit values, the allocator never wraps them
 #[repr(C, packed)]
 struct PackedTupleHeader {
     flags: u16,
     data_len: u16,
-    xmin: u32,
-    xmax: u32,
+    xmin: u64,
+    xmax: u64,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PackedTupleHeader>() == 2 + 2 + 4 + 4);
+    assert!(std::mem::size_of::<PackedTupleHeader>() == 2 + 2 + 8 + 8);
     assert!(std::mem::align_of::<PackedTupleHeader>() == 1);
 };
 
@@ -109,17 +110,17 @@ pub struct TupleHeader {
     /// Length of tuple data in bytes.
     pub data_len: u16,
     /// Transaction ID that created this tuple.
-    pub xmin: u32,
+    pub xmin: u64,
     /// Transaction ID that deleted or updated this tuple (0 if still live).
-    pub xmax: u32,
+    pub xmax: u64,
 }
 
 impl TupleHeader {
     /// Size of the tuple header in bytes.
-    pub const SIZE: usize = 12;
+    pub const SIZE: usize = 20;
 
     /// Creates a new tuple header.
-    pub fn new(data_len: u16, xmin: u32) -> Self {
+    pub fn new(data_len: u16, xmin: u64) -> Self {
         Self {
             flags: TupleFlags::empty(),
             data_len,
@@ -129,7 +130,7 @@ impl TupleHeader {
     }
 
     /// Creates a tuple header with both xmin and xmax.
-    pub fn with_xmax(data_len: u16, xmin: u32, xmax: u32) -> Self {
+    pub fn with_xmax(data_len: u16, xmin: u64, xmax: u64) -> Self {
         Self {
             flags: TupleFlags::empty(),
             data_len,
@@ -142,17 +143,16 @@ impl TupleHeader {
     /// A tuple is visible if:
     /// - xmin is committed and less than or equal to the snapshot
     /// - xmax is either 0 (not deleted) or greater than the snapshot
-    pub fn is_visible(&self, snapshot_xid: u32) -> bool {
+    pub fn is_visible(&self, snapshot_xid: u64) -> bool {
         self.xmin <= snapshot_xid && (self.xmax == 0 || self.xmax > snapshot_xid)
     }
 
     /// Returns true if this tuple is visible to the given MVCC snapshot.
     ///
     /// Uses full MVCC visibility rules with active transaction tracking.
-    /// Widens u32 xmin/xmax to u64 for the Snapshot check.
     #[inline]
     pub fn is_visible_to(&self, snapshot: &Snapshot) -> bool {
-        snapshot.is_visible(self.xmin as u64, self.xmax as u64)
+        snapshot.is_visible(self.xmin, self.xmax)
     }
 
     /// Serializes the header to bytes via single memcpy.
@@ -174,23 +174,23 @@ impl TupleHeader {
         Self {
             flags: TupleFlags(u16::from_le(packed.flags)),
             data_len: u16::from_le(packed.data_len),
-            xmin: u32::from_le(packed.xmin),
-            xmax: u32::from_le(packed.xmax),
+            xmin: u64::from_le(packed.xmin),
+            xmax: u64::from_le(packed.xmax),
         }
     }
 
     /// Deserializes the header from bytes without bounds checks.
     ///
     /// # Safety
-    /// Caller must ensure buf has at least SIZE (12) bytes.
+    /// Caller must ensure buf has at least SIZE (20) bytes.
     #[inline(always)]
     pub unsafe fn from_bytes_unchecked(buf: &[u8]) -> Self {
         let packed = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const PackedTupleHeader) };
         Self {
             flags: TupleFlags(u16::from_le(packed.flags)),
             data_len: u16::from_le(packed.data_len),
-            xmin: u32::from_le(packed.xmin),
-            xmax: u32::from_le(packed.xmax),
+            xmin: u64::from_le(packed.xmin),
+            xmax: u64::from_le(packed.xmax),
         }
     }
 }
@@ -277,7 +277,7 @@ impl Tuple {
     /// Creates a new tuple from raw data.
     ///
     /// Panics if data exceeds 65535 bytes (u16::MAX), the maximum tuple data length.
-    pub fn new(data: Vec<u8>, xmin: u32) -> Self {
+    pub fn new(data: Vec<u8>, xmin: u64) -> Self {
         assert!(
             data.len() <= u16::MAX as usize,
             "tuple data length {} exceeds maximum {} bytes",
@@ -399,19 +399,19 @@ impl<'a> TupleView<'a> {
 // Versioned tuple header (28 bytes): base header + version tracking
 // ---------------------------------------------------------------------------
 
-/// Packed 28-byte versioned tuple header for single-memcpy serialization.
+/// Packed 36-byte versioned tuple header for single-memcpy serialization.
 #[repr(C, packed)]
 struct PackedVersionedTupleHeader {
     flags: u16,
     data_len: u16,
-    xmin: u32,
-    xmax: u32,
+    xmin: u64,
+    xmax: u64,
     version_id: u64,
     deleted_at_version: u64,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PackedVersionedTupleHeader>() == 28);
+    assert!(std::mem::size_of::<PackedVersionedTupleHeader>() == 36);
     assert!(std::mem::align_of::<PackedVersionedTupleHeader>() == 1);
 };
 
@@ -419,12 +419,12 @@ unsafe impl AsBytes for PackedVersionedTupleHeader {}
 unsafe impl FromBytes for PackedVersionedTupleHeader {}
 
 /// Size of the versioned tuple header in bytes.
-pub const VERSIONED_TUPLE_HEADER_SIZE: usize = 28;
+pub const VERSIONED_TUPLE_HEADER_SIZE: usize = 36;
 
 /// Extended tuple header with version tracking.
 ///
-/// Layout (28 bytes):
-/// - base: 12 bytes (flags, data_len, xmin, xmax)
+/// Layout (36 bytes):
+/// - base: 20 bytes (flags, data_len, xmin, xmax)
 /// - version_id: 8 bytes (version that created this tuple)
 /// - deleted_at_version: 8 bytes (version that deleted this tuple, 0 if live)
 #[derive(Debug, Clone, Copy, Default)]
@@ -442,7 +442,7 @@ impl VersionedTupleHeader {
     pub const SIZE: usize = VERSIONED_TUPLE_HEADER_SIZE;
 
     /// Creates a new versioned tuple header.
-    pub fn new(data_len: u16, xmin: u32, version_id: u64) -> Self {
+    pub fn new(data_len: u16, xmin: u64, version_id: u64) -> Self {
         let mut base = TupleHeader::new(data_len, xmin);
         base.flags.set_has_version(true);
         Self {
@@ -455,8 +455,8 @@ impl VersionedTupleHeader {
     /// Creates a versioned tuple header with all fields.
     pub fn with_deletion(
         data_len: u16,
-        xmin: u32,
-        xmax: u32,
+        xmin: u64,
+        xmax: u64,
         version_id: u64,
         deleted_at_version: u64,
     ) -> Self {
@@ -498,8 +498,8 @@ impl VersionedTupleHeader {
             base: TupleHeader {
                 flags: TupleFlags(u16::from_le(packed.flags)),
                 data_len: u16::from_le(packed.data_len),
-                xmin: u32::from_le(packed.xmin),
-                xmax: u32::from_le(packed.xmax),
+                xmin: u64::from_le(packed.xmin),
+                xmax: u64::from_le(packed.xmax),
             },
             version_id: u64::from_le(packed.version_id),
             deleted_at_version: u64::from_le(packed.deleted_at_version),
@@ -509,7 +509,7 @@ impl VersionedTupleHeader {
     /// Deserializes the header from bytes without bounds checks.
     ///
     /// # Safety
-    /// Caller must ensure buf has at least SIZE (28) bytes.
+    /// Caller must ensure buf has at least SIZE (36) bytes.
     #[inline(always)]
     pub unsafe fn from_bytes_unchecked(buf: &[u8]) -> Self {
         let packed =
@@ -518,8 +518,8 @@ impl VersionedTupleHeader {
             base: TupleHeader {
                 flags: TupleFlags(u16::from_le(packed.flags)),
                 data_len: u16::from_le(packed.data_len),
-                xmin: u32::from_le(packed.xmin),
-                xmax: u32::from_le(packed.xmax),
+                xmin: u64::from_le(packed.xmin),
+                xmax: u64::from_le(packed.xmax),
             },
             version_id: u64::from_le(packed.version_id),
             deleted_at_version: u64::from_le(packed.deleted_at_version),
@@ -843,8 +843,8 @@ mod tests {
 
     #[test]
     fn test_versioned_header_size_constant() {
-        assert_eq!(VERSIONED_TUPLE_HEADER_SIZE, 28);
-        assert_eq!(VersionedTupleHeader::SIZE, 28);
+        assert_eq!(VERSIONED_TUPLE_HEADER_SIZE, 36);
+        assert_eq!(VersionedTupleHeader::SIZE, 36);
         assert_eq!(
             VersionedTupleHeader::SIZE,
             TupleHeader::SIZE + std::mem::size_of::<u64>() * 2

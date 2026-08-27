@@ -11,6 +11,9 @@
 //!
 //! Suite: "temporal". 5-run averaged, JSON+TXT under benchmarks/temporal/.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use zyron_bench_harness::*;
 use zyron_common::types::TypeId;
 use zyron_storage::columnar::ColumnSegment;

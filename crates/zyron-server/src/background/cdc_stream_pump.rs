@@ -89,6 +89,9 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
                     slots.as_ref(),
                     sink.as_ref(),
                     |rec| Ok(decode_change(rec, &table_name, &columns)),
+                    // Lake change records derive from committed transaction
+                    // log versions, an undecided change never appears there
+                    &|_| zyron_cdc::TxnDecision::Committed,
                 )
             })
             .await
@@ -96,13 +99,29 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
             let Some(feed) = registry.get_feed(stream.table_id) else {
                 continue;
             };
+            // Heap change records land in the feed at DML execution time,
+            // inside the transaction. The commit-status map is the authority
+            // on which of those transactions actually committed, so rolled
+            // back changes never reach a sink and an undecided transaction
+            // holds delivery until it resolves
+            let txn_manager = Arc::clone(&server.txn_manager);
             tokio::task::spawn_blocking(move || {
+                let status_map = txn_manager.status_map();
                 zyron_cdc::drive_stream_once(
                     &stream,
                     feed.as_ref(),
                     slots.as_ref(),
                     sink.as_ref(),
                     |rec| Ok(decode_change(rec, &table_name, &columns)),
+                    &|txn_id| {
+                        if status_map.is_committed(txn_id) {
+                            zyron_cdc::TxnDecision::Committed
+                        } else if status_map.is_aborted(txn_id) {
+                            zyron_cdc::TxnDecision::Aborted
+                        } else {
+                            zyron_cdc::TxnDecision::InFlight
+                        }
+                    },
                 )
             })
             .await

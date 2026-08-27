@@ -29,5 +29,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 apache-avro = "0.19"
 
 [dev-dependencies]
+mimalloc.workspace = true
 tempfile = "3"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

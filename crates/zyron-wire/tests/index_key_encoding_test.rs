@@ -274,3 +274,60 @@ async fn test_interval_index_refused() {
         "CREATE INDEX on an INTERVAL column must be refused"
     );
 }
+
+/// Exclusive string range bounds keep every row the predicate admits.
+/// Byte arithmetic on a variable-length key is wrong in both directions:
+/// incrementing 'abc' to 'abd' as a start skips 'abcd', and decrementing
+/// 'abc' to 'abb' as an end skips 'abbz'. The bound stays at the value and
+/// the post-filter excludes the boundary value's own rows.
+#[tokio::test]
+async fn test_string_exclusive_range_bounds_keep_all_rows() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = common::new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE t (name VARCHAR(32) NOT NULL, v BIGINT)",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO t VALUES ('abb', 1), ('abbz', 2), ('abc', 3), ('abcd', 4), ('abd', 5)",
+    )
+    .await;
+    exec_ddl(&server, &mut session, "CREATE INDEX ix ON t (name)")
+        .await
+        .expect("index");
+
+    let gt = "SELECT v FROM t WHERE name > 'abc' ORDER BY v";
+    let plan = plan_of(&server, gt).await;
+    assert!(
+        uses_index_scan(&plan),
+        "range predicate should use the index"
+    );
+    assert_eq!(
+        as_i64(&query_values(&server, gt).await),
+        vec![4, 5],
+        "name > 'abc' keeps 'abcd'"
+    );
+
+    let lt = "SELECT v FROM t WHERE name < 'abc' ORDER BY v";
+    let plan = plan_of(&server, lt).await;
+    assert!(
+        uses_index_scan(&plan),
+        "range predicate should use the index"
+    );
+    assert_eq!(
+        as_i64(&query_values(&server, lt).await),
+        vec![1, 2],
+        "name < 'abc' keeps 'abbz'"
+    );
+
+    let between = "SELECT v FROM t WHERE name > 'abb' AND name < 'abd' ORDER BY v";
+    assert_eq!(
+        as_i64(&query_values(&server, between).await),
+        vec![2, 3, 4],
+        "the combined range keeps every value strictly inside it"
+    );
+}

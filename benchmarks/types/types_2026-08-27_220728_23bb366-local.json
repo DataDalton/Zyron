@@ -1,0 +1,161 @@
+{
+  "id": "2026-08-27_220728_23bb366-local",
+  "date": "2026-08-27 22:07:33Z",
+  "ts": 1787868453,
+  "commit": "23bb366-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Performance": {
+      "NPV 360 cashflows (us)": {
+        "average": 0.000040,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "IRR convergence (us)": {
+        "average": 0.020700,
+        "runs": [0.02, 0.02, 0.02, 0.02, 0.02],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "LTTB 10K -> 100 (us)": {
+        "average": 11.400000,
+        "runs": [13.00, 11.00, 11.00, 11.00, 11.00],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "MATRIX_MULTIPLY 4x4 (ns)": {
+        "average": 8.644200,
+        "runs": [8.91, 8.45, 8.56, 8.77, 8.53],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "SVD 100x100 (ms)": {
+        "average": 0.872900,
+        "runs": [0.91, 0.85, 0.85, 0.86, 0.89],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "TIME_BUCKET throughput (rows/sec)": {
+        "average": 469148463.141146,
+        "runs": [468794681.99, 468537693.86, 469362371.22, 471209122.61, 467838446.03],
+        "target": 150000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "LOCF throughput (rows/sec)": {
+        "average": 492537152.465025,
+        "runs": [476417341.59, 498290862.34, 501014554.47, 501127536.96, 485835466.96],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "ST_Distance (ns)": {
+        "average": 12.952360,
+        "runs": [12.99, 12.91, 12.98, 12.90, 12.99],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Levenshtein 10-char (ns)": {
+        "average": 111.387860,
+        "runs": [111.85, 112.72, 111.35, 110.25, 110.77],
+        "target": 300.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Jaro-Winkler 10-char (ns)": {
+        "average": 32.081520,
+        "runs": [32.08, 32.30, 32.01, 32.04, 31.98],
+        "target": 150.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Soundex (ns)": {
+        "average": 14.096040,
+        "runs": [14.11, 14.03, 14.09, 14.17, 14.08],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "UUID v7 throughput (IDs/sec)": {
+        "average": 508783379.576149,
+        "runs": [506080557.90, 512728484.63, 505681329.74, 505366997.51, 514059528.09],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "SLUG 100-char (ns)": {
+        "average": 62.368800,
+        "runs": [62.43, 62.56, 62.31, 62.30, 62.24],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "format_number (ns)": {
+        "average": 57.855980,
+        "runs": [60.44, 57.01, 57.36, 57.35, 57.12],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "DATA_PROFILE 1M rows (s)": {
+        "average": 0.185942,
+        "runs": [0.22, 0.19, 0.18, 0.17, 0.18],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "KNN top-10 of 100K (ms)": {
+        "average": 2.975620,
+        "runs": [3.10, 2.93, 2.89, 2.96, 2.99],
+        "target": 2.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

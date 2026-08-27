@@ -37,6 +37,10 @@ pub struct Session {
     /// query's execution context so currval('s') returns the value the
     /// session's last nextval('s') produced.
     pub sequence_state: std::sync::Arc<zyron_executor::sequence::SessionSeqState>,
+    /// Per-session statement deadline set by SET statement_timeout. None
+    /// means the server default applies, Some(None) is an explicit SET to
+    /// zero disabling the deadline, Some(Some(d)) is a session override.
+    pub statement_timeout_override: Option<Option<std::time::Duration>>,
 }
 
 impl Session {
@@ -86,6 +90,7 @@ impl Session {
             rate_limiters: std::sync::Arc::new(zyron_types::scheduling::RateLimiterRegistry::new()),
             quotas: std::sync::Arc::new(zyron_types::scheduling::QuotaRegistry::new()),
             sequence_state: std::sync::Arc::new(zyron_executor::sequence::SessionSeqState::new()),
+            statement_timeout_override: None,
         }
     }
 
@@ -97,11 +102,10 @@ impl Session {
     /// unsecured one of the same name nor with the same login under a
     /// different role.
     ///
-    /// Row-security policies are loaded at startup and have no live
-    /// CREATE/ALTER/DROP path today, so the policy set is fixed for the
-    /// process lifetime and need not be in the key. If runtime policy DDL is
-    /// added, it must either bump catalog schema_version or fold a policy
-    /// epoch into the cache key, otherwise stale plans would survive the change.
+    /// Runtime policy DDL (CREATE ABAC POLICY, SET MASKING, row ownership)
+    /// bumps the security manager's policy epoch, which the cache key
+    /// carries in rls_policy_hash, so plans bound before a policy change
+    /// never survive it. This hash only needs to distinguish identities.
     pub fn identity_hash(&self) -> u64 {
         let mut h = zyron_common::hash64(self.user.as_bytes());
         // Row-security predicates are baked into the cached plan per effective

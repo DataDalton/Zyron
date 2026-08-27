@@ -539,6 +539,45 @@ impl BruteForceManager {
         }
     }
 
+    /// Drops attempt trackers idle longer than the given window, and the
+    /// per-IP lockout sets for IPs whose tracker aged out with them. The
+    /// maps are keyed by attacker-supplied names and addresses, so without
+    /// this sweep a scan of random usernames grows them without bound.
+    pub fn prune_idle(&self, now_ms: u64, idle_ms: u64) -> u64 {
+        let cutoff = now_ms.saturating_sub(idle_ms);
+        let mut pruned = 0u64;
+        self.user_attempts.retain_sync(|_, tracker| {
+            let live = tracker.last_attempt_ms() >= cutoff;
+            if !live {
+                pruned += 1;
+            }
+            live
+        });
+        self.ip_attempts.retain_sync(|_, tracker| {
+            let live = tracker.last_attempt_ms() >= cutoff;
+            if !live {
+                pruned += 1;
+            }
+            live
+        });
+        // A lockout set matters only while its IP is still being tracked,
+        // once the tracker aged out the auto-block decision it feeds is
+        // stale anyway
+        let mut live_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.ip_attempts.iter_sync(|ip, _| {
+            live_ips.insert(ip.clone());
+            true
+        });
+        self.locked_accounts_per_ip.retain_sync(|ip, _| {
+            let live = live_ips.contains(ip);
+            if !live {
+                pruned += 1;
+            }
+            live
+        });
+        pruned
+    }
+
     /// Called after the caller has locked a user account due to a LockAction.
     /// Tracks how many distinct accounts this IP has caused to lock. If 2 or more
     /// accounts have been locked from the same IP, the IP gets auto-blocked.

@@ -794,8 +794,11 @@ impl CatalogStorage for HeapCatalogStorage {
         // Each page routes through the disk manager, sharing the per-page
         // latch and the open file handle instead of opening the file per page
         self.pool.flush_all(|page_id, data| {
+            // A page outside the catalog's files belongs to another
+            // subsystem sharing the pool. Answer Skipped so its dirty
+            // state survives for the owner's flush
             if !allowed.contains(&page_id.file_id) {
-                return Ok(());
+                return Ok(zyron_buffer::FlushOutcome::Skipped);
             }
             let data_len = data.len();
             let page: &mut [u8; PAGE_SIZE] =
@@ -803,7 +806,8 @@ impl CatalogStorage for HeapCatalogStorage {
                     expected: PAGE_SIZE,
                     actual: data_len,
                 })?;
-            self.disk.write_page_sync_no_fsync(page_id, page)
+            self.disk.write_page_sync_no_fsync(page_id, page)?;
+            Ok(zyron_buffer::FlushOutcome::Written)
         })?;
         Ok(())
     }

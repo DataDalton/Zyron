@@ -256,6 +256,245 @@ pub fn compare(left: &Column, right: &Column, op: CmpOp) -> Result<Column> {
     ))
 }
 
+/// Generates a typed comparison fast path against a single scalar value held
+/// in a one-row column of the same variant
+macro_rules! typed_cmp_scalar {
+    ($col:expr, $scalar:expr, $col_nulls:expr, $scalar_null:expr, $len:expr, $op:expr, $variant:ident) => {
+        if let (ColumnData::$variant(l), ColumnData::$variant(r)) = ($col, $scalar) {
+            let mut result = Vec::with_capacity($len);
+            let mut nulls = NullBitmap::none($len);
+            if $scalar_null {
+                for i in 0..$len {
+                    nulls.set_null(i);
+                    result.push(false);
+                }
+            } else {
+                let s = &r[0];
+                for i in 0..$len {
+                    if $col_nulls.is_null(i) {
+                        nulls.set_null(i);
+                        result.push(false);
+                    } else {
+                        result.push(match $op {
+                            CmpOp::Eq => l[i] == *s,
+                            CmpOp::Neq => l[i] != *s,
+                            CmpOp::Lt => l[i] < *s,
+                            CmpOp::Gt => l[i] > *s,
+                            CmpOp::LtEq => l[i] <= *s,
+                            CmpOp::GtEq => l[i] >= *s,
+                        });
+                    }
+                }
+            }
+            return Ok(Column::with_nulls(
+                ColumnData::Boolean(result),
+                nulls,
+                TypeId::Boolean,
+            ));
+        }
+    };
+}
+
+/// Flips an ordered comparison so `scalar OP col` can run as `col OP' scalar`
+fn swap_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Neq => CmpOp::Neq,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::LtEq => CmpOp::GtEq,
+        CmpOp::GtEq => CmpOp::LtEq,
+    }
+}
+
+/// Widens a one-row column to `len` rows for the fallback path
+fn broadcast_column(scalar: &Column, len: usize) -> Column {
+    if scalar.nulls.is_null(0) {
+        let mut widened = Column::null_column(scalar.type_id, len);
+        widened.fractional_digits = scalar.fractional_digits;
+        return widened;
+    }
+    Column::new_ts(
+        ColumnData::from_scalar(&scalar.data.get_scalar(0), len),
+        scalar.type_id,
+        scalar.fractional_digits,
+    )
+}
+
+/// Compares every row of `col` against the single value in the one-row
+/// column `scalar`, producing col.len() results without materializing the
+/// scalar to full width. `scalar_on_left` records that the caller wrote
+/// `scalar OP col`, so ordered operators flip. Matches `compare` exactly:
+/// same decimal alignment, same null semantics, and a fallback that widens
+/// the scalar and defers to `compare` for type pairs the kernels skip
+pub fn compare_scalar(
+    col: &Column,
+    scalar: &Column,
+    op: CmpOp,
+    scalar_on_left: bool,
+) -> Result<Column> {
+    if scalar.len() != 1 {
+        return Err(ZyronError::ExecutionError(
+            "compare_scalar: scalar operand must be one row".to_string(),
+        ));
+    }
+
+    // Decimal alignment runs in the caller's operand orientation, matching
+    // what compare() does internally for full-width operands
+    let col_aligned;
+    let scalar_aligned;
+    let (col, scalar) = if scalar_on_left {
+        match align_decimal_operands(scalar, col)? {
+            Some((s, c)) => {
+                scalar_aligned = s;
+                col_aligned = c;
+                (&col_aligned, &scalar_aligned)
+            }
+            None => (col, scalar),
+        }
+    } else {
+        match align_decimal_operands(col, scalar)? {
+            Some((c, s)) => {
+                col_aligned = c;
+                scalar_aligned = s;
+                (&col_aligned, &scalar_aligned)
+            }
+            None => (col, scalar),
+        }
+    };
+
+    let len = col.len();
+    let eff_op = if scalar_on_left { swap_cmp(op) } else { op };
+    let scalar_null = scalar.nulls.is_null(0);
+
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Int64
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Int32
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Int16
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Int8
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Int128
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        UInt8
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        UInt16
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        UInt32
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        UInt64
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Boolean
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Utf8
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Float64
+    );
+    typed_cmp_scalar!(
+        &col.data,
+        &scalar.data,
+        &col.nulls,
+        scalar_null,
+        len,
+        eff_op,
+        Float32
+    );
+
+    // Type pairs outside the kernels widen the scalar and take the
+    // full-width path in the caller's original orientation
+    let expanded = broadcast_column(scalar, len);
+    if scalar_on_left {
+        compare(&expanded, col, op)
+    } else {
+        compare(col, &expanded, op)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arithmetic kernels
 // ---------------------------------------------------------------------------
@@ -299,11 +538,16 @@ fn decimal_arithmetic(left: &Column, right: &Column, scale: u8, op: ArithOp) -> 
             ArithOp::Add => a.checked_add(b),
             ArithOp::Sub => a.checked_sub(b),
             // The product carries both scales, so it is divided back down
-            ArithOp::Mul => a
-                .checked_mul(b)
-                .map(|p| zyron_common::rescale(p, scale.saturating_mul(2).min(38), scale).ok())
-                .and_then(|v| v)
-                .or_else(|| a.checked_mul(b).and_then(|p| p.checked_div(factor))),
+            // with rounding. The rescale factor is the scale DIFFERENCE, so
+            // a doubled scale above 38 is fine and must not be clamped, a
+            // clamp would divide by too small a factor and inflate the
+            // result by a power of ten. A product that overflows the i128
+            // intermediate retries through the 256-bit wide path, only the
+            // final value has to fit
+            ArithOp::Mul => match a.checked_mul(b) {
+                Some(p) => Some(zyron_common::rescale(p, scale.saturating_mul(2), scale)?),
+                None => Some(zyron_common::decimal::mul_rescale(a, b, scale)?),
+            },
             // A quotient of two same-scale values has no scale, so the
             // dividend is raised first to land the result back on this one.
             // The last digit rounds half away from zero, the same rule
@@ -366,33 +610,56 @@ pub fn arithmetic(left: &Column, right: &Column, op: ArithOp) -> Result<Column> 
         return decimal_arithmetic(&l, &r, scale, op);
     }
 
-    // Int64 fast path.
+    // Int64 fast path. Overflow raises a flag inside the loop and reports
+    // after it, so the hot loop stays a flag check instead of a per-element
+    // early return, and a wrapped number never leaves as a result
     if let (ColumnData::Int64(l), ColumnData::Int64(r)) = (&left.data, &right.data) {
         let mut result = Vec::with_capacity(len);
         let mut nulls = NullBitmap::none(len);
+        let mut overflowed = false;
         for i in 0..len {
             if left.is_null(i) || right.is_null(i) {
                 nulls.set_null(i);
                 result.push(0);
             } else {
                 result.push(match op {
-                    ArithOp::Add => l[i].wrapping_add(r[i]),
-                    ArithOp::Sub => l[i].wrapping_sub(r[i]),
-                    ArithOp::Mul => l[i].wrapping_mul(r[i]),
+                    ArithOp::Add => l[i].checked_add(r[i]).unwrap_or_else(|| {
+                        overflowed = true;
+                        0
+                    }),
+                    ArithOp::Sub => l[i].checked_sub(r[i]).unwrap_or_else(|| {
+                        overflowed = true;
+                        0
+                    }),
+                    ArithOp::Mul => l[i].checked_mul(r[i]).unwrap_or_else(|| {
+                        overflowed = true;
+                        0
+                    }),
                     ArithOp::Div => {
                         if r[i] == 0 {
                             return Err(ZyronError::ExecutionError("division by zero".to_string()));
                         }
-                        l[i] / r[i]
+                        l[i].checked_div(r[i]).unwrap_or_else(|| {
+                            overflowed = true;
+                            0
+                        })
                     }
                     ArithOp::Mod => {
                         if r[i] == 0 {
                             return Err(ZyronError::ExecutionError("modulo by zero".to_string()));
                         }
-                        l[i] % r[i]
+                        l[i].checked_rem(r[i]).unwrap_or_else(|| {
+                            overflowed = true;
+                            0
+                        })
                     }
                 });
             }
+        }
+        if overflowed {
+            return Err(ZyronError::ExecutionError(
+                "BIGINT arithmetic overflowed".to_string(),
+            ));
         }
         return Ok(Column::with_nulls(
             ColumnData::Int64(result),
@@ -401,33 +668,54 @@ pub fn arithmetic(left: &Column, right: &Column, op: ArithOp) -> Result<Column> 
         ));
     }
 
-    // Int32 fast path.
+    // Int32 fast path, same overflow rule as Int64.
     if let (ColumnData::Int32(l), ColumnData::Int32(r)) = (&left.data, &right.data) {
         let mut result = Vec::with_capacity(len);
         let mut nulls = NullBitmap::none(len);
+        let mut overflowed = false;
         for i in 0..len {
             if left.is_null(i) || right.is_null(i) {
                 nulls.set_null(i);
                 result.push(0);
             } else {
                 result.push(match op {
-                    ArithOp::Add => l[i].wrapping_add(r[i]),
-                    ArithOp::Sub => l[i].wrapping_sub(r[i]),
-                    ArithOp::Mul => l[i].wrapping_mul(r[i]),
+                    ArithOp::Add => l[i].checked_add(r[i]).unwrap_or_else(|| {
+                        overflowed = true;
+                        0
+                    }),
+                    ArithOp::Sub => l[i].checked_sub(r[i]).unwrap_or_else(|| {
+                        overflowed = true;
+                        0
+                    }),
+                    ArithOp::Mul => l[i].checked_mul(r[i]).unwrap_or_else(|| {
+                        overflowed = true;
+                        0
+                    }),
                     ArithOp::Div => {
                         if r[i] == 0 {
                             return Err(ZyronError::ExecutionError("division by zero".to_string()));
                         }
-                        l[i] / r[i]
+                        l[i].checked_div(r[i]).unwrap_or_else(|| {
+                            overflowed = true;
+                            0
+                        })
                     }
                     ArithOp::Mod => {
                         if r[i] == 0 {
                             return Err(ZyronError::ExecutionError("modulo by zero".to_string()));
                         }
-                        l[i] % r[i]
+                        l[i].checked_rem(r[i]).unwrap_or_else(|| {
+                            overflowed = true;
+                            0
+                        })
                     }
                 });
             }
+        }
+        if overflowed {
+            return Err(ZyronError::ExecutionError(
+                "INTEGER arithmetic overflowed".to_string(),
+            ));
         }
         return Ok(Column::with_nulls(
             ColumnData::Int32(result),
@@ -496,24 +784,26 @@ fn apply_arith(
 
     if !out_float && !operand_float {
         if let (Some(l), Some(r)) = (left.to_i128(), right.to_i128()) {
+            let overflow =
+                || ZyronError::ExecutionError("integer arithmetic overflowed".to_string());
             let v = match op {
-                ArithOp::Add => l.wrapping_add(r),
-                ArithOp::Sub => l.wrapping_sub(r),
-                ArithOp::Mul => l.wrapping_mul(r),
+                ArithOp::Add => l.checked_add(r).ok_or_else(overflow)?,
+                ArithOp::Sub => l.checked_sub(r).ok_or_else(overflow)?,
+                ArithOp::Mul => l.checked_mul(r).ok_or_else(overflow)?,
                 ArithOp::Div => {
                     if r == 0 {
                         return Err(ZyronError::ExecutionError("division by zero".to_string()));
                     }
-                    l / r
+                    l.checked_div(r).ok_or_else(overflow)?
                 }
                 ArithOp::Mod => {
                     if r == 0 {
                         return Err(ZyronError::ExecutionError("modulo by zero".to_string()));
                     }
-                    l % r
+                    l.checked_rem(r).ok_or_else(overflow)?
                 }
             };
-            return Ok(int_scalar_for_type(out_type, v));
+            return int_scalar_for_type(out_type, v);
         }
     }
 
@@ -533,20 +823,25 @@ fn apply_arith(
     }
 }
 
-/// Builds an integer ScalarValue of the given type from an i128 result.
-fn int_scalar_for_type(out_type: TypeId, v: i128) -> ScalarValue {
-    match out_type {
-        TypeId::Int8 => ScalarValue::Int8(v as i8),
-        TypeId::Int16 => ScalarValue::Int16(v as i16),
-        TypeId::Int32 => ScalarValue::Int32(v as i32),
-        TypeId::Int64 => ScalarValue::Int64(v as i64),
+/// Builds an integer ScalarValue of the given type from an i128 result,
+/// refusing a result the output type cannot hold instead of wrapping it
+/// into a different number.
+fn int_scalar_for_type(out_type: TypeId, v: i128) -> Result<ScalarValue> {
+    let narrow = |name: &str| {
+        ZyronError::ExecutionError(format!("arithmetic result {v} is out of range for {name}"))
+    };
+    Ok(match out_type {
+        TypeId::Int8 => ScalarValue::Int8(i8::try_from(v).map_err(|_| narrow("TINYINT"))?),
+        TypeId::Int16 => ScalarValue::Int16(i16::try_from(v).map_err(|_| narrow("SMALLINT"))?),
+        TypeId::Int32 => ScalarValue::Int32(i32::try_from(v).map_err(|_| narrow("INTEGER"))?),
+        TypeId::Int64 => ScalarValue::Int64(i64::try_from(v).map_err(|_| narrow("BIGINT"))?),
         TypeId::Int128 => ScalarValue::Int128(v),
-        TypeId::UInt8 => ScalarValue::UInt8(v as u8),
-        TypeId::UInt16 => ScalarValue::UInt16(v as u16),
-        TypeId::UInt32 => ScalarValue::UInt32(v as u32),
-        TypeId::UInt64 => ScalarValue::UInt64(v as u64),
-        _ => ScalarValue::Int64(v as i64),
-    }
+        TypeId::UInt8 => ScalarValue::UInt8(u8::try_from(v).map_err(|_| narrow("UTINYINT"))?),
+        TypeId::UInt16 => ScalarValue::UInt16(u16::try_from(v).map_err(|_| narrow("USMALLINT"))?),
+        TypeId::UInt32 => ScalarValue::UInt32(u32::try_from(v).map_err(|_| narrow("UINTEGER"))?),
+        TypeId::UInt64 => ScalarValue::UInt64(u64::try_from(v).map_err(|_| narrow("UBIGINT"))?),
+        _ => ScalarValue::Int64(i64::try_from(v).map_err(|_| narrow("BIGINT"))?),
+    })
 }
 
 /// Promotes two numeric types to a common output type.
@@ -798,30 +1093,59 @@ fn like_impl(
     let mut result = Vec::with_capacity(len);
     let mut nulls = NullBitmap::none(len);
 
+    // A one-row pattern column broadcasts across every input row, wider
+    // patterns pair row for row
+    let pattern_len = pattern.len();
+    let pat_idx = |i: usize| if pattern_len == 1 { 0 } else { i };
+
+    let (vals, pats) = match (&col.data, &pattern.data) {
+        (ColumnData::Utf8(v), ColumnData::Utf8(p)) => (v, p),
+        _ => {
+            // Non-text operands never match, null inputs still yield null
+            for i in 0..len {
+                if col.is_null(i) || pattern.is_null(pat_idx(i)) {
+                    nulls.set_null(i);
+                }
+                result.push(false);
+            }
+            return Ok(Column::with_nulls(
+                ColumnData::Boolean(result),
+                nulls,
+                TypeId::Boolean,
+            ));
+        }
+    };
+
+    // The pattern column is almost always one literal replicated per row.
+    // The compiled form is cached and rebuilt only when a row's pattern
+    // string differs from the cached one, so the steady-state per-row cost
+    // is a short string equality instead of a fresh compilation
+    let mut cached_raw: Option<&str> = None;
+    let mut program = CompiledLike::Exact(String::new());
+    let mut scratch = LikeScratch::default();
+
     for i in 0..len {
-        if col.is_null(i) || pattern.is_null(i) {
+        if col.is_null(i) || pattern.is_null(pat_idx(i)) {
             nulls.set_null(i);
             result.push(false);
             continue;
         }
-        let val = match &col.data {
-            ColumnData::Utf8(v) => &v[i],
-            _ => {
-                result.push(false);
-                continue;
-            }
-        };
-        let pat = match &pattern.data {
-            ColumnData::Utf8(v) => &v[i],
-            _ => {
-                result.push(false);
-                continue;
-            }
-        };
+        let pat = pats[pat_idx(i)].as_str();
+        if cached_raw != Some(pat) {
+            program = if case_insensitive {
+                compile_like(&pat.to_lowercase())
+            } else {
+                compile_like(pat)
+            };
+            cached_raw = Some(pat);
+        }
+        // ILIKE lowers the text through str::to_lowercase to keep its
+        // context-sensitive mappings (final sigma), which has no
+        // write-into-buffer form, so this is the one per-row allocation
         let matched = if case_insensitive {
-            sql_like_match(&val.to_lowercase(), &pat.to_lowercase())
+            match_compiled(&vals[i].to_lowercase(), &program, &mut scratch)
         } else {
-            sql_like_match(val, pat)
+            match_compiled(&vals[i], &program, &mut scratch)
         };
         result.push(if negated { !matched } else { matched });
     }
@@ -833,16 +1157,113 @@ fn like_impl(
     ))
 }
 
-fn sql_like_match(text: &str, pattern: &str) -> bool {
-    let t: Vec<char> = text.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
-    sql_like_dp(&t, &p)
+/// A LIKE pattern compiled once and matched against many rows. The shape
+/// picks the matcher: no wildcard is a string equality, patterns using only
+/// '%' match by anchored prefix and suffix checks with in-order substring
+/// search between them, and patterns containing '_' run the general
+/// dynamic program
+enum CompiledLike {
+    Exact(String),
+    Segments {
+        start: Option<String>,
+        middle: Vec<String>,
+        end: Option<String>,
+    },
+    General(Vec<char>),
 }
 
-fn sql_like_dp(text: &[char], pattern: &[char]) -> bool {
+/// Reused per-row buffers for the dynamic-program matcher
+#[derive(Default)]
+struct LikeScratch {
+    text_chars: Vec<char>,
+    prev: Vec<bool>,
+    curr: Vec<bool>,
+}
+
+fn compile_like(pattern: &str) -> CompiledLike {
+    if pattern.contains('_') {
+        return CompiledLike::General(pattern.chars().collect());
+    }
+    if !pattern.contains('%') {
+        return CompiledLike::Exact(pattern.to_string());
+    }
+    // Split on '%' and keep the literal runs: a non-empty leading run is an
+    // anchored prefix, a non-empty trailing run is an anchored suffix, and
+    // the non-empty runs between them must appear in order. Empty runs from
+    // consecutive '%' collapse away, matching the wildcard's semantics
+    let mut parts = pattern.split('%');
+    let first = parts.next().unwrap_or("");
+    let start = if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    };
+    let mut middle: Vec<String> = Vec::new();
+    let mut last: &str = "";
+    for part in parts {
+        if !last.is_empty() {
+            middle.push(last.to_string());
+        }
+        last = part;
+    }
+    let end = if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    };
+    CompiledLike::Segments { start, middle, end }
+}
+
+fn match_compiled(text: &str, compiled: &CompiledLike, scratch: &mut LikeScratch) -> bool {
+    match compiled {
+        CompiledLike::Exact(p) => text == p,
+        CompiledLike::Segments { start, middle, end } => {
+            let mut pos = 0usize;
+            if let Some(prefix) = start {
+                if !text.starts_with(prefix.as_str()) {
+                    return false;
+                }
+                pos = prefix.len();
+            }
+            // Matched offsets always land on character boundaries because a
+            // valid UTF-8 needle only matches at boundaries of the haystack
+            for seg in middle {
+                match text.get(pos..).and_then(|rest| rest.find(seg.as_str())) {
+                    Some(off) => pos = pos + off + seg.len(),
+                    None => return false,
+                }
+            }
+            match end {
+                Some(suffix) => text.len() >= pos + suffix.len() && text.ends_with(suffix.as_str()),
+                None => true,
+            }
+        }
+        CompiledLike::General(pattern_chars) => {
+            scratch.text_chars.clear();
+            scratch.text_chars.extend(text.chars());
+            sql_like_dp(
+                &scratch.text_chars,
+                pattern_chars,
+                &mut scratch.prev,
+                &mut scratch.curr,
+            )
+        }
+    }
+}
+
+/// Two-row dynamic program over chars for patterns containing '_'. The row
+/// buffers are caller-owned so repeated matches reuse their capacity
+fn sql_like_dp(
+    text: &[char],
+    pattern: &[char],
+    prev: &mut Vec<bool>,
+    curr: &mut Vec<bool>,
+) -> bool {
     let (m, n) = (text.len(), pattern.len());
-    let mut prev = vec![false; n + 1];
-    let mut curr = vec![false; n + 1];
+    prev.clear();
+    prev.resize(n + 1, false);
+    curr.clear();
+    curr.resize(n + 1, false);
     prev[0] = true;
     for j in 1..=n {
         if pattern[j - 1] == '%' {
@@ -861,7 +1282,7 @@ fn sql_like_dp(text: &[char], pattern: &[char]) -> bool {
                 curr[j] = false;
             }
         }
-        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(prev, curr);
     }
     prev[n]
 }
@@ -1258,9 +1679,16 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
             ScalarValue::UInt8(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::UInt16(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::UInt32(v) => Ok(ScalarValue::Int64(*v as i64)),
-            ScalarValue::UInt64(v) => Ok(ScalarValue::Int64(*v as i64)),
-            ScalarValue::Float32(v) => Ok(ScalarValue::Int64(*v as i64)),
-            ScalarValue::Float64(v) => Ok(ScalarValue::Int64(*v as i64)),
+            // A u64 above i64::MAX has no i64 twin, wrapping it makes a
+            // negative number out of a large positive one
+            ScalarValue::UInt64(v) => i64::try_from(*v).map(ScalarValue::Int64).map_err(|_| {
+                ZyronError::ExecutionError(format!("value {v} is out of range for Int64"))
+            }),
+            // Floats round half away from zero, the same rule decimal
+            // narrowing applies. NaN and infinity have no integer value and
+            // report instead of becoming zero or a saturated extreme
+            ScalarValue::Float32(v) => float_to_i64(*v as f64),
+            ScalarValue::Float64(v) => float_to_i64(*v),
             ScalarValue::Boolean(v) => Ok(ScalarValue::Int64(if *v { 1 } else { 0 })),
             ScalarValue::Utf8(s) => s
                 .parse::<i64>()
@@ -1451,6 +1879,25 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 
 /// Coerces an integer-like scalar to an i128 for range-checked narrowing.
 /// Rejects out-of-range narrowing (e.g. a BIGINT value that does not fit an
+/// Rounds a float onto i64 half away from zero, refusing NaN, infinity,
+/// and values outside the i64 range instead of saturating or zeroing.
+fn float_to_i64(f: f64) -> Result<ScalarValue> {
+    if !f.is_finite() {
+        return Err(ZyronError::ExecutionError(format!(
+            "cannot cast {f} to Int64"
+        )));
+    }
+    let rounded = f.round();
+    // i64::MAX is not exactly representable in f64, the nearest exact
+    // bounds are -(2^63) inclusive and 2^63 exclusive
+    if rounded >= 9_223_372_036_854_775_808.0 || rounded < -9_223_372_036_854_775_808.0 {
+        return Err(ZyronError::ExecutionError(format!(
+            "value {f} is out of range for Int64"
+        )));
+    }
+    Ok(ScalarValue::Int64(rounded as i64))
+}
+
 /// INTEGER column) with an error instead of silently wrapping. Floats must be
 /// finite and integral within the target range.
 fn checked_int(value: &ScalarValue, target_name: &str) -> Result<i128> {
@@ -1493,6 +1940,30 @@ fn checked_int(value: &ScalarValue, target_name: &str) -> Result<i128> {
 // Typed row comparison (for sort_indices)
 // ---------------------------------------------------------------------------
 
+/// Total order over f64 for sorting: NaN sorts after every number and equal
+/// to itself, negative zero ties positive zero. partial_cmp alone is not a
+/// total order and Rust sort implementations may panic or misorder on one
+#[inline]
+pub fn cmp_f64_total(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// f32 counterpart of cmp_f64_total.
+#[inline]
+pub fn cmp_f32_total(a: f32, b: f32) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
 /// Compares two values within the same ColumnData directly, without ScalarValue.
 #[inline]
 fn compare_column_values(data: &ColumnData, a: usize, b: usize) -> Ordering {
@@ -1507,13 +1978,91 @@ fn compare_column_values(data: &ColumnData, a: usize, b: usize) -> Ordering {
         ColumnData::UInt16(v) => v[a].cmp(&v[b]),
         ColumnData::UInt32(v) => v[a].cmp(&v[b]),
         ColumnData::UInt64(v) => v[a].cmp(&v[b]),
-        ColumnData::Float32(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
-        ColumnData::Float64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
+        ColumnData::Float32(v) => cmp_f32_total(v[a], v[b]),
+        ColumnData::Float64(v) => cmp_f64_total(v[a], v[b]),
         ColumnData::Utf8(v) => v[a].cmp(&v[b]),
         ColumnData::Binary(v) => v[a].cmp(&v[b]),
         ColumnData::FixedBinary16(v) => v[a].cmp(&v[b]),
         ColumnData::Interval(v) => v[a].cmp(&v[b]),
     }
+}
+
+/// Compares one value against a value of the same type in a different column.
+///
+/// The single-column comparator takes two rows of one column, which is what a
+/// sort within one batch needs. A merge across sorted runs compares the head
+/// of one run against the head of another, and those live in different
+/// batches: same schema, same type, different memory.
+///
+/// Two columns of different types compare Equal, which cannot happen: the runs
+/// were written from one operator's output and carry one schema. Returning
+/// Equal rather than panicking means a corrupted spill file produces wrong
+/// order rather than a crash, and the decode that read it already checked its
+/// magic and version.
+#[inline]
+fn compare_values_across(left: &ColumnData, a: usize, right: &ColumnData, b: usize) -> Ordering {
+    match (left, right) {
+        (ColumnData::Boolean(l), ColumnData::Boolean(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Int8(l), ColumnData::Int8(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Int16(l), ColumnData::Int16(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Int32(l), ColumnData::Int32(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Int64(l), ColumnData::Int64(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Int128(l), ColumnData::Int128(r)) => l[a].cmp(&r[b]),
+        (ColumnData::UInt8(l), ColumnData::UInt8(r)) => l[a].cmp(&r[b]),
+        (ColumnData::UInt16(l), ColumnData::UInt16(r)) => l[a].cmp(&r[b]),
+        (ColumnData::UInt32(l), ColumnData::UInt32(r)) => l[a].cmp(&r[b]),
+        (ColumnData::UInt64(l), ColumnData::UInt64(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Float32(l), ColumnData::Float32(r)) => cmp_f32_total(l[a], r[b]),
+        (ColumnData::Float64(l), ColumnData::Float64(r)) => cmp_f64_total(l[a], r[b]),
+        (ColumnData::Utf8(l), ColumnData::Utf8(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Binary(l), ColumnData::Binary(r)) => l[a].cmp(&r[b]),
+        (ColumnData::FixedBinary16(l), ColumnData::FixedBinary16(r)) => l[a].cmp(&r[b]),
+        (ColumnData::Interval(l), ColumnData::Interval(r)) => l[a].cmp(&r[b]),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Orders a row of one batch against a row of another by the same sort key.
+///
+/// The comparator a k-way merge runs at every step, so it does the same typed
+/// dispatch the in-memory sort does rather than going through ScalarValue.
+pub fn compare_rows_across(
+    left: &[&Column],
+    a: usize,
+    right: &[&Column],
+    b: usize,
+    ascending: &[bool],
+    nulls_first: &[bool],
+) -> Ordering {
+    for (i, (lc, rc)) in left.iter().zip(right.iter()).enumerate() {
+        let a_null = lc.is_null(a);
+        let b_null = rc.is_null(b);
+        let nf = nulls_first[i];
+        match (a_null, b_null) {
+            (true, true) => continue,
+            (true, false) => {
+                return if nf {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            (false, true) => {
+                return if nf {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            (false, false) => {}
+        }
+        let ord = compare_values_across(&lc.data, a, &rc.data, b);
+        let ord = if ascending[i] { ord } else { ord.reverse() };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Compares two rows across multiple sort columns using typed dispatch.
@@ -1599,6 +2148,25 @@ macro_rules! sort_single_ord {
 /// read from each radix pass, and a byte whose histogram is a single bucket
 /// is constant across all keys, so its pass is the identity and is skipped.
 /// Boxed because the eight histograms are 8KB, too large for a stack local.
+/// Counts the low `N` bytes of every key into their tables. `N` is a
+/// constant so the inner walk unrolls to exactly the loads and increments
+/// the key range calls for.
+#[inline]
+fn histogram_bytes<const N: usize, T: Copy>(
+    counts: &mut [[u32; 256]; 8],
+    items: &[T],
+    key_of: impl Fn(T) -> u64,
+) {
+    for &item in items {
+        let key = key_of(item);
+        let mut byte = 0usize;
+        while byte < N {
+            counts[byte][((key >> (byte * 8)) & 0xFF) as usize] += 1;
+            byte += 1;
+        }
+    }
+}
+
 struct RadixPrep {
     counts: Box<[[u32; 256]; 8]>,
     min_key: u64,
@@ -1614,20 +2182,37 @@ impl RadixPrep {
         }
     }
 
-    /// Folds one key into the range and all eight byte histograms.
+    /// Folds one key into the observed range.
+    ///
+    /// Histograms are deliberately not built here. The range decides how
+    /// many byte positions can differ, and counting the rest is pure
+    /// waste: a 64-bit key carrying a twenty-bit value would fill five
+    /// tables no pass ever reads. Keeping this loop to two comparisons
+    /// also leaves it vectorizable, which a scatter into eight tables is
+    /// not.
     #[inline]
-    fn record(&mut self, key: u64) {
+    fn observe(&mut self, key: u64) {
         self.min_key = self.min_key.min(key);
         self.max_key = self.max_key.max(key);
-        let c = &mut *self.counts;
-        c[0][(key & 0xFF) as usize] += 1;
-        c[1][((key >> 8) & 0xFF) as usize] += 1;
-        c[2][((key >> 16) & 0xFF) as usize] += 1;
-        c[3][((key >> 24) & 0xFF) as usize] += 1;
-        c[4][((key >> 32) & 0xFF) as usize] += 1;
-        c[5][((key >> 40) & 0xFF) as usize] += 1;
-        c[6][((key >> 48) & 0xFF) as usize] += 1;
-        c[7][((key >> 56) & 0xFF) as usize] += 1;
+    }
+
+    /// Builds the byte histograms the scatter passes will read, for the
+    /// byte positions the observed range spans and no others. Call once
+    /// after every key has been observed.
+    fn build_histograms<T: Copy>(&mut self, items: &[T], key_of: impl Fn(T) -> u64) {
+        let needed = self.needed_bytes();
+        let counts = &mut *self.counts;
+        match needed {
+            0 => {}
+            1 => histogram_bytes::<1, T>(counts, items, key_of),
+            2 => histogram_bytes::<2, T>(counts, items, key_of),
+            3 => histogram_bytes::<3, T>(counts, items, key_of),
+            4 => histogram_bytes::<4, T>(counts, items, key_of),
+            5 => histogram_bytes::<5, T>(counts, items, key_of),
+            6 => histogram_bytes::<6, T>(counts, items, key_of),
+            7 => histogram_bytes::<7, T>(counts, items, key_of),
+            _ => histogram_bytes::<8, T>(counts, items, key_of),
+        }
     }
 
     /// Number of low bytes that differ between the smallest and largest
@@ -1853,16 +2438,17 @@ macro_rules! radix_sort_signed {
         if $asc {
             for (i, &v) in $data.iter().enumerate() {
                 let key = (v as $uty as u64) ^ $sign_bit;
-                prep.record(key);
+                prep.observe(key);
                 pairs.push((key, i as u32));
             }
         } else {
             for (i, &v) in $data.iter().enumerate() {
                 let key = !((v as $uty as u64) ^ $sign_bit);
-                prep.record(key);
+                prep.observe(key);
                 pairs.push((key, i as u32));
             }
         }
+        prep.build_histograms(&pairs, |p: (u64, u32)| p.0);
         radix_sort_pair_indices(pairs, &prep)
     }};
 }
@@ -1876,16 +2462,17 @@ macro_rules! radix_sort_unsigned {
         if $asc {
             for (i, &v) in $data.iter().enumerate() {
                 let key = v as u64;
-                prep.record(key);
+                prep.observe(key);
                 pairs.push((key, i as u32));
             }
         } else {
             for (i, &v) in $data.iter().enumerate() {
                 let key = !(v as u64);
-                prep.record(key);
+                prep.observe(key);
                 pairs.push((key, i as u32));
             }
         }
+        prep.build_histograms(&pairs, |p: (u64, u32)| p.0);
         radix_sort_pair_indices(pairs, &prep)
     }};
 }
@@ -1906,13 +2493,13 @@ macro_rules! radix_extract_signed {
                 if $asc {
                     for (i, &val) in v.iter().enumerate() {
                         let key = (val as $uty as u64) ^ $sign_bit;
-                        prep.record(key);
+                        prep.observe(key);
                         pairs.push((key, off + i as u32));
                     }
                 } else {
                     for (i, &val) in v.iter().enumerate() {
                         let key = !((val as $uty as u64) ^ $sign_bit);
-                        prep.record(key);
+                        prep.observe(key);
                         pairs.push((key, off + i as u32));
                     }
                 }
@@ -1921,6 +2508,7 @@ macro_rules! radix_extract_signed {
                 return None;
             }
         }
+        prep.build_histograms(&pairs, |p: (u64, u32)| p.0);
         let (indices, sorted) = if $asc {
             radix_scatter_pairs(pairs, &prep, |k: u64| (k ^ $sign_bit) as $ty)
         } else {
@@ -1941,13 +2529,13 @@ macro_rules! radix_extract_unsigned {
                 if $asc {
                     for (i, &val) in v.iter().enumerate() {
                         let key = val as u64;
-                        prep.record(key);
+                        prep.observe(key);
                         pairs.push((key, off + i as u32));
                     }
                 } else {
                     for (i, &val) in v.iter().enumerate() {
                         let key = !(val as u64);
-                        prep.record(key);
+                        prep.observe(key);
                         pairs.push((key, off + i as u32));
                     }
                 }
@@ -1956,6 +2544,7 @@ macro_rules! radix_extract_unsigned {
                 return None;
             }
         }
+        prep.build_histograms(&pairs, |p: (u64, u32)| p.0);
         let (indices, sorted) = if $asc {
             radix_scatter_pairs(pairs, &prep, |k: u64| k as $ty)
         } else {
@@ -1978,13 +2567,13 @@ macro_rules! radix_values_signed {
                 if $asc {
                     for &val in v.iter() {
                         let key = (val as $uty as u64) ^ $sign_bit;
-                        prep.record(key);
+                        prep.observe(key);
                         keys.push(key);
                     }
                 } else {
                     for &val in v.iter() {
                         let key = !((val as $uty as u64) ^ $sign_bit);
-                        prep.record(key);
+                        prep.observe(key);
                         keys.push(key);
                     }
                 }
@@ -1992,6 +2581,7 @@ macro_rules! radix_values_signed {
                 return None;
             }
         }
+        prep.build_histograms(&keys, |k: u64| k);
         let sorted = if $asc {
             radix_scatter_values(keys, &prep, |k: u64| (k ^ $sign_bit) as $ty)
         } else {
@@ -2011,13 +2601,13 @@ macro_rules! radix_values_unsigned {
                 if $asc {
                     for &val in v.iter() {
                         let key = val as u64;
-                        prep.record(key);
+                        prep.observe(key);
                         keys.push(key);
                     }
                 } else {
                     for &val in v.iter() {
                         let key = !(val as u64);
-                        prep.record(key);
+                        prep.observe(key);
                         keys.push(key);
                     }
                 }
@@ -2025,6 +2615,7 @@ macro_rules! radix_values_unsigned {
                 return None;
             }
         }
+        prep.build_histograms(&keys, |k: u64| k);
         let sorted = if $asc {
             radix_scatter_values(keys, &prep, |k: u64| k as $ty)
         } else {
@@ -2076,20 +2667,165 @@ pub fn radix_sort_column_batches(
 /// pdqsort (sort_unstable) is faster due to lower constant overhead.
 const RADIX_SORT_THRESHOLD: usize = 256;
 
+/// How much wider than the row count the value range may be before the
+/// counting path stops paying off, as a numerator over
+/// `COUNTING_SPAN_PER`.
+///
+/// Both paths are linear in the row count; the only term that separates
+/// them is that counting walks every slot of its tally while radix walks
+/// the rows once per differing key byte. So the decision is a ratio of
+/// range to rows, and where it sits was measured rather than guessed:
+/// counting wins by 4x at a ratio of one, still wins at three for inputs
+/// up to a million rows, and loses at four everywhere. The crossover
+/// slides down to about 2.7 by four million rows, because by then the
+/// tally no longer fits cache and each slot costs more to touch.
+///
+/// Two is the widest ratio that won at every row count measured, so it is
+/// the last safe integer rather than an arbitrary one. Raising it to three
+/// would gain on inputs up to a million rows and lose a few percent above
+/// that.
+const COUNTING_SPAN_NUM: i128 = 2;
+const COUNTING_SPAN_PER: i128 = 1;
+
+/// Slots the counting emit writes unconditionally before it looks at the
+/// run length. When the range is about as wide as the input, most runs are
+/// empty or single and the branch that would skip an empty run mispredicts
+/// about as often as it is taken. A few stores that land again on the same
+/// cache line cost less than the branch they replace, and the run length
+/// still decides where the next value goes.
+const COUNTING_EMIT_LANE: usize = 4;
+
+/// Writes `count` copies of `value` starting at `w` and returns the next
+/// write position.
+///
+/// # Safety
+/// `dst` must have room for `w + max(count, COUNTING_EMIT_LANE)` elements.
+#[inline(always)]
+unsafe fn emit_value_run<T: Copy>(dst: *mut T, w: usize, count: usize, value: T) -> usize {
+    unsafe {
+        if count <= COUNTING_EMIT_LANE {
+            for slot in 0..COUNTING_EMIT_LANE {
+                dst.add(w + slot).write(value);
+            }
+        } else {
+            for slot in 0..count {
+                dst.add(w + slot).write(value);
+            }
+        }
+    }
+    w + count
+}
+
+/// Sorts integer values by counting how many times each distinct value
+/// occurs, then writing the runs out in order.
+///
+/// Taken when the value range is no wider than the data itself, which is
+/// the shape identifier, enum, date, bucket and status columns take. It
+/// reads the input twice and writes the output once, where the radix path
+/// materializes a key buffer and scatters over it once per differing key
+/// byte. Returns None when the range is too wide for the tally to be worth
+/// its memory, leaving the radix path to handle it.
+macro_rules! counting_values {
+    ($batches:expr, $asc:expr, $total:expr, $variant:ident, $ty:ty, $uty:ty) => {{
+        let mut lo = <$ty>::MAX;
+        let mut hi = <$ty>::MIN;
+        for col in $batches {
+            match &col.data {
+                ColumnData::$variant(v) => {
+                    for &x in v.iter() {
+                        lo = if x < lo { x } else { lo };
+                        hi = if x > hi { x } else { hi };
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let span = (hi as i128) - (lo as i128) + 1;
+        // No floor under this. A floor would only ever widen the range a
+        // small input may take, and a small input with a wide range is
+        // exactly where counting loses: at 256 rows over a 4096 range the
+        // tally walk costs twice what two radix passes do
+        if span * COUNTING_SPAN_PER > ($total as i128) * COUNTING_SPAN_NUM {
+            return None;
+        }
+        let span = span as usize;
+
+        let mut tally = vec![0u32; span];
+        for col in $batches {
+            if let ColumnData::$variant(v) = &col.data {
+                for &x in v.iter() {
+                    tally[x.wrapping_sub(lo) as $uty as usize] += 1;
+                }
+            }
+        }
+
+        let mut out: Vec<$ty> = Vec::with_capacity($total + COUNTING_EMIT_LANE);
+        // SAFETY: the tally sums to $total, so the run writes advance `w`
+        // to exactly $total and never past it. Each call may touch
+        // COUNTING_EMIT_LANE slots beyond `w`, which the extra capacity
+        // covers. Every slot below $total is written before set_len.
+        unsafe {
+            let dst = out.as_mut_ptr();
+            let mut w = 0usize;
+            if $asc {
+                for (i, &count) in tally.iter().enumerate() {
+                    let value = lo.wrapping_add(i as $uty as $ty);
+                    w = emit_value_run(dst, w, count as usize, value);
+                }
+            } else {
+                for (i, &count) in tally.iter().enumerate().rev() {
+                    let value = lo.wrapping_add(i as $uty as $ty);
+                    w = emit_value_run(dst, w, count as usize, value);
+                }
+            }
+            debug_assert_eq!(w, $total);
+            out.set_len($total);
+        }
+        Some(ColumnData::$variant(out))
+    }};
+}
+
+/// Dispatches the counting path by column type. None means the type or the
+/// value range does not suit it.
+fn counting_sort_batches_values(
+    batches: &[Column],
+    ascending: bool,
+    total: usize,
+) -> Option<ColumnData> {
+    match &batches[0].data {
+        ColumnData::Int64(_) => counting_values!(batches, ascending, total, Int64, i64, u64),
+        ColumnData::Int32(_) => counting_values!(batches, ascending, total, Int32, i32, u32),
+        ColumnData::Int16(_) => counting_values!(batches, ascending, total, Int16, i16, u16),
+        ColumnData::Int8(_) => counting_values!(batches, ascending, total, Int8, i8, u8),
+        ColumnData::UInt64(_) => counting_values!(batches, ascending, total, UInt64, u64, u64),
+        ColumnData::UInt32(_) => counting_values!(batches, ascending, total, UInt32, u32, u32),
+        ColumnData::UInt16(_) => counting_values!(batches, ascending, total, UInt16, u16, u16),
+        ColumnData::UInt8(_) => counting_values!(batches, ascending, total, UInt8, u8, u8),
+        _ => None,
+    }
+}
+
 /// Sorts a single integer key column split across batches, producing the
-/// sorted values directly with no permutation indices. One fused loop
-/// builds the transformed key buffer while gathering the range and byte
-/// histograms, and the final radix pass writes untransformed values
-/// straight into the output. Returns None for non-integer types, columns
-/// with nulls, or inputs below the radix threshold, where the caller's
-/// concat plus comparison sort is the better path.
+/// sorted values directly with no permutation indices.
+///
+/// A value range no wider than the data takes the counting path, which
+/// never scatters. Everything else builds a transformed key buffer while
+/// gathering the range, histograms the byte positions the range spans, and
+/// lets the final radix pass write untransformed values straight into the
+/// output. Returns None for non-integer types, columns with nulls, or
+/// inputs below the radix threshold, where the caller's concat plus
+/// comparison sort is the better path.
 pub fn radix_sort_batches_values(batches: &[Column], ascending: bool) -> Option<ColumnData> {
     let total: usize = batches.iter().map(|c| c.len()).sum();
     if batches.is_empty()
         || total < RADIX_SORT_THRESHOLD
+        || total > u32::MAX as usize
         || batches.iter().any(|c| c.nulls.has_nulls())
     {
         return None;
+    }
+    if let Some(sorted) = counting_sort_batches_values(batches, ascending, total) {
+        return Some(sorted);
     }
     match &batches[0].data {
         ColumnData::Int64(_) => {
@@ -2181,16 +2917,16 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
         }
         ColumnData::Float64(v) => {
             if ascending {
-                v.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_unstable_by(|a, b| cmp_f64_total(*a, *b));
             } else {
-                v.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_unstable_by(|a, b| cmp_f64_total(*b, *a));
             }
         }
         ColumnData::Float32(v) => {
             if ascending {
-                v.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_unstable_by(|a, b| cmp_f32_total(*a, *b));
             } else {
-                v.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_unstable_by(|a, b| cmp_f32_total(*b, *a));
             }
         }
         ColumnData::Int128(v) => {
@@ -2279,32 +3015,16 @@ pub fn sort_indices(
             ColumnData::FixedBinary16(v) => sort_single_ord!(indices, v, asc),
             ColumnData::Float64(v) => {
                 if asc {
-                    indices.sort_unstable_by(|&a, &b| {
-                        v[a as usize]
-                            .partial_cmp(&v[b as usize])
-                            .unwrap_or(Ordering::Equal)
-                    });
+                    indices.sort_unstable_by(|&a, &b| cmp_f64_total(v[a as usize], v[b as usize]));
                 } else {
-                    indices.sort_unstable_by(|&a, &b| {
-                        v[b as usize]
-                            .partial_cmp(&v[a as usize])
-                            .unwrap_or(Ordering::Equal)
-                    });
+                    indices.sort_unstable_by(|&a, &b| cmp_f64_total(v[b as usize], v[a as usize]));
                 }
             }
             ColumnData::Float32(v) => {
                 if asc {
-                    indices.sort_unstable_by(|&a, &b| {
-                        v[a as usize]
-                            .partial_cmp(&v[b as usize])
-                            .unwrap_or(Ordering::Equal)
-                    });
+                    indices.sort_unstable_by(|&a, &b| cmp_f32_total(v[a as usize], v[b as usize]));
                 } else {
-                    indices.sort_unstable_by(|&a, &b| {
-                        v[b as usize]
-                            .partial_cmp(&v[a as usize])
-                            .unwrap_or(Ordering::Equal)
-                    });
+                    indices.sort_unstable_by(|&a, &b| cmp_f32_total(v[b as usize], v[a as usize]));
                 }
             }
             // Integer types already handled above by radix sort.
@@ -2431,6 +3151,46 @@ macro_rules! hash_int_column_batch {
 // Typed row hashing
 // ---------------------------------------------------------------------------
 
+/// Bit pattern an f64 hashes as: every NaN collapses onto one pattern and
+/// negative zero onto positive zero, so grouping, join, and distinct keys
+/// treat them as the single value SQL equality reports
+#[inline]
+pub fn f64_hash_bits(v: f64) -> u64 {
+    if v.is_nan() {
+        f64::NAN.to_bits()
+    } else if v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    }
+}
+
+/// f32 counterpart of f64_hash_bits.
+#[inline]
+pub fn f32_hash_bits(v: f32) -> u32 {
+    if v.is_nan() {
+        f32::NAN.to_bits()
+    } else if v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    }
+}
+
+/// Key equality for grouping, joins, distinct, and set operations over
+/// floats: value equality, with every NaN pair equal. Value equality makes
+/// negative zero equal positive zero, matching what the = operator says
+#[inline]
+pub fn f64_key_eq(a: f64, b: f64) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
+}
+
+/// f32 counterpart of f64_key_eq.
+#[inline]
+pub fn f32_key_eq(a: f32, b: f32) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
+}
+
 /// Computes a hash for a single row across multiple columns.
 /// Uses typed dispatch with fast hash combination (no SipHash overhead).
 pub fn hash_row(columns: &[&Column], row: usize) -> u64 {
@@ -2452,8 +3212,8 @@ pub fn hash_row(columns: &[&Column], row: usize) -> u64 {
                 ColumnData::UInt16(v) => hash_combine(h, v[row] as u64),
                 ColumnData::UInt32(v) => hash_combine(h, v[row] as u64),
                 ColumnData::UInt64(v) => hash_combine(h, v[row]),
-                ColumnData::Float32(v) => hash_combine(h, v[row].to_bits() as u64),
-                ColumnData::Float64(v) => hash_combine(h, v[row].to_bits()),
+                ColumnData::Float32(v) => hash_combine(h, f32_hash_bits(v[row]) as u64),
+                ColumnData::Float64(v) => hash_combine(h, f64_hash_bits(v[row])),
                 ColumnData::Utf8(v) => hash_combine(h, hash_bytes_fnv(v[row].as_bytes())),
                 ColumnData::Binary(v) => hash_combine(h, hash_bytes_fnv(&v[row])),
                 ColumnData::FixedBinary16(v) => {
@@ -2541,12 +3301,12 @@ pub fn hash_column_batch_into(columns: &[&Column], num_rows: usize, hashes: &mut
                         if col.nulls.is_null(i) {
                             hashes[i] = hash_combine(hashes[i], HASH_GOLDEN);
                         } else {
-                            hashes[i] = hash_combine(hashes[i], v[i].to_bits() as u64);
+                            hashes[i] = hash_combine(hashes[i], f32_hash_bits(v[i]) as u64);
                         }
                     }
                 } else {
                     for i in 0..num_rows {
-                        hashes[i] = hash_combine(hashes[i], v[i].to_bits() as u64);
+                        hashes[i] = hash_combine(hashes[i], f32_hash_bits(v[i]) as u64);
                     }
                 }
             }
@@ -2556,12 +3316,12 @@ pub fn hash_column_batch_into(columns: &[&Column], num_rows: usize, hashes: &mut
                         if col.nulls.is_null(i) {
                             hashes[i] = hash_combine(hashes[i], HASH_GOLDEN);
                         } else {
-                            hashes[i] = hash_combine(hashes[i], v[i].to_bits());
+                            hashes[i] = hash_combine(hashes[i], f64_hash_bits(v[i]));
                         }
                     }
                 } else {
                     for i in 0..num_rows {
-                        hashes[i] = hash_combine(hashes[i], v[i].to_bits());
+                        hashes[i] = hash_combine(hashes[i], f64_hash_bits(v[i]));
                     }
                 }
             }
@@ -2659,8 +3419,8 @@ fn column_values_equal(data: &ColumnData, a: usize, b: usize) -> bool {
         ColumnData::UInt16(v) => v[a] == v[b],
         ColumnData::UInt32(v) => v[a] == v[b],
         ColumnData::UInt64(v) => v[a] == v[b],
-        ColumnData::Float32(v) => v[a].to_bits() == v[b].to_bits(),
-        ColumnData::Float64(v) => v[a].to_bits() == v[b].to_bits(),
+        ColumnData::Float32(v) => f32_key_eq(v[a], v[b]),
+        ColumnData::Float64(v) => f64_key_eq(v[a], v[b]),
         ColumnData::Utf8(v) => v[a] == v[b],
         ColumnData::Binary(v) => v[a] == v[b],
         ColumnData::FixedBinary16(v) => v[a] == v[b],
@@ -2692,12 +3452,8 @@ fn cross_column_data_equal(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx: 
         (ColumnData::UInt16(x), ColumnData::UInt16(y)) => x[a_idx] == y[b_idx],
         (ColumnData::UInt32(x), ColumnData::UInt32(y)) => x[a_idx] == y[b_idx],
         (ColumnData::UInt64(x), ColumnData::UInt64(y)) => x[a_idx] == y[b_idx],
-        (ColumnData::Float32(x), ColumnData::Float32(y)) => {
-            x[a_idx].to_bits() == y[b_idx].to_bits()
-        }
-        (ColumnData::Float64(x), ColumnData::Float64(y)) => {
-            x[a_idx].to_bits() == y[b_idx].to_bits()
-        }
+        (ColumnData::Float32(x), ColumnData::Float32(y)) => f32_key_eq(x[a_idx], y[b_idx]),
+        (ColumnData::Float64(x), ColumnData::Float64(y)) => f64_key_eq(x[a_idx], y[b_idx]),
         (ColumnData::Utf8(x), ColumnData::Utf8(y)) => x[a_idx] == y[b_idx],
         (ColumnData::Binary(x), ColumnData::Binary(y)) => x[a_idx] == y[b_idx],
         (ColumnData::FixedBinary16(x), ColumnData::FixedBinary16(y)) => x[a_idx] == y[b_idx],
@@ -2999,5 +3755,186 @@ mod radix_sort_tests {
         let mut expect = vals.clone();
         expect.sort_unstable();
         assert_eq!(ordered, expect);
+    }
+
+    /// The counting path and the radix path have to agree on every shape
+    /// that decides between them: sign, width, direction, duplicates,
+    /// a single distinct value, and the type's extreme values.
+    #[test]
+    fn counting_path_matches_a_reference_sort() {
+        fn check_i64(vals: Vec<i64>) {
+            for asc in [true, false] {
+                let batches = vec![Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64)];
+                let got = match radix_sort_batches_values(&batches, asc) {
+                    Some(ColumnData::Int64(v)) => v,
+                    other => panic!("expected sorted i64, got {:?}", other.is_none()),
+                };
+                let mut want = vals.clone();
+                want.sort_unstable();
+                if !asc {
+                    want.reverse();
+                }
+                assert_eq!(got, want, "asc={asc}");
+            }
+        }
+
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        // Range equal to the row count, the shape the counting path targets
+        check_i64((0..5000).map(|_| (lcg(&mut state) % 5000) as i64).collect());
+        // Negatives straddling zero
+        check_i64(
+            (0..5000)
+                .map(|_| (lcg(&mut state) % 5000) as i64 - 2500)
+                .collect(),
+        );
+        // Heavy duplicates, runs far longer than the unconditional emit
+        check_i64((0..5000).map(|_| (lcg(&mut state) % 7) as i64).collect());
+        // One distinct value
+        check_i64(vec![-9; 5000]);
+        // Extremes, whose span overflows the limit and falls to radix
+        let mut extremes: Vec<i64> = (0..5000).map(|_| lcg(&mut state) as i64).collect();
+        extremes[0] = i64::MIN;
+        extremes[1] = i64::MAX;
+        check_i64(extremes);
+    }
+
+    /// Every integer width the counting path claims, at the value range
+    /// where the index arithmetic wraps in the native type.
+    #[test]
+    fn counting_path_covers_every_integer_width_at_its_extremes() {
+        macro_rules! width_case {
+            ($variant:ident, $ty:ty) => {{
+                let mut state = 0xF00D_BEEF_1234_5678u64;
+                let mut vals: Vec<$ty> =
+                    (0..3000).map(|_| (lcg(&mut state) % 251) as $ty).collect();
+                vals[0] = <$ty>::MIN;
+                vals[1] = <$ty>::MAX;
+                vals[2] = <$ty>::MIN;
+                for asc in [true, false] {
+                    let batches = vec![Column::new(
+                        ColumnData::$variant(vals.clone()),
+                        TypeId::$variant,
+                    )];
+                    let got = match radix_sort_batches_values(&batches, asc) {
+                        Some(ColumnData::$variant(v)) => v,
+                        _ => panic!(concat!(stringify!($variant), ": no sorted output")),
+                    };
+                    let mut want = vals.clone();
+                    want.sort_unstable();
+                    if !asc {
+                        want.reverse();
+                    }
+                    assert_eq!(got, want, concat!(stringify!($variant), " asc={}"), asc);
+                }
+            }};
+        }
+        width_case!(Int8, i8);
+        width_case!(Int16, i16);
+        width_case!(Int32, i32);
+        width_case!(Int64, i64);
+        width_case!(UInt8, u8);
+        width_case!(UInt16, u16);
+        width_case!(UInt32, u32);
+        width_case!(UInt64, u64);
+    }
+
+    /// The counting path's index arithmetic at the extremes of each width.
+    ///
+    /// The case above spreads values across the whole type, which for
+    /// anything wider than a byte is a range far too wide for the counting
+    /// path to accept, so it exercises radix. This one keeps the values in
+    /// a narrow band so counting is the path taken, and puts that band
+    /// hard against MIN and against MAX, which is where
+    /// `x.wrapping_sub(lo)` and `lo.wrapping_add(i)` have to wrap in the
+    /// native type to land on the right slot.
+    #[test]
+    fn counting_path_indexes_correctly_against_each_widths_bounds() {
+        macro_rules! band_case {
+            ($variant:ident, $ty:ty) => {{
+                let mut state = 0xC0FFEE_1234_5678u64;
+                // The band has to fit inside the type. A byte cannot hold a
+                // 400 wide band placed against its maximum, so the span is
+                // derived from the width rather than fixed
+                let width_span: u64 = {
+                    let range = (<$ty>::MAX as i128) - (<$ty>::MIN as i128);
+                    (400i128).min(range / 4).max(1) as u64
+                };
+                for at_max in [false, true] {
+                    let base: $ty = if at_max {
+                        <$ty>::MAX - (width_span as $ty)
+                    } else {
+                        <$ty>::MIN
+                    };
+                    let mut vals: Vec<$ty> = (0..3000)
+                        .map(|_| base.wrapping_add((lcg(&mut state) % width_span) as $ty))
+                        .collect();
+                    // Both ends of the band present, so the span is exactly
+                    // the band and lo/hi sit on the boundary values
+                    vals[0] = base;
+                    vals[1] = base.wrapping_add(width_span as $ty);
+                    for asc in [true, false] {
+                        let batches = vec![Column::new(
+                            ColumnData::$variant(vals.clone()),
+                            TypeId::$variant,
+                        )];
+                        let got = match radix_sort_batches_values(&batches, asc) {
+                            Some(ColumnData::$variant(v)) => v,
+                            _ => panic!(concat!(stringify!($variant), ": no sorted output")),
+                        };
+                        let mut want = vals.clone();
+                        want.sort_unstable();
+                        if !asc {
+                            want.reverse();
+                        }
+                        assert_eq!(
+                            got, want,
+                            concat!(stringify!($variant), " at_max={} asc={}"),
+                            at_max, asc
+                        );
+                    }
+                }
+            }};
+        }
+        band_case!(Int8, i8);
+        band_case!(Int16, i16);
+        band_case!(Int32, i32);
+        band_case!(Int64, i64);
+        band_case!(UInt8, u8);
+        band_case!(UInt16, u16);
+        band_case!(UInt32, u32);
+        band_case!(UInt64, u64);
+    }
+
+    /// Values split across batches sort as one sequence, and a range wider
+    /// than the limit still produces the same answer through radix.
+    #[test]
+    fn counting_path_spans_batches_and_yields_to_a_wide_range() {
+        let mut state = 0xABCD_0123_4567_89EFu64;
+        let mut concat: Vec<i64> = Vec::new();
+        let mut batches = Vec::new();
+        for _ in 0..4 {
+            let vals: Vec<i64> = (0..900).map(|_| (lcg(&mut state) % 3600) as i64).collect();
+            concat.extend_from_slice(&vals);
+            batches.push(Column::new(ColumnData::Int64(vals), TypeId::Int64));
+        }
+        let got = match radix_sort_batches_values(&batches, true) {
+            Some(ColumnData::Int64(v)) => v,
+            _ => panic!("no sorted output"),
+        };
+        let mut want = concat.clone();
+        want.sort_unstable();
+        assert_eq!(got, want);
+
+        // Range far wider than twice the row count, so the tally is refused
+        let sparse: Vec<i64> = (0..3000).map(|i| i as i64 * 1_000_003).collect();
+        let batches = vec![Column::new(
+            ColumnData::Int64(sparse.clone()),
+            TypeId::Int64,
+        )];
+        let got = match radix_sort_batches_values(&batches, true) {
+            Some(ColumnData::Int64(v)) => v,
+            _ => panic!("radix has to take the wide range"),
+        };
+        assert_eq!(got, sparse);
     }
 }
