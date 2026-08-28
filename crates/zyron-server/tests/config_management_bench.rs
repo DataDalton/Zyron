@@ -397,7 +397,7 @@ fn test_stat_view_query_latency() {
 
     let before = take_util_snapshot();
 
-    // Simulate what query_stat_view does: build field descriptions + data rows
+    // Simulate what query_system_view does: build field descriptions + data rows
     // from atomic counter reads and string formatting.
     // We test the formatting overhead directly since we cannot construct a full ServerState.
 
@@ -412,7 +412,7 @@ fn test_stat_view_query_latency() {
     for _ in 0..VALIDATION_RUNS {
         let start = Instant::now();
         for _ in 0..iterations {
-            // Simulate reading 12 atomic counters (zyron_stat_tables columns)
+            // Simulate reading 12 atomic counters (zyron_sys.stat.tables columns)
             let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(12);
             for counter in &counters {
                 let val = counter.load(std::sync::atomic::Ordering::Relaxed);
@@ -440,13 +440,25 @@ fn test_stat_view_query_latency() {
     assert!(!v.regression_detected, "Stat view regression detected");
 
     // Verify is_stat_view correctness
-    assert!(zyron_wire::stat_views::is_stat_view("zyron_stat_activity"));
-    assert!(zyron_wire::stat_views::is_stat_view("zyron_stat_tables"));
-    assert!(zyron_wire::stat_views::is_stat_view("zyron_stat_indexes"));
-    assert!(zyron_wire::stat_views::is_stat_view("zyron_stat_wal"));
-    assert!(zyron_wire::stat_views::is_stat_view("zyron_stat_bgwriter"));
-    assert!(!zyron_wire::stat_views::is_stat_view("pg_stat_activity"));
-    assert!(!zyron_wire::stat_views::is_stat_view(""));
+    assert!(zyron_wire::system_views::is_system_view(
+        "zyron_sys.stat.activity"
+    ));
+    assert!(zyron_wire::system_views::is_system_view(
+        "zyron_sys.stat.tables"
+    ));
+    assert!(zyron_wire::system_views::is_system_view(
+        "zyron_sys.stat.indexes"
+    ));
+    assert!(zyron_wire::system_views::is_system_view(
+        "zyron_sys.stat.wal"
+    ));
+    assert!(zyron_wire::system_views::is_system_view(
+        "zyron_sys.stat.bgwriter"
+    ));
+    assert!(!zyron_wire::system_views::is_system_view(
+        "pg_stat_activity"
+    ));
+    assert!(!zyron_wire::system_views::is_system_view(""));
     tprintln!("  Stat view name recognition: PASS");
 
     let after = take_util_snapshot();

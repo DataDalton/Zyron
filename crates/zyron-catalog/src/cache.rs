@@ -283,6 +283,11 @@ impl CatalogCache {
         self.databases.write().insert(id, arc);
     }
 
+    /// Every cached catalog entry.
+    pub fn list_databases(&self) -> Vec<Arc<DatabaseEntry>> {
+        self.databases.read().values().cloned().collect()
+    }
+
     pub fn invalidate_database(&self, id: DatabaseId) {
         if let Some(entry) = self.databases.write().remove(&id) {
             let key = name_key(0, &entry.name);
@@ -324,6 +329,11 @@ impl CatalogCache {
                 .remove_if_sync(&ekey, |v| v.id == evicted_id);
         }
         let _ = self.schema_by_name.insert_sync(key, arc);
+    }
+
+    /// Every cached schema across all catalogs.
+    pub fn list_all_schemas(&self) -> Vec<Arc<SchemaEntry>> {
+        self.schemas.read().values().cloned().collect()
     }
 
     pub fn invalidate_schema(&self, id: SchemaId) {
@@ -470,6 +480,11 @@ impl CatalogCache {
 
     pub fn get_index(&self, id: IndexId) -> Option<Arc<IndexEntry>> {
         self.indexes.read().get(&id).cloned()
+    }
+
+    /// Every cached index across all tables.
+    pub fn list_all_indexes(&self) -> Vec<Arc<IndexEntry>> {
+        self.indexes.read().values().cloned().collect()
     }
 
     pub fn get_indexes_for_table(&self, table_id: TableId) -> Vec<Arc<IndexEntry>> {

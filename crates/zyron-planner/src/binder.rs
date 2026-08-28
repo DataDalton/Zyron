@@ -2427,6 +2427,26 @@ impl<'a> Binder<'a> {
     /// Resolves a table through a per-bind memo so a statement that
     /// references the same table many times pays the resolver (cache lookup
     /// or, on miss, a heap scan) once. Mirrors `NameResolver::resolve_table`.
+    /// Resolves a possibly catalog-qualified relation name, memoized per
+    /// bind so a name referenced twice in one statement resolves once.
+    async fn rel_memo(&self, name: &str) -> Result<Arc<TableEntry>> {
+        let key = (None, name.to_string());
+        if let Some(e) = self
+            .table_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(Arc::clone(e));
+        }
+        let entry = self.resolver.resolve_relation(name).await?;
+        self.table_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::clone(&entry));
+        Ok(entry)
+    }
+
     async fn rt_memo(&self, schema: Option<&str>, name: &str) -> Result<Arc<TableEntry>> {
         let key = (schema.map(|s| s.to_string()), name.to_string());
         if let Some(e) = self
@@ -3073,14 +3093,12 @@ impl<'a> Binder<'a> {
                         });
                     }
 
-                    // Parse optional schema qualifier (schema.table)
-                    let (schema_name, table_name) = if let Some(dot_pos) = name.find('.') {
-                        (Some(&name[..dot_pos]), &name[dot_pos + 1..])
-                    } else {
-                        (None, name.as_str())
-                    };
-
-                    let entry = self.rt_memo(schema_name, table_name).await?;
+                    // A name arrives as `object`, `schema.object`, or
+                    // `catalog.schema.object`. The resolver owns the split so
+                    // a three-part name reaches the catalog it names instead
+                    // of looking for a schema called `zyron_sys` holding a
+                    // table called `core.tables`
+                    let entry = self.rel_memo(name).await?;
                     let idx = self.alloc_table_idx();
 
                     let columns: Vec<BoundColumnDef> = entry
@@ -7200,13 +7218,15 @@ fn as_qualified_col(expr: &Expr) -> Result<(String, String)> {
     }
 }
 
-/// Splits an optionally schema-qualified name into (schema, table) pieces.
+/// Splits an optionally qualified name into (schema, table) pieces, dropping
+/// a catalog qualifier when one is present.
+///
+/// Used by the DDL paths that resolve against the session's own catalog. A
+/// three-part name there names the schema in its middle part, so the split
+/// keeps that rather than treating the catalog as the schema.
 fn split_qualified(name: &str) -> (Option<&str>, &str) {
-    if let Some(pos) = name.find('.') {
-        (Some(&name[..pos]), &name[pos + 1..])
-    } else {
-        (None, name)
-    }
+    let (_, schema, object) = zyron_catalog::resolver::split_relation_name(name);
+    (schema, object)
 }
 
 /// Returns the alias to register for a streaming source table scope.

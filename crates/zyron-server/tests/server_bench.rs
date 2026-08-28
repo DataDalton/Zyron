@@ -122,6 +122,14 @@ async fn create_test_state(
             .expect("Catalog creation failed"),
     );
 
+    // The server registers the zyron_sys catalog before it accepts a
+    // connection. A harness that skipped it would serve system views whose
+    // catalog and schema rows do not exist, so the two core navigation views
+    // would disagree with production
+    zyron_catalog::SystemCatalog::init(&catalog)
+        .await
+        .expect("register the zyron_sys catalog");
+
     catalog
         .create_database("testdb", "test_user")
         .await
@@ -1964,12 +1972,38 @@ server_test!(
 // Test 18: Stat View Completeness
 // ---------------------------------------------------------------------------
 
+/// The predicates an entity needs before it can answer.
+///
+/// A version diff is between two named versions and a slot read names a slot,
+/// so those refuse a bare call rather than inventing arguments. Everything
+/// else answers as it stands.
+fn system_entity_query(schema: &str, object: &str) -> String {
+    match (schema, object) {
+        ("time_travel", "diff_versions") => "SELECT * FROM zyron_sys.time_travel.diff_versions \
+             WHERE from_version = 1 AND to_version = 2"
+            .to_string(),
+        ("compliance", "report") => {
+            "SELECT * FROM zyron_sys.compliance.report('audit')".to_string()
+        }
+        ("cdc", "create_replication_slot") => {
+            "SELECT * FROM zyron_sys.cdc.create_replication_slot('wire_probe_slot')".to_string()
+        }
+        // Reads a slot the setup made, not the one the function above
+        // creates. Sharing one slot between them would make this test depend
+        // on the order the registry happens to list them in
+        ("cdc", "logical_slot_get_changes") => {
+            "SELECT * FROM zyron_sys.cdc.logical_slot_get_changes('wire_read_slot')".to_string()
+        }
+        _ => format!("SELECT * FROM zyron_sys.{}.{}", schema, object),
+    }
+}
+
 server_test!(
-    test_18_stat_view_completeness,
-    "Stat View Completeness Test",
+    test_18_system_catalog_wire_surface,
+    "System Catalog Wire Surface Test",
     |client| {
         Box::pin(async move {
-            // Generate some activity
+            // Some activity so the stat views have something to report
             assert_query_ok(
                 client,
                 "CREATE TABLE stat_t (id INT)",
@@ -1979,32 +2013,113 @@ server_test!(
             .await;
             let _ = query_full(client, "INSERT INTO stat_t VALUES (1)").await;
 
-            // Query each stat view
-            let views = [
-                "zyron_stat_activity",
-                "zyron_stat_wal",
-                "zyron_stat_bgwriter",
-                "zyron_stat_tables",
-                "zyron_stat_indexes",
-                "zyron_stat_streaming_jobs",
-                "zyron_stat_triggers",
-                "zyron_stat_branches",
-            ];
-            let mut verified = 0;
-            for view in &views {
-                let sql = format!("SELECT * FROM {}", view);
-                let msgs = query_full(client, &sql).await.expect(view);
-                assert!(!has_error(&msgs), "{} returned error", view);
-                assert!(
-                    has_row_description(&msgs),
-                    "{} missing RowDescription",
-                    view
-                );
+            // A slot for the change-reading function to read. Made here so
+            // the two cdc functions are independent of each other
+            assert_query_ok(
+                client,
+                "CREATE REPLICATION SLOT wire_read_slot PLUGIN 'zyron_cdc'",
+                "CREATE_REPLICATION_SLOT",
+                "slot for the reader",
+            )
+            .await;
+
+            // ---------------------------------------------------------------
+            // Every registered entity answers over the wire
+            // ---------------------------------------------------------------
+            //
+            // The registry is the list, not a copy of it, so an entity added
+            // in a later phase is covered here the day it is registered. The
+            // slot-creating function runs before the slot-reading one because
+            // the reader needs the slot the writer makes; the registry keeps
+            // them in that order.
+            let mut verified = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            for object in zyron_catalog::SYSTEM_OBJECTS {
+                let name = object.canonical_name();
+                let sql = system_entity_query(object.schema, object.object);
+                let msgs = match query_full(client, &sql).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        failures.push(format!("{name}: transport error {e}"));
+                        continue;
+                    }
+                };
+                if has_error(&msgs) {
+                    failures.push(format!("{name}: {}", extract_error_message(&msgs)));
+                    continue;
+                }
+                if !has_row_description(&msgs) {
+                    failures.push(format!("{name}: no RowDescription"));
+                    continue;
+                }
                 verified += 1;
             }
+            assert!(
+                failures.is_empty(),
+                "{} of {} system entities failed over the wire:\n  {}",
+                failures.len(),
+                zyron_catalog::SYSTEM_OBJECTS.len(),
+                failures.join("\n  ")
+            );
+            assert_eq!(
+                verified,
+                zyron_catalog::SYSTEM_OBJECTS.len(),
+                "not every registered entity was reached"
+            );
+            tprintln!("  {} system entities answered over the wire", verified);
+
+            // ---------------------------------------------------------------
+            // The two bare names the default search path resolves
+            // ---------------------------------------------------------------
+            //
+            // The bench sets search_path to its own schema, so the default is
+            // restored for this check and put back afterwards. Resolving a
+            // bare name is a property of the path, not of the catalog, and
+            // testing it under the bench's path would test nothing.
+            assert_query_ok(
+                client,
+                "SET search_path = 'zyron_sys.core, zyron_sys.stat, public'",
+                "SET",
+                "system search path",
+            )
+            .await;
+            for (bare, qualified) in [
+                ("tables", "zyron_sys.core.tables"),
+                ("activity", "zyron_sys.stat.activity"),
+            ] {
+                let bare_msgs = query_full(client, &format!("SELECT * FROM {bare}"))
+                    .await
+                    .expect(bare);
+                assert!(
+                    !has_error(&bare_msgs),
+                    "bare `{bare}` failed: {}",
+                    extract_error_message(&bare_msgs)
+                );
+                let qualified_msgs = query_full(client, &format!("SELECT * FROM {qualified}"))
+                    .await
+                    .expect(qualified);
+                let bare_rows = bare_msgs.iter().filter(|(t, _)| *t == b'D').count();
+                let qualified_rows = qualified_msgs.iter().filter(|(t, _)| *t == b'D').count();
+                assert_eq!(
+                    bare_rows, qualified_rows,
+                    "`{bare}` and `{qualified}` returned different row counts"
+                );
+            }
+            tprintln!("  bare `tables` and `activity` resolve through the search path");
+            assert_query_ok(client, "SET search_path = bench", "SET", "restore path").await;
+
+            // A name under the system catalog that is not registered is
+            // refused rather than handed to the planner, which would look for
+            // a user table of that name and report the wrong thing
+            let msgs = query_full(client, "SELECT * FROM zyron_sys.core.test_canary")
+                .await
+                .expect("canary");
+            assert!(has_error(&msgs), "the canary answered");
+            let text = extract_error_message(&msgs);
+            assert!(text.contains("does not exist"), "canary: {text}");
+            tprintln!("  an unregistered system name is refused");
 
             assert_query_ok(client, "DROP TABLE stat_t", "DROP TABLE", "cleanup").await;
-            tprintln!("  {} stat views queried without error", verified);
         })
     }
 );
@@ -2267,7 +2382,7 @@ server_test!(test_20_cdc_roundtrip, "CDC DDL Roundtrip Test", |client| {
         let _ = query_full(client, "DELETE FROM cdc_t WHERE id = 1").await;
 
         // Query CDC stat views
-        let msgs = query_full(client, "SELECT * FROM zyron_stat_cdc_feeds")
+        let msgs = query_full(client, "SELECT * FROM zyron_sys.stat.cdc_feeds")
             .await
             .expect("cdc feeds");
         assert!(!has_error(&msgs), "cdc feeds should not error");
@@ -2454,7 +2569,7 @@ server_test!(test_23_versioning_ddl, "Versioning DDL Test", |client| {
         assert_query_ok(client, "DROP BRANCH ver_b", "DROP BRANCH", "drop branch").await;
 
         // Stat view
-        let msgs = query_full(client, "SELECT * FROM zyron_stat_branches")
+        let msgs = query_full(client, "SELECT * FROM zyron_sys.stat.branches")
             .await
             .expect("branches");
         assert!(!has_error(&msgs), "branches view should not error");

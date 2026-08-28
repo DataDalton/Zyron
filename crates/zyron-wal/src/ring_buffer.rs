@@ -84,7 +84,7 @@ pub struct RingBuffer {
     /// is also the highest LSN with no unwritten record below it.
     max_lsn: CachePadded<AtomicU64>,
     /// Total record count drained past the watermark, advanced by the flush
-    /// thread so observers (zyron_stat_wal, tests) see counts without the
+    /// thread so observers (zyron_sys.stat.wal, tests) see counts without the
     /// writer maintaining a contended counter on the hot path.
     committed_records: CachePadded<AtomicU64>,
     /// Read cursor: bytes already drained. Owned by the flush thread;

@@ -143,6 +143,10 @@ pub enum ZyronError {
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
+    /// A name in a FROM clause resolved to nothing.
+    #[error("relation `{name}` does not exist")]
+    RelationNotFound { name: String },
+
     #[error("Table already exists: {0}")]
     TableAlreadyExists(String),
 
@@ -486,6 +490,11 @@ impl ZyronError {
             txn_id,
             reason: reason.into(),
         }
+    }
+
+    /// A relation name that resolved to nothing.
+    pub fn relation_not_found(name: impl Into<String>) -> Self {
+        ZyronError::RelationNotFound { name: name.into() }
     }
 }
 

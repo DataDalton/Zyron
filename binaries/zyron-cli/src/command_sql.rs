@@ -18,11 +18,17 @@ use crate::command::{
 
 /// Returns the SQL statement(s) that implement `cmd` on the server. For
 /// purely local commands (help, clear, toggles, etc.) returns `None`.
+///
+/// Every statement here names an entity of the `zyron_sys` catalog by its
+/// canonical three-part name. The system entities answer a projection, a
+/// conjunction of equalities, LIMIT, and OFFSET, and refuse everything else,
+/// so none of these carries an ORDER BY: a view that cannot sort would
+/// reject the statement rather than return unsorted rows.
 pub fn command_to_sql(cmd: &Command) -> Option<String> {
     match cmd {
         Command::Tables(TablesAction::List) => Some(
-            "SELECT table_name, schema_name, row_count, page_count, last_analyze \
-             FROM zyron_stat_tables ORDER BY schema_name, table_name"
+            "SELECT table_name, schema_name, storage_format, column_count \
+             FROM zyron_sys.core.tables"
                 .into(),
         ),
         Command::Tables(TablesAction::Describe(name)) => {
@@ -36,13 +42,13 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
         }
 
         Command::Indexes(IndexesAction::List) => Some(
-            "SELECT index_name, table_name, index_type, unique_index, idx_scan \
-             FROM zyron_stat_indexes ORDER BY table_name, index_name"
+            "SELECT index_name, table_name, schema_name, index_type, is_unique \
+             FROM zyron_sys.storage.indexes"
                 .into(),
         ),
         Command::Indexes(IndexesAction::Describe(name)) => Some(format!(
-            "SELECT index_name, table_name, index_type, columns, unique_index \
-             FROM zyron_stat_indexes WHERE index_name = {}",
+            "SELECT index_name, table_name, index_type, key_columns, is_unique \
+             FROM zyron_sys.storage.indexes WHERE index_name = {}",
             quote_string(name)
         )),
         Command::Indexes(IndexesAction::Drop(name)) => {
@@ -53,8 +59,8 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
         }
 
         Command::Users(UsersAction::List) => Some(
-            "SELECT username, can_login, is_superuser, valid_until \
-             FROM zyron_stat_users ORDER BY username"
+            "SELECT username, can_login, is_superuser, locked, valid_until \
+             FROM zyron_sys.security.users"
                 .into(),
         ),
         Command::Users(UsersAction::Create(name)) => {
@@ -83,13 +89,13 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
         )),
 
         Command::Schemas => Some(
-            "SELECT schema_name, owner, created_at FROM zyron_stat_schemas \
-             ORDER BY schema_name"
+            "SELECT catalog_name, schema_name, owner, is_system \
+             FROM zyron_sys.core.schemas"
                 .into(),
         ),
         Command::Databases => Some(
-            "SELECT database_name, owner, created_at FROM zyron_stat_databases \
-             ORDER BY database_name"
+            "SELECT catalog_name, owner, created_at, is_system \
+             FROM zyron_sys.core.databases"
                 .into(),
         ),
 
@@ -100,11 +106,11 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
         Command::Checkpoint => Some("CHECKPOINT".into()),
 
         // -- Ops surface --
-        Command::Wal(WalAction::Status) => Some("SELECT * FROM zyron_stat_wal".into()),
+        Command::Wal(WalAction::Status) => Some("SELECT * FROM zyron_sys.stat.wal".into()),
 
         Command::Slots(SlotsAction::List) => Some(
-            "SELECT slot_name, slot_type, active, restart_lsn, confirmed_flush_lsn \
-             FROM zyron_stat_replication_slots ORDER BY slot_name"
+            "SELECT name, plugin, active, restart_lsn, confirmed_lsn, lag_bytes \
+             FROM zyron_sys.stat.replication_slots"
                 .into(),
         ),
         Command::Slots(SlotsAction::Create { name }) => {
@@ -114,15 +120,9 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
             Some(format!("DROP REPLICATION SLOT {}", quote_ident(name)))
         }
 
-        Command::Cdc(CdcAction::Streams) => {
-            Some("SELECT * FROM zyron_stat_cdc_streams ORDER BY stream_name".into())
-        }
-        Command::Cdc(CdcAction::Feeds) => {
-            Some("SELECT * FROM zyron_stat_cdc_feeds ORDER BY table_id".into())
-        }
-        Command::Cdc(CdcAction::Ingests) => {
-            Some("SELECT * FROM zyron_stat_cdc_ingests ORDER BY ingest_name".into())
-        }
+        Command::Cdc(CdcAction::Streams) => Some("SELECT * FROM zyron_sys.stat.cdc_streams".into()),
+        Command::Cdc(CdcAction::Feeds) => Some("SELECT * FROM zyron_sys.stat.cdc_feeds".into()),
+        Command::Cdc(CdcAction::Ingests) => Some("SELECT * FROM zyron_sys.stat.cdc_ingests".into()),
         Command::Cdc(CdcAction::DropStream { name }) => {
             Some(format!("DROP CDC STREAM {}", quote_ident(name)))
         }
@@ -137,7 +137,9 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
             quote_string(value)
         )),
 
-        Command::Sessions(SessionsAction::List) => Some("SELECT * FROM zyron_stat_activity".into()),
+        Command::Sessions(SessionsAction::List) => {
+            Some("SELECT * FROM zyron_sys.stat.activity".into())
+        }
 
         Command::Archive {
             table,
@@ -167,12 +169,10 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
             ),
         }),
 
-        Command::Branches => Some("SELECT * FROM zyron_stat_branches ORDER BY branch_name".into()),
-        Command::Triggers => {
-            Some("SELECT * FROM zyron_stat_triggers ORDER BY table_name, trigger_name".into())
-        }
-        Command::Jobs => Some("SELECT * FROM zyron_stat_streaming_jobs ORDER BY job_name".into()),
-        Command::Buffer => Some("SELECT * FROM zyron_stat_bgwriter".into()),
+        Command::Branches => Some("SELECT * FROM zyron_sys.stat.branches".into()),
+        Command::Triggers => Some("SELECT * FROM zyron_sys.stat.trigger_executions".into()),
+        Command::Jobs => Some("SELECT * FROM zyron_sys.streaming.jobs".into()),
+        Command::Buffer => Some("SELECT * FROM zyron_sys.stat.bgwriter".into()),
 
         // Non-server or handled directly by the dispatcher.
         Command::Help { .. }
@@ -195,12 +195,12 @@ pub fn command_to_sql(cmd: &Command) -> Option<String> {
 /// renders one table rather than six.
 fn stats_sql(view: Option<StatsView>) -> String {
     match view {
-        Some(StatsView::Wal) => "SELECT * FROM zyron_stat_wal".into(),
-        Some(StatsView::Tables) => "SELECT * FROM zyron_stat_tables".into(),
-        Some(StatsView::Indexes) => "SELECT * FROM zyron_stat_indexes".into(),
-        Some(StatsView::Buffer) => "SELECT * FROM zyron_stat_buffer".into(),
-        Some(StatsView::Connections) => "SELECT * FROM zyron_stat_connections".into(),
-        None | Some(StatsView::Summary) => "SELECT * FROM zyron_stat_summary".into(),
+        Some(StatsView::Wal) => "SELECT * FROM zyron_sys.stat.wal".into(),
+        Some(StatsView::Tables) => "SELECT * FROM zyron_sys.stat.tables".into(),
+        Some(StatsView::Indexes) => "SELECT * FROM zyron_sys.stat.indexes".into(),
+        Some(StatsView::Buffer) => "SELECT * FROM zyron_sys.stat.bgwriter".into(),
+        Some(StatsView::Connections) => "SELECT * FROM zyron_sys.stat.activity".into(),
+        None | Some(StatsView::Summary) => "SELECT * FROM zyron_sys.stat.summary".into(),
     }
 }
 

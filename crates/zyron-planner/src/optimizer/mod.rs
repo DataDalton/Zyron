@@ -35,7 +35,7 @@ impl<'a> Optimizer<'a> {
             Box::new(rules::ProjectionPushdown),
             Box::new(rules::JoinReorder::new()),
             Box::new(rules::EncodingPushdown),
-            Box::new(rules::IndexAdvisor::new()),
+            Box::new(rules::SharedIndexAdvisor::new()),
         ];
         Self {
             catalog,

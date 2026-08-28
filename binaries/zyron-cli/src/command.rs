@@ -6,7 +6,7 @@
 //!
 //! Every command that needs server interaction compiles to SQL against
 //! either regular statements (GRANT/REVOKE/DROP/TRUNCATE/VACUUM) or stat
-//! views (`SELECT ... FROM zyron_stat_*`). This keeps server-side
+//! views (`SELECT ... FROM zyron_sys.stat.*`). This keeps server-side
 //! compatibility with any PG-protocol client and lets the server-side
 //! privilege machinery enforce access identically for CLI and GUI clients.
 //!
@@ -111,7 +111,7 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 pub enum WalAction {
-    /// `SELECT * FROM zyron_stat_wal`.
+    /// `SELECT * FROM zyron_sys.stat.wal`.
     Status,
 }
 
@@ -144,7 +144,7 @@ pub enum ConfigAction {
 
 #[derive(Debug, Clone)]
 pub enum SessionsAction {
-    /// `SELECT * FROM zyron_stat_activity`.
+    /// `SELECT * FROM zyron_sys.stat.activity`.
     List,
 }
 

@@ -208,7 +208,8 @@ pub struct WalWriter {
     /// Set to true by the flush thread when an I/O error occurs during flush.
     /// Checked by append() to fail fast instead of buffering into a broken WAL.
     flush_io_error: Arc<AtomicBool>,
-    /// Total fsync calls (for zyron_stat_wal). Arc-shared with the flush thread.
+    /// Total fsync calls (for zyron_sys.stat.wal). Arc-shared with the flush
+    /// thread.
     pub wal_syncs: Arc<AtomicU64>,
     /// Retention hook that returns the minimum LSN that must be retained.
     /// Used by replication slots to prevent WAL segment deletion.

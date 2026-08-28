@@ -445,6 +445,11 @@ impl Server {
         // Load catalog entries from disk
         catalog.load().await?;
 
+        // Register the zyron_sys catalog and its schemas before any
+        // connection is accepted. Idempotent: a restart finds the rows and
+        // only re-derives the schema id set that keeps DDL out of them
+        zyron_catalog::SystemCatalog::init(&catalog).await?;
+
         // 7. Create TransactionManager
         let txn_manager = Arc::new(TransactionManager::with_start_txn_id(
             Arc::clone(&wal),
@@ -1308,10 +1313,10 @@ impl Server {
             })),
             data_dir: data_dir.clone(),
             session_info_collector: Some(Arc::new(
-                move || -> Vec<zyron_wire::stat_views::SessionRow> {
+                move || -> Vec<zyron_wire::system_views::SessionRow> {
                     let mut rows = Vec::new();
                     session_mgr_for_view.for_each(|info| {
-                        rows.push(zyron_wire::stat_views::SessionRow {
+                        rows.push(zyron_wire::system_views::SessionRow {
                             pid: info.process_id,
                             user_name: info.user.clone(),
                             database: info.database.clone(),

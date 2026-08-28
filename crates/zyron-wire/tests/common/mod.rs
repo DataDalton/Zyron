@@ -96,6 +96,12 @@ async fn create_test_server_configured(
             .await
             .expect("catalog"),
     );
+    // The server registers the zyron_sys catalog before it accepts a
+    // connection, so a harness that skipped it would run tests against an
+    // engine that does not exist
+    zyron_catalog::SystemCatalog::init(&catalog)
+        .await
+        .expect("register the zyron_sys catalog");
     let public_schema = catalog
         .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
         .await

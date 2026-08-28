@@ -1,0 +1,136 @@
+# suite:   catalog
+# run:     2026-08-28_030421_41c919a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Benchmark: ANALYZE Throughput ===
+  ANALYZE throughput (rows/sec) [PASS/OK]:
+    Runs: [16,245,370, 20,232,676, 20,971,835, 20,560,056, 21,153,724]
+    Average: 19,832,732 >= 8,000,000 (target)
+    Min/Max: 16,245,370 / 21,153,724, StdDev: 1,822,125
+
+=== Benchmark: Cache Hit Rate ===
+  Cache hit rate [PASS]: 1 >= 1 (target)
+
+=== Benchmark: DDL Create Latency ===
+  Create table latency (us/op) [PASS/OK]:
+    Runs: [101.0350, 100.4950, 99.3900, 155.0200, 110.9700]
+    Average: 113.3820 <= 200 (target)
+    Min/Max: 99.3900 / 155.0200, StdDev: 21.2313
+
+=== Benchmark: DDL Drop Latency ===
+  Drop table latency (us/op) [FAIL/OK]:
+    Runs: [113.5200, 123.6200, 91.0150, 102.0600, 108.0700]
+    Average: 107.6570 <= 80 (target)
+    Min/Max: 91.0150 / 123.6200, StdDev: 10.9329
+
+=== Benchmark: Histogram Build Latency ===
+  Histogram build latency (ms/col) [PASS/OK]:
+    Runs: [0.0034, 0.0005, 0.0005, 0.0003, 0.0003]
+    Average: 0.0010 <= 10 (target)
+    Min/Max: 0.0003 / 0.0034, StdDev: 0.0012
+
+=== Benchmark: Recovery Time ===
+  Recovery time (ms) [FAIL/REGR!]:
+    Runs: [5.0037, 0.3560, 0.3048, 0.2507, 0.2403]
+    Average: 1.2311 <= 1 (target)
+    Min/Max: 0.2403 / 5.0037, StdDev: 1.8868
+
+=== Benchmark: Schema Resolve Latency ===
+  Resolve latency (ns/op) [PASS/OK]:
+    Runs: [45.5166, 45.5036, 45.5802, 47.8598, 45.5188]
+    Average: 45.9958 <= 100 (target)
+    Min/Max: 45.5036 / 47.8598, StdDev: 0.9324
+
+=== Benchmark: Table Lookup Latency ===
+  Lookup latency (ns/op) [PASS/OK]:
+    Runs: [24.1908, 24.0425, 24.2154, 24.2145, 24.0861]
+    Average: 24.1499 <= 50 (target)
+    Min/Max: 24.0425 / 24.2154, StdDev: 0.0718
+
+============================================
+  Catalog - All Tests Complete
+============================================
+  DDL Persistence:    1 test (create + reload)
+  Name Resolution:    1 test (6 cases)
+  Column Types:       1 test (29 types)
+  Constraints:        1 test (5 constraint types)
+  DDL Create/Drop:    1 test (8 operations)
+  Statistics:         1 test (100K rows)
+  Crash Recovery:     1 test (3 object types)
+  Benchmarks:         8 performance tests
+============================================
+
+=== Column Type Roundtrip ===
+  All 29 column types roundtripped: PASS
+  Default expression preserved: PASS
+
+=== Constraint Storage ===
+  PRIMARY KEY (column-level): PASS
+  PRIMARY KEY (table-level, composite): PASS
+  UNIQUE constraint: PASS
+  NOT NULL constraint: PASS
+  DEFAULT value: PASS
+  All constraint tables listed: PASS (5 tables)
+
+=== DDL Create/Drop Cycle ===
+  Create table: PASS
+  Create index: PASS
+  Drop index: PASS
+  Drop table: PASS
+  Create/drop schema: PASS
+  Create/drop database: PASS
+  Duplicate database detection: PASS
+
+=== DDL Persistence ===
+  Created: database=DatabaseId(10000), schema=SchemaId(10001), table=TableId(10002), idx1=IndexId(10003), idx2=IndexId(10004)
+  Database reload: PASS
+  Schema reload: PASS
+  Table reload: PASS (10 columns)
+  Column metadata: PASS
+  Index reload: PASS (2 indexes, 1 unique, 1 composite)
+
+=== Name Resolution ===
+  Resolve 'users' -> app.users: PASS
+  Resolve 'orders' -> app.orders: PASS
+  Resolve 'catalog_test.users' -> catalog_test.users: PASS
+  Resolve 'nonexistent' -> error: PASS
+  Resolve column 'user_id': PASS
+  Resolve nonexistent column -> error: PASS
+
+=== Crash Recovery ===
+  Database survived crash: PASS
+  Schema survived crash: PASS
+  Table survived crash: PASS (2 columns)
+
+=== Statistics Collection ===
+  Inserting 100000 rows...
+  Row count: 100000 (expected 100000): PASS
+  Page count: 200: PASS
+  Avg row size: 8 bytes: PASS
+  Distinct count: 100000: PASS
+  Histogram: 100 buckets, total=100000: PASS
+  MCV: 10 entries: PASS
+  Stats store/retrieve: PASS
+  ANALYZE: 5993 us for 100000 rows (16686134 rows/sec)
+
+=== Benchmark: System Catalog Name Resolution ===
+  Three-part hit (ns/op) [PASS/OK]:
+    Runs: [97.8466, 97.9146, 97.9568, 97.8267, 97.9430]
+    Average: 97.8975 <= 500 (target)
+    Min/Max: 97.8267 / 97.9568, StdDev: 0.0519
+  Three-part miss (ns/op) [PASS/OK]:
+    Runs: [47.1161, 46.8484, 47.1519, 47.0665, 46.8402]
+    Average: 47.0046 <= 500 (target)
+    Min/Max: 46.8402 / 47.1519, StdDev: 0.1337
+  Search path hit (ns/op) [PASS/OK]:
+    Runs: [57.0046, 57.2087, 57.2248, 57.2266, 57.3057]
+    Average: 57.1941 <= 800 (target)
+    Min/Max: 57.0046 / 57.3057, StdDev: 0.1006
+  Search path miss (ns/op) [PASS/OK]:
+    Runs: [107.2607, 107.1856, 107.8232, 107.6657, 107.4077]
+    Average: 107.4686 <= 800 (target)
+    Min/Max: 107.1856 / 107.8232, StdDev: 0.2415
+  Registry: 69 objects across 57 schemas

@@ -539,6 +539,110 @@ impl StreamJobHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Runner reporting
+// ---------------------------------------------------------------------------
+
+/// What one runner has done, published to the process-wide streaming metrics
+/// registry after each poll cycle.
+///
+/// A runner drives one source through one filter/project stage into one sink,
+/// so it reports as a single operator keyed by the job's id. Publishing after
+/// the cycle rather than per record keeps the mutex out of the row path: one
+/// map write per poll, however many rows the poll carried.
+struct RunnerReport {
+    job_name: String,
+    operator_id: u32,
+    source_id: u32,
+    records_in: u64,
+    records_out: u64,
+    processing_ns: u64,
+    watermark_ms: i64,
+}
+
+impl RunnerReport {
+    fn new(entry: &StreamingJobEntry) -> Self {
+        Self {
+            job_name: entry.name.clone(),
+            operator_id: entry.id.0,
+            source_id: entry.source_table_id.0,
+            records_in: 0,
+            records_out: 0,
+            processing_ns: 0,
+            watermark_ms: i64::MIN,
+        }
+    }
+
+    /// Records one poll cycle: how many rows the source produced, how many
+    /// survived to the sink, how long the cycle took, the newest event time
+    /// seen, and how full the read batch came back.
+    ///
+    /// A poll that fills its batch is the observable form of backpressure
+    /// here: the source had at least as much as one cycle could take, so the
+    /// ratio of rows read to batch size is what the queue occupancy is.
+    fn cycle(
+        &mut self,
+        read: usize,
+        written: usize,
+        elapsed: std::time::Duration,
+        event_time_ms: Option<i64>,
+    ) {
+        let registry = crate::metrics::global_metrics();
+        self.records_in = self.records_in.saturating_add(read as u64);
+        self.records_out = self.records_out.saturating_add(written as u64);
+        self.processing_ns = self
+            .processing_ns
+            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+        if let Some(ms) = event_time_ms {
+            if ms > self.watermark_ms {
+                self.watermark_ms = ms;
+            }
+        }
+        registry.record_ingested(read as u64);
+        registry.record_emitted(written as u64);
+
+        let now_ms = now_millis();
+        if self.watermark_ms > i64::MIN {
+            registry.update_global_watermark(self.watermark_ms);
+            registry.update_source_watermark(self.source_id, self.watermark_ms, now_ms);
+        }
+        registry.publish_operator_metrics(crate::metrics::OperatorMetricsView {
+            job_name: self.job_name.clone(),
+            operator_name: RUNNER_OPERATOR_NAME.to_string(),
+            operator_id: self.operator_id,
+            input_records_total: self.records_in,
+            output_records_total: self.records_out,
+            processing_time_ns_total: self.processing_ns,
+            current_watermark_ms: self.watermark_ms,
+        });
+        registry.publish_backpressure(crate::metrics::BackpressureView {
+            job_name: self.job_name.clone(),
+            operator_name: RUNNER_OPERATOR_NAME.to_string(),
+            operator_id: self.operator_id,
+            ratio: read as f64 / RUNNER_BATCH as f64,
+            queue_usage: read,
+            queue_capacity: RUNNER_BATCH,
+        });
+    }
+
+    /// Clears this job's readings so the views stop reporting a runner that
+    /// has exited.
+    fn finish(&self) {
+        crate::metrics::global_metrics().forget_job(&self.job_name);
+    }
+}
+
+/// Name the runner reports its single stage under.
+const RUNNER_OPERATOR_NAME: &str = "source_filter_sink";
+
+/// Wall-clock milliseconds, used to stamp when a watermark last advanced.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Runner loop
 // ---------------------------------------------------------------------------
 
@@ -584,6 +688,8 @@ fn run_loop(
         }
     };
 
+    let mut report = RunnerReport::new(&entry);
+
     loop {
         if stop_flag.load(Ordering::Acquire) {
             // Anything staged for coalescing is written before the runner
@@ -591,6 +697,7 @@ fn run_loop(
             let _ = rt.block_on(async { sink.flush().await });
             break;
         }
+        let cycle_start = std::time::Instant::now();
 
         // Pause handling. A paused job sleeps and re-checks status until
         // resumed or stopped.
@@ -628,10 +735,14 @@ fn run_loop(
             None => records,
         };
 
+        let batch_size = records.len();
+        let batch_event_time = records.iter().map(|r| r.commit_timestamp).max();
+
         if records.is_empty() {
             // The source has nothing more right now, so anything the sink is
             // still coalescing has no later batch to join and goes out now
             let _ = rt.block_on(async { sink.flush().await });
+            report.cycle(0, 0, cycle_start.elapsed(), None);
             std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
             continue;
         }
@@ -649,17 +760,21 @@ fn run_loop(
         };
 
         if filtered.is_empty() {
+            report.cycle(batch_size, 0, cycle_start.elapsed(), batch_event_time);
             continue;
         }
 
         // Write to sink. RunnerSink::write_batch is async to support Remote
         // adapters, so block on the current-thread runtime owned by the
         // runner thread.
+        let written = filtered.len();
         if let Err(e) = rt.block_on(async { sink.write_batch(filtered).await }) {
             mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
             break;
         }
+        report.cycle(batch_size, written, cycle_start.elapsed(), batch_event_time);
     }
+    report.finish();
 }
 
 /// Runs a runner body under a panic guard. A panic inside the body is caught
@@ -1009,8 +1124,10 @@ fn run_external_loop(
     // Compile schedule once. Falls back to a fixed interval parsed from the
     // string when cron parsing fails, supporting strings like "60s", "5m".
     let schedule = schedule_cron.as_deref().and_then(parse_schedule);
+    let mut report = RunnerReport::new(&entry);
 
     loop {
+        let cycle_start = std::time::Instant::now();
         if stop_flag.load(Ordering::Acquire) {
             // Best effort on the way out. An unflushed batch keeps its
             // objects unacknowledged, so a restart re-reads them
@@ -1045,6 +1162,8 @@ fn run_external_loop(
             }
         };
 
+        let batch_size = rows.len();
+        let mut written = 0usize;
         if !rows.is_empty() {
             let filtered = match apply_external_filter_project(&rows, &spec) {
                 Ok(v) => v,
@@ -1053,6 +1172,7 @@ fn run_external_loop(
                     break;
                 }
             };
+            written = filtered.len();
             if !filtered.is_empty() {
                 if let Err(e) = rt.block_on(async { sink.write_batch(filtered).await }) {
                     mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
@@ -1060,6 +1180,7 @@ fn run_external_loop(
                 }
             }
         }
+        report.cycle(batch_size, written, cycle_start.elapsed(), None);
 
         match mode {
             ExternalMode::OneShot => {
@@ -1434,8 +1555,10 @@ fn run_external_to_zyron_loop(
         }
     };
     let schedule = schedule_cron.as_deref().and_then(parse_schedule);
+    let mut report = RunnerReport::new(&entry);
 
     loop {
+        let cycle_start = std::time::Instant::now();
         if stop_flag.load(Ordering::Acquire) {
             // Best effort on the way out. An unflushed batch keeps its
             // objects unacknowledged, so a restart re-reads them
@@ -1468,6 +1591,8 @@ fn run_external_to_zyron_loop(
             }
         };
 
+        let batch_size = rows.len();
+        let mut written = 0usize;
         if !rows.is_empty() {
             let filtered = match apply_external_filter_project(&rows, &spec) {
                 Ok(v) => v,
@@ -1494,6 +1619,7 @@ fn run_external_to_zyron_loop(
                     primary_key_data: Vec::new(),
                 });
             }
+            written = changes.len();
             if !changes.is_empty() {
                 if let Err(e) = rt.block_on(async { sink.write_batch(changes).await }) {
                     mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
@@ -1510,6 +1636,7 @@ fn run_external_to_zyron_loop(
                 }
             }
         }
+        report.cycle(batch_size, written, cycle_start.elapsed(), None);
 
         match mode {
             ExternalMode::OneShot => {
@@ -1635,11 +1762,14 @@ fn run_zyron_to_external_loop(
         }
     };
 
+    let mut report = RunnerReport::new(&entry);
+
     loop {
         if stop_flag.load(Ordering::Acquire) {
             let _ = rt.block_on(async { sink.flush().await });
             break;
         }
+        let cycle_start = std::time::Instant::now();
         let current_status = catalog.get_streaming_job_by_id(entry.id).map(|j| j.status);
         match current_status {
             Some(StreamingJobStatus::Paused) => {
@@ -1658,10 +1788,14 @@ fn run_zyron_to_external_loop(
                 break;
             }
         };
+        let batch_size = records.len();
+        let batch_event_time = records.iter().map(|r| r.commit_timestamp).max();
+
         if records.is_empty() {
             // The source has nothing more right now, so anything the sink is
             // still coalescing has no later batch to join and goes out now
             let _ = rt.block_on(async { sink.flush().await });
+            report.cycle(0, 0, cycle_start.elapsed(), None);
             std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
             continue;
         }
@@ -1685,13 +1819,16 @@ fn run_zyron_to_external_loop(
             }
         };
 
+        let written = filtered.len();
         if !filtered.is_empty() {
             if let Err(e) = rt.block_on(async { sink.write_batch(filtered).await }) {
                 mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
                 break;
             }
         }
+        report.cycle(batch_size, written, cycle_start.elapsed(), batch_event_time);
     }
+    report.finish();
 }
 
 // ---------------------------------------------------------------------------

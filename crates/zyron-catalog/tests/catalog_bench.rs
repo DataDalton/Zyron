@@ -53,6 +53,12 @@ use zyron_wal::{WalWriter, WalWriterConfig};
 // =============================================================================
 
 const TABLE_LOOKUP_TARGET_NS: f64 = 50.0;
+/// Three-part `zyron_sys.<schema>.<object>` resolution, from the spec's
+/// Phase 18.2 performance table.
+const SYSTEM_NAME_RESOLVE_TARGET_NS: f64 = 500.0;
+/// Unqualified resolution walking the session search path, first hit wins.
+const SYSTEM_SEARCH_PATH_TARGET_NS: f64 = 800.0;
+
 const SCHEMA_RESOLVE_TARGET_NS: f64 = 100.0;
 const DDL_CREATE_TARGET_US: f64 = 200.0;
 const DDL_DROP_TARGET_US: f64 = 80.0;
@@ -1772,6 +1778,128 @@ async fn test_bench_recovery() {
 
     let after = take_util_snapshot();
     record_test_util("Recovery", before, after);
+}
+
+// =============================================================================
+// System catalog name resolution
+// =============================================================================
+
+/// The three resolution paths a client name takes through the `zyron_sys`
+/// registry, held to the Phase 18.2 targets.
+///
+/// The miss cases are the ones that matter: every SELECT against a user table
+/// pays search-path resolution before the planner sees it, and every SELECT
+/// against a dotted user name pays the three-part check. A registry that got
+/// slower as future phases added views would tax every query in the system,
+/// so the misses are measured alongside the hits rather than only the hits.
+#[test]
+fn test_system_name_resolution_latency() {
+    zyron_bench_harness::init("catalog");
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!(
+        "
+=== Benchmark: System Catalog Name Resolution ==="
+    );
+
+    let before = take_util_snapshot();
+    let iterations = 1_000_000u64;
+
+    // Three-part hit: the last schema in the list, so a linear scan pays its
+    // full price rather than stopping at the first entry
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = std::hint::black_box(zyron_catalog::system_catalog::find(
+                "zyron_sys.pressure.spill_stats",
+            ));
+        }
+        runs.push(start.elapsed().as_nanos() as f64 / iterations as f64);
+    }
+    let v = validate_metric(
+        "System Name Resolution",
+        "Three-part hit (ns/op)",
+        runs,
+        SYSTEM_NAME_RESOLVE_TARGET_NS,
+        false,
+    );
+    assert!(v.passed, "three-part resolution exceeded target");
+
+    // Three-part miss under the system catalog, which is the refusal path
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = std::hint::black_box(zyron_catalog::system_catalog::find(
+                "zyron_sys.core.not_a_view",
+            ));
+        }
+        runs.push(start.elapsed().as_nanos() as f64 / iterations as f64);
+    }
+    let v = validate_metric(
+        "System Name Resolution",
+        "Three-part miss (ns/op)",
+        runs,
+        SYSTEM_NAME_RESOLVE_TARGET_NS,
+        false,
+    );
+    assert!(v.passed, "three-part miss exceeded target");
+
+    let path: Vec<String> = zyron_catalog::DEFAULT_SEARCH_PATH
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Search-path hit: a bare name the default path resolves
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = std::hint::black_box(zyron_catalog::system_catalog::resolve_in_search_path(
+                "activity", &path,
+            ));
+        }
+        runs.push(start.elapsed().as_nanos() as f64 / iterations as f64);
+    }
+    let v = validate_metric(
+        "System Name Resolution",
+        "Search path hit (ns/op)",
+        runs,
+        SYSTEM_SEARCH_PATH_TARGET_NS,
+        false,
+    );
+    assert!(v.passed, "search path resolution exceeded target");
+
+    // Search-path miss: an ordinary user table. Every user query pays this,
+    // so it is the number that decides whether the registry is affordable
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = std::hint::black_box(zyron_catalog::system_catalog::resolve_in_search_path(
+                "line_items",
+                &path,
+            ));
+        }
+        runs.push(start.elapsed().as_nanos() as f64 / iterations as f64);
+    }
+    let v = validate_metric(
+        "System Name Resolution",
+        "Search path miss (ns/op)",
+        runs,
+        SYSTEM_SEARCH_PATH_TARGET_NS,
+        false,
+    );
+    assert!(v.passed, "search path miss exceeded target");
+
+    tprintln!(
+        "  Registry: {} objects across {} schemas",
+        zyron_catalog::SYSTEM_OBJECTS.len(),
+        zyron_catalog::SYSTEM_SCHEMAS.len()
+    );
+
+    let after = take_util_snapshot();
+    record_test_util("System Name Resolution", before, after);
 }
 
 // =============================================================================

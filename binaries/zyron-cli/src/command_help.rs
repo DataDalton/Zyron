@@ -256,7 +256,7 @@ Aliases: o",
         detail: "\
 Usage:
   wal                           Short for `wal status`.
-  wal status                    SELECT * FROM zyron_stat_wal",
+  wal status                    SELECT * FROM zyron_sys.stat.wal",
     },
     CommandHelp {
         name: "slots",
@@ -299,7 +299,7 @@ Aliases for the noun: conf.",
         detail: "\
 Usage:
   sessions                       Short for `sessions list`.
-  sessions list                  SELECT * FROM zyron_stat_activity
+  sessions list                  SELECT * FROM zyron_sys.stat.activity
 
 Aliases for the noun: session, activity.",
     },
@@ -326,7 +326,7 @@ Usage:
         summary: "List version branches on the server.",
         detail: "\
 Usage:
-  branches                       SELECT * FROM zyron_stat_branches
+  branches                       SELECT * FROM zyron_sys.stat.branches
 
 Aliases: branch.",
     },
@@ -335,7 +335,7 @@ Aliases: branch.",
         summary: "List triggers registered on tables.",
         detail: "\
 Usage:
-  triggers                       SELECT * FROM zyron_stat_triggers
+  triggers                       SELECT * FROM zyron_sys.stat.trigger_executions
 
 Aliases: trigger.",
     },
@@ -344,7 +344,7 @@ Aliases: trigger.",
         summary: "List streaming jobs.",
         detail: "\
 Usage:
-  jobs                           SELECT * FROM zyron_stat_streaming_jobs
+  jobs                           SELECT * FROM zyron_sys.streaming.jobs
 
 Aliases: job, streaming.",
     },
@@ -353,7 +353,7 @@ Aliases: job, streaming.",
         summary: "Buffer-pool and background-writer counters.",
         detail: "\
 Usage:
-  buffer                         SELECT * FROM zyron_stat_bgwriter
+  buffer                         SELECT * FROM zyron_sys.stat.bgwriter
 
 Aliases: buffers, bgwriter.",
     },

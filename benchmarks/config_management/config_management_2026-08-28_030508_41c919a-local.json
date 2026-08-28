@@ -1,0 +1,102 @@
+{
+  "id": "2026-08-28_030508_41c919a-local",
+  "date": "2026-08-28 03:05:25Z",
+  "ts": 1787886325,
+  "commit": "41c919a-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Backup": {
+      "Backup throughput (MB/sec)": {
+        "average": 2091.309906,
+        "runs": [1877.91, 2193.66, 2158.12, 2135.61, 2091.25],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Restore": {
+      "Restore throughput (MB/sec)": {
+        "average": 2321.294121,
+        "runs": [2338.32, 2329.92, 2331.93, 2355.84, 2250.46],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Config Load": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.38 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 12.37 },
+      "Load latency (ms)": {
+        "average": 1.411000,
+        "runs": [6.84, 0.09, 0.04, 0.04, 0.04],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "SET Command": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 12.38 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.38 },
+      "Set+Get latency (us/op)": {
+        "average": 0.047984,
+        "runs": [0.05, 0.05, 0.05, 0.05, 0.05],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "SHOW Command": {
+      "util_before": { "cpu_pct": 9.0, "ram_used_gb": 12.37 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 12.37 },
+      "Lookup latency (us/op)": {
+        "average": 0.008300,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Stat View Query": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 12.37 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 12.36 },
+      "View build latency (us/op)": {
+        "average": 0.067680,
+        "runs": [0.07, 0.07, 0.07, 0.07, 0.07],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Tab Completion": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 12.37 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 12.37 },
+      "Completion latency (ms/op)": {
+        "average": 0.000098,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

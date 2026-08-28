@@ -15,6 +15,7 @@ pub mod schema;
 pub mod sequence;
 pub mod stats;
 pub mod storage;
+pub mod system_catalog;
 
 pub use cache::{BTreeIndexSpec, CatalogCache, TableIndexSnapshot};
 pub use catalog::{Catalog, DropOutcome};
@@ -40,3 +41,7 @@ pub use schema::{
 pub use sequence::LiveSequence;
 pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};
 pub use storage::{CatalogStorage, HeapCatalogStorage};
+pub use system_catalog::{
+    DEFAULT_SEARCH_PATH, SYSTEM_CATALOG_NAME, SYSTEM_OBJECTS, SYSTEM_SCHEMAS, SystemCatalog,
+    SystemObject, SystemObjectKind,
+};

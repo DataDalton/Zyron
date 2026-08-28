@@ -44,7 +44,8 @@ use crate::session::Session;
 use crate::types;
 
 /// Wall-clock seconds since the epoch, the unit the maintenance timestamps in
-/// zyron_stat_tables are reported in. Matches what ANALYZE stamps into the
+/// zyron_sys.stat.tables are reported in. Matches what ANALYZE stamps into
+/// the
 /// catalog's table statistics, so the two sources agree.
 fn epoch_seconds_now() -> u64 {
     std::time::SystemTime::now()
@@ -78,9 +79,10 @@ pub struct ServerState {
     /// index snapshots as doc_registry.zydoc.
     pub doc_registry: Arc<zyron_common::DocRegistry>,
     /// Per-table IO and tuple counters, handed to every execution context so
-    /// scan and DML operators record into them. Read back by zyron_stat_tables.
+    /// scan and DML operators record into them. Read back by
+    /// zyron_sys.stat.tables.
     pub table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
-    /// Per-index scan counters, read back by zyron_stat_indexes.
+    /// Per-index scan counters, read back by zyron_sys.stat.indexes.
     pub index_io_stats: Arc<zyron_common::IndexIOStatsRegistry>,
     pub security_manager: Option<Arc<zyron_auth::SecurityManager>>,
     /// Lock-free legal-hold registry. Reloaded from the catalog at startup and
@@ -88,7 +90,7 @@ pub struct ServerState {
     pub legal_holds: Arc<zyron_lifecycle::legal_hold::LegalHoldRegistry>,
     /// Live dead letter queues, one per streaming sink target. Sinks register
     /// their queue at build time, the TTL sweeper evicts aged rows, and
-    /// zyron_stat_dead_letters reads pending counts from here.
+    /// zyron_sys.stat.dead_letters reads pending counts from here.
     pub dlq_registry: Arc<zyron_streaming::dlq::DlqRegistry>,
     /// Key store for sealing and opening external-source/sink credentials.
     /// Populated by the server binary from a data-dir-derived master key.
@@ -106,7 +108,7 @@ pub struct ServerState {
     pub node_capabilities: Option<std::sync::Arc<zyron_pressure::capability::NodeCapabilities>>,
     /// Session manager for stat view queries.
     pub session_info_collector:
-        Option<Arc<dyn Fn() -> Vec<crate::stat_views::SessionRow> + Send + Sync>>,
+        Option<Arc<dyn Fn() -> Vec<crate::system_views::SessionRow> + Send + Sync>>,
     /// Checkpoint worker stats: (checkpoints_completed, segments_deleted, last_checkpoint_lsn).
     pub checkpoint_stats: Option<Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>>,
     /// Vacuum worker stats: (cycles_completed, tuples_reclaimed, pages_scanned).
@@ -1263,23 +1265,14 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
-            // Intercept SELECT from virtual stat views
+            // Intercept SELECT against the zyron_sys catalog
             if let zyron_parser::Statement::Select(ref sel) = stmt {
-                if let Some(view_name) = extract_single_from_table(sel) {
-                    if crate::stat_views::is_stat_view(&view_name) {
-                        let outcome =
-                            match crate::stat_views::parse_stat_view_query(&view_name, sel) {
-                                Ok(filters) => {
-                                    self.handle_stat_view_query(&view_name, &filters).await
-                                }
-                                Err(e) => Err(ProtocolError::Database(e)),
-                            };
-                        if let Err(e) = outcome {
-                            self.send_protocol_error(&e).await?;
-                            self.mark_failed_if_in_transaction();
-                        }
-                        continue;
+                if let Some(outcome) = self.try_handle_system_relation(sel).await {
+                    if let Err(e) = outcome {
+                        self.send_protocol_error(&e).await?;
+                        self.mark_failed_if_in_transaction();
                     }
+                    continue;
                 }
             }
 
@@ -3125,20 +3118,14 @@ impl<T: WireTransport> Connection<T> {
             return Ok(());
         }
 
-        // SELECT against a virtual stat view.
+        // SELECT against the zyron_sys catalog.
         if let zyron_parser::Statement::Select(ref sel) = stmt {
-            if let Some(view_name) = extract_single_from_table(sel) {
-                if crate::stat_views::is_stat_view(&view_name) {
-                    let outcome = match crate::stat_views::parse_stat_view_query(&view_name, sel) {
-                        Ok(filters) => self.handle_stat_view_query(&view_name, &filters).await,
-                        Err(e) => Err(ProtocolError::Database(e)),
-                    };
-                    if let Err(e) = outcome {
-                        self.send_protocol_error(&e).await?;
-                        self.mark_failed_if_in_transaction();
-                    }
-                    return Ok(());
+            if let Some(outcome) = self.try_handle_system_relation(sel).await {
+                if let Err(e) = outcome {
+                    self.send_protocol_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
                 }
+                return Ok(());
             }
         }
 
@@ -4619,21 +4606,94 @@ impl<T: WireTransport> Connection<T> {
         .await
     }
 
-    /// Handles a SELECT query against a virtual stat view, sending the result
-    /// directly without going through the planner/executor.
-    async fn handle_stat_view_query(
+    /// Routes a SELECT that names an entity of the `zyron_sys` catalog.
+    ///
+    /// Returns None when the statement names something else, which sends it
+    /// down the planner path unchanged. Four shapes end here:
+    ///
+    /// - a canonical three-part name, read directly
+    /// - a bare name the session's search path puts under a system schema,
+    ///   which is what makes `SELECT * FROM tables` read
+    ///   `zyron_sys.core.tables`
+    /// - a call to a system table function, with its arguments
+    /// - a name under `zyron_sys` that is not registered, refused here with
+    ///   RelationNotFound rather than passed to the planner, which would
+    ///   report it as a missing user table and lose the suggestion
+    ///
+    /// A bare `zyron_<name>` is deliberately not one of these. It could name
+    /// a user table, so it goes to the planner, and the resolver produces the
+    /// same RelationNotFound with the same suggestion when nothing has it.
+    async fn try_handle_system_relation(
         &mut self,
-        view_name: &str,
-        filters: &crate::stat_views::StatViewFilters,
-    ) -> Result<(), ProtocolError> {
-        let (fields, rows) =
-            match crate::stat_views::query_stat_view(view_name, &self.server, filters)
-                .map_err(ProtocolError::Database)?
-            {
-                Some(result) => result,
-                None => return Ok(()),
-            };
+        sel: &zyron_parser::SelectStatement,
+    ) -> Option<Result<(), ProtocolError>> {
+        // A FROM entry carrying arguments is a function call, never a
+        // relation, so that form is settled before anything else
+        if let Some(parsed) = crate::system_views::parse_system_function(sel) {
+            return Some(self.run_system_function(parsed, sel).await);
+        }
 
+        let name = extract_single_from_table(sel)?;
+        let canonical = if crate::system_views::is_system_view(&name) {
+            name
+        } else if let Some(object) = self
+            .session
+            .as_ref()
+            .and_then(|s| crate::system_views::resolve_in_search_path(&name, &s.search_path))
+        {
+            object.canonical_name()
+        } else if zyron_catalog::system_catalog::is_system_catalog_name(&name) {
+            return Some(Err(ProtocolError::Database(
+                zyron_catalog::system_catalog::relation_not_found(&name),
+            )));
+        } else {
+            return None;
+        };
+
+        let filters = match crate::system_views::parse_system_view_query(&canonical, sel) {
+            Ok(filters) => filters,
+            Err(e) => return Some(Err(ProtocolError::Database(e))),
+        };
+        let built = match crate::system_views::query_system_view(&canonical, &self.server, &filters)
+            .await
+        {
+            Ok(Some(result)) => result,
+            // A registered name always builds, so None here is a name that
+            // passed is_system_view and then was not found, which cannot
+            // happen without the registry and the dispatch disagreeing
+            Ok(None) => {
+                return Some(Err(ProtocolError::Database(
+                    zyron_catalog::system_catalog::relation_not_found(&canonical),
+                )));
+            }
+            Err(e) => return Some(Err(ProtocolError::Database(e))),
+        };
+        Some(self.send_system_rows(built).await)
+    }
+
+    /// Runs one `zyron_sys` table function and sends its rows.
+    async fn run_system_function(
+        &mut self,
+        parsed: Result<crate::system_views::SystemFunctionCall, ZyronError>,
+        sel: &zyron_parser::SelectStatement,
+    ) -> Result<(), ProtocolError> {
+        let call = parsed.map_err(ProtocolError::Database)?;
+        let name = call.object.canonical_name();
+        let filters = crate::system_views::parse_system_view_query(&name, sel)
+            .map_err(ProtocolError::Database)?;
+        let built = crate::system_views::query_system_function(&call, &self.server, &filters)
+            .await
+            .map_err(ProtocolError::Database)?;
+        self.send_system_rows(built).await
+    }
+
+    /// Sends a system entity's result set, which is already materialized:
+    /// these are computed on read and never stream.
+    async fn send_system_rows(
+        &mut self,
+        built: (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>),
+    ) -> Result<(), ProtocolError> {
+        let (fields, rows) = built;
         self.feed(BackendMessage::RowDescription(fields)).await?;
         let row_count = rows.len();
         for row in rows {
@@ -5735,6 +5795,9 @@ pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
     let (code, severity) = match err {
         ZyronError::ParseError(_) => ("42601", "ERROR"),
         ZyronError::TableNotFound(_) => ("42P01", "ERROR"),
+        // undefined_table: a name that resolved to nothing is the same
+        // condition to a client whether or not a suggestion came with it
+        ZyronError::RelationNotFound { .. } => ("42P01", "ERROR"),
         ZyronError::ColumnNotFound(_) => ("42703", "ERROR"),
         ZyronError::DuplicateKey => ("23505", "ERROR"),
         ZyronError::TransactionAborted(_) => ("25P02", "ERROR"),

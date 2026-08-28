@@ -62,11 +62,20 @@ impl NameResolver {
                     return Ok(table);
                 }
                 // Schema cached but table not, fall through to storage
-                return self.find_table_in_schema(schema_entry.id, table_name).await;
+                return self
+                    .find_table_in_schema(schema_entry.id, table_name)
+                    .await
+                    .map_err(|_| Self::missing_relation(Some(schema), table_name));
             }
             // Schema not cached, full async fallback
-            let schema_entry = self.resolve_schema(schema).await?;
-            return self.find_table_in_schema(schema_entry.id, table_name).await;
+            let schema_entry = self
+                .resolve_schema(schema)
+                .await
+                .map_err(|_| Self::missing_relation(Some(schema), table_name))?;
+            return self
+                .find_table_in_schema(schema_entry.id, table_name)
+                .await
+                .map_err(|_| Self::missing_relation(Some(schema), table_name));
         }
 
         // No qualifier and empty search path is a programming or user error.
@@ -114,7 +123,52 @@ impl NameResolver {
             }
         }
 
-        Err(ZyronError::TableNotFound(table_name.to_string()))
+        Err(Self::missing_relation(None, table_name))
+    }
+
+    /// Resolves a possibly catalog-qualified relation name.
+    ///
+    /// Accepts all three shapes a name can arrive in: `object`,
+    /// `schema.object`, and `catalog.schema.object`. The three-part form is
+    /// how the system catalog is addressed and how a query reaches a schema
+    /// in a catalog other than the session's, so the split happens here
+    /// rather than at each caller.
+    pub async fn resolve_relation(&self, name: &str) -> Result<Arc<TableEntry>> {
+        let (catalog, schema, object) = split_relation_name(name);
+        let Some(catalog) = catalog else {
+            return self.resolve_table(schema, object).await;
+        };
+
+        let database = self
+            .cache
+            .get_database_by_name(catalog)
+            .ok_or_else(|| Self::missing_relation_full(name))?;
+        // A three-part name always carries its schema, so nothing here walks
+        // the search path: the name says exactly where to look
+        let schema_name = schema.ok_or_else(|| Self::missing_relation_full(name))?;
+        let schema_entry = self
+            .cache
+            .get_schema_by_name(database.id, schema_name)
+            .ok_or_else(|| Self::missing_relation_full(name))?;
+        if let Some(table) = self.cache.get_table_by_name(schema_entry.id, object) {
+            return Ok(table);
+        }
+        self.find_table_in_schema(schema_entry.id, object)
+            .await
+            .map_err(|_| Self::missing_relation_full(name))
+    }
+
+    /// The error a name that resolved to nothing produces, carrying the
+    /// closest canonical system name when one is near enough to help.
+    fn missing_relation(schema: Option<&str>, table: &str) -> ZyronError {
+        match schema {
+            Some(s) => Self::missing_relation_full(&format!("{}.{}", s, table)),
+            None => Self::missing_relation_full(table),
+        }
+    }
+
+    fn missing_relation_full(name: &str) -> ZyronError {
+        crate::system_catalog::relation_not_found(name)
     }
 
     /// Resolves a column name within a table.
@@ -195,6 +249,24 @@ impl NameResolver {
         }
 
         Err(ZyronError::TableNotFound(table_name.to_string()))
+    }
+}
+
+/// Splits a relation name into its catalog, schema, and object parts.
+///
+/// One part is a bare object, two are `schema.object`, and three are
+/// `catalog.schema.object`. Anything with more dots than that keeps the
+/// leading parts as written so the name fails to resolve rather than
+/// silently addressing something shorter.
+pub fn split_relation_name(name: &str) -> (Option<&str>, Option<&str>, &str) {
+    let mut parts = name.splitn(3, '.');
+    let first = parts.next().unwrap_or(name);
+    let Some(second) = parts.next() else {
+        return (None, None, first);
+    };
+    match parts.next() {
+        Some(third) => (Some(first), Some(second), third),
+        None => (None, Some(first), second),
     }
 }
 

@@ -49,8 +49,12 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         .await
         .expect("create public schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
+    zyron_catalog::SystemCatalog::init(&catalog)
+        .await
+        .expect("register the zyron_sys catalog");
     let slot_mgr =
         Arc::new(SlotManager::open(&data_dir, SlotLagConfig::default()).expect("slot mgr"));
+    let cdf_registry = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.clone()));
 
     let state = Arc::new(ServerState {
         node_capabilities: None,
@@ -77,7 +81,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         cdc_slot_stats: None,
         cdc_stream_stats: None,
         cdc_ingest_stats: None,
-        cdc_registry: None,
+        cdc_registry: Some(cdf_registry),
         slot_manager: Some(slot_mgr),
         publication_manager: None,
         cdc_stream_manager: None,
@@ -363,4 +367,205 @@ async fn min_restart_lsn_reflects_created_slot() {
     let mgr = server.slot_manager.as_ref().unwrap();
     // The slot now pins retention, so the minimum restart LSN is set.
     assert!(mgr.min_restart_lsn().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// zyron_sys.cdc.* table functions
+// ---------------------------------------------------------------------------
+
+/// Runs one system table function the way a client SELECT reaches it.
+async fn call_function(
+    server: &Arc<ServerState>,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let stmt = zyron_parser::parse(sql)
+        .map_err(|e| format!("parse: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no statement".to_string())?;
+    let sel = match stmt {
+        zyron_parser::Statement::Select(sel) => sel,
+        other => return Err(format!("not a select: {other:?}")),
+    };
+    let call = zyron_wire::system_views::parse_system_function(&sel)
+        .ok_or_else(|| "not a system function call".to_string())?
+        .map_err(|e| e.to_string())?;
+    let name = call.object.canonical_name();
+    let filters = zyron_wire::system_views::parse_system_view_query(&name, &sel)
+        .map_err(|e| e.to_string())?;
+    let (fields, rows) = zyron_wire::system_views::query_system_function(&call, server, &filters)
+        .await
+        .map_err(|e| e.to_string())?;
+    let columns = fields.iter().map(|f| f.name.clone()).collect();
+    let rendered = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    cell.map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    Ok((columns, rendered))
+}
+
+/// The canonical create function makes a real slot, pinned at the WAL head.
+#[tokio::test]
+async fn cdc_create_replication_slot_function_creates_a_pinned_slot() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(&server, &mut session, "CREATE TABLE t (id INT)").await;
+    exec(&server, &mut session, "INSERT INTO t (id) VALUES (1)").await;
+
+    let (columns, rows) = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot('fn_slot', 'zyron_cdc')",
+    )
+    .await
+    .expect("create");
+    assert_eq!(
+        columns,
+        vec!["slot_name", "plugin", "start_lsn", "restart_lsn", "active"]
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "fn_slot");
+    assert_eq!(rows[0][1], "zyron_cdc");
+
+    let mgr = server.slot_manager.as_ref().expect("slot manager");
+    let slot = mgr.get_slot("fn_slot").expect("the slot exists");
+    assert_eq!(slot.plugin, DecoderPlugin::ZyronCdc);
+    assert!(
+        mgr.min_restart_lsn().is_some(),
+        "the slot must pin WAL retention on creation"
+    );
+}
+
+/// Creating the same slot twice fails, and the second failure leaves the
+/// first slot alone rather than half-rewriting it.
+#[tokio::test]
+async fn cdc_create_replication_slot_function_refuses_a_duplicate() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot('dup')",
+    )
+    .await
+    .expect("first create");
+    let err = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot('dup')",
+    )
+    .await
+    .expect_err("a duplicate is refused");
+    assert!(!err.is_empty());
+    assert!(
+        server
+            .slot_manager
+            .as_ref()
+            .expect("manager")
+            .get_slot("dup")
+            .is_ok(),
+        "the original slot survived the refused duplicate"
+    );
+}
+
+/// The change reader returns the slot's shape and consumes nothing when the
+/// slot has no feed behind it.
+#[tokio::test]
+async fn cdc_logical_slot_get_changes_function_answers() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot('reader')",
+    )
+    .await
+    .expect("create");
+
+    let (columns, rows) = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.logical_slot_get_changes('reader')",
+    )
+    .await
+    .expect("read");
+    assert_eq!(columns, vec!["lsn", "xid", "table_id", "operation", "data"]);
+    assert!(rows.is_empty(), "no feed means no changes");
+
+    // The row cap is read and applied
+    let (_, capped) = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.logical_slot_get_changes('reader', 5)",
+    )
+    .await
+    .expect("read with a cap");
+    assert!(capped.is_empty());
+}
+
+/// Bad arguments are refused rather than answered with an empty result.
+#[tokio::test]
+async fn cdc_functions_refuse_bad_arguments() {
+    let (server, _schema, _tmp) = create_test_server().await;
+
+    let err = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.logical_slot_get_changes('missing_slot')",
+    )
+    .await
+    .expect_err("an unknown slot is refused");
+    assert!(!err.is_empty());
+
+    let err = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot()",
+    )
+    .await
+    .expect_err("no arguments is refused");
+    assert!(err.contains("takes one or two arguments"), "got: {err}");
+
+    let err = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot('s', 'not_a_plugin')",
+    )
+    .await
+    .expect_err("an unknown plugin is refused");
+    assert!(!err.is_empty());
+
+    call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.create_replication_slot('capped')",
+    )
+    .await
+    .expect("create");
+    let err = call_function(
+        &server,
+        "SELECT * FROM zyron_sys.cdc.logical_slot_get_changes('capped', 'lots')",
+    )
+    .await
+    .expect_err("a non-numeric cap is refused");
+    assert!(err.contains("is not a row count"), "got: {err}");
+}
+
+/// A flat name is not a function either. A table function is as deletable as
+/// a view, and this is the half a view test cannot cover.
+///
+/// The probes are derived from the registry rather than typed, so no list of
+/// dead names exists here.
+#[tokio::test]
+async fn cdc_flat_function_names_do_not_resolve() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let cdc: Vec<String> = zyron_catalog::SYSTEM_OBJECTS
+        .iter()
+        .filter(|o| o.schema == "cdc")
+        .map(|o| format!("zyron_{}", o.object))
+        .collect();
+    assert!(!cdc.is_empty(), "the cdc schema registers no functions");
+    for probe in cdc {
+        let sql = format!("SELECT * FROM {probe}('x')");
+        let outcome = call_function(&server, &sql).await;
+        assert!(
+            outcome.is_err(),
+            "`{probe}` still resolves as a table function"
+        );
+    }
 }

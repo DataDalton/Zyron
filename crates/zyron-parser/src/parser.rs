@@ -8465,6 +8465,10 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         // Data type keywords commonly used as identifiers
         Keyword::Type => Some("type"),
         Keyword::Column => Some("column"),
+        // `columns` names a real relation, zyron_sys.core.columns, so it has
+        // to read as an identifier where one is expected. Every grammar
+        // position that needs the keyword checks the token directly
+        Keyword::Columns => Some("columns"),
         Keyword::First => Some("first"),
         Keyword::Last => Some("last"),
         Keyword::Key => Some("key"),

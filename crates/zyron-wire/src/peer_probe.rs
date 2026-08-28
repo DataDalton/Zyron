@@ -6,7 +6,8 @@
 //! mesh that acts on a belief it never checked will route work to a node
 //! that cannot do it.
 //!
-//! So the peer is asked. It answers out of its own `zyron_nodes` view,
+//! So the peer is asked. It answers out of its own
+//! `zyron_sys.mesh.nodes` view,
 //! which reports the local node for certain, and what comes back replaces
 //! what was assumed. Until then the mesh view says the peer's id and mode
 //! are unknown rather than guessing, because an unknown that admits it is
@@ -64,7 +65,9 @@ pub async fn probe_peer(
         .await
         .map_err(|e| ZyronError::ConfigError(format!("connecting to {}: {}", address, e)))?;
     let results = client
-        .simple_query("SELECT node_name, node_id, mode FROM zyron_nodes WHERE is_local = 't'")
+        .simple_query(
+            "SELECT node_name, node_id, mode FROM zyron_sys.mesh.nodes WHERE is_local = 't'",
+        )
         .await
         .map_err(|e| ZyronError::ConfigError(format!("querying {}: {}", address, e)))?;
 
@@ -105,7 +108,8 @@ pub async fn probe_peer(
 
 /// Reads a leader's published log over the wire.
 ///
-/// The leader exposes its version files through `zyron_lake_log`, so a
+/// The leader exposes its version files through
+/// `zyron_sys.storage.lake_log`, so a
 /// follower fetches metadata and nothing else: the entries name immutable
 /// data files, and where storage is shared the follower already has them.
 ///
@@ -143,7 +147,7 @@ pub async fn fetch_remote_versions(
         .await
         .map_err(|e| ZyronError::ConfigError(format!("connecting to {}: {}", address, e)))?;
     let sql = format!(
-        "SELECT version, payload FROM zyron_lake_log \
+        "SELECT version, payload FROM zyron_sys.storage.lake_log \
          WHERE table_name = '{}' AND from_version = {} LIMIT {}",
         table, from, limit
     );

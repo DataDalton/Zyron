@@ -225,8 +225,9 @@ async fn test_the_derived_columns_view_reports_an_expression_key() {
     .await
     .expect("create");
 
-    let (columns, rows) =
-        stat_view(&server, "SELECT * FROM zyron_derived_columns").expect("derived columns view");
+    let (columns, rows) = stat_view(&server, "SELECT * FROM zyron_sys.storage.derived_columns")
+        .await
+        .expect("derived columns view");
     assert_eq!(rows.len(), 1, "one expression, one row");
     let row = &rows[0];
     let value = |name: &str| -> &str {
@@ -255,8 +256,9 @@ async fn test_the_derived_columns_view_reports_an_expression_key() {
     )
     .await
     .expect("create");
-    let (_, rows) =
-        stat_view(&server, "SELECT * FROM zyron_derived_columns").expect("derived columns view");
+    let (_, rows) = stat_view(&server, "SELECT * FROM zyron_sys.storage.derived_columns")
+        .await
+        .expect("derived columns view");
     assert_eq!(rows.len(), 1);
 }
 
@@ -292,8 +294,9 @@ async fn test_the_auto_compaction_history_view_reports_a_run() {
 
     let (columns, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_auto_compaction_history WHERE table_name = 'parts'",
+        "SELECT * FROM zyron_sys.storage.auto_compaction_history WHERE table_name = 'parts'",
     )
+    .await
     .expect("history view");
     assert!(!rows.is_empty(), "the run has to be reported");
     let row = rows.last().expect("a run");
@@ -315,8 +318,9 @@ async fn test_the_auto_compaction_history_view_reports_a_run() {
     // The filter runs on the ring, so another table's runs are not counted
     let (_, other) = stat_view(
         &server,
-        "SELECT * FROM zyron_auto_compaction_history WHERE table_name = 'nothing'",
+        "SELECT * FROM zyron_sys.storage.auto_compaction_history WHERE table_name = 'nothing'",
     )
+    .await
     .expect("history view");
     assert!(other.is_empty());
 }
@@ -339,8 +343,9 @@ async fn test_clustering_status_separates_declared_from_active_keys() {
 
     let (columns, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_clustering_status WHERE table_name = 'sales'",
+        "SELECT * FROM zyron_sys.storage.clustering_status WHERE table_name = 'sales'",
     )
+    .await
     .expect("clustering status view");
     let row = rows.first().expect("one lake table, one row");
     let value = |name: &str| -> &str {
@@ -355,7 +360,7 @@ async fn test_clustering_status_separates_declared_from_active_keys() {
 }
 
 /// One virtual view's answer, as column names and rows of rendered text
-fn stat_view(
+async fn stat_view(
     server: &Arc<ServerState>,
     sql: &str,
 ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
@@ -373,12 +378,13 @@ fn stat_view(
         other => return Err(format!("not a plain table ref: {other:?}")),
     };
     assert!(
-        zyron_wire::stat_views::is_stat_view(&name),
+        zyron_wire::system_views::is_system_view(&name),
         "{name} must be a registered view"
     );
-    let filters =
-        zyron_wire::stat_views::parse_stat_view_query(&name, &sel).map_err(|e| e.to_string())?;
-    let (fields, rows) = zyron_wire::stat_views::query_stat_view(&name, server, &filters)
+    let filters = zyron_wire::system_views::parse_system_view_query(&name, &sel)
+        .map_err(|e| e.to_string())?;
+    let (fields, rows) = zyron_wire::system_views::query_system_view(&name, server, &filters)
+        .await
         .map_err(|e| e.to_string())?
         .expect("a registered view builds");
     let columns = fields.iter().map(|f| f.name.clone()).collect();

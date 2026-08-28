@@ -850,7 +850,7 @@ mod tests {
     #[test]
     fn an_unknown_name_is_not_ours() {
         assert!(!is_pressure_view("zyron_sys.pressure.nope"));
-        assert!(!is_pressure_view("zyron_stat_wal"));
+        assert!(!is_pressure_view("zyron_sys.stat.wal"));
         assert!(is_pressure_view("zyron_sys.pressure.current"));
         // Names are matched the way SQL matches them
         assert!(is_pressure_view("ZYRON_SYS.PRESSURE.CURRENT"));

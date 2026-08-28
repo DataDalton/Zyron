@@ -26,7 +26,9 @@ mod projection_pushdown;
 
 pub use constant_folding::ConstantFolding;
 pub use encoding_pushdown::EncodingPushdown;
-pub use index_advisor::{IndexAdvisor, IndexRecommendation};
+pub use index_advisor::{
+    IndexAdvisor, IndexRecommendation, SharedIndexAdvisor, global_index_advisor,
+};
 pub use join_reorder::JoinReorder;
 pub use parallel_plan::{compute_worker_count, should_parallelize};
 pub use predicate_pushdown::PredicatePushdown;

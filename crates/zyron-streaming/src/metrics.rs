@@ -1,11 +1,16 @@
 //! Streaming metrics registry and system view data structures.
 //!
 //! StreamingMetricsRegistry collects metrics from all running streaming
-//! jobs. All data is read from atomic counters with zero locking.
-//! View structures provide the data model for SQL system tables:
-//! zyron_streaming_watermarks, zyron_checkpoint_history,
-//! zyron_streaming_backpressure, zyron_operator_metrics,
-//! zyron_streaming_state_size.
+//! jobs. Counters are atomic; the per-source, per-operator, and history maps
+//! sit behind short mutexes taken once per poll cycle rather than per record.
+//! View structures provide the data model for the SQL system tables
+//! zyron_sys.streaming.watermarks, zyron_sys.streaming.checkpoint_history,
+//! zyron_sys.streaming.backpressure, and
+//! zyron_sys.streaming.operator_metrics.
+//!
+//! The registry is process-wide: the views read whatever the running jobs
+//! published into it, so a job that starts and stops still leaves its last
+//! reading behind for an operator to look at.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -14,7 +19,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 // WatermarkView
 // ---------------------------------------------------------------------------
 
-/// Data for the zyron_streaming_watermarks system view.
+/// Data for the zyron_sys.streaming.watermarks system view.
 /// Represents the current watermark state for a single source.
 #[derive(Debug, Clone)]
 pub struct WatermarkView {
@@ -27,7 +32,7 @@ pub struct WatermarkView {
 // CheckpointHistoryView
 // ---------------------------------------------------------------------------
 
-/// Data for the zyron_checkpoint_history system view.
+/// Data for the zyron_sys.streaming.checkpoint_history system view.
 /// Represents one completed checkpoint record.
 #[derive(Debug, Clone)]
 pub struct CheckpointHistoryView {
@@ -61,7 +66,7 @@ impl std::fmt::Display for CheckpointStatus {
 // BackpressureView
 // ---------------------------------------------------------------------------
 
-/// Data for the zyron_streaming_backpressure system view.
+/// Data for the zyron_sys.streaming.backpressure system view.
 /// Represents backpressure state for one operator.
 #[derive(Debug, Clone)]
 pub struct BackpressureView {
@@ -77,7 +82,7 @@ pub struct BackpressureView {
 // OperatorMetricsView
 // ---------------------------------------------------------------------------
 
-/// Data for the zyron_operator_metrics system view.
+/// Data for the zyron_sys.streaming.operator_metrics system view.
 /// Represents throughput and latency metrics for one operator.
 #[derive(Debug, Clone)]
 pub struct OperatorMetricsView {
@@ -104,7 +109,7 @@ impl OperatorMetricsView {
 // StateSizeView
 // ---------------------------------------------------------------------------
 
-/// Data for the zyron_streaming_state_size system view.
+/// Data for one operator's state size reading.
 /// Represents state storage metrics for one operator.
 #[derive(Debug, Clone)]
 pub struct StateSizeView {
@@ -141,8 +146,26 @@ pub struct StreamingMetricsRegistry {
     pub total_records_shed: AtomicU64,
     /// Watermark views indexed by source_id for O(1) lookup.
     watermark_views: parking_lot::Mutex<HashMap<u32, WatermarkView>>,
-    /// Checkpoint history (stored behind a mutex for structural updates).
+    /// Checkpoint history, oldest first, capped at CHECKPOINT_HISTORY_CAP so
+    /// a long-running node keeps a bounded window rather than every
+    /// checkpoint it has ever taken.
     checkpoint_history: parking_lot::Mutex<Vec<CheckpointHistoryView>>,
+    /// Latest operator reading keyed by (job name, operator id).
+    operator_views: parking_lot::Mutex<HashMap<(String, u32), OperatorMetricsView>>,
+    /// Latest backpressure reading keyed by (job name, operator id).
+    backpressure_views: parking_lot::Mutex<HashMap<(String, u32), BackpressureView>>,
+}
+
+/// How many checkpoint records the history keeps. Older records are dropped
+/// from the front, so the view answers about recent behaviour and the memory
+/// the registry holds does not grow with uptime.
+pub const CHECKPOINT_HISTORY_CAP: usize = 1024;
+
+/// The process-wide registry running jobs publish into and the
+/// zyron_sys.streaming views read from.
+pub fn global_metrics() -> &'static StreamingMetricsRegistry {
+    static GLOBAL: std::sync::OnceLock<StreamingMetricsRegistry> = std::sync::OnceLock::new();
+    GLOBAL.get_or_init(StreamingMetricsRegistry::new)
 }
 
 impl StreamingMetricsRegistry {
@@ -158,6 +181,8 @@ impl StreamingMetricsRegistry {
             total_records_shed: AtomicU64::new(0),
             watermark_views: parking_lot::Mutex::new(HashMap::new()),
             checkpoint_history: parking_lot::Mutex::new(Vec::new()),
+            operator_views: parking_lot::Mutex::new(HashMap::new()),
+            backpressure_views: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -182,8 +207,7 @@ impl StreamingMetricsRegistry {
     ) {
         self.total_checkpoints_completed
             .fetch_add(1, Ordering::Relaxed);
-        let mut history = self.checkpoint_history.lock();
-        history.push(CheckpointHistoryView {
+        self.push_history(CheckpointHistoryView {
             job_name,
             checkpoint_id,
             checkpoint_time_ms,
@@ -202,8 +226,7 @@ impl StreamingMetricsRegistry {
     ) {
         self.total_checkpoints_failed
             .fetch_add(1, Ordering::Relaxed);
-        let mut history = self.checkpoint_history.lock();
-        history.push(CheckpointHistoryView {
+        self.push_history(CheckpointHistoryView {
             job_name,
             checkpoint_id,
             checkpoint_time_ms,
@@ -237,9 +260,53 @@ impl StreamingMetricsRegistry {
         self.watermark_views.lock().values().cloned().collect()
     }
 
-    /// Returns a snapshot of checkpoint history.
+    /// Appends one checkpoint record, dropping the oldest once the window is
+    /// full.
+    fn push_history(&self, record: CheckpointHistoryView) {
+        let mut history = self.checkpoint_history.lock();
+        if history.len() >= CHECKPOINT_HISTORY_CAP {
+            let overflow = history.len() + 1 - CHECKPOINT_HISTORY_CAP;
+            history.drain(..overflow);
+        }
+        history.push(record);
+    }
+
+    /// Returns a snapshot of checkpoint history, oldest first.
     pub fn checkpoint_history(&self) -> Vec<CheckpointHistoryView> {
         self.checkpoint_history.lock().clone()
+    }
+
+    /// Records the running totals for one operator of one job. Replaces the
+    /// previous reading for that operator rather than accumulating a series,
+    /// because the counters carried in are themselves cumulative.
+    pub fn publish_operator_metrics(&self, view: OperatorMetricsView) {
+        let key = (view.job_name.clone(), view.operator_id);
+        self.operator_views.lock().insert(key, view);
+    }
+
+    /// Returns the latest reading for every operator that has published one.
+    pub fn operator_metrics_views(&self) -> Vec<OperatorMetricsView> {
+        self.operator_views.lock().values().cloned().collect()
+    }
+
+    /// Records how full one operator's input was on its last cycle.
+    pub fn publish_backpressure(&self, view: BackpressureView) {
+        let key = (view.job_name.clone(), view.operator_id);
+        self.backpressure_views.lock().insert(key, view);
+    }
+
+    /// Returns the latest backpressure reading per operator.
+    pub fn backpressure_views(&self) -> Vec<BackpressureView> {
+        self.backpressure_views.lock().values().cloned().collect()
+    }
+
+    /// Drops every reading a job published. Called when a job stops so the
+    /// views stop reporting an operator that is no longer running.
+    pub fn forget_job(&self, job_name: &str) {
+        self.operator_views.lock().retain(|(n, _), _| n != job_name);
+        self.backpressure_views
+            .lock()
+            .retain(|(n, _), _| n != job_name);
     }
 
     /// Returns summary metrics as key-value pairs.

@@ -69,9 +69,12 @@ impl Session {
             ("TimeZone".into(), String::from("UTC")),
             ("integer_datetimes".into(), String::from("on")),
             ("standard_conforming_strings".into(), String::from("on")),
-            // Empty default: Zyron does not auto-create a user schema. The
-            // client must set search_path or fully qualify identifiers.
-            ("search_path".into(), String::new()),
+            // The two system schemas come first so a bare `tables` reads
+            // zyron_sys.core.tables and a bare `activity` reads
+            // zyron_sys.stat.activity. `public` is last and is not
+            // auto-created: a client that wants a user schema still has to
+            // make one or qualify its names.
+            ("search_path".into(), default_search_path().join(", ")),
             ("is_superuser".into(), String::from(superuser_str)),
             ("session_authorization".into(), user.clone()),
         ]);
@@ -82,7 +85,7 @@ impl Session {
             database,
             user,
             database_id,
-            search_path: Vec::new(),
+            search_path: default_search_path(),
             security_context,
             circuit_breakers: std::sync::Arc::new(
                 zyron_types::resilience::CircuitBreakerRegistry::new(),
@@ -234,6 +237,15 @@ impl Session {
 }
 
 /// Parses a search_path value like '"$user", public, myschema' into a Vec.
+/// The search path a session starts with, taken from the system catalog so
+/// the default and the registry cannot drift apart.
+fn default_search_path() -> Vec<String> {
+    zyron_catalog::DEFAULT_SEARCH_PATH
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn parse_search_path(value: &str) -> Vec<String> {
     value
         .split(',')

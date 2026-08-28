@@ -1,4 +1,4 @@
-//! zyron_stat_tables and zyron_stat_indexes report real activity.
+//! zyron_sys.stat.tables and zyron_sys.stat.indexes report real activity.
 //!
 //! Both views returned a hardcoded zero for every counter before the IO stats
 //! registry was wired to the executor, so a table that had served a million
@@ -11,7 +11,7 @@ mod common;
 use common::{create_test_server, exec_ddl, exec_dml, new_session, query_rows};
 use std::sync::Arc;
 use zyron_wire::connection::ServerState;
-use zyron_wire::stat_views::{StatViewFilters, query_stat_view};
+use zyron_wire::system_views::{SystemViewFilters, query_system_view};
 
 /// One row of a stat view, columns addressed by name.
 struct ViewRow {
@@ -49,8 +49,9 @@ impl ViewRow {
 }
 
 /// Reads a stat view and returns the row whose `key_column` equals `key`.
-fn view_row(server: &Arc<ServerState>, view: &str, key_column: &str, key: &str) -> ViewRow {
-    let (fields, rows) = query_stat_view(view, server, &StatViewFilters::default())
+async fn view_row(server: &Arc<ServerState>, view: &str, key_column: &str, key: &str) -> ViewRow {
+    let (fields, rows) = query_system_view(view, server, &SystemViewFilters::default())
+        .await
         .expect("stat view query")
         .unwrap_or_else(|| panic!("{view} is not a recognized stat view"));
     let columns: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
@@ -85,7 +86,7 @@ async fn test_stat_tables_counts_the_rows_a_heap_scan_read() {
 
     // A table nobody has touched reports zeros rather than being absent, which
     // is what makes the view usable as a starting baseline
-    let before = view_row(&server, "zyron_stat_tables", "table_name", "readers");
+    let before = view_row(&server, "zyron_sys.stat.tables", "table_name", "readers").await;
     assert_eq!(before.u64("seq_scan"), 0);
     assert_eq!(before.u64("seq_tup_read"), 0);
     assert_eq!(before.u64("bytes_read"), 0);
@@ -99,7 +100,7 @@ async fn test_stat_tables_counts_the_rows_a_heap_scan_read() {
         .await;
     }
 
-    let after_insert = view_row(&server, "zyron_stat_tables", "table_name", "readers");
+    let after_insert = view_row(&server, "zyron_sys.stat.tables", "table_name", "readers").await;
     assert_eq!(
         after_insert.u64("n_tup_ins"),
         40,
@@ -115,7 +116,7 @@ async fn test_stat_tables_counts_the_rows_a_heap_scan_read() {
 
     assert_eq!(query_rows(&server, "SELECT id FROM readers").await, 40);
 
-    let after_scan = view_row(&server, "zyron_stat_tables", "table_name", "readers");
+    let after_scan = view_row(&server, "zyron_sys.stat.tables", "table_name", "readers").await;
     assert!(
         after_scan.u64("seq_scan") >= 1,
         "the scan was counted, got {}",
@@ -133,7 +134,7 @@ async fn test_stat_tables_counts_the_rows_a_heap_scan_read() {
 
     // A second scan accumulates rather than replacing
     assert_eq!(query_rows(&server, "SELECT id FROM readers").await, 40);
-    let after_second = view_row(&server, "zyron_stat_tables", "table_name", "readers");
+    let after_second = view_row(&server, "zyron_sys.stat.tables", "table_name", "readers").await;
     assert_eq!(after_second.u64("seq_tup_read"), 80);
     assert!(after_second.u64("bytes_read") > after_scan.u64("bytes_read"));
 }
@@ -153,7 +154,7 @@ async fn test_stat_tables_separates_updates_deletes_and_dead_rows() {
     exec_dml(&server, "UPDATE churn SET v = 99 WHERE id < 4").await;
     exec_dml(&server, "DELETE FROM churn WHERE id >= 8").await;
 
-    let row = view_row(&server, "zyron_stat_tables", "table_name", "churn");
+    let row = view_row(&server, "zyron_sys.stat.tables", "table_name", "churn").await;
     assert_eq!(row.u64("n_tup_ins"), 10);
     assert_eq!(row.u64("n_tup_upd"), 4);
     assert_eq!(row.u64("n_tup_del"), 2);
@@ -199,10 +200,11 @@ async fn test_stat_indexes_counts_index_scans_and_the_rows_they_fetched() {
 
     let before = view_row(
         &server,
-        "zyron_stat_indexes",
+        "zyron_sys.stat.indexes",
         "index_name",
         "indexed_id_idx",
-    );
+    )
+    .await;
     assert_eq!(before.text("table_name"), "indexed");
     assert_eq!(before.text("index_type"), "btree");
     assert_eq!(before.u64("idx_scan"), 0);
@@ -210,13 +212,14 @@ async fn test_stat_indexes_counts_index_scans_and_the_rows_they_fetched() {
     let matched = query_rows(&server, "SELECT v FROM indexed WHERE id = 7").await;
     assert_eq!(matched, 1);
 
-    let table_row = view_row(&server, "zyron_stat_tables", "table_name", "indexed");
+    let table_row = view_row(&server, "zyron_sys.stat.tables", "table_name", "indexed").await;
     let index_row = view_row(
         &server,
-        "zyron_stat_indexes",
+        "zyron_sys.stat.indexes",
         "index_name",
         "indexed_id_idx",
-    );
+    )
+    .await;
 
     // The planner is free to answer this with a sequential scan, and either
     // choice must be reported honestly. What must never happen is the query
@@ -282,8 +285,8 @@ async fn test_stat_tables_counts_a_lake_scan_the_same_way_as_a_heap_scan() {
     assert_eq!(query_rows(&server, "SELECT v FROM heap_side").await, ROWS);
     assert_eq!(query_rows(&server, "SELECT v FROM lake_side").await, ROWS);
 
-    let heap = view_row(&server, "zyron_stat_tables", "table_name", "heap_side");
-    let lake = view_row(&server, "zyron_stat_tables", "table_name", "lake_side");
+    let heap = view_row(&server, "zyron_sys.stat.tables", "table_name", "heap_side").await;
+    let lake = view_row(&server, "zyron_sys.stat.tables", "table_name", "lake_side").await;
 
     for row in [&heap, &lake] {
         assert_eq!(row.u64("n_tup_ins"), ROWS as u64);
@@ -340,7 +343,13 @@ async fn test_every_index_type_records_the_scans_it_serves() {
         .await;
     }
 
-    let before = view_row(&server, "zyron_stat_indexes", "index_name", "docs_body_fts");
+    let before = view_row(
+        &server,
+        "zyron_sys.stat.indexes",
+        "index_name",
+        "docs_body_fts",
+    )
+    .await;
     assert_eq!(before.text("index_type"), "fulltext");
     assert_eq!(before.u64("idx_scan"), 0);
 
@@ -354,7 +363,13 @@ async fn test_every_index_type_records_the_scans_it_serves() {
         "the search matched nothing, so it scanned nothing"
     );
 
-    let after = view_row(&server, "zyron_stat_indexes", "index_name", "docs_body_fts");
+    let after = view_row(
+        &server,
+        "zyron_sys.stat.indexes",
+        "index_name",
+        "docs_body_fts",
+    )
+    .await;
     assert_eq!(
         after.u64("idx_scan"),
         1,
@@ -371,7 +386,7 @@ async fn test_every_index_type_records_the_scans_it_serves() {
     );
 
     // The table's own counters must agree, since they describe the same scan
-    let table = view_row(&server, "zyron_stat_tables", "table_name", "docs");
+    let table = view_row(&server, "zyron_sys.stat.tables", "table_name", "docs").await;
     assert_eq!(table.u64("idx_scan"), 1);
     assert_eq!(table.u64("idx_tup_fetch"), hits as u64);
     assert!(
@@ -392,7 +407,9 @@ async fn test_dropping_a_table_discards_its_counters() {
         exec_dml(&server, &format!("INSERT INTO transient VALUES ({i})")).await;
     }
     assert_eq!(
-        view_row(&server, "zyron_stat_tables", "table_name", "transient").u64("n_tup_ins"),
+        view_row(&server, "zyron_sys.stat.tables", "table_name", "transient")
+            .await
+            .u64("n_tup_ins"),
         5
     );
     let dropped_id = server

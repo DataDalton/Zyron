@@ -981,7 +981,7 @@ async fn test_peers_are_declared_persisted_and_dropped() {
     );
 }
 
-/// zyron_nodes reports this node for certain and a peer only as far as it
+/// zyron_sys.mesh.nodes reports this node for certain and a peer only as far as it
 /// has been told, so an unreached peer reads as unknown rather than as a
 /// guess that happens to be wrong.
 #[tokio::test]
@@ -1006,7 +1006,9 @@ async fn test_zyron_nodes_reports_mode_format_and_membership() {
     .await
     .expect("peer");
 
-    let (columns, rows) = stat_view(&server, "SELECT * FROM zyron_nodes").expect("nodes view");
+    let (columns, rows) = stat_view(&server, "SELECT * FROM zyron_sys.mesh.nodes")
+        .await
+        .expect("nodes view");
     let col = |name: &str| columns.iter().position(|c| c == name).expect(name);
     assert_eq!(rows.len(), 2, "this node plus one peer");
 
@@ -1044,8 +1046,9 @@ async fn test_zyron_nodes_reports_mode_format_and_membership() {
     // The view narrows the way every other stat view does
     let (_, narrowed) = stat_view(
         &server,
-        "SELECT * FROM zyron_nodes WHERE node_name = 'west'",
+        "SELECT * FROM zyron_sys.mesh.nodes WHERE node_name = 'west'",
     )
+    .await
     .expect("narrowed nodes view");
     assert_eq!(narrowed.len(), 1);
 }
@@ -1071,8 +1074,9 @@ async fn test_table_freshness_distinguishes_a_leader_from_a_lagging_follower() {
     }
 
     // A table this node writes reports itself current, with no lag
-    let (columns, rows) =
-        stat_view(&server, "SELECT * FROM zyron_table_freshness").expect("freshness view");
+    let (columns, rows) = stat_view(&server, "SELECT * FROM zyron_sys.storage.table_freshness")
+        .await
+        .expect("freshness view");
     let col = |name: &str| columns.iter().position(|c| c == name).expect(name);
     let row = rows
         .iter()
@@ -1121,8 +1125,9 @@ async fn test_table_freshness_distinguishes_a_leader_from_a_lagging_follower() {
     // paths have to be the ones registered
     zyron_lake::TransactionLog::register_shared(std::sync::Arc::new(replica_log));
 
-    let (columns, rows) =
-        stat_view(&server, "SELECT * FROM zyron_table_freshness").expect("freshness view");
+    let (columns, rows) = stat_view(&server, "SELECT * FROM zyron_sys.storage.table_freshness")
+        .await
+        .expect("freshness view");
     let col = |name: &str| columns.iter().position(|c| c == name).expect(name);
     let replica_row = rows
         .iter()
@@ -1182,8 +1187,9 @@ async fn test_an_unreachable_peer_stays_declared_and_records_why() {
     // And the mesh view says the id is unknown rather than inventing one
     let (columns, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_nodes WHERE node_name = 'down'",
+        "SELECT * FROM zyron_sys.mesh.nodes WHERE node_name = 'down'",
     )
+    .await
     .expect("nodes view");
     let col = |name: &str| columns.iter().position(|c| c == name).expect(name);
     assert_eq!(rows.len(), 1);
@@ -1257,8 +1263,8 @@ async fn test_the_published_log_decodes_to_the_same_versions_as_the_filesystem()
     // What the leader publishes over the wire
     let (columns, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_lake_log WHERE table_name = 'shipped' AND from_version = 1",
-    )
+        "SELECT * FROM zyron_sys.storage.lake_log WHERE table_name = 'shipped' AND from_version = 1",
+    ).await
     .expect("log view");
     let col = |name: &str| columns.iter().position(|c| c == name).expect(name);
     let published: Vec<(u64, String)> = rows
@@ -1287,8 +1293,8 @@ async fn test_the_published_log_decodes_to_the_same_versions_as_the_filesystem()
     // A follower asks from where it is, and gets only what it lacks
     let (_, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_lake_log WHERE table_name = 'shipped' AND from_version = 3",
-    )
+        "SELECT * FROM zyron_sys.storage.lake_log WHERE table_name = 'shipped' AND from_version = 3",
+    ).await
     .expect("log view");
     let versions: Vec<u64> = rows
         .iter()
@@ -1438,7 +1444,7 @@ async fn test_a_table_name_a_peer_is_asked_for_is_checked() {
 /// Runs a SELECT against a virtual view exactly as the wire path does:
 /// parse, read the supported clauses, build and narrow. Returns the column
 /// names paired with the rows rendered as text.
-fn stat_view(
+async fn stat_view(
     server: &Arc<ServerState>,
     sql: &str,
 ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
@@ -1456,12 +1462,13 @@ fn stat_view(
         other => return Err(format!("not a plain table ref: {other:?}")),
     };
     assert!(
-        zyron_wire::stat_views::is_stat_view(&name),
+        zyron_wire::system_views::is_system_view(&name),
         "{name} must be a registered view"
     );
-    let filters =
-        zyron_wire::stat_views::parse_stat_view_query(&name, &sel).map_err(|e| e.to_string())?;
-    let (fields, rows) = zyron_wire::stat_views::query_stat_view(&name, server, &filters)
+    let filters = zyron_wire::system_views::parse_system_view_query(&name, &sel)
+        .map_err(|e| e.to_string())?;
+    let (fields, rows) = zyron_wire::system_views::query_system_view(&name, server, &filters)
+        .await
         .map_err(|e| e.to_string())?
         .expect("a registered view builds");
     let names = fields.iter().map(|f| f.name.clone()).collect();
@@ -1512,8 +1519,9 @@ async fn test_table_history_view_reports_every_commit() {
 
     let (names, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name = 'h'",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name = 'h'",
     )
+    .await
     .expect("history");
     let version = column_of(&names, "version");
     let operation = column_of(&names, "operation");
@@ -1528,8 +1536,9 @@ async fn test_table_history_view_reports_every_commit() {
     // LIMIT bounds the walk rather than being dropped
     let (_, limited) = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name = 'h' LIMIT 2",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name = 'h' LIMIT 2",
     )
+    .await
     .expect("history");
     assert_eq!(limited.len(), 2);
     assert_eq!(limited[0][version], "4");
@@ -1537,8 +1546,9 @@ async fn test_table_history_view_reports_every_commit() {
     // OFFSET skips from the newest end
     let (_, offset) = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name = 'h' LIMIT 1 OFFSET 1",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name = 'h' LIMIT 1 OFFSET 1",
     )
+    .await
     .expect("history");
     assert_eq!(offset.len(), 1);
     assert_eq!(offset[0][version], "3");
@@ -1553,13 +1563,16 @@ async fn test_stat_view_where_clause_is_honored_not_dropped() {
     history_fixture(&server, &mut session, "one").await;
     history_fixture(&server, &mut session, "two").await;
 
-    let (_, both) = stat_view(&server, "SELECT * FROM zyron_table_history").expect("history");
+    let (_, both) = stat_view(&server, "SELECT * FROM zyron_sys.time_travel.table_history")
+        .await
+        .expect("history");
     assert_eq!(both.len(), 8, "two tables of four versions each");
 
     let (names, only_one) = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name = 'one'",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name = 'one'",
     )
+    .await
     .expect("history");
     assert_eq!(only_one.len(), 4);
     let table = column_of(&names, "table_name");
@@ -1568,16 +1581,17 @@ async fn test_stat_view_where_clause_is_honored_not_dropped() {
     // A filter on a second column narrows further
     let (_, appends) = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name = 'one' AND operation = 'APPEND'",
-    )
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name = 'one' AND operation = 'APPEND'",
+    ).await
     .expect("history");
     assert_eq!(appends.len(), 2);
 
     // A table this node does not have matches nothing
     let (_, none) = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name = 'absent'",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name = 'absent'",
     )
+    .await
     .expect("history");
     assert!(none.is_empty());
 }
@@ -1591,22 +1605,25 @@ async fn test_stat_view_refuses_clauses_it_cannot_apply() {
 
     let err = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE table_name LIKE 'h%'",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE table_name LIKE 'h%'",
     )
+    .await
     .expect_err("LIKE is not a supported filter");
     assert!(err.contains("column = literal"), "{err}");
 
     let err = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history ORDER BY version",
+        "SELECT * FROM zyron_sys.time_travel.table_history ORDER BY version",
     )
+    .await
     .expect_err("ORDER BY is not applied");
     assert!(err.contains("ORDER BY"), "{err}");
 
     let err = stat_view(
         &server,
-        "SELECT * FROM zyron_table_history WHERE version > 2",
+        "SELECT * FROM zyron_sys.time_travel.table_history WHERE version > 2",
     )
+    .await
     .expect_err("range filters are not supported");
     assert!(err.contains("column = literal"), "{err}");
 }
@@ -1620,8 +1637,9 @@ async fn test_version_scoped_views_read_the_past() {
     // Files at version 3, before the delete dropped one
     let (names, files) = stat_view(
         &server,
-        "SELECT * FROM zyron_version_files WHERE table_name = 'h' AND version = 3",
+        "SELECT * FROM zyron_sys.time_travel.version_files WHERE table_name = 'h' AND version = 3",
     )
+    .await
     .expect("files");
     assert_eq!(files.len(), 2);
     let row_count = column_of(&names, "row_count");
@@ -1634,16 +1652,17 @@ async fn test_version_scoped_views_read_the_past() {
     // The latest version is the default, and the delete removed a file
     let (_, latest) = stat_view(
         &server,
-        "SELECT * FROM zyron_version_files WHERE table_name = 'h'",
+        "SELECT * FROM zyron_sys.time_travel.version_files WHERE table_name = 'h'",
     )
+    .await
     .expect("files");
     assert_eq!(latest.len(), 1);
 
     // Schema at a past version
     let (names, schema) = stat_view(
         &server,
-        "SELECT * FROM zyron_schema_at_version WHERE table_name = 'h' AND version = 1",
-    )
+        "SELECT * FROM zyron_sys.time_travel.schema_at_version WHERE table_name = 'h' AND version = 1",
+    ).await
     .expect("schema");
     assert_eq!(schema.len(), 2);
     let column_name = column_of(&names, "column_name");
@@ -1653,8 +1672,8 @@ async fn test_version_scoped_views_read_the_past() {
     // Details carry the operation and the recorded delete predicate
     let (names, details) = stat_view(
         &server,
-        "SELECT * FROM zyron_version_details WHERE table_name = 'h' AND version = 4",
-    )
+        "SELECT * FROM zyron_sys.time_travel.version_details WHERE table_name = 'h' AND version = 4",
+    ).await
     .expect("details");
     assert_eq!(details.len(), 1);
     let operation = column_of(&names, "operation");
@@ -1665,8 +1684,8 @@ async fn test_version_scoped_views_read_the_past() {
     // Lineage follows the read_version links back to version one
     let (names, lineage) = stat_view(
         &server,
-        "SELECT * FROM zyron_version_lineage WHERE table_name = 'h' AND version = 4",
-    )
+        "SELECT * FROM zyron_sys.time_travel.version_lineage WHERE table_name = 'h' AND version = 4",
+    ).await
     .expect("lineage");
     let ancestor = column_of(&names, "ancestor_version");
     let chain: Vec<&str> = lineage.iter().map(|r| r[ancestor].as_str()).collect();
@@ -1681,15 +1700,16 @@ async fn test_diff_versions_view_needs_both_endpoints() {
 
     let err = stat_view(
         &server,
-        "SELECT * FROM zyron_diff_versions WHERE table_name = 'h'",
+        "SELECT * FROM zyron_sys.time_travel.diff_versions WHERE table_name = 'h'",
     )
+    .await
     .expect_err("a diff without endpoints has no answer");
     assert!(err.contains("from_version"), "{err}");
 
     let (names, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_diff_versions WHERE table_name = 'h' AND from_version = 2 AND to_version = 3",
-    )
+        "SELECT * FROM zyron_sys.time_travel.diff_versions WHERE table_name = 'h' AND from_version = 2 AND to_version = 3",
+    ).await
     .expect("diff");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][column_of(&names, "files_added")], "1");
@@ -1698,8 +1718,8 @@ async fn test_diff_versions_view_needs_both_endpoints() {
 
     let (names, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_diff_versions WHERE table_name = 'h' AND from_version = 3 AND to_version = 4",
-    )
+        "SELECT * FROM zyron_sys.time_travel.diff_versions WHERE table_name = 'h' AND from_version = 3 AND to_version = 4",
+    ).await
     .expect("diff");
     assert_eq!(rows[0][column_of(&names, "files_removed")], "1");
     assert_eq!(rows[0][column_of(&names, "rows_removed")], "2");
@@ -1870,7 +1890,9 @@ async fn test_lake_branches_view_lists_branches_and_their_lead() {
     let log = open_log(&server, &entry);
     zyron_lake::create_branch(&log, "staging", None, 4242).expect("create branch");
 
-    let (names, rows) = stat_view(&server, "SELECT * FROM zyron_lake_branches").expect("branches");
+    let (names, rows) = stat_view(&server, "SELECT * FROM zyron_sys.branch.lake_branches")
+        .await
+        .expect("branches");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][column_of(&names, "table_name")], "b");
     assert_eq!(rows[0][column_of(&names, "branch_name")], "staging");
@@ -1902,8 +1924,9 @@ async fn test_lake_branches_view_lists_branches_and_their_lead() {
 
     let (names, rows) = stat_view(
         &server,
-        "SELECT * FROM zyron_lake_branches WHERE branch_name = 'staging'",
+        "SELECT * FROM zyron_sys.branch.lake_branches WHERE branch_name = 'staging'",
     )
+    .await
     .expect("branches");
     assert_eq!(rows[0][column_of(&names, "commits_ahead")], "1");
     assert_eq!(rows[0][column_of(&names, "head_version")], "3");

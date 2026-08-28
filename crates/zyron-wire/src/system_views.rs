@@ -1,18 +1,29 @@
-//! Virtual statistics views that bypass the normal planner/executor path.
+//! The `zyron_sys` catalog's read path.
 //!
-//! Each view returns a column schema (FieldDescription vector) and data rows
-//! directly, allowing clients to query internal server metrics through
-//! standard SQL SELECT statements on virtual system tables.
+//! Every object of the system catalog is computed when it is read rather than
+//! stored, so a SELECT against one is answered here instead of going through
+//! the planner and executor. Each entity returns a column schema
+//! (FieldDescription vector) and its rows directly.
+//!
+//! Which names exist is decided by the registry in
+//! `zyron_catalog::system_catalog`, not here. This module owns the row
+//! builders and the clause handling; the registry owns the names, so a name
+//! that resolves and an entity that can be read are the same set by
+//! construction, and a name outside it does not exist.
 
 use std::sync::atomic::Ordering;
 
+use zyron_catalog::system_catalog::{self, SystemObject, SystemObjectKind};
 use zyron_common::ZyronError;
 
 use crate::connection::ServerState;
 use crate::messages::backend::FieldDescription;
 use crate::types::{PG_INT4_OID, PG_INT8_OID, PG_TEXT_OID};
 
-/// Row data for zyron_stat_activity, collected by the session manager.
+/// Column schema paired with rendered rows, what every builder returns.
+pub type ViewRows = (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>);
+
+/// Row data for zyron_sys.stat.activity, collected by the session manager.
 pub struct SessionRow {
     pub pid: i32,
     pub user_name: String,
@@ -22,57 +33,18 @@ pub struct SessionRow {
     pub last_activity_secs: u64,
 }
 
-/// List of recognized virtual statistics view names.
-const STAT_VIEW_NAMES: &[&str] = &[
-    "zyron_stat_activity",
-    "zyron_stat_tables",
-    "zyron_stat_indexes",
-    "zyron_stat_wal",
-    "zyron_stat_bgwriter",
-    "zyron_stat_cdc_feeds",
-    "zyron_stat_replication_slots",
-    "zyron_stat_cdc_streams",
-    "zyron_stat_cdc_ingests",
-    "zyron_stat_streaming_jobs",
-    "zyron_stat_triggers",
-    "zyron_stat_branches",
-    "zyron_stat_publications",
-    "zyron_stat_subscriptions",
-    "zyron_stat_endpoints",
-    "zyron_stat_dead_letters",
-    "zyron_stat_zyron_sinks",
-    "zyron_stat_zyron_sources",
-    "zyron_stat_credential_cache",
-    // Lake version history, plan items 771-775
-    "zyron_table_history",
-    "zyron_version_details",
-    "zyron_version_files",
-    "zyron_diff_versions",
-    "zyron_schema_at_version",
-    "zyron_version_lineage",
-    "zyron_lake_branches",
-    // Adaptive Clustering status, plan items 330-332
-    "zyron_clustering_status",
-    "zyron_derived_columns",
-    "zyron_auto_compaction_history",
-    // Node mesh
-    "zyron_nodes",
-    "zyron_table_freshness",
-    "zyron_lake_log",
-];
-
 // ---------------------------------------------------------------------------
 // Query shape
 // ---------------------------------------------------------------------------
 
-/// The parts of a SELECT a virtual view honors.
+/// The parts of a SELECT a system view honors.
 ///
 /// These views bypass the planner, so anything the parser accepted has to be
 /// applied here or refused here. Silently dropping a WHERE clause would hand
 /// back every row of a view the caller asked to narrow, which reads as an
 /// answer rather than as a missing feature.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StatViewFilters {
+pub struct SystemViewFilters {
     /// `column = literal` conjuncts in statement order
     pub equalities: Vec<(String, String)>,
     pub limit: Option<usize>,
@@ -83,7 +55,7 @@ pub struct StatViewFilters {
     pub projection: Vec<(String, String)>,
 }
 
-impl StatViewFilters {
+impl SystemViewFilters {
     /// The literal a column was equated to, case-insensitive on the name
     pub fn get(&self, column: &str) -> Option<&str> {
         self.equalities
@@ -107,7 +79,7 @@ impl StatViewFilters {
         view: &str,
         fields: Vec<FieldDescription>,
         rows: Vec<Vec<Option<Vec<u8>>>>,
-    ) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    ) -> Result<ViewRows, ZyronError> {
         if self.projection.is_empty() {
             return Ok((fields, rows));
         }
@@ -263,11 +235,11 @@ fn constant_usize(expr: &zyron_parser::Expr, view: &str, what: &str) -> Result<u
 
 /// Reads the supported clauses off a SELECT against a virtual view, or
 /// refuses a shape the view cannot answer. Never silently drops a clause.
-pub fn parse_stat_view_query(
+pub fn parse_system_view_query(
     view: &str,
     sel: &zyron_parser::SelectStatement,
-) -> Result<StatViewFilters, ZyronError> {
-    let mut refuse = |clause: &str| -> Result<(), ZyronError> {
+) -> Result<SystemViewFilters, ZyronError> {
+    let refuse = |clause: &str| -> Result<(), ZyronError> {
         Err(ZyronError::PlanError(format!(
             "{} does not support {}",
             view, clause
@@ -301,7 +273,7 @@ pub fn parse_stat_view_query(
         refuse("row locking")?;
     }
 
-    let mut filters = StatViewFilters::default();
+    let mut filters = SystemViewFilters::default();
     // The select list is honoured or refused, never ignored. A view answered
     // from here does not go through the planner, so an expression has nothing
     // to evaluate it and returning every column instead would be answering a
@@ -338,100 +310,226 @@ pub fn parse_stat_view_query(
     Ok(filters)
 }
 
-/// Returns true if the given name matches a virtual statistics view.
+/// A call to one of the system catalog's table functions, with its
+/// arguments already reduced to the literal text each evaluated to.
+pub struct SystemFunctionCall {
+    pub object: &'static SystemObject,
+    pub args: Vec<String>,
+}
+
+/// Reads a `FROM zyron_sys.<schema>.<object>(...)` call out of a SELECT.
 ///
-/// The pressure schema is included: its views are computed on read the same
-/// way, and routing them here is what makes them answer to a plain SELECT
-/// from any client rather than needing a side channel.
-pub fn is_stat_view(name: &str) -> bool {
-    STAT_VIEW_NAMES.contains(&name) || crate::pressure_views::is_pressure_view(name)
-}
-
-/// Dispatches to the appropriate view builder and returns the column schema
-/// paired with data rows. Returns None if the name is not a recognized view.
-pub fn query_stat_view(
-    name: &str,
-    server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<Option<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>)>, ZyronError> {
-    // The history views scope themselves by table and version so they read
-    // only the log versions the query asked about, every other view builds
-    // its rows and is narrowed afterwards
-    if crate::pressure_views::is_pressure_view(name) {
-        let capabilities = server.node_capabilities.as_deref();
-        let built = crate::pressure_views::query_pressure_view(name, capabilities);
-        return match built {
-            Some((fields, rows)) => {
-                let rows = filters.apply(&fields, rows);
-                filters.project(name, fields, rows).map(Some)
-            }
-            None => Ok(None),
-        };
+/// Returns None when the statement is not a single call to a registered
+/// table function, which sends it down the normal path. A call to a name
+/// under the system catalog that is not registered is refused here rather
+/// than passed on, because the planner would look for a user function of
+/// that name and report the wrong thing.
+pub fn parse_system_function(
+    sel: &zyron_parser::SelectStatement,
+) -> Option<Result<SystemFunctionCall, ZyronError>> {
+    if sel.from.len() != 1 {
+        return None;
     }
-
-    let built = match name {
-        "zyron_table_history" => Some(build_table_history(server, filters)?),
-        "zyron_version_details" => Some(build_version_details(server, filters)?),
-        "zyron_version_files" => Some(build_version_files(server, filters)?),
-        "zyron_diff_versions" => Some(build_diff_versions(server, filters)?),
-        "zyron_schema_at_version" => Some(build_schema_at_version(server, filters)?),
-        "zyron_version_lineage" => Some(build_version_lineage(server, filters)?),
-        "zyron_lake_branches" => Some(build_lake_branches(server, filters)?),
-        "zyron_clustering_status" => Some(build_clustering_status(server, filters)?),
-        "zyron_derived_columns" => Some(build_derived_columns(server, filters)?),
-        "zyron_auto_compaction_history" => Some(build_auto_compaction_history(server, filters)?),
-        "zyron_nodes" => Some(build_nodes(server, filters)?),
-        "zyron_table_freshness" => Some(build_table_freshness(server, filters)?),
-        "zyron_lake_log" => Some(build_lake_log(server, filters)?),
-        other => build_stat_view(other, server),
+    let zyron_parser::TableRef::TableFunction(call) = &sel.from[0] else {
+        return None;
     };
-    match built {
-        Some((fields, rows)) => {
-            let rows = filters.apply(&fields, rows);
-            filters.project(name, fields, rows).map(Some)
+    let name = call.name.as_str();
+    let object = match system_catalog::find(name) {
+        Some(object) => object,
+        None if system_catalog::is_system_catalog_name(name) => {
+            return Some(Err(system_catalog::relation_not_found(name)));
         }
-        None => Ok(None),
+        None => return None,
+    };
+    if object.kind != SystemObjectKind::TableFunction {
+        return Some(Err(ZyronError::PlanError(format!(
+            "`{}` is a view, read it with `SELECT * FROM {}`",
+            name,
+            object.canonical_name()
+        ))));
     }
+
+    let mut args = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        match arg {
+            zyron_parser::ast::FunctionArg::Unnamed(expr) => match literal_argument(expr) {
+                Some(text) => args.push(text),
+                None => {
+                    return Some(Err(ZyronError::PlanError(format!(
+                        "`{}` takes literal arguments, and one of these is not a literal",
+                        object.canonical_name()
+                    ))));
+                }
+            },
+            _ => {
+                return Some(Err(ZyronError::PlanError(format!(
+                    "`{}` takes positional arguments only",
+                    object.canonical_name()
+                ))));
+            }
+        }
+    }
+    Some(Ok(SystemFunctionCall { object, args }))
 }
 
-fn build_stat_view(
-    name: &str,
-    server: &ServerState,
-) -> Option<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>)> {
-    match name {
-        "zyron_stat_activity" => Some(build_stat_activity(server)),
-        "zyron_stat_tables" => Some(build_stat_tables(server)),
-        "zyron_stat_indexes" => Some(build_stat_indexes(server)),
-        "zyron_stat_wal" => Some(build_stat_wal(server)),
-        "zyron_stat_bgwriter" => Some(build_stat_bgwriter(server)),
-        "zyron_stat_cdc_feeds" => Some(build_stat_cdc_feeds(server)),
-        "zyron_stat_replication_slots" => Some(build_stat_replication_slots(server)),
-        "zyron_stat_cdc_streams" => Some(build_stat_cdc_streams(server)),
-        "zyron_stat_cdc_ingests" => Some(build_stat_cdc_ingests(server)),
-        "zyron_stat_streaming_jobs" => Some(build_stat_streaming_jobs(server)),
-        "zyron_stat_triggers" => Some(build_stat_triggers(server)),
-        "zyron_stat_branches" => Some(build_stat_branches(server)),
-        "zyron_stat_publications" => Some(build_stat_publications(server)),
-        "zyron_stat_subscriptions" => Some(build_stat_subscriptions(server)),
-        "zyron_stat_endpoints" => Some(build_stat_endpoints(server)),
-        "zyron_stat_dead_letters" => Some(build_stat_dead_letters(server)),
-        "zyron_stat_zyron_sinks" => Some(build_stat_zyron_sinks(server)),
-        "zyron_stat_zyron_sources" => Some(build_stat_zyron_sources(server)),
-        "zyron_stat_credential_cache" => Some(build_stat_credential_cache(server)),
+/// The text a literal argument carries, or None when the expression is not a
+/// literal a system function can be called with.
+fn literal_argument(expr: &zyron_parser::Expr) -> Option<String> {
+    match unwrap_nested(expr) {
+        zyron_parser::Expr::Literal(lit) => literal_text(lit),
+        // A bare word in an argument position reads as the name it spells,
+        // which is how `report(retention)` and `report('retention')` mean the
+        // same thing
+        zyron_parser::Expr::Identifier(name) => Some(name.clone()),
         _ => None,
     }
+}
+
+/// Runs one system table function and narrows its result by the clauses the
+/// statement carried.
+pub async fn query_system_function(
+    call: &SystemFunctionCall,
+    server: &ServerState,
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
+    let (fields, rows) = match (call.object.schema, call.object.object) {
+        ("cdc", object) => crate::system_cdc_views::call(object, &call.args, server)?,
+        ("compliance", "report") => {
+            crate::system_compliance_report::call(&call.args, server).await?
+        }
+        (schema, object) => {
+            return Err(ZyronError::Internal(format!(
+                "`zyron_sys.{}.{}` is registered but has no implementation",
+                schema, object
+            )));
+        }
+    };
+    let name = call.object.canonical_name();
+    let rows = filters.apply(&fields, rows);
+    filters.project(&name, fields, rows)
+}
+
+/// Whether a name addresses an entity of the system catalog.
+///
+/// Canonical three-part names only. A retired name is not one of these, which
+/// is what sends it to the planner and out again as RelationNotFound.
+pub fn is_system_view(name: &str) -> bool {
+    system_catalog::is_system_object(name)
+}
+
+/// The entity a bare name reaches through a search path, or None when the
+/// path does not put a system schema ahead of it.
+pub fn resolve_in_search_path<S: AsRef<str>>(
+    object: &str,
+    search_path: &[S],
+) -> Option<&'static SystemObject> {
+    system_catalog::resolve_in_search_path(object, search_path)
+}
+
+/// Reads one entity of the system catalog.
+///
+/// Returns Ok(None) only when the name is not registered; a registered name
+/// always has a builder, which the registry test enforces. Table functions
+/// are refused here because they need their arguments, and a bare SELECT
+/// carries none.
+pub async fn query_system_view(
+    name: &str,
+    server: &ServerState,
+    filters: &SystemViewFilters,
+) -> Result<Option<ViewRows>, ZyronError> {
+    let Some(object) = system_catalog::find(name) else {
+        return Ok(None);
+    };
+    if object.kind == SystemObjectKind::TableFunction {
+        return Err(ZyronError::PlanError(format!(
+            "`{}` is a table function and needs its arguments, call it as `{}(...)`",
+            name,
+            object.canonical_name()
+        )));
+    }
+
+    // The pressure schema computes its own rows off the controller rather
+    // than off ServerState, so it is dispatched before the rest
+    if object.schema == "pressure" {
+        let capabilities = server.node_capabilities.as_deref();
+        let Some((fields, rows)) = crate::pressure_views::query_pressure_view(name, capabilities)
+        else {
+            return Ok(None);
+        };
+        let rows = filters.apply(&fields, rows);
+        return filters.project(name, fields, rows).map(Some);
+    }
+
+    let built = match (object.schema, object.object) {
+        // The history views scope themselves by table and version so they
+        // read only the log versions the query asked about; every other view
+        // builds its rows and is narrowed afterwards
+        ("time_travel", "table_history") => build_table_history(server, filters)?,
+        ("time_travel", "version_details") => build_version_details(server, filters)?,
+        ("time_travel", "version_files") => build_version_files(server, filters)?,
+        ("time_travel", "diff_versions") => build_diff_versions(server, filters)?,
+        ("time_travel", "schema_at_version") => build_schema_at_version(server, filters)?,
+        ("time_travel", "version_lineage") => build_version_lineage(server, filters)?,
+        ("branch", "lake_branches") => build_lake_branches(server, filters)?,
+        ("storage", "clustering_status") => build_clustering_status(server, filters)?,
+        ("storage", "derived_columns") => build_derived_columns(server, filters)?,
+        ("storage", "auto_compaction_history") => build_auto_compaction_history(server, filters)?,
+        ("storage", "table_freshness") => build_table_freshness(server, filters)?,
+        ("storage", "lake_log") => build_lake_log(server, filters)?,
+        ("mesh", "nodes") => build_nodes(server, filters)?,
+        ("security", "users") => {
+            crate::system_core_views::build(object.schema, object.object, server).await?
+        }
+        ("stat", object) => build_stat_view(object, server)?,
+        ("streaming", object) => crate::system_streaming_views::build(object, server)?,
+        (schema, object) => crate::system_core_views::build(schema, object, server).await?,
+    };
+    let (fields, rows) = built;
+    let rows = filters.apply(&fields, rows);
+    filters.project(name, fields, rows).map(Some)
+}
+
+/// The `zyron_sys.stat.*` views.
+fn build_stat_view(object: &str, server: &ServerState) -> Result<ViewRows, ZyronError> {
+    Ok(match object {
+        "activity" => build_stat_activity(server),
+        "tables" => build_stat_tables(server),
+        "indexes" => build_stat_indexes(server),
+        "wal" => build_stat_wal(server),
+        "bgwriter" => build_stat_bgwriter(server),
+        "cdc_feeds" => build_stat_cdc_feeds(server),
+        "replication_slots" => build_stat_replication_slots(server),
+        "cdc_streams" => build_stat_cdc_streams(server),
+        "cdc_ingests" => build_stat_cdc_ingests(server),
+        "streaming_jobs" => build_stat_streaming_jobs(server),
+        "trigger_executions" => build_stat_trigger_executions(server),
+        "pipeline_runs" => build_stat_pipeline_runs(server),
+        "branches" => build_stat_branches(server),
+        "publications" => build_stat_publications(server),
+        "subscriptions" => build_stat_subscriptions(server),
+        "endpoints" => build_stat_endpoints(server),
+        "dead_letters" => build_stat_dead_letters(server),
+        "zyron_sinks" => build_stat_zyron_sinks(server),
+        "zyron_sources" => build_stat_zyron_sources(server),
+        "credential_cache" => build_stat_credential_cache(server),
+        "summary" => build_stat_summary(server),
+        other => {
+            return Err(ZyronError::Internal(format!(
+                "`zyron_sys.stat.{}` is registered but has no builder",
+                other
+            )));
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Zyron-to-Zyron stat views
 // ---------------------------------------------------------------------------
 
-/// Builds zyron_stat_publications.
+/// Builds zyron_sys.stat.publications.
 /// Columns: name, schema_id, change_feed, retention_days, classification,
 ///          allow_initial_snapshot, created_at.
-fn build_stat_publications(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_publications(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("schema_id", PG_INT4_OID, 4),
@@ -460,11 +558,9 @@ fn build_stat_publications(
     (fields, rows)
 }
 
-/// Builds zyron_stat_subscriptions.
+/// Builds zyron_sys.stat.subscriptions.
 /// Columns: id, publication_id, consumer_id, mode, state, last_seen_lsn, last_poll_at.
-fn build_stat_subscriptions(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_subscriptions(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("id", PG_INT4_OID, 4),
         make_field("publication_id", PG_INT4_OID, 4),
@@ -493,11 +589,9 @@ fn build_stat_subscriptions(
     (fields, rows)
 }
 
-/// Builds zyron_stat_endpoints.
+/// Builds zyron_sys.stat.endpoints.
 /// Columns: name, path, kind, enabled, auth_mode, created_at.
-fn build_stat_endpoints(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_endpoints(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("path", PG_TEXT_OID, -1),
@@ -524,11 +618,9 @@ fn build_stat_endpoints(
     (fields, rows)
 }
 
-/// Builds zyron_stat_dead_letters. One row per registered dead letter
+/// Builds zyron_sys.stat.dead_letters. One row per registered dead letter
 /// queue with its pending row count and the receive time of its oldest row.
-fn build_stat_dead_letters(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_dead_letters(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("queue", PG_TEXT_OID, -1),
         make_field("pending", PG_INT8_OID, 8),
@@ -549,11 +641,9 @@ fn build_stat_dead_letters(
     (fields, rows)
 }
 
-/// Builds zyron_stat_zyron_sinks. Lists remote Zyron sink entries from the
+/// Builds zyron_sys.stat.zyron_sinks. Lists remote Zyron sink entries from the
 /// external-sink catalog whose backend is Zyron.
-fn build_stat_zyron_sinks(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_zyron_sinks(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("uri", PG_TEXT_OID, -1),
@@ -575,11 +665,9 @@ fn build_stat_zyron_sinks(
     (fields, rows)
 }
 
-/// Builds zyron_stat_zyron_sources. Lists remote Zyron source entries from the
+/// Builds zyron_sys.stat.zyron_sources. Lists remote Zyron source entries from the
 /// external-source catalog whose backend is Zyron.
-fn build_stat_zyron_sources(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_zyron_sources(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("uri", PG_TEXT_OID, -1),
@@ -601,12 +689,10 @@ fn build_stat_zyron_sources(
     (fields, rows)
 }
 
-/// Builds zyron_stat_credential_cache. Every dynamic credential provider
+/// Builds zyron_sys.stat.credential_cache. Every dynamic credential provider
 /// shares one TTL cache under distinct key namespaces, so this reports one
 /// row of aggregate counters. No row when security is disabled.
-fn build_stat_credential_cache(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_credential_cache(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("provider", PG_TEXT_OID, -1),
         make_field("entries", PG_INT8_OID, 8),
@@ -634,7 +720,7 @@ fn build_stat_credential_cache(
 /// Creates a FieldDescription with default values for virtual view columns.
 /// table_oid, column_attr, type_modifier, and format are all set to zero/default
 /// since these columns do not belong to a physical table.
-fn make_field(name: &str, typeOid: i32, typeSize: i16) -> FieldDescription {
+pub(crate) fn make_field(name: &str, typeOid: i32, typeSize: i16) -> FieldDescription {
     FieldDescription {
         name: name.to_string(),
         table_oid: 0,
@@ -646,10 +732,10 @@ fn make_field(name: &str, typeOid: i32, typeSize: i16) -> FieldDescription {
     }
 }
 
-/// Builds the zyron_stat_activity view.
+/// Builds the zyron_sys.stat.activity view.
 /// Columns: pid, user_name, database, state, connected_at_secs, last_activity_secs.
 /// Data source: server.session_info_collector callback.
-fn build_stat_activity(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_activity(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("pid", PG_INT4_OID, 4),
         make_field("user_name", PG_TEXT_OID, -1),
@@ -685,7 +771,7 @@ fn counter_cell(value: u64) -> Option<Vec<u8>> {
     Some(value.to_string().into_bytes())
 }
 
-/// Builds the zyron_stat_tables view.
+/// Builds the zyron_sys.stat.tables view.
 /// Columns: table_name, seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
 ///          n_tup_ins, n_tup_upd, n_tup_del, n_dead_tup,
 ///          last_vacuum, last_analyze, bytes_read, row_count.
@@ -699,7 +785,7 @@ fn counter_cell(value: u64) -> Option<Vec<u8>> {
 /// outlive a restart. A table never analyzed falls back to inserts less
 /// deletes observed this run, which is an estimate and labelled as one here
 /// rather than reported as a count.
-fn build_stat_tables(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_tables(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("seq_scan", PG_INT8_OID, 8),
@@ -751,14 +837,14 @@ fn build_stat_tables(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Op
     (fields, rows)
 }
 
-/// Builds the zyron_stat_indexes view.
+/// Builds the zyron_sys.stat.indexes view.
 /// Columns: index_name, table_name, index_type, idx_scan, idx_tup_read, idx_tup_fetch.
 ///
 /// Counters come from the server's IndexIOStatsRegistry, written by the index
 /// scan operators. idx_tup_read is index entries the range scan examined,
 /// idx_tup_fetch is the table rows those entries resolved to, so the gap
 /// between them is entries that pointed at a row this snapshot could not see.
-fn build_stat_indexes(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_indexes(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("index_name", PG_TEXT_OID, -1),
         make_field("table_name", PG_TEXT_OID, -1),
@@ -794,12 +880,12 @@ fn build_stat_indexes(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<O
     (fields, rows)
 }
 
-/// Builds the zyron_stat_wal view.
+/// Builds the zyron_sys.stat.wal view.
 /// Columns: wal_records, wal_bytes, wal_syncs, wal_flushed_lsn,
 ///          wal_current_segment, last_checkpoint_lsn.
 /// Reads flushed_lsn and current_segment_id from the WAL writer.
 /// Last checkpoint LSN from server.checkpoint_stats callback.
-fn build_stat_wal(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_wal(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("wal_records", PG_INT8_OID, 8),
         make_field("wal_bytes", PG_INT8_OID, 8),
@@ -832,11 +918,79 @@ fn build_stat_wal(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Optio
     (fields, vec![row])
 }
 
-/// Builds the zyron_stat_bgwriter view.
+/// Builds the zyron_sys.stat.summary view.
+/// Columns: counter, value.
+///
+/// One row per server-wide counter rather than one wide row, so a reader can
+/// filter to the counter it cares about and so adding a counter does not
+/// change the shape of the result. The tuple counters are summed across every
+/// table: this is the node's total, and per-table detail is what
+/// zyron_sys.stat.tables is for.
+fn build_stat_summary(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("counter", PG_TEXT_OID, -1),
+        make_field("value", PG_INT8_OID, 8),
+    ];
+    let ordering = Ordering::Relaxed;
+    let (checkpoints, segments_deleted, last_checkpoint_lsn) = server
+        .checkpoint_stats
+        .as_ref()
+        .map(|f| f())
+        .unwrap_or((0, 0, 0));
+    let (vacuum_cycles, tuples_reclaimed, pages_scanned) = server
+        .vacuum_stats
+        .as_ref()
+        .map(|f| f())
+        .unwrap_or((0, 0, 0));
+
+    let mut inserted = 0u64;
+    let mut updated = 0u64;
+    let mut deleted = 0u64;
+    let mut seq_scans = 0u64;
+    let mut idx_scans = 0u64;
+    let mut bytes_read = 0u64;
+    let tables = server.catalog.list_all_tables();
+    for table in &tables {
+        let stats = server.table_io_stats.get_or_create(table.id.0);
+        inserted = inserted.saturating_add(stats.n_tup_ins.load(ordering));
+        updated = updated.saturating_add(stats.n_tup_upd.load(ordering));
+        deleted = deleted.saturating_add(stats.n_tup_del.load(ordering));
+        seq_scans = seq_scans.saturating_add(stats.seq_scan.load(ordering));
+        idx_scans = idx_scans.saturating_add(stats.idx_scan.load(ordering));
+        bytes_read = bytes_read.saturating_add(stats.bytes_read.load(ordering));
+    }
+
+    let counters: Vec<(&str, u64)> = vec![
+        ("tables", tables.len() as u64),
+        ("wal_records", server.wal.wal_records_written()),
+        ("wal_bytes", server.wal.wal_bytes_written()),
+        ("wal_syncs", server.wal.wal_syncs.load(ordering)),
+        ("wal_flushed_lsn", server.wal.flushed_lsn().0),
+        ("checkpoints_completed", checkpoints),
+        ("checkpoint_segments_deleted", segments_deleted),
+        ("last_checkpoint_lsn", last_checkpoint_lsn),
+        ("vacuum_cycles", vacuum_cycles),
+        ("vacuum_tuples_reclaimed", tuples_reclaimed),
+        ("vacuum_pages_scanned", pages_scanned),
+        ("tuples_inserted", inserted),
+        ("tuples_updated", updated),
+        ("tuples_deleted", deleted),
+        ("seq_scans", seq_scans),
+        ("index_scans", idx_scans),
+        ("bytes_read", bytes_read),
+    ];
+    let rows = counters
+        .into_iter()
+        .map(|(name, value)| vec![cell(name), cell(value)])
+        .collect();
+    (fields, rows)
+}
+
+/// Builds the zyron_sys.stat.bgwriter view.
 /// Columns: checkpoints_completed, checkpoint_segments_deleted,
 ///          last_checkpoint_lsn, vacuum_cycles, tuples_reclaimed, pages_scanned.
 /// Data source: server.checkpoint_stats and server.vacuum_stats callbacks.
-fn build_stat_bgwriter(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_bgwriter(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("checkpoints_completed", PG_INT8_OID, 8),
         make_field("checkpoint_segments_deleted", PG_INT8_OID, 8),
@@ -869,12 +1023,10 @@ fn build_stat_bgwriter(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<
     (fields, vec![row])
 }
 
-/// Builds the zyron_stat_cdc_feeds view.
+/// Builds the zyron_sys.stat.cdc_feeds view.
 /// Columns: table_id, record_count, file_size_bytes, retention_days.
 /// Data source: server.cdc_feed_stats callback.
-fn build_stat_cdc_feeds(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_cdc_feeds(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("table_id", PG_INT4_OID, 4),
         make_field("record_count", PG_INT8_OID, 8),
@@ -900,12 +1052,10 @@ fn build_stat_cdc_feeds(
     (fields, rows)
 }
 
-/// Builds the zyron_stat_replication_slots view.
+/// Builds the zyron_sys.stat.replication_slots view.
 /// Columns: name, plugin, confirmed_lsn, restart_lsn, active, lag_bytes.
 /// Data source: server.cdc_slot_stats callback.
-fn build_stat_replication_slots(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_replication_slots(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("plugin", PG_TEXT_OID, -1),
@@ -935,12 +1085,10 @@ fn build_stat_replication_slots(
     (fields, rows)
 }
 
-/// Builds the zyron_stat_cdc_streams view.
+/// Builds the zyron_sys.stat.cdc_streams view.
 /// Columns: name, table_id, active, slot_name.
 /// Data source: server.cdc_stream_stats callback.
-fn build_stat_cdc_streams(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_cdc_streams(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("table_id", PG_INT4_OID, 4),
@@ -966,12 +1114,10 @@ fn build_stat_cdc_streams(
     (fields, rows)
 }
 
-/// Builds the zyron_stat_cdc_ingests view.
+/// Builds the zyron_sys.stat.cdc_ingests view.
 /// Columns: name, table_id, active, records_applied, records_failed.
 /// Data source: server.cdc_ingest_stats callback.
-fn build_stat_cdc_ingests(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_cdc_ingests(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("table_id", PG_INT4_OID, 4),
@@ -999,12 +1145,10 @@ fn build_stat_cdc_ingests(
     (fields, rows)
 }
 
-/// Builds the zyron_stat_streaming_jobs view.
+/// Builds the zyron_sys.stat.streaming_jobs view.
 /// Columns: job_id, name, status, parallelism.
 /// Data source: server.stream_job_manager.
-fn build_stat_streaming_jobs(
-    server: &ServerState,
-) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_streaming_jobs(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("job_id", PG_INT4_OID, 4),
         make_field("name", PG_TEXT_OID, -1),
@@ -1031,10 +1175,10 @@ fn build_stat_streaming_jobs(
     (fields, rows)
 }
 
-/// Builds the zyron_stat_triggers view.
+/// Builds the zyron_sys.stat.trigger_executions view.
 /// Columns: trigger_name, table_id, timing, events, enabled.
 /// Data source: server.trigger_manager.
-fn build_stat_triggers(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_trigger_executions(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("trigger_name", PG_TEXT_OID, -1),
         make_field("table_id", PG_INT4_OID, 4),
@@ -1068,10 +1212,59 @@ fn build_stat_triggers(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<
     (fields, rows)
 }
 
-/// Builds the zyron_stat_branches view.
+/// Builds the zyron_sys.stat.pipeline_runs view.
+/// Columns: pipeline_name, enabled, stage_count, status, last_run,
+///          last_success, rows_processed, last_error.
+/// Data source: the catalog's pipeline entries, which carry the persisted run
+/// outcome, plus the pipeline manager for the stage count of the live
+/// definition.
+fn build_stat_pipeline_runs(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("pipeline_name", PG_TEXT_OID, -1),
+        make_field("enabled", PG_TEXT_OID, -1),
+        make_field("stage_count", PG_INT4_OID, 4),
+        make_field("status", PG_TEXT_OID, -1),
+        make_field("last_run", PG_INT8_OID, 8),
+        make_field("last_success", PG_INT8_OID, 8),
+        make_field("rows_processed", PG_INT8_OID, 8),
+        make_field("last_error", PG_TEXT_OID, -1),
+    ];
+    let rows = server
+        .catalog
+        .list_pipelines()
+        .into_iter()
+        .map(|p| {
+            let stage_count = server
+                .pipeline_manager
+                .as_ref()
+                .and_then(|m| m.get_pipeline(&p.name))
+                .map(|live| live.stages.len())
+                .unwrap_or(0);
+            let status = match p.status_code {
+                zyron_catalog::PipelineEntry::STATUS_RUNNING => "RUNNING",
+                zyron_catalog::PipelineEntry::STATUS_COMPLETED => "COMPLETED",
+                zyron_catalog::PipelineEntry::STATUS_FAILED => "FAILED",
+                _ => "IDLE",
+            };
+            vec![
+                cell(&p.name),
+                cell(p.enabled),
+                cell(stage_count),
+                cell(status),
+                p.last_run.map(|v| v.to_string().into_bytes()),
+                p.last_success.map(|v| v.to_string().into_bytes()),
+                cell(p.rows_processed),
+                p.status_msg.as_ref().map(|m| m.as_bytes().to_vec()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds the zyron_sys.stat.branches view.
 /// Columns: branch_name, parent_branch, created_at, is_active.
 /// Data source: server.branch_manager.
-fn build_stat_branches(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+fn build_stat_branches(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("branch_name", PG_TEXT_OID, -1),
         make_field("parent_branch", PG_TEXT_OID, -1),
@@ -1115,7 +1308,7 @@ fn cell(value: impl ToString) -> Option<Vec<u8>> {
 /// quietly opening logs its deployment mode excluded.
 fn lake_logs(
     server: &ServerState,
-    filters: &StatViewFilters,
+    filters: &SystemViewFilters,
 ) -> Vec<(String, std::sync::Arc<zyron_lake::TransactionLog>)> {
     let wanted = filters.get("table_name");
     let mut out = Vec::new();
@@ -1139,7 +1332,7 @@ fn lake_logs(
 /// The version a version-scoped view should read, the filter's when given
 /// and the table's published head otherwise.
 fn target_version(
-    filters: &StatViewFilters,
+    filters: &SystemViewFilters,
     log: &zyron_lake::TransactionLog,
     column: &str,
 ) -> Option<u64> {
@@ -1156,7 +1349,7 @@ fn target_version(
 ///
 /// The walk can stop at the LIMIT only when nothing else narrows the result,
 /// otherwise a row dropped by a later filter would shorten the answer.
-fn history_walk_limit(filters: &StatViewFilters) -> usize {
+fn history_walk_limit(filters: &SystemViewFilters) -> usize {
     let only_table_scope = filters
         .equalities
         .iter()
@@ -1169,8 +1362,8 @@ fn history_walk_limit(filters: &StatViewFilters) -> usize {
 
 fn build_table_history(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("version", PG_INT8_OID, 8),
@@ -1210,8 +1403,8 @@ fn build_table_history(
 
 fn build_version_details(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("version", PG_INT8_OID, 8),
@@ -1263,8 +1456,8 @@ fn build_version_details(
 
 fn build_version_files(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("version", PG_INT8_OID, 8),
@@ -1305,8 +1498,8 @@ fn build_version_files(
 
 fn build_diff_versions(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("from_version", PG_INT8_OID, 8),
@@ -1325,7 +1518,7 @@ fn build_diff_versions(
         filters.get_u64("to_version"),
     ) else {
         return Err(ZyronError::PlanError(
-            "zyron_diff_versions needs from_version = <n> AND to_version = <n> in WHERE".into(),
+            "zyron_sys.time_travel.diff_versions needs from_version = <n> AND to_version = <n> in WHERE".into(),
         ));
     };
     let mut rows = Vec::new();
@@ -1348,8 +1541,8 @@ fn build_diff_versions(
 
 fn build_schema_at_version(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("version", PG_INT8_OID, 8),
@@ -1388,8 +1581,8 @@ fn build_schema_at_version(
 
 fn build_version_lineage(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("version", PG_INT8_OID, 8),
@@ -1418,8 +1611,8 @@ fn build_version_lineage(
 
 fn build_lake_branches(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("branch_name", PG_TEXT_OID, -1),
@@ -1461,8 +1654,8 @@ fn build_lake_branches(
 /// refusal explicable
 fn build_derived_columns(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("column_id", PG_INT8_OID, 8),
@@ -1532,8 +1725,8 @@ fn build_derived_columns(
 /// happened is each table's transaction log
 fn build_auto_compaction_history(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("table_id", PG_INT8_OID, 8),
@@ -1582,8 +1775,8 @@ fn build_auto_compaction_history(
 
 fn build_clustering_status(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("mode", PG_TEXT_OID, -1),
@@ -1695,10 +1888,7 @@ fn build_clustering_status(
 /// unknowns render as NULL rather than as a guess, because a mesh view
 /// that invents a peer's mode is worse than one that admits it has not
 /// reached the peer yet.
-fn build_nodes(
-    server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+fn build_nodes(server: &ServerState, filters: &SystemViewFilters) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("node_name", PG_TEXT_OID, -1),
         make_field("node_id", PG_TEXT_OID, -1),
@@ -1787,8 +1977,8 @@ fn build_nodes(
 /// current, not stale.
 fn build_table_freshness(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("role", PG_TEXT_OID, -1),
@@ -1858,8 +2048,8 @@ fn build_table_freshness(
 /// far less than the data it describes.
 fn build_lake_log(
     server: &ServerState,
-    filters: &StatViewFilters,
-) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    filters: &SystemViewFilters,
+) -> Result<ViewRows, ZyronError> {
     // from_version is echoed as a column, not only read as a parameter.
     // Narrowing drops any row that fails an equality, and it compares
     // against what the row displays, so a request parameter that never
@@ -1916,7 +2106,7 @@ mod tests {
     use super::*;
 
     /// Helper: the fields and rows a two-column view would produce.
-    fn two_columns() -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    fn two_columns() -> ViewRows {
         let named = |name: &str| FieldDescription {
             name: name.to_string(),
             table_oid: 0,
@@ -1939,9 +2129,9 @@ mod tests {
     /// select list said, so a client reading by position read the wrong value.
     #[test]
     fn a_named_column_is_the_only_one_returned() {
-        let filters = StatViewFilters {
+        let filters = SystemViewFilters {
             projection: vec![("beta".into(), "beta".into())],
-            ..StatViewFilters::default()
+            ..SystemViewFilters::default()
         };
         let (fields, rows) = two_columns();
         let (fields, rows) = filters.project("v", fields, rows).expect("beta exists");
@@ -1954,12 +2144,12 @@ mod tests {
     /// The order asked for is the order returned, and an alias renames.
     #[test]
     fn the_select_order_and_aliases_are_kept() {
-        let filters = StatViewFilters {
+        let filters = SystemViewFilters {
             projection: vec![
                 ("beta".into(), "second".into()),
                 ("alpha".into(), "first".into()),
             ],
-            ..StatViewFilters::default()
+            ..SystemViewFilters::default()
         };
         let (fields, rows) = two_columns();
         let (fields, rows) = filters.project("v", fields, rows).expect("both exist");
@@ -1975,7 +2165,7 @@ mod tests {
     /// A star leaves the view's own shape alone.
     #[test]
     fn a_star_returns_the_whole_view() {
-        let filters = StatViewFilters::default();
+        let filters = SystemViewFilters::default();
         let (fields, rows) = two_columns();
         let (fields, rows) = filters
             .project("v", fields, rows)
@@ -1988,9 +2178,9 @@ mod tests {
     /// not a silent fallback to every column.
     #[test]
     fn a_column_the_view_lacks_is_refused() {
-        let filters = StatViewFilters {
+        let filters = SystemViewFilters {
             projection: vec![("gamma".into(), "gamma".into())],
-            ..StatViewFilters::default()
+            ..SystemViewFilters::default()
         };
         let (fields, rows) = two_columns();
         let error = filters
@@ -2001,7 +2191,7 @@ mod tests {
 
     #[test]
     fn test_lake_log_is_a_stat_view() {
-        assert!(is_stat_view("zyron_lake_log"));
+        assert!(is_system_view("zyron_sys.storage.lake_log"));
     }
 
     #[test]
@@ -2017,51 +2207,51 @@ mod tests {
 
     #[test]
     fn test_table_freshness_is_a_stat_view() {
-        assert!(is_stat_view("zyron_table_freshness"));
+        assert!(is_system_view("zyron_sys.storage.table_freshness"));
     }
 
     #[test]
     fn test_nodes_is_a_stat_view() {
-        assert!(is_stat_view("zyron_nodes"));
+        assert!(is_system_view("zyron_sys.mesh.nodes"));
     }
 
     #[test]
     fn test_clustering_status_is_a_stat_view() {
-        assert!(is_stat_view("zyron_clustering_status"));
+        assert!(is_system_view("zyron_sys.storage.clustering_status"));
     }
 
     #[test]
-    fn test_is_stat_view_recognized() {
-        assert!(is_stat_view("zyron_stat_activity"));
-        assert!(is_stat_view("zyron_stat_tables"));
-        assert!(is_stat_view("zyron_stat_indexes"));
-        assert!(is_stat_view("zyron_stat_wal"));
-        assert!(is_stat_view("zyron_stat_bgwriter"));
-        assert!(is_stat_view("zyron_stat_streaming_jobs"));
-        assert!(is_stat_view("zyron_stat_triggers"));
-        assert!(is_stat_view("zyron_stat_branches"));
+    fn test_is_system_view_recognized() {
+        assert!(is_system_view("zyron_sys.stat.activity"));
+        assert!(is_system_view("zyron_sys.stat.tables"));
+        assert!(is_system_view("zyron_sys.stat.indexes"));
+        assert!(is_system_view("zyron_sys.stat.wal"));
+        assert!(is_system_view("zyron_sys.stat.bgwriter"));
+        assert!(is_system_view("zyron_sys.stat.streaming_jobs"));
+        assert!(is_system_view("zyron_sys.stat.trigger_executions"));
+        assert!(is_system_view("zyron_sys.stat.branches"));
     }
 
     #[test]
-    fn test_is_stat_view_unrecognized() {
-        assert!(!is_stat_view("zyron_stat_unknown"));
-        assert!(!is_stat_view("pg_stat_activity"));
-        assert!(!is_stat_view(""));
+    fn test_is_system_view_unrecognized() {
+        assert!(!is_system_view("zyron_sys.stat.unknown"));
+        assert!(!is_system_view("pg_stat_activity"));
+        assert!(!is_system_view(""));
     }
 
     #[test]
-    fn test_is_stat_view_publications_recognized() {
-        assert!(is_stat_view("zyron_stat_publications"));
-        assert!(is_stat_view("zyron_stat_subscriptions"));
-        assert!(is_stat_view("zyron_stat_endpoints"));
+    fn test_is_system_view_publications_recognized() {
+        assert!(is_system_view("zyron_sys.stat.publications"));
+        assert!(is_system_view("zyron_sys.stat.subscriptions"));
+        assert!(is_system_view("zyron_sys.stat.endpoints"));
     }
 
     #[test]
-    fn test_is_stat_view_z2z_runtime_recognized() {
-        assert!(is_stat_view("zyron_stat_dead_letters"));
-        assert!(is_stat_view("zyron_stat_zyron_sinks"));
-        assert!(is_stat_view("zyron_stat_zyron_sources"));
-        assert!(is_stat_view("zyron_stat_credential_cache"));
+    fn test_is_system_view_z2z_runtime_recognized() {
+        assert!(is_system_view("zyron_sys.stat.dead_letters"));
+        assert!(is_system_view("zyron_sys.stat.zyron_sinks"));
+        assert!(is_system_view("zyron_sys.stat.zyron_sources"));
+        assert!(is_system_view("zyron_sys.stat.credential_cache"));
     }
 
     #[test]
@@ -2136,10 +2326,10 @@ mod tests {
     }
 
     #[test]
-    fn test_query_stat_view_unknown_returns_none() {
+    fn test_query_system_view_unknown_returns_none() {
         // Cannot construct ServerState in unit tests without full subsystem init,
-        // but we can verify the None path by checking is_stat_view instead.
-        assert!(!is_stat_view("no_such_view"));
+        // but we can verify the None path by checking is_system_view instead.
+        assert!(!is_system_view("no_such_view"));
     }
 
     #[test]

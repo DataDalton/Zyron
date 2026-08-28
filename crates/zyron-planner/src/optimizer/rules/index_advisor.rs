@@ -9,6 +9,7 @@ use crate::binder::BoundExpr;
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use zyron_catalog::{Catalog, ColumnId, TableId};
 
@@ -198,6 +199,51 @@ impl Default for IndexAdvisor {
     }
 }
 
+/// Process-wide advisor.
+///
+/// The scan tracker is the whole point of the rule, and an advisor built per
+/// optimizer would throw away what it learned at the end of each statement.
+/// Sharing one across every plan is what lets
+/// `zyron_sys.query.recommend_indexes` answer from a workload rather than
+/// from a single query.
+static GLOBAL_ADVISOR: std::sync::OnceLock<Arc<IndexAdvisor>> = std::sync::OnceLock::new();
+
+/// The advisor every optimizer records into and the recommendation view
+/// reads from.
+pub fn global_index_advisor() -> Arc<IndexAdvisor> {
+    Arc::clone(GLOBAL_ADVISOR.get_or_init(|| Arc::new(IndexAdvisor::new())))
+}
+
+/// The rule wrapper the optimizer installs. Holds the shared advisor so
+/// every statement records into the same tracker.
+pub struct SharedIndexAdvisor {
+    advisor: Arc<IndexAdvisor>,
+}
+
+impl SharedIndexAdvisor {
+    pub fn new() -> Self {
+        Self {
+            advisor: global_index_advisor(),
+        }
+    }
+}
+
+impl Default for SharedIndexAdvisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OptimizationRule for SharedIndexAdvisor {
+    fn name(&self) -> &str {
+        "index_advisor"
+    }
+
+    fn apply(&self, plan: &LogicalPlan, catalog: &Catalog) -> Option<LogicalPlan> {
+        self.advisor.apply(plan, catalog)
+    }
+}
+
 impl OptimizationRule for IndexAdvisor {
     fn name(&self) -> &str {
         "index_advisor"
@@ -217,7 +263,6 @@ impl OptimizationRule for IndexAdvisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_index_advisor_new() {

@@ -168,6 +168,18 @@ pub struct Catalog {
     /// Per-table serialization of whole-entry read-modify-write updates,
     /// lazily created and shared by every mutator of that table's entry.
     table_update_locks: scc::HashMap<TableId, Arc<tokio::sync::Mutex<()>>>,
+    /// The `zyron_sys` catalog and the schemas registered under it, set by
+    /// SystemCatalog::init at startup. Every object in it is computed on read,
+    /// so DDL against those schemas is refused: there is nothing there for a
+    /// user table to be stored beside.
+    system_catalog: RwLock<SystemCatalogIds>,
+}
+
+/// Identity of the system catalog once it has been registered.
+#[derive(Default)]
+struct SystemCatalogIds {
+    database_id: Option<DatabaseId>,
+    schema_ids: HashSet<SchemaId>,
 }
 
 impl Catalog {
@@ -209,6 +221,7 @@ impl Catalog {
             version_tags_by_id: RwLock::new(HashMap::new()),
             compliance_append_lock: tokio::sync::Mutex::new(()),
             table_update_locks: scc::HashMap::new(),
+            system_catalog: RwLock::new(SystemCatalogIds::default()),
         };
 
         if !catalog.storage.is_bootstrapped().await? {
@@ -1759,6 +1772,23 @@ impl Catalog {
     // -----------------------------------------------------------------------
 
     pub async fn create_database(&self, name: &str, owner: &str) -> Result<DatabaseId> {
+        if name.eq_ignore_ascii_case(SYSTEM_SCHEMA_NAME) {
+            return Err(ZyronError::PermissionDenied(format!(
+                "catalog name `{}` is reserved for Zyron internals",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
+        self.store_database(name, owner).await
+    }
+
+    /// Creates the `zyron_sys` catalog itself. Separate from create_database
+    /// because that path refuses the reserved name, which is what keeps a user
+    /// from making a second one.
+    pub async fn create_system_database(&self, name: &str, owner: &str) -> Result<DatabaseId> {
+        self.store_database(name, owner).await
+    }
+
+    async fn store_database(&self, name: &str, owner: &str) -> Result<DatabaseId> {
         if self.cache.get_database_by_name(name).is_some() {
             return Err(ZyronError::DatabaseAlreadyExists(name.to_string()));
         }
@@ -1783,6 +1813,12 @@ impl Catalog {
             .cache
             .get_database_by_name(name)
             .ok_or_else(|| ZyronError::DatabaseNotFound(name.to_string()))?;
+        if Some(db.id) == self.system_catalog_id() {
+            return Err(ZyronError::PermissionDenied(format!(
+                "catalog `{}` is reserved for Zyron internals and cannot be dropped",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
 
         let id = db.id;
         let mut payload = vec![0u8; 4];
@@ -1797,6 +1833,76 @@ impl Catalog {
         self.cache
             .get_database_by_name(name)
             .ok_or_else(|| ZyronError::DatabaseNotFound(name.to_string()))
+    }
+
+    /// Every catalog known to this node, ordered by id so a listing is stable
+    /// across calls.
+    pub fn list_databases(&self) -> Vec<Arc<DatabaseEntry>> {
+        let mut out = self.cache.list_databases();
+        out.sort_by_key(|d| d.id.0);
+        out
+    }
+
+    /// Every schema in every catalog, ordered by (catalog, schema) id.
+    pub fn list_schemas(&self) -> Vec<Arc<SchemaEntry>> {
+        let mut out = self.cache.list_all_schemas();
+        out.sort_by_key(|s| (s.database_id.0, s.id.0));
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // System catalog
+    // -----------------------------------------------------------------------
+
+    /// Records which catalog and schemas make up `zyron_sys`, so DDL naming
+    /// one of them is refused. Called by SystemCatalog::init after the rows
+    /// exist.
+    pub fn adopt_system_catalog(&self, database_id: DatabaseId, schema_ids: HashSet<SchemaId>) {
+        let mut guard = self.system_catalog.write();
+        guard.database_id = Some(database_id);
+        guard.schema_ids = schema_ids;
+    }
+
+    /// The `zyron_sys` catalog's id, once registered.
+    pub fn system_catalog_id(&self) -> Option<DatabaseId> {
+        self.system_catalog.read().database_id
+    }
+
+    /// Whether a schema belongs to Zyron rather than to a user.
+    ///
+    /// True for the reserved `zyron_sys` schema of the default catalog and
+    /// for every schema of the `zyron_sys` catalog. Both are read-only: their
+    /// contents are computed on read, so a stored object in either is a
+    /// contradiction rather than a permission question.
+    pub fn is_system_schema(&self, schema_id: SchemaId) -> bool {
+        schema_id == SYSTEM_SCHEMA_ID || self.system_catalog.read().schema_ids.contains(&schema_id)
+    }
+
+    /// Creates one schema of the `zyron_sys` catalog.
+    ///
+    /// Separate from create_schema because that path refuses reserved names
+    /// outright, which is what keeps a user from making one of these. This is
+    /// the registration path SystemCatalog::init drives at startup.
+    pub async fn create_system_schema(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+        owner: &str,
+    ) -> Result<SchemaId> {
+        if let Some(existing) = self.cache.get_schema_by_name(db_id, name) {
+            return Ok(existing.id);
+        }
+        let id = SchemaId(self.oid_allocator.next());
+        let entry = SchemaEntry {
+            id,
+            database_id: db_id,
+            name: name.to_string(),
+            owner: owner.to_string(),
+        };
+        self.log_ddl(DDL_CREATE_SCHEMA, &entry.to_bytes())?;
+        self.storage.store_schema(&entry).await?;
+        self.cache.put_schema(entry);
+        Ok(id)
     }
 
     // -----------------------------------------------------------------------
@@ -1844,6 +1950,12 @@ impl Catalog {
             .cache
             .get_schema_by_name(db_id, name)
             .ok_or_else(|| ZyronError::SchemaNotFound(name.to_string()))?;
+        if self.is_system_schema(schema.id) {
+            return Err(ZyronError::PermissionDenied(format!(
+                "schema `{}.{}` is reserved for Zyron internals and cannot be dropped",
+                SYSTEM_SCHEMA_NAME, name
+            )));
+        }
 
         let id = schema.id;
         let mut payload = vec![0u8; 4];
@@ -1871,9 +1983,9 @@ impl Catalog {
         column_defs: &[ColumnDef],
         table_constraints: &[TableConstraint],
     ) -> Result<TableId> {
-        if schema_id == SYSTEM_SCHEMA_ID {
+        if self.is_system_schema(schema_id) {
             return Err(ZyronError::PermissionDenied(format!(
-                "schema `{}` is reserved for Zyron internals and cannot hold user tables",
+                "schemas of `{}` are reserved for Zyron internals and cannot hold user tables",
                 SYSTEM_SCHEMA_NAME
             )));
         }
@@ -2092,9 +2204,9 @@ impl Catalog {
         peer: &str,
         remote_table: &str,
     ) -> Result<TableId> {
-        if schema_id == SYSTEM_SCHEMA_ID {
+        if self.is_system_schema(schema_id) {
             return Err(ZyronError::PermissionDenied(format!(
-                "schema `{}` is reserved for Zyron internals and cannot hold user tables",
+                "schemas of `{}` are reserved for Zyron internals and cannot hold user tables",
                 SYSTEM_SCHEMA_NAME
             )));
         }
@@ -2160,7 +2272,7 @@ impl Catalog {
     }
 
     pub async fn drop_table(&self, schema_id: SchemaId, name: &str) -> Result<DropOutcome> {
-        if schema_id == SYSTEM_SCHEMA_ID {
+        if self.is_system_schema(schema_id) {
             return Err(ZyronError::PermissionDenied(format!(
                 "tables in `{}` are reserved for Zyron internals and cannot be dropped",
                 SYSTEM_SCHEMA_NAME
@@ -2380,6 +2492,13 @@ impl Catalog {
     /// Returns all cached tables across all schemas.
     pub fn list_all_tables(&self) -> Vec<Arc<TableEntry>> {
         self.cache.list_all_tables()
+    }
+
+    /// Every index across all tables, ordered by id so a listing is stable.
+    pub fn list_all_indexes(&self) -> Vec<Arc<IndexEntry>> {
+        let mut out = self.cache.list_all_indexes();
+        out.sort_by_key(|i| i.id.0);
+        out
     }
 
     // -----------------------------------------------------------------------

@@ -26,7 +26,7 @@ fn now_micros() -> u64 {
 }
 
 /// Converts an epoch-microsecond instant to epoch seconds, the unit the
-/// maintenance timestamps in zyron_stat_tables are reported in.
+/// maintenance timestamps in zyron_sys.stat.tables are reported in.
 fn epoch_seconds(micros: u64) -> u64 {
     micros / 1_000_000
 }
