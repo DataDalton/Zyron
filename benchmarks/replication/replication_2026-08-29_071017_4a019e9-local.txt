@@ -1,0 +1,97 @@
+# suite:   replication
+# run:     2026-08-29_071017_4a019e9-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== A Follower Does Not Write ===
+  the follower redirected instead of writing
+
+=== Streaming a Large Transaction ===
+  4000 rows through the group in 10.305ms
+  the group's log holds 4 entries
+
+=== Schema Change ===
+  every node holds table t as id 10059
+
+=== Commit Order ===
+  fifty writes, identical on all three nodes
+
+=== No Primary Key ===
+  duplicates delete and update in the right numbers everywhere
+
+=== A Client on the Wire ===
+  the BEGIN block, the savepoint cut and the portal writes are on all three nodes
+
+=== MERGE, CALL and DO Reach Every Node ===
+  merge, procedure and do block rows are on all three nodes
+
+=== Replicated Write Throughput and Follower Lag ===
+--- Run 1/5 ---
+  2,000 writes at 8 outstanding: p50 675.800µs, p99 1.047ms
+  20,000 writes at 64 outstanding in 397.707ms, 50,288 txn/sec
+  worst follower lag 131 entries while running, 17 left at the end, closed in 55.656ms
+  lag in the second half was 1.03x the first half
+  slowest node applied 19,983 entries in 397.707ms, 50,246 entries/sec against a leader committing 50,288 txn/sec
+--- Run 2/5 ---
+  2,000 writes at 8 outstanding: p50 691.100µs, p99 1.183ms
+  20,000 writes at 64 outstanding in 396.634ms, 50,424 txn/sec
+  worst follower lag 122 entries while running, 65 left at the end, closed in 7.426ms
+  lag in the second half was 1.02x the first half
+  slowest node applied 19,935 entries in 396.634ms, 50,260 entries/sec against a leader committing 50,424 txn/sec
+--- Run 3/5 ---
+  2,000 writes at 8 outstanding: p50 722.700µs, p99 1.125ms
+  20,000 writes at 64 outstanding in 405.754ms, 49,291 txn/sec
+  worst follower lag 130 entries while running, 49 left at the end, closed in 13.622ms
+  lag in the second half was 0.99x the first half
+  slowest node applied 19,951 entries in 405.754ms, 49,170 entries/sec against a leader committing 49,291 txn/sec
+--- Run 4/5 ---
+  2,000 writes at 8 outstanding: p50 714.600µs, p99 1.252ms
+  20,000 writes at 64 outstanding in 398.981ms, 50,128 txn/sec
+  worst follower lag 217 entries while running, 31 left at the end, closed in 16.249ms
+  lag in the second half was 1.14x the first half
+  slowest node applied 19,969 entries in 398.981ms, 50,050 entries/sec against a leader committing 50,128 txn/sec
+--- Run 5/5 ---
+  2,000 writes at 8 outstanding: p50 709.600µs, p99 1.240ms
+  20,000 writes at 64 outstanding in 385.486ms, 51,883 txn/sec
+  worst follower lag 129 entries while running, 111 left at the end, closed in 2.869ms
+  lag in the second half was 0.92x the first half
+  slowest node applied 19,889 entries in 385.486ms, 51,595 entries/sec against a leader committing 51,883 txn/sec
+  Replicated write throughput, three nodes:
+    Runs: [50,288 txn/sec, 50,424 txn/sec, 49,291 txn/sec, 50,128 txn/sec, 51,883 txn/sec]
+    Average: 50,403 txn/sec (no target set)
+    Min/Max: 49,291 txn/sec / 51,883 txn/sec, StdDev: 838.4618 txn/sec
+  Write latency p50, unsaturated:
+    Runs: [0.0007s, 0.0007s, 0.0007s, 0.0007s, 0.0007s]
+    Average: 0.0007s (no target set)
+    Min/Max: 0.0007s / 0.0007s, StdDev: 0.0000s
+  Write latency p99, unsaturated:
+    Runs: [0.0010s, 0.0012s, 0.0011s, 0.0013s, 0.0012s]
+    Average: 0.0012s (no target set)
+    Min/Max: 0.0010s / 0.0013s, StdDev: 0.0001s
+  Follower apply rate:
+    Runs: [50,246 entries/sec, 50,260 entries/sec, 49,170 entries/sec, 50,050 entries/sec, 51,595 entries/sec]
+    Average: 50,264 entries/sec (no target set)
+    Min/Max: 49,170 entries/sec / 51,595 entries/sec, StdDev: 776.2809 entries/sec
+  Worst follower lag:
+    Runs: [131 entries, 122 entries, 130 entries, 217 entries, 129 entries]
+    Average: 145.8000 entries (no target set)
+    Min/Max: 122 entries / 217 entries, StdDev: 35.7402 entries
+  Time to close the lag:
+    Runs: [0.0557s, 0.0074s, 0.0136s, 0.0162s, 0.0029s]
+    Average: 0.0192s (no target set)
+    Min/Max: 0.0029s / 0.0557s, StdDev: 0.0188s
+  Follower lag, second half against first [PASS/OK]:
+    Runs: [1.0299x, 1.0235x, 0.9939x, 1.1365x, 0.9192x]
+    Average: 1.0206x <= 2x (target)
+    Min/Max: 0.9192x / 1.1365x, StdDev: 0.0700x
+  Follower apply rate against leader commit rate [PASS/OK]:
+    Runs: [0.9991x, 0.9968x, 0.9976x, 0.9984x, 0.9945x]
+    Average: 0.9973x >= 0.9900x (target)
+    Min/Max: 0.9945x / 0.9991x, StdDev: 0.0016x
+
+=== Insert, Update, Delete ===
+  four rows on all three nodes
+  the update reached all three
+  the delete reached all three

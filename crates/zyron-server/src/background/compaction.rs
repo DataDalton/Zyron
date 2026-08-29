@@ -289,6 +289,7 @@ impl CompactionWorker {
         doc_registry: Arc<zyron_common::DocRegistry>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
+        authority: crate::background::authority::WriteAuthority,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
@@ -321,6 +322,7 @@ impl CompactionWorker {
                     &doc_registry,
                     &btree_indexes,
                     &gate,
+                    &authority,
                 );
             })
             .expect("failed to spawn compaction worker thread");
@@ -349,6 +351,7 @@ impl CompactionWorker {
         doc_registry: &Arc<zyron_common::DocRegistry>,
         btree_indexes: &Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         gate: &CompactionGate,
+        authority: &crate::background::authority::WriteAuthority,
     ) {
         let interval = Duration::from_secs(config.interval_secs.max(1));
 
@@ -357,6 +360,14 @@ impl CompactionWorker {
 
             if shutdown.load(Ordering::Acquire) {
                 return;
+            }
+
+            // A compaction writes new files and retires old ones through the
+            // catalog, and nothing captures that for the rest of a group, so
+            // a member holds off entirely rather than holding files no other
+            // member has
+            if !authority.may_write() {
+                continue;
             }
 
             // OLTP-aware backoff: do not compete with the foreground write

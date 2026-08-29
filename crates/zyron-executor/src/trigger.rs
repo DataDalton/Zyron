@@ -32,6 +32,12 @@ pub async fn fire_row_triggers(
     batch: &DataBatch,
     columns: &[ColumnEntry],
 ) -> Result<()> {
+    // A trigger fired on the leader and its row effects are in the changeset
+    // this apply is replaying. Firing it again here would run its side effects
+    // a second time and write rows nobody agreed on
+    if ctx.replication_apply {
+        return Ok(());
+    }
     let triggers = ctx.catalog.triggers_for_table(table_id);
     if triggers.is_empty() {
         return Ok(());

@@ -66,8 +66,8 @@ pub use curve::{normalize_component, ordering_key};
 pub use encoded_filter::StoredFilter;
 pub use feedback::{Decision, GateConfig, PredicateClass, evaluate, skip_rate};
 pub use follow::{
-    FollowedVersion, Freshness, apply_versions, decode_hex, decode_log_rows, leader_head,
-    load_cursor, read_versions_after, sync,
+    FollowedVersion, Freshness, apply_versions, apply_versions_under, decode_hex, decode_log_rows,
+    leader_head, load_cursor, read_versions_after, sync,
 };
 pub use history::{
     VersionDetails, VersionDiff, VersionRecord, diff_versions, schema_at_version, table_history,
@@ -121,8 +121,9 @@ pub use schema::{DerivedColumn, LakeColumn, LakeSchema};
 pub use time_travel::{TimeTravelSpec, manifest_as_of, resolve_version};
 pub use transaction_log::{
     AllCommitted, CommitAttempt, CommitHeader, CommitInfo, CommitStatus, LogEntry, OperationKind,
-    TransactionLog, VersionFileData, WRITER_NODE_PROPERTY, abandon_txn, local_node, publish_txn,
-    register_txn_pending, set_local_node, transfer_writer, writer_node,
+    TransactionLog, VersionFileData, WRITER_NODE_PROPERTY, abandon_txn, local_node,
+    pending_versions, publish_txn, register_txn_pending, set_local_node, transfer_writer,
+    writer_node,
 };
 pub use workload::{
     ObserverStats, TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_JOIN_KEY,

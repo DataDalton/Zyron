@@ -14,13 +14,13 @@ MVCC concurrency · lock-free hot paths · shared-storage table format · full-m
 
 ---
 
-Zyron runs three surfaces off one codebase: an **HTAP database** with an MVCC row heap and a custom `.zyr` columnar format; **ZyronLake**, a shared-storage table format on an append-only transaction log with branches, time travel, and secondary indexes; and a **mesh** where any node can host a database, a lake, both, or embed in an application, and nodes peer over the wire so a single query reaches across them. All three are reachable from any client language over the same wire protocol.
+Zyron runs three surfaces off one codebase: an **HTAP database** with an MVCC row heap and a custom `.zyr` columnar format, **ZyronLake** as a shared-storage table format on an append-only transaction log with branches, time travel, and secondary indexes, and a **mesh** where any node can host a database, a lake, both, or embed in an application, and nodes peer over the wire so a single query reaches across them. All three are reachable from any client language over the same wire protocol.
 
 Under the hood, Rust throughout, with an in-repo write-ahead log, buffer pool, B+ tree, MVCC engine, SQL parser, cost-based optimizer, vectorized executor, columnar encoding engine, lake transaction log, and wire protocol: no embedded SQL engine, no third-party storage layer, no ORM.
 
 Fresh writes land in the MVCC row heap tuned for OLTP. A background thread compacts committed rows into `.zyr` segments with per-column encoding, and analytical queries run directly on the encoded data with predicate pushdown and late materialization. Heap and lake tables are first-class in the same SQL, joined by the same HybridScan operator, whether they live on the local node or across the mesh.
 
-> **Status:** active development. The single-node engine is feature-complete through data lifecycle management, and the ZyronLake table format runs beside it with cross-format federation. Next up is distribution: Raft consensus, multi-region, and sharding.
+> **Status:** active development. The single-node engine is feature-complete through data lifecycle management, the ZyronLake table format runs beside it with cross-format federation, and Raft consensus with logical DML replication commits writes across a three-node group under one fsync per quorum ack. Next up is sharding, multi-region, and the enterprise stack around them.
 
 ## Table of Contents
 
@@ -46,11 +46,12 @@ Fresh writes land in the MVCC row heap tuned for OLTP. A background thread compa
 ## Highlights
 
 - **One engine, both workloads.** Row heap for transactional writes, `.zyr` columnar format for analytical scans, with automatic background compaction between them.
-- **Mesh, not monolith.** A Zyron node can host a database, a ZyronLake, both, or neither (embedded in an app). Nodes peer over the wire and a single `SELECT` reaches across the mesh, joining a local heap table to a remote publication or a shared lake with no external gateway or middleware in front.
+- **Mesh, not monolith.** A Zyron node can host a database, a ZyronLake, both, or neither (embedded in an app). Nodes peer over the wire and a single `SELECT` reaches across the mesh, joining a local heap table to a remote publication or a shared lake with no external gateway or middleware in front. Database nodes can also join a Raft group where writes commit through quorum and any node serves linearizable reads.
+- **Quorum-committed writes.** Every DML shape, DDL, savepoints, MERGE/CALL/DO, and prepared statements over the extended protocol all ride the same replication channel. The leader group-commits under one fsync per quorum ack, followers apply committed entries through the same operator path the leader used, and follower reads take a ReadIndex round trip so they stay linearizable.
 - **Shared-storage table format.** ZyronLake stores immutable `.zyr` files against an append-only transaction log versioned per commit, with `File::create_new` as the optimistic-concurrency primitive and periodic manifest checkpoints so readers open one file instead of replaying history. Branches, time travel, secondary indexes, Z-order clustering, constraint enforcement, and change feed all live in the format.
 - **Lock-free hot paths.** LSN assignment, the WAL ring buffer, MVCC visibility checks, the buffer pool, and the B+ tree avoid mutexes on the query and write path entirely. Locks exist only on single-owner background threads.
 - **Full durability, no per-page fsync tax.** Every commit fsyncs the WAL through group commit before acknowledging the client. Dirty heap and index pages are written by a background writer and then fsynced at explicit durability barriers, so an acknowledged transaction survives a power loss without paying a per-page fsync on the OLTP hot path.
-- **Query-on-encoded.** Dictionary, RLE, bit-pack, and FastLanes columns are filtered without being decoded; only rows that survive predicates are materialized.
+- **Query-on-encoded.** Dictionary, RLE, bit-pack, and FastLanes columns are filtered without being decoded, and only rows that survive predicates are materialized.
 - **Time as a first-class dimension.** `AS OF TIMESTAMP` and `VERSION AS OF` queries, copy-on-write branches, slowly changing dimensions, and bitemporal tables are part of the engine, with picosecond-resolution timestamps and hybrid logical clocks underneath.
 - **Security built into the planner.** Three-state privileges, row-level security, column masking, ABAC, and mandatory access control are evaluated inside query planning, not in an application tier.
 - **Drop-in client compatibility.** Implements the PostgreSQL wire protocol v3 over both TCP and QUIC, so existing drivers and tooling connect unchanged.
@@ -100,7 +101,7 @@ flowchart TB
 
 ### Mesh topology
 
-The diagram above is one node's internals. In a deployment, Zyron nodes peer over the wire. Each node can host a database only, a lake reader only, both, or be embedded inside an application. Any client can hit any node, and a single query reaches across the mesh. Lake-holding nodes share the same object-store backing.
+The diagram above is one node's internals. In a deployment, Zyron nodes peer over the wire. Each node can host a database only, a lake reader only, both, or be embedded inside an application. Any client can hit any node, and a single query reaches across the mesh. Lake-holding nodes share the same object-store backing. Database nodes can also be joined into a Raft group where writes commit through quorum and any node serves linearizable reads.
 
 ![Zyron mesh deployment topology: clients above, four peered nodes in the middle with dashed peer edges, and a shared object store below](assets/diagrams/mesh.svg)
 
@@ -111,8 +112,9 @@ The diagram above is one node's internals. In a deployment, Zyron nodes peer ove
 | B+ tree index | Resident in RAM, persisted via WAL + checkpoint | Point lookups, range scans |
 | Row heap (OLTP) | Buffer pool with clock-sweep eviction | Recent and transactional rows |
 | Columnar (`.zyr`) | Disk, hot segments cached in the buffer pool | Encoded analytical scans |
-| ZyronLake (`.zyr` + log) | Object store or shared filesystem, versioned per commit, manifest-checkpointed | Analytical tables on shared storage; branches, time travel, cross-engine reads |
+| ZyronLake (`.zyr` + log) | Object store or shared filesystem, versioned per commit, manifest-checkpointed | Analytical tables on shared storage, branches, time travel, cross-engine reads |
 | Write-ahead log | Append-only, group commit, fsync on commit | Durability and crash recovery |
+| Raft log | Group-committed on the leader, quorum-replicated to followers, byte-aware residency cap with older entries paged from disk | Consensus record of DML and DDL for replication and failover |
 
 ## Capabilities
 
@@ -148,7 +150,7 @@ The diagram above is one node's internals. In a deployment, Zyron nodes peer ove
 
 **Security & governance**
 
-- Three-state privileges (GRANT / DENY / unset); DENY always wins, column-level overrides table-level
+- Three-state privileges (GRANT / DENY / unset) where DENY always wins and column-level overrides table-level
 - Temporal grants with recurring time windows
 - Row-level security and row ownership
 - Attribute-based access control (ABAC)
@@ -191,12 +193,12 @@ The diagram above is one node's internals. In a deployment, Zyron nodes peer ove
 - Tamper-evident audit chain
 
 </td></tr>
-<tr><td valign="top" width="50%">
+<tr><td valign="top" width="33%">
 
 **ZyronLake table format**
 
 - Immutable `.zyr` data files against an append-only transaction log, one numbered version file per commit
-- `File::create_new` as the optimistic-concurrency primitive; periodic manifest checkpoints collapse the log
+- `File::create_new` as the optimistic-concurrency primitive, with periodic manifest checkpoints collapsing the log
 - Copy-on-write branches with merge
 - Time travel to any committed version
 - Secondary indexes (also versioned as lake artifacts, safe against staleness)
@@ -207,7 +209,7 @@ The diagram above is one node's internals. In a deployment, Zyron nodes peer ove
 - `OPTIMIZE`, `VACUUM`, `FOLLOW`, `REPAIR` operations
 - Runs on local disk, shared filesystem, or object storage
 
-</td><td valign="top" width="50%">
+</td><td valign="top" width="33%">
 
 **Federation & mesh**
 
@@ -222,12 +224,29 @@ The diagram above is one node's internals. In a deployment, Zyron nodes peer ove
 - Connection routing over host lists with role hints, DNS SRV, health checks, and automatic failover
 - mTLS with SPKI pinning and labeled Prometheus families per subscriber, publication, and TLS direction
 
+</td><td valign="top" width="33%">
+
+**Consensus & replication**
+
+- Raft group per cluster with leaders, followers, learners, and single-command membership change
+- Group commit under one fsync per quorum ack
+- Logical DML replication, heap follows row-level puts and deletes, lake follows agreed version numbers
+- No primary key required. Falls back to secondary index probe or full-image match, following `REPLICA IDENTITY FULL` semantics
+- DDL runs on the connection so clients see the real command tag, and the applier picks it up if the client drops
+- Explicit `BEGIN` blocks, savepoints, `MERGE`/`CALL`/`DO`, and prepared statements over the extended protocol all replicate
+- Savepoints resolved at capture time so rolled-back rows never ship
+- Linearizable follower reads through ReadIndex
+- WAL commit record carries the raft index so recovery reconciles local durability with the agreed log
+- Byte-aware log residency cap with older entries paged from disk on demand
+- Whole-cluster snapshots with byte-aware compaction bounded by the slowest group member
+- Background writers stand down inside a group so only the replicated log commits data
+
 </td></tr>
 </table>
 
 ## Performance
 
-Two views: what a client actually gets from a running server, and the raw subsystem numbers underneath it. Every figure is extracted from the committed result files in [`benchmarks/`](benchmarks/); the tables and charts are regenerated from them by [`scripts/gen_bench_charts.py`](scripts/gen_bench_charts.py).
+Two views: what a client actually gets from a running server, and the raw subsystem numbers underneath it. Every figure is extracted from the committed result files in [`benchmarks/`](benchmarks/), and the tables and charts are regenerated from them by [`scripts/gen_bench_charts.py`](scripts/gen_bench_charts.py).
 
 <!-- BENCH:START -->
 _Release build, single machine: Intel(R) Core(TM) Ultra 7 270K Plus, 24 cores, 31.4 GB RAM, windows/x86_64. Regenerated from `benchmarks/` by `scripts/gen_bench_charts.py`._
@@ -266,6 +285,14 @@ Same workload, same rows, run against both formats. Blue is Row heap and purple 
 
 ![Cross-format wall-clock, Row heap vs ZyronLake](benchmarks/charts/cross_format.svg)
 
+### Consensus and replication
+
+A three-node Raft group with the leader accepting writes, followers applying committed entries through the same operator path the leader used, and reads served through a ReadIndex round trip so they stay linearizable. Throughput first, then hot-path latency:
+
+![Consensus and replication throughput (thousand ops/sec, higher is better)](benchmarks/charts/raft_throughput.svg)
+
+![Consensus hot-path latency (microseconds, lower is better)](benchmarks/charts/raft_latency.svg)
+
 A few more numbers not shown in the charts above:
 
 | Subsystem | Metric | Result |
@@ -284,13 +311,19 @@ A few more numbers not shown in the charts above:
 | Lake | Commit rate (delete predicate) | ~1635 commits/sec |
 | Lake | Derived clustering expression files pruned | ~93% |
 | Lake | Load with clustering expression | ~812K rows/sec |
+| Consensus | Leader election after a kill | ~228 ms |
+| Consensus | Single log append | ~0.14 us |
+| Consensus | Snapshot 1GB, create | ~0.95 s |
+| Consensus | Snapshot 1GB, transfer | ~2.54 s |
+| Replication | Follower keep-up vs leader | ~99.7% |
+| Replication | Worst follower lag | ~146 entries |
 | Transactions | Durable group-commit peak | ~747K txn/sec |
 | Transactions | Group-commit amplification (c=1 to c=512) | ~63.4x |
 | Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.5x (heap wins indexed points) |
 | Cross-format | Bulk load to queryable, lake vs heap | ~10.4x (heap wins large batches) |
 | Cross-format | Trickle load to queryable, lake vs heap | ~26.6x (heap wins tiny commits) |
 
-34 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+36 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started
@@ -419,11 +452,17 @@ Each area ships with an optimization review and a validation checkpoint with har
 | Data operations | Versioning & time travel, CDC, pipelines/triggers/UDFs, streaming, server integration | ✅ Complete |
 | Native features | Full-text search, vector & graph search, native data types, utility operations | ✅ Complete |
 | Analytics & lifecycle | Analytics engine, feature store & ML, data lifecycle management | ✅ Complete |
-| ZyronLake table format | Immutable versioned `.zyr` on a transaction log; branches, time travel, secondary indexes, clustering, constraint enforcement, change feed, cross-format federation | ✅ Complete |
-| Enterprise & distribution | Raft consensus and replication, sharding and multi-region, secret store and KMS, high availability and DR, observability and compliance, semantic views, schema registry, data contracts, data governance, multi-tenancy and cost tracking, migration tools and ecosystem connectors, Volumes (arbitrary-file storage as catalog objects), enterprise type-system extensions | 🔨 In progress |
-| Serverless mesh and autonomous operations | Base compute mesh, user meshes with compute reservations, workload-aware scheduling, continuous self-tuning and self-healing across every node in the mesh | ⏳ Planned |
+| ZyronLake table format | Immutable versioned `.zyr` on a transaction log, branches, time travel, secondary indexes, clustering, constraint enforcement, change feed, cross-format federation | ✅ Complete |
+| Consensus and replication | Raft groups per cluster, quorum-committed writes with one fsync per ack, logical DML replication for heap and version replication for lake, linearizable follower reads through ReadIndex, learner promotion, whole-cluster snapshots | ✅ Complete |
+| SQL surface, type system and media types | Range and multirange types, interval refinements, native media types, additional function coverage, and a silent-bug hardening pass across the engine | 🔨 In progress |
+| Enterprise & distribution | Sharding and multi-region, secret store and KMS, high availability and DR, observability and compliance, semantic views, schema registry, data contracts, data governance, multi-tenancy and cost tracking, migration tools and ecosystem connectors, Volumes (arbitrary-file storage as catalog objects), enterprise type-system extensions | ⏳ Planned |
+| Serverless mesh and autonomous operations | Base compute mesh, user meshes with compute reservations, workload-aware scheduling, continuous self-tuning and self-healing across every node in the mesh, query engine advances | ⏳ Planned |
 | Wire protocols, API and drivers | ZWP native wire protocol alongside PostgreSQL wire compatibility, Zyron API (unified QUERY / POST / GET / WS surface for apps), native drivers across every supported client language, Zyron Embedded (`libzyron`) for in-process use | ⏳ Planned |
-| Application and workflow hosting | Zyron Apps (container hosting on the mesh substrate), Workflows (task orchestration, subsuming pipelines and schedules), deployment artifacts, SQL function library expansion, query engine advances | ⏳ Planned |
+| Application and workflow hosting | Zyron Apps (container hosting on the mesh substrate), Workflows (task orchestration subsuming pipelines and schedules), deployment artifacts, SQL function library expansion | ⏳ Planned |
+| Dashboards and workspace | Zyron Dashboards (first-party visualization with live query overlays, formatting with data, branch-native and time-travel-aware), Zyron Workspace with editors, language runtimes (Python, JS/TS, Java/Scala, Go, Rust), data & discovery, ops & integrations | ⏳ Planned |
+| Enterprise identity, cross-cluster and Git | Enterprise auth (OIDC, SAML, TOTP, WebAuthn, universal PATs, tenant security policies), cross-cluster federation with mutual TLS and primary/secondary/peer roles, authorized Git integration per workspace with item versioning | ⏳ Planned |
+| AI Gateway and AI-native assist | BYO-credentials gateway with prompt versioning and branching, semantic caching, continuous evaluation and cost tracking, plus opt-in per-workspace SQL, chart, and notebook assist that routes through the gateway | ⏳ Planned |
+| Zyron Web | React + Vite + Tailwind webapp shipping as a first-party static Zyron App, path-based URLs, admin surfaces for every backend area above | ⏳ Planned |
 
 ## Development
 
@@ -434,7 +473,7 @@ cargo test -p zyron-storage
 # Whole workspace
 cargo test --workspace
 
-# A benchmark suite (release, serialized; results land in benchmarks/<suite>/)
+# A benchmark suite, release build and serialized, results land in benchmarks/<suite>/
 cargo test -p zyron-search --test search_bench --release -- --nocapture
 
 # Regenerate the README performance charts from the latest benchmark files

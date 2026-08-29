@@ -51,6 +51,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     let dispatcher = Arc::new(zyron_pipeline::event_handler::EventDispatcher::new());
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

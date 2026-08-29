@@ -49,6 +49,12 @@ pub fn start(
                 if server.cdc_ingest_manager.is_none() {
                     continue;
                 }
+                // Pulling rows in from another system is producing them, so it
+                // happens once per group. Three nodes each ingesting the same
+                // source would write the same rows three times
+                if !server.may_produce_changes() {
+                    continue;
+                }
                 let report = runtime.block_on(zyron_wire::ddl_dispatch::run_due_ingests(&server));
                 if report.failed > 0 {
                     warn!(

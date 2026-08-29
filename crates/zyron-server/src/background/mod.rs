@@ -4,6 +4,7 @@
 //! in the correct order. On shutdown, runs a final checkpoint for
 //! zero-replay restart.
 
+pub mod authority;
 pub mod cdc_ingest;
 pub mod cdc_stream_pump;
 pub mod cdc_writer;
@@ -79,6 +80,8 @@ pub struct BackgroundWorkers {
     lake_clustering: Option<self::lake_clustering::LakeClusteringWorker>,
     lake_follower: Option<self::lake_follower::LakeFollowerWorker>,
     pressure: Option<self::pressure::PressureWorker>,
+    /// Whether this node may start work that produces changes
+    authority: self::authority::WriteAuthority,
 }
 
 impl BackgroundWorkers {
@@ -105,6 +108,7 @@ impl BackgroundWorkers {
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         doc_registry: Arc<zyron_common::DocRegistry>,
         table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
+        authority: self::authority::WriteAuthority,
     ) -> Self {
         info!("Starting background workers");
 
@@ -155,6 +159,7 @@ impl BackgroundWorkers {
             buffer_pool.clone(),
             disk_manager.clone(),
             RetentionWorkerConfig::default(),
+            authority.clone(),
         );
         let schedule = ScheduleWorker::start(
             catalog.clone(),
@@ -163,6 +168,7 @@ impl BackgroundWorkers {
             buffer_pool.clone(),
             disk_manager.clone(),
             ScheduleWorkerConfig::default(),
+            authority.clone(),
         );
         let compaction = CompactionWorker::start(
             catalog.clone(),
@@ -175,6 +181,7 @@ impl BackgroundWorkers {
             doc_registry,
             Arc::clone(&btree_indexes),
             table_io_stats.clone(),
+            authority.clone(),
         );
         let vacuum = VacuumWorker::start(
             catalog,
@@ -202,10 +209,15 @@ impl BackgroundWorkers {
             slot_manager,
             Some(catalog_for_cdc),
         );
-        let mv_refresh =
-            MvRefreshWorker::start_with_catalog(MvRefreshConfig::default(), Some(catalog_for_mv));
-        let feature_materialization =
-            FeatureMaterializationWorker::start(FeatureMaterializationConfig::default());
+        let mv_refresh = MvRefreshWorker::start_with_catalog(
+            MvRefreshConfig::default(),
+            Some(catalog_for_mv),
+            authority.clone(),
+        );
+        let feature_materialization = FeatureMaterializationWorker::start(
+            FeatureMaterializationConfig::default(),
+            authority.clone(),
+        );
         let stream_monitor = StreamMonitor::start_with_manager(
             StreamMonitorConfig::default(),
             stream_job_manager.clone(),
@@ -229,6 +241,7 @@ impl BackgroundWorkers {
             lake_clustering: None,
             lake_follower: None,
             pressure: None,
+            authority,
         }
     }
 
@@ -242,8 +255,13 @@ impl BackgroundWorkers {
         config: self::lake_follower::LakeFollowerConfig,
     ) {
         if self.lake_follower.is_none() {
-            self.lake_follower =
-                self::lake_follower::LakeFollowerWorker::start(mode, catalog, peers, config);
+            self.lake_follower = self::lake_follower::LakeFollowerWorker::start(
+                mode,
+                catalog,
+                peers,
+                config,
+                self.authority.clone(),
+            );
         }
     }
 
@@ -270,8 +288,13 @@ impl BackgroundWorkers {
         config: self::lake_clustering::LakeClusteringConfig,
     ) {
         if self.lake_clustering.is_none() {
-            self.lake_clustering =
-                self::lake_clustering::LakeClusteringWorker::start(mode, catalog, metrics, config);
+            self.lake_clustering = self::lake_clustering::LakeClusteringWorker::start(
+                mode,
+                catalog,
+                metrics,
+                config,
+                self.authority.clone(),
+            );
         }
     }
 

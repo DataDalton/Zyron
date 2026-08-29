@@ -48,6 +48,7 @@ impl ScheduleWorker {
         buffer_pool: Arc<BufferPool>,
         disk_manager: Arc<DiskManager>,
         config: ScheduleWorkerConfig,
+        authority: crate::background::authority::WriteAuthority,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
@@ -74,6 +75,12 @@ impl ScheduleWorker {
                     thread::park_timeout(interval);
                     if t_shutdown.load(Ordering::Acquire) {
                         return;
+                    }
+                    // A schedule's statements write through paths nothing
+                    // captures for the rest of a group, so a member runs no
+                    // schedules rather than diverging quietly
+                    if !authority.may_write() {
+                        continue;
                     }
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

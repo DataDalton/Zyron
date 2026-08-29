@@ -1151,6 +1151,7 @@ impl Operator for LakeUpdateOperator {
                 // The image is what CHECK sees, so a violating update
                 // aborts before anything is written
                 crate::operator::modify::enforce_check_constraints(
+                    &self.ctx,
                     &self.check_constraints,
                     &image,
                     &table_entry.columns,

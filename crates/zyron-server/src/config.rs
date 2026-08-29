@@ -26,6 +26,10 @@ pub struct ZyronConfig {
     /// provisioner so that nothing outside it reads how the node was
     /// registered
     pub mesh: zyron_pressure::provisioner::MeshSection,
+    /// The consensus group this node belongs to. Off unless an operator
+    /// describes one, and a node with it off behaves exactly as it did
+    /// before there were groups
+    pub cluster: ClusterSection,
 }
 
 impl Default for ZyronConfig {
@@ -42,7 +46,120 @@ impl Default for ZyronConfig {
             vacuum: VacuumSection::default(),
             query: QuerySection::default(),
             mesh: zyron_pressure::provisioner::MeshSection::default(),
+            cluster: ClusterSection::default(),
         }
+    }
+}
+
+/// One member of the consensus group.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ClusterPeerSection {
+    /// The name an operator gave the node. The consensus id is derived from
+    /// it, so every member arrives at the same id for it without asking
+    pub name: String,
+    /// Where that node serves consensus, as `host:port`
+    pub address: String,
+}
+
+/// The consensus group, described entirely by configuration.
+///
+/// Nothing about the group is discovered. A node that guessed at its own
+/// membership could form a second group beside the real one, so every member
+/// including this node is listed, and this node's own name has to be among
+/// them
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClusterSection {
+    pub enabled: bool,
+    /// This node's name, which must appear in `peers`
+    pub node_name: String,
+    /// Where this node serves consensus
+    pub listen: String,
+    /// Every member of the group, this node included
+    pub peers: Vec<ClusterPeerSection>,
+    /// Stretches the timers for a group whose members are in different
+    /// regions, where a round trip is tens of milliseconds
+    pub multi_region: bool,
+    /// How far the log may grow past the last snapshot, in entries
+    pub snapshot_threshold: u64,
+    /// How far the log may grow past the last snapshot, in bytes. Zero keeps
+    /// the built-in figure. Counting entries alone is right for a log of keys
+    /// and wrong for a log of transactions
+    pub snapshot_threshold_bytes: u64,
+    /// Bytes of decoded log entries held in memory. Zero keeps the built-in
+    /// figure. Past this the oldest are read back from the file when a
+    /// follower asks for them
+    pub resident_log_bytes: u64,
+    /// Bytes a transaction buffers before a chunk of it is replicated. A bulk
+    /// load past this replicates while it runs rather than arriving as one
+    /// entry the size of the load
+    pub chunk_bytes: u64,
+    /// The table committed Put and Delete commands are applied to
+    pub replicated_table: String,
+}
+
+impl Default for ClusterSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_name: String::new(),
+            listen: "0.0.0.0:5434".to_string(),
+            peers: Vec::new(),
+            multi_region: false,
+            snapshot_threshold: 10_000,
+            snapshot_threshold_bytes: 0,
+            resident_log_bytes: 0,
+            chunk_bytes: 1024 * 1024,
+            replicated_table: "raft_kv".to_string(),
+        }
+    }
+}
+
+impl ClusterSection {
+    /// Refuses a group description that cannot produce a working node.
+    ///
+    /// Checked at startup rather than on the first election, because a node
+    /// that is not in its own group would come up, campaign for nothing, and
+    /// look like a network fault
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.node_name.trim().is_empty() {
+            return Err(ZyronError::ConfigError(
+                "cluster.node_name is required when cluster.enabled is true".into(),
+            ));
+        }
+        if self.listen.trim().is_empty() {
+            return Err(ZyronError::ConfigError(
+                "cluster.listen is required when cluster.enabled is true".into(),
+            ));
+        }
+        if self.peers.is_empty() {
+            return Err(ZyronError::ConfigError(
+                "cluster.peers must name every member of the group, this node included".into(),
+            ));
+        }
+        for peer in &self.peers {
+            if peer.name.trim().is_empty() || peer.address.trim().is_empty() {
+                return Err(ZyronError::ConfigError(
+                    "every entry in cluster.peers needs a name and an address".into(),
+                ));
+            }
+        }
+        if !self.peers.iter().any(|p| p.name == self.node_name) {
+            return Err(ZyronError::ConfigError(format!(
+                "cluster.node_name \"{}\" is not among cluster.peers, so this node is not in its own group",
+                self.node_name
+            )));
+        }
+        if self.replicated_table.trim().is_empty() {
+            return Err(ZyronError::ConfigError(
+                "cluster.replicated_table cannot be empty".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

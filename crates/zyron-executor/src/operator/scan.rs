@@ -1175,6 +1175,63 @@ struct IndexScanState {
 }
 
 impl IndexScanOperator {
+    /// Builds a scan over locators the caller already has.
+    ///
+    /// Replication apply resolves the rows a changeset names itself, by
+    /// probing an index with a shipped key or by matching whole row images,
+    /// and then needs exactly what an index scan does next: resolve each
+    /// locator to a row, apply visibility, batch columnar entries in one pass,
+    /// and hand the rows on with their locators attached so a delete can
+    /// address them. Rebuilding that would be a second copy of the trickiest
+    /// loop in the scan layer, so it is entered here instead
+    pub async fn from_locators(
+        ctx: Arc<ExecutionContext>,
+        table_id: zyron_catalog::TableId,
+        columns: Vec<LogicalColumn>,
+        locators: Vec<zyron_common::RowLocator>,
+    ) -> Result<Self> {
+        let table_entry = ctx.get_table_entry(table_id)?;
+        let has_columnar = locators
+            .iter()
+            .any(|l| !matches!(l, zyron_common::RowLocator::Heap { .. }));
+        let columnar = if has_columnar {
+            Some(
+                crate::operator::doc_fetch::DocRowFetcher::prepare_columnar_only(
+                    &ctx, table_id, &columns, &locators, None,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let output_ids: Vec<zyron_catalog::ColumnId> =
+            columns.iter().map(|c| c.column_id).collect();
+        let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let io_stats =
+            crate::operator::IndexScanStats::open(&ctx, table_id.0, u32::MAX, locators.len());
+        let branch_id = ctx.active_branch_id;
+        Ok(Self {
+            index_state: Some(IndexScanState {
+                ctx,
+                table_entry,
+                output_columns: columns,
+                column_to_builder,
+                // The caller already decided which rows these are, and a
+                // predicate here would be re-deciding it
+                remaining_predicate: None,
+                track_tuple_ids: true,
+                locators,
+                columnar,
+                cursor: 0,
+                branch_id,
+                finished: false,
+                io_stats,
+            }),
+            fallback: None,
+            append_delta: None,
+        })
+    }
+
     /// Creates an index scan operator. When a BTreeIndex instance is
     /// registered in the ExecutionContext for the given index_id, performs
     /// an actual B+ tree range scan. Otherwise falls back to sequential

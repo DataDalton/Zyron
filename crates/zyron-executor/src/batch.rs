@@ -432,14 +432,34 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
     let num_cols = columns.len();
     let null_bitmap_len = (num_cols + 7) / 8;
     let mut buf = Vec::with_capacity(null_bitmap_len + num_cols * 8);
-    buf.resize(null_bitmap_len, 0u8);
+    encode_row_into(&mut buf, batch, row_idx, columns);
+    buf
+}
+
+/// Encodes one row onto the end of an existing buffer.
+///
+/// The whole-batch callers go through this: a replication capture encodes a
+/// thousand rows into the buffer that becomes the log record, and a
+/// whole-image match scan encodes every row it inspects into one reused
+/// scratch buffer. A vector per row on those paths is an allocation and a
+/// copy that buys nothing
+pub fn encode_row_into(
+    buf: &mut Vec<u8>,
+    batch: &DataBatch,
+    row_idx: usize,
+    columns: &[ColumnEntry],
+) {
+    let num_cols = columns.len();
+    let null_bitmap_len = (num_cols + 7) / 8;
+    let base = buf.len();
+    buf.resize(base + null_bitmap_len, 0u8);
 
     for (i, col) in columns.iter().enumerate() {
         let column = &batch.columns[i];
         let is_null = column.is_null(row_idx);
 
         if is_null {
-            buf[i / 8] |= 1 << (i % 8);
+            buf[base + i / 8] |= 1 << (i % 8);
         }
 
         // Physical type drives byte layout (TIMESTAMP(p>6) = 16-byte i128 ps).
@@ -448,7 +468,7 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
             if is_null {
                 buf.extend(std::iter::repeat(0u8).take(fixed_size));
             } else {
-                encode_fixed_scalar(&mut buf, phys_type, &column.data.get_scalar(row_idx));
+                encode_fixed_scalar(buf, phys_type, &column.data.get_scalar(row_idx));
             }
         } else if is_null {
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -456,14 +476,12 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
             // Varlen payloads are borrowed straight from the column, the
             // length prefix and bytes land in buf without a scalar copy
             match &column.data {
-                ColumnData::Utf8(v) => encode_varlen_bytes(&mut buf, v[row_idx].as_bytes()),
-                ColumnData::Binary(v) => encode_varlen_bytes(&mut buf, &v[row_idx]),
-                other => encode_varlen_scalar(&mut buf, &other.get_scalar(row_idx)),
+                ColumnData::Utf8(v) => encode_varlen_bytes(buf, v[row_idx].as_bytes()),
+                ColumnData::Binary(v) => encode_varlen_bytes(buf, &v[row_idx]),
+                other => encode_varlen_scalar(buf, &other.get_scalar(row_idx)),
             }
         }
     }
-
-    buf
 }
 
 /// Writes one length-prefixed variable-length payload, the borrowed

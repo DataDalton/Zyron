@@ -57,6 +57,8 @@ async fn create_harness() -> Harness {
     ));
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

@@ -170,6 +170,7 @@ impl LakeClusteringWorker {
         catalog: Arc<Catalog>,
         metrics: Option<Arc<LabeledMetrics>>,
         config: LakeClusteringConfig,
+        authority: crate::background::authority::WriteAuthority,
     ) -> Option<Self> {
         if !mode.runs_lake_tier() {
             return None;
@@ -182,6 +183,7 @@ impl LakeClusteringWorker {
             catalog,
             metrics,
             config,
+            authority,
         ));
         info!("lake clustering worker started");
         Some(Self {
@@ -370,6 +372,7 @@ async fn clustering_loop(
     catalog: Arc<Catalog>,
     metrics: Option<Arc<LabeledMetrics>>,
     config: LakeClusteringConfig,
+    authority: crate::background::authority::WriteAuthority,
 ) {
     // Passes a crash left half done are finished or unwound before any new
     // one starts, so a resumed pass never races a fresh one over the same
@@ -430,6 +433,14 @@ async fn clustering_loop(
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
+        }
+        // Rewriting a lake table commits versions to this node's own log,
+        // and nothing carries a background commit to the rest of a group, so
+        // a member holds off entirely rather than leaving the others' logs
+        // behind its own
+        if !authority.may_write() {
+            tokio::time::sleep(Duration::from_secs(config.interval_secs.max(1))).await;
+            continue;
         }
         stats.wakes.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();

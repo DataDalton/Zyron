@@ -11,6 +11,7 @@ pub mod lake_stats;
 pub mod operator;
 pub mod parallel_pool;
 pub mod probe;
+pub mod replication;
 pub mod sequence;
 pub mod spill;
 pub mod subquery;

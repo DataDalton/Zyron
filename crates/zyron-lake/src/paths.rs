@@ -90,6 +90,26 @@ impl LakePaths {
         }
     }
 
+    /// The database directory this table's root sits under, which is what the
+    /// pending-version registry is keyed by.
+    ///
+    /// `<data_dir>/lake/t<id>` back to `<data_dir>`. None when the root did
+    /// not come from `new`
+    pub fn database_dir(&self) -> Option<&Path> {
+        self.root.parent().and_then(|lake| lake.parent())
+    }
+
+    /// Rebuilds the layout from a root that `new` produced.
+    ///
+    /// The pending-version registry records roots rather than table ids, so a
+    /// caller walking it needs the way back
+    pub fn from_root(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            shared_data: None,
+        }
+    }
+
     /// Resolves data files under another table's root while keeping this
     /// table's own log, which is how a follower reads a leader's files
     /// without copying them.

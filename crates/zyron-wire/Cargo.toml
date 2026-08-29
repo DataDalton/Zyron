@@ -11,6 +11,7 @@ profile = ["zyron-common/profile"]
 
 [dependencies]
 zyron-pressure = { path = "../zyron-pressure" }
+zyron-raft = { path = "../zyron-raft" }
 zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }

@@ -446,6 +446,14 @@ impl TransactionManager {
     /// active-set entry across the fsync would close that window at the
     /// cost of serializing contended rows on device latency.
     fn commit_inner(&self, txn: &mut Transaction) -> Result<Lsn> {
+        self.commit_inner_at(txn, None)
+    }
+
+    fn commit_inner_at(
+        &self,
+        txn: &mut Transaction,
+        agreed: Option<&zyron_wal::AgreedCommit>,
+    ) -> Result<Lsn> {
         if txn.status != TransactionStatus::Active {
             return Err(ZyronError::TransactionAborted(format!(
                 "transaction {} is not active (status: {:?})",
@@ -455,7 +463,12 @@ impl TransactionManager {
 
         let lsn = {
             let _s = profile::scope(Phase::CommitRecordAppend);
-            self.wal.log_commit(txn.txn_id, txn.last_lsn)?
+            match agreed {
+                Some(stamp) => self
+                    .wal
+                    .log_commit_agreed(txn.txn_id, txn.last_lsn, stamp)?,
+                None => self.wal.log_commit(txn.txn_id, txn.last_lsn)?,
+            }
         };
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Committed;
@@ -510,6 +523,32 @@ impl TransactionManager {
             self.wait_durable(lsn).await;
         }
         Ok(())
+    }
+
+    /// Commits a transaction a consensus group has already agreed to.
+    ///
+    /// Visibility, locks and the commit record, and then the caller is
+    /// answered. There is deliberately no durability wait: the entry carrying
+    /// this transaction is already on a majority of the group's logs, which is
+    /// the durability the caller was promised, and one that arrives twice
+    /// costs less than one that waits twice.
+    ///
+    /// If the commit record is lost to a crash before it reaches the disk,
+    /// recovery finds a transaction with data records and no commit, treats it
+    /// as aborted, and the applied index the record would have carried is not
+    /// there either. The entry is then replayed on the way back up and the
+    /// rows come back. That is why the stamp goes into the record rather than
+    /// into a file beside it.
+    ///
+    /// Answers with the record's position, which the caller pins WAL
+    /// retention with: a checkpoint must not reclaim the record while a
+    /// restart could still need it to know this transaction happened
+    pub fn commit_agreed(
+        &self,
+        txn: &mut Transaction,
+        agreed: &zyron_wal::AgreedCommit,
+    ) -> Result<Lsn> {
+        self.commit_inner_at(txn, Some(agreed))
     }
 
     /// Commits a read-only transaction: one that appended no WAL data record.

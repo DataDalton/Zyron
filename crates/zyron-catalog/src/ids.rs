@@ -37,6 +37,12 @@ impl OidAllocator {
     }
 
     /// Allocates the next OID.
+    ///
+    /// In a consensus group this counter is a function of the applied log: a
+    /// schema change is agreed before it runs and then runs on every node from
+    /// the same applied position, and nothing but a schema change allocates.
+    /// So two nodes number the same object identically without any id being
+    /// replicated
     pub fn next(&self) -> Oid {
         self.next.fetch_add(1, Ordering::Relaxed)
     }

@@ -147,6 +147,8 @@ pub enum Statement {
     CreateSpatialIndex(Box<CreateSpatialIndexStatement>),
     /// ALTER SYSTEM SET name = value
     AlterSystemSet(Box<AlterSystemSetStatement>),
+    /// ALTER CLUSTER ADD NODE 'node-3' AT 'host3:5434', or REMOVE NODE 'node-3'
+    AlterCluster(Box<AlterClusterStatement>),
     /// ANALYZE [table_name]
     Analyze(Box<AnalyzeStatement>),
     /// ALTER TABLE t FOLLOW <peer>.<table>, or UNFOLLOW
@@ -1106,6 +1108,24 @@ pub struct CheckpointStatement {}
 pub struct AlterSystemSetStatement {
     pub name: String,
     pub value: Expr,
+}
+
+/// A change to the consensus group this node belongs to.
+///
+/// Membership is replicated, so this is a write like any other and only the
+/// leader accepts it. A node named here is named by the name an operator gave
+/// it, which is what the consensus id is derived from
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterClusterStatement {
+    pub operation: AlterClusterOperation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterClusterOperation {
+    /// Brings a node in, as a learner first and a voter once it has caught up
+    AddNode { name: String, address: String },
+    /// Takes a node out, through a joint configuration when it votes
+    RemoveNode { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

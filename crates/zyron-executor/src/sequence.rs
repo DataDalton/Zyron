@@ -284,6 +284,13 @@ async fn resolve_one(
             if let Some(state) = &ctx.session_sequences {
                 state.record(live.id, last);
             }
+            // What the group is told is how far the counter was reserved, not
+            // the numbers that were drawn: those are already in the rows this
+            // statement wrote. A node elected later has to know not to hand
+            // them out again, and the reservation is what says so. Recording
+            // the high-water rather than each draw means one small operation
+            // per statement instead of one per row
+            crate::replication::capture_sequence(ctx, live.id, live.current_reserved())?;
             Ok(out)
         }
         SeqKind::CurrVal => {
@@ -322,6 +329,7 @@ async fn resolve_one(
             if let Some(state) = &ctx.session_sequences {
                 state.record(live.id, value);
             }
+            crate::replication::capture_sequence(ctx, live.id, live.current_reserved())?;
             Ok(vec![v; num_rows])
         }
     }

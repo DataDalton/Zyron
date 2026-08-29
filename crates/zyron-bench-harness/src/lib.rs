@@ -432,7 +432,25 @@ pub fn validate_metric(
     target: f64,
     higher_is_better: bool,
 ) -> ValidationResult {
-    validate_metric_inner(test, name, None, runs, target, higher_is_better)
+    validate_metric_inner(test, name, None, "", runs, target, higher_is_better)
+}
+
+/// Validates a metric and stamps its unit onto every number it prints.
+///
+/// A run list of bare figures has to be read against a unit stated once in the
+/// metric name, several lines away, and a reader scanning a run file for an
+/// outlier has no way to tell seconds from milliseconds at the point where the
+/// outlier is. The unit rides on each value instead, the way [`record_metric`]
+/// already does it, so a line means something on its own
+pub fn validate_metric_with_unit(
+    test: &str,
+    name: &str,
+    unit: &str,
+    runs: Vec<f64>,
+    target: f64,
+    higher_is_better: bool,
+) -> ValidationResult {
+    validate_metric_inner(test, name, None, unit, runs, target, higher_is_better)
 }
 
 /// Validates a metric that belongs to one storage format.
@@ -450,13 +468,35 @@ pub fn validate_metric_for(
     target: f64,
     higher_is_better: bool,
 ) -> ValidationResult {
-    validate_metric_inner(test, name, Some(format), runs, target, higher_is_better)
+    validate_metric_inner(test, name, Some(format), "", runs, target, higher_is_better)
+}
+
+/// A format specific metric whose numbers each carry their unit
+pub fn validate_metric_with_unit_for(
+    format: Format,
+    test: &str,
+    name: &str,
+    unit: &str,
+    runs: Vec<f64>,
+    target: f64,
+    higher_is_better: bool,
+) -> ValidationResult {
+    validate_metric_inner(
+        test,
+        name,
+        Some(format),
+        unit,
+        runs,
+        target,
+        higher_is_better,
+    )
 }
 
 fn validate_metric_inner(
     test: &str,
     name: &str,
     format: Option<Format>,
+    unit: &str,
     runs: Vec<f64>,
     target: f64,
     higher_is_better: bool,
@@ -467,6 +507,9 @@ fn validate_metric_inner(
         Some(f) => format!("{} [{}]", name, f),
         None => name.to_string(),
     };
+    // Every printed figure goes through this, so a value never appears
+    // without the unit it is in
+    let u = |v: f64| format!("{}{}", format_measurement(v), unit);
     let average = runs.iter().sum::<f64>() / runs.len() as f64;
     let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -501,16 +544,13 @@ fn validate_metric_inner(
         tprintln!("  {} [NOT MEASURED, unoptimized build]:", display);
         tprintln!(
             "    Runs: [{}]",
-            runs.iter()
-                .map(|x| format_measurement(*x))
-                .collect::<Vec<_>>()
-                .join(", ")
+            runs.iter().map(|x| u(*x)).collect::<Vec<_>>().join(", ")
         );
         tprintln!(
             "    Average: {} (target {} {}, not applied)",
-            format_measurement(average),
+            u(average),
             if higher_is_better { ">=" } else { "<=" },
-            format_measurement(target)
+            u(target)
         );
         tprintln!("    Re-run with --release for a number worth comparing");
         // Recorded like any other run. Every run writes, and the run file's
@@ -540,22 +580,19 @@ fn validate_metric_inner(
     tprintln!("  {} [{}/{}]:", display, status, regr_status);
     tprintln!(
         "    Runs: [{}]",
-        runs.iter()
-            .map(|x| format_measurement(*x))
-            .collect::<Vec<_>>()
-            .join(", ")
+        runs.iter().map(|x| u(*x)).collect::<Vec<_>>().join(", ")
     );
     tprintln!(
         "    Average: {} {} {} (target)",
-        format_measurement(average),
+        u(average),
         comparison,
-        format_measurement(target)
+        u(target)
     );
     tprintln!(
         "    Min/Max: {} / {}, StdDev: {}",
-        format_measurement(min),
-        format_measurement(max),
-        format_measurement(std_dev)
+        u(min),
+        u(max),
+        u(std_dev)
     );
 
     write_benchmark_record(
@@ -583,7 +620,27 @@ pub fn check_performance(
     target: f64,
     higher_is_better: bool,
 ) -> bool {
-    check_performance_inner(test, metric_name, None, value, target, higher_is_better)
+    check_performance_inner(test, metric_name, None, "", value, target, higher_is_better)
+}
+
+/// Checks one measurement and stamps its unit onto the value and the target
+pub fn check_performance_with_unit(
+    test: &str,
+    metric_name: &str,
+    unit: &str,
+    value: f64,
+    target: f64,
+    higher_is_better: bool,
+) -> bool {
+    check_performance_inner(
+        test,
+        metric_name,
+        None,
+        unit,
+        value,
+        target,
+        higher_is_better,
+    )
 }
 
 /// Checks a single measurement that belongs to one storage format.
@@ -602,6 +659,7 @@ pub fn check_performance_for(
         test,
         metric_name,
         Some(format),
+        "",
         value,
         target,
         higher_is_better,
@@ -612,6 +670,7 @@ fn check_performance_inner(
     test: &str,
     metric_name: &str,
     format: Option<Format>,
+    unit: &str,
     value: f64,
     target: f64,
     higher_is_better: bool,
@@ -620,13 +679,14 @@ fn check_performance_inner(
         Some(f) => format!("{} [{}]", metric_name, f),
         None => metric_name.to_string(),
     };
+    let u = |v: f64| format!("{}{}", format_measurement(v), unit);
     if !measuring() {
         tprintln!(
             "  {} [NOT MEASURED, unoptimized build]: {} (target {} {}, not applied)",
             display,
-            format_measurement(value),
+            u(value),
             if higher_is_better { ">=" } else { "<=" },
-            format_measurement(target)
+            u(target)
         );
         // Recorded like any other run, matching validate_metric. Returning
         // without recording left a suite that reaches the harness only
@@ -657,9 +717,9 @@ fn check_performance_inner(
         "  {} [{}]: {} {} {} (target)",
         display,
         status,
-        format_measurement(value),
+        u(value),
         comparison,
-        format_measurement(target),
+        u(target),
     );
     write_benchmark_record(
         test,

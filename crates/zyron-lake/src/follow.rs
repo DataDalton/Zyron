@@ -134,6 +134,24 @@ pub fn apply_versions(
     follower: &TransactionLog,
     versions: &[FollowedVersion],
 ) -> Result<u64, ZyronError> {
+    apply_versions_under(follower, versions, 0)
+}
+
+/// Applies the leader's versions under a database transaction of this node's.
+///
+/// A replicated commit must not become visible here before the transaction
+/// carrying it commits, or a follower would show rows from a transaction its
+/// leader had not finished, and a leader that died part way would leave them
+/// showing forever. Staging under `db_txn_id` puts the versions behind the
+/// same commit the rows are behind, and `publish_txn` releases both together.
+///
+/// `db_txn_id` of zero publishes immediately, which is what a pull-based
+/// follower with no transaction of its own wants
+pub fn apply_versions_under(
+    follower: &TransactionLog,
+    versions: &[FollowedVersion],
+    db_txn_id: u64,
+) -> Result<u64, ZyronError> {
     let mut applied = 0u64;
     // A replay originates nothing, so it must not claim ownership either.
     // Claiming here would make the follower the owner of the first version
@@ -153,7 +171,7 @@ them the same, so a version out of sequence means a gap rather than a conflict"
         }
         let attempt = CommitAttempt {
             operation: version.operation,
-            db_txn_id: 0,
+            db_txn_id,
             commit_lsn: 0,
             timestamp_us: version.timestamp_us,
             read_predicate: None,
@@ -162,7 +180,21 @@ them the same, so a version out of sequence means a gap rather than a conflict"
             deadline: None,
         };
         let entries = version.entries.clone();
-        follower.commit(attempt, move |_| Ok(entries.clone()))?;
+        let committed = follower.commit(attempt, move |_| Ok(entries.clone()))?;
+        if db_txn_id != 0 {
+            let Some(database_dir) = follower.paths().database_dir() else {
+                return Err(ZyronError::Internal(format!(
+                    "a lake log at {} is not under a database directory, so a transactional apply has nowhere to register",
+                    follower.paths().root().display()
+                )));
+            };
+            crate::transaction_log::register_txn_pending(
+                database_dir,
+                db_txn_id,
+                follower.paths().root().to_path_buf(),
+                committed,
+            );
+        }
         applied += 1;
         // A replica writes as whoever owns the dataset, because the
         // versions it holds are that node's. Without this the first

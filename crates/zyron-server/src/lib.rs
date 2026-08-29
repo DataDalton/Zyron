@@ -16,6 +16,8 @@ pub mod hooks;
 pub mod lake_recovery;
 pub mod mesh_node;
 pub mod metrics;
+pub mod raft;
+pub mod replication;
 pub mod session;
 pub mod signal;
 
@@ -350,7 +352,7 @@ impl Server {
         // record whose fold registry entry is still cache-only. Without this
         // a crash after such a checkpoint loses the segment and regresses the
         // file-id counter, which the next fold would overwrite.
-        wal.set_retention_hook(std::sync::Arc::new(|| {
+        wal.add_retention_hook(std::sync::Arc::new(|| {
             crate::columnar_wal_pin::ColumnarWalPin::global()
                 .min_retained()
                 .map(zyron_wal::Lsn)
@@ -1040,6 +1042,15 @@ impl Server {
             doc_registry: Arc::clone(&doc_registry_arc),
             btree_indexes: Arc::clone(&btree_indexes),
         });
+        // A member of a group produces no background changes at all, because
+        // these workers do not capture what they change and a change held by
+        // one member alone is a divergence. A node in no group decides
+        // everything for itself
+        let write_authority = if self.config.cluster.enabled {
+            crate::background::authority::WriteAuthority::pending()
+        } else {
+            crate::background::authority::WriteAuthority::alone()
+        };
         let mut background = BackgroundWorkers::start(
             Arc::clone(&catalog),
             Arc::clone(&wal),
@@ -1062,6 +1073,7 @@ impl Server {
             Arc::clone(&btree_indexes),
             Arc::clone(&doc_registry_arc),
             Arc::clone(&table_io_stats_arc),
+            write_authority.clone(),
         );
 
         // Attach the QuotaGossip worker with the default no-op transport.
@@ -1277,8 +1289,33 @@ impl Server {
         // them, the TTL sweeper, and the stat views
         let dlq_registry_arc = Arc::new(zyron_streaming::dlq::DlqRegistry::new());
 
+        // Join the consensus group, when the operator has described one.
+        // Started before ServerState so the handle can be in it: every
+        // consensus check reads it from there, and a node that joined after
+        // the first connection was accepted would have served a write it had
+        // no right to
+        let cluster = if self.config.cluster.enabled {
+            let handle = crate::raft::start_cluster(
+                &self.config.cluster,
+                &self.config.storage.data_dir,
+                Arc::clone(&catalog),
+                Arc::clone(&wal),
+                Arc::clone(&buffer_pool),
+                Arc::clone(&disk_manager),
+                Arc::clone(&txn_manager),
+            )
+            .await?;
+            Some(handle)
+        } else {
+            None
+        };
+
         // Build ServerState for zyron-wire
         let server_state = Arc::new(ServerState {
+            raft: cluster.as_ref().map(|c| Arc::clone(&c.node)),
+            replication: cluster.as_ref().map(|c| {
+                Arc::clone(&c.replication) as Arc<dyn zyron_wire::connection::ReplicationRouter>
+            }),
             node_capabilities: Some(std::sync::Arc::clone(&capabilities)),
             catalog: Arc::clone(&catalog),
             legal_holds: Arc::clone(&legal_hold_registry),
@@ -1767,6 +1804,16 @@ impl Server {
             info!("metrics disabled, health/metrics HTTP server not started");
             None
         };
+
+        // The applier can carry out a schema change now that the server it
+        // needs exists. Attached before the listener accepts anything, so no
+        // entry can reach it first
+        if let Some(cluster) = cluster.as_ref() {
+            cluster
+                .replication
+                .machine
+                .attach_ddl_runner(crate::replication::DispatchedDdl::new(&server_state));
+        }
 
         // Mark startup complete
         self.health_state.mark_startup_complete();

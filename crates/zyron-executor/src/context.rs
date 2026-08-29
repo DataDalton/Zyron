@@ -191,6 +191,21 @@ pub struct ExecutionContext {
     pub analyze: bool,
     /// Optional CDC hook invoked by DML operators after mutations.
     pub cdc_hook: Option<Arc<dyn CdcHook>>,
+    /// Where this transaction's effects accumulate for the consensus group.
+    /// None on a node that leads no group, which is what makes replication an
+    /// addition to the write path rather than a second write path
+    pub replication: Option<Arc<crate::replication::TxnChangeset>>,
+    /// True while committed changes from another node are being put back.
+    ///
+    /// The leader already ran the constraints, the foreign keys, the checks
+    /// and the triggers, and re-running them here would fire side effects a
+    /// second time and could reject a row the group has already agreed on. A
+    /// `CHECK` over a volatile function is the clearest case: it can answer
+    /// differently here and there is no answer but the leader's.
+    ///
+    /// Index maintenance, the WAL and the change feed all stay on: those
+    /// describe what happened rather than deciding it
+    pub replication_apply: bool,
     /// Optional DML hook invoked by DML operators before mutations (BEFORE triggers).
     pub dml_hook: Option<Arc<dyn DmlHook>>,
     /// Bound parameter values ($1, $2, ...) for prepared statements.
@@ -333,6 +348,8 @@ impl ExecutionContext {
             wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: None,
+            replication: None,
+            replication_apply: false,
             dml_hook: None,
             params: Vec::new(),
             security_context: None,
@@ -388,6 +405,8 @@ impl ExecutionContext {
             wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: self.cdc_hook.clone(),
+            replication: self.replication.clone(),
+            replication_apply: self.replication_apply,
             dml_hook: self.dml_hook.clone(),
             params,
             security_context: self.security_context.clone(),

@@ -57,6 +57,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     let ingest_mgr = Arc::new(CdcIngestManager::new(&data_dir).expect("ingest mgr"));
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

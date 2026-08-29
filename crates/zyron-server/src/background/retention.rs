@@ -91,6 +91,7 @@ impl RetentionWorker {
         buffer_pool: Arc<BufferPool>,
         disk_manager: Arc<DiskManager>,
         config: RetentionWorkerConfig,
+        authority: crate::background::authority::WriteAuthority,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
@@ -131,6 +132,12 @@ impl RetentionWorker {
                     thread::park_timeout(interval);
                     if t_shutdown.load(Ordering::Acquire) {
                         return;
+                    }
+                    // Expiring rows is a write that nothing captures for the
+                    // rest of a group, so a member expires nothing rather
+                    // than holding a different table from the others
+                    if !authority.may_write() {
+                        continue;
                     }
                     runtime.block_on(Self::run_cycle(&wc, &t_stats));
                 }

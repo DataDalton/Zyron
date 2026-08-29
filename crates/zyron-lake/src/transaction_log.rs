@@ -1265,6 +1265,25 @@ pub fn publish_txn(
     Ok(published)
 }
 
+/// Every version a transaction has staged, in the order they were written.
+///
+/// Read rather than taken, so a caller can record what is about to be
+/// published without deciding whether it is published. Replication uses this
+/// as the single capture point for lake writes: append, delete, update,
+/// optimize and schema change all stage the same way, so one read here covers
+/// every one of them and no write path has to remember to report itself
+pub fn pending_versions(
+    data_dir: &std::path::Path,
+    db_txn_id: u64,
+) -> Vec<(std::path::PathBuf, u64)> {
+    let key = (data_dir.to_path_buf(), db_txn_id);
+    let mut list = txn_pending()
+        .read_sync(&key, |_, v| v.clone())
+        .unwrap_or_default();
+    list.sort_by_key(|(_, version)| *version);
+    list
+}
+
 /// Discards every lake version the transaction wrote, newest first,
 /// called when the transaction aborts. Best effort, recovery is the
 /// authority for anything that slips through

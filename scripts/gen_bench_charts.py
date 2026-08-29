@@ -150,6 +150,38 @@ CROSS_READS = [
     ("range_scan", "Range scan, wide", "Wide scan"),
 ]
 
+# Consensus + replication throughput (raft group writes, replicated txn/sec,
+# log entries made durable per second). Values normalized to thousands.
+# (suite, group, key, divisor, short label)
+RAFT_THROUGHPUT = [
+    ("raft", "Write Throughput", "Committed writes on a three node group", 1e3, "Raft group writes"),
+    ("replication", "Replication", "Replicated write throughput, three nodes", 1e3, "Replicated txn/sec"),
+    ("raft", "Log Append", "Entries made durable by group commit", 1e3, "Log entries durable"),
+]
+
+# Consensus + replication hot-path latency in microseconds.
+# The source JSON stores each metric in its own unit, so a per-row multiplier
+# lifts everything to microseconds without loss.
+# (suite, group, key, multiplier_to_us, short label)
+RAFT_LATENCY_US = [
+    ("raft", "Follower Read", "ReadIndex round trip and local apply wait, p99", 1e3, "Follower read"),
+    ("raft", "Replication Lag", "Leader commit to follower apply, p99", 1e3, "Replication lag"),
+    ("raft", "Linearizable Read", "Follower read after a write, p99", 1e3, "Linearizable read"),
+    ("replication", "Replication", "Write latency p99, unsaturated", 1e6, "Replicated write p99"),
+    ("raft", "Membership Change", "Add a node as learner and promote it", 1e6, "Learner promoted"),
+]
+
+# Consensus + replication rows for the supplementary EXTRA table.
+# Same shape as EXTRA above.
+RAFT_EXTRA = [
+    ("raft", "Election Latency", "Leader replaced after a kill", "Consensus", "Leader election after a kill", 1, 0, " ms"),
+    ("raft", "Log Append", "One append into the replicated log", "Consensus", "Single log append", 1, 2, " us"),
+    ("raft", "Snapshot 1GB", "Checkpoint one gigabyte of state", "Consensus", "Snapshot 1GB, create", 1, 2, " s"),
+    ("raft", "Snapshot 1GB", "Stream one gigabyte to a node that has none of it", "Consensus", "Snapshot 1GB, transfer", 1, 2, " s"),
+    ("replication", "Replication", "Follower apply rate against leader commit rate", "Replication", "Follower keep-up vs leader", 0.01, 1, "%"),
+    ("replication", "Replication", "Worst follower lag", "Replication", "Worst follower lag", 1, 0, " entries"),
+]
+
 
 def latest_json(suite: str):
     files = sorted((BENCH / suite).glob(f"{suite}_*.json"))
@@ -426,8 +458,43 @@ def main():
     svg_rel = svg_path.relative_to(ROOT).as_posix()
     out.append(f"![Cross-format wall-clock, Row heap vs ZyronLake]({svg_rel})\n")
 
+    # Consensus and replication. One throughput chart, one latency chart, and
+    # the rest goes into the supplementary table below.
+    raft_tp_labels = [label for _, _, _, _, label in RAFT_THROUGHPUT]
+    raft_tp_vals = [metric(doc(s), g, k) / d for s, g, k, d, _ in RAFT_THROUGHPUT]
+    raft_tp_top = int(max(raft_tp_vals) * 1.15)
+
+    raft_lat_labels = [label for _, _, _, _, label in RAFT_LATENCY_US]
+    raft_lat_vals = [metric(doc(s), g, k) * mult for s, g, k, mult, _ in RAFT_LATENCY_US]
+    raft_lat_top = int(max(raft_lat_vals) * 1.15)
+
+    out.append("### Consensus and replication\n")
+    out.append(
+        "A three-node Raft group with the leader accepting writes, followers "
+        "applying committed entries through the same operator path the leader "
+        "used, and reads served through a ReadIndex round trip so they stay "
+        "linearizable. Throughput first, then hot-path latency:\n"
+    )
+    svg_chart(
+        "raft_throughput",
+        "Consensus and replication throughput (thousand ops/sec, higher is better)",
+        raft_tp_labels,
+        raft_tp_vals,
+        raft_tp_top,
+        "K ops/sec",
+    )
+    svg_chart(
+        "raft_latency",
+        "Consensus hot-path latency (microseconds, lower is better)",
+        raft_lat_labels,
+        raft_lat_vals,
+        raft_lat_top,
+        "us",
+        fmt="{:.1f}",
+    )
+
     extra_rows = []
-    for suite, group, key, sub, mlabel, div, dec, suffix in EXTRA:
+    for suite, group, key, sub, mlabel, div, dec, suffix in EXTRA + RAFT_EXTRA:
         v = metric(doc(suite), group, key) / div
         extra_rows.append(f"| {sub} | {mlabel} | ~{v:.{dec}f}{suffix} |")
     extra_rows.append(f"| Transactions | Durable group-commit peak | ~{dc_peak/1000:.0f}K txn/sec |")
@@ -448,8 +515,8 @@ def main():
     out.append(
         f"{suite_count} benchmark suites cover storage, executor, optimizer, encoding, wire, "
         "search, analytics, CDC, versioning, transactions, temporal, columnar, lake, "
-        "cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run "
-        "writes a timestamped "
+        "cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and "
+        "end-to-end. Each run writes a timestamped "
         "JSON/TXT pair under `benchmarks/<suite>/`.\n"
     )
 

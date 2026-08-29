@@ -192,6 +192,8 @@ async fn create_test_state(
     let cdc_ingest_view_mgr = Arc::clone(&cdc_ingest_mgr_arc);
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog: Arc::clone(&catalog),
         wal: Arc::clone(&wal),

@@ -64,6 +64,7 @@ impl LakeFollowerWorker {
         catalog: Arc<Catalog>,
         peers: Arc<parking_lot::RwLock<Arc<PeerRegistry>>>,
         config: LakeFollowerConfig,
+        authority: crate::background::authority::WriteAuthority,
     ) -> Option<Self> {
         if !mode.runs_lake_tier() {
             return None;
@@ -76,6 +77,7 @@ impl LakeFollowerWorker {
             catalog,
             peers,
             config,
+            authority,
         ));
         info!("lake follower worker started");
         Some(Self {
@@ -103,12 +105,19 @@ async fn follower_loop(
     catalog: Arc<Catalog>,
     peers: Arc<parking_lot::RwLock<Arc<PeerRegistry>>>,
     config: LakeFollowerConfig,
+    authority: crate::background::authority::WriteAuthority,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs.max(1)));
     loop {
         ticker.tick().await;
         if shutdown.load(Ordering::Acquire) {
             break;
+        }
+        // A table this node's group replicates already receives its versions
+        // through consensus. Pulling them as well would put two writers on one
+        // log, which is the one thing the lake's single-writer rule forbids
+        if authority.in_group() {
+            continue;
         }
         for (table, peer_name, remote) in followed_tables(&catalog) {
             if shutdown.load(Ordering::Acquire) {

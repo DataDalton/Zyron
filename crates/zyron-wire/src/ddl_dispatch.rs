@@ -81,6 +81,11 @@ pub fn try_handle_ddl_utility<'a>(
             Box::pin(async move { Some(handle_show_clustering(s, server, session).await) })
         }
 
+        // -- Consensus group --
+        Statement::AlterCluster(s) => {
+            Box::pin(async move { Some(handle_alter_cluster(s, server).await) })
+        }
+
         // -- Node mesh --
         Statement::AlterTableFollow(s) => {
             Box::pin(async move { Some(handle_alter_table_follow(s, server, session).await) })
@@ -4120,6 +4125,42 @@ pub async fn contact_peer(server: &Arc<ServerState>, name: &str, address: &str) 
 }
 
 /// `DROP PEER [IF EXISTS] <name>`.
+/// `ALTER CLUSTER ADD NODE 'name' AT 'host:port'` and `REMOVE NODE 'name'`.
+///
+/// Membership is a replicated decision, so this goes through the log like any
+/// other write and only the leader accepts it. A node with no consensus group
+/// is told so rather than being given a silent success, because an operator
+/// who typed this expects a group to exist
+async fn handle_alter_cluster(
+    stmt: &zyron_parser::ast::AlterClusterStatement,
+    server: &Arc<ServerState>,
+) -> Result<DdlResult, ProtocolError> {
+    use zyron_parser::ast::AlterClusterOperation;
+
+    let Some(raft) = server.raft.as_ref() else {
+        return Err(ProtocolError::Database(ZyronError::ConfigError(
+            "this node is not part of a consensus group, so its membership cannot be changed"
+                .into(),
+        )));
+    };
+    match &stmt.operation {
+        AlterClusterOperation::AddNode { name, address } => {
+            let node_id = zyron_raft::node_id_for_name(name);
+            raft.add_node(node_id, address)
+                .await
+                .map_err(ProtocolError::Database)?;
+            Ok(DdlResult::Tag("ALTER CLUSTER".to_string()))
+        }
+        AlterClusterOperation::RemoveNode { name } => {
+            let node_id = zyron_raft::node_id_for_name(name);
+            raft.remove_node(node_id)
+                .await
+                .map_err(ProtocolError::Database)?;
+            Ok(DdlResult::Tag("ALTER CLUSTER".to_string()))
+        }
+    }
+}
+
 async fn handle_drop_peer(
     stmt: &zyron_parser::ast::DropPeerStatement,
     server: &Arc<ServerState>,
@@ -5793,7 +5834,7 @@ async fn handle_merge(
         return Ok(DdlResult::Tag("MERGE 0".to_string()));
     }
     let (db_id, search_path) = session_db_and_search_path(session);
-    execute_call_body(server, statements, Vec::new(), db_id, search_path).await?;
+    execute_call_body(server, statements, Vec::new(), db_id, search_path, true).await?;
     Ok(DdlResult::Tag("MERGE".to_string()))
 }
 
@@ -6011,7 +6052,7 @@ async fn handle_call(
         )))
     })?;
 
-    execute_call_body(server, body_stmts, params, db_id, search_path).await?;
+    execute_call_body(server, body_stmts, params, db_id, search_path, true).await?;
     Ok(DdlResult::Tag("CALL".to_string()))
 }
 
@@ -6131,7 +6172,7 @@ async fn handle_do_block(
     }
 
     let (db_id, search_path) = session_db_and_search_path(session);
-    execute_call_body(server, statements, Vec::new(), db_id, search_path).await?;
+    execute_call_body(server, statements, Vec::new(), db_id, search_path, true).await?;
     tracing::info!(
         target: "zyron::audit",
         event = "DoBlockExecuted",
@@ -6143,12 +6184,22 @@ async fn handle_do_block(
 /// Runs a procedure body's statements in one transaction with `params` bound as
 /// positional parameters. Commits when every statement succeeds, aborts on the
 /// first error so the body is atomic.
+///
+/// `through_group` decides how the transaction leaves a node in a consensus
+/// group. A body that runs once, on the node the client sent it to, captures
+/// its rows and agrees them with the group the way any other write does,
+/// which also makes a follower refuse it and name the leader. A body every
+/// node runs at the same applied position, an event handler fired by a
+/// replicated schema change, commits locally instead: capturing it would
+/// ship each node's own copy and a follower would hold the rows once per
+/// member
 async fn execute_call_body(
     server: &Arc<ServerState>,
     statements: Vec<zyron_parser::Statement>,
     params: Vec<zyron_executor::column::ScalarValue>,
     db_id: zyron_catalog::DatabaseId,
     search_path: Vec<String>,
+    through_group: bool,
 ) -> Result<(), ProtocolError> {
     use zyron_executor::context::ExecutionContext;
 
@@ -6157,6 +6208,11 @@ async fn execute_call_body(
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
     let txn_id = txn.txn_id;
+    let changeset = if through_group {
+        server.replication.as_ref().map(|r| r.changeset(txn_id))
+    } else {
+        None
+    };
 
     for stmt in statements {
         let plan = match zyron_planner::plan(
@@ -6201,20 +6257,70 @@ async fn execute_call_body(
             ctx.set_spatial_manager(Arc::clone(m));
         }
         ctx.params = params.clone();
+        ctx.replication = changeset.clone();
         let ctx = Arc::new(ctx);
 
         if let Err(e) = zyron_executor::execute(plan, &ctx).await {
             let _ = server.txn_manager.abort(&mut txn);
+            withdraw_streamed(server, changeset.as_deref());
             return Err(ProtocolError::Database(e));
         }
     }
 
-    server
-        .txn_manager
-        .commit(&mut txn)
-        .await
-        .map_err(ProtocolError::Database)?;
+    match (server.replication.as_ref(), changeset) {
+        (Some(router), Some(changeset)) => {
+            // The same order a connection's commit takes: lake versions are
+            // read into the changeset once everything is staged, and the
+            // transaction is agreed with the group before it becomes visible
+            if let Err(e) = router.capture_lake(txn_id, &changeset) {
+                let _ = server.txn_manager.abort(&mut txn);
+                withdraw_streamed(server, Some(&changeset));
+                return Err(ProtocolError::Database(e));
+            }
+            if changeset.is_dirty() {
+                router
+                    .commit(txn, changeset)
+                    .await
+                    .map_err(ProtocolError::Database)?;
+            } else if txn.wrote_data() {
+                server
+                    .txn_manager
+                    .commit(&mut txn)
+                    .await
+                    .map_err(ProtocolError::Database)?;
+            } else {
+                server
+                    .txn_manager
+                    .commit_read_only(&mut txn)
+                    .map_err(ProtocolError::Database)?;
+            }
+        }
+        _ => {
+            server
+                .txn_manager
+                .commit(&mut txn)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+    }
     Ok(())
+}
+
+/// Tells the group to discard a failed body's chunks, when any had already
+/// gone out
+fn withdraw_streamed(
+    server: &Arc<ServerState>,
+    changeset: Option<&zyron_executor::replication::TxnChangeset>,
+) {
+    let Some(changeset) = changeset else {
+        return;
+    };
+    if !changeset.has_streamed() {
+        return;
+    }
+    if let Some(router) = server.replication.as_ref() {
+        router.abort(changeset);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9473,7 +9579,9 @@ pub async fn fire_event(
             }
         };
         let (db_id, search_path) = session_db_and_search_path(&None);
-        if let Err(e) = execute_call_body(server, body_stmts, params, db_id, search_path).await {
+        if let Err(e) =
+            execute_call_body(server, body_stmts, params, db_id, search_path, false).await
+        {
             tracing::warn!(target: "zyron::events", handler = %handler.name, "event handler execution failed: {e:?}");
         }
     }

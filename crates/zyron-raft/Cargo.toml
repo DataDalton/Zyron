@@ -1,0 +1,17 @@
+[package]
+name = "zyron-raft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+crossbeam.workspace = true
+
+[dev-dependencies]
+mimalloc.workspace = true
+tempfile = "3.27"

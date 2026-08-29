@@ -44,11 +44,19 @@ impl MvRefreshWorker {
 
     /// Starts the MV refresh worker thread.
     pub fn start(config: MvRefreshConfig) -> Self {
-        Self::start_with_catalog(config, None)
+        Self::start_with_catalog(
+            config,
+            None,
+            crate::background::authority::WriteAuthority::alone(),
+        )
     }
 
     /// Starts the MV refresh worker thread with an optional Catalog reference.
-    pub fn start_with_catalog(config: MvRefreshConfig, catalog: Option<Arc<Catalog>>) -> Self {
+    pub fn start_with_catalog(
+        config: MvRefreshConfig,
+        catalog: Option<Arc<Catalog>>,
+        authority: crate::background::authority::WriteAuthority,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
 
@@ -59,7 +67,7 @@ impl MvRefreshWorker {
             .name("zyron-mv-refresh".into())
             .spawn(move || {
                 let _ = thread_waker.set(thread::current());
-                Self::refresh_loop(&config, &thread_shutdown, catalog.as_ref());
+                Self::refresh_loop(&config, &thread_shutdown, catalog.as_ref(), &authority);
             })
             .expect("failed to spawn MV refresh thread");
 
@@ -75,6 +83,7 @@ impl MvRefreshWorker {
         config: &MvRefreshConfig,
         shutdown: &AtomicBool,
         _catalog: Option<&Arc<Catalog>>,
+        authority: &crate::background::authority::WriteAuthority,
     ) {
         let interval = Duration::from_secs(config.interval_secs);
 
@@ -83,6 +92,13 @@ impl MvRefreshWorker {
 
             if shutdown.load(Ordering::Acquire) {
                 return;
+            }
+
+            // A refresh writes the view's rows, and nothing captures them
+            // for the rest of a group, so a member refreshes nothing rather
+            // than holding a view the others do not
+            if !authority.may_write() {
+                continue;
             }
 
             debug!("MV refresh check cycle completed");

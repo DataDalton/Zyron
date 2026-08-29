@@ -51,6 +51,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     let cdc_registry = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.clone()));
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

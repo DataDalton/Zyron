@@ -160,6 +160,8 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

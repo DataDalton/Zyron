@@ -1450,13 +1450,14 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_alter_user(),
             Token::Keyword(Keyword::Role) => self.parse_alter_role(),
             Token::Keyword(Keyword::System) => self.parse_alter_system(),
+            Token::Keyword(Keyword::Cluster) => self.parse_alter_cluster(),
             Token::Keyword(Keyword::Publication) => self.parse_alter_publication(),
             Token::Keyword(Keyword::Streaming) => self.parse_alter_streaming_job(),
             Token::Keyword(Keyword::External) => self.parse_alter_external(),
             Token::Keyword(Keyword::Endpoint) => self.parse_alter_endpoint(),
             Token::Keyword(Keyword::Security) => self.parse_alter_security_map(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, STREAMING, ENDPOINT, SECURITY, or PUBLICATION after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, CLUSTER, STREAMING, ENDPOINT, SECURITY, or PUBLICATION after ALTER, found {}",
                 self.current.token
             ))),
         }
@@ -1471,6 +1472,35 @@ impl<'a> Parser<'a> {
         Ok(Statement::AlterSystemSet(Box::new(
             AlterSystemSetStatement { name, value },
         )))
+    }
+
+    /// ALTER CLUSTER ADD NODE 'name' AT 'host:port'
+    /// ALTER CLUSTER REMOVE NODE 'name'
+    ///
+    /// REMOVE is matched as a soft keyword, so a column or table called
+    /// `remove` keeps working everywhere else
+    fn parse_alter_cluster(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Cluster)?;
+        let operation = if self.consume_keyword(Keyword::Add)? {
+            self.expect_keyword(Keyword::Node)?;
+            let name = self.parse_string_literal()?;
+            self.expect_keyword(Keyword::At)?;
+            let address = self.parse_string_literal()?;
+            AlterClusterOperation::AddNode { name, address }
+        } else if self.at_ident_ignore_case("remove") {
+            self.advance()?;
+            self.expect_keyword(Keyword::Node)?;
+            let name = self.parse_string_literal()?;
+            AlterClusterOperation::RemoveNode { name }
+        } else {
+            return Err(self.error(&format!(
+                "Expected ADD or REMOVE after ALTER CLUSTER, found {}",
+                self.current.token
+            )));
+        };
+        Ok(Statement::AlterCluster(Box::new(AlterClusterStatement {
+            operation,
+        })))
     }
 
     fn parse_alter_table(&mut self) -> Result<Statement> {
@@ -14852,5 +14882,46 @@ mod tests {
             }
             _ => panic!("expected Function"),
         }
+    }
+
+    #[test]
+    fn test_alter_cluster_add_node() {
+        let stmt = parse_one("ALTER CLUSTER ADD NODE 'node-3' AT 'host3:5434'");
+        match stmt {
+            Statement::AlterCluster(s) => match s.operation {
+                AlterClusterOperation::AddNode { name, address } => {
+                    assert_eq!(name, "node-3");
+                    assert_eq!(address, "host3:5434");
+                }
+                other => panic!("expected AddNode, got {other:?}"),
+            },
+            other => panic!("expected AlterCluster, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_alter_cluster_remove_node() {
+        let stmt = parse_one("ALTER CLUSTER REMOVE NODE 'node-3'");
+        match stmt {
+            Statement::AlterCluster(s) => match s.operation {
+                AlterClusterOperation::RemoveNode { name } => assert_eq!(name, "node-3"),
+                other => panic!("expected RemoveNode, got {other:?}"),
+            },
+            other => panic!("expected AlterCluster, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_alter_cluster_needs_add_or_remove() {
+        let mut parser = Parser::new("ALTER CLUSTER DROP NODE 'node-3'").expect("lex");
+        assert!(parser.parse_statement().is_err());
+    }
+
+    #[test]
+    fn test_remove_is_still_usable_as_an_identifier() {
+        // REMOVE is matched as a soft keyword, so a column called remove keeps
+        // working
+        let stmt = parse_one("SELECT remove FROM t");
+        assert!(matches!(stmt, Statement::Select(_)));
     }
 }

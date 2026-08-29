@@ -551,6 +551,13 @@ pub(crate) async fn check_unique_constraints(
     index_snap: &zyron_catalog::TableIndexSnapshot,
     exclude_locators: &[zyron_common::RowLocator],
 ) -> zyron_common::Result<()> {
+    // A decision the leader already made is not remade here. Re-running it
+    // could reject a row the group has agreed on, which would leave this node
+    // holding a different table from every other one
+    if ctx.replication_apply {
+        return Ok(());
+    }
+
     if index_snap.btree.is_empty() {
         return Ok(());
     }
@@ -2036,11 +2043,20 @@ pub(crate) fn enforce_not_null(
 /// row that violates the type it was declared with should be named by that
 /// rule rather than by whichever CHECK happens to trip on it.
 pub(crate) fn enforce_check_constraints(
+    ctx: &ExecutionContext,
     checks: &[zyron_planner::binder::BoundExpr],
     batch: &DataBatch,
     table_columns: &[zyron_catalog::ColumnEntry],
     params: &[crate::column::ScalarValue],
 ) -> zyron_common::Result<()> {
+    // A decision the leader already made is not remade here. Re-running it
+    // could reject a row the group has agreed on, and a CHECK over a volatile
+    // function can genuinely answer differently on two machines. The value
+    // rules below it are the leader's too: the row image being replayed is the
+    // one it accepted
+    if ctx.replication_apply {
+        return Ok(());
+    }
     enforce_not_null(batch, table_columns)?;
     enforce_vector_dimensions(batch, table_columns)?;
     enforce_declared_lengths(batch, table_columns)?;
@@ -2324,6 +2340,7 @@ impl Operator for InsertOperator {
                 // Enforce CHECK constraints on the full-width row image before
                 // any write so a violation aborts the statement with no effect.
                 enforce_check_constraints(
+                    &self.ctx,
                     &self.check_constraints,
                     &exec_batch.batch,
                     &table_entry.columns,
@@ -2649,6 +2666,10 @@ impl Operator for InsertOperator {
                 );
                 #[cfg(feature = "profile")]
                 drop(_idx_span);
+
+                // Record the rows for the consensus group, when this node
+                // leads one
+                crate::replication::capture_insert(&self.ctx, &table_entry, &exec_batch.batch)?;
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
@@ -3013,6 +3034,13 @@ pub(crate) fn maintain_lake_search_indexes(
     partition_id: u64,
     order: &[usize],
 ) -> zyron_common::Result<()> {
+    // A decision the leader already made is not remade here. Re-running it
+    // could reject a row the group has agreed on, which would leave this node
+    // holding a different table from every other one
+    if ctx.replication_apply {
+        return Ok(());
+    }
+
     let index_snap = ctx.index_snapshot_for_table(table_entry.id.0);
     let fts_resolved: Vec<(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)> =
         if index_snap.fts.is_empty() {
@@ -3479,6 +3507,10 @@ impl Operator for DeleteOperator {
                     )
                     .await?;
 
+                    // Record the rows for the consensus group, when this node
+                    // leads one
+                    crate::replication::capture_delete(&self.ctx, &te, &exec_batch.batch)?;
+
                     // Notify CDC hook if present.
                     if let Some(ref hook) = self.ctx.cdc_hook {
                         if let Some(ref old_tuples) = old_tuples_for_cdc {
@@ -3713,6 +3745,13 @@ impl Operator for DeleteOperator {
                             }
                         }
                     }
+                }
+
+                // Record the rows for the consensus group, when this node
+                // leads one
+                {
+                    let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                    crate::replication::capture_delete(&self.ctx, &table_entry, &exec_batch.batch)?;
                 }
 
                 // Notify CDC hook if present.
@@ -3988,6 +4027,7 @@ impl Operator for UpdateOperator {
                     normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
                     normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
                     enforce_check_constraints(
+                        &self.ctx,
                         &self.check_constraints,
                         &updated_batch,
                         &table_entry.columns,
@@ -4217,6 +4257,15 @@ impl Operator for UpdateOperator {
                     )
                     .await?;
 
+                    // Record the rows for the consensus group, when this node
+                    // leads one
+                    crate::replication::capture_update(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                        &updated_batch,
+                    )?;
+
                     // Notify CDC hook if present.
                     if let Some(ref hook) = self.ctx.cdc_hook {
                         let old_tuples =
@@ -4318,6 +4367,7 @@ impl Operator for UpdateOperator {
                 // Enforce CHECK constraints on the updated row image before any
                 // write so a violating update aborts with no effect.
                 enforce_check_constraints(
+                    &self.ctx,
                     &self.check_constraints,
                     &updated_batch,
                     &table_entry.columns,
@@ -4626,6 +4676,15 @@ impl Operator for UpdateOperator {
                     crate::operator::fk::FkPhase::AfterWrite,
                 )
                 .await?;
+
+                // Record the rows for the consensus group, when this node
+                // leads one
+                crate::replication::capture_update(
+                    &self.ctx,
+                    &table_entry,
+                    &exec_batch.batch,
+                    &updated_batch,
+                )?;
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {

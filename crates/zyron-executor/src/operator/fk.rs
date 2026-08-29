@@ -822,6 +822,13 @@ pub async fn enforce_parent_delete(
     old_batch: &DataBatch,
     phase: FkPhase,
 ) -> Result<()> {
+    // A decision the leader already made is not remade here. Re-running it
+    // could reject a row the group has agreed on, which would leave this node
+    // holding a different table from every other one
+    if ctx.replication_apply {
+        return Ok(());
+    }
+
     let referencing = ctx.catalog.referencing_constraints(parent.id);
     if referencing.is_empty() {
         return Ok(());
@@ -1164,6 +1171,13 @@ pub async fn enforce_parent_update(
     new_batch: &DataBatch,
     phase: FkPhase,
 ) -> Result<()> {
+    // A decision the leader already made is not remade here. Re-running it
+    // could reject a row the group has agreed on, which would leave this node
+    // holding a different table from every other one
+    if ctx.replication_apply {
+        return Ok(());
+    }
+
     let referencing = ctx.catalog.referencing_constraints(parent.id);
     if referencing.is_empty() {
         return Ok(());

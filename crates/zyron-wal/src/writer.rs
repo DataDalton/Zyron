@@ -22,6 +22,85 @@ use std::thread::JoinHandle;
 use zyron_common::profile::{self, Phase};
 use zyron_common::{Result, ZyronError};
 
+/// index 8, floor 8, origin node 8, origin epoch 8, origin txn 8
+pub const AGREED_COMMIT_LEN: usize = 40;
+
+/// The consensus stamp a group-agreed commit record carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgreedCommit {
+    /// The log entry that completed the transaction, which is where this
+    /// node's applied position stood the moment the commit was recorded
+    pub index: u64,
+    /// The highest entry index below which nothing needs replay.
+    ///
+    /// Not always `index`: a transaction streamed across several entries is
+    /// staged as its chunks arrive and committed at its last one, so a
+    /// still-open one at the moment this commit was recorded pins the floor
+    /// at the entry before its first chunk. Replay after a crash starts past
+    /// the floor, which is what brings a lost staged transaction back whole
+    pub floor: u64,
+    /// The node that originated the transaction
+    pub origin_node: u64,
+    /// Which life of that node
+    pub origin_epoch: u64,
+    /// The transaction id it carried there
+    pub origin_txn: u64,
+}
+
+impl AgreedCommit {
+    fn encode(&self, out: &mut [u8; AGREED_COMMIT_LEN]) {
+        out[0..8].copy_from_slice(&self.index.to_le_bytes());
+        out[8..16].copy_from_slice(&self.floor.to_le_bytes());
+        out[16..24].copy_from_slice(&self.origin_node.to_le_bytes());
+        out[24..32].copy_from_slice(&self.origin_epoch.to_le_bytes());
+        out[32..40].copy_from_slice(&self.origin_txn.to_le_bytes());
+    }
+
+    fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < AGREED_COMMIT_LEN {
+            return None;
+        }
+        let u = |at: usize| {
+            u64::from_le_bytes([
+                payload[at],
+                payload[at + 1],
+                payload[at + 2],
+                payload[at + 3],
+                payload[at + 4],
+                payload[at + 5],
+                payload[at + 6],
+                payload[at + 7],
+            ])
+        };
+        Some(Self {
+            index: u(0),
+            floor: u(8),
+            origin_node: u(16),
+            origin_epoch: u(24),
+            origin_txn: u(32),
+        })
+    }
+}
+
+/// One agreed commit read back at recovery, with where its record sits.
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveredCommit {
+    pub stamp: AgreedCommit,
+    /// The record's position, which seeds the retention pin so a checkpoint
+    /// does not reclaim the record while a restart could still need it
+    pub lsn: Lsn,
+}
+
+/// Where a restarted member of a consensus group resumes.
+#[derive(Debug, Clone)]
+pub struct ReplayState {
+    /// Replay starts at the entry after this
+    pub floor: u64,
+    /// Transactions already committed here whose entries sit above the floor,
+    /// so replay must pass over them rather than stage them again
+    pub committed: Vec<RecoveredCommit>,
+}
+
 /// Atomic state machine for coordinating segment rotation between append() and the flush thread.
 ///
 /// Packs state into a single AtomicU64:
@@ -213,7 +292,7 @@ pub struct WalWriter {
     pub wal_syncs: Arc<AtomicU64>,
     /// Retention hook that returns the minimum LSN that must be retained.
     /// Used by replication slots to prevent WAL segment deletion.
-    retention_hook: parking_lot::RwLock<Option<Arc<dyn Fn() -> Option<Lsn> + Send + Sync>>>,
+    retention_hooks: parking_lot::RwLock<Vec<Arc<dyn Fn() -> Option<Lsn> + Send + Sync>>>,
     /// Called by the flush thread after each flush so an async durability
     /// waiter can be woken without this crate depending on an async runtime.
     /// Set once via register_flush_waker.
@@ -321,7 +400,7 @@ impl WalWriter {
             rotation,
             flush_io_error,
             wal_syncs,
-            retention_hook: parking_lot::RwLock::new(None),
+            retention_hooks: parking_lot::RwLock::new(Vec::new()),
             durable_waker,
             notifier,
             notifier_thread: Mutex::new(Some(notifier_thread)),
@@ -1139,10 +1218,13 @@ impl WalWriter {
         &self.config.wal_dir
     }
 
-    /// Sets a retention hook that returns the minimum LSN that must be retained.
-    /// Used by replication slots to prevent WAL segment deletion.
-    pub fn set_retention_hook(&self, hook: Arc<dyn Fn() -> Option<Lsn> + Send + Sync>) {
-        *self.retention_hook.write() = Some(hook);
+    /// Adds a retention hook that returns the minimum LSN that must be
+    /// retained. Segment cleanup keeps everything at or above the lowest
+    /// answer any hook gives. One pins segments for the columnar fold
+    /// registry, one pins the agreed-commit records a consensus member's
+    /// restart replays from
+    pub fn add_retention_hook(&self, hook: Arc<dyn Fn() -> Option<Lsn> + Send + Sync>) {
+        self.retention_hooks.write().push(hook);
     }
 
     /// Deletes WAL segment files whose records are fully covered by a checkpoint.
@@ -1155,19 +1237,15 @@ impl WalWriter {
     pub fn cleanup_old_segments(&self, checkpoint_lsn: Lsn) -> Result<usize> {
         let checkpoint_segment_id = checkpoint_lsn.segment_id();
 
-        // Respect replication slot retention: do not delete segments
-        // that any active slot still needs.
-        // Clone the Arc out of the Mutex so the lock is not held during the hook call.
-        let hook_fn = self.retention_hook.read().clone();
-        let effective_segment_id = if let Some(ref hook_fn) = hook_fn {
-            if let Some(min_lsn) = hook_fn() {
-                checkpoint_segment_id.min(min_lsn.segment_id())
-            } else {
-                checkpoint_segment_id
+        // Every hook pins whatever it still needs, and cleanup respects the
+        // lowest. The hooks are cloned out so no lock is held while they run
+        let hooks: Vec<_> = self.retention_hooks.read().clone();
+        let mut effective_segment_id = checkpoint_segment_id;
+        for hook in &hooks {
+            if let Some(min_lsn) = hook() {
+                effective_segment_id = effective_segment_id.min(min_lsn.segment_id());
             }
-        } else {
-            checkpoint_segment_id
-        };
+        }
 
         let mut deleted = 0;
 
@@ -1274,6 +1352,74 @@ impl WalWriter {
     #[inline]
     pub fn log_commit(&self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
         self.append(txn_id, prev_lsn, LogRecordType::Commit, 0, &[])
+    }
+
+    /// Logs a transaction commit that a consensus group agreed to.
+    ///
+    /// The stamp rides in the commit record rather than beside it because the
+    /// two have to be durable together or not at all. A node that recorded
+    /// having applied index N in one place and lost the commit for N in
+    /// another would come back up believing it holds a transaction it does
+    /// not, and would never replay it
+    #[inline]
+    pub fn log_commit_agreed(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        stamp: &AgreedCommit,
+    ) -> Result<Lsn> {
+        let mut payload = [0u8; AGREED_COMMIT_LEN];
+        stamp.encode(&mut payload);
+        self.append(txn_id, prev_lsn, LogRecordType::Commit, 0, &payload)
+    }
+
+    /// The consensus stamp a commit record carries, or None for a commit that
+    /// reached no group
+    #[inline]
+    pub fn agreed_commit_of(payload: &[u8]) -> Option<AgreedCommit> {
+        AgreedCommit::decode(payload)
+    }
+
+    /// What a restarted member of a consensus group has to know before it
+    /// replays: where replay starts, and which transactions it must not
+    /// commit a second time.
+    ///
+    /// Read from the same records that decide which transactions committed,
+    /// so the two can never disagree. The floor is the highest one any commit
+    /// recorded, which is exact because commits happen in log order and each
+    /// records the floor that was true at its own moment. The committed set
+    /// is every agreed transaction whose own entry sits above that floor,
+    /// because replay will pass its entries again and staging them again
+    /// would double its rows.
+    ///
+    /// Scans once, at startup, before the node serves anything
+    pub fn recover_replay_state(&self) -> Result<ReplayState> {
+        let reader = crate::reader::WalReader::new(&self.config.wal_dir)?;
+        let mut floor = 0u64;
+        let mut commits: Vec<RecoveredCommit> = Vec::new();
+        for record in reader.scan_all_trusted() {
+            if record.record_type != LogRecordType::Commit {
+                continue;
+            }
+            let Some(stamp) = Self::agreed_commit_of(&record.payload) else {
+                continue;
+            };
+            floor = floor.max(stamp.floor);
+            commits.push(RecoveredCommit {
+                stamp,
+                lsn: record.lsn,
+            });
+            // Anything at or below the floor will never be replayed, so it is
+            // dropped as the scan goes rather than held for the whole log
+            if commits.len() >= 65_536 {
+                commits.retain(|c| c.stamp.index > floor);
+            }
+        }
+        commits.retain(|c| c.stamp.index > floor);
+        Ok(ReplayState {
+            floor,
+            committed: commits,
+        })
     }
 
     /// Logs a transaction abort.
@@ -1759,6 +1905,106 @@ mod tests {
         // room
         writer.wait_for_flush(last).unwrap();
         assert!(writer.flushed_lsn() >= last);
+    }
+
+    /// The stamp a group-agreed commit carries has to come back exactly,
+    /// because replay position, floor and origin all live in it
+    #[test]
+    fn an_agreed_commit_stamp_round_trips() {
+        let stamp = AgreedCommit {
+            index: 120,
+            floor: 94,
+            origin_node: 7,
+            origin_epoch: 3,
+            origin_txn: 42,
+        };
+        let mut payload = [0u8; AGREED_COMMIT_LEN];
+        stamp.encode(&mut payload);
+        assert_eq!(WalWriter::agreed_commit_of(&payload), Some(stamp));
+        // A record from a commit that reached no group carries no stamp
+        assert_eq!(WalWriter::agreed_commit_of(&[]), None);
+        assert_eq!(WalWriter::agreed_commit_of(&payload[..24]), None);
+    }
+
+    /// Recovery takes the highest recorded floor and keeps exactly the
+    /// commits whose own entries sit above it, because replay will pass
+    /// those entries again and must not stage them twice
+    #[test]
+    fn replay_state_recovers_the_floor_and_the_committed_set() {
+        let (writer, _dir) = create_test_writer();
+        let origin = |txn: u64| AgreedCommit {
+            index: 0,
+            floor: 0,
+            origin_node: 1,
+            origin_epoch: 9,
+            origin_txn: txn,
+        };
+
+        // A commit at 100 while a streamed transaction that started at 95 was
+        // still open, then that transaction's own commit at 103 with nothing
+        // open behind it
+        let a = writer
+            .log_commit_agreed(
+                11,
+                Lsn::INVALID,
+                &AgreedCommit {
+                    index: 100,
+                    floor: 94,
+                    ..origin(11)
+                },
+            )
+            .unwrap();
+        writer.wait_for_flush(a).unwrap();
+        let b = writer
+            .log_commit_agreed(
+                12,
+                Lsn::INVALID,
+                &AgreedCommit {
+                    index: 103,
+                    floor: 103,
+                    ..origin(12)
+                },
+            )
+            .unwrap();
+        writer.wait_for_flush(b).unwrap();
+        // An ordinary local commit sits between them and carries no stamp
+        let c = writer.log_commit(13, Lsn::INVALID).unwrap();
+        writer.wait_for_flush(c).unwrap();
+
+        let state = writer.recover_replay_state().unwrap();
+        assert_eq!(state.floor, 103);
+        // Both agreed commits sit at or below the floor, so nothing needs
+        // skipping on replay
+        assert!(state.committed.is_empty());
+    }
+
+    /// A crash before the streamed transaction commits leaves the earlier
+    /// commit's floor in force, and that commit itself is above it, so replay
+    /// has to know to pass over it
+    #[test]
+    fn a_commit_above_the_floor_is_reported_for_skipping() {
+        let (writer, _dir) = create_test_writer();
+        let lsn = writer
+            .log_commit_agreed(
+                11,
+                Lsn::INVALID,
+                &AgreedCommit {
+                    index: 100,
+                    floor: 94,
+                    origin_node: 1,
+                    origin_epoch: 9,
+                    origin_txn: 11,
+                },
+            )
+            .unwrap();
+        writer.wait_for_flush(lsn).unwrap();
+
+        let state = writer.recover_replay_state().unwrap();
+        assert_eq!(state.floor, 94);
+        assert_eq!(state.committed.len(), 1);
+        assert_eq!(state.committed[0].stamp.index, 100);
+        assert_eq!(state.committed[0].stamp.origin_txn, 11);
+        assert!(state.committed[0].lsn.is_valid());
     }
 
     #[test]

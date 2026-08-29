@@ -67,7 +67,292 @@ pub trait ColumnarMaintenance: Send + Sync {
 }
 
 /// Shared server state passed to every connection.
+/// How a write reaches the consensus group.
+///
+/// Declared here and implemented above, because the pieces it needs, the
+/// consensus node, the proposer and the applier, all live in a crate that
+/// depends on this one. A connection holds one of these or none, and none is
+/// exactly the single-node behaviour
+pub trait ReplicationRouter: Send + Sync {
+    /// A changeset for one transaction to accumulate into
+    fn changeset(&self, txn_id: u64) -> Arc<zyron_executor::replication::TxnChangeset>;
+
+    /// Records the lake versions a transaction staged, before they publish
+    fn capture_lake(
+        &self,
+        txn_id: u64,
+        changeset: &zyron_executor::replication::TxnChangeset,
+    ) -> Result<(), ZyronError>;
+
+    /// Seals the changeset, agrees it with the group, and returns once the
+    /// applier has committed the transaction locally
+    fn commit<'a>(
+        &'a self,
+        txn: zyron_storage::txn::Transaction,
+        changeset: Arc<zyron_executor::replication::TxnChangeset>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<zyron_storage::txn::Transaction, ZyronError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Tells the group to discard a transaction whose chunks already went out
+    fn abort(&self, changeset: &zyron_executor::replication::TxnChangeset);
+
+    /// Puts a schema change to the group and waits for this node's turn.
+    ///
+    /// Answers with the channel to report the outcome on. The caller runs the
+    /// statement when it answers and reports back, which is what keeps the
+    /// reply the client is waiting for on the connection that asked while the
+    /// order the change happens in is still the group's
+    fn begin_statement<'a>(
+        &'a self,
+        sql: &'a str,
+        context: &'a zyron_executor::replication::StatementContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        tokio::sync::oneshot::Sender<Result<(), ZyronError>>,
+                        ZyronError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+}
+
+/// How a statement reaches the rest of a consensus group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationClass {
+    /// The rows it writes are captured and replicated. Statements whose
+    /// results depend on when and where they run are all here: `now()`,
+    /// `random()` and a sequence draw answer differently on two machines, so
+    /// what travels is what the statement produced rather than the statement
+    Rows,
+    /// The statement itself is replicated and every node runs it.
+    ///
+    /// Only catalog work qualifies. It is deterministic given the same catalog
+    /// state, it moves no rows, and running it on each node is what puts the
+    /// files and indexes it describes where they have to be
+    Statement,
+    /// Runs here and nowhere else. Reads, session state, and physical work
+    /// whose effect on the data is nil: a vacuum, a checkpoint, a reindex.
+    /// Each node decides these for itself, and vacuum in particular must,
+    /// because the oldest snapshot it may reclaim behind is its own
+    Local,
+    /// Not yet safe to run in a group.
+    ///
+    /// These move rows through paths that neither capture them nor replay
+    /// deterministically. Refusing is the only honest answer: running one
+    /// would leave this node holding data no other node has, and nothing
+    /// later would notice
+    Unsupported,
+}
+
+/// Decides how a statement reaches the group.
+///
+/// Written as an allowlist with an explicit refusal at the end rather than as
+/// a rule with exceptions, because the failure mode of a wrong guess here is
+/// two nodes holding different data and no error anywhere
+pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
+    use ReplicationClass::{Local, Rows, Statement as AsStatement, Unsupported};
+    use zyron_parser::Statement as S;
+    match stmt {
+        // Rows the DML operators capture on the way past
+        S::Insert(_)
+        | S::Update(_)
+        | S::Delete(_)
+        | S::Merge(_)
+        | S::Copy(_)
+        | S::Call(_)
+        | S::DoBlock(_) => Rows,
+
+        // Catalog work
+        S::CreateTable(_)
+        | S::DropTable(_)
+        | S::AlterTable(_)
+        | S::AlterTableTtl(_)
+        | S::AlterTableOptions(_)
+        | S::AlterTableSetUsing(_)
+        | S::AlterTableClusterBy(_)
+        | S::AlterTableClusteringSchedule(_)
+        | S::AlterColumnClassification(_)
+        | S::AlterTableFollow(_)
+        | S::AlterTableMove(_)
+        | S::CreateIndex(_)
+        | S::DropIndex(_)
+        | S::AlterIndex(_)
+        | S::CreateFulltextIndex(_)
+        | S::CreateVectorIndex(_)
+        | S::CreateSpatialIndex(_)
+        | S::CreateView(_)
+        | S::DropView(_)
+        | S::AlterView(_)
+        | S::CreateMaterializedView(_)
+        | S::DropMaterializedView(_)
+        | S::CreateSchema(_)
+        | S::DropSchema(_)
+        | S::CreateSequence(_)
+        | S::DropSequence(_)
+        | S::AlterSequence(_)
+        | S::Truncate(_)
+        | S::CommentOn(_)
+        | S::Grant(_)
+        | S::Revoke(_)
+        | S::CreateUser(_)
+        | S::AlterUser(_)
+        | S::DropUser(_)
+        | S::CreateRole(_)
+        | S::AlterRole(_)
+        | S::DropRole(_)
+        | S::CreateSchedule(_)
+        | S::DropSchedule(_)
+        | S::PauseSchedule(_)
+        | S::ResumeSchedule(_)
+        | S::CreatePipeline(_)
+        | S::DropPipeline(_)
+        | S::AddExpectation(_)
+        | S::DropExpectation(_)
+        | S::EnableFeature(_)
+        | S::DisableFeature(_)
+        | S::CreateFeatureGroup(_)
+        | S::DropFeatureGroup(_)
+        | S::CreateModel(_)
+        | S::DropModel(_)
+        | S::CreatePeer(_)
+        | S::DropPeer(_)
+        | S::CreateForeignTable(_)
+        | S::DropForeignTable(_)
+        | S::CreateBranch(_)
+        | S::DropBranch(_)
+        | S::CreateVersion(_)
+        | S::DropVersion(_)
+        | S::CreateReplicationSlot(_)
+        | S::DropReplicationSlot(_)
+        | S::CreateCdcStream(_)
+        | S::DropCdcStream(_)
+        | S::CreateCdcIngest(_)
+        | S::DropCdcIngest(_)
+        | S::DropStreamingJob(_)
+        | S::AlterStreamingJob(_)
+        | S::CreatePublication(_)
+        | S::AlterPublication(_)
+        | S::DropPublication(_)
+        | S::CreateTrigger(_)
+        | S::DropTrigger(_)
+        | S::CreateFunction(_)
+        | S::DropFunction(_)
+        | S::CreateAggregate(_)
+        | S::DropAggregate(_)
+        | S::CreateProcedure(_)
+        | S::DropProcedure(_)
+        | S::CreateEventHandler(_)
+        | S::LegalHold(_) => AsStatement,
+
+        // Reads, session state, and per-node physical work
+        S::Select(_)
+        | S::Explain(_)
+        | S::Show(_)
+        | S::SetVariable(_)
+        | S::Begin(_)
+        | S::Commit(_)
+        | S::Rollback(_)
+        | S::Savepoint(_)
+        | S::ReleaseSavepoint(_)
+        | S::DeclareCursor(_)
+        | S::FetchCursor(_)
+        | S::CloseCursor(_)
+        | S::Prepare(_)
+        | S::Execute(_)
+        | S::Deallocate(_)
+        | S::Listen(_)
+        | S::Notify(_)
+        | S::ValuesQuery(_)
+        | S::Vacuum(_)
+        | S::Reindex(_)
+        | S::Checkpoint(_)
+        | S::Analyze(_)
+        | S::OptimizeTable(_)
+        | S::AlterSystemSet(_)
+        | S::UseBranch(_)
+        | S::AlterCluster(_) => Local,
+
+        // Everything else moves rows through a path that neither captures
+        // them nor replays the same way twice. CREATE STREAMING JOB sits here
+        // rather than with the catalog work because the job starts writing
+        // its sink table the moment it is created, straight through the heap
+        // with nothing capturing the rows, and running one per node writes
+        // each node a sink of its own
+        _ => Unsupported,
+    }
+}
+
+/// Tells the applier how the schema change it handed over went.
+///
+/// A statement the group agreed and this node then refused, because the table
+/// already exists or the name is not there, is refused on every node for the
+/// same reason and leaves them all in the same state. That is an answer, not a
+/// failure, and it goes back as one so the applier carries on.
+///
+/// A statement the dispatcher does not handle at all is different: the group
+/// agreed to it and only this node would skip it, so it is reported as the
+/// defect it is rather than passed over
+fn report_turn(
+    turn: Option<StatementTurn>,
+    handled: Option<Result<crate::ddl_dispatch::DdlResult, ProtocolError>>,
+) -> Option<Result<crate::ddl_dispatch::DdlResult, ProtocolError>> {
+    let Some(turn) = turn else {
+        return handled;
+    };
+    match handled {
+        Some(result) => {
+            turn.finish(match &result {
+                Ok(_) => Ok(()),
+                Err(e) => Err(ZyronError::Internal(e.to_string())),
+            });
+            Some(result)
+        }
+        None => {
+            let reason = ZyronError::Internal(
+                "a statement the group agreed to was not carried out by this node".to_string(),
+            );
+            turn.finish(Err(ZyronError::Internal(reason.to_string())));
+            Some(Err(ProtocolError::Database(reason)))
+        }
+    }
+}
+
+/// This node's turn to run a schema change the group has agreed.
+///
+/// Dropped without an answer when the connection gives up, which the applier
+/// takes as its cue to run the statement itself so this node does not end up
+/// the only one without it
+pub struct StatementTurn {
+    done: tokio::sync::oneshot::Sender<Result<(), ZyronError>>,
+}
+
+impl StatementTurn {
+    /// Reports how the statement went, so the applier can move on
+    pub fn finish(self, outcome: Result<(), ZyronError>) {
+        let _ = self.done.send(outcome);
+    }
+}
+
 pub struct ServerState {
+    /// The consensus group this node belongs to, when it runs in one.
+    ///
+    /// `None` on a single node deployment, and every consensus check reads it
+    /// as "this node decides for itself", so a node with no group behaves
+    /// exactly as it did before there was one
+    pub raft: Option<Arc<zyron_raft::RaftNode>>,
+    /// What a write goes through on a node that leads a group: the changeset
+    /// it accumulates into, the proposer it reaches the log by, and the
+    /// applier that finishes its commit. None on a node outside a group, and
+    /// every write path tests exactly this one option
+    pub replication: Option<Arc<dyn ReplicationRouter>>,
     pub catalog: Arc<Catalog>,
     pub wal: Arc<WalWriter>,
     pub buffer_pool: Arc<BufferPool>,
@@ -338,6 +623,112 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// Refuses a write on a node that does not lead its consensus group.
+    ///
+    /// The error names the leader, so a client redirects rather than polls. A
+    /// node outside a group passes everything, which is what makes consensus
+    /// an addition rather than a mode
+    pub fn check_write_allowed(&self, stmt: &zyron_parser::Statement) -> Result<(), ZyronError> {
+        let Some(raft) = self.raft.as_ref() else {
+            return Ok(());
+        };
+        if !is_write_statement(stmt) || raft.is_leader() {
+            return Ok(());
+        }
+        Err(ZyronError::NotLeader {
+            leader: raft.leader_id(),
+        })
+    }
+
+    /// Establishes the point a follower must have applied to before a read of
+    /// its local state reflects everything committed before the call.
+    ///
+    /// One round trip to the leader, then a wait for this node's own apply to
+    /// reach the index it named. That is a linearizable read served locally,
+    /// which is the whole reason a follower is worth reading from: the data
+    /// does not move, only the watermark does.
+    ///
+    /// A leader answers from its own lease when it has one, so this costs it
+    /// nothing at all
+    pub async fn read_index_if_follower(&self) -> Result<(), ZyronError> {
+        let Some(raft) = self.raft.as_ref() else {
+            return Ok(());
+        };
+        raft.linearizable_read_index().await.map(|_| ())
+    }
+
+    /// Whether this node may start work that produces changes outside a
+    /// replicated connection.
+    ///
+    /// A node outside a group decides everything for itself. A member of a
+    /// group answers no even while it leads, because the work asking runs
+    /// through contexts that carry no replication changeset: rows it ingested
+    /// or rewrote would exist on this node alone, and nothing anywhere would
+    /// report the divergence. This becomes a leadership question again when
+    /// that work captures what it writes
+    #[inline]
+    pub fn may_produce_changes(&self) -> bool {
+        self.raft.is_none()
+    }
+
+    /// A context for work that is replaying what the group agreed.
+    ///
+    /// Every server-wide registry a statement's context carries, because a
+    /// replayed write maintains the same indexes, writes the same log and
+    /// feeds the same change feed as the write that produced it. What it does
+    /// not carry is anything belonging to a session: there is no user here,
+    /// no search path and no branch, because the leader resolved all of that
+    /// before the rows were decided.
+    ///
+    /// `replication_apply` turns off the deciding. Constraints, foreign keys,
+    /// checks and triggers all ran on the leader, and the group has agreed
+    /// their outcome
+    pub fn apply_context(&self, txn_id: u64, snapshot: Snapshot) -> ExecutionContext {
+        let mut ctx = self.statement_context(txn_id, snapshot);
+        ctx.replication_apply = true;
+        ctx
+    }
+
+    /// A context carrying every registry the server owns, and nothing that
+    /// belongs to a session.
+    ///
+    /// The registries are not an optimisation. `heap_files` in particular is
+    /// what lets consecutive single row inserts land on the same page: a
+    /// context without it builds a fresh `HeapFile` whose insertion shards are
+    /// empty, so every statement allocates a page of its own
+    pub fn statement_context(&self, txn_id: u64, snapshot: Snapshot) -> ExecutionContext {
+        let mut ctx = ExecutionContext::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.wal),
+            Arc::clone(&self.buffer_pool),
+            Arc::clone(&self.disk_manager),
+            txn_id,
+            snapshot,
+        );
+        ctx.heap_files = Some(Arc::clone(&self.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&self.btree_indexes));
+        ctx.foreign_reader = self.foreign_reader.clone();
+        ctx.peers = Some(Arc::clone(&self.peers));
+        ctx.intent_locks = Some(Arc::clone(self.txn_manager.intent_locks()));
+        ctx.row_locks = Some(Arc::clone(self.txn_manager.lock_table()));
+        ctx.doc_registry = Some(Arc::clone(&self.doc_registry));
+        ctx.table_io_stats = Some(Arc::clone(&self.table_io_stats));
+        ctx.index_io_stats = Some(Arc::clone(&self.index_io_stats));
+        ctx.fts_manager = self.fts_manager.clone();
+        ctx.vector_manager = self.vector_manager.clone();
+        ctx.graph_manager = self.graph_manager.clone();
+        ctx.spatial_manager = self.spatial_manager.clone();
+        if let Some(mgr) = &self.branch_manager {
+            ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+        }
+        // The change feed is fed here as well as on the leader, so a follower
+        // that is promoted carries on publishing where the old leader stopped
+        if let Some(hook) = &self.cdc_hook {
+            ctx.cdc_hook = Some(Arc::clone(hook));
+        }
+        ctx
+    }
+
     /// This node's view of the mesh, as a value the planner can hold.
     ///
     /// A snapshot rather than the lock, because planning is asynchronous and
@@ -549,6 +940,9 @@ pub struct Connection<T: WireTransport> {
     authenticator: Box<dyn Authenticator>,
     /// Active explicit transaction (None = auto-commit mode).
     transaction: Option<Transaction>,
+    /// What this transaction has done, as the group will be told it. Opened
+    /// with the transaction and taken by whichever of commit or abort ends it
+    changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
     /// Cross-table lake commit opened by BEGIN ZYRONLAKE TRANSACTION. The
     /// transaction's lake writes commit under its intent, so several lake
     /// tables become visible together without waiting on the database
@@ -625,6 +1019,12 @@ impl<T: WireTransport> Drop for Connection<T> {
             let logs = self.abandon_lake_work(txn.txn_id);
             refresh_lake_stats(&self.server, &logs);
         }
+        // Chunks already proposed sit staged on every follower, and only a
+        // leadership change would otherwise clear them. In a stable group
+        // that is never, and each would pin a follower's version horizon for
+        // as long as the leader lives, so the group is told to discard the
+        // transaction now
+        self.abandon_changeset();
     }
 }
 
@@ -676,6 +1076,7 @@ impl<T: WireTransport> Connection<T> {
             server,
             authenticator: Box::new(TrustAuthenticator),
             transaction: None,
+            changeset: None,
             lake_txn: None,
             statements: HashMap::new(),
             portals: HashMap::new(),
@@ -1239,6 +1640,14 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
+            // A follower does not decide what the group has agreed, so a write
+            // that reached one is sent back with the leader to retry against
+            if let Err(e) = self.server.check_write_allowed(&stmt) {
+                self.send_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+                continue;
+            }
+
             // Reject write statements in a READ ONLY transaction before they
             // reach any operator that touches the heap
             if let Some(txn) = self.transaction.as_ref() {
@@ -1276,6 +1685,19 @@ impl<T: WireTransport> Connection<T> {
                 }
             }
 
+            // A read of replicated data is only linearizable once this node
+            // has applied everything the leader had committed when the read
+            // arrived. System relations are above this because they describe
+            // this node rather than the group, and paying a consensus round
+            // trip to read a local counter would be nonsense
+            if matches!(stmt, zyron_parser::Statement::Select(_)) {
+                if let Err(e) = self.server.read_index_if_follower().await {
+                    self.send_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
+                    continue;
+                }
+            }
+
             // Handle EXPLAIN statements (pass owned value to avoid cloning the AST)
             if let zyron_parser::Statement::Explain(explain_stmt) = stmt {
                 match self.handle_explain_statement(*explain_stmt).await {
@@ -1288,8 +1710,21 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
+            // A schema change reaches the group before it runs here, so the
+            // object ids it allocates are the same on every node and the
+            // order it happens in is the group's
+            let turn = match self.agree_statement(&stmt, &sql).await {
+                Some(Ok(turn)) => Some(turn),
+                Some(Err(e)) => {
+                    self.send_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
+                    continue;
+                }
+                None => None,
+            };
+
             // Handle DDL, DCL, and utility statements directly
-            if let Some(result) = crate::ddl_dispatch::try_handle_ddl_utility(
+            let handled = crate::ddl_dispatch::try_handle_ddl_utility(
                 &stmt,
                 &self.server,
                 &mut self.session,
@@ -1297,8 +1732,16 @@ impl<T: WireTransport> Connection<T> {
                 &mut self.active_branch,
                 &sql,
             )
-            .await
-            {
+            .await;
+            if matches!(&handled, Some(Ok(_))) {
+                if let Err(e) = self.mark_changeset_savepoints(&stmt) {
+                    self.send_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
+                    continue;
+                }
+            }
+            let handled = report_turn(turn, handled);
+            if let Some(result) = handled {
                 match result {
                     Ok(crate::ddl_dispatch::DdlResult::Tag(tag)) => {
                         self.feed(BackendMessage::CommandComplete { tag }).await?;
@@ -1485,6 +1928,7 @@ impl<T: WireTransport> Connection<T> {
                         ctx.set_security_manager(Arc::clone(sec_mgr));
                     }
                     self.attach_undo_log(&mut ctx);
+                    self.attach_replication(&mut ctx);
                     self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
 
@@ -1645,6 +2089,7 @@ impl<T: WireTransport> Connection<T> {
                         snapshot,
                     );
                     self.attach_undo_log(&mut ctx);
+                    self.attach_replication(&mut ctx);
                     self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
                     match execute_admitted(plan_clone, &ctx, self.admission_tenant().as_deref())
@@ -1871,6 +2316,7 @@ impl<T: WireTransport> Connection<T> {
                                 snapshot,
                             );
                             self.attach_undo_log(&mut ctx);
+                            self.attach_replication(&mut ctx);
                             self.apply_session_limits(&mut ctx);
                             let ctx = Arc::new(ctx);
 
@@ -2178,6 +2624,7 @@ impl<T: WireTransport> Connection<T> {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
         self.attach_undo_log(&mut ctx);
+        self.attach_replication(&mut ctx);
         self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
 
@@ -2339,6 +2786,7 @@ impl<T: WireTransport> Connection<T> {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
         self.attach_undo_log(&mut ctx);
+        self.attach_replication(&mut ctx);
         self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
         let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
@@ -2534,6 +2982,7 @@ impl<T: WireTransport> Connection<T> {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
         self.attach_undo_log(&mut ctx);
+        self.attach_replication(&mut ctx);
         self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
 
@@ -2633,6 +3082,7 @@ impl<T: WireTransport> Connection<T> {
                 snapshot,
             );
             self.attach_undo_log(&mut ctx);
+            self.attach_replication(&mut ctx);
             self.apply_session_limits(&mut ctx);
             let ctx = Arc::new(ctx);
 
@@ -2981,6 +3431,11 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
+        // The same context the simple query path builds, because a prepared
+        // statement is the same statement. This path used to skip the change
+        // feed hooks, the search managers and the replication changeset, so a
+        // write through a driver's prepared statement fed no CDC and reached
+        // no other member of a consensus group
         let mut ctx_owned = ExecutionContext::new(
             self.server.catalog.clone(),
             self.server.wal.clone(),
@@ -2994,6 +3449,30 @@ impl<T: WireTransport> Connection<T> {
         ctx_owned.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
         ctx_owned.foreign_reader = self.server.foreign_reader.clone();
         ctx_owned.peers = Some(Arc::clone(&self.server.peers));
+        if let Some(ref hook) = self.server.cdc_hook {
+            ctx_owned.cdc_hook = Some(Arc::clone(hook));
+        }
+        if let Some(ref hook) = self.server.dml_hook {
+            ctx_owned.dml_hook = Some(Arc::clone(hook));
+        }
+        ctx_owned.doc_registry = Some(Arc::clone(&self.server.doc_registry));
+        ctx_owned.table_io_stats = Some(Arc::clone(&self.server.table_io_stats));
+        ctx_owned.index_io_stats = Some(Arc::clone(&self.server.index_io_stats));
+        if let Some(ref fts_mgr) = self.server.fts_manager {
+            ctx_owned.set_fts_manager(Arc::clone(fts_mgr));
+        }
+        if let Some(ref vec_mgr) = self.server.vector_manager {
+            ctx_owned.set_vector_manager(Arc::clone(vec_mgr));
+        }
+        if let Some(ref graph_mgr) = self.server.graph_manager {
+            ctx_owned.set_graph_manager(Arc::clone(graph_mgr));
+        }
+        if let Some(ref spatial_mgr) = self.server.spatial_manager {
+            ctx_owned.set_spatial_manager(Arc::clone(spatial_mgr));
+        }
+        if let Some(ref sec_mgr) = self.server.security_manager {
+            ctx_owned.set_security_manager(Arc::clone(sec_mgr));
+        }
         ctx_owned.active_branch_name = self.active_branch.clone();
         if let Some(mgr) = &self.server.branch_manager {
             ctx_owned.branch_catalog =
@@ -3002,6 +3481,8 @@ impl<T: WireTransport> Connection<T> {
                 ctx_owned.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
             }
         }
+        self.attach_undo_log(&mut ctx_owned);
+        self.attach_replication(&mut ctx_owned);
         self.apply_session_limits(&mut ctx_owned);
         let ctx = Arc::new(ctx_owned);
         #[cfg(feature = "profile")]
@@ -3095,6 +3576,14 @@ impl<T: WireTransport> Connection<T> {
             return Ok(());
         }
 
+        // A follower does not decide what the group has agreed, so a write
+        // that reached one is sent back with the leader to retry against
+        if let Err(e) = self.server.check_write_allowed(&stmt) {
+            self.send_error(&e).await?;
+            self.mark_failed_if_in_transaction();
+            return Ok(());
+        }
+
         // Reject write statements in a READ ONLY transaction before they reach
         // any operator that touches the heap
         if let Some(txn) = self.transaction.as_ref() {
@@ -3129,6 +3618,16 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        // A read of replicated data waits for this node to have applied
+        // everything the leader had committed when it arrived
+        if matches!(stmt, zyron_parser::Statement::Select(_)) {
+            if let Err(e) = self.server.read_index_if_follower().await {
+                self.send_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+                return Ok(());
+            }
+        }
+
         // EXPLAIN.
         if let zyron_parser::Statement::Explain(explain_stmt) = stmt {
             if let Err(e) = self.handle_explain_statement(*explain_stmt).await {
@@ -3138,8 +3637,19 @@ impl<T: WireTransport> Connection<T> {
             return Ok(());
         }
 
+        // A schema change reaches the group before it runs here
+        let turn = match self.agree_statement(&stmt, query).await {
+            Some(Ok(turn)) => Some(turn),
+            Some(Err(e)) => {
+                self.send_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+                return Ok(());
+            }
+            None => None,
+        };
+
         // DDL, DCL, and other utility statements.
-        if let Some(result) = crate::ddl_dispatch::try_handle_ddl_utility(
+        let handled = crate::ddl_dispatch::try_handle_ddl_utility(
             &stmt,
             &self.server,
             &mut self.session,
@@ -3147,8 +3657,16 @@ impl<T: WireTransport> Connection<T> {
             &mut self.active_branch,
             query,
         )
-        .await
-        {
+        .await;
+        if matches!(&handled, Some(Ok(_))) {
+            if let Err(e) = self.mark_changeset_savepoints(&stmt) {
+                self.send_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+                return Ok(());
+            }
+        }
+        let handled = report_turn(turn, handled);
+        if let Some(result) = handled {
             match result {
                 Ok(crate::ddl_dispatch::DdlResult::Tag(tag)) => {
                     self.feed(BackendMessage::CommandComplete { tag }).await?;
@@ -3296,10 +3814,156 @@ impl<T: WireTransport> Connection<T> {
                 .txn_manager
                 .begin(self.server.default_isolation)
                 .map_err(ProtocolError::Database)?;
+            // The changeset is opened with the transaction so every statement
+            // of it appends to the same set, nested executions included
+            self.changeset = self
+                .server
+                .replication
+                .as_ref()
+                .map(|r| r.changeset(txn.txn_id));
             self.transaction = Some(txn);
         }
         let txn = self.transaction.as_ref().unwrap();
         Ok((txn.txn_id, txn.snapshot.clone()))
+    }
+
+    /// Puts a schema change to the group before it runs here.
+    ///
+    /// Returns None on a node in no group, or for a statement that is not
+    /// replicated as itself, which is the caller's signal to carry on the way
+    /// it always did. Returns Some(Err) when the group refused it.
+    ///
+    /// A statement that would move rows through a path replication cannot
+    /// follow is refused rather than run, because running it would leave this
+    /// node holding data no other node has and nothing later would notice
+    async fn agree_statement(
+        &mut self,
+        stmt: &zyron_parser::Statement,
+        sql: &str,
+    ) -> Option<Result<StatementTurn, ZyronError>> {
+        let router = self.server.replication.as_ref()?;
+        match replication_class(stmt) {
+            ReplicationClass::Statement => {}
+            ReplicationClass::Unsupported => {
+                return Some(Err(ZyronError::NotReplicable {
+                    statement: statement_op_name(stmt).to_string(),
+                }));
+            }
+            ReplicationClass::Rows | ReplicationClass::Local => return None,
+        }
+        // The context the statement ran under travels with it, because the
+        // same text under a different search path names a different object
+        let context = zyron_executor::replication::StatementContext {
+            user: self
+                .session
+                .as_ref()
+                .map(|s| s.user.clone())
+                .unwrap_or_else(|| "zyron".to_string()),
+            database: self
+                .session
+                .as_ref()
+                .map(|s| s.database.clone())
+                .unwrap_or_else(|| "zyron".to_string()),
+            search_path: self
+                .session
+                .as_ref()
+                .map(|s| s.search_path.clone())
+                .unwrap_or_else(|| vec!["public".to_string()]),
+        };
+        Some(
+            router
+                .begin_statement(sql, &context)
+                .await
+                .map(|done| StatementTurn { done }),
+        )
+    }
+
+    /// Hangs this transaction's changeset on a statement's context.
+    fn attach_replication(&self, ctx: &mut ExecutionContext) {
+        ctx.replication = self.changeset.clone();
+    }
+
+    /// Keeps the changeset's savepoint marks in step with the transaction's
+    /// own, after the dispatcher has taken or released one.
+    ///
+    /// Nothing is shipped for a savepoint. The mark is where a rollback cuts
+    /// the buffer back to, so what a rollback discards never reaches the
+    /// group at all
+    fn mark_changeset_savepoints(&self, stmt: &zyron_parser::Statement) -> Result<(), ZyronError> {
+        let Some(changeset) = self.changeset.as_ref() else {
+            return Ok(());
+        };
+        match stmt {
+            zyron_parser::Statement::Savepoint(s) => {
+                changeset.mark_savepoint(&s.name);
+                Ok(())
+            }
+            zyron_parser::Statement::ReleaseSavepoint(s) => changeset.release_savepoint(&s.name),
+            _ => Ok(()),
+        }
+    }
+
+    /// Tells the group to discard a transaction that is being rolled back.
+    ///
+    /// Only reaches the group when part of the transaction had already been
+    /// proposed. A transaction whose whole changeset is still buffered is
+    /// abandoned by dropping it, and the group never hears of it at all
+    fn abandon_changeset(&mut self) {
+        let Some(changeset) = self.changeset.take() else {
+            return;
+        };
+        if !changeset.has_streamed() {
+            return;
+        }
+        if let Some(router) = self.server.replication.as_ref() {
+            router.abort(&changeset);
+        }
+    }
+
+    /// Commits through the consensus group when this node leads one, and
+    /// locally when it does not.
+    ///
+    /// The order is the whole point. The changeset is sealed once every lock
+    /// is held, proposed, and the transaction is handed to the applier, which
+    /// commits it when its entry reaches the front of the log. So this node's
+    /// transactions become visible in the group's order rather than in the
+    /// order their waits happen to finish, and every node passes through the
+    /// same sequence of states.
+    ///
+    /// There is no local durability wait on the replicated path: the entry is
+    /// already on a majority of logs. A commit record lost to a crash leaves
+    /// the applied index behind it and the entry is replayed on the way back
+    /// up, which is why the index rides inside the record
+    async fn commit_through_group(
+        &mut self,
+        mut txn: zyron_storage::txn::Transaction,
+    ) -> Result<zyron_storage::txn::Transaction, ZyronError> {
+        let txn_id = txn.txn_id;
+        let changeset = self.changeset.take();
+        let (Some(router), Some(changeset)) = (self.server.replication.as_ref(), changeset) else {
+            self.server.txn_manager.commit(&mut txn).await?;
+            return Ok(txn);
+        };
+
+        // A lake commit is described by its version files, and every lake
+        // write path stages the same way, so reading what this transaction
+        // staged catches append, delete, update, optimize and schema change
+        // in one place
+        router.capture_lake(txn_id, &changeset)?;
+
+        if !changeset.is_dirty() {
+            // Nothing to agree on. A read-only transaction never reaches the
+            // group at all, which is what keeps a read-mostly node from
+            // paying for consensus it does not need
+            if txn.wrote_data() {
+                self.server.txn_manager.commit(&mut txn).await?;
+            } else {
+                self.server.txn_manager.commit_read_only(&mut txn)?;
+            }
+            return Ok(txn);
+        }
+
+        router.commit(txn, changeset).await
     }
 
     /// Tries to handle BEGIN/COMMIT/ROLLBACK statements directly.
@@ -3335,6 +3999,17 @@ impl<T: WireTransport> Connection<T> {
                         if begin.read_only == Some(true) {
                             txn.set_read_only(true);
                         }
+                        // The changeset opens with the transaction here just
+                        // as it does on the lazy path, because
+                        // ensure_transaction sees this transaction already in
+                        // place and creates nothing. Without this, a write
+                        // inside an explicit BEGIN block had nothing
+                        // capturing it and committed on this node alone
+                        self.changeset = self
+                            .server
+                            .replication
+                            .as_ref()
+                            .map(|r| r.changeset(txn.txn_id));
                         self.transaction = Some(txn);
                         if begin.lake {
                             let now = std::time::SystemTime::now()
@@ -3354,6 +4029,7 @@ impl<T: WireTransport> Connection<T> {
                                 Ok(lake_txn) => self.lake_txn = Some(lake_txn),
                                 Err(e) => {
                                     self.transaction = None;
+                                    self.changeset = None;
                                     return Some(Err(e));
                                 }
                             }
@@ -3370,11 +4046,15 @@ impl<T: WireTransport> Connection<T> {
                 if let Some(mut txn) = self.transaction.take() {
                     let txn_id = txn.txn_id;
                     // A transaction that wrote nothing commits without a
-                    // commit record or flush wait.
+                    // commit record or flush wait. One that wrote goes through
+                    // the group when this node leads one, which is what puts
+                    // its visibility in the group's order
                     let commit_result = if txn.wrote_data() {
-                        self.server.txn_manager.commit(&mut txn).await
+                        self.commit_through_group(txn).await.map(|_| ())
                     } else {
-                        self.server.txn_manager.commit_read_only(&mut txn)
+                        self.changeset = None;
+                        let outcome = self.server.txn_manager.commit_read_only(&mut txn);
+                        outcome
                     };
                     match commit_result {
                         Ok(()) => {
@@ -3437,6 +4117,7 @@ impl<T: WireTransport> Connection<T> {
                 let abort_result = if let Some(mut txn) = self.transaction.take() {
                     let logs = self.abandon_lake_work(txn.txn_id);
                     refresh_lake_stats(&self.server, &logs);
+                    self.abandon_changeset();
                     self.server.txn_manager.abort(&mut txn)
                 } else {
                     Ok(())
@@ -3495,6 +4176,12 @@ impl<T: WireTransport> Connection<T> {
         let rollback = txn.rollback_to_savepoint(name).ok_or_else(|| {
             ZyronError::TransactionAborted(format!("savepoint \"{}\" does not exist", name))
         })?;
+
+        // What the rollback discards is cut out of the changeset as well, so
+        // the group is never told about rows this transaction unwrote
+        if let Some(changeset) = self.changeset.as_ref() {
+            changeset.rollback_to_savepoint(name)?;
+        }
 
         // Reverse each recorded write, last write first. Heap files are cached
         // per heap_file_id so repeated tuples on the same table reuse one handle.
@@ -4804,13 +5491,14 @@ impl<T: WireTransport> Connection<T> {
                 if self.session_ref().transaction_state() == TransactionState::Failed {
                     let logs = self.abandon_lake_work(txn_id);
                     refresh_lake_stats(&self.server, &logs);
+                    self.abandon_changeset();
                     if let Err(e) = self.server.txn_manager.abort(&mut txn) {
                         self.write_buf.truncate(buf_mark);
                         self.send_error(&e).await?;
                         return Err(ProtocolError::Database(e));
                     }
                 } else if txn.wrote_data() {
-                    if let Err(e) = self.server.txn_manager.commit(&mut txn).await {
+                    if let Err(e) = self.commit_through_group(txn).await {
                         // The implicit transaction failed to durably commit.
                         // Replace the buffered success responses with an error.
                         let logs = self.abandon_lake_work(txn_id);
@@ -5946,6 +6634,35 @@ fn is_read_only_safe_statement(stmt: &zyron_parser::Statement) -> bool {
             | Statement::Execute(_)
             | Statement::Listen(_)
             | Statement::Analyze(_)
+    )
+}
+
+/// Whether a statement changes anything, and so must reach the leader.
+///
+/// The consensus group orders writes, and a follower that accepted one would
+/// be deciding on its own what the group had agreed. Reads are not gated here:
+/// a follower serves them from its own state, and a client that needs the
+/// result to reflect every committed write asks for that through
+/// [`ServerState::read_index_if_follower`], which is a round trip rather than
+/// a redirect
+fn is_write_statement(stmt: &zyron_parser::Statement) -> bool {
+    use zyron_parser::Statement;
+    !matches!(
+        stmt,
+        Statement::Select(_)
+            | Statement::Explain(_)
+            | Statement::Show(_)
+            | Statement::SetVariable(_)
+            | Statement::Begin(_)
+            | Statement::Commit(_)
+            | Statement::Rollback(_)
+            | Statement::DeclareCursor(_)
+            | Statement::FetchCursor(_)
+            | Statement::CloseCursor(_)
+            | Statement::Prepare(_)
+            | Statement::Deallocate(_)
+            | Statement::Listen(_)
+            | Statement::ValuesQuery(_)
     )
 }
 

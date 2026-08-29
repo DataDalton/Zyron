@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-mesh = { path = "../zyron-mesh" }
+zyron-raft = { path = "../zyron-raft" }
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
 zyron-buffer = { path = "../zyron-buffer" }
@@ -27,6 +28,7 @@ zyron-types = { path = "../zyron-types" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-planner = { path = "../zyron-planner" }
 tokio.workspace = true
+bytes.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }

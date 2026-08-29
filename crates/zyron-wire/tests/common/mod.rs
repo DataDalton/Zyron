@@ -123,6 +123,8 @@ async fn create_test_server_configured(
     };
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

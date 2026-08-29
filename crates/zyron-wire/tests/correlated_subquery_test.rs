@@ -51,6 +51,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
+        raft: None,
+        replication: None,
         node_capabilities: None,
         catalog,
         wal,

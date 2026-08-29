@@ -3012,6 +3012,38 @@ impl Catalog {
         Ok(value)
     }
 
+    /// Moves a sequence's high-water to where another node left it.
+    ///
+    /// Nothing here draws a number: the values a replicated transaction used
+    /// are already in the rows it carried. This exists so a node elected later
+    /// does not hand out numbers that are already in the table.
+    ///
+    /// Never moves a counter backwards. Entries can arrive after a snapshot
+    /// that already covered them, and a sequence that went back would reissue
+    pub async fn set_sequence_reserved(&self, id: u32, reserved: i64) -> Result<()> {
+        let Some(live) = self.get_sequence_by_id(id) else {
+            return Err(ZyronError::Internal(format!(
+                "a changeset advances sequence id {id}, which this node does not hold"
+            )));
+        };
+        if live.current_reserved() >= reserved {
+            return Ok(());
+        }
+        let _gate = live.lock_refill().await;
+        if live.current_reserved() >= reserved {
+            return Ok(());
+        }
+        let (entry, slot) = live.plan_setval(reserved, true)?;
+        self.log_sequence_reserve(&entry)?;
+        if !self.storage.update_sequence(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "sequence id {id} row missing or undecodable while replaying an advance"
+            )));
+        }
+        live.install_window(slot);
+        Ok(())
+    }
+
     /// Persists an advanced sequence high-water to the WAL and waits for its
     /// durability. Unlike `log_ddl` this does not bump `schema_version`: a
     /// reserved-block advance is not a schema change and must not invalidate

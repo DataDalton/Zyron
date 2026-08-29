@@ -466,6 +466,41 @@ pub enum ZyronError {
     #[error("Clustering proposal rejected: {0}")]
     ClusteringRejected(String),
 
+    // Consensus errors
+    /// A write reached a node that is not the leader of its consensus group.
+    /// Carries the leader the node last heard from so the caller can redirect
+    /// rather than poll, and None while an election is in progress
+    #[error("not the leader of the consensus group, known leader: {leader:?}")]
+    NotLeader { leader: Option<u64> },
+
+    /// A candidate ran its election timeout without reaching a majority, or a
+    /// caller waited for a leader to appear and none did
+    #[error("election timed out in term {term} after {elapsed_ms}ms")]
+    ElectionTimeout { term: u64, elapsed_ms: u64 },
+
+    /// A statement whose effects replication cannot carry, on a node that is
+    /// in a group. Refused rather than run, because running it would leave
+    /// this node holding data no other member has and nothing later would
+    /// notice the difference
+    #[error(
+        "{statement} cannot run on a node in a consensus group, because its effects would not reach the other members"
+    )]
+    NotReplicable { statement: String },
+
+    /// A consensus operation did not finish inside the caller's deadline.
+    /// Distinct from a failure: the group may still commit the work, and the
+    /// caller has to decide whether to retry or to check the outcome
+    #[error("consensus {operation} did not finish inside {elapsed_ms}ms")]
+    ConsensusTimeout { operation: String, elapsed_ms: u64 },
+
+    /// A raft log record failed its checksum or its framing on read back
+    #[error("Raft log corrupted at index {index}: {reason}")]
+    RaftLogCorrupted { index: u64, reason: String },
+
+    /// A consensus RPC did not produce an answer
+    #[error("Raft transport error: {0}")]
+    RaftTransport(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),

@@ -96,8 +96,16 @@ struct FileEntry {
     /// so it is done once when the file is first referenced.
     file: std::sync::Arc<std::fs::File>,
     /// Pages the file is known to hold, which bounds what `read_page`
-    /// accepts.
+    /// accepts. Only ever advanced once the file is physically that long
     num_pages: AtomicU64,
+    /// Pages handed out by the allocator, which runs ahead of `num_pages`
+    /// while a growth is in flight.
+    ///
+    /// Two counters rather than one because an allocation has to claim its
+    /// range before it grows the file, and a reader must not be told a page
+    /// exists before it does. Claiming happens here and publishing happens on
+    /// `num_pages` after the file is long enough
+    allocated: AtomicU64,
     /// Bytes the file has been extended to. Kept beside `num_pages` so a
     /// grow is one compare rather than a metadata call.
     len_bytes: AtomicU64,
@@ -185,6 +193,7 @@ impl DiskManager {
         let entry = std::sync::Arc::new(FileEntry {
             file: std::sync::Arc::new(file),
             num_pages: AtomicU64::new(len / PAGE_SIZE as u64),
+            allocated: AtomicU64::new(len / PAGE_SIZE as u64),
             len_bytes: AtomicU64::new(len),
             extent: parking_lot::RwLock::new(()),
             page_latches: std::array::from_fn(|_| parking_lot::RwLock::new(())),
@@ -203,17 +212,24 @@ impl DiskManager {
     /// has to be the high water mark rather than its own value, otherwise a
     /// smaller late call would truncate away another's pages.
     fn grow_to(entry: &FileEntry, target_len: u64) -> Result<()> {
-        let previous = entry.len_bytes.fetch_max(target_len, Ordering::AcqRel);
-        if previous >= target_len {
+        // What the file has actually reached decides this, not what somebody
+        // has claimed it will reach. Returning on the claim let a caller whose
+        // target was covered by a larger, still in flight extension report
+        // success while the bytes were not there yet, and the page it then
+        // published read back as a short file
+        if entry.applied_len.load(Ordering::Acquire) >= target_len {
             return Ok(());
         }
+        entry.len_bytes.fetch_max(target_len, Ordering::AcqRel);
         // The syscall is serialized and always extends to the CURRENT
         // high-water mark, never this caller's own target: two racing
         // extensions could otherwise issue set_len out of order and the
         // smaller late call would truncate the larger one's pages
         let _grow = entry.grow.lock();
         let high = entry.len_bytes.load(Ordering::Acquire);
-        if entry.applied_len.load(Ordering::Acquire) >= high {
+        // Somebody else's syscall ran while this caller waited for the lock.
+        // It is only done if that syscall covered this caller's target
+        if entry.applied_len.load(Ordering::Acquire) >= target_len {
             return Ok(());
         }
         match entry.file.set_len(high) {
@@ -269,9 +285,19 @@ impl DiskManager {
             {
                 let _page = entry.page_latch(page_num).read();
                 positional_read_exact(&entry.file, &mut buffer, offset).map_err(|e| {
+                    // The file's real length goes in the message because the
+                    // page count was already checked above: a read that gets
+                    // here and still fails means the two disagree, and which
+                    // way they disagree is the whole diagnosis
+                    let on_disk = entry.file.metadata().map(|m| m.len()).unwrap_or(0);
                     ZyronError::IoError(format!(
-                        "read page {}@{} for file {}: {}",
-                        page_num, offset, file_id, e
+                        "read page {}@{} for file {}: {} (file holds {} bytes, {} pages claimed)",
+                        page_num,
+                        offset,
+                        file_id,
+                        e,
+                        on_disk,
+                        entry.num_pages.load(Ordering::Acquire)
                     ))
                 })?;
             }
@@ -358,9 +384,12 @@ impl DiskManager {
                     .sync_all()
                     .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))?;
             }
-            // A write past the known end extends the file, so both counters
-            // rise to cover it and never fall
+            // A write past the known end extends the file, so every counter
+            // rises to cover it and none of them falls. The page is on disk by
+            // the time this runs, so publishing the count here is backed by
+            // bytes the same way the allocator's publish is
             entry.num_pages.fetch_max(page_num + 1, Ordering::AcqRel);
+            entry.allocated.fetch_max(page_num + 1, Ordering::AcqRel);
             entry
                 .len_bytes
                 .fetch_max((page_num + 1) * PAGE_SIZE as u64, Ordering::AcqRel);
@@ -393,8 +422,14 @@ impl DiskManager {
             return Ok(Vec::new());
         }
         let entry = self.entry(file_id)?;
-        let start_page = entry.num_pages.fetch_add(count, Ordering::AcqRel);
-        let target_len = (start_page + count) * (PAGE_SIZE as u64);
+        // The range is claimed first so two allocators take disjoint pages
+        // without a lock between them, and published last so no reader is told
+        // a page exists before the file reaches it. Between the two the growth
+        // hops onto a blocking thread, and a reader that saw the page count
+        // move in that window would read past the end of the file
+        let start_page = entry.allocated.fetch_add(count, Ordering::AcqRel);
+        let end_page = start_page + count;
+        let target_len = end_page * (PAGE_SIZE as u64);
         let e2 = entry.clone();
         tokio::task::spawn_blocking(move || {
             let _extent = e2.extent.read();
@@ -402,6 +437,12 @@ impl DiskManager {
         })
         .await
         .map_err(|e| ZyronError::IoError(format!("allocate task: {}", e)))??;
+
+        // A grow sets an absolute length, so whichever allocator finishes last
+        // has produced a file at least as long as every range claimed before
+        // it. Publishing the high-water mark is therefore always backed by
+        // bytes that are there
+        entry.num_pages.fetch_max(end_page, Ordering::AcqRel);
 
         Ok((0..count)
             .map(|i| PageId::new(file_id, start_page + i))
@@ -524,6 +565,7 @@ impl DiskManager {
                     .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))?;
             }
             entry.num_pages.store(0, Ordering::Release);
+            entry.allocated.store(0, Ordering::Release);
             entry.len_bytes.store(0, Ordering::Release);
             // Under the exclusive extent lock no grow is in flight, so the
             // applied length resets with the claim
