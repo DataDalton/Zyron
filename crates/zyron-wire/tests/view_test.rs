@@ -45,9 +45,9 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
             .expect("catalog"),
     );
     let public_schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
@@ -105,6 +105,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -133,7 +134,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
 
 fn new_session() -> Option<Session> {
     let mut s = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    s.search_path = vec!["public".into()];
+    s.search_path = vec!["zyron_test".into()];
     Some(s)
 }
 
@@ -166,7 +167,7 @@ async fn try_exec(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -425,4 +426,94 @@ async fn create_view_on_missing_table_errors() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn views_resolve_scoped_never_globally() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(&server, &mut session, "CREATE SCHEMA vs2").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE VIEW vs2.vv AS SELECT id FROM zyron_test.t",
+    )
+    .await;
+
+    // The view lives only in vs2, which is not on the search path: a bare
+    // name must not find it by scanning every schema.
+    let err = try_exec(&server, &mut session, "SELECT * FROM vv")
+        .await
+        .expect_err("a view off the search path is not reachable bare");
+    assert!(
+        err.contains("vv") || err.contains("not"),
+        "the error names the unresolved relation: {err}"
+    );
+
+    // Qualified reads exactly that schema.
+    let rows = exec(&server, &mut session, "SELECT * FROM vs2.vv").await;
+    let ids = col_i64(&rows, 0);
+    assert!(!ids.is_empty(), "the qualified view reads its base rows");
+}
+
+// ---------------------------------------------------------------------------
+// Views and tables share one relation namespace per schema
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_view_rejects_an_existing_table_name() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+
+    // A view may not shadow the table: reads would hit the view while
+    // writes hit the table.
+    let err = try_exec(
+        &server,
+        &mut session,
+        "CREATE VIEW t AS SELECT id FROM zyron_test.t",
+    )
+    .await
+    .expect_err("a view may not take an existing table's name");
+    assert!(err.contains("table named 't'"), "{err}");
+
+    // The same name in a different schema is a different namespace.
+    exec(&server, &mut session, "CREATE SCHEMA other_ns").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE VIEW other_ns.t AS SELECT id FROM zyron_test.t",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_table_rejects_an_existing_view_name() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(&server, &mut session, "CREATE VIEW vt AS SELECT id FROM t").await;
+
+    let err = try_exec(&server, &mut session, "CREATE TABLE vt (id INT)")
+        .await
+        .expect_err("a table may not take an existing view's name");
+    assert!(err.contains("view named 'vt'"), "{err}");
+}
+
+#[tokio::test]
+async fn rename_view_rejects_an_existing_table_name() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(&server, &mut session, "CREATE VIEW vr AS SELECT id FROM t").await;
+
+    let err = try_exec(&server, &mut session, "ALTER VIEW vr RENAME TO t")
+        .await
+        .expect_err("a rename may not move a view onto a table's name");
+    assert!(err.contains("table named 't'"), "{err}");
+
+    // The view is untouched by the failed rename.
+    let rows = exec(&server, &mut session, "SELECT * FROM vr").await;
+    assert!(!col_i64(&rows, 0).is_empty());
 }

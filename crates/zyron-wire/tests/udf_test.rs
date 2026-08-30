@@ -44,9 +44,9 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
             .expect("catalog"),
     );
     let public_schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
@@ -104,6 +104,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -132,7 +133,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
 
 fn new_session() -> Option<Session> {
     let mut s = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    s.search_path = vec!["public".into()];
+    s.search_path = vec!["zyron_test".into()];
     Some(s)
 }
 
@@ -165,7 +166,7 @@ async fn try_exec(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -264,6 +265,106 @@ async fn scalar_function_select_body() {
         first_i64(&exec(&server, &mut session, "SELECT dbl(21)").await),
         42
     );
+}
+
+// ---------------------------------------------------------------------------
+// Schema-scoped function resolution
+// ---------------------------------------------------------------------------
+
+/// Two same-named functions in different schemas with distinguishable
+/// bodies. The off-path twin registers FIRST, so a bare call would hit it
+/// under registration-order resolution.
+async fn twin_functions(server: &Arc<ServerState>, session: &mut Option<Session>) {
+    exec(server, session, "CREATE SCHEMA fs2").await;
+    exec(
+        server,
+        session,
+        "CREATE FUNCTION fs2.pick(x INT) RETURNS INT AS 'x + 200 'LANGUAGE SQL",
+    )
+    .await;
+    exec(
+        server,
+        session,
+        "CREATE FUNCTION zyron_test.pick(x INT) RETURNS INT AS 'x + 100 'LANGUAGE SQL",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bare_call_resolves_through_the_search_path_not_first_wins() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_functions(&server, &mut session).await;
+
+    // The search path holds zyron_test only: the bare call binds that
+    // schema's function even though fs2's registered first.
+    assert_eq!(
+        first_i64(&exec(&server, &mut session, "SELECT pick(1)").await),
+        101
+    );
+}
+
+#[tokio::test]
+async fn qualified_call_reads_exactly_the_named_schema() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_functions(&server, &mut session).await;
+
+    assert_eq!(
+        first_i64(&exec(&server, &mut session, "SELECT fs2.pick(1)").await),
+        201
+    );
+    assert_eq!(
+        first_i64(&exec(&server, &mut session, "SELECT zyron_test.pick(1)").await),
+        101
+    );
+}
+
+#[tokio::test]
+async fn qualified_call_never_falls_back_to_another_schema() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(&server, &mut session, "CREATE SCHEMA fs2").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE FUNCTION zyron_test.pick(x INT) RETURNS INT AS 'x + 100 'LANGUAGE SQL",
+    )
+    .await;
+
+    // fs2 holds no such function; the qualified call must not reach the
+    // zyron_test twin.
+    let err = try_exec(&server, &mut session, "SELECT fs2.pick(1)")
+        .await
+        .expect_err("a qualified call resolves only the named schema");
+    assert!(err.contains("fs2.pick"), "the error names the call: {err}");
+}
+
+#[tokio::test]
+async fn drop_function_touches_one_schema_only() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_functions(&server, &mut session).await;
+
+    // The bare drop resolves via the search path to zyron_test's overloads.
+    exec(&server, &mut session, "DROP FUNCTION pick").await;
+    let err = try_exec(&server, &mut session, "SELECT zyron_test.pick(1)")
+        .await
+        .expect_err("the dropped schema's function is gone");
+    assert!(err.contains("pick"), "{err}");
+
+    // The same-named function in the other schema survives.
+    assert_eq!(
+        first_i64(&exec(&server, &mut session, "SELECT fs2.pick(1)").await),
+        201
+    );
+
+    // A qualified drop removes exactly the named schema's function.
+    exec(&server, &mut session, "DROP FUNCTION fs2.pick").await;
+    let err = try_exec(&server, &mut session, "SELECT fs2.pick(1)")
+        .await
+        .expect_err("both twins are gone");
+    assert!(err.contains("pick"), "{err}");
 }
 
 #[tokio::test]

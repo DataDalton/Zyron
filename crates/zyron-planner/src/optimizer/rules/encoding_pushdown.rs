@@ -336,6 +336,19 @@ impl EncodingPushdown {
                     expectations: expectations.clone(),
                     source: Arc::new(new_source),
                 }),
+            LogicalPlan::ViewTriggerWrite {
+                view_id,
+                event,
+                param_map,
+                source,
+            } => self
+                .transform(source)
+                .map(|new_source| LogicalPlan::ViewTriggerWrite {
+                    view_id: *view_id,
+                    event: *event,
+                    param_map: param_map.clone(),
+                    source: Arc::new(new_source),
+                }),
             LogicalPlan::Update {
                 table_id,
                 assignments,

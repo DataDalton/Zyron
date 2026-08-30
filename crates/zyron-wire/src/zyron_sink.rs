@@ -1048,7 +1048,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(0.5, 4, Duration::from_secs(5)));
         let cfg = ZyronSinkConfig {
             pool: make_pool(),
-            target_schema: "public".into(),
+            target_schema: "zyron_test".into(),
             target_table: "orders".into(),
             write_mode: CatalogStreamingWriteMode::Append,
             pk_columns: vec!["id".into()],
@@ -1127,14 +1127,14 @@ mod tests {
     #[test]
     fn qualified_target_renders_schema() {
         let (sink, _) = make_sink(false);
-        assert_eq!(sink.target(), "public.orders");
+        assert_eq!(sink.target(), "zyron_test.orders");
     }
 
     #[test]
     fn build_delete_sql_uses_pk() {
         let (sink, _) = make_sink(false);
         let sql = sink.build_delete_sql(2);
-        assert!(sql.contains("DELETE FROM public.orders WHERE (id) IN"));
+        assert!(sql.contains("DELETE FROM zyron_test.orders WHERE (id) IN"));
     }
 
     #[test]
@@ -1142,7 +1142,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(0.5, 4, Duration::from_secs(1)));
         let cfg = ZyronSinkConfig {
             pool: make_pool(),
-            target_schema: "public".into(),
+            target_schema: "zyron_test".into(),
             target_table: "t".into(),
             write_mode: CatalogStreamingWriteMode::Upsert,
             pk_columns: vec!["id".into()],
@@ -1203,7 +1203,7 @@ mod tests {
         cb.record_failure();
         let cfg = ZyronSinkConfig {
             pool: make_pool(),
-            target_schema: "public".into(),
+            target_schema: "zyron_test".into(),
             target_table: "t".into(),
             write_mode: CatalogStreamingWriteMode::Append,
             pk_columns: vec![],
@@ -1247,7 +1247,7 @@ mod tests {
         cb.record_failure();
         let cfg = ZyronSinkConfig {
             pool: make_pool(),
-            target_schema: "public".into(),
+            target_schema: "zyron_test".into(),
             target_table: "t".into(),
             write_mode: CatalogStreamingWriteMode::Append,
             pk_columns: vec![],
@@ -1276,7 +1276,7 @@ mod tests {
         cb.record_failure();
         let cfg = ZyronSinkConfig {
             pool: make_pool(),
-            target_schema: "public".into(),
+            target_schema: "zyron_test".into(),
             target_table: "t".into(),
             write_mode: CatalogStreamingWriteMode::Append,
             pk_columns: vec![],

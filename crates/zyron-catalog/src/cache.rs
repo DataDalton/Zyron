@@ -1102,12 +1102,20 @@ mod tests {
     #[test]
     fn test_schema_cache() {
         let cache = CatalogCache::new(100, 100);
-        let schema = make_schema(1, 1, "public");
+        let schema = make_schema(1, 1, "zyron_test");
         cache.put_schema(schema);
 
         assert!(cache.get_schema(SchemaId(1)).is_some());
-        assert!(cache.get_schema_by_name(DatabaseId(1), "public").is_some());
-        assert!(cache.get_schema_by_name(DatabaseId(2), "public").is_none());
+        assert!(
+            cache
+                .get_schema_by_name(DatabaseId(1), "zyron_test")
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_schema_by_name(DatabaseId(2), "zyron_test")
+                .is_none()
+        );
 
         cache.invalidate_schema(SchemaId(1));
         assert!(cache.get_schema(SchemaId(1)).is_none());
@@ -1171,7 +1179,7 @@ mod tests {
     fn test_invalidate_all() {
         let cache = CatalogCache::new(100, 100);
         cache.put_database(make_db(1, "db1"));
-        cache.put_schema(make_schema(1, 1, "public"));
+        cache.put_schema(make_schema(1, 1, "zyron_test"));
         cache.put_table(make_table(1, 1, "t1"));
         cache.put_index(make_index(1, 1, "idx1"));
 

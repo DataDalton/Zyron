@@ -767,7 +767,7 @@ impl ChangesetMachine {
         zyron_executor::replication::StatementContext {
             user: "zyron".to_string(),
             database: "zyron".to_string(),
-            search_path: vec!["public".to_string()],
+            search_path: zyron_catalog::default_search_path(),
         }
     }
 

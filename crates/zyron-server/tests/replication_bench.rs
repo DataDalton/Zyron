@@ -77,9 +77,9 @@ impl Node {
             .await
             .expect("register the zyron_sys catalog");
         let schema = catalog
-            .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+            .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
             .await
-            .expect("create public schema");
+            .expect("create zyron_test schema");
         let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
         let section = ClusterSection {
@@ -152,7 +152,7 @@ impl Node {
         let context = zyron_executor::replication::StatementContext {
             user: "test_user".to_string(),
             database: "zyron".to_string(),
-            search_path: vec!["public".to_string()],
+            search_path: vec!["zyron_test".to_string()],
         };
         let done = self.router().begin_statement(sql, &context).await?;
         let outcome = zyron_server::replication::DispatchedDdl::new(&self._server)
@@ -211,7 +211,7 @@ impl Node {
             let plan = zyron_planner::plan(
                 &self.catalog,
                 zyron_catalog::DatabaseId(1),
-                vec!["public".to_string()],
+                vec!["zyron_test".to_string()],
                 statement,
                 None,
             )
@@ -285,7 +285,7 @@ impl Node {
                 zyron_catalog::DatabaseId(1),
             ));
             if let Some(session) = session.as_mut() {
-                session.search_path = vec!["public".to_string()];
+                session.search_path = vec!["zyron_test".to_string()];
             }
             let mut txn = None;
             let mut branch = None;
@@ -396,6 +396,7 @@ fn build_server_state(
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -1058,7 +1059,7 @@ async fn dispatcher_writes_reach_every_node() {
         .expect("create source");
     group.nodes[leader]
         .ddl(
-            "CREATE PROCEDURE add_d(k INT, v INT) AS 'INSERT INTO d (k, v) VALUES ($1, $2)' \
+            "CREATE PROCEDURE add_d(k INT, v INT) AS 'INSERT INTO zyron_test.d (k, v) VALUES ($1, $2)' \
 LANGUAGE SQL",
         )
         .await
@@ -1166,8 +1167,11 @@ async fn a_wire_client_transaction_replicates() {
     let mut client = WireClient::connect(addr).await;
 
     // An explicit transaction with a savepoint rolled back inside it. Rows 1,
-    // 2 and 4 survive, row 3 was unwritten and must reach nobody
+    // 2 and 4 survive, row 3 was unwritten and must reach nobody. The default
+    // search path carries no user schema, so the client points its session at
+    // the schema the table lives in first
     for sql in [
+        "SET search_path = zyron_test",
         "BEGIN",
         "INSERT INTO w (k, v) VALUES (1, 10)",
         "INSERT INTO w (k, v) VALUES (2, 20)",

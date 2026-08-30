@@ -170,7 +170,7 @@ async fn a_shed_reaches_the_client_as_a_capacity_refusal() {
     for i in 0..64 {
         common::exec_dml(
             &state,
-            &format!("INSERT INTO public.orders VALUES ({i}, {})", i * 10),
+            &format!("INSERT INTO zyron_test.orders VALUES ({i}, {})", i * 10),
         )
         .await;
     }
@@ -180,7 +180,7 @@ async fn a_shed_reaches_the_client_as_a_capacity_refusal() {
 
     // With the node quiet, the query runs
     let admitted = client
-        .simple_query("SELECT id FROM public.orders")
+        .simple_query("SELECT id FROM zyron_test.orders")
         .await
         .expect("a quiet node admitted the query");
     assert!(!admitted.is_empty(), "the admitted query returned nothing");
@@ -189,7 +189,7 @@ async fn a_shed_reaches_the_client_as_a_capacity_refusal() {
     let refusal = {
         let _full = SaturatedClass::hold(WorkloadClass::Bulk, 5.0);
         client
-            .simple_query("SELECT id FROM public.orders")
+            .simple_query("SELECT id FROM zyron_test.orders")
             .await
             .expect_err("a full node admitted a query it had no capacity for")
     };
@@ -212,7 +212,7 @@ async fn a_shed_reaches_the_client_as_a_capacity_refusal() {
     // The pressure is gone with the guard, and the same connection works again
     restore_pricing();
     let after = client
-        .simple_query("SELECT id FROM public.orders")
+        .simple_query("SELECT id FROM zyron_test.orders")
         .await
         .expect("the node stayed refusing after the pressure cleared");
     assert!(!after.is_empty());
@@ -231,7 +231,7 @@ async fn a_refused_query_leaves_the_session_usable() {
     )
     .await
     .expect("ddl");
-    common::exec_dml(&state, "INSERT INTO public.items VALUES (1)").await;
+    common::exec_dml(&state, "INSERT INTO zyron_test.items VALUES (1)").await;
 
     let port = serve(state).await;
     let mut client = connect(port).await;
@@ -241,7 +241,7 @@ async fn a_refused_query_leaves_the_session_usable() {
         let _full = SaturatedClass::hold(WorkloadClass::Bulk, 5.0);
         for attempt in 0..3 {
             let refusal = client
-                .simple_query("SELECT id FROM public.items")
+                .simple_query("SELECT id FROM zyron_test.items")
                 .await
                 .expect_err("attempt {attempt} was admitted on a full node");
             assert_eq!(
@@ -255,7 +255,7 @@ async fn a_refused_query_leaves_the_session_usable() {
 
     // Three refusals later the session still works
     let rows = client
-        .simple_query("SELECT id FROM public.items")
+        .simple_query("SELECT id FROM zyron_test.items")
         .await
         .expect("the session did not survive being refused");
     assert!(!rows.is_empty());
@@ -274,7 +274,7 @@ async fn a_cheap_query_still_runs_on_a_shedding_node() {
     )
     .await
     .expect("ddl");
-    common::exec_dml(&state, "INSERT INTO public.tiny VALUES (7)").await;
+    common::exec_dml(&state, "INSERT INTO zyron_test.tiny VALUES (7)").await;
 
     let port = serve(state).await;
     let mut client = connect(port).await;
@@ -287,7 +287,7 @@ async fn a_cheap_query_still_runs_on_a_shedding_node() {
     // Priced on the real cost model, this costs microseconds and is below the
     // bypass threshold
     let rows = client
-        .simple_query("SELECT id FROM public.tiny")
+        .simple_query("SELECT id FROM zyron_test.tiny")
         .await
         .expect("a query below the bypass threshold was refused");
     assert!(!rows.is_empty());
@@ -306,7 +306,7 @@ async fn a_refusal_is_recorded_where_an_operator_can_see_it() {
     )
     .await
     .expect("ddl");
-    common::exec_dml(&state, "INSERT INTO public.audit_src VALUES (1)").await;
+    common::exec_dml(&state, "INSERT INTO zyron_test.audit_src VALUES (1)").await;
 
     let port = serve(state).await;
     let mut client = connect(port).await;
@@ -317,7 +317,7 @@ async fn a_refusal_is_recorded_where_an_operator_can_see_it() {
     {
         let _full = SaturatedClass::hold(WorkloadClass::Bulk, 5.0);
         client
-            .simple_query("SELECT id FROM public.audit_src")
+            .simple_query("SELECT id FROM zyron_test.audit_src")
             .await
             .expect_err("expected a refusal");
     }

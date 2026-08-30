@@ -390,6 +390,19 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// DML against a view with an INSTEAD OF trigger. `source` produces one
+    /// parameter row per affected row and the executor runs the view's
+    /// trigger body per row; storage is never written directly. `param_map`
+    /// routes each trigger parameter position to a source column, None
+    /// filling NULL.
+    ViewTriggerWrite {
+        view_id: u32,
+        event: u8,
+        param_map: Vec<Option<usize>>,
+        source: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+
     /// Parallel sequential scan distributing page ranges across workers.
     ParallelSeqScan {
         table_id: TableId,
@@ -569,6 +582,7 @@ impl PhysicalPlan {
             PhysicalPlan::LockRows { child, .. } => vec![child.as_ref()],
             PhysicalPlan::SetOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
             PhysicalPlan::Insert { source, .. } => vec![source.as_ref()],
+            PhysicalPlan::ViewTriggerWrite { source, .. } => vec![source.as_ref()],
             PhysicalPlan::Update { child, .. } => vec![child.as_ref()],
             PhysicalPlan::Delete { child, .. } => vec![child.as_ref()],
             PhysicalPlan::ParallelHashJoin { left, right, .. } => {
@@ -609,6 +623,7 @@ impl PhysicalPlan {
             | PhysicalPlan::LockRows { cost, .. }
             | PhysicalPlan::SetOp { cost, .. }
             | PhysicalPlan::Insert { cost, .. }
+            | PhysicalPlan::ViewTriggerWrite { cost, .. }
             | PhysicalPlan::Values { cost, .. }
             | PhysicalPlan::Update { cost, .. }
             | PhysicalPlan::Delete { cost, .. }
@@ -730,6 +745,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Broadcast { child, .. } => child.output_schema(),
             PhysicalPlan::SetOp { left, .. } => left.output_schema(),
             PhysicalPlan::Insert { .. }
+            | PhysicalPlan::ViewTriggerWrite { .. }
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. }
             | PhysicalPlan::LakeDelete { .. }
@@ -798,6 +814,7 @@ impl PhysicalPlan {
             | PhysicalPlan::HashDistinct { child, .. }
             | PhysicalPlan::LockRows { child, .. }
             | PhysicalPlan::Insert { source: child, .. }
+            | PhysicalPlan::ViewTriggerWrite { source: child, .. }
             | PhysicalPlan::Update { child, .. }
             | PhysicalPlan::Delete { child, .. }
             | PhysicalPlan::LakeUpdate { child, .. }

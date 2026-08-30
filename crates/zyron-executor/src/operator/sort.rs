@@ -64,6 +64,13 @@ pub struct SortOperator {
     merge: Option<MergeState>,
     /// Rows already emitted, so a limit is honoured across a merge
     emitted: u64,
+    /// Context whose cancel flag the merge phase polls between output
+    /// batches. The input side is covered by the consumer-side poll wrapper,
+    /// but the merge runs after consumption and reads spill files without
+    /// touching a tokio resource, so it polls and yields on its own
+    poll_ctx: Option<std::sync::Arc<crate::context::ExecutionContext>>,
+    /// Merge batches emitted since the last explicit yield
+    merge_batches: u32,
 }
 
 impl SortOperator {
@@ -88,7 +95,14 @@ impl SortOperator {
             runs: Vec::new(),
             merge: None,
             emitted: 0,
+            poll_ctx: None,
+            merge_batches: 0,
         }
+    }
+
+    /// Installs the context whose cancel flag the spill merge polls.
+    pub fn set_poll_context(&mut self, ctx: std::sync::Arc<crate::context::ExecutionContext>) {
+        self.poll_ctx = Some(ctx);
     }
 
     /// Attaches the query memory budget. Set by the operator builder from
@@ -617,6 +631,16 @@ impl Operator for SortOperator {
             // merged result is larger than memory by construction, so handing
             // it out whole would spend exactly the memory the spill saved
             if self.merge.is_some() {
+                // The merge is post-consumption compute over spill files and
+                // never touches a tokio leaf resource, so it polls the cancel
+                // flag itself and periodically hands the worker back
+                if let Some(ctx) = &self.poll_ctx {
+                    ctx.check_cancelled()?;
+                }
+                self.merge_batches = self.merge_batches.wrapping_add(1);
+                if self.merge_batches % 16 == 0 {
+                    tokio::task::yield_now().await;
+                }
                 let mut timer = crate::calibrate::BatchTimer::start(
                     zyron_pressure::capability::OperatorKind::Sort,
                 );

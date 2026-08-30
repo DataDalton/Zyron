@@ -91,6 +91,68 @@ pub struct DropOutcome {
     pub fsm_file_id: u32,
 }
 
+/// Everything a schema still contains, gathered by `schema_contents` for
+/// DROP SCHEMA. Live tables exclude materialized-view backing tables, which
+/// are reported as their materialized view instead.
+#[derive(Debug, Default)]
+pub struct SchemaContents {
+    pub tables: Vec<String>,
+    pub recycled_tables: Vec<(TableId, String)>,
+    pub views: Vec<String>,
+    pub mviews: Vec<String>,
+    pub sequences: Vec<String>,
+    pub functions: Vec<String>,
+    pub aggregates: Vec<String>,
+    pub procedures: Vec<String>,
+}
+
+impl SchemaContents {
+    /// True when the schema holds nothing at all, recycled tables included.
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+            && self.recycled_tables.is_empty()
+            && self.views.is_empty()
+            && self.mviews.is_empty()
+            && self.sequences.is_empty()
+            && self.functions.is_empty()
+            && self.aggregates.is_empty()
+            && self.procedures.is_empty()
+    }
+
+    /// One line naming what the schema holds, at most five names per kind,
+    /// so a refused DROP SCHEMA tells the caller exactly what is in the way.
+    pub fn describe(&self) -> String {
+        fn kind(parts: &mut Vec<String>, label: &str, names: &[String]) {
+            if names.is_empty() {
+                return;
+            }
+            let shown: Vec<&str> = names.iter().take(5).map(|s| s.as_str()).collect();
+            let ellipsis = if names.len() > 5 { ", ..." } else { "" };
+            let plural = if names.len() == 1 { "" } else { "s" };
+            parts.push(format!(
+                "{} {label}{plural} ({}{ellipsis})",
+                names.len(),
+                shown.join(", ")
+            ));
+        }
+        let recycled_names: Vec<String> = self
+            .recycled_tables
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect();
+        let mut parts = Vec::new();
+        kind(&mut parts, "table", &self.tables);
+        kind(&mut parts, "recycled table", &recycled_names);
+        kind(&mut parts, "view", &self.views);
+        kind(&mut parts, "materialized view", &self.mviews);
+        kind(&mut parts, "sequence", &self.sequences);
+        kind(&mut parts, "function", &self.functions);
+        kind(&mut parts, "aggregate", &self.aggregates);
+        kind(&mut parts, "procedure", &self.procedures);
+        parts.join(", ")
+    }
+}
+
 /// Central catalog manager.
 pub struct Catalog {
     storage: Arc<dyn CatalogStorage>,
@@ -1939,7 +2001,14 @@ impl Catalog {
         Ok(id)
     }
 
-    pub async fn drop_schema(&self, db_id: DatabaseId, name: &str) -> Result<()> {
+    /// The reserved-schema checks a DROP SCHEMA must pass, shared by the
+    /// direct drop and the wire-level CASCADE that empties the schema
+    /// through the real drop paths first. Returns the schema entry.
+    pub fn ensure_schema_droppable(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<SchemaEntry>> {
         if name == SYSTEM_SCHEMA_NAME {
             return Err(ZyronError::PermissionDenied(format!(
                 "schema `{}` is reserved for Zyron internals and cannot be dropped",
@@ -1956,6 +2025,25 @@ impl Catalog {
                 SYSTEM_SCHEMA_NAME, name
             )));
         }
+        Ok(schema)
+    }
+
+    /// Drops a schema. Only an EMPTY schema can be dropped: deleting the
+    /// entry with objects still inside would strand every one of them
+    /// unreachable under a dead schema id, invisible to name resolution but
+    /// holding storage forever. DROP SCHEMA CASCADE empties the schema at
+    /// the wire layer through the real per-object drop paths, then this
+    /// removes the empty shell.
+    pub async fn drop_schema(&self, db_id: DatabaseId, name: &str) -> Result<()> {
+        let schema = self.ensure_schema_droppable(db_id, name)?;
+
+        let contents = self.schema_contents(schema.id);
+        if !contents.is_empty() {
+            return Err(ZyronError::Internal(format!(
+                "schema '{name}' is not empty: it holds {}; drop these objects first or use DROP SCHEMA {name} CASCADE",
+                contents.describe()
+            )));
+        }
 
         let id = schema.id;
         let mut payload = vec![0u8; 4];
@@ -1964,6 +2052,97 @@ impl Catalog {
         self.storage.delete_schema(id).await?;
         self.cache.invalidate_schema(id);
         Ok(())
+    }
+
+    /// Everything a schema still contains, gathered for DROP SCHEMA. Live
+    /// tables exclude materialized-view backing tables, which are reported
+    /// as their materialized view instead. Recycled tables count as
+    /// contents: they are restorable and must not outlive their schema.
+    /// Every list is sorted so error text and cascade order are
+    /// deterministic.
+    pub fn schema_contents(&self, schema_id: SchemaId) -> SchemaContents {
+        let mut mviews: Vec<String> = self
+            .mviews_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        mviews.sort_unstable();
+
+        let mut tables: Vec<String> = self
+            .cache
+            .list_tables(schema_id)
+            .iter()
+            .filter(|t| mviews.binary_search(&t.name).is_err())
+            .map(|t| t.name.clone())
+            .collect();
+        tables.sort_unstable();
+
+        let mut recycled_tables: Vec<(TableId, String)> = self
+            .cache
+            .list_dropped_tables()
+            .iter()
+            .filter(|t| t.schema_id == schema_id)
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        recycled_tables.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+
+        let mut views: Vec<String> = self
+            .views_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        views.sort_unstable();
+
+        let mut sequences: Vec<String> = self
+            .sequences_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        sequences.sort_unstable();
+
+        let mut functions: Vec<String> = self
+            .functions_by_name
+            .read()
+            .iter()
+            .filter(|(_, overloads)| overloads.iter().any(|f| f.schema_id == schema_id))
+            .map(|(n, _)| n.clone())
+            .collect();
+        functions.sort_unstable();
+
+        let mut aggregates: Vec<String> = self
+            .aggregates_by_name
+            .read()
+            .iter()
+            .filter(|(_, overloads)| overloads.iter().any(|a| a.schema_id == schema_id))
+            .map(|(n, _)| n.clone())
+            .collect();
+        aggregates.sort_unstable();
+
+        let mut procedures: Vec<String> = self
+            .procedures_by_name
+            .read()
+            .iter()
+            .filter(|(_, overloads)| overloads.iter().any(|p| p.schema_id == schema_id))
+            .map(|(n, _)| n.clone())
+            .collect();
+        procedures.sort_unstable();
+
+        SchemaContents {
+            tables,
+            recycled_tables,
+            views,
+            mviews,
+            sequences,
+            functions,
+            aggregates,
+            procedures,
+        }
     }
 
     pub fn get_schema(&self, db_id: DatabaseId, name: &str) -> Result<Arc<SchemaEntry>> {
@@ -1991,6 +2170,18 @@ impl Catalog {
         }
         if self.cache.get_table_by_name(schema_id, name).is_some() {
             return Err(ZyronError::TableAlreadyExists(name.to_string()));
+        }
+        // Views and tables share the relation namespace of a schema. A table
+        // shadowing a view would make reads and writes of one name reach
+        // different objects, so the collision is rejected at creation
+        if self
+            .views_by_name
+            .read()
+            .contains_key(&(schema_id.0, name.to_string()))
+        {
+            return Err(ZyronError::Internal(format!(
+                "a view named '{name}' already exists in the schema; a table cannot share its name"
+            )));
         }
 
         if column_defs.len() > u16::MAX as usize {
@@ -2303,21 +2494,26 @@ impl Catalog {
         }
 
         // Cascade dependent catalog rows before removing the table entry.
-        // Indexes and comments are stored as their own rows, so dropping only
-        // the table entry would orphan them. Expectations live on the table
-        // entry itself and are removed with it. Every removal is logged in one
-        // transaction with a single durable flush, so drop latency is one fsync
-        // regardless of how many indexes and comments the table has.
+        // Indexes, triggers, and comments are stored as their own rows, so
+        // dropping only the table entry would orphan them. Expectations live
+        // on the table entry itself and are removed with it. Every removal is
+        // logged in one transaction with a single durable flush, so drop
+        // latency is one fsync regardless of how many dependents the table
+        // has.
         let indexes = self.cache.get_indexes_for_table(id);
         let comment_ids = self.stale_comment_ids(name);
+        let triggers = self.triggers_owned_by_table(id);
 
         let mut ddl_records: Vec<(u8, Vec<u8>)> =
-            Vec::with_capacity(indexes.len() + comment_ids.len() + 1);
+            Vec::with_capacity(indexes.len() + comment_ids.len() + triggers.len() + 1);
         for idx in &indexes {
             ddl_records.push((DDL_DROP_INDEX, idx.id.0.to_le_bytes().to_vec()));
         }
         for cid in &comment_ids {
             ddl_records.push((DDL_DROP_COMMENT, cid.to_le_bytes().to_vec()));
+        }
+        for trig in &triggers {
+            ddl_records.push((DDL_DROP_TRIGGER, trig.id.to_le_bytes().to_vec()));
         }
         ddl_records.push((DDL_DROP_TABLE, id.0.to_le_bytes().to_vec()));
         self.log_ddl_batch(&ddl_records)?;
@@ -2330,6 +2526,7 @@ impl Catalog {
             self.cache.invalidate_index(idx.id);
         }
         self.purge_table_comments(&comment_ids, name).await?;
+        self.purge_table_triggers(id, &triggers).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
         Ok(DropOutcome {
@@ -2338,6 +2535,35 @@ impl Catalog {
             heap_file_id,
             fsm_file_id,
         })
+    }
+
+    /// The triggers keyed by a table's id, collected so a cascading drop can
+    /// log their removal in the same batch as the table's.
+    fn triggers_owned_by_table(&self, id: TableId) -> Vec<Arc<crate::schema::TriggerEntry>> {
+        self.triggers_by_table
+            .read()
+            .get(&id.0)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Removes a dropped table's triggers from storage and both maps after
+    /// their removal has been logged. A trigger keyed by a dead table id
+    /// would never fire again but would linger in listings forever.
+    async fn purge_table_triggers(
+        &self,
+        id: TableId,
+        triggers: &[Arc<crate::schema::TriggerEntry>],
+    ) -> Result<()> {
+        if triggers.is_empty() {
+            return Ok(());
+        }
+        for trig in triggers {
+            self.storage.delete_trigger(trig.id).await?;
+            self.triggers_by_id.write().remove(&trig.id);
+        }
+        self.triggers_by_table.write().remove(&id.0);
+        Ok(())
     }
 
     /// Collects the ids of table-level and column-level comments attached to a
@@ -2413,19 +2639,23 @@ impl Catalog {
             _ => return Ok(None),
         };
 
-        // Log the table and its dependent index/comment removals in one
-        // transaction with a single durable flush, then apply the buffered
-        // storage and cache mutations.
+        // Log the table and its dependent index/trigger/comment removals in
+        // one transaction with a single durable flush, then apply the
+        // buffered storage and cache mutations.
         let indexes = self.cache.get_indexes_for_table(id);
         let comment_ids = self.stale_comment_ids(&entry.name);
+        let triggers = self.triggers_owned_by_table(id);
 
         let mut ddl_records: Vec<(u8, Vec<u8>)> =
-            Vec::with_capacity(indexes.len() + comment_ids.len() + 1);
+            Vec::with_capacity(indexes.len() + comment_ids.len() + triggers.len() + 1);
         for idx in &indexes {
             ddl_records.push((DDL_DROP_INDEX, idx.id.0.to_le_bytes().to_vec()));
         }
         for cid in &comment_ids {
             ddl_records.push((DDL_DROP_COMMENT, cid.to_le_bytes().to_vec()));
+        }
+        for trig in &triggers {
+            ddl_records.push((DDL_DROP_TRIGGER, trig.id.to_le_bytes().to_vec()));
         }
         ddl_records.push((DDL_DROP_TABLE, id.0.to_le_bytes().to_vec()));
         self.log_ddl_batch(&ddl_records)?;
@@ -2435,6 +2665,7 @@ impl Catalog {
             self.cache.invalidate_index(idx.id);
         }
         self.purge_table_comments(&comment_ids, &entry.name).await?;
+        self.purge_table_triggers(id, &triggers).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
         Ok(Some(entry))
@@ -2875,15 +3106,35 @@ impl Catalog {
     /// all schemas. Used by nextval/currval/setval at execution time where the
     /// session schema is not threaded into the executor. Errors when the name
     /// is ambiguous across schemas or not found.
-    pub fn find_sequence_by_name(&self, name: &str) -> Result<Arc<crate::sequence::LiveSequence>> {
-        let bare = name.rsplit('.').next().unwrap_or(name);
+    pub fn resolve_sequence(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::sequence::LiveSequence>> {
+        // A qualified name reads exactly the named schema of the database.
+        // The executor resolves sequences at runtime from a string value, so
+        // a bare name keeps the unique-across-schemas rule with a loud
+        // ambiguity error rather than silently picking one.
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .sequences_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "sequence '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
         let map = self.sequences_by_name.read();
         let mut found: Option<Arc<crate::sequence::LiveSequence>> = None;
         for ((_, n), live) in map.iter() {
-            if n == bare {
+            if n == name {
                 if found.is_some() {
                     return Err(ZyronError::Internal(format!(
-                        "sequence name '{bare}' is ambiguous across schemas; qualify it"
+                        "sequence name '{name}' is ambiguous across schemas; qualify it"
                     )));
                 }
                 found = Some(Arc::clone(live));
@@ -3073,6 +3324,19 @@ impl Catalog {
         mut entry: crate::schema::ViewEntry,
         or_replace: bool,
     ) -> Result<u32> {
+        // Views and tables share the relation namespace of a schema. A view
+        // shadowing a table would make reads and writes of one name reach
+        // different objects, so the collision is rejected at creation
+        if self
+            .cache
+            .get_table_by_name(entry.schema_id, &entry.name)
+            .is_some()
+        {
+            return Err(ZyronError::Internal(format!(
+                "a table named '{}' already exists in the schema; a view cannot share its name",
+                entry.name
+            )));
+        }
         let key = (entry.schema_id.0, entry.name.clone());
         let existing_id = self.views_by_name.read().get(&key).map(|v| v.id);
         match existing_id {
@@ -3121,24 +3385,33 @@ impl Catalog {
             .map(Arc::clone)
     }
 
-    /// Resolves a view by its bare name across all schemas. Used by the binder,
-    /// which resolves view references without a threaded schema. Errors when
-    /// the bare name is ambiguous across schemas.
-    pub fn find_view_by_name(&self, name: &str) -> Result<Option<Arc<crate::schema::ViewEntry>>> {
-        let bare = name.rsplit('.').next().unwrap_or(name);
-        let map = self.views_by_name.read();
-        let mut found: Option<Arc<crate::schema::ViewEntry>> = None;
-        for ((_, n), entry) in map.iter() {
-            if n == bare {
-                if found.is_some() {
-                    return Err(ZyronError::Internal(format!(
-                        "view name '{bare}' is ambiguous across schemas; qualify it"
-                    )));
-                }
-                found = Some(Arc::clone(entry));
+    /// Resolves a view reference the way the binder resolves tables: a
+    /// qualified `schema.view` reads exactly that schema of the database, a
+    /// bare name walks the search path in order and takes the first hit.
+    /// There is no cross-schema fallback, so a name never resolves into a
+    /// schema the session did not name.
+    pub fn resolve_view_scoped(
+        &self,
+        db_id: DatabaseId,
+        search_path: &[String],
+        name: &str,
+    ) -> Option<Arc<crate::schema::ViewEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part).ok()?;
+            return self.get_view(schema.id, bare);
+        }
+        for entry in search_path {
+            // System entries like zyron_sys.core are not schemas of this
+            // database and resolve to nothing here, which is correct: user
+            // views never live in them
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            if let Some(view) = self.get_view(schema.id, name) {
+                return Some(view);
             }
         }
-        Ok(found)
+        None
     }
 
     /// Lists every view.
@@ -3155,6 +3428,20 @@ impl Catalog {
             .get(&key)
             .map(|v| v.id)
             .ok_or_else(|| ZyronError::Internal(format!("view '{name}' not found")))?;
+
+        // INSTEAD OF triggers are keyed by the view's id, so they go first.
+        // A failure here leaves the view fully intact and the drop retryable;
+        // deleting the view first would strand any trigger the cascade did
+        // not reach as an orphan keyed by a dead id
+        let trigger_names: Vec<String> = self
+            .triggers_by_table
+            .read()
+            .get(&id)
+            .map(|v| v.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
+        for trig_name in trigger_names {
+            self.drop_trigger(TableId(id), &trig_name).await?;
+        }
 
         self.log_ddl(DDL_DROP_VIEW, &id.to_le_bytes())?;
         self.storage.delete_view(id).await?;
@@ -3180,6 +3467,13 @@ impl Catalog {
         {
             return Err(ZyronError::Internal(format!(
                 "view '{new_name}' already exists"
+            )));
+        }
+        // Views and tables share the relation namespace of a schema, so a
+        // rename may not move the view onto an existing table's name
+        if self.cache.get_table_by_name(schema_id, new_name).is_some() {
+            return Err(ZyronError::Internal(format!(
+                "a table named '{new_name}' already exists in the schema; a view cannot share its name"
             )));
         }
 
@@ -3368,13 +3662,15 @@ impl Catalog {
         mut entry: crate::schema::FunctionEntry,
         or_replace: bool,
     ) -> Result<u32> {
-        // Detect an existing overload with the identical signature.
+        // Detect an existing overload with the identical signature. Uniqueness
+        // is per schema, a same-named function in another schema is a
+        // different object
         let existing_id = {
             let map = self.functions_by_name.read();
             map.get(&entry.name).and_then(|overloads| {
                 overloads
                     .iter()
-                    .find(|f| f.param_types == entry.param_types)
+                    .find(|f| f.schema_id == entry.schema_id && f.param_types == entry.param_types)
                     .map(|f| f.id)
             })
         };
@@ -3405,29 +3701,125 @@ impl Catalog {
         Ok(id)
     }
 
-    /// Resolves a function overload by bare name and argument count. When
-    /// several overloads share the arity, the one whose parameter types match
-    /// `arg_types` wins; otherwise the first same-arity overload is returned.
-    pub fn find_function(
+    /// Picks a function overload within one schema. An overload whose
+    /// parameter types match exactly wins, then the first overload of the
+    /// right arity, whose arguments coerce at bind time.
+    fn pick_function_overload(
+        overloads: &[Arc<crate::schema::FunctionEntry>],
+        schema_id: SchemaId,
+        arg_types: &[zyron_common::TypeId],
+    ) -> Option<Arc<crate::schema::FunctionEntry>> {
+        let mut first_same_arity = None;
+        for f in overloads {
+            if f.schema_id != schema_id || f.param_types.len() != arg_types.len() {
+                continue;
+            }
+            if f.param_types.as_slice() == arg_types {
+                return Some(Arc::clone(f));
+            }
+            if first_same_arity.is_none() {
+                first_same_arity = Some(Arc::clone(f));
+            }
+        }
+        first_same_arity
+    }
+
+    /// Resolves a scalar UDF reference: a qualified `schema.fn` reads exactly
+    /// that schema of the database, a bare name walks the search path in
+    /// order. No cross-schema fallback and no first-wins pick, so a call
+    /// never lands on a same-named function in a schema the session did not
+    /// name.
+    pub fn resolve_function_scoped(
+        &self,
+        db_id: DatabaseId,
+        search_path: &[String],
+        name: &str,
+        arg_types: &[zyron_common::TypeId],
+    ) -> Option<Arc<crate::schema::FunctionEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part).ok()?;
+            let map = self.functions_by_name.read();
+            return Self::pick_function_overload(map.get(bare)?, schema.id, arg_types);
+        }
+        let map = self.functions_by_name.read();
+        let overloads = map.get(name)?;
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            if let Some(hit) = Self::pick_function_overload(overloads, schema.id, arg_types) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    /// Resolves a stored canonical `schema.fn` reference, matching the schema
+    /// by name through the entry's own schema id, so an aggregate's state or
+    /// final function binds to the exact function its definition named
+    /// regardless of any session's database or search path.
+    pub fn resolve_function_canonical(
         &self,
         name: &str,
         arg_types: &[zyron_common::TypeId],
     ) -> Option<Arc<crate::schema::FunctionEntry>> {
-        let bare = name.rsplit('.').next().unwrap_or(name);
+        let (schema_part, bare) = name.split_once('.')?;
         let map = self.functions_by_name.read();
         let overloads = map.get(bare)?;
-        let same_arity: Vec<&Arc<crate::schema::FunctionEntry>> = overloads
-            .iter()
-            .filter(|f| f.param_types.len() == arg_types.len())
-            .collect();
-        if same_arity.is_empty() {
-            return None;
+        let mut first_same_arity = None;
+        for f in overloads {
+            let schema_matches = self
+                .get_schema_by_id(f.schema_id)
+                .map(|s| s.name == schema_part)
+                .unwrap_or(false);
+            if !schema_matches || f.param_types.len() != arg_types.len() {
+                continue;
+            }
+            if f.param_types.as_slice() == arg_types {
+                return Some(Arc::clone(f));
+            }
+            if first_same_arity.is_none() {
+                first_same_arity = Some(Arc::clone(f));
+            }
         }
-        same_arity
-            .iter()
-            .find(|f| f.param_types.as_slice() == arg_types)
-            .or_else(|| same_arity.first())
-            .map(|f| Arc::clone(f))
+        first_same_arity
+    }
+
+    /// The canonical `schema.name` a stored reference records for a function,
+    /// derived from the entry's own schema.
+    pub fn canonical_function_name(&self, entry: &crate::schema::FunctionEntry) -> Result<String> {
+        let schema = self.get_schema_by_id(entry.schema_id)?;
+        Ok(format!("{}.{}", schema.name, entry.name))
+    }
+
+    /// Resolves which schema a function reference names, for DROP. A
+    /// qualified name reads exactly that schema, a bare name walks the search
+    /// path to the first schema holding any overload. Returns the schema and
+    /// the bare function name.
+    pub fn resolve_function_schema(
+        &self,
+        db_id: DatabaseId,
+        search_path: &[String],
+        name: &str,
+    ) -> Option<(SchemaId, String)> {
+        let map = self.functions_by_name.read();
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part).ok()?;
+            let present = map
+                .get(bare)
+                .is_some_and(|ov| ov.iter().any(|f| f.schema_id == schema.id));
+            return present.then(|| (schema.id, bare.to_string()));
+        }
+        let overloads = map.get(name)?;
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            if overloads.iter().any(|f| f.schema_id == schema.id) {
+                return Some((schema.id, name.to_string()));
+            }
+        }
+        None
     }
 
     /// Lists every registered function.
@@ -3439,13 +3831,19 @@ impl Catalog {
             .collect()
     }
 
-    /// Drops every overload of a function by name. Errors when none exist.
-    pub async fn drop_function(&self, name: &str) -> Result<()> {
+    /// Drops every overload of a function name within ONE schema. The schema
+    /// comes from the caller's resolution, so a drop never reaches a
+    /// same-named function in another schema.
+    pub async fn drop_function(&self, schema_id: SchemaId, name: &str) -> Result<()> {
         let bare = name.rsplit('.').next().unwrap_or(name);
         let ids: Vec<u32> = {
             let map = self.functions_by_name.read();
             match map.get(bare) {
-                Some(overloads) => overloads.iter().map(|f| f.id).collect(),
+                Some(overloads) => overloads
+                    .iter()
+                    .filter(|f| f.schema_id == schema_id)
+                    .map(|f| f.id)
+                    .collect(),
                 None => Vec::new(),
             }
         };
@@ -3491,12 +3889,14 @@ impl Catalog {
         mut entry: crate::schema::AggregateEntry,
         or_replace: bool,
     ) -> Result<u32> {
+        // Uniqueness is per schema, a same-named aggregate in another schema
+        // is a different object
         let existing_id = {
             let map = self.aggregates_by_name.read();
             map.get(&entry.name).and_then(|overloads| {
                 overloads
                     .iter()
-                    .find(|a| a.input_types == entry.input_types)
+                    .find(|a| a.schema_id == entry.schema_id && a.input_types == entry.input_types)
                     .map(|a| a.id)
             })
         };
@@ -3526,35 +3926,87 @@ impl Catalog {
         Ok(id)
     }
 
-    /// Resolves an aggregate overload by bare name and argument count. When
-    /// several overloads share the arity, the one whose input types match
-    /// `arg_types` wins; otherwise the first same-arity overload is returned.
-    pub fn find_aggregate(
+    /// Picks an aggregate overload within one schema. An overload whose input
+    /// types match exactly wins, then the first overload of the right arity,
+    /// whose arguments coerce at bind time.
+    fn pick_aggregate_overload(
+        overloads: &[Arc<crate::schema::AggregateEntry>],
+        schema_id: SchemaId,
+        arg_types: &[zyron_common::TypeId],
+    ) -> Option<Arc<crate::schema::AggregateEntry>> {
+        let mut first_same_arity = None;
+        for a in overloads {
+            if a.schema_id != schema_id || a.input_types.len() != arg_types.len() {
+                continue;
+            }
+            if a.input_types.as_slice() == arg_types {
+                return Some(Arc::clone(a));
+            }
+            if first_same_arity.is_none() {
+                first_same_arity = Some(Arc::clone(a));
+            }
+        }
+        first_same_arity
+    }
+
+    /// Resolves a user-defined aggregate reference: a qualified `schema.agg`
+    /// reads exactly that schema of the database, a bare name walks the
+    /// search path in order. No cross-schema fallback and no first-wins pick,
+    /// so a call never lands on a same-named aggregate in a schema the
+    /// session did not name.
+    pub fn resolve_aggregate_scoped(
         &self,
+        db_id: DatabaseId,
+        search_path: &[String],
         name: &str,
         arg_types: &[zyron_common::TypeId],
     ) -> Option<Arc<crate::schema::AggregateEntry>> {
-        let bare = name.rsplit('.').next().unwrap_or(name);
-        let map = self.aggregates_by_name.read();
-        let overloads = map.get(bare)?;
-        let same_arity: Vec<&Arc<crate::schema::AggregateEntry>> = overloads
-            .iter()
-            .filter(|a| a.input_types.len() == arg_types.len())
-            .collect();
-        if same_arity.is_empty() {
-            return None;
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part).ok()?;
+            let map = self.aggregates_by_name.read();
+            return Self::pick_aggregate_overload(map.get(bare)?, schema.id, arg_types);
         }
-        same_arity
-            .iter()
-            .find(|a| a.input_types.as_slice() == arg_types)
-            .or_else(|| same_arity.first())
-            .map(|a| Arc::clone(a))
+        let map = self.aggregates_by_name.read();
+        let overloads = map.get(name)?;
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            if let Some(hit) = Self::pick_aggregate_overload(overloads, schema.id, arg_types) {
+                return Some(hit);
+            }
+        }
+        None
     }
 
-    /// Returns true when any aggregate overload is registered under the name.
-    pub fn is_aggregate(&self, name: &str) -> bool {
-        let bare = name.rsplit('.').next().unwrap_or(name);
-        self.aggregates_by_name.read().contains_key(bare)
+    /// Resolves which schema an aggregate reference names, for DROP. A
+    /// qualified name reads exactly that schema, a bare name walks the search
+    /// path to the first schema holding any overload. Returns the schema and
+    /// the bare aggregate name.
+    pub fn resolve_aggregate_schema(
+        &self,
+        db_id: DatabaseId,
+        search_path: &[String],
+        name: &str,
+    ) -> Option<(SchemaId, String)> {
+        let map = self.aggregates_by_name.read();
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part).ok()?;
+            let present = map
+                .get(bare)
+                .is_some_and(|ov| ov.iter().any(|a| a.schema_id == schema.id));
+            return present.then(|| (schema.id, bare.to_string()));
+        }
+        let overloads = map.get(name)?;
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            if overloads.iter().any(|a| a.schema_id == schema.id) {
+                return Some((schema.id, name.to_string()));
+            }
+        }
+        None
     }
 
     /// Lists every registered aggregate.
@@ -3566,13 +4018,19 @@ impl Catalog {
             .collect()
     }
 
-    /// Drops every overload of an aggregate by name. Errors when none exist.
-    pub async fn drop_aggregate(&self, name: &str) -> Result<()> {
+    /// Drops every overload of an aggregate name within ONE schema. The
+    /// schema comes from the caller's resolution, so a drop never reaches a
+    /// same-named aggregate in another schema.
+    pub async fn drop_aggregate(&self, schema_id: SchemaId, name: &str) -> Result<()> {
         let bare = name.rsplit('.').next().unwrap_or(name);
         let ids: Vec<u32> = {
             let map = self.aggregates_by_name.read();
             match map.get(bare) {
-                Some(overloads) => overloads.iter().map(|a| a.id).collect(),
+                Some(overloads) => overloads
+                    .iter()
+                    .filter(|a| a.schema_id == schema_id)
+                    .map(|a| a.id)
+                    .collect(),
                 None => Vec::new(),
             }
         };
@@ -3620,12 +4078,14 @@ impl Catalog {
         mut entry: crate::schema::ProcedureEntry,
         or_replace: bool,
     ) -> Result<u32> {
+        // Uniqueness is per schema: the same name and signature may exist in
+        // two schemas as two distinct procedures
         let existing_id = {
             let map = self.procedures_by_name.read();
             map.get(&entry.name).and_then(|overloads| {
                 overloads
                     .iter()
-                    .find(|p| p.param_types == entry.param_types)
+                    .find(|p| p.schema_id == entry.schema_id && p.param_types == entry.param_types)
                     .map(|p| p.id)
             })
         };
@@ -3655,39 +4115,69 @@ impl Catalog {
         Ok(id)
     }
 
-    /// Resolves a procedure overload by bare name and argument count. When
-    /// several overloads share the arity, the one whose parameter types match
-    /// `arg_types` wins; otherwise the first same-arity overload is returned.
-    pub fn find_procedure(
+    /// Resolves a procedure reference: a qualified `schema.proc` reads
+    /// exactly that schema of the database, a bare name walks the search
+    /// path in order. No cross-schema fallback and no first-wins pick, so a
+    /// call never lands on a same-named procedure in a schema the session
+    /// did not name.
+    pub fn resolve_procedure_scoped(
         &self,
+        db_id: DatabaseId,
+        search_path: &[String],
         name: &str,
-        arg_types: &[zyron_common::TypeId],
     ) -> Option<Arc<crate::schema::ProcedureEntry>> {
-        let bare = name.rsplit('.').next().unwrap_or(name);
-        let map = self.procedures_by_name.read();
-        let overloads = map.get(bare)?;
-        let same_arity: Vec<&Arc<crate::schema::ProcedureEntry>> = overloads
-            .iter()
-            .filter(|p| p.param_types.len() == arg_types.len())
-            .collect();
-        if same_arity.is_empty() {
-            return None;
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part).ok()?;
+            return self
+                .procedures_by_name
+                .read()
+                .get(bare)
+                .and_then(|ov| ov.iter().find(|p| p.schema_id == schema.id).map(Arc::clone));
         }
-        same_arity
-            .iter()
-            .find(|p| p.param_types.as_slice() == arg_types)
-            .or_else(|| same_arity.first())
-            .map(|p| Arc::clone(p))
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            let hit = self
+                .procedures_by_name
+                .read()
+                .get(name)
+                .and_then(|ov| ov.iter().find(|p| p.schema_id == schema.id).map(Arc::clone));
+            if hit.is_some() {
+                return hit;
+            }
+        }
+        None
     }
 
-    /// Resolves a procedure by bare name, ignoring argument types. Used by CALL
-    /// to find the single overload when only the name is known.
-    pub fn find_procedure_by_name(&self, name: &str) -> Option<Arc<crate::schema::ProcedureEntry>> {
-        let bare = name.rsplit('.').next().unwrap_or(name);
-        self.procedures_by_name
-            .read()
-            .get(bare)
-            .and_then(|overloads| overloads.first().map(Arc::clone))
+    /// Resolves a stored canonical `schema.proc` reference, matching the
+    /// schema by name through the entry's own schema id, so a trigger or
+    /// event handler fires the exact procedure its definition bound
+    /// regardless of any session's database or search path.
+    pub fn resolve_procedure_canonical(
+        &self,
+        name: &str,
+    ) -> Option<Arc<crate::schema::ProcedureEntry>> {
+        let (schema_part, bare) = name.split_once('.')?;
+        self.procedures_by_name.read().get(bare).and_then(|ov| {
+            ov.iter()
+                .find(|p| {
+                    self.get_schema_by_id(p.schema_id)
+                        .map(|s| s.name == schema_part)
+                        .unwrap_or(false)
+                })
+                .map(Arc::clone)
+        })
+    }
+
+    /// The canonical `schema.name` a stored reference records for a
+    /// procedure, derived from the entry's own schema.
+    pub fn canonical_procedure_name(
+        &self,
+        entry: &crate::schema::ProcedureEntry,
+    ) -> Result<String> {
+        let schema = self.get_schema_by_id(entry.schema_id)?;
+        Ok(format!("{}.{}", schema.name, entry.name))
     }
 
     /// Lists every registered procedure.
@@ -3700,12 +4190,19 @@ impl Catalog {
     }
 
     /// Drops every overload of a procedure by name. Errors when none exist.
-    pub async fn drop_procedure(&self, name: &str) -> Result<()> {
+    /// Drops every overload of a procedure name within ONE schema. The
+    /// schema comes from the caller's resolution, so a drop never reaches a
+    /// same-named procedure in another schema.
+    pub async fn drop_procedure(&self, schema_id: SchemaId, name: &str) -> Result<()> {
         let bare = name.rsplit('.').next().unwrap_or(name);
         let ids: Vec<u32> = {
             let map = self.procedures_by_name.read();
             match map.get(bare) {
-                Some(overloads) => overloads.iter().map(|p| p.id).collect(),
+                Some(overloads) => overloads
+                    .iter()
+                    .filter(|p| p.schema_id == schema_id)
+                    .map(|p| p.id)
+                    .collect(),
                 None => Vec::new(),
             }
         };

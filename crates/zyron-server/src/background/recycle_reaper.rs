@@ -64,89 +64,31 @@ pub async fn run_reaper_once(server: &Arc<ServerState>) -> usize {
         if now < dropped_at.saturating_add(window) {
             continue;
         }
-        if finalize_one(server, entry.id).await {
-            purged += 1;
+        // The shared finalize path removes the catalog rows and reclaims
+        // the storage: index handles and files, heap and FSM files, the
+        // lake and columnar tiers. It is the same path DROP SCHEMA CASCADE
+        // purges through, so the two cannot drift apart.
+        match zyron_wire::ddl_dispatch::finalize_recycled_table(server, entry.id).await {
+            Ok(true) => {
+                info!(
+                    target: "zyron::recycle",
+                    table_id = entry.id.0,
+                    name = %entry.name,
+                    "purged recycled table after window elapsed"
+                );
+                purged += 1;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    target: "zyron::recycle",
+                    table_id = entry.id.0,
+                    "failed to finalize recycled table: {e:?}"
+                );
+            }
         }
     }
     purged
-}
-
-/// Finalizes a single recycled table: drops its index entries and table entry
-/// from the catalog, then reclaims the in-memory index handles and on-disk
-/// heap, FSM, and index files. Returns true when the table was purged.
-async fn finalize_one(server: &Arc<ServerState>, table_id: zyron_catalog::TableId) -> bool {
-    // Capture the index set before finalize removes the catalog entries.
-    let indexes = server.catalog.get_indexes_for_table(table_id);
-
-    let entry = match server.catalog.finalize_dropped_table(table_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return false,
-        Err(e) => {
-            warn!(
-                target: "zyron::recycle",
-                table_id = table_id.0,
-                "failed to finalize recycled table: {e}"
-            );
-            return false;
-        }
-    };
-
-    // Drop in-memory index handles and delete index files so the checkpoint
-    // worker does not resurrect a file for a now-gone index.
-    for idx in &indexes {
-        match idx.index_type {
-            zyron_catalog::IndexType::BTree => {
-                let _ = server.btree_indexes.remove_async(&idx.id.0).await;
-            }
-            zyron_catalog::IndexType::Fulltext => {
-                if let Some(m) = &server.fts_manager {
-                    let _ = m.drop_index(idx.id.0);
-                }
-            }
-            zyron_catalog::IndexType::Vector => {
-                if let Some(m) = &server.vector_manager {
-                    let _ = m.drop_index(idx.id.0);
-                }
-            }
-            zyron_catalog::IndexType::Spatial => {
-                if let Some(m) = &server.spatial_manager {
-                    m.drop_index(idx.id.0);
-                }
-            }
-        }
-        if let Err(e) = server.disk_manager.delete_file(idx.index_file_id).await {
-            warn!(
-                target: "zyron::recycle",
-                index_file_id = idx.index_file_id,
-                "failed to remove index file: {e}"
-            );
-        }
-    }
-
-    // Reclaim the heap and FSM files the recycle bin was holding.
-    let _ = server.heap_files.remove_async(&entry.heap_file_id).await;
-    if let Err(e) = server.disk_manager.delete_file(entry.heap_file_id).await {
-        warn!(
-            target: "zyron::recycle",
-            heap_file_id = entry.heap_file_id,
-            "failed to remove heap file: {e}"
-        );
-    }
-    if let Err(e) = server.disk_manager.delete_file(entry.fsm_file_id).await {
-        warn!(
-            target: "zyron::recycle",
-            fsm_file_id = entry.fsm_file_id,
-            "failed to remove FSM file: {e}"
-        );
-    }
-
-    info!(
-        target: "zyron::recycle",
-        table_id = table_id.0,
-        name = %entry.name,
-        "purged recycled table after window elapsed"
-    );
-    true
 }
 
 fn current_secs() -> u64 {

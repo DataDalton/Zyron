@@ -294,8 +294,7 @@ async fn test_default_search_path_resolves_bare_names() {
         &vec![
             "zyron_sys.core".to_string(),
             "zyron_sys.stat".to_string(),
-            "information_schema".to_string(),
-            "public".to_string()
+            "information_schema".to_string()
         ],
         "the shipped default search path changed"
     );
@@ -382,7 +381,7 @@ async fn test_core_views_describe_a_real_table() {
     .expect("tables");
     assert_eq!(rows.len(), 1, "exactly one row for the table");
     let at = |name: &str| columns.iter().position(|c| c == name).expect(name);
-    assert_eq!(rows[0][at("schema_name")], "public");
+    assert_eq!(rows[0][at("schema_name")], "zyron_test");
     assert_eq!(rows[0][at("catalog_name")], "zyron");
     assert_eq!(rows[0][at("storage_format")], "HEAP");
     assert_eq!(rows[0][at("column_count")], "2");
@@ -737,7 +736,7 @@ async fn test_clauses_still_apply_under_the_new_names() {
 
     let (columns, rows) = read(
         &server,
-        "SELECT table_name, storage_format FROM zyron_sys.core.tables WHERE schema_name = 'public'",
+        "SELECT table_name, storage_format FROM zyron_sys.core.tables WHERE schema_name = 'zyron_test'",
     )
     .await
     .expect("projection");
@@ -875,7 +874,7 @@ async fn test_the_planner_refuses_an_unknown_user_table_without_a_hint() {
     let err = zyron_planner::plan(
         &server.catalog,
         zyron_catalog::DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -912,7 +911,7 @@ async fn test_a_user_table_with_a_zyron_prefix_still_resolves() {
     zyron_planner::plan(
         &server.catalog,
         zyron_catalog::DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )

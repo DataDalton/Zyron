@@ -528,6 +528,16 @@ fn build_operator_tree(
             table_id, child, ..
         } => Box::pin(build_delete(table_id, child, analyze, ctx)),
 
+        PhysicalPlan::ViewTriggerWrite {
+            view_id,
+            event,
+            param_map,
+            source,
+            ..
+        } => Box::pin(build_view_trigger_write(
+            view_id, event, param_map, source, analyze, ctx,
+        )),
+
         PhysicalPlan::Update {
             table_id,
             assignments,
@@ -1301,13 +1311,14 @@ async fn build_nested_loop_join(
         .as_ref()
         .is_some_and(zyron_planner::binder::expr_contains_subquery);
     let mut op = NestedLoopJoinOperator::new(
-        left_br.op,
-        right_br.op,
+        crate::operator::CancelPollOperator::wrap(left_br.op, ctx),
+        crate::operator::CancelPollOperator::wrap(right_br.op, ctx),
         join_type,
         condition.clone(),
         left_schema,
         right_schema,
     );
+    op.set_poll_context(Arc::clone(ctx));
     if has_subquery_cond {
         // The ON condition has a subquery (an outer join; inner joins
         // are lowered to Cross + Filter). Evaluate it per joined row
@@ -1378,8 +1389,8 @@ async fn build_hash_join(
     let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
     let remaining_condition = crate::subquery::materialize_opt(remaining_condition, ctx).await?;
     let mut join_op = HashJoinOperator::new(
-        left_br.op,
-        right_br.op,
+        crate::operator::CancelPollOperator::wrap(left_br.op, ctx),
+        crate::operator::CancelPollOperator::wrap(right_br.op, ctx),
         join_type,
         left_keys,
         right_keys,
@@ -1413,8 +1424,8 @@ async fn build_merge_join(
     let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
     let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
     let mut join_op = MergeJoinOperator::new(
-        left_br.op,
-        right_br.op,
+        crate::operator::CancelPollOperator::wrap(left_br.op, ctx),
+        crate::operator::CancelPollOperator::wrap(right_br.op, ctx),
         join_type,
         left_keys,
         right_keys,
@@ -1505,7 +1516,7 @@ async fn build_hash_aggregate(
         let child_br = build_operator_tree(*child, ctx).await?;
         let child_m = collect_metrics(&[&child_br.metrics]);
         let mut agg_op = HashAggregateOperator::new(
-            child_br.op,
+            crate::operator::CancelPollOperator::wrap(child_br.op, ctx),
             group_by,
             aggregates,
             input_schema,
@@ -1555,7 +1566,7 @@ async fn build_sort_aggregate(
     let child_br = build_operator_tree(*child, ctx).await?;
     let child_m = collect_metrics(&[&child_br.metrics]);
     let mut agg_op = SortAggregateOperator::new(
-        child_br.op,
+        crate::operator::CancelPollOperator::wrap(child_br.op, ctx),
         group_by,
         aggregates,
         input_schema,
@@ -1590,9 +1601,15 @@ async fn build_sort(
         });
     }
     let order_by = materialized_order;
-    let mut sort_op = SortOperator::new(child_br.op, order_by, input_schema, limit);
+    let mut sort_op = SortOperator::new(
+        crate::operator::CancelPollOperator::wrap(child_br.op, ctx),
+        order_by,
+        input_schema,
+        limit,
+    );
     sort_op.set_memory_budget(ctx.memory_budget.clone());
     sort_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+    sort_op.set_poll_context(Arc::clone(ctx));
     let br = BuildResult::new(Box::new(sort_op));
     Ok(br.with_metrics("Sort", analyze, child_m))
 }
@@ -1623,7 +1640,9 @@ async fn build_hash_distinct(
 ) -> Result<BuildResult> {
     let child_br = build_operator_tree(*child, ctx).await?;
     let child_m = collect_metrics(&[&child_br.metrics]);
-    let br = BuildResult::new(Box::new(HashDistinctOperator::new(child_br.op)));
+    let br = BuildResult::new(Box::new(HashDistinctOperator::new(
+        crate::operator::CancelPollOperator::wrap(child_br.op, ctx),
+    )));
     Ok(br.with_metrics("HashDistinct", analyze, child_m))
 }
 
@@ -1668,7 +1687,12 @@ async fn build_set_op(
     let left_br = build_operator_tree(*left, ctx).await?;
     let right_br = build_operator_tree(*right, ctx).await?;
     let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
-    let mut setop = SetOpOperator::new(left_br.op, right_br.op, op, all);
+    let mut setop = SetOpOperator::new(
+        crate::operator::CancelPollOperator::wrap(left_br.op, ctx),
+        crate::operator::CancelPollOperator::wrap(right_br.op, ctx),
+        op,
+        all,
+    );
     setop.set_memory_budget(ctx.memory_budget.clone());
     let br = BuildResult::new(Box::new(setop));
     Ok(br.with_metrics("SetOp", analyze, child_m))
@@ -1728,6 +1752,31 @@ async fn build_insert(
         expectations,
     )));
     Ok(br.with_metrics("Insert", analyze, child_m))
+}
+
+/// One arm of `build_operator_tree`, see that function for why the arms
+/// are not written inline
+#[inline(never)]
+async fn build_view_trigger_write(
+    view_id: u32,
+    event: u8,
+    param_map: Vec<Option<usize>>,
+    source: Box<zyron_planner::physical::PhysicalPlan>,
+    analyze: bool,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<BuildResult> {
+    let source_br = build_operator_tree(*source, ctx).await?;
+    let child_m = collect_metrics(&[&source_br.metrics]);
+    let br = BuildResult::new(Box::new(
+        crate::operator::view_write::ViewTriggerWriteOperator::new(
+            source_br.op,
+            ctx.clone(),
+            view_id,
+            event,
+            param_map,
+        ),
+    ));
+    Ok(br.with_metrics("ViewTriggerWrite", analyze, child_m))
 }
 
 /// One arm of `build_operator_tree`, see that function for why the arms
@@ -1859,8 +1908,8 @@ async fn build_parallel_hash_join(
     let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
     let remaining_condition = crate::subquery::materialize_opt(remaining_condition, ctx).await?;
     let mut join_op = ParallelHashJoinOperator::new(
-        left_br.op,
-        right_br.op,
+        crate::operator::CancelPollOperator::wrap(left_br.op, ctx),
+        crate::operator::CancelPollOperator::wrap(right_br.op, ctx),
         join_type,
         left_keys,
         right_keys,
@@ -1928,8 +1977,11 @@ async fn build_window(
     // Fold uncorrelated subqueries inside window function args,
     // PARTITION BY, and ORDER BY keys to constants.
     let window_exprs = crate::subquery::materialize_vec(window_exprs, ctx).await?;
-    let mut op =
-        crate::operator::window::WindowOperator::new(child_br.op, window_exprs, input_schema);
+    let mut op = crate::operator::window::WindowOperator::new(
+        crate::operator::CancelPollOperator::wrap(child_br.op, ctx),
+        window_exprs,
+        input_schema,
+    );
     op.set_memory_budget(ctx.memory_budget.clone());
     Ok(BuildResult::new(Box::new(op)).with_metrics("Window", analyze, child_m))
 }
@@ -2186,11 +2238,16 @@ fn build_scan_with_tuple_ids(
                         nulls_first: o.nulls_first,
                     });
                 }
-                let mut sort_op =
-                    SortOperator::new(child_br.op, materialized_order, input_schema, limit)
-                        .with_locator_tracking();
+                let mut sort_op = SortOperator::new(
+                    crate::operator::CancelPollOperator::wrap(child_br.op, ctx),
+                    materialized_order,
+                    input_schema,
+                    limit,
+                )
+                .with_locator_tracking();
                 sort_op.set_memory_budget(ctx.memory_budget.clone());
                 sort_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
+                sort_op.set_poll_context(Arc::clone(ctx));
                 let br = BuildResult::new(Box::new(sort_op));
                 Ok(br.with_metrics("Sort", analyze, child_m))
             }

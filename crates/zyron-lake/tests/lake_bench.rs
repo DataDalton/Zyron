@@ -1712,7 +1712,7 @@ fn test_encode_cost_per_row_stays_flat_as_a_column_grows() {
 /// `Commit, insert` is one figure for the whole write path. It says a batch
 /// costs four milliseconds and nothing about which part to attack, so every
 /// optimization aimed at it is a guess. This splits the path into phases a
-/// caller can invoke on its own, by differencing public entry points rather
+/// caller can invoke on its own, by differencing zyron_test entry points rather
 /// than by instrumenting the writer, so no phase is a number this test made
 /// up about code it cannot see.
 ///

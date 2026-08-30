@@ -337,7 +337,7 @@ async fn plan_for(
     zyron_planner::plan(
         &server.catalog,
         zyron_catalog::DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )

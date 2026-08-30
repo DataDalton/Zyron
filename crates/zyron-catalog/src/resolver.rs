@@ -613,7 +613,7 @@ mod tests {
                 SchemaEntry {
                     id: SchemaId(1),
                     database_id: DatabaseId(1),
-                    name: "public".to_string(),
+                    name: "zyron_test".to_string(),
                     owner: "system".to_string(),
                 },
                 SchemaEntry {
@@ -707,7 +707,12 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_unqualified_table() {
         let (cache, storage) = make_mock();
-        let resolver = NameResolver::new(DatabaseId(1), vec!["public".to_string()], cache, storage);
+        let resolver = NameResolver::new(
+            DatabaseId(1),
+            vec!["zyron_test".to_string()],
+            cache,
+            storage,
+        );
 
         let table = resolver.resolve_table(None, "users").await.unwrap();
         assert_eq!(table.id, TableId(10));
@@ -717,7 +722,12 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_qualified_table() {
         let (cache, storage) = make_mock();
-        let resolver = NameResolver::new(DatabaseId(1), vec!["public".to_string()], cache, storage);
+        let resolver = NameResolver::new(
+            DatabaseId(1),
+            vec!["zyron_test".to_string()],
+            cache,
+            storage,
+        );
 
         let table = resolver
             .resolve_table(Some("analytics"), "events")
@@ -729,7 +739,12 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_table_not_found() {
         let (cache, storage) = make_mock();
-        let resolver = NameResolver::new(DatabaseId(1), vec!["public".to_string()], cache, storage);
+        let resolver = NameResolver::new(
+            DatabaseId(1),
+            vec!["zyron_test".to_string()],
+            cache,
+            storage,
+        );
 
         let result = resolver.resolve_table(None, "nonexistent").await;
         assert!(result.is_err());
@@ -738,7 +753,12 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_column() {
         let (cache, storage) = make_mock();
-        let resolver = NameResolver::new(DatabaseId(1), vec!["public".to_string()], cache, storage);
+        let resolver = NameResolver::new(
+            DatabaseId(1),
+            vec!["zyron_test".to_string()],
+            cache,
+            storage,
+        );
 
         let table = resolver.resolve_table(None, "users").await.unwrap();
         let col = resolver.resolve_column(&table, "email").unwrap();
@@ -755,7 +775,7 @@ mod tests {
         // analytics first in search path, events is only in analytics
         let resolver = NameResolver::new(
             DatabaseId(1),
-            vec!["analytics".to_string(), "public".to_string()],
+            vec!["analytics".to_string(), "zyron_test".to_string()],
             cache,
             storage,
         );
@@ -763,7 +783,7 @@ mod tests {
         let table = resolver.resolve_table(None, "events").await.unwrap();
         assert_eq!(table.schema_id, SchemaId(2));
 
-        // users is only in public, should still be found
+        // users is only in zyron_test, should still be found
         let table = resolver.resolve_table(None, "users").await.unwrap();
         assert_eq!(table.schema_id, SchemaId(1));
     }
@@ -771,7 +791,12 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_schema_not_found() {
         let (cache, storage) = make_mock();
-        let resolver = NameResolver::new(DatabaseId(1), vec!["public".to_string()], cache, storage);
+        let resolver = NameResolver::new(
+            DatabaseId(1),
+            vec!["zyron_test".to_string()],
+            cache,
+            storage,
+        );
 
         let result = resolver.resolve_schema("nonexistent").await;
         assert!(result.is_err());
@@ -784,11 +809,15 @@ mod tests {
             schemas: vec![],
             tables: vec![],
         });
-        let mut resolver =
-            NameResolver::new(DatabaseId(1), vec!["public".to_string()], cache, storage);
+        let mut resolver = NameResolver::new(
+            DatabaseId(1),
+            vec!["zyron_test".to_string()],
+            cache,
+            storage,
+        );
 
-        assert_eq!(resolver.search_path(), &["public"]);
-        resolver.set_search_path(vec!["myschema".to_string(), "public".to_string()]);
-        assert_eq!(resolver.search_path(), &["myschema", "public"]);
+        assert_eq!(resolver.search_path(), &["zyron_test"]);
+        resolver.set_search_path(vec!["myschema".to_string(), "zyron_test".to_string()]);
+        assert_eq!(resolver.search_path(), &["myschema", "zyron_test"]);
     }
 }

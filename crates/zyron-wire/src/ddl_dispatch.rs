@@ -344,6 +344,12 @@ pub fn try_handle_ddl_utility<'a>(
             Box::pin(async move { Some(handle_resume_schedule(s, server, session).await) })
         }
 
+        // -- Session control --
+        Statement::CancelBackend { pid } => {
+            let pid = *pid;
+            Box::pin(async move { Some(handle_cancel_backend(pid, server, session).await) })
+        }
+
         // -- Functions/Aggregates --
         Statement::CreateFunction(s) => {
             Box::pin(async move { Some(handle_create_function(s, server, session).await) })
@@ -731,8 +737,10 @@ async fn handle_alter_table(
                     column.clone(),
                 )));
             }
+            let ns = schema_scoped_path(server, schema_id);
             let null_count = count_query(
                 server,
+                ns,
                 &format!(
                     "SELECT \"{}\" FROM \"{}\" WHERE \"{}\" IS NULL",
                     column, stmt.name, column
@@ -1381,6 +1389,7 @@ async fn rewrite_table_columns(
     // with old_table.columns.
     let mut new_batches = select_query_batches(
         server,
+        schema_scoped_path(server, schema_id),
         &format!("SELECT * FROM \"{table_name}\" INCLUDING DELETED"),
     )
     .await?;
@@ -1844,7 +1853,16 @@ async fn eval_default_scalar(
         "SELECT {} AS v",
         crate::lifecycle_dispatch::expr_to_sql(expr)
     );
-    let batches = select_query_batches(server, &sql).await?;
+    // A DEFAULT expression is table-free, so the system path is enough
+    let batches = select_query_batches(
+        server,
+        (
+            zyron_catalog::DatabaseId(1),
+            zyron_catalog::default_search_path(),
+        ),
+        &sql,
+    )
+    .await?;
     let scalar = batches
         .iter()
         .find(|b| b.num_rows > 0 && !b.columns.is_empty())
@@ -1860,6 +1878,7 @@ async fn eval_default_scalar(
 /// ReadCommitted transaction that is aborted afterward.
 async fn select_query_batches(
     server: &Arc<ServerState>,
+    ns: (zyron_catalog::DatabaseId, Vec<String>),
     sql: &str,
 ) -> Result<Vec<zyron_executor::batch::DataBatch>, ProtocolError> {
     use zyron_executor::context::ExecutionContext;
@@ -1871,8 +1890,8 @@ async fn select_query_batches(
         .ok_or_else(|| ProtocolError::Database(ZyronError::Internal("empty sql".into())))?;
     let plan = zyron_planner::plan(
         &server.catalog,
-        zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
+        ns.0,
+        ns.1,
         stmt,
         Some(&server.peer_facts()),
     )
@@ -1973,6 +1992,84 @@ async fn execute_write_stmt(
     }
 }
 
+/// Executes several write statements under one transaction, committing once
+/// after every statement succeeds and aborting on the first failure. Readers
+/// on other connections see all of the writes or none of them, which is what
+/// lets a refresh replace a table's contents without ever exposing an empty
+/// or half-loaded state. Statements share the transaction's id and snapshot
+/// the same way statements inside an explicit BEGIN block do.
+async fn execute_write_stmts_atomic(
+    server: &Arc<ServerState>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: Vec<String>,
+    stmts: Vec<zyron_parser::Statement>,
+) -> Result<(), ProtocolError> {
+    use zyron_executor::context::ExecutionContext;
+
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .map_err(ProtocolError::Database)?;
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id;
+
+    for stmt in stmts {
+        let plan = match zyron_planner::plan(
+            &server.catalog,
+            db_id,
+            search_path.clone(),
+            stmt,
+            Some(&server.peer_facts()),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = server.txn_manager.abort(&mut txn);
+                return Err(ProtocolError::Database(e));
+            }
+        };
+
+        let mut ctx = ExecutionContext::new(
+            server.catalog.clone(),
+            server.wal.clone(),
+            server.buffer_pool.clone(),
+            server.disk_manager.clone(),
+            txn_id,
+            snapshot.clone(),
+        );
+        ctx.heap_files = Some(Arc::clone(&server.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+        ctx.foreign_reader = server.foreign_reader.clone();
+        ctx.peers = Some(Arc::clone(&server.peers));
+        ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
+        ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+        ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+        if let Some(m) = &server.fts_manager {
+            ctx.set_fts_manager(Arc::clone(m));
+        }
+        if let Some(m) = &server.vector_manager {
+            ctx.set_vector_manager(Arc::clone(m));
+        }
+        if let Some(m) = &server.spatial_manager {
+            ctx.set_spatial_manager(Arc::clone(m));
+        }
+        let ctx = Arc::new(ctx);
+
+        if let Err(e) = zyron_executor::execute(plan, &ctx).await {
+            let _ = server.txn_manager.abort(&mut txn);
+            return Err(ProtocolError::Database(e));
+        }
+    }
+
+    server
+        .txn_manager
+        .commit(&mut txn)
+        .await
+        .map_err(ProtocolError::Database)?;
+    Ok(())
+}
+
 /// Replays reshaped batches through the InsertOperator under a write
 /// transaction, populating the new heap and every recreated index, then
 /// commits. Aborts on any failure.
@@ -2071,7 +2168,11 @@ async fn run_rebuild_insert(
 
 /// Runs a read-only SELECT and returns the number of rows it produced. Uses a
 /// throwaway ReadCommitted transaction that is aborted afterward.
-async fn count_query(server: &Arc<ServerState>, sql: &str) -> Result<u64, ProtocolError> {
+async fn count_query(
+    server: &Arc<ServerState>,
+    ns: (zyron_catalog::DatabaseId, Vec<String>),
+    sql: &str,
+) -> Result<u64, ProtocolError> {
     use zyron_executor::context::ExecutionContext;
 
     let stmt = zyron_parser::parse(sql)
@@ -2081,8 +2182,8 @@ async fn count_query(server: &Arc<ServerState>, sql: &str) -> Result<u64, Protoc
         .ok_or_else(|| ProtocolError::Database(ZyronError::Internal("empty sql".into())))?;
     let plan = zyron_planner::plan(
         &server.catalog,
-        zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
+        ns.0,
+        ns.1,
         stmt,
         Some(&server.peer_facts()),
     )
@@ -2265,11 +2366,16 @@ async fn validate_constraint_against_existing(
     let quote =
         |cols: &[String]| -> Vec<String> { cols.iter().map(|c| format!("\"{c}\"")).collect() };
 
+    // Validation queries resolve against the table's own schema, never an
+    // implicit namespace
+    let ns = schema_scoped_path(server, schema_id);
+
     match &tc.kind {
         TC::Check(expr) => {
             let pred = zyron_parser::expr_to_sql(expr);
             let violating = count_query(
                 server,
+                ns.clone(),
                 &format!("SELECT 1 FROM \"{table_name}\" WHERE NOT ({pred})"),
             )
             .await?;
@@ -2345,6 +2451,7 @@ async fn validate_constraint_against_existing(
                 .join(" AND ");
             let orphans = count_query(
                 server,
+                ns.clone(),
                 &format!(
                     "SELECT 1 FROM \"{table_name}\" c LEFT JOIN \"{ref_table}\" p ON {on} \
                      WHERE ({all_non_null}) AND p.{} IS NULL",
@@ -2370,6 +2477,7 @@ async fn validate_constraint_against_existing(
                     .join(" OR ");
                 let nulls = count_query(
                     server,
+                    ns.clone(),
                     &format!("SELECT 1 FROM \"{table_name}\" WHERE {any_null}"),
                 )
                 .await?;
@@ -2391,11 +2499,13 @@ async fn validate_constraint_against_existing(
             let key_list = qcols.join(", ");
             let total = count_query(
                 server,
+                ns.clone(),
                 &format!("SELECT {key_list} FROM \"{table_name}\" WHERE {not_null}"),
             )
             .await?;
             let distinct = count_query(
                 server,
+                ns.clone(),
                 &format!("SELECT DISTINCT {key_list} FROM \"{table_name}\" WHERE {not_null}"),
             )
             .await?;
@@ -2445,13 +2555,14 @@ async fn handle_create_table_clone(
     source: &zyron_parser::ast::CloneSource,
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::SchemaId,
+    name: &str,
 ) -> Result<DdlResult, ProtocolError> {
-    if server.catalog.get_table(schema_id, &stmt.name).is_ok() {
+    if server.catalog.get_table(schema_id, name).is_ok() {
         if stmt.if_not_exists {
             return Ok(DdlResult::Tag("CREATE TABLE".to_string()));
         }
         return Err(ProtocolError::Database(ZyronError::TableAlreadyExists(
-            stmt.name.clone(),
+            name.to_string(),
         )));
     }
 
@@ -2483,7 +2594,7 @@ async fn handle_create_table_clone(
         .collect();
     let clone_id = server
         .catalog
-        .create_table_from_columns(schema_id, &stmt.name, &columns)
+        .create_table_from_columns(schema_id, name, &columns)
         .await
         .map_err(ProtocolError::Database)?;
 
@@ -2508,14 +2619,14 @@ async fn handle_create_table_clone(
             Err(e) => {
                 // A clone without its log is unusable, so the catalog entry
                 // goes back rather than standing for a table nothing can read
-                let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+                let _ = server.catalog.drop_table(schema_id, name).await;
                 return Err(ProtocolError::Database(e));
             }
         };
     let manifest = match log.latest_manifest() {
         Ok(m) => m,
         Err(e) => {
-            let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+            let _ = server.catalog.drop_table(schema_id, name).await;
             return Err(ProtocolError::Database(e));
         }
     };
@@ -2525,7 +2636,7 @@ async fn handle_create_table_clone(
     // the file set the clone now holds still resolves
     let mut entry = server
         .catalog
-        .get_table(schema_id, &stmt.name)
+        .get_table(schema_id, name)
         .map_err(ProtocolError::Database)?
         .as_ref()
         .clone();
@@ -2571,7 +2682,9 @@ async fn handle_create_table(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // `schema.table` creates in exactly that schema; a bare name lands in
+    // the session's first user schema.
+    let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
 
     // Check CREATE privilege on the target schema
     check_ddl_privilege(
@@ -2585,7 +2698,7 @@ async fn handle_create_table(
     // A clone takes its shape from the source rather than declaring one, so
     // it does not go through column resolution at all
     if let Some(source) = &stmt.clone_of {
-        return handle_create_table_clone(stmt, source, server, schema_id).await;
+        return handle_create_table_clone(stmt, source, server, schema_id, &name).await;
     }
 
     // Storage format, resolved before the catalog entry exists so a format
@@ -2594,33 +2707,33 @@ async fn handle_create_table(
 
     match server
         .catalog
-        .create_table(schema_id, &stmt.name, &stmt.columns, &stmt.constraints)
+        .create_table(schema_id, &name, &stmt.columns, &stmt.constraints)
         .await
     {
         Ok(_) => {
-            apply_create_table_retention(server, schema_id, &stmt.name, &stmt.options).await?;
+            apply_create_table_retention(server, schema_id, &name, &stmt.options).await?;
             // A constraint declared ON VIOLATION QUARANTINE needs its
             // companion table to exist before the first row is rejected
-            apply_constraint_quarantine(server, schema_id, &stmt.name).await?;
+            apply_constraint_quarantine(server, schema_id, &name).await?;
             if lake_format {
-                if let Err(e) = apply_create_table_lake(server, schema_id, stmt).await {
+                if let Err(e) = apply_create_table_lake(server, schema_id, stmt, &name).await {
                     // A lake table without its log is unusable, undo the
                     // catalog entry rather than leave a half-created table
-                    let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+                    let _ = server.catalog.drop_table(schema_id, &name).await;
                     return Err(e);
                 }
             }
             // A declared PRIMARY KEY or UNIQUE needs the index that enforces
             // it, or the constraint is recorded and never checked
-            if let Err(e) = provision_constraint_indexes(server, schema_id, &stmt.name).await {
-                let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+            if let Err(e) = provision_constraint_indexes(server, schema_id, &name).await {
+                let _ = server.catalog.drop_table(schema_id, &name).await;
                 return Err(e);
             }
             fire_event(
                 server,
                 zyron_pipeline::event_handler::EventType::TableCreated,
-                &stmt.name,
-                &[("table".to_string(), stmt.name.clone())],
+                &name,
+                &[("table".to_string(), name.clone())],
             )
             .await;
             Ok(DdlResult::Tag("CREATE TABLE".to_string()))
@@ -3159,12 +3272,13 @@ async fn apply_create_table_lake(
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::SchemaId,
     stmt: &zyron_parser::ast::CreateTableStatement,
+    table_name: &str,
 ) -> Result<(), ProtocolError> {
     use zyron_parser::ast::{ClusterKeyTarget, ClusterMode, TableOptionValue};
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.name)
+        .get_table(schema_id, table_name)
         .map_err(ProtocolError::Database)?;
     let mut entry = (*table).clone();
 
@@ -4322,6 +4436,277 @@ async fn apply_create_table_retention(
     Ok(())
 }
 
+/// Storage-side reclamation info captured from a table entry before its
+/// catalog rows are removed. Everything needed to delete files and handles
+/// is captured up front because the catalog entry is gone by the time the
+/// reclamation runs.
+struct TableReclaim {
+    table_id: u32,
+    heap_file_id: u32,
+    fsm_file_id: u32,
+    indexes: Vec<Arc<zyron_catalog::IndexEntry>>,
+    is_lake: bool,
+    columnar_segments: Vec<zyron_catalog::schema::ColumnarSegmentEntry>,
+}
+
+fn capture_table_reclaim(
+    server: &Arc<ServerState>,
+    table: &zyron_catalog::TableEntry,
+) -> TableReclaim {
+    TableReclaim {
+        table_id: table.id.0,
+        heap_file_id: table.heap_file_id,
+        fsm_file_id: table.fsm_file_id,
+        indexes: server.catalog.get_indexes_for_table(table.id),
+        is_lake: table.lake.is_lake(),
+        columnar_segments: table.columnar.segments.clone(),
+    }
+}
+
+/// Reclaims every storage artifact of a hard-dropped table: IO counters,
+/// in-memory index handles, index files, the heap and FSM files, the lake
+/// tier, and the columnar tier. The catalog rows are already gone, so
+/// nothing can re-register these files. A deletion failure is surfaced
+/// rather than swallowed, because it leaks the file until a restart.
+async fn reclaim_table_storage(
+    server: &Arc<ServerState>,
+    r: &TableReclaim,
+) -> Result<(), ProtocolError> {
+    server.table_io_stats.remove(r.table_id);
+
+    // Index handles go before index files: the checkpoint worker writes
+    // through live handles, so a file deleted under a live handle could be
+    // resurrected by the next checkpoint.
+    for idx in &r.indexes {
+        server.index_io_stats.remove(idx.id.0);
+        match idx.index_type {
+            zyron_catalog::IndexType::BTree => {
+                let _ = server.btree_indexes.remove_async(&idx.id.0).await;
+            }
+            zyron_catalog::IndexType::Fulltext => {
+                if let Some(m) = &server.fts_manager {
+                    let _ = m.drop_index(idx.id.0);
+                }
+            }
+            zyron_catalog::IndexType::Vector => {
+                if let Some(m) = &server.vector_manager {
+                    let _ = m.drop_index(idx.id.0);
+                }
+            }
+            zyron_catalog::IndexType::Spatial => {
+                if let Some(m) = &server.spatial_manager {
+                    m.drop_index(idx.id.0);
+                }
+            }
+        }
+        if idx.index_file_id != 0 {
+            if let Err(e) = server.disk_manager.delete_file(idx.index_file_id).await {
+                tracing::error!(
+                    target: "zyron::ddl",
+                    index_file_id = idx.index_file_id,
+                    "table drop failed to remove index file: {e}"
+                );
+                return Err(ProtocolError::Database(e));
+            }
+        }
+    }
+
+    // Heap and FSM files. File id zero is the reserved "no file" value a
+    // foreign table carries, and there is nothing local to reclaim for one.
+    if r.heap_file_id != 0 {
+        let _ = server.heap_files.remove_async(&r.heap_file_id).await;
+        if let Err(e) = server.disk_manager.delete_file(r.heap_file_id).await {
+            tracing::error!(
+                target: "zyron::ddl",
+                heap_file_id = r.heap_file_id,
+                "table drop failed to remove heap file: {e}"
+            );
+            return Err(ProtocolError::Database(e));
+        }
+        if let Err(e) = server.disk_manager.delete_file(r.fsm_file_id).await {
+            tracing::error!(
+                target: "zyron::ddl",
+                fsm_file_id = r.fsm_file_id,
+                "table drop failed to remove FSM file: {e}"
+            );
+            return Err(ProtocolError::Database(e));
+        }
+    }
+
+    // Reclaim the lake tier: the shared log handle and the whole table
+    // root, log, checkpoints and data files. The catalog entry is already
+    // gone so nothing can re-register them.
+    if r.is_lake {
+        let id = r.table_id;
+        let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), id);
+        // A clone holds a claim on the table it came from. Read it before
+        // the log goes, because the claim is recorded in the clone's own
+        // manifest, and drop it after: a source left carrying a pin from a
+        // table that no longer exists would never reclaim those files again
+        let pinned_source = zyron_lake::TransactionLog::lookup_shared(&paths)
+            .and_then(|log| log.latest_manifest().ok())
+            .and_then(|m| zyron_lake::clone_source(&m))
+            .map(|(source_id, _)| source_id);
+        zyron_lake::TransactionLog::remove_shared(&paths);
+        if let Some(source_id) = pinned_source {
+            let source_paths =
+                zyron_lake::LakePaths::new(server.disk_manager.data_dir(), source_id);
+            if let Err(e) = zyron_lake::release_pin(&source_paths, id) {
+                tracing::warn!(
+                    target: "zyron::ddl",
+                    table_id = id,
+                    source_id,
+                    error = %e,
+                    "dropped a clone but could not release its pin, the source will \
+                     keep its files until the pin is removed by hand"
+                );
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(paths.root()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(
+                    target: "zyron::ddl",
+                    table_id = id,
+                    "table drop failed to remove the lake root: {e}"
+                );
+                return Err(ProtocolError::Database(e.into()));
+            }
+        }
+    }
+
+    // Reclaim the columnar tier: .zyr segments, RID sidecars and the patch
+    // store. The catalog entry is already gone, so recovery cannot
+    // re-register these files, no WAL record is needed.
+    if !r.columnar_segments.is_empty() {
+        let columnar_table_id = r.table_id as u64;
+        let columnar_dir = std::path::Path::new(&r.columnar_segments[0].path)
+            .parent()
+            .map(|d| d.to_path_buf());
+        let store = zyron_storage::columnar::ColumnarPatchManager::store_for_segment(
+            columnar_table_id,
+            std::path::Path::new(&r.columnar_segments[0].path),
+        )
+        .map_err(ProtocolError::Database)?;
+        let patch_path = columnar_dir
+            .as_ref()
+            .map(|d| d.join(format!("{}.zyrpatch", columnar_table_id)));
+        for seg in &r.columnar_segments {
+            let seg_path = std::path::Path::new(&seg.path);
+            if let Err(e) = std::fs::remove_file(seg_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(
+                        target: "zyron::ddl",
+                        segment = %seg.path,
+                        "table drop failed to remove columnar segment: {e}"
+                    );
+                    return Err(ProtocolError::Database(ZyronError::IoError(format!(
+                        "table drop failed to remove columnar segment {}: {e}",
+                        seg.path
+                    ))));
+                }
+            }
+            let rids = seg_path.with_extension("zyrrids");
+            if let Err(e) = std::fs::remove_file(&rids) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        target: "zyron::ddl",
+                        segment = %seg.path,
+                        "table drop failed to remove RID sidecar: {e}"
+                    );
+                }
+            }
+            if let Some(pp) = &patch_path {
+                store
+                    .drop_file(seg.file_id, pp)
+                    .map_err(ProtocolError::Database)?;
+            }
+        }
+        if let (Some(dir), Some(pp)) = (&columnar_dir, &patch_path) {
+            let mgr = zyron_storage::columnar::ColumnarPatchManager::global(dir);
+            if let Err(e) = mgr.remove_store(columnar_table_id, pp) {
+                tracing::warn!(
+                    target: "zyron::ddl",
+                    table_id = columnar_table_id,
+                    "table drop left an empty patch file behind: {e}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How the shared table drop treats a configured recycle window.
+enum TableDropMode {
+    /// DROP TABLE semantics: a table with a recycle window soft-drops and
+    /// waits for UNDROP or the reaper
+    Statement,
+    /// DROP SCHEMA CASCADE semantics: the schema is being destroyed with
+    /// explicit consent, so a soft drop finalizes immediately, the recycle
+    /// bin cannot outlive its schema
+    Purge,
+}
+
+/// Drops one table of one schema through the full cleanup: the catalog
+/// rows (indexes, triggers, and comments cascade there), then the storage
+/// reclamation. Shared by DROP TABLE, DROP MATERIALIZED VIEW, and DROP
+/// SCHEMA CASCADE.
+async fn drop_table_in_schema(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+    name: &str,
+    mode: TableDropMode,
+) -> Result<(), ProtocolError> {
+    let table = server
+        .catalog
+        .get_table(schema_id, name)
+        .map_err(ProtocolError::Database)?;
+    let reclaim = capture_table_reclaim(server, &table);
+    let outcome = server
+        .catalog
+        .drop_table(schema_id, name)
+        .await
+        .map_err(ProtocolError::Database)?;
+    if outcome.soft_dropped {
+        return match mode {
+            TableDropMode::Statement => Ok(()),
+            TableDropMode::Purge => finalize_recycled_table(server, table.id).await.map(|_| ()),
+        };
+    }
+    reclaim_table_storage(server, &reclaim).await
+}
+
+/// Physically purges one soft-dropped table: removes its catalog rows and
+/// reclaims its storage, the lake and columnar tiers included. Returns
+/// false when the table is not soft-dropped (already restored or already
+/// purged), which keeps callers idempotent. Shared by the background
+/// recycle reaper and DROP SCHEMA CASCADE.
+pub async fn finalize_recycled_table(
+    server: &Arc<ServerState>,
+    table_id: zyron_catalog::TableId,
+) -> Result<bool, ProtocolError> {
+    // Captured before finalize removes the catalog entries.
+    let indexes = server.catalog.get_indexes_for_table(table_id);
+    let entry = match server
+        .catalog
+        .finalize_dropped_table(table_id)
+        .await
+        .map_err(ProtocolError::Database)?
+    {
+        Some(e) => e,
+        None => return Ok(false),
+    };
+    let reclaim = TableReclaim {
+        table_id: entry.id.0,
+        heap_file_id: entry.heap_file_id,
+        fsm_file_id: entry.fsm_file_id,
+        indexes,
+        is_lake: entry.lake.is_lake(),
+        columnar_segments: entry.columnar.segments.clone(),
+    };
+    reclaim_table_storage(server, &reclaim).await?;
+    Ok(true)
+}
+
 async fn handle_drop_table(
     stmt: &zyron_parser::ast::DropTableStatement,
     server: &Arc<ServerState>,
@@ -4330,17 +4715,7 @@ async fn handle_drop_table(
     let (_, schema_id) = get_session_schema(session, server, None)?;
 
     // Check DROP privilege on the table if it exists. If the table does not
-    // exist and IF EXISTS is set, skip the privilege check entirely. The
-    // columnar registry is captured here because the catalog entry is gone
-    // once the drop commits
-    let mut columnar_segments: Vec<zyron_catalog::schema::ColumnarSegmentEntry> = Vec::new();
-    let mut columnar_table_id: u64 = 0;
-    let mut lake_table_id: Option<u32> = None;
-    // Table and index ids captured before the drop so their IO counters can be
-    // discarded with them. A soft drop keeps both, because UNDROP restores the
-    // table under the same id and its history is still its own
-    let mut dropped_table_id: Option<u32> = None;
-    let mut dropped_index_ids: Vec<u32> = Vec::new();
+    // exist and IF EXISTS is set, skip the privilege check entirely.
     if let Ok(table) = server.catalog.get_table(schema_id, &stmt.name) {
         check_ddl_privilege(
             server,
@@ -4349,154 +4724,10 @@ async fn handle_drop_table(
             zyron_auth::ObjectType::Table,
             table.id.0,
         )?;
-        columnar_segments = table.columnar.segments.clone();
-        columnar_table_id = table.id.0 as u64;
-        lake_table_id = table.lake.is_lake().then_some(table.id.0);
-        dropped_table_id = Some(table.id.0);
-        dropped_index_ids = server
-            .catalog
-            .get_indexes_for_table(table.id)
-            .iter()
-            .map(|idx| idx.id.0)
-            .collect();
     }
 
-    match server.catalog.drop_table(schema_id, &stmt.name).await {
-        Ok(outcome) => {
-            if !outcome.soft_dropped {
-                if let Some(id) = dropped_table_id {
-                    server.table_io_stats.remove(id);
-                }
-                for idx_id in &dropped_index_ids {
-                    server.index_io_stats.remove(*idx_id);
-                }
-            }
-            // A hard drop removed the catalog entry, so reclaim the backing
-            // heap and FSM files now. A soft drop keeps them for UNDROP, the
-            // reaper reclaims them after the recycle window elapses. File id
-            // zero is the reserved "no file" value a foreign table carries,
-            // and there is nothing local to reclaim for one
-            if !outcome.soft_dropped && outcome.heap_file_id != 0 {
-                let _ = server.heap_files.remove_async(&outcome.heap_file_id).await;
-                // A failed file delete after the catalog entry is gone leaks the
-                // backing files. Surface it to the caller rather than swallowing
-                // it so the leak is not silent.
-                if let Err(e) = server.disk_manager.delete_file(outcome.heap_file_id).await {
-                    tracing::error!(
-                        target: "zyron::ddl",
-                        heap_file_id = outcome.heap_file_id,
-                        "DROP TABLE failed to remove heap file: {e}"
-                    );
-                    return Err(ProtocolError::Database(e));
-                }
-                if let Err(e) = server.disk_manager.delete_file(outcome.fsm_file_id).await {
-                    tracing::error!(
-                        target: "zyron::ddl",
-                        fsm_file_id = outcome.fsm_file_id,
-                        "DROP TABLE failed to remove FSM file: {e}"
-                    );
-                    return Err(ProtocolError::Database(e));
-                }
-                // Reclaim the lake tier: the shared log handle and the whole
-                // table root, log, checkpoints and data files. The catalog
-                // entry is already gone so nothing can re-register them. A
-                // soft drop keeps everything for UNDROP
-                if let Some(id) = lake_table_id {
-                    let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), id);
-                    // A clone holds a claim on the table it came from. Read
-                    // it before the log goes, because the claim is recorded
-                    // in the clone's own manifest, and drop it after: a
-                    // source left carrying a pin from a table that no longer
-                    // exists would never reclaim those files again
-                    let pinned_source = zyron_lake::TransactionLog::lookup_shared(&paths)
-                        .and_then(|log| log.latest_manifest().ok())
-                        .and_then(|m| zyron_lake::clone_source(&m))
-                        .map(|(source_id, _)| source_id);
-                    zyron_lake::TransactionLog::remove_shared(&paths);
-                    if let Some(source_id) = pinned_source {
-                        let source_paths =
-                            zyron_lake::LakePaths::new(server.disk_manager.data_dir(), source_id);
-                        if let Err(e) = zyron_lake::release_pin(&source_paths, id) {
-                            tracing::warn!(
-                                target: "zyron::ddl",
-                                table_id = id,
-                                source_id,
-                                error = %e,
-                                "dropped a clone but could not release its pin, the source will \
-                                 keep its files until the pin is removed by hand"
-                            );
-                        }
-                    }
-                    if let Err(e) = std::fs::remove_dir_all(paths.root()) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::error!(
-                                target: "zyron::ddl",
-                                table_id = id,
-                                "DROP TABLE failed to remove the lake root: {e}"
-                            );
-                            return Err(ProtocolError::Database(e.into()));
-                        }
-                    }
-                }
-                // Reclaim the columnar tier: .zyr segments, RID sidecars and
-                // the patch store. The catalog entry is already gone, so
-                // recovery cannot re-register these files, no WAL record is
-                // needed. A soft drop keeps them for UNDROP
-                if !columnar_segments.is_empty() {
-                    let columnar_dir = std::path::Path::new(&columnar_segments[0].path)
-                        .parent()
-                        .map(|d| d.to_path_buf());
-                    let store = zyron_storage::columnar::ColumnarPatchManager::store_for_segment(
-                        columnar_table_id,
-                        std::path::Path::new(&columnar_segments[0].path),
-                    )
-                    .map_err(ProtocolError::Database)?;
-                    let patch_path = columnar_dir
-                        .as_ref()
-                        .map(|d| d.join(format!("{}.zyrpatch", columnar_table_id)));
-                    for seg in &columnar_segments {
-                        let seg_path = std::path::Path::new(&seg.path);
-                        if let Err(e) = std::fs::remove_file(seg_path) {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                tracing::error!(
-                                    target: "zyron::ddl",
-                                    segment = %seg.path,
-                                    "DROP TABLE failed to remove columnar segment: {e}"
-                                );
-                                return Err(ProtocolError::Database(ZyronError::IoError(format!(
-                                    "DROP TABLE failed to remove columnar segment {}: {e}",
-                                    seg.path
-                                ))));
-                            }
-                        }
-                        let rids = seg_path.with_extension("zyrrids");
-                        if let Err(e) = std::fs::remove_file(&rids) {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                tracing::warn!(
-                                    target: "zyron::ddl",
-                                    segment = %seg.path,
-                                    "DROP TABLE failed to remove RID sidecar: {e}"
-                                );
-                            }
-                        }
-                        if let Some(pp) = &patch_path {
-                            store
-                                .drop_file(seg.file_id, pp)
-                                .map_err(ProtocolError::Database)?;
-                        }
-                    }
-                    if let (Some(dir), Some(pp)) = (&columnar_dir, &patch_path) {
-                        let mgr = zyron_storage::columnar::ColumnarPatchManager::global(dir);
-                        if let Err(e) = mgr.remove_store(columnar_table_id, pp) {
-                            tracing::warn!(
-                                target: "zyron::ddl",
-                                table_id = columnar_table_id,
-                                "DROP TABLE left an empty patch file behind: {e}"
-                            );
-                        }
-                    }
-                }
-            }
+    match drop_table_in_schema(server, schema_id, &stmt.name, TableDropMode::Statement).await {
+        Ok(()) => {
             fire_event(
                 server,
                 zyron_pipeline::event_handler::EventType::TableDropped,
@@ -4506,10 +4737,10 @@ async fn handle_drop_table(
             .await;
             Ok(DdlResult::Tag("DROP TABLE".to_string()))
         }
-        Err(ZyronError::TableNotFound(_)) if stmt.if_exists => {
+        Err(ProtocolError::Database(ZyronError::TableNotFound(_))) if stmt.if_exists => {
             Ok(DdlResult::Tag("DROP TABLE".to_string()))
         }
-        Err(e) => Err(ProtocolError::Database(e)),
+        Err(e) => Err(e),
     }
 }
 
@@ -5102,6 +5333,83 @@ async fn handle_drop_schema(
         db_id.0,
     )?;
 
+    // CASCADE empties the schema through the real per-object drop paths
+    // before the catalog removes the empty shell. Without it, the catalog
+    // refuses a non-empty schema and its error names what is inside. Each
+    // per-object drop is durable on its own, so a failure mid-cascade
+    // leaves a smaller schema and the statement can simply be retried.
+    if stmt.cascade {
+        let schema = match server.catalog.ensure_schema_droppable(db_id, &stmt.name) {
+            Ok(s) => s,
+            Err(ZyronError::SchemaNotFound(_)) if stmt.if_exists => {
+                return Ok(DdlResult::Tag("DROP SCHEMA".to_string()));
+            }
+            Err(e) => return Err(ProtocolError::Database(e)),
+        };
+        let contents = server.catalog.schema_contents(schema.id);
+
+        // Materialized views go first so their backing tables leave through
+        // the materialized-view path rather than as bare tables.
+        for name in &contents.mviews {
+            server
+                .catalog
+                .drop_mview(schema.id, name)
+                .await
+                .map_err(ProtocolError::Database)?;
+            match drop_table_in_schema(server, schema.id, name, TableDropMode::Purge).await {
+                Ok(()) => {}
+                Err(ProtocolError::Database(ZyronError::TableNotFound(_))) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Views cascade their INSTEAD OF triggers in the catalog drop.
+        for name in &contents.views {
+            server
+                .catalog
+                .drop_view(schema.id, name)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+        // Live tables purge even when a recycle window is configured: the
+        // recycle bin cannot outlive the schema being destroyed.
+        for name in &contents.tables {
+            drop_table_in_schema(server, schema.id, name, TableDropMode::Purge).await?;
+        }
+        for (table_id, _) in &contents.recycled_tables {
+            finalize_recycled_table(server, *table_id).await?;
+        }
+        for name in &contents.sequences {
+            server
+                .catalog
+                .drop_sequence(schema.id, name)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+        // Aggregates before functions: an aggregate's state function may
+        // live in this same schema.
+        for name in &contents.aggregates {
+            server
+                .catalog
+                .drop_aggregate(schema.id, name)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+        for name in &contents.functions {
+            server
+                .catalog
+                .drop_function(schema.id, name)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+        for name in &contents.procedures {
+            server
+                .catalog
+                .drop_procedure(schema.id, name)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+    }
+
     match server.catalog.drop_schema(db_id, &stmt.name).await {
         Ok(()) => {
             fire_event(
@@ -5499,6 +5807,65 @@ async fn handle_comment_on(
 // Function handlers
 // ---------------------------------------------------------------------------
 
+/// CANCEL BACKEND pid. Flips the cancel flag of the statement currently
+/// running on the identified connection; the statement observes it at its
+/// next poll and unwinds as canceled. A session may always cancel its own
+/// user's backends; canceling another user's requires role administration
+/// on the system. An idle backend is a valid no-op target, matching a
+/// signal that arrives after the statement finished.
+async fn handle_cancel_backend(
+    pid: i32,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    // Ownership comes from the live session table when the server publishes
+    // one. An unknown or unpublished target counts as cross-user so the
+    // privilege check still gates it.
+    let target_user = server
+        .session_info_collector
+        .as_ref()
+        .and_then(|c| c().into_iter().find(|s| s.pid == pid).map(|s| s.user_name));
+    let same_user = match (&target_user, session.as_ref()) {
+        (Some(target), Some(s)) => *target == s.user,
+        _ => false,
+    };
+    if !same_user {
+        check_ddl_privilege(
+            server,
+            session,
+            zyron_auth::PrivilegeType::ManageRoles,
+            zyron_auth::ObjectType::System,
+            0,
+        )?;
+    }
+
+    // The registry holds one weak statement handle per connection. A live
+    // handle gets its flag flipped; a dead one means the statement already
+    // finished, which is the same no-op as a late signal.
+    let hit = server
+        .cancel_registry
+        .read_sync(&pid, |_, (_, stmt)| stmt.upgrade());
+    match hit {
+        Some(Some(ctx)) => {
+            ctx.cancel();
+            Ok(DdlResult::Tag("CANCEL BACKEND".to_string()))
+        }
+        Some(None) => Ok(DdlResult::Tag("CANCEL BACKEND".to_string())),
+        None => {
+            // Never registered: the connection has not run a statement yet,
+            // or the pid does not exist. The session table tells them apart
+            // when available; without it an unknown pid is an error.
+            if target_user.is_some() {
+                Ok(DdlResult::Tag("CANCEL BACKEND".to_string()))
+            } else {
+                Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "backend {pid} not found"
+                ))))
+            }
+        }
+    }
+}
+
 async fn handle_create_function(
     stmt: &zyron_parser::ast::CreateFunctionStatement,
     server: &Arc<ServerState>,
@@ -5560,22 +5927,24 @@ async fn handle_drop_function(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
-
-    let bare = name.rsplit('.').next().unwrap_or(&name);
-    let exists = server
-        .catalog
-        .list_functions()
-        .iter()
-        .any(|f| f.name == bare);
-    if !exists {
+    // Resolve the target through the session's namespace, then drop the
+    // overloads of exactly that one schema. A qualified name reads that
+    // schema; a bare name walks the search path; a same-named function in
+    // any other schema is untouched.
+    let (db_id, search_path) = session_db_and_search_path(session);
+    let Some((schema_id, bare)) =
+        server
+            .catalog
+            .resolve_function_schema(db_id, &search_path, &stmt.name)
+    else {
         if stmt.if_exists {
             return Ok(DdlResult::Tag("DROP FUNCTION".to_string()));
         }
         return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "function '{name}' not found"
+            "function '{}' not found; qualify it as schema.name or set the search path",
+            stmt.name
         ))));
-    }
+    };
 
     check_ddl_privilege(
         server,
@@ -5587,7 +5956,7 @@ async fn handle_drop_function(
 
     server
         .catalog
-        .drop_function(&name)
+        .drop_function(schema_id, &bare)
         .await
         .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("DROP FUNCTION".to_string()))
@@ -5625,35 +5994,69 @@ async fn handle_create_aggregate(
     }
     let state_type = stmt.stype.to_type_id();
 
+    // Each referenced function resolves through the creating session's
+    // namespace and is stored as its canonical schema.name, so the binder
+    // later binds the exact functions this definition named no matter whose
+    // session runs the aggregate.
+    let (fn_db, fn_path) = session_db_and_search_path(session);
+
     // The state function takes (state, input) and must already exist.
     let mut sfunc_arg_types = Vec::with_capacity(1 + input_types.len());
     sfunc_arg_types.push(state_type);
     sfunc_arg_types.extend_from_slice(&input_types);
-    if server
+    let sfunc_entry = server
         .catalog
-        .find_function(&stmt.sfunc, &sfunc_arg_types)
-        .is_none()
-    {
-        return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "state function '{}' taking (state, input) was not found; create it first",
-            stmt.sfunc
-        ))));
-    }
+        .resolve_function_scoped(fn_db, &fn_path, &stmt.sfunc, &sfunc_arg_types)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "state function '{}' taking (state, input) was not found; create it first",
+                stmt.sfunc
+            )))
+        })?;
+    let canonical_sfunc = server
+        .catalog
+        .canonical_function_name(&sfunc_entry)
+        .map_err(ProtocolError::Database)?;
 
     // The final function, when given, takes (state) and yields the result type.
-    let return_type = match &stmt.finalfunc {
+    let (return_type, canonical_finalfunc) = match &stmt.finalfunc {
         Some(ff) => {
             let entry = server
                 .catalog
-                .find_function(ff, &[state_type])
+                .resolve_function_scoped(fn_db, &fn_path, ff, &[state_type])
                 .ok_or_else(|| {
                     ProtocolError::Database(ZyronError::Internal(format!(
                         "final function '{ff}' taking (state) was not found; create it first"
                     )))
                 })?;
-            entry.return_type
+            let canonical = server
+                .catalog
+                .canonical_function_name(&entry)
+                .map_err(ProtocolError::Database)?;
+            (entry.return_type, Some(canonical))
         }
-        None => state_type,
+        None => (state_type, None),
+    };
+
+    // The combine function, when given, merges two states: (state, state).
+    let canonical_combinefunc = match &stmt.combinefunc {
+        Some(cf) => {
+            let entry = server
+                .catalog
+                .resolve_function_scoped(fn_db, &fn_path, cf, &[state_type, state_type])
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "combine function '{cf}' taking (state, state) was not found; create it first"
+                    )))
+                })?;
+            Some(
+                server
+                    .catalog
+                    .canonical_function_name(&entry)
+                    .map_err(ProtocolError::Database)?,
+            )
+        }
+        None => None,
     };
 
     let entry = zyron_catalog::AggregateEntry {
@@ -5663,9 +6066,9 @@ async fn handle_create_aggregate(
         input_types,
         state_type,
         return_type,
-        sfunc_name: stmt.sfunc.clone(),
-        finalfunc_name: stmt.finalfunc.clone(),
-        combinefunc_name: stmt.combinefunc.clone(),
+        sfunc_name: canonical_sfunc,
+        finalfunc_name: canonical_finalfunc,
+        combinefunc_name: canonical_combinefunc,
         initcond: stmt.initcond.clone(),
     };
 
@@ -5682,22 +6085,24 @@ async fn handle_drop_aggregate(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
-
-    let bare = name.rsplit('.').next().unwrap_or(&name);
-    let exists = server
-        .catalog
-        .list_aggregates()
-        .iter()
-        .any(|a| a.name == bare);
-    if !exists {
+    // Resolve the target through the session's namespace, then drop the
+    // overloads of exactly that one schema. A qualified name reads that
+    // schema; a bare name walks the search path; a same-named aggregate in
+    // any other schema is untouched.
+    let (db_id, search_path) = session_db_and_search_path(session);
+    let Some((schema_id, bare)) =
+        server
+            .catalog
+            .resolve_aggregate_schema(db_id, &search_path, &stmt.name)
+    else {
         if stmt.if_exists {
             return Ok(DdlResult::Tag("DROP AGGREGATE".to_string()));
         }
         return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "aggregate '{name}' not found"
+            "aggregate '{}' not found; qualify it as schema.name or set the search path",
+            stmt.name
         ))));
-    }
+    };
 
     check_ddl_privilege(
         server,
@@ -5709,7 +6114,7 @@ async fn handle_drop_aggregate(
 
     server
         .catalog
-        .drop_aggregate(&name)
+        .drop_aggregate(schema_id, &bare)
         .await
         .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("DROP AGGREGATE".to_string()))
@@ -5782,34 +6187,35 @@ async fn handle_drop_procedure(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
-
-    let bare = name.rsplit('.').next().unwrap_or(&name);
-    let exists = server
+    // Resolve the target through the session's namespace, then drop the
+    // overloads of exactly that one schema. A qualified name reads that
+    // schema; a bare name walks the search path; a same-named procedure in
+    // any other schema is untouched.
+    let (db_id, search_path) = session_db_and_search_path(session);
+    let Some(proc) = server
         .catalog
-        .list_procedures()
-        .iter()
-        .any(|p| p.name == bare);
-    if !exists {
+        .resolve_procedure_scoped(db_id, &search_path, &stmt.name)
+    else {
         if stmt.if_exists {
             return Ok(DdlResult::Tag("DROP PROCEDURE".to_string()));
         }
         return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "procedure '{name}' not found"
+            "procedure '{}' not found; qualify it as schema.name or set the search path",
+            stmt.name
         ))));
-    }
+    };
 
     check_ddl_privilege(
         server,
         session,
         zyron_auth::PrivilegeType::Create,
         zyron_auth::ObjectType::Schema,
-        schema_id.0,
+        proc.schema_id.0,
     )?;
 
     server
         .catalog
-        .drop_procedure(&name)
+        .drop_procedure(proc.schema_id, &proc.name)
         .await
         .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("DROP PROCEDURE".to_string()))
@@ -6016,21 +6422,28 @@ async fn handle_call(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
+    let name = stmt.name.clone();
 
     // Table-format maintenance procedures are built in: they operate on a
     // table's log rather than running a SQL body, so they resolve before the
-    // catalog lookup and a user cannot shadow one
-    if let Some(result) = handle_lake_procedure(&name, stmt, server, session).await? {
-        return Ok(result);
+    // catalog lookup and a user cannot shadow one. They are unqualified by
+    // definition, so a schema-qualified call never matches one
+    if !name.contains('.') {
+        if let Some(result) = handle_lake_procedure(&name, stmt, server, session).await? {
+            return Ok(result);
+        }
     }
 
+    // The call itself is the caller's own SQL, so its NAME resolves through
+    // the caller's namespace: qualified means exactly that schema, bare
+    // walks the session search path. The body still executes strict.
+    let (db_id, search_path) = session_db_and_search_path(session);
     let proc = server
         .catalog
-        .find_procedure_by_name(&name)
+        .resolve_procedure_scoped(db_id, &search_path, &name)
         .ok_or_else(|| {
             ProtocolError::Database(ZyronError::Internal(format!(
-                "procedure '{name}' not found"
+                "procedure '{name}' not found; qualify it as schema.name or set the search path"
             )))
         })?;
 
@@ -6043,7 +6456,6 @@ async fn handle_call(
         ))));
     }
 
-    let (db_id, search_path) = session_db_and_search_path(session);
     let params = eval_call_args(server, &stmt.args, db_id, &search_path).await?;
 
     let body_stmts = zyron_parser::parse(&proc.body_sql).map_err(|e| {
@@ -6052,7 +6464,19 @@ async fn handle_call(
         )))
     })?;
 
-    execute_call_body(server, body_stmts, params, db_id, search_path, true).await?;
+    // A stored body means the same tables no matter which session calls
+    // it: user tables must be schema-qualified, the system path serves
+    // zyron_sys reads only. The arguments above are the caller's own SQL
+    // and were evaluated in the caller's namespace
+    execute_call_body(
+        server,
+        body_stmts,
+        params,
+        db_id,
+        zyron_catalog::default_search_path(),
+        true,
+    )
+    .await?;
     Ok(DdlResult::Tag("CALL".to_string()))
 }
 
@@ -6327,11 +6751,15 @@ fn withdraw_streamed(
 // Trigger handlers
 // ---------------------------------------------------------------------------
 
-/// CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE [OR ...]} ON table
-/// FOR EACH {ROW|STATEMENT} EXECUTE FUNCTION proc. The function must be a stored
-/// procedure; on a matching event the executor runs its body once per row (for
-/// EACH ROW) with the affected row's columns bound as $1..$N, or once per
-/// statement (FOR EACH STATEMENT), in the firing statement's transaction.
+/// CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE|DELETE
+/// [OR ...]} ON target FOR EACH {ROW|STATEMENT} EXECUTE FUNCTION proc. The
+/// function must be a stored procedure; on a matching event the executor runs
+/// its body once per row (FOR EACH ROW) with the affected row's columns bound
+/// as $1..$N, or once per statement (FOR EACH STATEMENT), in the firing
+/// statement's transaction. BEFORE and AFTER target a table. INSTEAD OF
+/// targets a view, must be FOR EACH ROW, and replaces the write entirely: the
+/// body receives the NEW image for INSERT, the OLD image for DELETE, and OLD
+/// then NEW ($1..$N, $N+1..$2N) for UPDATE.
 async fn handle_create_trigger(
     stmt: &zyron_parser::ast::CreateTriggerStatement,
     server: &Arc<ServerState>,
@@ -6341,30 +6769,11 @@ async fn handle_create_trigger(
     use zyron_parser::ast::{TriggerEvent, TriggerGranularity, TriggerTiming};
 
     let (_, schema_id) = get_session_schema(session, server, None)?;
-    let table = server
-        .catalog
-        .get_table(schema_id, &stmt.table)
-        .map_err(ProtocolError::Database)?;
-
-    check_ddl_privilege(
-        server,
-        session,
-        zyron_auth::PrivilegeType::Create,
-        zyron_auth::ObjectType::Table,
-        table.id.0,
-    )?;
 
     let reject = |msg: &str| {
         Err(ProtocolError::Database(ZyronError::Internal(
             msg.to_string(),
         )))
-    };
-    let timing = match stmt.timing {
-        TriggerTiming::Before => TriggerEntry::TIMING_BEFORE,
-        TriggerTiming::After => TriggerEntry::TIMING_AFTER,
-        TriggerTiming::InsteadOf => {
-            return reject("INSTEAD OF triggers are not supported");
-        }
     };
     if stmt.when_condition.is_some() {
         return reject("trigger WHEN conditions are not supported");
@@ -6396,27 +6805,92 @@ async fn handle_create_trigger(
         TriggerGranularity::Statement => TriggerEntry::FOR_EACH_STATEMENT,
     };
 
-    // The action must be an existing stored procedure.
-    if server
+    let (timing, target_id) = match stmt.timing {
+        TriggerTiming::Before | TriggerTiming::After => {
+            let table = server.catalog.get_table(schema_id, &stmt.table).map_err(|e| {
+                if server.catalog.get_view(schema_id, &stmt.table).is_some() {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "'{}' is a view; BEFORE and AFTER triggers require a table, use INSTEAD OF for a view",
+                        stmt.table
+                    )))
+                } else {
+                    ProtocolError::Database(e)
+                }
+            })?;
+            let timing = match stmt.timing {
+                TriggerTiming::Before => TriggerEntry::TIMING_BEFORE,
+                _ => TriggerEntry::TIMING_AFTER,
+            };
+            (timing, table.id.0)
+        }
+        TriggerTiming::InsteadOf => {
+            let Some(view) = server.catalog.get_view(schema_id, &stmt.table) else {
+                if server.catalog.get_table(schema_id, &stmt.table).is_ok() {
+                    return reject(&format!(
+                        "'{}' is a table; INSTEAD OF triggers require a view",
+                        stmt.table
+                    ));
+                }
+                return reject(&format!("view '{}' not found", stmt.table));
+            };
+            if for_each != TriggerEntry::FOR_EACH_ROW {
+                return reject("INSTEAD OF triggers must be FOR EACH ROW");
+            }
+            // One INSTEAD OF trigger per event keeps the write path
+            // deterministic: two bodies for one event would both run per row
+            for existing in server
+                .catalog
+                .triggers_for_table(zyron_catalog::TableId(view.id))
+            {
+                if existing.timing == TriggerEntry::TIMING_INSTEAD_OF
+                    && (existing.events & events) != 0
+                {
+                    return reject(&format!(
+                        "view '{}' already has INSTEAD OF trigger '{}' covering one of these events",
+                        stmt.table, existing.name
+                    ));
+                }
+            }
+            (TriggerEntry::TIMING_INSTEAD_OF, view.id)
+        }
+    };
+
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Table,
+        target_id,
+    )?;
+
+    // The action must be an existing stored procedure, resolved through the
+    // creating session's namespace and stored as its canonical schema.name,
+    // so firing later binds the exact procedure this definition named no
+    // matter whose session fires it.
+    let (proc_db, proc_path) = session_db_and_search_path(session);
+    let proc = server
         .catalog
-        .find_procedure_by_name(&stmt.execute_function)
-        .is_none()
-    {
-        return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "trigger function '{}' must be an existing procedure; create it first",
-            stmt.execute_function
-        ))));
-    }
+        .resolve_procedure_scoped(proc_db, &proc_path, &stmt.execute_function)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "trigger function '{}' must be an existing procedure; create it first",
+                stmt.execute_function
+            )))
+        })?;
+    let canonical_proc = server
+        .catalog
+        .canonical_procedure_name(&proc)
+        .map_err(ProtocolError::Database)?;
 
     let entry = TriggerEntry {
         id: 0,
         schema_id,
-        table_id: table.id.0,
+        table_id: target_id,
         name: stmt.name.clone(),
         timing,
         events,
         for_each,
-        execute_function: stmt.execute_function.clone(),
+        execute_function: canonical_proc,
         enabled: stmt.enabled,
     };
     server
@@ -6433,17 +6907,23 @@ async fn handle_drop_trigger(
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     let (_, schema_id) = get_session_schema(session, server, None)?;
-    let table = server
-        .catalog
-        .get_table(schema_id, &stmt.table)
-        .map_err(ProtocolError::Database)?;
 
-    if server.catalog.find_trigger(table.id, &stmt.name).is_none() {
+    // The ON target is a table for BEFORE/AFTER triggers and a view for
+    // INSTEAD OF triggers. Both key the trigger map by their catalog id.
+    let target_id = match server.catalog.get_table(schema_id, &stmt.table) {
+        Ok(table) => table.id,
+        Err(table_err) => match server.catalog.get_view(schema_id, &stmt.table) {
+            Some(view) => zyron_catalog::TableId(view.id),
+            None => return Err(ProtocolError::Database(table_err)),
+        },
+    };
+
+    if server.catalog.find_trigger(target_id, &stmt.name).is_none() {
         if stmt.if_exists {
             return Ok(DdlResult::Tag("DROP TRIGGER".to_string()));
         }
         return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "trigger '{}' not found on table '{}'",
+            "trigger '{}' not found on '{}'",
             stmt.name, stmt.table
         ))));
     }
@@ -6453,12 +6933,12 @@ async fn handle_drop_trigger(
         session,
         zyron_auth::PrivilegeType::Create,
         zyron_auth::ObjectType::Table,
-        table.id.0,
+        target_id.0,
     )?;
 
     server
         .catalog
-        .drop_trigger(table.id, &stmt.name)
+        .drop_trigger(target_id, &stmt.name)
         .await
         .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("DROP TRIGGER".to_string()))
@@ -6991,17 +7471,33 @@ async fn handle_create_materialized_view(
         .await
         .map_err(ProtocolError::Database)?;
 
-    // Populate the backing table from the query. Plan against the session's
-    // database and search path so the backing table resolves in its own schema.
+    // Populate the backing table from the query. The insert target is
+    // schema-qualified so it resolves in the view's own schema no matter
+    // what the session's search path holds; the query itself still plans in
+    // the session's namespace.
     let db_id = get_session_database(session)?;
     let search_path = session
         .as_ref()
         .map(|s| s.search_path.clone())
         .unwrap_or_default();
-    let insert = build_mv_insert(name.clone(), stmt.query.clone());
+    let schema_name = server
+        .catalog
+        .get_schema_by_id(schema_id)
+        .map_err(ProtocolError::Database)?
+        .name
+        .clone();
+    let insert = build_mv_insert(format!("{schema_name}.{name}"), stmt.query.clone());
     if let Err(e) = execute_write_stmt(server, db_id, search_path, insert).await {
         // Roll back the backing table so a failed populate leaves no orphan.
-        let _ = server.catalog.drop_table(schema_id, &name).await;
+        // The populate error is the one worth returning; a cleanup failure on
+        // top of it is logged so the leftover table is not a silent mystery
+        // when a retry reports the relation already exists
+        if let Err(cleanup) = server.catalog.drop_table(schema_id, &name).await {
+            tracing::warn!(
+                target: "zyron::ddl",
+                "materialized view '{name}' populate failed and its backing table cleanup also failed: {cleanup}"
+            );
+        }
         return Err(e);
     }
 
@@ -7052,22 +7548,38 @@ async fn handle_refresh_materialized_view(
         }
     };
 
-    // Clear the backing table, then repopulate from the query. Plan against the
-    // session's database and search path so the backing table resolves.
+    // Clear the backing table and repopulate from the query in one
+    // transaction. Plan against the session's database and search path so the
+    // backing table resolves. MVCC gives readers on other connections the old
+    // contents until the commit and the new contents after it, never an empty
+    // or partially loaded table, and no reader blocks while the refresh runs.
+    // That delivers what CONCURRENTLY promises, so the plain and CONCURRENTLY
+    // forms share this path; the flag needs no separate handling. The
+    // uniqueness probes inside the insert see the transaction's own deletes,
+    // so re-inserting rows a unique index covers does not conflict with the
+    // old contents.
     let db_id = get_session_database(session)?;
     let search_path = session
         .as_ref()
         .map(|s| s.search_path.clone())
         .unwrap_or_default();
+    // The write targets are schema-qualified so the backing table resolves
+    // in the view's own schema no matter what the session's path holds.
+    let schema_name = server
+        .catalog
+        .get_schema_by_id(schema_id)
+        .map_err(ProtocolError::Database)?
+        .name
+        .clone();
+    let qualified = format!("{schema_name}.{name}");
     let delete = zyron_parser::Statement::Delete(Box::new(zyron_parser::ast::DeleteStatement {
-        table: name.clone(),
+        table: qualified.clone(),
         where_clause: None,
         returning: None,
         hard: true,
     }));
-    execute_write_stmt(server, db_id, search_path.clone(), delete).await?;
-    let insert = build_mv_insert(name.clone(), query);
-    execute_write_stmt(server, db_id, search_path, insert).await?;
+    let insert = build_mv_insert(qualified, query);
+    execute_write_stmts_atomic(server, db_id, search_path, vec![delete, insert]).await?;
 
     Ok(DdlResult::Tag("REFRESH MATERIALIZED VIEW".to_string()))
 }
@@ -7102,13 +7614,14 @@ async fn handle_drop_materialized_view(
         .await
         .map_err(ProtocolError::Database)?;
 
-    // Drop the backing table through the standard path so its heap and FSM
-    // files are reclaimed.
-    let drop_table = zyron_parser::ast::DropTableStatement {
-        name: name.clone(),
-        if_exists: true,
-    };
-    handle_drop_table(&drop_table, server, session).await?;
+    // Drop the backing table through the shared path so its heap, FSM,
+    // index, lake, and columnar artifacts are reclaimed, and in the
+    // materialized view's own schema rather than the session's.
+    match drop_table_in_schema(server, schema_id, &name, TableDropMode::Statement).await {
+        Ok(()) => {}
+        Err(ProtocolError::Database(ZyronError::TableNotFound(_))) => {}
+        Err(e) => return Err(e),
+    }
     Ok(DdlResult::Tag("DROP MATERIALIZED VIEW".to_string()))
 }
 
@@ -9376,17 +9889,23 @@ async fn handle_create_event_handler(
         ))));
     }
 
-    // The handler runs a stored procedure; require it to exist up front.
-    if server
+    // The handler runs a stored procedure, resolved through the creating
+    // session's namespace and stored canonical, so background dispatch fires
+    // the exact procedure this definition named.
+    let (proc_db, proc_path) = session_db_and_search_path(session);
+    let handler_proc = server
         .catalog
-        .find_procedure_by_name(&stmt.execute_function)
-        .is_none()
-    {
-        return Err(ProtocolError::Database(ZyronError::Internal(format!(
-            "event handler '{name}' references unknown procedure '{}'",
-            stmt.execute_function
-        ))));
-    }
+        .resolve_procedure_scoped(proc_db, &proc_path, &stmt.execute_function)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "event handler '{name}' references unknown procedure '{}'",
+                stmt.execute_function
+            )))
+        })?;
+    let canonical_proc = server
+        .catalog
+        .canonical_procedure_name(&handler_proc)
+        .map_err(ProtocolError::Database)?;
 
     let condition_sql = stmt
         .condition
@@ -9399,7 +9918,7 @@ async fn handle_create_event_handler(
         name: name.clone(),
         event_type: stmt.event_type.clone(),
         condition_sql,
-        execute_function: stmt.execute_function.clone(),
+        execute_function: canonical_proc,
         enabled: true,
     };
     let id = server
@@ -9470,7 +9989,7 @@ async fn eval_event_condition(server: &Arc<ServerState>, condition_sql: &str) ->
     let Ok(plan) = zyron_planner::plan(
         &server.catalog,
         zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
+        zyron_catalog::default_search_path(),
         stmt,
         Some(&server.peer_facts()),
     )
@@ -9550,7 +10069,10 @@ pub async fn fire_event(
                 continue;
             }
         }
-        let Some(proc) = server.catalog.find_procedure_by_name(&handler.functionName) else {
+        let Some(proc) = server
+            .catalog
+            .resolve_procedure_canonical(&handler.functionName)
+        else {
             tracing::warn!(
                 target: "zyron::events",
                 handler = %handler.name,
@@ -10119,18 +10641,23 @@ fn ingest_value_literal(value: &str, type_id: zyron_common::TypeId) -> zyron_par
 }
 
 /// The database id and single-schema search path that resolves a table living
-/// in `schema_id`. Inbound ingestion runs without a client session, so the
-/// search path is derived from the target's own schema.
-fn ingest_search_path(
+/// in `schema_id`. Inbound ingestion and DDL validation queries run without a
+/// client session, so the namespace is derived from the target's own schema,
+/// never an implicit default.
+pub(crate) fn schema_scoped_path(
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::SchemaId,
 ) -> (zyron_catalog::DatabaseId, Vec<String>) {
-    let name = server
-        .catalog
-        .get_schema_by_id(schema_id)
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|_| "public".to_string());
-    (zyron_catalog::DatabaseId(1), vec![name])
+    // A schema id that no longer resolves gets the system default path, so
+    // the statement that follows fails on name resolution instead of landing
+    // in an implicit namespace
+    match server.catalog.get_schema_by_id(schema_id) {
+        Ok(s) => (s.database_id, vec![s.name.clone()]),
+        Err(_) => (
+            zyron_catalog::DatabaseId(1),
+            zyron_catalog::default_search_path(),
+        ),
+    }
 }
 
 /// Selects the (column, value) pairs that key a row: the configured primary key
@@ -10319,7 +10846,7 @@ async fn route_to_dead_letter(
         on_conflict: None,
         returning: None,
     }));
-    let (db_id, search_path) = ingest_search_path(server, dlq.schema_id);
+    let (db_id, search_path) = schema_scoped_path(server, dlq.schema_id);
     match run_pipeline_write_txn(server, db_id, search_path, vec![stmt]).await {
         Ok(_) => true,
         Err(e) => {
@@ -10422,7 +10949,7 @@ pub async fn apply_ingest_records(
         }
     };
     let target = table.name.clone();
-    let (db_id, search_path) = ingest_search_path(server, table.schema_id);
+    let (db_id, search_path) = schema_scoped_path(server, table.schema_id);
 
     // Once a record cannot be committed (failed with no durable dead letter
     // landing) the source offset must not advance past it, so every later
@@ -11037,14 +11564,20 @@ pub(crate) fn get_session_schema(
         .as_ref()
         .ok_or(ProtocolError::Malformed("no active session".into()))?;
     let db_id = session.database_id;
+    // DDL lands in the first USER schema on the search path. The system
+    // entries (zyron_sys.* and information_schema) are resolution-only: DDL
+    // is never allowed in them, and there is deliberately no implicit user
+    // schema to fall back to, so a session that has not set one gets clear
+    // guidance instead of a baffling schema-not-found error
     let schema_name = session
         .search_path
-        .first()
+        .iter()
         .map(|s| s.as_str())
+        .find(|s| !s.contains('.') && *s != "information_schema")
         .ok_or_else(|| {
             ProtocolError::Malformed(
-                "no target schema: session search_path is empty. \
-             Qualify the object as `schema.name` or run `SET search_path = your_schema` first."
+                "no target schema in search_path. Create one with CREATE SCHEMA, then \
+                 `SET search_path = your_schema`, or qualify the object as `schema.name`."
                     .into(),
             )
         })?;
@@ -11057,23 +11590,27 @@ pub(crate) fn get_session_schema(
     Ok((db_id, schema.id))
 }
 
-/// Returns the session's database id and search_path for executing procedure,
-/// DO, and trigger bodies in the caller's namespace. Falls back to the default
-/// database and the public schema when there is no session (background
-/// dispatch).
+/// Returns the session's database id and search_path for executing the
+/// caller's own inline SQL (DO blocks, desugared MERGE, CALL arguments) in
+/// the caller's namespace. Stored bodies never use this: they run under the
+/// system default path so a body resolves the same tables for every caller.
+/// Background dispatch with no session gets the system default path only.
 fn session_db_and_search_path(
     session: &Option<Session>,
 ) -> (zyron_catalog::DatabaseId, Vec<String>) {
     match session.as_ref() {
         Some(s) => {
             let path = if s.search_path.is_empty() {
-                vec!["public".to_string()]
+                zyron_catalog::default_search_path()
             } else {
                 s.search_path.clone()
             };
             (s.database_id, path)
         }
-        None => (zyron_catalog::DatabaseId(1), vec!["public".to_string()]),
+        None => (
+            zyron_catalog::DatabaseId(1),
+            zyron_catalog::default_search_path(),
+        ),
     }
 }
 
@@ -15278,7 +15815,7 @@ async fn collectTrainingRowsFromQuery(
 
     let stmt = zyron_parser::Statement::Select(Box::new(query.clone()));
     let database_id = zyron_catalog::DatabaseId(1);
-    let search_path: Vec<String> = vec!["public".to_string()];
+    let search_path: Vec<String> = zyron_catalog::default_search_path();
     let plan = zyron_planner::plan(
         &server.catalog,
         database_id,

@@ -528,6 +528,21 @@ pub struct ServerState {
     /// `HeapFile` across queries keeps the per-file free-space hint cache
     /// warm so single-row INSERTs land on the same hot page instead of
     /// allocating a new one per call
+    /// The statement each connection is currently executing, keyed by its
+    /// backend process id, holding the cancel secret the connection was
+    /// issued at startup. A CancelRequest on a fresh connection proves the
+    /// secret, upgrades the weak handle, and flips the statement's cancel
+    /// flag; a statement that already finished leaves a dead weak behind,
+    /// which the next statement of that connection overwrites.
+    pub cancel_registry: Arc<
+        scc::HashMap<
+            i32,
+            (
+                i32,
+                std::sync::Weak<zyron_executor::context::ExecutionContext>,
+            ),
+        >,
+    >,
     pub heap_files: Arc<scc::HashMap<u32, Arc<zyron_storage::HeapFile>>>,
     /// Live B+Tree indexes keyed by index_id, used by IndexScan and
     /// maintained by INSERT/UPDATE/DELETE
@@ -1005,6 +1020,17 @@ impl<T: WireTransport> Connection<T> {
     fn admission_tenant(&self) -> Option<String> {
         self.session.as_ref().map(|s| s.database.clone())
     }
+
+    /// Publishes the statement this connection is about to run so a
+    /// CancelRequest proving this connection's secret can flip its cancel
+    /// flag. The weak handle means a finished statement is never kept alive
+    /// by the registry, and the next statement simply overwrites the entry,
+    /// so there is no unregister step to forget.
+    fn register_cancellable(&self, ctx: &Arc<ExecutionContext>) {
+        self.server
+            .cancel_registry
+            .upsert_sync(self.process_id, (self.secret_key, Arc::downgrade(ctx)));
+    }
 }
 
 impl<T: WireTransport> Drop for Connection<T> {
@@ -1036,10 +1062,19 @@ pub struct CursorState {
     pub output_schema: Vec<LogicalColumn>,
     /// Buffered result rows from execution.
     pub rows: Vec<DataBatch>,
-    /// Current position within the buffered rows.
+    /// The 1-based row the cursor stands on: 0 is before the first row,
+    /// total + 1 is past the last. FETCH directions move it with PostgreSQL
+    /// semantics over the buffered result set, backward forms included.
     pub position: usize,
-    /// Whether the cursor holds across transactions.
+    /// Whether the cursor holds across transactions. Enforced at COMMIT: a
+    /// held cursor's result set is materialized under the committing
+    /// transaction and stays fetchable afterwards, every other cursor closes.
     pub with_hold: bool,
+    /// Whether the plan has executed and `rows` holds the complete result
+    /// set. Set on first FETCH, or at COMMIT for a held cursor never fetched.
+    /// A materialized cursor never re-executes, so rows committed after the
+    /// snapshot can not leak into its result set.
+    pub materialized: bool,
 }
 
 /// Maps a parsed SQL isolation level to the engine isolation level.
@@ -1107,6 +1142,10 @@ impl<T: WireTransport> Connection<T> {
         match self.handle_startup().await {
             Ok(()) => {}
             Err(e) => {
+                // A cancel connection closes with no reply, per the protocol
+                if matches!(e, ProtocolError::ConnectionClosed) {
+                    return Ok(());
+                }
                 // Send error to client before closing
                 let _ = self
                     .feed(BackendMessage::ErrorResponse(ErrorFields {
@@ -1192,6 +1231,31 @@ impl<T: WireTransport> Connection<T> {
                     }
                     self.process_startup(startup).await?;
                     break;
+                }
+                FrontendMessage::CancelRequest {
+                    process_id,
+                    secret_key,
+                } => {
+                    // A cancel connection carries no session and gets no
+                    // reply, per the protocol: prove the secret, flip the
+                    // running statement's cancel flag, close. A wrong secret
+                    // and an already finished statement look identical from
+                    // outside, so a prober learns nothing
+                    let target = self
+                        .server
+                        .cancel_registry
+                        .read_sync(&process_id, |_, (secret, stmt)| {
+                            if *secret == secret_key {
+                                stmt.upgrade()
+                            } else {
+                                None
+                            }
+                        })
+                        .flatten();
+                    if let Some(ctx) = target {
+                        ctx.cancel();
+                    }
+                    return Err(ProtocolError::ConnectionClosed);
                 }
                 _ => {
                     return Err(ProtocolError::Malformed("Expected startup message".into()));
@@ -1892,6 +1956,7 @@ impl<T: WireTransport> Connection<T> {
                     let plan_clone = (**plan).clone();
                     let output_schema = ps.output_schema.clone();
                     let is_select = !output_schema.is_empty() && is_query_plan(&plan_clone);
+                    let dml_verb = dml_tag_verb(&plan_clone);
 
                     let (txn_id, snapshot) = self.ensure_transaction()?;
                     let mut ctx = ExecutionContext::new(
@@ -1932,6 +1997,7 @@ impl<T: WireTransport> Connection<T> {
                     self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
 
+                    self.register_cancellable(&ctx);
                     match execute_admitted(plan_clone, &ctx, self.admission_tenant().as_deref())
                         .await
                     {
@@ -1947,7 +2013,7 @@ impl<T: WireTransport> Connection<T> {
                                 .await?;
                             } else {
                                 let affected = count_affected_rows(&batches);
-                                let tag = make_dml_tag(&output_schema, affected);
+                                let tag = make_dml_tag(dml_verb, affected);
                                 self.feed(BackendMessage::CommandComplete { tag }).await?;
                             }
                         }
@@ -2013,6 +2079,22 @@ impl<T: WireTransport> Connection<T> {
                 let db_id = session.database_id;
                 let search_path = session.search_path.clone();
 
+                // A WITHOUT HOLD cursor lives and dies with its transaction
+                // block. In autocommit there is no block for it to live in,
+                // so the declaration is refused rather than leaving a cursor
+                // floating across statements with no transaction to scope
+                // its snapshot. WITH HOLD is the form that outlives the
+                // transaction and stays valid anywhere.
+                let with_hold = decl_stmt.hold.unwrap_or(false);
+                if !with_hold && session.transaction_state() != TransactionState::InTransaction {
+                    self.send_error(&ZyronError::Internal(format!(
+                        "cursor '{}' can only be declared inside a transaction block; use BEGIN, or declare it WITH HOLD",
+                        decl_stmt.name
+                    )))
+                    .await?;
+                    continue;
+                }
+
                 let select_stmt = zyron_parser::Statement::Select(decl_stmt.query);
                 match zyron_planner::plan(
                     &self.server.catalog,
@@ -2025,7 +2107,6 @@ impl<T: WireTransport> Connection<T> {
                 {
                     Ok(plan) => {
                         let output_schema = plan.output_schema();
-                        let with_hold = decl_stmt.hold.unwrap_or(false);
                         self.cursors.insert(
                             decl_stmt.name.clone(),
                             CursorState {
@@ -2034,6 +2115,7 @@ impl<T: WireTransport> Connection<T> {
                                 rows: Vec::new(),
                                 position: 0,
                                 with_hold,
+                                materialized: false,
                             },
                         );
                         self.feed(BackendMessage::CommandComplete {
@@ -2051,17 +2133,6 @@ impl<T: WireTransport> Connection<T> {
 
             if let zyron_parser::Statement::FetchCursor(fetch_stmt) = stmt {
                 let cursor_name = fetch_stmt.cursor.clone();
-                let fetch_count = match fetch_stmt.direction {
-                    zyron_parser::ast::FetchDirection::Next => 1i64,
-                    zyron_parser::ast::FetchDirection::Prior => -1,
-                    zyron_parser::ast::FetchDirection::First => 1,
-                    zyron_parser::ast::FetchDirection::Last => -1,
-                    zyron_parser::ast::FetchDirection::Absolute(n) => n,
-                    zyron_parser::ast::FetchDirection::Relative(n) => n,
-                    zyron_parser::ast::FetchDirection::Forward(n) => n.unwrap_or(1),
-                    zyron_parser::ast::FetchDirection::Backward(n) => -(n.unwrap_or(1)),
-                    zyron_parser::ast::FetchDirection::All => i64::MAX,
-                };
 
                 let cursor = match self.cursors.get_mut(&cursor_name) {
                     Some(c) => c,
@@ -2076,8 +2147,10 @@ impl<T: WireTransport> Connection<T> {
                     }
                 };
 
-                // Execute the plan on first fetch if rows are empty
-                if cursor.rows.is_empty() {
+                // Execute the plan on first fetch. A materialized cursor,
+                // including one held across COMMIT, reads its buffered rows
+                // without touching the current transaction.
+                if !cursor.materialized {
                     let plan_clone = (*cursor.plan).clone();
                     let (txn_id, snapshot) = self.ensure_transaction()?;
                     let mut ctx = ExecutionContext::new(
@@ -2092,12 +2165,14 @@ impl<T: WireTransport> Connection<T> {
                     self.attach_replication(&mut ctx);
                     self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
+                    self.register_cancellable(&ctx);
                     match execute_admitted(plan_clone, &ctx, self.admission_tenant().as_deref())
                         .await
                     {
                         Ok(batches) => {
                             let cursor = self.cursors.get_mut(&cursor_name).unwrap();
                             cursor.rows = batches;
+                            cursor.materialized = true;
                         }
                         Err(e) => {
                             self.send_protocol_error(&ProtocolError::Database(e))
@@ -2111,57 +2186,47 @@ impl<T: WireTransport> Connection<T> {
 
                 // Collect row data from cursor into owned values to avoid
                 // holding a borrow on self.cursors while calling self.feed.
-                let (output_schema, data_rows) = {
+                let (output_schema, data_rows, new_position) = {
                     let cursor = self.cursors.get(&cursor_name).unwrap();
                     let output_schema = cursor.output_schema.clone();
                     let total_rows: usize = cursor.rows.iter().map(|b| b.num_rows).sum();
-                    let start = cursor.position;
-                    let count = if fetch_count < 0 {
-                        0usize // Backward fetch returns empty for simplicity
-                    } else if fetch_count == i64::MAX {
-                        total_rows.saturating_sub(start)
-                    } else {
-                        (fetch_count as usize).min(total_rows.saturating_sub(start))
-                    };
+                    let (indices, new_position) =
+                        resolve_fetch_direction(&fetch_stmt.direction, cursor.position, total_rows);
 
-                    let mut data_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-                    let mut sent = 0usize;
-                    let mut global_pos = 0usize;
-                    for batch in &cursor.rows {
-                        if sent >= count {
-                            break;
-                        }
-                        let batch_end = global_pos + batch.num_rows;
-                        if batch_end <= start {
-                            global_pos = batch_end;
-                            continue;
-                        }
-                        let batch_start = if start > global_pos {
-                            start - global_pos
-                        } else {
-                            0
-                        };
-                        let remaining = count - sent;
-                        let slice_end = (batch_start + remaining).min(batch.num_rows);
-
-                        for row_idx in batch_start..slice_end {
-                            let mut values: Vec<Option<Vec<u8>>> =
-                                Vec::with_capacity(output_schema.len());
-                            for col in &batch.columns {
-                                let scalar = col.get_scalar(row_idx);
-                                let mut buf = bytes::BytesMut::with_capacity(32);
-                                if types::scalar_write_text(&scalar, &mut buf) {
-                                    values.push(Some(buf.to_vec()));
-                                } else {
-                                    values.push(None);
-                                }
-                            }
-                            data_rows.push(values);
-                            sent += 1;
-                        }
-                        global_pos = batch_end;
+                    // Cumulative batch offsets, so each selected row resolves
+                    // to its batch directly. Backward fetches emit rows in
+                    // descending order, which a forward batch walk cannot
+                    // produce.
+                    let mut batch_starts = Vec::with_capacity(cursor.rows.len());
+                    let mut acc = 0usize;
+                    for b in &cursor.rows {
+                        batch_starts.push(acc);
+                        acc += b.num_rows;
                     }
-                    (output_schema, data_rows)
+                    let mut data_rows: Vec<Vec<Option<Vec<u8>>>> =
+                        Vec::with_capacity(indices.len());
+                    for &ri in &indices {
+                        // Every index is below total_rows, so a batch holding
+                        // it exists and partition_point is at least one
+                        let bi = batch_starts.partition_point(|&s| s <= ri).saturating_sub(1);
+                        let Some(batch) = cursor.rows.get(bi) else {
+                            continue;
+                        };
+                        let row_idx = ri - batch_starts[bi];
+                        let mut values: Vec<Option<Vec<u8>>> =
+                            Vec::with_capacity(output_schema.len());
+                        for col in &batch.columns {
+                            let scalar = col.get_scalar(row_idx);
+                            let mut buf = bytes::BytesMut::with_capacity(32);
+                            if types::scalar_write_text(&scalar, &mut buf) {
+                                values.push(Some(buf.to_vec()));
+                            } else {
+                                values.push(None);
+                            }
+                        }
+                        data_rows.push(values);
+                    }
+                    (output_schema, data_rows, new_position)
                 };
 
                 let sent = data_rows.len();
@@ -2173,9 +2238,8 @@ impl<T: WireTransport> Connection<T> {
                     self.feed(BackendMessage::DataRow(values)).await?;
                 }
 
-                // Advance cursor position
                 if let Some(cursor) = self.cursors.get_mut(&cursor_name) {
-                    cursor.position += sent;
+                    cursor.position = new_position;
                 }
 
                 self.feed(BackendMessage::CommandComplete {
@@ -2320,6 +2384,7 @@ impl<T: WireTransport> Connection<T> {
                             self.apply_session_limits(&mut ctx);
                             let ctx = Arc::new(ctx);
 
+                            self.register_cancellable(&ctx);
                             match execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
                                 .await
                             {
@@ -2587,6 +2652,7 @@ impl<T: WireTransport> Connection<T> {
 
         let output_schema = plan.output_schema();
         let is_select = !output_schema.is_empty() && is_query_plan(&plan);
+        let dml_verb = dml_tag_verb(&plan);
 
         // Build execution context with security context for privilege enforcement
         let mut ctx = ExecutionContext::new(
@@ -2629,6 +2695,7 @@ impl<T: WireTransport> Connection<T> {
         let ctx = Arc::new(ctx);
 
         // Execute
+        self.register_cancellable(&ctx);
         let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
             .await
             .map_err(ProtocolError::Database)?;
@@ -2662,7 +2729,7 @@ impl<T: WireTransport> Connection<T> {
         } else {
             // DML: count affected rows from result batches
             let affected = count_affected_rows(&batches);
-            let tag = make_dml_tag(&output_schema, affected);
+            let tag = make_dml_tag(dml_verb, affected);
             self.feed(BackendMessage::CommandComplete { tag }).await?;
         }
 
@@ -2789,6 +2856,7 @@ impl<T: WireTransport> Connection<T> {
         self.attach_replication(&mut ctx);
         self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
+        self.register_cancellable(&ctx);
         let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
             .await
             .map_err(ProtocolError::Database)?;
@@ -2989,7 +3057,9 @@ impl<T: WireTransport> Connection<T> {
         let plan = (*cached.plan).clone();
         let output_schema = cached.output_schema;
         let is_select = !output_schema.is_empty() && is_query_plan(&plan);
+        let dml_verb = dml_tag_verb(&plan);
 
+        self.register_cancellable(&ctx);
         let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
             .await
             .map_err(ProtocolError::Database)?;
@@ -3017,7 +3087,7 @@ impl<T: WireTransport> Connection<T> {
             .await?;
         } else {
             let affected = count_affected_rows(&batches);
-            let tag = make_dml_tag(&output_schema, affected);
+            let tag = make_dml_tag(dml_verb, affected);
             self.feed(BackendMessage::CommandComplete { tag }).await?;
         }
 
@@ -3421,6 +3491,7 @@ impl<T: WireTransport> Connection<T> {
         let result_formats = portal.result_formats.clone();
         let params = portal.params.clone();
         let is_select = !output_schema.is_empty() && is_query_plan(&*plan);
+        let dml_verb = dml_tag_verb(&plan);
 
         let (txn_id, snapshot) = match self.ensure_transaction() {
             Ok(t) => t,
@@ -3488,6 +3559,7 @@ impl<T: WireTransport> Connection<T> {
         #[cfg(feature = "profile")]
         drop(setup_span);
 
+        self.register_cancellable(&ctx);
         let exec_result = {
             #[cfg(feature = "profile")]
             let _s = profile::scope(Phase::WireExecute);
@@ -3519,7 +3591,7 @@ impl<T: WireTransport> Connection<T> {
                     .await?;
                 } else {
                     let affected = count_affected_rows(&batches);
-                    let tag = make_dml_tag(&output_schema, affected);
+                    let tag = make_dml_tag(dml_verb, affected);
                     self.feed(BackendMessage::CommandComplete { tag }).await?;
                 }
             }
@@ -3868,7 +3940,7 @@ impl<T: WireTransport> Connection<T> {
                 .session
                 .as_ref()
                 .map(|s| s.search_path.clone())
-                .unwrap_or_else(|| vec!["public".to_string()]),
+                .unwrap_or_else(zyron_catalog::default_search_path),
         };
         Some(
             router
@@ -4043,6 +4115,21 @@ impl<T: WireTransport> Connection<T> {
                 }
             }
             zyron_parser::Statement::Commit(_) => {
+                // A WITH HOLD cursor that never executed materializes now,
+                // while the transaction that owns its snapshot is still open.
+                // The rows are staged and installed only after the commit
+                // succeeds, so a failed commit leaves no held cursor exposing
+                // aborted state. A staging failure surfaces before the commit
+                // runs, keeping the transaction open for the client to retry
+                // or roll back.
+                let staged = if self.transaction.is_some() {
+                    match self.stage_holdable_cursors().await {
+                        Ok(s) => s,
+                        Err(e) => return Some(Err(e)),
+                    }
+                } else {
+                    Vec::new()
+                };
                 if let Some(mut txn) = self.transaction.take() {
                     let txn_id = txn.txn_id;
                     // A transaction that wrote nothing commits without a
@@ -4076,12 +4163,14 @@ impl<T: WireTransport> Connection<T> {
                                     if let Some(session) = self.session.as_mut() {
                                         session.set_transaction_state(TransactionState::Idle);
                                     }
+                                    self.finalize_cursors_on_commit(Vec::new(), false);
                                     return Some(Err(e));
                                 }
                             }
                             if let Some(session) = self.session.as_mut() {
                                 session.set_transaction_state(TransactionState::Idle);
                             }
+                            self.finalize_cursors_on_commit(staged, true);
                             Some(Ok("COMMIT".into()))
                         }
                         Err(e) => {
@@ -4090,6 +4179,7 @@ impl<T: WireTransport> Connection<T> {
                             if let Some(session) = self.session.as_mut() {
                                 session.set_transaction_state(TransactionState::Idle);
                             }
+                            self.finalize_cursors_on_commit(Vec::new(), false);
                             Some(Err(e))
                         }
                     }
@@ -4114,6 +4204,7 @@ impl<T: WireTransport> Connection<T> {
                 if let Some(name) = &rb.savepoint {
                     return Some(self.partial_rollback_to_savepoint(name).await);
                 }
+                let had_txn = self.transaction.is_some();
                 let abort_result = if let Some(mut txn) = self.transaction.take() {
                     let logs = self.abandon_lake_work(txn.txn_id);
                     refresh_lake_stats(&self.server, &logs);
@@ -4122,6 +4213,13 @@ impl<T: WireTransport> Connection<T> {
                 } else {
                     Ok(())
                 };
+                if had_txn {
+                    // Cursors die with the aborted transaction. Only a WITH
+                    // HOLD cursor already materialized by an earlier COMMIT
+                    // has a result set independent of this transaction, so
+                    // only those survive.
+                    self.cursors.retain(|_, c| c.with_hold && c.materialized);
+                }
                 if let Some(session) = self.session.as_mut() {
                     session.set_transaction_state(TransactionState::Idle);
                 }
@@ -4131,6 +4229,66 @@ impl<T: WireTransport> Connection<T> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Executes every WITH HOLD cursor that has not run yet under the open
+    /// transaction and returns the result sets keyed by cursor name. Runs
+    /// before COMMIT so the transaction's snapshot is still valid; the caller
+    /// installs the staged rows only once the commit succeeds.
+    async fn stage_holdable_cursors(&mut self) -> ZyronResult<Vec<(String, Vec<DataBatch>)>> {
+        let pending: Vec<(String, PhysicalPlan)> = self
+            .cursors
+            .iter()
+            .filter(|(_, c)| c.with_hold && !c.materialized)
+            .map(|(name, c)| (name.clone(), (*c.plan).clone()))
+            .collect();
+        let mut staged = Vec::with_capacity(pending.len());
+        for (name, plan) in pending {
+            let (txn_id, snapshot) = self.ensure_transaction().map_err(|e| match e {
+                ProtocolError::Database(inner) => inner,
+                other => ZyronError::Internal(other.to_string()),
+            })?;
+            let mut ctx = ExecutionContext::new(
+                self.server.catalog.clone(),
+                self.server.wal.clone(),
+                self.server.buffer_pool.clone(),
+                self.server.disk_manager.clone(),
+                txn_id,
+                snapshot,
+            );
+            self.attach_undo_log(&mut ctx);
+            self.attach_replication(&mut ctx);
+            self.apply_session_limits(&mut ctx);
+            let ctx = Arc::new(ctx);
+            self.register_cancellable(&ctx);
+            let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref()).await?;
+            self.note_ctx_writes(&ctx);
+            staged.push((name, batches));
+        }
+        Ok(staged)
+    }
+
+    /// Applies cursor lifetime rules after COMMIT. On success the staged WITH
+    /// HOLD result sets are installed and every WITHOUT HOLD cursor closes;
+    /// held cursors stay fetchable in later transactions. On a failed commit
+    /// the transaction is gone, so every cursor closes with it except a held
+    /// cursor a previous COMMIT already materialized.
+    fn finalize_cursors_on_commit(
+        &mut self,
+        staged: Vec<(String, Vec<DataBatch>)>,
+        committed: bool,
+    ) {
+        if committed {
+            for (name, rows) in staged {
+                if let Some(c) = self.cursors.get_mut(&name) {
+                    c.rows = rows;
+                    c.materialized = true;
+                }
+            }
+            self.cursors.retain(|_, c| c.with_hold);
+        } else {
+            self.cursors.retain(|_, c| c.with_hold && c.materialized);
         }
     }
 
@@ -5438,6 +5596,13 @@ impl<T: WireTransport> Connection<T> {
         if let Some(timeout) = timeout {
             ctx.set_deadline(std::time::Instant::now() + timeout);
         }
+        // A nested plan built during execution, a trigger body above all,
+        // plans against the session's database. Never its search path: a
+        // stored body qualifies user tables so it means the same objects
+        // for every caller
+        if let Some(session) = self.session.as_ref() {
+            ctx.planning_database = session.database_id;
+        }
         ctx.max_result_rows = self.server.max_result_rows;
         // Trimmed by the controller when the node is short of memory, so a
         // query starting under pressure is handed a smaller allowance than one
@@ -6700,7 +6865,12 @@ fn is_ddl_statement(stmt: &zyron_parser::Statement) -> bool {
 fn is_query_plan(plan: &PhysicalPlan) -> bool {
     !matches!(
         plan,
-        PhysicalPlan::Insert { .. } | PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. }
+        PhysicalPlan::Insert { .. }
+            | PhysicalPlan::Update { .. }
+            | PhysicalPlan::Delete { .. }
+            | PhysicalPlan::LakeUpdate { .. }
+            | PhysicalPlan::LakeDelete { .. }
+            | PhysicalPlan::ViewTriggerWrite { .. }
     )
 }
 
@@ -6805,16 +6975,138 @@ fn expr_to_string(expr: &zyron_parser::Expr) -> String {
     }
 }
 
-/// Creates a DML command tag like "INSERT 0 5" or "UPDATE 3".
-fn make_dml_tag(schema: &[LogicalColumn], affected: usize) -> String {
-    // Without a full statement type, infer from context.
-    // DML plans with empty schema are INSERT/UPDATE/DELETE.
-    if schema.is_empty() {
-        // Default to a generic tag. The connection handler can override
-        // this based on the original statement type in a future refinement.
+/// Resolves a FETCH direction over a fully buffered cursor into the row
+/// indices to emit (0-based, in emission order) and the cursor position
+/// afterwards, with PostgreSQL semantics. `position` is the 1-based row the
+/// cursor stands on: 0 is before the first row, `total + 1` is past the
+/// last, which is where an exhausting forward fetch leaves it so a
+/// subsequent FETCH PRIOR returns the last row. Every cursor buffers its
+/// complete result set, so every direction, backward included, is served
+/// from the buffer.
+fn resolve_fetch_direction(
+    direction: &zyron_parser::ast::FetchDirection,
+    position: usize,
+    total: usize,
+) -> (Vec<usize>, usize) {
+    use zyron_parser::ast::FetchDirection as Dir;
+
+    // The n rows after the current one. Emptied out, the cursor stands past
+    // the last row.
+    let forward = |p: usize, n: usize| -> (Vec<usize>, usize) {
+        let start = p.min(total);
+        let end = start.saturating_add(n).min(total);
+        let rows: Vec<usize> = (start..end).collect();
+        match rows.last() {
+            Some(&last) => {
+                let landed_on = last + 1;
+                (rows, landed_on)
+            }
+            None => (rows, total + 1),
+        }
+    };
+    // Up to n rows before the current one, newest first. The cursor lands on
+    // the last row returned, or before the first row when the fetch runs off
+    // the beginning. Callers pass n of at least one.
+    let backward = |p: usize, n: usize| -> (Vec<usize>, usize) {
+        let first_prior = p.saturating_sub(1).min(total);
+        let k = n.min(first_prior);
+        let rows: Vec<usize> = (first_prior - k..first_prior).rev().collect();
+        if k < n {
+            (rows, 0)
+        } else {
+            (rows, first_prior - k + 1)
+        }
+    };
+    // A zero count re-fetches the row the cursor stands on, moving nothing.
+    let refetch = |p: usize| -> (Vec<usize>, usize) {
+        if p >= 1 && p <= total {
+            (vec![p - 1], p)
+        } else {
+            (Vec::new(), p.min(total + 1))
+        }
+    };
+    // Jump to a 1-based row and return it; out of range parks the cursor
+    // before the first row or past the last one and returns nothing.
+    let goto = |target: i64| -> (Vec<usize>, usize) {
+        if target >= 1 && target <= total as i64 {
+            (vec![(target - 1) as usize], target as usize)
+        } else if target <= 0 {
+            (Vec::new(), 0)
+        } else {
+            (Vec::new(), total + 1)
+        }
+    };
+
+    match direction {
+        Dir::Next => forward(position, 1),
+        Dir::Prior => backward(position, 1),
+        Dir::First => goto(1),
+        Dir::Last => goto(total as i64),
+        Dir::All => forward(position, total),
+        Dir::Absolute(n) => {
+            // A negative ABSOLUTE counts from the end, -1 being the last row
+            if *n < 0 {
+                goto(total as i64 + 1 + n)
+            } else {
+                goto(*n)
+            }
+        }
+        Dir::Relative(n) => {
+            if *n == 0 {
+                refetch(position)
+            } else {
+                goto(position as i64 + n)
+            }
+        }
+        Dir::Forward(n) => match n {
+            None => forward(position, total),
+            Some(0) => refetch(position),
+            Some(c) if *c < 0 => backward(position, c.unsigned_abs() as usize),
+            Some(c) => forward(position, *c as usize),
+        },
+        Dir::Backward(n) => match n {
+            None => {
+                // BACKWARD ALL: everything before the current row, newest
+                // first, leaving the cursor before the first row
+                let first_prior = position.saturating_sub(1).min(total);
+                ((0..first_prior).rev().collect(), 0)
+            }
+            Some(0) => refetch(position),
+            Some(c) if *c < 0 => forward(position, c.unsigned_abs() as usize),
+            Some(c) => backward(position, *c as usize),
+        },
+    }
+}
+
+/// The command-tag verb for a plan's top node. DML plans name their verb; a
+/// view trigger write reports the verb of the event it carries; anything else
+/// reports as a row-returning statement.
+fn dml_tag_verb(plan: &PhysicalPlan) -> &'static str {
+    use zyron_catalog::TriggerEntry;
+    match plan {
+        PhysicalPlan::Insert { .. } => "INSERT",
+        PhysicalPlan::Update { .. } | PhysicalPlan::LakeUpdate { .. } => "UPDATE",
+        PhysicalPlan::Delete { .. } | PhysicalPlan::LakeDelete { .. } => "DELETE",
+        PhysicalPlan::ViewTriggerWrite { event, .. } => {
+            if *event == TriggerEntry::EVENT_UPDATE {
+                "UPDATE"
+            } else if *event == TriggerEntry::EVENT_DELETE {
+                "DELETE"
+            } else {
+                "INSERT"
+            }
+        }
+        _ => "SELECT",
+    }
+}
+
+/// Creates a DML command tag like "INSERT 0 5", "UPDATE 3", or "DELETE 2".
+/// INSERT keeps the PostgreSQL oid slot in its tag shape.
+fn make_dml_tag(verb: &str, affected: usize) -> String {
+    if verb == "INSERT" {
         format!("INSERT 0 {}", affected)
     } else {
-        format!("SELECT {}", affected)
+        format!("{} {}", verb, affected)
     }
 }
 

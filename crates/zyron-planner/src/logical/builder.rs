@@ -20,6 +20,7 @@ pub fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
         BoundStatement::Insert(insert) => build_insert_plan(insert),
         BoundStatement::Update(update) => build_update_plan(update),
         BoundStatement::Delete(delete) => build_delete_plan(delete),
+        BoundStatement::ViewTriggerWrite(vw) => build_view_trigger_write_plan(vw),
         BoundStatement::CreateStreamingJob(_)
         | BoundStatement::DropStreamingJob { .. }
         | BoundStatement::AlterStreamingJob { .. } => Err(ZyronError::PlanError(
@@ -1119,6 +1120,22 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
         column_defaults: insert.column_defaults.clone(),
         check_constraints: insert.check_constraints.clone(),
         expectations: insert.expectations.clone(),
+        source: Arc::new(source),
+    })
+}
+
+fn build_view_trigger_write_plan(vw: &BoundViewTriggerWrite) -> Result<LogicalPlan> {
+    let source = match &vw.source {
+        BoundViewTriggerSource::Rows { rows, schema } => LogicalPlan::Values {
+            rows: rows.clone(),
+            schema: schema.clone(),
+        },
+        BoundViewTriggerSource::Query(query) => build_select_plan(query)?,
+    };
+    Ok(LogicalPlan::ViewTriggerWrite {
+        view_id: vw.view_id,
+        event: vw.event,
+        param_map: vw.param_map.clone(),
         source: Arc::new(source),
     })
 }

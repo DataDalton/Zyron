@@ -55,7 +55,11 @@ pub fn operator_kind_of(plan: &PhysicalPlan) -> Option<OperatorKind> {
         // occupies the query for that long, so it is priced as a scan here
         PhysicalPlan::ForeignScan { .. } => Some(OperatorKind::SeqScan),
         PhysicalPlan::Filter { .. } | PhysicalPlan::LockRows { .. } => Some(OperatorKind::Filter),
-        PhysicalPlan::Project { .. } | PhysicalPlan::Values { .. } => Some(OperatorKind::Project),
+        // A view trigger write shapes source rows into per-row parameters;
+        // the trigger bodies it fires are priced as their own statements
+        PhysicalPlan::Project { .. }
+        | PhysicalPlan::Values { .. }
+        | PhysicalPlan::ViewTriggerWrite { .. } => Some(OperatorKind::Project),
         PhysicalPlan::HashJoin { .. } | PhysicalPlan::ParallelHashJoin { .. } => {
             Some(OperatorKind::HashJoinProbe)
         }

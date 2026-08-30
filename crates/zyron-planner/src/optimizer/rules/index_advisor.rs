@@ -76,6 +76,7 @@ impl IndexAdvisor {
             | LogicalPlan::LockRows { child, .. }
             | LogicalPlan::Aggregate { child, .. }
             | LogicalPlan::Insert { source: child, .. }
+            | LogicalPlan::ViewTriggerWrite { source: child, .. }
             | LogicalPlan::Update { child, .. }
             | LogicalPlan::Delete { child, .. } => {
                 self.walk_and_record(child);

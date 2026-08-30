@@ -69,11 +69,11 @@ impl Session {
             ("TimeZone".into(), String::from("UTC")),
             ("integer_datetimes".into(), String::from("on")),
             ("standard_conforming_strings".into(), String::from("on")),
-            // The two system schemas come first so a bare `tables` reads
+            // System entries only, so a bare `tables` reads
             // zyron_sys.core.tables and a bare `activity` reads
-            // zyron_sys.stat.activity. `public` is last and is not
-            // auto-created: a client that wants a user schema still has to
-            // make one or qualify its names.
+            // zyron_sys.stat.activity. There is no default user schema: a
+            // client reaches its own objects by creating a schema and setting
+            // the search path to it, or by qualifying names.
             ("search_path".into(), default_search_path().join(", ")),
             ("is_superuser".into(), String::from(superuser_str)),
             ("session_authorization".into(), user.clone()),
@@ -299,18 +299,18 @@ mod tests {
     fn test_set_search_path() {
         let mut session = test_session();
         session
-            .set_variable("search_path".into(), "myschema, public".into())
+            .set_variable("search_path".into(), "myschema, zyron_test".into())
             .unwrap();
-        assert_eq!(session.search_path, vec!["myschema", "public"]);
+        assert_eq!(session.search_path, vec!["myschema", "zyron_test"]);
     }
 
     #[test]
     fn test_search_path_with_user() {
         let mut session = test_session();
         session
-            .set_variable("search_path".into(), "\"$user\", public, extra".into())
+            .set_variable("search_path".into(), "\"$user\", zyron_test, extra".into())
             .unwrap();
-        assert_eq!(session.search_path, vec!["public", "extra"]);
+        assert_eq!(session.search_path, vec!["zyron_test", "extra"]);
     }
 
     #[test]
@@ -346,17 +346,33 @@ mod tests {
     #[test]
     fn test_parse_search_path() {
         assert_eq!(
-            parse_search_path("public, myschema"),
-            vec!["public", "myschema"]
+            parse_search_path("zyron_test, myschema"),
+            vec!["zyron_test", "myschema"]
         );
-        assert_eq!(parse_search_path("public"), vec!["public"]);
-        assert_eq!(parse_search_path("\"$user\", public"), vec!["public"]);
+        assert_eq!(parse_search_path("zyron_test"), vec!["zyron_test"]);
+        assert_eq!(
+            parse_search_path("\"$user\", zyron_test"),
+            vec!["zyron_test"]
+        );
     }
 
     #[test]
     fn test_default_search_path() {
         let session = test_session();
-        assert!(session.search_path.is_empty());
-        assert_eq!(session.get_variable("search_path"), Some(""));
+        let expected: Vec<String> = zyron_catalog::DEFAULT_SEARCH_PATH
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(session.search_path, expected);
+        let joined = expected.join(", ");
+        assert_eq!(session.get_variable("search_path"), Some(joined.as_str()));
+        // The default path carries system entries only, never an implicit
+        // user schema
+        assert!(
+            session
+                .search_path
+                .iter()
+                .all(|s| s.contains('.') || s == "information_schema")
+        );
     }
 }

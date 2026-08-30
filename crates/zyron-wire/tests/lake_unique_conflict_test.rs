@@ -30,7 +30,7 @@ async fn run_stmt_pending(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )

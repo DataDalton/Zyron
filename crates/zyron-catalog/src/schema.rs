@@ -2168,8 +2168,13 @@ impl VersionTagEntry {
 /// Catalog entry for a row- or statement-level trigger. On a matching DML
 /// event the executor fires `execute_function` (a stored procedure) with the
 /// affected row's columns bound as positional parameters ($1..$N). `events` is
-/// a bitmask (Insert=1, Update=2, Delete=4); `timing` is 0=Before, 1=After;
-/// `for_each` is 0=Row, 1=Statement.
+/// a bitmask (Insert=1, Update=2, Delete=4); `timing` is 0=Before, 1=After,
+/// 2=InsteadOf; `for_each` is 0=Row, 1=Statement.
+///
+/// An INSTEAD OF trigger targets a view: `table_id` holds the view's id
+/// (views and tables draw ids from the same allocator, so the key spaces
+/// never collide). A write against the view runs the trigger body instead of
+/// touching storage; the body decides what to write to the underlying tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerEntry {
     pub id: u32,
@@ -2189,6 +2194,7 @@ impl TriggerEntry {
     pub const EVENT_DELETE: u8 = 4;
     pub const TIMING_BEFORE: u8 = 0;
     pub const TIMING_AFTER: u8 = 1;
+    pub const TIMING_INSTEAD_OF: u8 = 2;
     pub const FOR_EACH_ROW: u8 = 0;
     pub const FOR_EACH_STATEMENT: u8 = 1;
 
@@ -3926,7 +3932,7 @@ mod tests {
         let entry = SchemaEntry {
             id: SchemaId(5),
             database_id: DatabaseId(1),
-            name: "public".to_string(),
+            name: "zyron_test".to_string(),
             owner: "admin".to_string(),
         };
         let bytes = entry.to_bytes();
@@ -4246,7 +4252,7 @@ mod tests {
     fn test_streaming_job_entry_roundtrip() {
         let entry = StreamingJobEntry {
             id: StreamingJobId(42),
-            name: "orders_to_warehouse".to_string(),
+            name: "orders_to_analytics".to_string(),
             source_table_id: TableId(100),
             target_table_id: TableId(200),
             source_schema_id: SchemaId(1),
@@ -4325,7 +4331,7 @@ mod tests {
         let entry = ExternalSinkEntry {
             id: ExternalSinkId(88),
             schema_id: SchemaId(4),
-            name: "warehouse_sink".to_string(),
+            name: "events_sink".to_string(),
             backend: ExternalBackend::Gcs,
             uri: "gs://bucket/out/".to_string(),
             format: ExternalFormat::JsonLines,

@@ -56,7 +56,7 @@ async fn seeded_server(
         if values.len() == 500 {
             common::exec_dml(
                 &state,
-                &format!("INSERT INTO public.wide VALUES {}", values.join(", ")),
+                &format!("INSERT INTO zyron_test.wide VALUES {}", values.join(", ")),
             )
             .await;
             values.clear();
@@ -65,7 +65,7 @@ async fn seeded_server(
     if !values.is_empty() {
         common::exec_dml(
             &state,
-            &format!("INSERT INTO public.wide VALUES {}", values.join(", ")),
+            &format!("INSERT INTO zyron_test.wide VALUES {}", values.join(", ")),
         )
         .await;
     }
@@ -88,7 +88,7 @@ async fn seeded_server(
 /// query returning twenty thousand rows exceeds a sixty-four kilobyte budget
 /// on the result alone, spill or no spill. What spilling fixes is the
 /// operator's own buffering, so that is what this measures.
-const SORTING_QUERY: &str = "SELECT id FROM public.wide ORDER BY id LIMIT 50";
+const SORTING_QUERY: &str = "SELECT id FROM zyron_test.wide ORDER BY id LIMIT 50";
 
 /// Rows the query asks for.
 const WANTED: usize = 50;
@@ -218,4 +218,99 @@ async fn the_view_reports_what_spilling_cost() {
         refusals_before,
         "the quota refused a query"
     );
+}
+
+/// The spill merge phase polls cancellation between output batches.
+///
+/// The merge runs after the input is fully consumed, so the consumer-side
+/// poll wrapper around the sort's child can no longer observe a cancel. The
+/// sort is driven directly here: the first merged batch streams out, the
+/// flag flips while the merge is mid-output, and the next pull must come
+/// back as the cancellation error instead of finishing the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_spill_merge_phase_observes_a_cancel_between_batches() {
+    use zyron_common::TypeId;
+    use zyron_executor::batch::DataBatch;
+    use zyron_executor::column::{Column, ColumnData};
+    use zyron_executor::context::{ExecutionContext, QueryMemoryBudget};
+    use zyron_executor::operator::sort::SortOperator;
+    use zyron_executor::operator::{ExecutionBatch, Operator};
+    use zyron_planner::binder::{BoundExpr, BoundOrderBy, ColumnRef};
+    use zyron_planner::logical::LogicalColumn;
+
+    struct Feed {
+        batches: Vec<DataBatch>,
+    }
+    impl Operator for Feed {
+        fn next(&mut self) -> zyron_executor::operator::OperatorResult<'_> {
+            Box::pin(async move { Ok(self.batches.pop().map(ExecutionBatch::new)) })
+        }
+    }
+
+    let (state, _schema, _tmp) = create_test_server().await;
+    let txn = state
+        .txn_manager
+        .begin(zyron_storage::IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let ctx = Arc::new(ExecutionContext::new(
+        state.catalog.clone(),
+        state.wal.clone(),
+        state.buffer_pool.clone(),
+        state.disk_manager.clone(),
+        txn.txn_id,
+        txn.snapshot.clone(),
+    ));
+
+    // Three descending runs of 16384 rows against a budget that forces every
+    // one of them to disk, so the output is a pure merge over spill files.
+    let run = |offset: i64| -> DataBatch {
+        DataBatch::new(vec![Column::new(
+            ColumnData::Int64((0..16_384).map(|i| offset + i).rev().collect()),
+            TypeId::Int64,
+        )])
+    };
+    let schema = vec![LogicalColumn {
+        name: "v".into(),
+        type_id: TypeId::Int64,
+        nullable: false,
+        fractional_digits: None,
+        table_idx: Some(0),
+        column_id: zyron_catalog::ColumnId(0),
+    }];
+    let order = vec![BoundOrderBy {
+        expr: BoundExpr::ColumnRef(ColumnRef {
+            table_idx: 0,
+            column_id: zyron_catalog::ColumnId(0),
+            type_id: TypeId::Int64,
+            nullable: false,
+            fractional_digits: None,
+        }),
+        asc: true,
+        nulls_first: false,
+    }];
+
+    let dir = spill_directory("merge_cancel");
+    let feed = Feed {
+        batches: vec![run(0), run(100_000), run(200_000)],
+    };
+    let mut sort = SortOperator::new(Box::new(feed), order, schema, None);
+    sort.set_memory_budget(Some(QueryMemoryBudget::new(1024 * 1024)));
+    sort.set_spill(Some(Arc::clone(&dir)), 64 * 1024);
+    sort.set_poll_context(Arc::clone(&ctx));
+
+    // The first merged batch streams out normally, proving the merge is the
+    // phase in progress when the flag flips.
+    let first = sort
+        .next()
+        .await
+        .expect("the merge starts cleanly")
+        .expect("a merged batch");
+    assert!(first.batch.num_rows > 0);
+
+    ctx.cancel();
+    let err = match sort.next().await {
+        Err(e) => e,
+        Ok(_) => panic!("the merge kept producing after the cancel"),
+    };
+    assert!(err.to_string().contains("cancelled"), "{err}");
 }

@@ -70,7 +70,9 @@ impl PlannerMaterializationExecutor {
             .map_err(|e| format!("parse error: {}", e))?;
         let catalog = self.catalog.clone();
         let database_id = zyron_catalog::DatabaseId(1);
-        let search_path: Vec<String> = vec!["public".to_string()];
+        // No session namespace exists here: a stored source query reaches
+        // user tables by qualifying them, never through an implicit schema
+        let search_path: Vec<String> = zyron_catalog::default_search_path();
 
         let wal = self.wal.clone();
         let bp = self.buffer_pool.clone();

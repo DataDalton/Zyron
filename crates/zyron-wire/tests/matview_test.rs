@@ -45,9 +45,9 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
             .expect("catalog"),
     );
     let public_schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
@@ -105,6 +105,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -133,7 +134,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
 
 fn new_session() -> Option<Session> {
     let mut s = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    s.search_path = vec!["public".into()];
+    s.search_path = vec!["zyron_test".into()];
     Some(s)
 }
 
@@ -166,7 +167,7 @@ async fn try_exec(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -390,4 +391,140 @@ async fn refresh_missing_view_errors() {
             .await
             .is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// REFRESH MATERIALIZED VIEW CONCURRENTLY
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn refresh_concurrently_applies_the_new_contents() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM t",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE UNIQUE INDEX mv_id ON mv (id)",
+    )
+    .await;
+
+    exec(&server, &mut session, "UPDATE t SET v = v + 1000").await;
+    exec(
+        &server,
+        &mut session,
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+    )
+    .await;
+
+    let mut vs = col_i64(&exec(&server, &mut session, "SELECT v FROM mv").await, 0);
+    vs.sort_unstable();
+    assert_eq!(vs, vec![1010, 1020, 1030]);
+}
+
+#[tokio::test]
+async fn refresh_concurrently_tolerates_overlapping_unique_rows() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM t",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE UNIQUE INDEX mv_id ON mv (id)",
+    )
+    .await;
+
+    // The refresh re-inserts the same unique keys the delete removed inside
+    // one transaction, so the uniqueness probe must see the transaction's own
+    // deletes or every refresh of unchanged data would conflict.
+    exec(
+        &server,
+        &mut session,
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+    )
+    .await;
+
+    let mut ids = col_i64(&exec(&server, &mut session, "SELECT id FROM mv").await, 0);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readers_never_see_a_partial_state_during_concurrent_refresh() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM t",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE UNIQUE INDEX mv_id ON mv (id)",
+    )
+    .await;
+
+    // Change the source so pre-refresh and post-refresh contents are
+    // distinguishable: the old set is {10,20,30}, the new {1010,1020,1030,4}.
+    exec(&server, &mut session, "UPDATE t SET v = v + 1000").await;
+    exec(&server, &mut session, "INSERT INTO t (id, v) VALUES (4, 4)").await;
+    let old_set: Vec<i64> = vec![10, 20, 30];
+    let new_set: Vec<i64> = vec![4, 1010, 1020, 1030];
+
+    // One task refreshes while this task reads in a loop. Every read must
+    // return exactly the old contents or exactly the new contents.
+    let refresher = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            let mut session = new_session();
+            exec(
+                &server,
+                &mut session,
+                "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+            )
+            .await;
+        })
+    };
+
+    let mut saw_new = false;
+    while !refresher.is_finished() {
+        let mut vs = col_i64(&exec(&server, &mut session, "SELECT v FROM mv").await, 0);
+        vs.sort_unstable();
+        assert!(
+            vs == old_set || vs == new_set,
+            "a reader saw a partial refresh state: {vs:?}"
+        );
+        if vs == new_set {
+            saw_new = true;
+        }
+        tokio::task::yield_now().await;
+    }
+    refresher.await.expect("refresh task");
+
+    // After the refresh the new contents are the only visible state.
+    let mut vs = col_i64(&exec(&server, &mut session, "SELECT v FROM mv").await, 0);
+    vs.sort_unstable();
+    assert_eq!(vs, new_set);
+    let _ = saw_new;
 }

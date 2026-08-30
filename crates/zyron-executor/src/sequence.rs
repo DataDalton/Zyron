@@ -274,7 +274,9 @@ async fn resolve_one(
 ) -> Result<Vec<i64>> {
     match p.kind {
         SeqKind::NextVal => {
-            let live = ctx.catalog.find_sequence_by_name(&p.seq_name)?;
+            let live = ctx
+                .catalog
+                .resolve_sequence(ctx.planning_database, &p.seq_name)?;
             let mut out = Vec::with_capacity(num_rows);
             let mut last = 0i64;
             for _ in 0..num_rows {
@@ -294,7 +296,9 @@ async fn resolve_one(
             Ok(out)
         }
         SeqKind::CurrVal => {
-            let live = ctx.catalog.find_sequence_by_name(&p.seq_name)?;
+            let live = ctx
+                .catalog
+                .resolve_sequence(ctx.planning_database, &p.seq_name)?;
             let state = ctx.session_sequences.as_ref().ok_or_else(|| {
                 ZyronError::ExecutionError("currval is not available outside a session".to_string())
             })?;
@@ -316,7 +320,9 @@ async fn resolve_one(
             Ok(vec![v; num_rows])
         }
         SeqKind::SetVal => {
-            let live = ctx.catalog.find_sequence_by_name(&p.seq_name)?;
+            let live = ctx
+                .catalog
+                .resolve_sequence(ctx.planning_database, &p.seq_name)?;
             let value = scalar_i64(p.value_expr.as_ref(), batch, schema, &ctx.params)?.ok_or_else(
                 || ZyronError::ExecutionError("setval requires a value argument".to_string()),
             )?;

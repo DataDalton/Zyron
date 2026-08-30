@@ -45,9 +45,9 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
             .expect("catalog"),
     );
     let public_schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
@@ -105,6 +105,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -133,7 +134,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
 
 fn new_session() -> Option<Session> {
     let mut s = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    s.search_path = vec!["public".into()];
+    s.search_path = vec!["zyron_test".into()];
     Some(s)
 }
 
@@ -166,7 +167,7 @@ async fn try_exec(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -374,4 +375,151 @@ async fn create_aggregate_requires_existing_sfunc() {
         err.to_lowercase().contains("state function") || err.to_lowercase().contains("nope"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn create_aggregate_requires_existing_combinefunc() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed_table(&server, &mut session).await;
+    define_sum_sfunc(&server, &mut session).await;
+    // The state function exists but the combine function does not; the
+    // dangling reference must be rejected rather than stored.
+    let err = try_exec(
+        &server,
+        &mut session,
+        "CREATE AGGREGATE mysum(val INT) (SFUNC = agg_add, STYPE = INT, COMBINEFUNC = nope, INITCOND = '0')",
+    )
+    .await
+    .expect_err("missing combinefunc should be rejected");
+    assert!(
+        err.to_lowercase().contains("combine function") || err.to_lowercase().contains("nope"),
+        "unexpected error: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Schema-scoped aggregate resolution
+// ---------------------------------------------------------------------------
+
+/// Two same-named aggregates in different schemas with distinguishable
+/// semantics: the off-path twin multiplies, the on-path twin sums. The
+/// off-path twin registers FIRST, so a bare call would hit it under
+/// registration-order resolution.
+async fn twin_aggregates(server: &Arc<ServerState>, session: &mut Option<Session>) {
+    seed_table(server, session).await;
+    define_sum_sfunc(server, session).await;
+    exec(server, session, "CREATE SCHEMA as2").await;
+    exec(
+        server,
+        session,
+        "CREATE FUNCTION as2.agg_mul(acc INT, val INT) RETURNS INT AS 'acc * val 'LANGUAGE SQL",
+    )
+    .await;
+    exec(
+        server,
+        session,
+        "CREATE AGGREGATE as2.twin(val INT) (SFUNC = as2.agg_mul, STYPE = INT, INITCOND = '1')",
+    )
+    .await;
+    exec(
+        server,
+        session,
+        "CREATE AGGREGATE zyron_test.twin(val INT) (SFUNC = agg_add, STYPE = INT, INITCOND = '0')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bare_aggregate_resolves_through_the_search_path_not_first_wins() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_aggregates(&server, &mut session).await;
+
+    // The search path holds zyron_test only: the bare call binds the summing
+    // twin even though as2's product twin registered first.
+    assert_eq!(
+        scalar_i64(&exec(&server, &mut session, "SELECT twin(x) FROM t").await),
+        45
+    );
+}
+
+#[tokio::test]
+async fn qualified_aggregate_reads_exactly_the_named_schema() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_aggregates(&server, &mut session).await;
+
+    // 10 * 20 * 5 * 7 * 3 = 21000
+    assert_eq!(
+        scalar_i64(&exec(&server, &mut session, "SELECT as2.twin(x) FROM t").await),
+        21000
+    );
+    assert_eq!(
+        scalar_i64(&exec(&server, &mut session, "SELECT zyron_test.twin(x) FROM t").await),
+        45
+    );
+}
+
+#[tokio::test]
+async fn aggregate_binds_its_canonical_sfunc_despite_a_decoy() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed_table(&server, &mut session).await;
+    exec(&server, &mut session, "CREATE SCHEMA impl_schema").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE FUNCTION impl_schema.acc(acc INT, val INT) RETURNS INT AS 'acc + val 'LANGUAGE SQL",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE AGGREGATE total(val INT) (SFUNC = impl_schema.acc, STYPE = INT, INITCOND = '0')",
+    )
+    .await;
+
+    // A same-named function lands ON the search path after the definition.
+    // The definition stored a canonical schema.name, so the decoy must
+    // never bind even though a bare walk would find it first.
+    exec(
+        &server,
+        &mut session,
+        "CREATE FUNCTION zyron_test.acc(acc INT, val INT) RETURNS INT AS 'acc + 1000 'LANGUAGE SQL",
+    )
+    .await;
+
+    assert_eq!(
+        scalar_i64(&exec(&server, &mut session, "SELECT total(x) FROM t").await),
+        45,
+        "the canonical state function folded, not the decoy"
+    );
+}
+
+#[tokio::test]
+async fn drop_aggregate_touches_one_schema_only() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_aggregates(&server, &mut session).await;
+
+    // The bare drop resolves via the search path to zyron_test's twin.
+    exec(&server, &mut session, "DROP AGGREGATE twin").await;
+    let err = try_exec(&server, &mut session, "SELECT zyron_test.twin(x) FROM t")
+        .await
+        .expect_err("the dropped schema's aggregate is gone");
+    assert!(err.contains("twin"), "{err}");
+
+    // The same-named aggregate in the other schema survives.
+    assert_eq!(
+        scalar_i64(&exec(&server, &mut session, "SELECT as2.twin(x) FROM t").await),
+        21000
+    );
+
+    // A qualified drop removes exactly the named schema's aggregate.
+    exec(&server, &mut session, "DROP AGGREGATE as2.twin").await;
+    let err = try_exec(&server, &mut session, "SELECT as2.twin(x) FROM t")
+        .await
+        .expect_err("both twins are gone");
+    assert!(err.contains("twin"), "{err}");
 }

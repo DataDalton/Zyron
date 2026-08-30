@@ -45,9 +45,9 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
             .expect("catalog"),
     );
     let public_schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
@@ -105,6 +105,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -133,7 +134,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
 
 fn new_session() -> Option<Session> {
     let mut s = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    s.search_path = vec!["public".into()];
+    s.search_path = vec!["zyron_test".into()];
     Some(s)
 }
 
@@ -166,7 +167,7 @@ async fn try_exec(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -239,7 +240,7 @@ async fn call_runs_single_statement_body_with_params() {
     exec(
         &server,
         &mut session,
-        "CREATE PROCEDURE add_row(grp INT, val INT) AS 'INSERT INTO t (g, x) VALUES ($1, $2)' LANGUAGE SQL",
+        "CREATE PROCEDURE add_row(grp INT, val INT) AS 'INSERT INTO zyron_test.t (g, x) VALUES ($1, $2)' LANGUAGE SQL",
     )
     .await;
     exec(&server, &mut session, "CALL add_row(1, 100)").await;
@@ -259,7 +260,7 @@ async fn call_runs_multi_statement_body() {
     exec(
         &server,
         &mut session,
-        "CREATE PROCEDURE add_pair(a INT, b INT) AS 'INSERT INTO t (g, x) VALUES ($1, $2); INSERT INTO t (g, x) VALUES ($2, $1)' LANGUAGE SQL",
+        "CREATE PROCEDURE add_pair(a INT, b INT) AS 'INSERT INTO zyron_test.t (g, x) VALUES ($1, $2); INSERT INTO zyron_test.t (g, x) VALUES ($2, $1)' LANGUAGE SQL",
     )
     .await;
     exec(&server, &mut session, "CALL add_pair(3, 4)").await;
@@ -284,7 +285,7 @@ async fn call_runs_update_body_with_param() {
     exec(
         &server,
         &mut session,
-        "CREATE PROCEDURE set_all(val INT) AS 'UPDATE t SET x = $1' LANGUAGE SQL",
+        "CREATE PROCEDURE set_all(val INT) AS 'UPDATE zyron_test.t SET x = $1' LANGUAGE SQL",
     )
     .await;
     exec(&server, &mut session, "CALL set_all(5)").await;
@@ -300,7 +301,7 @@ async fn call_with_wrong_argument_count_errors() {
     exec(
         &server,
         &mut session,
-        "CREATE PROCEDURE add_row(grp INT, val INT) AS 'INSERT INTO t (g, x) VALUES ($1, $2)' LANGUAGE SQL",
+        "CREATE PROCEDURE add_row(grp INT, val INT) AS 'INSERT INTO zyron_test.t (g, x) VALUES ($1, $2)' LANGUAGE SQL",
     )
     .await;
     let err = try_exec(&server, &mut session, "CALL add_row(1)")
@@ -320,7 +321,7 @@ async fn drop_procedure_then_call_errors() {
     exec(
         &server,
         &mut session,
-        "CREATE PROCEDURE add_row(grp INT, val INT) AS 'INSERT INTO t (g, x) VALUES ($1, $2)' LANGUAGE SQL",
+        "CREATE PROCEDURE add_row(grp INT, val INT) AS 'INSERT INTO zyron_test.t (g, x) VALUES ($1, $2)' LANGUAGE SQL",
     )
     .await;
     exec(&server, &mut session, "CALL add_row(1, 100)").await;
@@ -350,4 +351,77 @@ async fn create_procedure_rejects_malformed_body() {
         err.to_lowercase().contains("parse") || err.to_lowercase().contains("body"),
         "unexpected error: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Schema-scoped procedure resolution
+// ---------------------------------------------------------------------------
+
+/// Two same-named procedures in different schemas writing distinguishable
+/// rows, so a test can prove exactly which one a CALL resolved.
+async fn twin_procedures(server: &Arc<ServerState>, session: &mut Option<Session>) {
+    seed(server, session).await;
+    exec(server, session, "CREATE SCHEMA s2").await;
+    exec(
+        server,
+        session,
+        "CREATE PROCEDURE mark() AS 'INSERT INTO zyron_test.t (g, x) VALUES (1, 100)' LANGUAGE SQL",
+    )
+    .await;
+    if let Some(s) = session.as_mut() {
+        s.search_path = vec!["s2".into()];
+    }
+    exec(
+        server,
+        session,
+        "CREATE PROCEDURE mark() AS 'INSERT INTO zyron_test.t (g, x) VALUES (2, 200)' LANGUAGE SQL",
+    )
+    .await;
+    if let Some(s) = session.as_mut() {
+        s.search_path = vec!["zyron_test".into()];
+    }
+}
+
+#[tokio::test]
+async fn call_resolves_through_the_search_path_not_first_wins() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_procedures(&server, &mut session).await;
+
+    // A bare CALL takes the session's path, never whichever schema happened
+    // to register first.
+    if let Some(s) = session.as_mut() {
+        s.search_path = vec!["s2".into()];
+    }
+    exec(&server, &mut session, "CALL mark()").await;
+    if let Some(s) = session.as_mut() {
+        s.search_path = vec!["zyron_test".into()];
+    }
+    let xs = sorted_col(&exec(&server, &mut session, "SELECT x FROM t").await, 0);
+    assert_eq!(xs, vec![200], "the s2 procedure ran, not zyron_test's");
+
+    // A qualified CALL reads exactly the named schema, path irrelevant.
+    exec(&server, &mut session, "CALL zyron_test.mark()").await;
+    exec(&server, &mut session, "CALL s2.mark()").await;
+    let xs = sorted_col(&exec(&server, &mut session, "SELECT x FROM t").await, 0);
+    assert_eq!(xs, vec![100, 200, 200]);
+}
+
+#[tokio::test]
+async fn drop_procedure_touches_one_schema_only() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    twin_procedures(&server, &mut session).await;
+
+    // The drop resolves via the session path to zyron_test's overloads only.
+    exec(&server, &mut session, "DROP PROCEDURE mark").await;
+    let err = try_exec(&server, &mut session, "CALL zyron_test.mark()")
+        .await
+        .expect_err("the dropped schema's procedure is gone");
+    assert!(err.contains("not found"), "{err}");
+
+    // The same-named procedure in the other schema survives.
+    exec(&server, &mut session, "CALL s2.mark()").await;
+    let xs = sorted_col(&exec(&server, &mut session, "SELECT x FROM t").await, 0);
+    assert_eq!(xs, vec![200]);
 }

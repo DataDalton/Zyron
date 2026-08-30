@@ -586,6 +586,8 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     Update(BoundUpdate),
     Delete(BoundDelete),
+    /// DML against a view with an INSTEAD OF trigger for the event.
+    ViewTriggerWrite(Box<BoundViewTriggerWrite>),
     CreateStreamingJob(BoundStreamingJob),
     DropStreamingJob {
         name: String,
@@ -1932,6 +1934,38 @@ pub struct BoundDelete {
     pub returning: Option<Vec<BoundSelectItem>>,
 }
 
+/// A bound DML statement whose target is a view carrying an INSTEAD OF
+/// trigger for the event. The view's underlying tables are never written
+/// directly: the executor evaluates `source` to produce one parameter row per
+/// affected row and runs the trigger's procedure body once per row, with the
+/// row values bound as $1..$N. For INSERT the row is the NEW image in view
+/// column order; for DELETE it is the OLD image; for UPDATE it is the OLD
+/// image followed by the NEW image ($1..$N old, $N+1..$2N new).
+#[derive(Debug, Clone)]
+pub struct BoundViewTriggerWrite {
+    /// The target view's catalog id. Trigger entries are keyed by it.
+    pub view_id: u32,
+    pub view_name: String,
+    /// TriggerEntry event bit (EVENT_INSERT / EVENT_UPDATE / EVENT_DELETE).
+    pub event: u8,
+    /// Maps each trigger parameter position to a source column index. None
+    /// fills NULL, covering view columns an INSERT column list omits.
+    pub param_map: Vec<Option<usize>>,
+    pub source: BoundViewTriggerSource,
+}
+
+/// Row source for a view trigger write. INSERT ... VALUES rows are bound and
+/// padded to view column order at bind time; INSERT ... SELECT and the
+/// UPDATE/DELETE image queries execute as regular plans.
+#[derive(Debug, Clone)]
+pub enum BoundViewTriggerSource {
+    Rows {
+        rows: Vec<Vec<BoundExpr>>,
+        schema: Vec<LogicalColumn>,
+    },
+    Query(Box<BoundSelect>),
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate function names
 // ---------------------------------------------------------------------------
@@ -2560,10 +2594,18 @@ impl<'a> Binder<'a> {
                 Ok(BoundStatement::Select(bound))
             }
             Statement::Insert(s) => {
+                if let Some(view) = self.dml_view_target(&s.table).await? {
+                    let bound = self.bind_view_insert(view, &s).await?;
+                    return Ok(BoundStatement::ViewTriggerWrite(Box::new(bound)));
+                }
                 let bound = self.bind_insert(&s).await?;
                 Ok(BoundStatement::Insert(bound))
             }
             Statement::Update(s) => {
+                if let Some(view) = self.dml_view_target(&s.table).await? {
+                    let bound = self.bind_view_update(view, &s).await?;
+                    return Ok(BoundStatement::ViewTriggerWrite(Box::new(bound)));
+                }
                 let bound = self.bind_update(&s).await?;
                 Ok(BoundStatement::Update(bound))
             }
@@ -3023,7 +3065,13 @@ impl<'a> Binder<'a> {
                     // stored query as a derived table, exposed under the view
                     // name (or the supplied alias). The view reduces to a
                     // subquery so the rest of planning and execution is shared.
-                    if let Some(view) = self.catalog.find_view_by_name(name)? {
+                    // Probing views before tables is safe because the catalog
+                    // rejects a table and a view sharing one name in a schema.
+                    if let Some(view) = self.catalog.resolve_view_scoped(
+                        self.resolver.database_id(),
+                        self.resolver.search_path(),
+                        name,
+                    ) {
                         if self.view_stack.iter().any(|v| v == &view.name) {
                             return Err(ZyronError::PlanError(format!(
                                 "view '{}' references itself",
@@ -3912,7 +3960,12 @@ impl<'a> Binder<'a> {
                             return_type,
                             uda: None,
                         })
-                    } else if let Some(agg) = self.catalog.find_aggregate(name, &arg_types) {
+                    } else if let Some(agg) = self.catalog.resolve_aggregate_scoped(
+                        self.resolver.database_id(),
+                        self.resolver.search_path(),
+                        name,
+                        &arg_types,
+                    ) {
                         // User-defined aggregate: bind its state-transition and
                         // final functions over synthetic columns so the executor
                         // folds each group without an async catalog lookup.
@@ -3924,7 +3977,12 @@ impl<'a> Binder<'a> {
                             return_type: agg.return_type,
                             uda: Some(Box::new(uda)),
                         })
-                    } else if let Some(func) = self.catalog.find_function(name, &arg_types) {
+                    } else if let Some(func) = self.catalog.resolve_function_scoped(
+                        self.resolver.database_id(),
+                        self.resolver.search_path(),
+                        name,
+                        &arg_types,
+                    ) {
                         // SQL scalar UDF: inline the body with the call's
                         // argument expressions substituted for the parameters,
                         // then bind the result. Nested calls of the same
@@ -3972,6 +4030,13 @@ impl<'a> Binder<'a> {
                             target_type: func.return_type,
                             fractional_digits: None,
                         })
+                    } else if name.contains('.') {
+                        // A qualified call names a user function or aggregate
+                        // in exactly one schema; built-ins are never
+                        // schema-qualified, so nothing else can match
+                        Err(ZyronError::PlanError(format!(
+                            "function '{name}' not found; a qualified call resolves user functions and aggregates in exactly that schema"
+                        )))
                     } else {
                         let return_type = infer_function_type(name, &arg_types)?;
                         Ok(BoundExpr::Function {
@@ -4708,9 +4773,12 @@ impl<'a> Binder<'a> {
         let mut sfunc_arg_types = Vec::with_capacity(1 + agg.input_types.len());
         sfunc_arg_types.push(agg.state_type);
         sfunc_arg_types.extend_from_slice(&agg.input_types);
+        // The definition stored a canonical schema.name at CREATE AGGREGATE,
+        // so the state function binds to the exact function it named no
+        // matter which session or namespace runs the aggregate
         let sfunc = self
             .catalog
-            .find_function(&agg.sfunc_name, &sfunc_arg_types)
+            .resolve_function_canonical(&agg.sfunc_name, &sfunc_arg_types)
             .ok_or_else(|| {
                 ZyronError::PlanError(format!(
                     "aggregate '{}' references undefined state function '{}'",
@@ -4763,7 +4831,7 @@ impl<'a> Binder<'a> {
         let finalfunc = if let Some(fname) = &agg.finalfunc_name {
             let ff = self
                 .catalog
-                .find_function(fname, &[agg.state_type])
+                .resolve_function_canonical(fname, &[agg.state_type])
                 .ok_or_else(|| {
                     ZyronError::PlanError(format!(
                         "aggregate '{}' references undefined final function '{}'",
@@ -5038,6 +5106,10 @@ impl<'a> Binder<'a> {
     /// `is_deleted = true, deleted_at = now()` (filtered to not re-tombstone
     /// already-deleted rows). Otherwise it binds a normal physical delete.
     async fn bind_delete_dispatch(&mut self, stmt: &DeleteStatement) -> Result<BoundStatement> {
+        if let Some(view) = self.dml_view_target(&stmt.table).await? {
+            let bound = self.bind_view_delete(view, stmt).await?;
+            return Ok(BoundStatement::ViewTriggerWrite(Box::new(bound)));
+        }
         let (schema_name, table_name) = if let Some(dot_pos) = stmt.table.find('.') {
             (Some(&stmt.table[..dot_pos]), &stmt.table[dot_pos + 1..])
         } else {
@@ -5125,6 +5197,395 @@ impl<'a> Binder<'a> {
             where_clause,
             returning,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // View DML binding (INSTEAD OF triggers)
+    // -----------------------------------------------------------------------
+
+    /// Resolves a DML target name as a view when no table of that name
+    /// exists. Tables are probed first here while FROM probes views first,
+    /// which is safe because the catalog rejects a table and a view sharing
+    /// one name in a schema, so the two orders can never pick different
+    /// objects. When neither a table nor a view matches, the original table
+    /// resolution error propagates.
+    async fn dml_view_target(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<zyron_catalog::schema::ViewEntry>>> {
+        let (schema_name, table_name) = if let Some(dot_pos) = name.find('.') {
+            (Some(&name[..dot_pos]), &name[dot_pos + 1..])
+        } else {
+            (None, name)
+        };
+        match self.rt_memo(schema_name, table_name).await {
+            Ok(_) => Ok(None),
+            Err(table_err) => match self.catalog.resolve_view_scoped(
+                self.resolver.database_id(),
+                self.resolver.search_path(),
+                name,
+            ) {
+                Some(view) => Ok(Some(view)),
+                None => Err(table_err),
+            },
+        }
+    }
+
+    /// Requires an enabled INSTEAD OF trigger on the view for the event. A
+    /// view without one is not writable for that event, and the error names
+    /// the missing trigger form rather than reporting the view as an unknown
+    /// relation.
+    fn require_instead_of_trigger(
+        &self,
+        view_id: u32,
+        view_name: &str,
+        event: u8,
+        action_phrase: &str,
+        event_word: &str,
+    ) -> Result<()> {
+        use zyron_catalog::TriggerEntry;
+        let has = self
+            .catalog
+            .triggers_for_table(TableId(view_id))
+            .iter()
+            .any(|t| {
+                t.enabled && t.timing == TriggerEntry::TIMING_INSTEAD_OF && (t.events & event) != 0
+            });
+        if has {
+            Ok(())
+        } else {
+            Err(ZyronError::PlanError(format!(
+                "cannot {action_phrase} view '{view_name}', it has no INSTEAD OF {event_word} trigger"
+            )))
+        }
+    }
+
+    /// Resolves the columns a view exposes, in definition order, with
+    /// declared column aliases applied. Mirrors the FROM-clause view
+    /// expansion so a write against the view sees the same column names and
+    /// types a read does.
+    async fn view_write_columns(
+        &mut self,
+        view: &Arc<zyron_catalog::schema::ViewEntry>,
+    ) -> Result<Vec<BoundColumnDef>> {
+        if self.view_stack.iter().any(|v| v == &view.name) {
+            return Err(ZyronError::PlanError(format!(
+                "view '{}' references itself",
+                view.name
+            )));
+        }
+        let parsed = zyron_parser::parse(&view.definition_sql).map_err(|e| {
+            ZyronError::PlanError(format!(
+                "view '{}' definition failed to parse: {e}",
+                view.name
+            ))
+        })?;
+        let query = match parsed.into_iter().next() {
+            Some(zyron_parser::ast::Statement::CreateView(cv)) => cv.query,
+            _ => {
+                return Err(ZyronError::PlanError(format!(
+                    "view '{}' definition is not a CREATE VIEW",
+                    view.name
+                )));
+            }
+        };
+        self.view_stack.push(view.name.clone());
+        let bound_query = self.bind_select(&mut BindContext::new(), &query).await;
+        self.view_stack.pop();
+        let bound_query = bound_query?;
+
+        let mut columns = bound_query.output_schema;
+        if !view.column_aliases.is_empty() {
+            if view.column_aliases.len() != columns.len() {
+                return Err(ZyronError::PlanError(format!(
+                    "view '{}' declares {} column aliases but its query produces {}",
+                    view.name,
+                    view.column_aliases.len(),
+                    columns.len()
+                )));
+            }
+            for (col, alias_name) in columns.iter_mut().zip(view.column_aliases.iter()) {
+                col.name = alias_name.clone();
+            }
+        }
+        for (i, col) in columns.iter_mut().enumerate() {
+            col.column_id = ColumnId(i as u16);
+            col.ordinal = i as u16;
+        }
+        Ok(columns)
+    }
+
+    /// Maps an INSERT column list onto view column positions. An empty list
+    /// targets every view column in order. Rejects unknown and repeated
+    /// columns.
+    fn view_insert_positions(
+        view_name: &str,
+        view_cols: &[BoundColumnDef],
+        columns: &[String],
+    ) -> Result<Vec<usize>> {
+        if columns.is_empty() {
+            return Ok((0..view_cols.len()).collect());
+        }
+        let mut positions = Vec::with_capacity(columns.len());
+        for col_name in columns {
+            // Exact match, the same rule resolve_column applies to table
+            // columns: the parser lowercases unquoted identifiers, quoted
+            // ones stay as written
+            let pos = view_cols
+                .iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| {
+                    ZyronError::PlanError(format!(
+                        "column '{col_name}' does not exist in view '{view_name}'"
+                    ))
+                })?;
+            if positions.contains(&pos) {
+                return Err(ZyronError::PlanError(format!(
+                    "column '{col_name}' specified more than once"
+                )));
+            }
+            positions.push(pos);
+        }
+        Ok(positions)
+    }
+
+    /// Binds INSERT into a view with an INSTEAD OF INSERT trigger. The
+    /// trigger body receives each NEW row's values as $1..$N in view column
+    /// order, with NULL for columns the statement omits.
+    async fn bind_view_insert(
+        &mut self,
+        view: Arc<zyron_catalog::schema::ViewEntry>,
+        stmt: &InsertStatement,
+    ) -> Result<BoundViewTriggerWrite> {
+        use zyron_catalog::TriggerEntry;
+        if stmt.returning.is_some() {
+            return Err(ZyronError::PlanError(format!(
+                "INSERT ... RETURNING is not supported on view '{}'",
+                view.name
+            )));
+        }
+        if stmt.on_conflict.is_some() {
+            return Err(ZyronError::PlanError(format!(
+                "INSERT ... ON CONFLICT is not supported on view '{}'",
+                view.name
+            )));
+        }
+        self.require_instead_of_trigger(
+            view.id,
+            &view.name,
+            TriggerEntry::EVENT_INSERT,
+            "INSERT into",
+            "INSERT",
+        )?;
+        let view_cols = self.view_write_columns(&view).await?;
+        let target_positions = Self::view_insert_positions(&view.name, &view_cols, &stmt.columns)?;
+
+        match &stmt.source {
+            InsertSource::Values(rows) => {
+                let ctx = BindContext::new();
+                let mut bound_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if row.len() != target_positions.len() {
+                        return Err(ZyronError::PlanError(format!(
+                            "INSERT into view '{}' targets {} columns but a VALUES row supplies {}",
+                            view.name,
+                            target_positions.len(),
+                            row.len()
+                        )));
+                    }
+                    let mut full_row: Vec<BoundExpr> = view_cols
+                        .iter()
+                        .map(|c| BoundExpr::Literal {
+                            value: LiteralValue::Null,
+                            type_id: c.type_id,
+                        })
+                        .collect();
+                    for (expr, &pos) in row.iter().zip(target_positions.iter()) {
+                        full_row[pos] = self.bind_expr(&ctx, expr).await?;
+                    }
+                    bound_rows.push(full_row);
+                }
+                let schema: Vec<LogicalColumn> = view_cols
+                    .iter()
+                    .map(|c| LogicalColumn {
+                        table_idx: None,
+                        column_id: c.column_id,
+                        name: c.name.clone(),
+                        type_id: c.type_id,
+                        nullable: true,
+                        fractional_digits: c.fractional_digits,
+                    })
+                    .collect();
+                Ok(BoundViewTriggerWrite {
+                    view_id: view.id,
+                    view_name: view.name.clone(),
+                    event: TriggerEntry::EVENT_INSERT,
+                    param_map: (0..view_cols.len()).map(Some).collect(),
+                    source: BoundViewTriggerSource::Rows {
+                        rows: bound_rows,
+                        schema,
+                    },
+                })
+            }
+            InsertSource::Query(query) => {
+                let mut sub_ctx = BindContext::new();
+                let bound_query = self.bind_select(&mut sub_ctx, query).await?;
+                if bound_query.output_schema.len() != target_positions.len() {
+                    return Err(ZyronError::PlanError(format!(
+                        "INSERT into view '{}' targets {} columns but the query produces {}",
+                        view.name,
+                        target_positions.len(),
+                        bound_query.output_schema.len()
+                    )));
+                }
+                let mut param_map: Vec<Option<usize>> = vec![None; view_cols.len()];
+                for (src_idx, &pos) in target_positions.iter().enumerate() {
+                    param_map[pos] = Some(src_idx);
+                }
+                Ok(BoundViewTriggerWrite {
+                    view_id: view.id,
+                    view_name: view.name.clone(),
+                    event: TriggerEntry::EVENT_INSERT,
+                    param_map,
+                    source: BoundViewTriggerSource::Query(Box::new(bound_query)),
+                })
+            }
+        }
+    }
+
+    /// Binds UPDATE against a view with an INSTEAD OF UPDATE trigger. The
+    /// image query selects the OLD columns followed by the NEW expressions
+    /// (SET values, or the column itself when unassigned) from the view under
+    /// the statement's WHERE clause, so the trigger body receives $1..$N as
+    /// the OLD row and $N+1..$2N as the NEW row.
+    async fn bind_view_update(
+        &mut self,
+        view: Arc<zyron_catalog::schema::ViewEntry>,
+        stmt: &UpdateStatement,
+    ) -> Result<BoundViewTriggerWrite> {
+        use zyron_catalog::TriggerEntry;
+        if stmt.returning.is_some() {
+            return Err(ZyronError::PlanError(format!(
+                "UPDATE ... RETURNING is not supported on view '{}'",
+                view.name
+            )));
+        }
+        self.require_instead_of_trigger(
+            view.id,
+            &view.name,
+            TriggerEntry::EVENT_UPDATE,
+            "UPDATE",
+            "UPDATE",
+        )?;
+        let view_cols = self.view_write_columns(&view).await?;
+
+        let mut new_exprs: Vec<Expr> = view_cols
+            .iter()
+            .map(|c| Expr::Identifier(c.name.clone()))
+            .collect();
+        for a in &stmt.assignments {
+            let pos = view_cols
+                .iter()
+                .position(|c| c.name == a.column)
+                .ok_or_else(|| {
+                    ZyronError::PlanError(format!(
+                        "column '{}' does not exist in view '{}'",
+                        a.column, view.name
+                    ))
+                })?;
+            new_exprs[pos] = a.value.clone();
+        }
+
+        let mut select = Self::view_row_select(&stmt.table);
+        for c in &view_cols {
+            select
+                .projections
+                .push(SelectItem::Expr(Expr::Identifier(c.name.clone()), None));
+        }
+        for e in new_exprs {
+            select.projections.push(SelectItem::Expr(e, None));
+        }
+        select.where_clause = stmt.where_clause.clone();
+        let bound_query = self.bind_select(&mut BindContext::new(), &select).await?;
+        let width = bound_query.output_schema.len();
+        Ok(BoundViewTriggerWrite {
+            view_id: view.id,
+            view_name: view.name.clone(),
+            event: TriggerEntry::EVENT_UPDATE,
+            param_map: (0..width).map(Some).collect(),
+            source: BoundViewTriggerSource::Query(Box::new(bound_query)),
+        })
+    }
+
+    /// Binds DELETE against a view with an INSTEAD OF DELETE trigger. The
+    /// image query selects the OLD columns from the view under the
+    /// statement's WHERE clause, so the trigger body receives $1..$N as the
+    /// OLD row.
+    async fn bind_view_delete(
+        &mut self,
+        view: Arc<zyron_catalog::schema::ViewEntry>,
+        stmt: &DeleteStatement,
+    ) -> Result<BoundViewTriggerWrite> {
+        use zyron_catalog::TriggerEntry;
+        if stmt.returning.is_some() {
+            return Err(ZyronError::PlanError(format!(
+                "DELETE ... RETURNING is not supported on view '{}'",
+                view.name
+            )));
+        }
+        self.require_instead_of_trigger(
+            view.id,
+            &view.name,
+            TriggerEntry::EVENT_DELETE,
+            "DELETE from",
+            "DELETE",
+        )?;
+        let view_cols = self.view_write_columns(&view).await?;
+
+        let mut select = Self::view_row_select(&stmt.table);
+        for c in &view_cols {
+            select
+                .projections
+                .push(SelectItem::Expr(Expr::Identifier(c.name.clone()), None));
+        }
+        select.where_clause = stmt.where_clause.clone();
+        let bound_query = self.bind_select(&mut BindContext::new(), &select).await?;
+        let width = bound_query.output_schema.len();
+        Ok(BoundViewTriggerWrite {
+            view_id: view.id,
+            view_name: view.name.clone(),
+            event: TriggerEntry::EVENT_DELETE,
+            param_map: (0..width).map(Some).collect(),
+            source: BoundViewTriggerSource::Query(Box::new(bound_query)),
+        })
+    }
+
+    /// A bare SELECT over the named view, ready for projections and a WHERE
+    /// clause. Binding it runs the regular FROM-clause view expansion.
+    fn view_row_select(view_name: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            projections: Vec::new(),
+            from: vec![TableRef::Table {
+                name: view_name.to_string(),
+                alias: None,
+                as_of: None,
+            }],
+            where_clause: None,
+            group_by: Vec::new(),
+            group_by_sets: None,
+            having: None,
+            qualify: None,
+            set_ops: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            fetch: None,
+            for_clause: None,
+            soft_delete_mode: SoftDeleteSelectMode::Default,
+        }
     }
 
     // -----------------------------------------------------------------------

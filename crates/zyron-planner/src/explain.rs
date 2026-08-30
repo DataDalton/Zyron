@@ -757,6 +757,30 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: Vec::new(),
             },
+            PhysicalPlan::ViewTriggerWrite {
+                view_id,
+                event,
+                source,
+                cost,
+                ..
+            } => Self {
+                operator_name: "ViewTriggerWrite".to_string(),
+                details: vec![
+                    ("view_id".to_string(), format!("{view_id}")),
+                    (
+                        "event".to_string(),
+                        match *event {
+                            1 => "INSERT".to_string(),
+                            2 => "UPDATE".to_string(),
+                            4 => "DELETE".to_string(),
+                            other => format!("{other}"),
+                        },
+                    ),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: vec![Self::from_physical_plan(source)],
+            },
             PhysicalPlan::Update {
                 table_id,
                 child,

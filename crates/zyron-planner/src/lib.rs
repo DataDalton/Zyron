@@ -39,7 +39,7 @@ pub async fn bind_table_check_constraints(
     catalog: &Catalog,
     entry: &TableEntry,
 ) -> Result<Vec<binder::BoundExpr>> {
-    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let resolver = catalog.resolver(DatabaseId(1), zyron_catalog::default_search_path());
     let mut binder = Binder::new(resolver, catalog);
     binder.bind_check_constraints(entry).await
 }
@@ -52,7 +52,7 @@ pub async fn bind_table_predicate(
     entry: &TableEntry,
     expr: &zyron_parser::ast::Expr,
 ) -> Result<binder::BoundExpr> {
-    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let resolver = catalog.resolver(DatabaseId(1), zyron_catalog::default_search_path());
     let mut binder = Binder::new(resolver, catalog);
     binder.bind_table_predicate(entry, expr).await
 }
@@ -70,7 +70,7 @@ pub async fn bind_column_defaults(
     entry: &TableEntry,
     columns: &[zyron_catalog::ColumnId],
 ) -> Result<Vec<(zyron_catalog::ColumnId, binder::BoundExpr)>> {
-    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let resolver = catalog.resolver(DatabaseId(1), zyron_catalog::default_search_path());
     let mut binder = Binder::new(resolver, catalog);
     binder.bind_column_defaults(entry, columns).await
 }

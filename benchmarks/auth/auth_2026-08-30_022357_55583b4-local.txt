@@ -1,0 +1,468 @@
+# suite:   auth
+# run:     2026-08-30_022357_55583b4-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+--- ABAC: Rule Evaluation Latency ---
+  Latency: 64 ns/eval (1000000 iterations)
+  latency_ns [PASS/OK]:
+    Runs: [63.6656]
+    Average: 63.6656 <= 2,000 (target)
+    Min/Max: 63.6656 / 63.6656, StdDev: 0
+  latency_ns [PASS]: 63.6656 <= 2,000 (target)
+--- ABAC Policies ---
+  Table 100: 2 policies, Table 200: 0
+  Remove policy: 1 remaining
+  Serialization: verified
+  Session attributes: verified
+--- ABAC: Region-Based Access ---
+  EU user -> EU data: allowed=true
+  US user -> EU data: allowed=false
+--- ABAC: Rule Serialization ---
+  AbacRule roundtrip: verified (all fields)
+--- ABAC: Time-Based Access ---
+  Business hours (hour=14): allowed=true
+  After hours (hour=22): allowed=false
+--- Admin Privilege Types ---
+  All 10 admin types granted to role 1: verified
+  Role 2 denied all admin types: verified
+  Impersonate privilege: verified
+  PrivilegeType::All matches admin types: verified
+--- API Key Correctness ---
+  Generated: zyron_4_Jo9NyE...
+  Valid key: authenticated
+  Modified key: rejected
+  Wrong prefix: rejected
+  Stored roundtrip: verified
+  API key verify: 36.1ns/op (target: <50us)
+  lookup_ns [PASS/OK]:
+    Runs: [36.0744]
+    Average: 36.0744 <= 50,000 (target)
+    Min/Max: 36.0744 / 36.0744, StdDev: 0
+  lookup_ns [PASS]: 36.0744 <= 50,000 (target)
+--- API Key Generate + Verify Throughput ---
+  Generate: 8519339 ops/sec (1ms for 10000 keys)
+  Verify: 27247956 ops/sec (0ms for 10000 keys)
+  Verified: 10000/10000
+  Combined: 12980270 ops/sec
+  combined_ops_sec [PASS/OK]:
+    Runs: [12,980,270]
+    Average: 12,980,270 >= 100,000 (target)
+    Min/Max: 12,980,270 / 12,980,270, StdDev: 0
+  combined_ops_sec [PASS]: 12,980,270 >= 100,000 (target)
+--- Credential Cache Lookup ---
+  1000000 lookups in 108.59ms, 9209197 ops/sec
+  ops_per_sec [PASS/OK]:
+    Runs: [9,209,197]
+    Average: 9,209,197 >= 3,000,000 (target)
+    Min/Max: 9,209,197 / 9,209,197, StdDev: 0
+--- Credential Seal/Open Roundtrip ---
+  Seal: 100000 iters in 36.38ms, 2748536 ops/sec
+  Open: 100000 iters in 31.20ms, 3205457 ops/sec
+  ops_per_sec [PASS/OK]:
+    Runs: [2,748,536]
+    Average: 2,748,536 >= 300,000 (target)
+    Min/Max: 2,748,536 / 2,748,536, StdDev: 0
+  ops_per_sec [PASS/OK]:
+    Runs: [3,205,457]
+    Average: 3,205,457 >= 300,000 (target)
+    Min/Max: 3,205,457 / 3,205,457, StdDev: 0
+--- JWT Encode + Verify (HS256) ---
+  100000 encode+verify cycles in 66.86ms, 1495743 ops/sec (24900000 bytes)
+  ops_per_sec [PASS/OK]:
+    Runs: [1,495,743]
+    Average: 1,495,743 >= 100,000 (target)
+    Min/Max: 1,495,743 / 1,495,743, StdDev: 0
+--- mTLS Fingerprint Verify ---
+  100000 verifies in 40.86ms, 2447513 ops/sec
+  ops_per_sec [PASS/OK]:
+    Runs: [2,447,513]
+    Average: 2,447,513 >= 500,000 (target)
+    Min/Max: 2,447,513 / 2,447,513, StdDev: 0
+--- Auth Rules Resolution ---
+  admin/prod/SSL/10.x: BalloonSha256
+  admin/prod/SSL/192.x: ScramSha256 (CIDR mismatch)
+  alice/mydb/Host: ScramSha256 (wildcard)
+  dev/Local: Trust
+--- Security Map Resolve ---
+  1000000 lookups (1000000 hits) in 52.71ms, 18972416 ops/sec
+  ops_per_sec [PASS/OK]:
+    Runs: [18,972,416]
+    Average: 18,972,416 >= 5,000,000 (target)
+    Min/Max: 18,972,416 / 18,972,416, StdDev: 0
+--- Balloon Hash Timing ---
+  Params: space_cost=1024, time_cost=1, delta=3
+  Hash time: 0.074ms
+  Hash output: 32 bytes
+  Elapsed: 74 us
+  hash_time_us [PASS/OK]:
+    Runs: [74]
+    Average: 74 >= 10 (target)
+    Min/Max: 74 / 74, StdDev: 0
+  memory_hard_minimum [PASS]: 74 >= 10 (target)
+  Determinism: verified
+--- Break-Glass ---
+  Activated with roles, privs, clearance, capped duration: verified
+  Deactivate + audit: verified
+  Serialization roundtrip: verified
+--- Challenge-Response Authentication ---
+  Correct proof: authenticated
+  Tampered proof: rejected
+  Hash: 0.1ms, Verify: 0.1ms (target: verify <200ms)
+  verify_latency_ms [PASS/OK]:
+    Runs: [0.0749]
+    Average: 0.0749 <= 200 (target)
+    Min/Max: 0.0749 / 0.0749, StdDev: 0
+  verify_latency_ms [PASS]: 0.0749 <= 200 (target)
+--- Classification Check Throughput ---
+  Throughput: 45552483 ops/sec (21ms for 1000000 checks)
+  Passed: 760000/1000000
+  ops_sec [PASS/OK]:
+    Runs: [45,552,483]
+    Average: 45,552,483 >= 10,000,000 (target)
+    Min/Max: 45,552,483 / 45,552,483, StdDev: 0
+  ops_sec [PASS]: 45,552,483 >= 10,000,000 (target)
+--- Classification Correctness ---
+  Internal clearance: Public(Y) Internal(Y) Confidential(N) Restricted(N)
+  Restricted clearance: all accessible
+  Unclassified: accessible at any level
+  Drop classification: now accessible
+  Serialization: verified
+--- Column-Level Privileges ---
+  Column 0: allowed
+  Column 1: allowed
+  Column 2 (not granted): denied
+--- Column Masking: All Mask Functions ---
+  email_mask: john@example.com -> j***@example.com
+  phone_mask: 555-123-4567 -> 555-12******
+  ssn_mask: 123-45-6789 -> ***-**-6789
+  cc_mask: 4111111111111111 -> ************1111
+  hash_mask: sensitive_data -> 3088daa11777358e507586600b955564012fc15698f90ab88a922df597f7eaec
+  redact_mask: anything -> [REDACTED]
+  partial_mask: 1234567890 -> 12******90
+  noise_mask: 50000 -> 53084.15738179967
+  bucket_mask: 75000 -> 50000-100000
+--- Column Masking: Policy Serialization ---
+  MaskingPolicy roundtrip: verified
+--- Column Masking: SSN Policy ---
+  Analyst: 123-45-6789 -> ***-**-6789
+  Admin (exempt): sees original value
+--- Column Masking: Throughput ---
+  Partial mask: 34.4M vals/sec
+  ops_per_sec [PASS/OK]:
+    Runs: [34,409,076]
+    Average: 34,409,076 >= 30,000,000 (target)
+    Min/Max: 34,409,076 / 34,409,076, StdDev: 0
+  ops_per_sec [PASS]: 34,409,076 >= 30,000,000 (target)
+  Hash mask: 25.5M vals/sec
+  ops_per_sec [PASS/OK]:
+    Runs: [25,458,119]
+    Average: 25,458,119 >= 15,000,000 (target)
+    Min/Max: 25,458,119 / 25,458,119, StdDev: 0
+  ops_per_sec [PASS]: 25,458,119 >= 15,000,000 (target)
+--- Concurrent Authentication ---
+  100 threads x 10 = 1000 auths, 148591 auth/sec
+  auth_per_sec [PASS/OK]:
+    Runs: [148,591]
+    Average: 148,591 >= 1,000 (target)
+    Min/Max: 148,591 / 148,591, StdDev: 0
+  auth_per_sec [PASS]: 148,591 >= 1,000 (target)
+  Concurrent privilege checks: 100000 total, 30000 allowed (no deadlock)
+--- Concurrent Privilege Checks ---
+  Single-thread: 65638333 ops/sec (7ms)
+  Multi-thread (8 threads): 464414258 ops/sec (8ms)
+  Total allowed: 1200000
+  Baseline allowed (single): 150000
+  Scaling factor: 7.08x (target: >2.0x)
+  scaling_factor [PASS/OK]:
+    Runs: [7.0754]
+    Average: 7.0754 >= 2 (target)
+    Min/Max: 7.0754 / 7.0754, StdDev: 0
+  scaling_factor [PASS]: 7.0754 >= 2 (target)
+--- Crypto Functions: Key Generation ---
+  128-bit key: 16 bytes
+  256-bit key: 32 bytes
+  Uniqueness: two 256-bit keys differ
+  Invalid size (64 bits): rejected
+  Signing keypair: 32 byte private, 32 byte public
+--- Crypto Functions: Password Hash/Verify ---
+  Hash: $balloon-aes$v=1$s=209715...Tke+Sx7x8=
+  Correct password: verified=true
+  Wrong password: verified=false
+--- Data Mask Throughput (Email) ---
+  Input: longusername@example.com
+  Masked: l***********@example.com
+  Throughput: 54229935 ops/sec (1ms for 100000 masks)
+  email_ops_sec [PASS/OK]:
+    Runs: [54,229,935]
+    Average: 54,229,935 >= 1,000,000 (target)
+    Min/Max: 54,229,935 / 54,229,935, StdDev: 0
+  email_ops_sec [PASS]: 54,229,935 >= 1,000,000 (target)
+--- Data Masking All Types ---
+  Email: user@example.com -> u***@example.com
+  Phone: 555-123-4567 -> 555-12******
+  SSN: 123-45-6789 -> ***-**-6789
+  CreditCard: 4111111111111111 -> ************1111
+  Null: anything -> None (SQL NULL)
+  Redact: -> [REDACTED]
+  Hash: deterministic, 64 chars
+  Partial(3): Hello World -> Hel********
+--- Encryption: AAD Prevents Column Swap ---
+  Correct AAD: decryption succeeded
+  Wrong AAD: decryption rejected (tag mismatch)
+--- Encryption: ColumnEncryption Serialization ---
+  ColumnEncryption roundtrip: verified
+--- Encryption: LocalKeyStore ---
+  Created key IDs: 1, 2
+  Retrieved: 128-bit (16 bytes), 256-bit (32 bytes)
+  Encrypt/decrypt with store-managed key: verified
+  Key rotation: old=2, new=3
+  Old key deleted: verified
+--- Encryption: Nonce Uniqueness ---
+  10000/10000 nonces unique: PASS
+--- Encryption: AES-GCM Round-Trip ---
+  AES-128-GCM: 37 bytes -> 65 bytes -> 37 bytes
+  AES-256-GCM: round-trip verified
+--- Encryption: Tamper Detection ---
+  Tampered ciphertext: decryption rejected
+--- Encryption: Throughput ---
+  Encrypt: 5.13 GB/sec (100000x 1KB blocks)
+  gb_per_sec [PASS/OK]:
+    Runs: [5.1255]
+    Average: 5.1255 >= 4 (target)
+    Min/Max: 5.1255 / 5.1255, StdDev: 0
+  gb_per_sec [PASS]: 5.1255 >= 4 (target)
+  Decrypt: 4.92 GB/sec (100000x 1KB blocks)
+  gb_per_sec [PASS/OK]:
+    Runs: [4.9197]
+    Average: 4.9197 >= 4 (target)
+    Min/Max: 4.9197 / 4.9197, StdDev: 0
+  gb_per_sec [PASS]: 4.9197 >= 4 (target)
+--- Governance ---
+  Analytics: 2 usages recorded
+  Cascade revoke from A: B+C revoked
+  Grant chain C->B->A: verified
+  Two-person: same-person denied, different-person approved
+  Two-person deny: removed
+  No rule for DropTable: request denied
+--- Governance Usage Recording ---
+  Throughput: 20144841 ops/sec (49ms for 1000000 records)
+  Role 0 distinct entries: 10
+  record_ops_sec [PASS/OK]:
+    Runs: [20,144,841]
+    Average: 20,144,841 >= 5,000,000 (target)
+    Min/Max: 20,144,841 / 20,144,841, StdDev: 0
+  record_ops_sec [PASS]: 20,144,841 >= 5,000,000 (target)
+--- JWT Correctness ---
+  Valid token: verified
+  Tampered signature: rejected
+  Wrong secret: rejected
+  Expired token: rejected
+  Issuer mismatch: rejected
+  Decode unverified: OK
+  HS384 + HS512: verified
+  JWT verify: 0.27us/op (target: <200us)
+  verify_latency_us [PASS/OK]:
+    Runs: [0.2713]
+    Average: 0.2713 <= 200 (target)
+    Min/Max: 0.2713 / 0.2713, StdDev: 0
+  verify_latency_us [PASS]: 0.2713 <= 200 (target)
+--- JWT Encode/Decode Throughput ---
+  Encode: 4069838 ops/sec (2ms)
+  Decode: 3481894 ops/sec (2ms)
+  Decoded: 10000/10000
+  Combined: 3752979 ops/sec
+  combined_ops_sec [PASS/OK]:
+    Runs: [3,752,979]
+    Average: 3,752,979 >= 50,000 (target)
+    Min/Max: 3,752,979 / 3,752,979, StdDev: 0
+  combined_ops_sec [PASS]: 3,752,979 >= 50,000 (target)
+--- Object Tagging ---
+  has_tag: pii=true, financial=false
+  tags_for_object: ["pii", "email"]
+  objects_with_tag(pii): found
+  untag: removed
+  Serialization: verified
+--- Password Authentication Correctness ---
+  Correct password: verified
+  Wrong password: rejected
+  Stored hash roundtrip: verified
+  Timing: correct=66080ns, wrong=66190ns, ratio=1.00
+  Hash time: 258.0ms (target: >=80ms, params: 64MB/3 rounds)
+  hash_time_ms [PASS/OK]:
+    Runs: [258.0036]
+    Average: 258.0036 >= 80 (target)
+    Min/Max: 258.0036 / 258.0036, StdDev: 0
+  hash_time_ms [PASS]: 258.0036 >= 80 (target)
+  Verify time: 253.9ms (target: >=80ms)
+  verify_time_ms [PASS/OK]:
+    Runs: [253.8949]
+    Average: 253.8949 >= 80 (target)
+    Min/Max: 253.8949 / 253.8949, StdDev: 0
+  verify_time_ms [PASS]: 253.8949 >= 80 (target)
+--- Privilege Check Latency ---
+  Latency: 25.4ns/check, allowed: 300000/1000000
+  per_check_ns [PASS/OK]:
+    Runs: [25.4304]
+    Average: 25.4304 <= 80 (target)
+    Min/Max: 25.4304 / 25.4304, StdDev: 0
+  per_check_ns [PASS]: 25.4304 <= 80 (target)
+--- Privilege Check Throughput ---
+  Throughput: 41602356 ops/sec (24ms for 1000000 checks)
+  Allowed: 300000/1000000
+  ops_sec [PASS/OK]:
+    Runs: [41,602,356]
+    Average: 41,602,356 >= 1,000,000 (target)
+    Min/Max: 41,602,356 / 41,602,356, StdDev: 0
+  ops_sec [PASS]: 41,602,356 >= 1,000,000 (target)
+--- Privilege DENY Wins ---
+  Table 1 SELECT: Denied (DENY wins)
+  Table 2 INSERT: Allow
+  DENY check throughput: 39658461 ops/sec (25ms)
+  Denied: 1000000/1000000
+  deny_ops_sec [PASS/OK]:
+    Runs: [39,658,461]
+    Average: 39,658,461 >= 1,000,000 (target)
+    Min/Max: 39,658,461 / 39,658,461, StdDev: 0
+  deny_ops_sec [PASS]: 39,658,461 >= 1,000,000 (target)
+--- Privilege Grant/Revoke ---
+  GRANT SELECT: allowed
+  INSERT without grant: denied
+  GRANT INSERT: allowed
+  REVOKE ALL: both denied
+--- Privilege Inheritance ---
+  analyst inherits SELECT on reports from manager: verified
+  analyst alone (no hierarchy): denied
+--- RLS: Command Filtering ---
+  SELECT: 1 using, 0 check
+  INSERT: 0 using, 1 check
+  DELETE: 0 using, 0 check (no matching policy)
+--- RLS: Predicate Injection Latency ---
+  Latency: 190 ns/eval (1000000 iterations)
+  latency_ns [PASS/OK]:
+    Runs: [189.5662]
+    Average: 189.5662 <= 1,000 (target)
+    Min/Max: 189.5662 / 189.5662, StdDev: 0
+  latency_ns [PASS]: 189.5662 <= 1,000 (target)
+  Predicates generated: 2
+--- RLS: Role-Scoped Policies ---
+  Analyst (role 50): sees 1 predicates
+  Other (role 99): sees 0 predicates (no match)
+--- RLS: Serialization Roundtrip ---
+  RlsPolicy roundtrip: verified (all fields)
+--- RLS: User Isolation ---
+  User A sees filter predicate: user_id = current_user_id()
+  User B sees filter predicate: user_id = current_user_id()
+  Admin (table owner): bypasses RLS, no predicates injected
+--- Role Hierarchy Correctness ---
+  user_a with analyst: has analyst,manager,admin. Not viewer.
+  After granting manager: user_a has manager+admin
+  After revoking direct manager: still inherits via analyst
+  Traversal: 166.3ns/op
+  traversal_ns [PASS/OK]:
+    Runs: [166.2780]
+    Average: 166.2780 <= 200 (target)
+    Min/Max: 166.2780 / 166.2780, StdDev: 0
+  traversal_ns [PASS]: 166.2780 <= 200 (target)
+--- Role Hierarchy Traversal ---
+  Depth: 10 levels, effective roles for role 0: 11
+  Per traversal: 0.45 us
+  Throughput: 2213099 traversals/sec (45ms total)
+  traversal_us [PASS/OK]:
+    Runs: [0.4519]
+    Average: 0.4519 <= 10 (target)
+    Min/Max: 0.4519 / 0.4519, StdDev: 0
+  traversal_us [PASS]: 0.4519 <= 10 (target)
+--- Row Ownership ---
+  Enable, config, admin check: verified
+  Disable: verified
+  Serialization: verified
+--- SecurityContext Impersonation ---
+  Privilege check: verified
+  Execute as role 50: succeeded
+  Revert: restored
+  Execute as without privilege: denied
+  SET ROLE / RESET ROLE: verified
+  Session attributes: verified
+--- Security Labels: MAC Access Control ---
+  secret:finance user -> confidential:finance row: VISIBLE
+  secret:finance user -> top_secret:finance row: HIDDEN
+  secret:finance user -> confidential:hr row: HIDDEN (missing compartment)
+--- Security Labels: Check Latency ---
+  Latency: 56.5 ns/check (5000000 iterations)
+  latency_ns [PASS/OK]:
+    Runs: [56.4625]
+    Average: 56.4625 <= 100 (target)
+    Min/Max: 56.4625 / 56.4625, StdDev: 0
+  latency_ns [PASS]: 56.4625 <= 100 (target)
+--- Security Labels: Dominance Rules ---
+  secret:finance >= secret:finance: true
+  top_secret:finance,hr >= secret:finance: true
+  top_secret:finance >= secret:finance,hr: false (missing hr)
+  unclassified >= unclassified: true
+--- Security Labels: Serialization ---
+  SecurityLabel roundtrip: verified (34 bytes)
+  ObjectSecurityLabel roundtrip: verified
+  SubjectSecurityLabel roundtrip: verified
+--- Serialization Roundtrips ---
+  GrantEntry (all fields): verified
+  RoleMembership: verified
+  AuthRule: verified
+  DelegationEdge (admin priv types): verified
+--- Session Binding ---
+  Business hours: Mon noon=active, Sat=inactive
+  Query limits: set/get/default verified
+  TimeWindow serialization: verified
+--- Temporal Privileges ---
+  Within window (t=1500): allowed
+  Before window (t=500): denied
+  After window (t=2500): denied
+--- Time Window Evaluation ---
+  Window: start_hour=9, end_hour=17, days=0b0011111
+  Throughput: 815394651 ops/sec (1ms for 1000000 evaluations)
+  Active: 238101/1000000
+  eval_ops_sec [PASS/OK]:
+    Runs: [815,394,651]
+    Average: 815,394,651 >= 10,000,000 (target)
+    Min/Max: 815,394,651 / 815,394,651, StdDev: 0
+  eval_ops_sec [PASS]: 815,394,651 >= 10,000,000 (target)
+--- TOTP Correctness ---
+  Current code: verified
+  Code from 30s ago (drift=1): verified
+  Code from 90s ago (drift=3): rejected
+  RFC 6238 vector: 287082
+  TOTP verify: 166.7ns/op (target: <500us)
+  verify_ns [PASS/OK]:
+    Runs: [166.7421]
+    Average: 166.7421 <= 500,000 (target)
+    Min/Max: 166.7421 / 166.7421, StdDev: 0
+  verify_ns [PASS]: 166.7421 <= 500,000 (target)
+--- TOTP Generate + Verify Throughput ---
+  Generate: 11223345 ops/sec (8ms)
+  Last code: 784138
+  Verify: 5927577 ops/sec (16ms)
+  Verified: 100000/100000
+  Combined: 7757862 ops/sec
+  combined_ops_sec [PASS/OK]:
+    Runs: [7,757,862]
+    Average: 7,757,862 >= 500,000 (target)
+    Min/Max: 7,757,862 / 7,757,862, StdDev: 0
+  combined_ops_sec [PASS]: 7,757,862 >= 500,000 (target)
+--- Webhook: GitHub Verification ---
+  Correct payload: verified=true
+  Tampered payload: verified=false
+--- Webhook: Slack Verification ---
+  Correct payload: verified=true
+  Wrong secret: verified=false
+--- Webhook: Stripe Verification ---
+  Correct payload: verified=true
+  Tampered payload: verified=false
+  Wrong secret: verified=false
+--- Webhook: Verification Latency ---
+  Latency: 0.14 us/verify (500000 iterations)
+  latency_us [PASS/OK]:
+    Runs: [0.1442]
+    Average: 0.1442 <= 20 (target)
+    Min/Max: 0.1442 / 0.1442, StdDev: 0
+  latency_us [PASS]: 0.1442 <= 20 (target)

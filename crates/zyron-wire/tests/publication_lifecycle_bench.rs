@@ -1,5 +1,5 @@
 //! Publication lifecycle, RBAC, classification, capacity, rate-limit, and
-//! retention coverage. All assertions go through the catalog public API and
+//! retention coverage. All assertions go through the catalog zyron_test API and
 //! the authorization decision exposed in zyron_wire::connection so the test
 //! is platform-agnostic and runs without standing up a wire server.
 

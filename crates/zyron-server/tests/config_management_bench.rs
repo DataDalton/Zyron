@@ -341,7 +341,7 @@ fn test_set_command_latency() {
     let mut variables: HashMap<String, String> = HashMap::new();
     variables.insert("server_version".into(), "0.1.0".into());
     variables.insert("client_encoding".into(), "UTF8".into());
-    variables.insert("search_path".into(), "public".into());
+    variables.insert("search_path".into(), "zyron_test".into());
 
     // Warm up
     for i in 0..1000 {

@@ -110,14 +110,21 @@ pub const SYSTEM_SCHEMAS: &[&str] = &[
 
 /// Search path a session starts with. The two system entries come first so a
 /// bare `tables` reads `zyron_sys.core.tables` and a bare `activity` reads
-/// `zyron_sys.stat.activity`. Anything else in the catalog needs its schema
-/// qualifier, which is the normal way to reach across subsystems.
-pub const DEFAULT_SEARCH_PATH: &[&str] = &[
-    "zyron_sys.core",
-    "zyron_sys.stat",
-    "information_schema",
-    "public",
-];
+/// `zyron_sys.stat.activity`. There is deliberately NO default user schema:
+/// Zyron never creates or assumes a schema for user tables, so a session
+/// reaches its own objects by creating a schema, setting the search path to
+/// it, or qualifying names. A bare name that is not a system entity fails to
+/// resolve rather than landing in an implicit namespace.
+pub const DEFAULT_SEARCH_PATH: &[&str] =
+    &["zyron_sys.core", "zyron_sys.stat", "information_schema"];
+
+/// The default search path as owned strings, for planner and context call
+/// sites. Statement execution that has no session namespace uses exactly
+/// this, never an implicit user schema, so an unqualified user-table name in
+/// session-less SQL fails loudly instead of resolving somewhere surprising.
+pub fn default_search_path() -> Vec<String> {
+    DEFAULT_SEARCH_PATH.iter().map(|s| s.to_string()).collect()
+}
 
 /// What a registered system entity is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,7 +818,7 @@ mod tests {
 
     #[test]
     fn test_resolve_in_search_path_ignores_user_schemas() {
-        let path = vec!["public".to_string(), "myschema".to_string()];
+        let path = vec!["zyron_test".to_string(), "myschema".to_string()];
         assert!(resolve_in_search_path("tables", &path).is_none());
     }
 
@@ -829,6 +836,6 @@ mod tests {
         assert!(is_system_catalog_name("zyron_sys.core.tables"));
         assert!(is_system_catalog_name("zyron_sys.clustering_status"));
         assert!(!is_system_catalog_name("some_table"));
-        assert!(!is_system_catalog_name("public.users"));
+        assert!(!is_system_catalog_name("zyron_test.users"));
     }
 }

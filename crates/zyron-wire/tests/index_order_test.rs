@@ -30,7 +30,7 @@ async fn plan_of(
     zyron_planner::plan(
         &server.catalog,
         zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
+        vec!["zyron_test".to_string()],
         stmt,
         None,
     )

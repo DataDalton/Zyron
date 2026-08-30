@@ -162,8 +162,11 @@ pub struct ExecutionContext {
     /// record, so their pending versions are keyed by the intent instead.
     pub lake_txn_id: Option<u64>,
     pub snapshot: Snapshot,
-    /// When set to true, operators check this flag and bail with a cancellation error.
-    cancelled: AtomicBool,
+    /// When set, operators bail with a cancellation error at their next
+    /// batch boundary. Shared into child contexts, so cancelling a statement
+    /// also stops its trigger bodies, correlated subqueries, and LATERAL
+    /// inner plans.
+    cancelled: Arc<AtomicBool>,
     /// Wall-clock instant past which the statement is treated as timed out.
     /// check_cancelled reports cancelled once Instant::now passes this. None
     /// disables the deadline. Set from the session statement_timeout by wire.
@@ -210,6 +213,12 @@ pub struct ExecutionContext {
     pub dml_hook: Option<Arc<dyn DmlHook>>,
     /// Bound parameter values ($1, $2, ...) for prepared statements.
     pub params: Vec<ScalarValue>,
+    /// Database the firing statement was planned against. A nested plan
+    /// built during execution, a trigger body above all, plans against this
+    /// database with the system default search path: stored bodies must
+    /// qualify user tables, so a body resolves the same objects for every
+    /// caller. Wire sets it from the session.
+    pub planning_database: zyron_catalog::DatabaseId,
     /// Per-session security context for privilege checks. None when the auth
     /// system is not configured or for internal queries that bypass auth.
     /// Held behind an Arc so a nested execution (a correlated subquery or a
@@ -339,7 +348,7 @@ impl ExecutionContext {
             txn_id,
             lake_txn_id: None,
             snapshot,
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
             deadline: None,
             max_result_rows: None,
             memory_budget: None,
@@ -352,6 +361,7 @@ impl ExecutionContext {
             replication_apply: false,
             dml_hook: None,
             params: Vec::new(),
+            planning_database: zyron_catalog::DatabaseId(1),
             security_context: None,
             indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
@@ -382,8 +392,10 @@ impl ExecutionContext {
     /// Builds a child context for executing a nested plan (a correlated
     /// subquery's per-row evaluation or a LATERAL inner plan) that shares this
     /// context's transaction, snapshot, storage caches, index managers, and
-    /// security context but carries its own parameter set. Cancellation and
-    /// wrote_wal start fresh because the child is read-only and short lived.
+    /// security context but carries its own parameter set. Cancellation is
+    /// SHARED so a cancelled statement stops its nested work too; wrote_wal
+    /// starts fresh and callers that run writes through a child propagate it
+    /// back explicitly.
     pub fn child_with_params(&self, params: Vec<ScalarValue>) -> Self {
         Self {
             catalog: Arc::clone(&self.catalog),
@@ -394,7 +406,7 @@ impl ExecutionContext {
             txn_id: self.txn_id,
             lake_txn_id: self.lake_txn_id,
             snapshot: self.snapshot.clone(),
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::clone(&self.cancelled),
             deadline: self.deadline,
             max_result_rows: self.max_result_rows,
             memory_budget: self.memory_budget.clone(),
@@ -409,6 +421,7 @@ impl ExecutionContext {
             replication_apply: self.replication_apply,
             dml_hook: self.dml_hook.clone(),
             params,
+            planning_database: self.planning_database,
             security_context: self.security_context.clone(),
             indexes: self.indexes.clone(),
             fts_indexes: self.fts_indexes.clone(),

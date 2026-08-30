@@ -53,7 +53,7 @@ async fn harness_with_one_lake_table() -> (Harness, LakePaths) {
         .expect("catalog"),
     );
     let schema_id = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
         .expect("schema");
 

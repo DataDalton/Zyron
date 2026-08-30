@@ -78,7 +78,7 @@ async fn setup() -> Env {
             .unwrap(),
     );
     let schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "t")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "t")
         .await
         .unwrap();
     let table = catalog

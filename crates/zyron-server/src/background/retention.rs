@@ -223,8 +223,14 @@ impl RetentionWorker {
 
             // Archive action: copy matching rows out before deleting.
             if pol.action == 1 && !lc.archive_destination.is_empty() {
-                match Self::archive_matching(wc, &table.name, &predicate, &lc.archive_destination)
-                    .await
+                match Self::archive_matching(
+                    wc,
+                    Self::table_ns(wc, table.schema_id),
+                    &table.name,
+                    &predicate,
+                    &lc.archive_destination,
+                )
+                .await
                 {
                     Ok(n) => archived_total += n,
                     Err(e) => {
@@ -235,7 +241,7 @@ impl RetentionWorker {
             }
 
             let sql = format!("DELETE FROM \"{}\" WHERE {}", table.name, predicate);
-            match Self::run_dml(wc, &sql).await {
+            match Self::run_dml(wc, Self::table_ns(wc, table.schema_id), &sql).await {
                 Ok(n) => {
                     deleted_total += n;
                     Self::record_job(wc, pol.table_id, 0, n, "ttl delete").await;
@@ -332,7 +338,7 @@ impl RetentionWorker {
                 "DELETE FROM \"{}\" WHERE \"{}\" = true AND \"{}\" < {} HARD",
                 t.name, is_del, del_at, cutoff
             );
-            match Self::run_dml(wc, &sql).await {
+            match Self::run_dml(wc, Self::table_ns(wc, t.schema_id), &sql).await {
                 Ok(n) => {
                     if n > 0 {
                         purged += n;
@@ -349,6 +355,7 @@ impl RetentionWorker {
     /// and writes them to the archive object store. Returns rows archived.
     async fn archive_matching(
         wc: &WorkerCtx,
+        ns: (zyron_catalog::DatabaseId, Vec<String>),
         table: &str,
         predicate: &str,
         destination: &str,
@@ -357,7 +364,7 @@ impl RetentionWorker {
             "SELECT * FROM \"{}\" WHERE {} INCLUDING DELETED",
             table, predicate
         );
-        let batches = Self::run_query(wc, &sql).await?;
+        let batches = Self::run_query(wc, ns, &sql).await?;
         let mut rows: Vec<Vec<u8>> = Vec::new();
         for b in &batches {
             for r in 0..b.num_rows {
@@ -378,20 +385,33 @@ impl RetentionWorker {
         Ok(n)
     }
 
+    /// The namespace that resolves a retention target: the table's own
+    /// schema, never an implicit default.
+    fn table_ns(
+        wc: &WorkerCtx,
+        schema_id: zyron_catalog::SchemaId,
+    ) -> (zyron_catalog::DatabaseId, Vec<String>) {
+        match wc.catalog.get_schema_by_id(schema_id) {
+            Ok(s) => (s.database_id, vec![s.name.clone()]),
+            Err(_) => (
+                zyron_catalog::DatabaseId(1),
+                zyron_catalog::default_search_path(),
+            ),
+        }
+    }
+
     /// Plans and executes a DML statement in its own transaction with the
     /// legal-hold / WORM enforcement hook attached. Returns rows affected.
-    async fn run_dml(wc: &WorkerCtx, sql: &str) -> Result<u64, String> {
+    async fn run_dml(
+        wc: &WorkerCtx,
+        ns: (zyron_catalog::DatabaseId, Vec<String>),
+        sql: &str,
+    ) -> Result<u64, String> {
         let stmts = zyron_parser::parse(sql).map_err(|e| format!("parse: {e}"))?;
         let stmt = stmts.into_iter().next().ok_or("empty statement")?;
-        let plan = zyron_planner::plan(
-            &wc.catalog,
-            zyron_catalog::DatabaseId(1),
-            vec!["public".to_string()],
-            stmt,
-            None,
-        )
-        .await
-        .map_err(|e| format!("plan: {e}"))?;
+        let plan = zyron_planner::plan(&wc.catalog, ns.0, ns.1, stmt, None)
+            .await
+            .map_err(|e| format!("plan: {e}"))?;
 
         let mut txn = wc
             .txn_manager
@@ -434,19 +454,14 @@ impl RetentionWorker {
     /// Plans and executes a read-only query in an aborted transaction.
     async fn run_query(
         wc: &WorkerCtx,
+        ns: (zyron_catalog::DatabaseId, Vec<String>),
         sql: &str,
     ) -> Result<Vec<zyron_executor::batch::DataBatch>, String> {
         let stmts = zyron_parser::parse(sql).map_err(|e| format!("parse: {e}"))?;
         let stmt = stmts.into_iter().next().ok_or("empty statement")?;
-        let plan = zyron_planner::plan(
-            &wc.catalog,
-            zyron_catalog::DatabaseId(1),
-            vec!["public".to_string()],
-            stmt,
-            None,
-        )
-        .await
-        .map_err(|e| format!("plan: {e}"))?;
+        let plan = zyron_planner::plan(&wc.catalog, ns.0, ns.1, stmt, None)
+            .await
+            .map_err(|e| format!("plan: {e}"))?;
         let mut txn = wc
             .txn_manager
             .begin(IsolationLevel::ReadCommitted)

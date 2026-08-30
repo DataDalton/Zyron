@@ -23,8 +23,8 @@
   <rect x="476.0" y="284.5" width="48.0" height="65.5" fill="#1f6feb" rx="2"/>
   <text x="500.0" y="280.5" text-anchor="middle" fill="#e6edf3" font-size="10">384.7</text>
   <text x="500.0" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Linearizable read</text>
-  <rect x="648.0" y="150.8" width="48.0" height="199.2" fill="#1f6feb" rx="2"/>
-  <text x="672.0" y="146.8" text-anchor="middle" fill="#e6edf3" font-size="10">1170.0</text>
+  <rect x="648.0" y="120.6" width="48.0" height="229.4" fill="#1f6feb" rx="2"/>
+  <text x="672.0" y="116.6" text-anchor="middle" fill="#e6edf3" font-size="10">1347.0</text>
   <text x="672.0" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Replicated write p99</text>
   <rect x="820.0" y="97.8" width="48.0" height="252.2" fill="#1f6feb" rx="2"/>
   <text x="844.0" y="93.8" text-anchor="middle" fill="#e6edf3" font-size="10">1481.0</text>

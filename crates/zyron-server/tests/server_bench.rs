@@ -288,6 +288,7 @@ async fn create_test_state(
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -2080,7 +2081,7 @@ server_test!(
             // testing it under the bench's path would test nothing.
             assert_query_ok(
                 client,
-                "SET search_path = 'zyron_sys.core, zyron_sys.stat, public'",
+                "SET search_path = 'zyron_sys.core, zyron_sys.stat, zyron_test'",
                 "SET",
                 "system search path",
             )

@@ -112,6 +112,11 @@ pub enum Statement {
     LegalHold(Box<LegalHoldStatement>),
     /// FORGET USER 'id' [CASCADE] [DRY RUN]
     ForgetUser(Box<ForgetUserStatement>),
+    /// CANCEL BACKEND pid, requests cancellation of the statement running
+    /// on another connection
+    CancelBackend {
+        pid: i32,
+    },
     /// EXPORT USER 'id' [TO 'uri'] [CASCADE]
     ExportUser(Box<ExportUserStatement>),
     /// ALTER TABLE t MOVE ... TO TIER 'tier'

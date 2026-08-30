@@ -1,0 +1,89 @@
+{
+  "id": "2026-08-30_024611_55583b4-local",
+  "date": "2026-08-30 02:46:19Z",
+  "ts": 1788057979,
+  "commit": "55583b4-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Replication": {
+      "Replicated write throughput, three nodes": {
+        "average": 49090.394689,
+        "runs": [49655.49, 50744.30, 50534.81, 47680.44, 46836.93],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Write latency p50, unsaturated": {
+        "average": 0.000712,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Write latency p99, unsaturated": {
+        "average": 0.001347,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Follower apply rate": {
+        "average": 48959.915075,
+        "runs": [49499.08, 50579.39, 50438.79, 47499.26, 46783.06],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Worst follower lag": {
+        "average": 162.200000,
+        "runs": [168.00, 185.00, 159.00, 138.00, 161.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Time to close the lag": {
+        "average": 0.026541,
+        "runs": [0.00, 0.01, 0.06, 0.00, 0.06],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Follower lag, second half against first": {
+        "average": 0.989638,
+        "runs": [1.02, 0.95, 0.95, 0.98, 1.05],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Follower apply rate against leader commit rate": {
+        "average": 0.997350,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 0.990000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

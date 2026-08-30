@@ -150,6 +150,12 @@ impl<'a> PhysicalPlanner<'a> {
                 child,
             } => self.plan_update(table_id, assignments, check_constraints, child),
             LogicalPlan::Delete { table_id, child } => self.plan_delete(table_id, child),
+            LogicalPlan::ViewTriggerWrite {
+                view_id,
+                event,
+                param_map,
+                source,
+            } => self.plan_view_trigger_write(view_id, event, param_map, source),
             LogicalPlan::GraphAlgorithm {
                 schema_name,
                 algorithm,
@@ -613,6 +619,27 @@ impl<'a> PhysicalPlanner<'a> {
         Ok(PhysicalPlan::Delete {
             table_id,
             child: Box::new(child_plan),
+            cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_view_trigger_write(
+        &self,
+        view_id: u32,
+        event: u8,
+        param_map: Vec<Option<usize>>,
+        source: Arc<LogicalPlan>,
+    ) -> Result<PhysicalPlan> {
+        let source_plan = self.plan(Arc::unwrap_or_clone(source))?;
+        let cost = *source_plan.cost();
+        Ok(PhysicalPlan::ViewTriggerWrite {
+            view_id,
+            event,
+            param_map,
+            source: Box::new(source_plan),
             cost,
         })
     }

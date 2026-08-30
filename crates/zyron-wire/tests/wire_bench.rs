@@ -164,6 +164,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -1284,11 +1285,11 @@ fn test_wire_session_management() {
 
     // Search path update
     session
-        .set_variable("search_path".into(), "public, myschema".into())
+        .set_variable("search_path".into(), "zyron_test, myschema".into())
         .unwrap();
     assert!(
-        session.search_path.contains(&"public".to_string()),
-        "Search path should contain public"
+        session.search_path.contains(&"zyron_test".to_string()),
+        "Search path should contain zyron_test"
     );
     assert!(
         session.search_path.contains(&"myschema".to_string()),
@@ -3258,7 +3259,7 @@ fn test_wire_ddl_dispatch_statement_coverage() {
         ("VACUUM", "Vacuum"),
         ("ANALYZE", "Analyze"),
         ("CHECKPOINT", "Checkpoint"),
-        ("SET search_path TO public", "SetVariable"),
+        ("SET search_path TO zyron_test", "SetVariable"),
         ("SHOW search_path", "Show"),
         ("REINDEX TABLE t", "Reindex"),
         ("DO 'BEGIN END'", "DoBlock"),

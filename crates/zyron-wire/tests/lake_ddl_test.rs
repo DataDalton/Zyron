@@ -106,7 +106,7 @@ async fn rows_affected(server: &Arc<ServerState>, sql: &str) -> i64 {
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -217,7 +217,7 @@ async fn test_lake_scan_reads_appended_rows_and_sql_insert_publishes_on_commit()
         let plan = zyron_planner::plan(
             &server.catalog,
             DatabaseId(1),
-            vec!["public".into()],
+            vec!["zyron_test".into()],
             stmt,
             None,
         )
@@ -322,7 +322,7 @@ async fn test_lake_update_replaces_rows_without_deleting_its_own_writes() {
     let err = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -384,7 +384,7 @@ async fn test_lake_delete_drops_covered_files_and_reports_exact_counts() {
     let err = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -658,7 +658,7 @@ async fn plan_select(
     zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -2454,7 +2454,7 @@ async fn exec_dml_result(server: &Arc<ServerState>, sql: &str) -> Result<(), Str
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -2744,7 +2744,7 @@ async fn exec_dml_in_lake_txn(server: &Arc<ServerState>, sql: &str, lake_txn_id:
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -3438,7 +3438,7 @@ async fn test_time_travel_on_a_foreign_table_is_refused() {
     let err = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         Some(&server.peer_facts()),
     )
@@ -3512,7 +3512,7 @@ async fn plan_sql(server: &Arc<ServerState>, sql: &str) -> zyron_planner::physic
     zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         Some(&server.peer_facts()),
     )

@@ -28,6 +28,7 @@ pub mod setop;
 pub mod sort;
 pub mod spatial_scan;
 pub mod vector_scan;
+pub mod view_write;
 pub mod window;
 
 use std::future::Future;
@@ -249,6 +250,59 @@ pub enum BatchTier {
 /// from their children.
 ///
 /// Uses boxed futures for dyn-compatible async dispatch.
+/// Pass-through that polls cancellation and the statement deadline before
+/// every batch it hands upward. Wrapped around the inputs of blocking
+/// operators (joins, aggregates, sorts, set ops, windows): their
+/// consume-everything loops would otherwise run to completion after a
+/// cancel, because only sources poll while producing and a source that is
+/// another operator's buffered output never polls. Costs one relaxed atomic
+/// load per batch when no deadline is set.
+pub(crate) struct CancelPollOperator {
+    child: Box<dyn Operator>,
+    ctx: std::sync::Arc<crate::context::ExecutionContext>,
+    batches: u32,
+}
+
+impl CancelPollOperator {
+    pub(crate) fn wrap(
+        child: Box<dyn Operator>,
+        ctx: &std::sync::Arc<crate::context::ExecutionContext>,
+    ) -> Box<dyn Operator> {
+        Box::new(Self {
+            child,
+            ctx: std::sync::Arc::clone(ctx),
+            batches: 0,
+        })
+    }
+}
+
+impl Operator for CancelPollOperator {
+    fn next(&mut self) -> OperatorResult<'_> {
+        Box::pin(async move {
+            self.ctx.check_cancelled()?;
+            // The compute between operator awaits never touches a tokio leaf
+            // resource, so the runtime's cooperative budget never trips and a
+            // long pipeline can hog its worker for minutes, starving timers
+            // and the accept loop. A periodic explicit yield keeps the
+            // runtime scheduling everything else
+            self.batches = self.batches.wrapping_add(1);
+            if self.batches % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
+            self.child.next().await
+        })
+    }
+}
+
+/// Convention for operators with unbounded compute per `next()` call: the
+/// executor's compute never touches a tokio leaf resource, so the runtime's
+/// cooperative budget never trips and a long loop can hog its worker and
+/// outlive a cancel. Blocking operators get a `CancelPollOperator` wrapped
+/// around their inputs at build time; an operator whose OUTPUT phase also
+/// loops without bound (a spill merge, a join product) additionally holds a
+/// poll context, checks `check_cancelled` per batch, and calls
+/// `tokio::task::yield_now` every 16 batches or every 64 inner steps. See
+/// `SortOperator` and `NestedLoopJoinOperator` for the two shapes.
 pub trait Operator: Send {
     /// Returns the next batch of rows, or None if the operator is exhausted.
     fn next(&mut self) -> OperatorResult<'_>;

@@ -219,6 +219,17 @@ pub enum LogicalPlan {
         child: Arc<LogicalPlan>,
     },
 
+    /// DML against a view with an INSTEAD OF trigger. `source` produces one
+    /// parameter row per affected row; the executor runs the trigger body per
+    /// row instead of writing storage. `param_map` routes each trigger
+    /// parameter position to a source column, None filling NULL.
+    ViewTriggerWrite {
+        view_id: u32,
+        event: u8,
+        param_map: Vec<Option<usize>>,
+        source: Arc<LogicalPlan>,
+    },
+
     /// Graph algorithm execution over a named graph schema.
     GraphAlgorithm {
         schema_name: String,
@@ -388,6 +399,7 @@ impl LogicalPlan {
             LogicalPlan::Values { schema, .. } => schema.clone(),
             LogicalPlan::Update { .. } => Vec::new(),
             LogicalPlan::Delete { .. } => Vec::new(),
+            LogicalPlan::ViewTriggerWrite { .. } => Vec::new(),
             LogicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
             LogicalPlan::AnalyticsTableFunction { output_columns, .. } => output_columns.clone(),
         }
@@ -408,6 +420,7 @@ impl LogicalPlan {
             | LogicalPlan::Distinct { child }
             | LogicalPlan::LockRows { child, .. }
             | LogicalPlan::Insert { source: child, .. }
+            | LogicalPlan::ViewTriggerWrite { source: child, .. }
             | LogicalPlan::Update { child, .. }
             | LogicalPlan::Delete { child, .. } => vec![child],
             LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {

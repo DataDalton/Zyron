@@ -43,5 +43,5 @@ pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};
 pub use storage::{CatalogStorage, HeapCatalogStorage};
 pub use system_catalog::{
     DEFAULT_SEARCH_PATH, SYSTEM_CATALOG_NAME, SYSTEM_OBJECTS, SYSTEM_SCHEMAS, SystemCatalog,
-    SystemObject, SystemObjectKind,
+    SystemObject, SystemObjectKind, default_search_path,
 };

@@ -48,9 +48,9 @@ async fn create_harness() -> Harness {
             .expect("catalog"),
     );
     catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
     let branch_manager = Arc::new(zyron_versioning::BranchManager::new(
         tmp.path().to_path_buf(),
@@ -111,6 +111,7 @@ async fn create_harness() -> Harness {
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -136,7 +137,7 @@ async fn create_harness() -> Harness {
     });
 
     let mut session = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    session.search_path = vec!["public".into()];
+    session.search_path = vec!["zyron_test".into()];
 
     Harness {
         server: state,
@@ -174,7 +175,7 @@ async fn exec(h: &mut Harness, sql: &str) -> Vec<DataBatch> {
     let plan = zyron_planner::plan(
         &h.server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )

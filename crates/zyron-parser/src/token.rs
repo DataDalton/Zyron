@@ -316,6 +316,10 @@ pub enum Keyword {
     Retain,
     Expire,
 
+    // Session control
+    Cancel,
+    Backend,
+
     // Data lifecycle
     Legal,
     Forget,
@@ -502,6 +506,7 @@ pub enum Keyword {
     Referencing,
     Old,
     New,
+    Prior,
     Priority,
     Function,
     Returns,
@@ -1067,6 +1072,10 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "RETAIN" => Some(Keyword::Retain),
         "EXPIRE" => Some(Keyword::Expire),
 
+        // Session control
+        "CANCEL" => Some(Keyword::Cancel),
+        "BACKEND" => Some(Keyword::Backend),
+
         // Data lifecycle
         "LEGAL" => Some(Keyword::Legal),
         "FORGET" => Some(Keyword::Forget),
@@ -1249,6 +1258,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "REFERENCING" => Some(Keyword::Referencing),
         "OLD" => Some(Keyword::Old),
         "NEW" => Some(Keyword::New),
+        "PRIOR" => Some(Keyword::Prior),
         "PRIORITY" => Some(Keyword::Priority),
         "FUNCTION" => Some(Keyword::Function),
         "RETURNS" => Some(Keyword::Returns),

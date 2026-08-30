@@ -731,6 +731,9 @@ impl CostModel {
                 row_count: rows.len() as f64,
             },
             LogicalPlan::Insert { source, .. } => self.estimate_plan_cost(source, catalog),
+            LogicalPlan::ViewTriggerWrite { source, .. } => {
+                self.estimate_plan_cost(source, catalog)
+            }
             LogicalPlan::Update { child, .. } => self.estimate_plan_cost(child, catalog),
             LogicalPlan::Delete { child, .. } => self.estimate_plan_cost(child, catalog),
             LogicalPlan::GraphAlgorithm { algorithm, .. } => {

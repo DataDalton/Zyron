@@ -194,10 +194,10 @@ mod tests {
 
     #[test]
     fn test_parse_table_target() {
-        let u = parse_zyron_uri("zyron://u@h/db/public.events").unwrap();
+        let u = parse_zyron_uri("zyron://u@h/db/zyron_test.events").unwrap();
         match u.target {
             ZyronUriTarget::Table { schema, table } => {
-                assert_eq!(schema, "public");
+                assert_eq!(schema, "zyron_test");
                 assert_eq!(table, "events");
             }
             _ => panic!("wrong target"),

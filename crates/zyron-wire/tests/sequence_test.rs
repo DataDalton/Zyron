@@ -45,9 +45,9 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
             .expect("catalog"),
     );
     let public_schema = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "test_user")
+        .create_schema(SYSTEM_DATABASE_ID, "zyron_test", "test_user")
         .await
-        .expect("create public schema");
+        .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
     let state = Arc::new(ServerState {
@@ -105,6 +105,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_registry: Default::default(),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
@@ -133,7 +134,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
 
 fn new_session() -> Option<Session> {
     let mut s = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));
-    s.search_path = vec!["public".into()];
+    s.search_path = vec!["zyron_test".into()];
     Some(s)
 }
 
@@ -168,7 +169,7 @@ async fn try_exec(
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )
@@ -415,4 +416,32 @@ async fn drop_sequence_removes_it() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn sequences_resolve_qualified_exactly_and_bare_errors_on_ambiguity() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(&server, &mut session, "CREATE TABLE seq_t (id INT)").await;
+    exec(&server, &mut session, "CREATE SCHEMA ss2").await;
+    exec(&server, &mut session, "CREATE SEQUENCE dup").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE SEQUENCE ss2.dup START WITH 500",
+    )
+    .await;
+
+    // Qualified names read exactly the named schema of each sequence.
+    let a = col_i64(&exec(&server, &mut session, "SELECT nextval('zyron_test.dup')").await);
+    assert_eq!(a, vec![1]);
+    let b = col_i64(&exec(&server, &mut session, "SELECT nextval('ss2.dup')").await);
+    assert_eq!(b, vec![500]);
+
+    // A bare name with the same sequence in two schemas errors loudly
+    // instead of silently picking one.
+    let err = try_exec(&server, &mut session, "SELECT nextval('dup')")
+        .await
+        .expect_err("an ambiguous bare sequence name is rejected");
+    assert!(err.contains("ambiguous"), "{err}");
 }

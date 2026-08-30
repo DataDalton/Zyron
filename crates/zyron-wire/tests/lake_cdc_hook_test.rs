@@ -86,7 +86,7 @@ async fn exec_dml_hooked(server: &Arc<ServerState>, hook: &Arc<CountingHook>, sq
     let plan = zyron_planner::plan(
         &server.catalog,
         DatabaseId(1),
-        vec!["public".into()],
+        vec!["zyron_test".into()],
         stmt,
         None,
     )

@@ -363,8 +363,27 @@ async fn apply_lake_maintenance_options(
     Ok(())
 }
 
+/// The namespace that resolves a lifecycle target table: its own schema,
+/// derived from the live catalog entry, never an implicit default.
+fn table_scoped_path(
+    server: &Arc<ServerState>,
+    table_id: u32,
+) -> (zyron_catalog::DatabaseId, Vec<String>) {
+    match server
+        .catalog
+        .get_table_by_id(zyron_catalog::TableId(table_id))
+    {
+        Ok(t) => crate::ddl_dispatch::schema_scoped_path(server, t.schema_id),
+        Err(_) => (
+            zyron_catalog::DatabaseId(1),
+            zyron_catalog::default_search_path(),
+        ),
+    }
+}
+
 async fn run_sql(
     server: &Arc<ServerState>,
+    ns: (zyron_catalog::DatabaseId, Vec<String>),
     sql: &str,
     dml: bool,
 ) -> Result<(u64, Vec<zyron_executor::batch::DataBatch>), ProtocolError> {
@@ -375,8 +394,8 @@ async fn run_sql(
         .ok_or_else(|| ProtocolError::Database(ZyronError::Internal("empty sql".into())))?;
     let plan = zyron_planner::plan(
         &server.catalog,
-        zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
+        ns.0,
+        ns.1,
         stmt,
         Some(&server.peer_facts()),
     )
@@ -807,7 +826,13 @@ pub async fn handle_forget_user(
             "SELECT * FROM \"{}\" WHERE {} INCLUDING DELETED",
             t.table_name, where_sql
         );
-        let (matched, _) = run_sql(server, &count_sql, false).await?;
+        let (matched, _) = run_sql(
+            server,
+            table_scoped_path(server, t.table_id),
+            &count_sql,
+            false,
+        )
+        .await?;
         if matched == 0 && t.history_table_id == 0 {
             continue;
         }
@@ -817,7 +842,13 @@ pub async fn handle_forget_user(
             continue;
         }
         let del_sql = format!("DELETE FROM \"{}\" WHERE {} HARD", t.table_name, where_sql);
-        let (deleted, _) = run_sql(server, &del_sql, true).await?;
+        let (deleted, _) = run_sql(
+            server,
+            table_scoped_path(server, t.table_id),
+            &del_sql,
+            true,
+        )
+        .await?;
         total_rows += deleted;
         tables_touched += 1;
         // System-versioned history scrub so erased data does not survive
@@ -833,7 +864,13 @@ pub async fn handle_forget_user(
                     "DELETE FROM \"{}\" WHERE \"{}\" = {} HARD",
                     hist.name, t.id_column, subject
                 );
-                let (hn, _) = run_sql(server, &h_sql, true).await?;
+                let (hn, _) = run_sql(
+                    server,
+                    crate::ddl_dispatch::schema_scoped_path(server, hist.schema_id),
+                    &h_sql,
+                    true,
+                )
+                .await?;
                 total_rows += hn;
             }
         }
@@ -871,7 +908,8 @@ pub async fn handle_export_user(
             "SELECT * FROM \"{}\" WHERE \"{}\" = {} INCLUDING DELETED",
             t.table_name, t.id_column, subject
         );
-        let (_, batches) = run_sql(server, &sel, false).await?;
+        let (_, batches) =
+            run_sql(server, table_scoped_path(server, t.table_id), &sel, false).await?;
         let mut records: Vec<Vec<u8>> = Vec::new();
         for b in &batches {
             for r in 0..b.num_rows {
@@ -1399,7 +1437,13 @@ pub async fn handle_restore_soft_delete(
         stmt.table, cfg.is_deleted_column, cfg.deleted_at_column, where_sql
     );
 
-    let (rows_restored, _) = run_sql(server, &restore_sql, true).await?;
+    let (rows_restored, _) = run_sql(
+        server,
+        crate::ddl_dispatch::schema_scoped_path(server, table.schema_id),
+        &restore_sql,
+        true,
+    )
+    .await?;
 
     audit(
         server,
@@ -1504,11 +1548,23 @@ pub async fn handle_run_retention_job(
                 "SELECT * FROM \"{}\" WHERE {} INCLUDING DELETED",
                 table.name, where_sql
             );
-            let (n, _) = run_sql(server, &sel, false).await?;
+            let (n, _) = run_sql(
+                server,
+                crate::ddl_dispatch::schema_scoped_path(server, table.schema_id),
+                &sel,
+                false,
+            )
+            .await?;
             (n, 4u8) // skipped/dry-run
         } else {
             let del = format!("DELETE FROM \"{}\" WHERE {} HARD", table.name, where_sql);
-            let (n, _) = run_sql(server, &del, true).await?;
+            let (n, _) = run_sql(
+                server,
+                crate::ddl_dispatch::schema_scoped_path(server, table.schema_id),
+                &del,
+                true,
+            )
+            .await?;
             (n, 2u8) // done
         };
 

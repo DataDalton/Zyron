@@ -1533,6 +1533,7 @@ impl Server {
             subscription_runtimes: Arc::new(scc::HashMap::new()),
             pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
             subscription_shutdown: Arc::clone(&self.shutdown),
+            cancel_registry: Default::default(),
             heap_files: Arc::new(scc::HashMap::new()),
             btree_indexes,
             plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),

@@ -75,7 +75,7 @@ static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 // =============================================================================
 
 /// Builds a temporary catalog test environment (DiskManager, BufferPool, WAL,
-/// Catalog) and creates a `public` schema inside the bootstrap `zyron`
+/// Catalog) and creates a `zyron_test` schema inside the bootstrap `zyron`
 /// database. The returned `SchemaId` addresses that schema for user tables.
 async fn setup_catalog(
     dir: &std::path::Path,

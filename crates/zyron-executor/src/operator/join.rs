@@ -172,6 +172,13 @@ pub struct NestedLoopJoinOperator {
     unmatched_rb_idx: usize,
     unmatched_rr_idx: usize,
     output_buffer: Option<JoinOutputBuffer>,
+    /// Polled once per right-side batch inside the product loop. A filtered
+    /// cross join can scan the whole materialized right side for many left
+    /// rows before one output buffer fills, which is compute no child pull
+    /// interrupts, so the loop itself must observe a cancel.
+    poll_ctx: Option<Arc<ExecutionContext>>,
+    /// Counts product-loop steps so the loop can yield periodically.
+    product_steps: u32,
     /// Set when the ON condition contains a subquery. The condition is then
     /// evaluated per joined row through this prepared predicate (which runs any
     /// correlated subquery against that row) instead of the synchronous
@@ -204,6 +211,8 @@ impl NestedLoopJoinOperator {
             input_schema,
             left_types,
             right_types,
+            poll_ctx: None,
+            product_steps: 0,
             right_batches: None,
             left_batch: None,
             left_row: 0,
@@ -224,6 +233,11 @@ impl NestedLoopJoinOperator {
     /// used to prepare a correlated ON condition before attaching it.
     pub fn input_schema(&self) -> &[LogicalColumn] {
         &self.input_schema
+    }
+
+    /// Installs the context whose cancel flag the product loop polls.
+    pub fn set_poll_context(&mut self, ctx: Arc<ExecutionContext>) {
+        self.poll_ctx = Some(ctx);
     }
 
     /// Evaluates the ON condition through a prepared correlated predicate so a
@@ -338,6 +352,17 @@ impl Operator for NestedLoopJoinOperator {
 
                 // Scan right side for current left row.
                 while self.right_batch_idx < right_batches.len() {
+                    if let Some(ctx) = &self.poll_ctx {
+                        ctx.check_cancelled()?;
+                    }
+                    // The product loop is pure compute and can run for
+                    // minutes inside one poll; without an explicit yield the
+                    // worker never schedules anything else, cancel
+                    // connections included
+                    self.product_steps = self.product_steps.wrapping_add(1);
+                    if self.product_steps % 64 == 0 {
+                        tokio::task::yield_now().await;
+                    }
                     let rb = &right_batches[self.right_batch_idx];
                     while self.right_row < rb.num_rows {
                         let rr = self.right_row;

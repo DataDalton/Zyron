@@ -90,6 +90,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Restore) => self.parse_restore_statement(),
             Token::Keyword(Keyword::Legal) => self.parse_legal_hold(),
             Token::Keyword(Keyword::Forget) => self.parse_forget_user(),
+            Token::Keyword(Keyword::Cancel) => self.parse_cancel_backend(),
             Token::Keyword(Keyword::Export) => self.parse_export_user(),
             Token::Keyword(Keyword::Undrop) => self.parse_undrop_table(),
             Token::Keyword(Keyword::Analyze) => self.parse_analyze(),
@@ -557,12 +558,20 @@ impl<'a> Parser<'a> {
                     self.advance()?; // consume *
                     return Ok(SelectItem::QualifiedWildcard(saved_name));
                 }
-                // Not a wildcard, it is ident.column. Re-construct as QualifiedIdentifier expr.
+                // Not a wildcard: ident.column, or a schema-qualified
+                // function call ident.fn(...). Either way the rest of the
+                // expression (operators, IS NULL, and the like) continues
+                // from that prefix.
                 let column = self.parse_ident()?;
-                let expr = Expr::QualifiedIdentifier {
-                    table: saved_name,
-                    column,
+                let prefix = if self.at_token(&Token::LParen) {
+                    self.parse_function_call(format!("{saved_name}.{column}"))?
+                } else {
+                    Expr::QualifiedIdentifier {
+                        table: saved_name,
+                        column,
+                    }
                 };
+                let expr = self.parse_expr_continuation(prefix, 0)?;
                 let alias = self.parse_optional_alias()?;
                 return Ok(SelectItem::Expr(expr, alias));
             }
@@ -1151,7 +1160,7 @@ impl<'a> Parser<'a> {
             false
         };
 
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         // `CLONE OF <table> [AT VERSION <n>]` takes the source's shape, so
         // it stands in place of a column list rather than beside one
@@ -2576,6 +2585,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An integer with an optional leading minus. ABSOLUTE and RELATIVE
+    /// fetch counts are signed: ABSOLUTE -1 addresses the last row and
+    /// RELATIVE -n moves backward.
+    fn parse_signed_integer_value(&mut self) -> Result<i64> {
+        if matches!(self.current.token, Token::Minus) {
+            self.advance()?;
+            let n = self.parse_integer_value()?;
+            return Ok(-n);
+        }
+        self.parse_integer_value()
+    }
+
     fn parse_integer_value(&mut self) -> Result<i64> {
         match &self.current.token {
             Token::Integer(n) => {
@@ -2645,8 +2666,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr> {
-        let mut lhs = self.parse_prefix()?;
+        let lhs = self.parse_prefix()?;
+        self.parse_expr_continuation(lhs, min_bp)
+    }
 
+    /// Continues expression parsing from an already-parsed prefix, applying
+    /// postfix and infix operators. Entry point for callers that consumed the
+    /// leading tokens themselves before recognizing an expression.
+    fn parse_expr_continuation(&mut self, mut lhs: Expr, min_bp: u8) -> Result<Expr> {
         loop {
             // Check for postfix-like operators: IS [NOT] NULL, [NOT] IN, [NOT] BETWEEN, [NOT] LIKE
             let (new_lhs, matched) = self.try_parse_postfix(lhs, min_bp)?;
@@ -2952,10 +2979,14 @@ impl<'a> Parser<'a> {
             return self.parse_function_call(name);
         }
 
-        // Check for qualified identifier: name.column
+        // Check for qualified identifier: name.column, or a schema-qualified
+        // function call: schema.fn(...)
         if self.at_token(&Token::Dot) {
             self.advance()?;
             let column = self.parse_ident()?;
+            if self.at_token(&Token::LParen) {
+                return self.parse_function_call(format!("{name}.{column}"));
+            }
             return Ok(Expr::QualifiedIdentifier {
                 table: name,
                 column,
@@ -3567,7 +3598,7 @@ impl<'a> Parser<'a> {
 
     fn parse_create_view(&mut self, or_replace: bool) -> Result<Statement> {
         self.expect_keyword(Keyword::View)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         let columns = if self.at_token(&Token::LParen) {
             self.advance()?;
             let cols = self.parse_comma_separated(|p| p.parse_ident())?;
@@ -3797,7 +3828,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         let mut increment = None;
         let mut min_value = None;
         let mut max_value = None;
@@ -4606,6 +4637,8 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Fetch)?;
         let direction = if self.consume_keyword(Keyword::Next)? {
             FetchDirection::Next
+        } else if self.consume_keyword(Keyword::Prior)? {
+            FetchDirection::Prior
         } else if self.at_keyword(Keyword::First) {
             self.advance()?;
             FetchDirection::First
@@ -4615,10 +4648,10 @@ impl<'a> Parser<'a> {
         } else if self.consume_keyword(Keyword::All)? {
             FetchDirection::All
         } else if self.consume_keyword(Keyword::Absolute)? {
-            let n = self.parse_integer_value()?;
+            let n = self.parse_signed_integer_value()?;
             FetchDirection::Absolute(n)
         } else if self.consume_keyword(Keyword::Relative)? {
-            let n = self.parse_integer_value()?;
+            let n = self.parse_signed_integer_value()?;
             FetchDirection::Relative(n)
         } else if self.consume_keyword(Keyword::Forward)? {
             if self.consume_keyword(Keyword::All)? {
@@ -4818,7 +4851,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::As)?;
         let query = Box::new(self.parse_select_body(None)?);
         Ok(Statement::CreateMaterializedView(Box::new(
@@ -5839,6 +5872,18 @@ impl<'a> Parser<'a> {
         Ok(Statement::LegalHold(Box::new(LegalHoldStatement {
             operation,
         })))
+    }
+
+    /// CANCEL BACKEND pid. The pid identifies a connection, as listed by
+    /// zyron_sys.stat.activity, and must fit an i32 like the wire protocol's
+    /// process id.
+    fn parse_cancel_backend(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Cancel)?;
+        self.expect_keyword(Keyword::Backend)?;
+        let raw = self.parse_integer_value()?;
+        let pid = i32::try_from(raw)
+            .map_err(|_| self.error(&format!("backend pid {raw} is out of range")))?;
+        Ok(Statement::CancelBackend { pid })
     }
 
     /// FORGET USER 'id' [CASCADE] [DRY RUN]
@@ -7218,7 +7263,7 @@ impl<'a> Parser<'a> {
         // EXECUTE FUNCTION func_name(args...)
         self.expect_keyword(Keyword::Execute)?;
         self.expect_keyword(Keyword::Function)?;
-        let execute_function = self.parse_ident()?;
+        let execute_function = self.parse_qualified_name()?;
 
         let mut args = Vec::new();
         if self.current.token == Token::LParen {
@@ -7298,7 +7343,7 @@ impl<'a> Parser<'a> {
     /// [LIBRARY 'path' SYMBOL 'name']
     fn parse_create_function(&mut self, or_replace: bool) -> Result<Statement> {
         self.expect_keyword(Keyword::Function)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         // Parse parameters
         self.expect_token(&Token::LParen)?;
@@ -7427,7 +7472,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         let drop_behavior = self.parse_optional_drop_behavior()?;
         Ok(Statement::DropFunction(Box::new(DropFunctionStatement {
             name,
@@ -7449,7 +7494,7 @@ impl<'a> Parser<'a> {
     /// )
     fn parse_create_aggregate(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Aggregate)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         // Parse input parameters
         self.expect_token(&Token::LParen)?;
@@ -7472,16 +7517,16 @@ impl<'a> Parser<'a> {
         loop {
             if self.consume_keyword(Keyword::Sfunc)? {
                 self.expect_token(&Token::Eq)?;
-                sfunc = Some(self.parse_ident()?);
+                sfunc = Some(self.parse_qualified_name()?);
             } else if self.consume_keyword(Keyword::Stype)? {
                 self.expect_token(&Token::Eq)?;
                 stype = Some(self.parse_data_type()?);
             } else if self.consume_keyword(Keyword::Finalfunc)? {
                 self.expect_token(&Token::Eq)?;
-                finalfunc = Some(self.parse_ident()?);
+                finalfunc = Some(self.parse_qualified_name()?);
             } else if self.consume_keyword(Keyword::Combinefunc)? {
                 self.expect_token(&Token::Eq)?;
-                combinefunc = Some(self.parse_ident()?);
+                combinefunc = Some(self.parse_qualified_name()?);
             } else if self.consume_keyword(Keyword::Initcond)? {
                 self.expect_token(&Token::Eq)?;
                 initcond = Some(self.parse_string_literal()?);
@@ -7520,7 +7565,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         let drop_behavior = self.parse_optional_drop_behavior()?;
         Ok(Statement::DropAggregate(Box::new(DropAggregateStatement {
             name,
@@ -7538,7 +7583,7 @@ impl<'a> Parser<'a> {
     /// [SECURITY {DEFINER|INVOKER}]
     fn parse_create_procedure(&mut self, or_replace: bool) -> Result<Statement> {
         self.expect_keyword(Keyword::Procedure)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         // Parse parameters
         self.expect_token(&Token::LParen)?;
@@ -7599,7 +7644,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         let drop_behavior = self.parse_optional_drop_behavior()?;
         Ok(Statement::DropProcedure(Box::new(DropProcedureStatement {
             name,
@@ -7611,7 +7656,7 @@ impl<'a> Parser<'a> {
     /// CALL procedure_name(args...)
     fn parse_call(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Call)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         self.expect_token(&Token::LParen)?;
         let args = if self.current.token == Token::RParen {
             Vec::new()
@@ -7643,7 +7688,7 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword(Keyword::Execute)?;
         self.expect_keyword(Keyword::Function)?;
-        let execute_function = self.parse_ident()?;
+        let execute_function = self.parse_qualified_name()?;
 
         Ok(Statement::CreateEventHandler(Box::new(
             CreateEventHandlerStatement {
@@ -8695,6 +8740,9 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Archive => Some("archive"),
         Keyword::Retain => Some("retain"),
         Keyword::Expire => Some("expire"),
+        // Session control (mid-statement, stays identifier-usable).
+        // Cancel is intentionally omitted so it leads statements.
+        Keyword::Backend => Some("backend"),
         // Data lifecycle (mid-statement, stay identifier-usable).
         // Legal and Forget are intentionally omitted so they lead statements.
         Keyword::Tier => Some("tier"),
@@ -12727,6 +12775,61 @@ mod tests {
                     assert!(matches!(&args[1], FunctionArg::Named { name, .. } if name == "key"));
                 } else {
                     panic!("Expected Function");
+                }
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_schema_qualified_function_call() {
+        let stmt = parse_one("SELECT s2.pick(t.x, 1) FROM t");
+        match stmt {
+            Statement::Select(s) => {
+                if let SelectItem::Expr(Expr::Function { name, args, .. }, _) = &s.projections[0] {
+                    assert_eq!(name, "s2.pick");
+                    assert_eq!(args.len(), 2);
+                    assert!(matches!(
+                        &args[0],
+                        FunctionArg::Unnamed(Expr::QualifiedIdentifier { table, column })
+                            if table == "t" && column == "x"
+                    ));
+                } else {
+                    panic!("Expected Function");
+                }
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_qualified_identifier_still_parses_without_parens() {
+        let stmt = parse_one("SELECT t.x FROM t");
+        match stmt {
+            Statement::Select(s) => {
+                assert!(matches!(
+                    &s.projections[0],
+                    SelectItem::Expr(Expr::QualifiedIdentifier { table, column }, _)
+                        if table == "t" && column == "x"
+                ));
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_qualified_identifier_projection_continues_into_operators() {
+        let stmt = parse_one("SELECT t.x + 1 AS y FROM t");
+        match stmt {
+            Statement::Select(s) => {
+                if let SelectItem::Expr(Expr::BinaryOp { left, .. }, alias) = &s.projections[0] {
+                    assert!(matches!(
+                        left.as_ref(),
+                        Expr::QualifiedIdentifier { table, column } if table == "t" && column == "x"
+                    ));
+                    assert_eq!(alias.as_deref(), Some("y"));
+                } else {
+                    panic!("Expected BinaryOp over t.x");
                 }
             }
             _ => panic!("Expected SELECT"),

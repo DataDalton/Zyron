@@ -42,7 +42,7 @@ async fn a_committed_write_is_counted() {
     for i in 0..32 {
         common::exec_dml(
             &state,
-            &format!("INSERT INTO public.counted VALUES ({i}, {i})"),
+            &format!("INSERT INTO zyron_test.counted VALUES ({i}, {i})"),
         )
         .await;
     }
@@ -81,7 +81,7 @@ async fn write_skew_is_visible_and_an_even_spread_is_not() {
         .expect("ddl");
         common::exec_dml(
             &state,
-            &format!("INSERT INTO public.part_{t} VALUES (1, 0)"),
+            &format!("INSERT INTO zyron_test.part_{t} VALUES (1, 0)"),
         )
         .await;
     }
@@ -94,7 +94,7 @@ async fn write_skew_is_visible_and_an_even_spread_is_not() {
         let t = i % EXTENTS;
         common::exec_dml(
             &state,
-            &format!("UPDATE public.part_{t} SET v = v + 1 WHERE id = 1"),
+            &format!("UPDATE zyron_test.part_{t} SET v = v + 1 WHERE id = 1"),
         )
         .await;
     }
@@ -112,7 +112,7 @@ async fn write_skew_is_visible_and_an_even_spread_is_not() {
         let t = if i % 8 == 0 { i % EXTENTS } else { 0 };
         common::exec_dml(
             &state,
-            &format!("UPDATE public.part_{t} SET v = v + 1 WHERE id = 1"),
+            &format!("UPDATE zyron_test.part_{t} SET v = v + 1 WHERE id = 1"),
         )
         .await;
     }
@@ -158,7 +158,11 @@ async fn durable_commits_reach_the_group_commit_signal() {
     assert_eq!(contention.group_commit_hit_rate(), 1.0);
 
     for i in 0..64 {
-        common::exec_dml(&state, &format!("INSERT INTO public.durable VALUES ({i})")).await;
+        common::exec_dml(
+            &state,
+            &format!("INSERT INTO zyron_test.durable VALUES ({i})"),
+        )
+        .await;
     }
 
     // Every writer has finished, so none is still parked on the device
@@ -186,7 +190,7 @@ async fn query_memory_reaches_the_node_gauge_and_is_returned() {
     for i in 0..2_000 {
         common::exec_dml(
             &state,
-            &format!("INSERT INTO public.big VALUES ({i}, {})", i % 97),
+            &format!("INSERT INTO zyron_test.big VALUES ({i}, {})", i % 97),
         )
         .await;
     }
@@ -196,11 +200,11 @@ async fn query_memory_reaches_the_node_gauge_and_is_returned() {
 
     // A sort and a grouped aggregate both materialize, which is what charges
     // the gauge
-    let sorted = common::query_rows(&state, "SELECT id FROM public.big ORDER BY v, id").await;
+    let sorted = common::query_rows(&state, "SELECT id FROM zyron_test.big ORDER BY v, id").await;
     assert_eq!(sorted, 2_000);
     let grouped = common::query_rows(
         &state,
-        "SELECT v, count(*) FROM public.big GROUP BY v ORDER BY v",
+        "SELECT v, count(*) FROM zyron_test.big GROUP BY v ORDER BY v",
     )
     .await;
     assert_eq!(grouped, 97);

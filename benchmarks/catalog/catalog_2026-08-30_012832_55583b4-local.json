@@ -1,0 +1,155 @@
+{
+  "id": "2026-08-30_012832_55583b4-local",
+  "date": "2026-08-30 01:29:15Z",
+  "ts": 1788053355,
+  "commit": "55583b4-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "ANALYZE": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.02 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 12.13 },
+      "ANALYZE throughput (rows/sec)": {
+        "average": 19932229.607780,
+        "runs": [16632846.55, 20428591.86, 20984597.31, 21076592.34, 20538519.99],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Cache Hit Rate": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 12.12 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.08 },
+      "Cache hit rate": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "DDL Create": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 12.08 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 12.08 },
+      "Create table latency (us/op)": {
+        "average": 83.383000,
+        "runs": [85.61, 84.23, 83.18, 85.81, 78.07],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "DDL Drop": {
+      "Drop table latency (us/op)": {
+        "average": 93.000000,
+        "runs": [116.67, 100.69, 82.42, 81.71, 83.52],
+        "target": 80.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Histogram Build": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 12.08 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 12.08 },
+      "Histogram build latency (ms/col)": {
+        "average": 0.000900,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Recovery": {
+      "Recovery time (ms)": {
+        "average": 1.366000,
+        "runs": [5.65, 0.32, 0.31, 0.29, 0.26],
+        "target": 1.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Schema Resolve": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.08 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.09 },
+      "Resolve latency (ns/op)": {
+        "average": 45.383960,
+        "runs": [45.36, 45.49, 45.37, 45.39, 45.32],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Table Lookup": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.09 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 12.09 },
+      "Lookup latency (ns/op)": {
+        "average": 24.146840,
+        "runs": [24.13, 24.14, 24.14, 24.14, 24.17],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "System Name Resolution": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 11.96 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 11.98 },
+      "Three-part hit (ns/op)": {
+        "average": 91.867840,
+        "runs": [91.26, 90.62, 91.77, 93.15, 92.55],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Three-part miss (ns/op)": {
+        "average": 49.622420,
+        "runs": [49.38, 49.55, 49.71, 49.77, 49.70],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Search path hit (ns/op)": {
+        "average": 51.557500,
+        "runs": [51.69, 51.69, 51.74, 51.60, 51.08],
+        "target": 800.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Search path miss (ns/op)": {
+        "average": 102.396300,
+        "runs": [101.26, 100.95, 103.83, 102.84, 103.09],
+        "target": 800.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

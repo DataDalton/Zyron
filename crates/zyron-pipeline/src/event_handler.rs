@@ -502,7 +502,7 @@ mod tests {
     fn test_event_payload_details() {
         let mut details = hashbrown::HashMap::new();
         details.insert("table".to_string(), "users".to_string());
-        details.insert("schema".to_string(), "public".to_string());
+        details.insert("schema".to_string(), "zyron_test".to_string());
 
         let payload = EventPayload {
             eventType: EventType::TableCreated,
