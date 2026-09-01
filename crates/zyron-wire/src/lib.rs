@@ -15,6 +15,7 @@ pub mod codec;
 pub mod connection;
 pub mod copy;
 pub mod copy_external_dispatch;
+pub mod currency_rates;
 pub mod ddl_dispatch;
 pub mod dml_enforce;
 pub mod endpoint_registrar;
@@ -33,12 +34,14 @@ pub mod pressure_views;
 pub mod publication_filter;
 pub mod quic;
 pub mod row_security;
+pub mod search_resilience_ddl;
 pub mod session;
 pub mod statement_cache;
 pub mod subscription;
 pub mod system_cdc_views;
 pub mod system_compliance_report;
 pub mod system_core_views;
+pub mod system_retention_views;
 pub mod system_streaming_views;
 pub mod system_views;
 pub mod tls;
@@ -194,15 +197,23 @@ pub async fn start_server(
             .await
             {
                 Ok(rx) => {
-                    info!("QUIC transport enabled on {}", quic_addr);
+                    info!(
+                        "HTTP/3 over QUIC serving on {} as the primary transport",
+                        quic_addr
+                    );
                     quic_rx = Some(rx);
                 }
                 Err(e) => {
-                    error!("Failed to start QUIC listener: {}. TCP-only mode.", e);
+                    error!(
+                        "HTTP/3 listener failed to start: {}. Serving the TCP fallback only.",
+                        e
+                    );
                 }
             }
         } else {
-            error!("QUIC requires tls_cert_path and tls_key_path. TCP-only mode.");
+            info!(
+                "HTTP/3 is the primary transport but needs tls_cert_path and tls_key_path.                  Serving the TCP fallback only until they are configured."
+            );
         }
     }
 

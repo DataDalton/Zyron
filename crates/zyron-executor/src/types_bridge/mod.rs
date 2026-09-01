@@ -406,25 +406,35 @@ fn dispatch_extended(name: &str, args: &[Column], num_rows: usize) -> Option<Res
         .or_else(|| money_quantity::dispatch(name, args, num_rows))
         .or_else(|| cron_range_time::dispatch(name, args, num_rows))
         .or_else(|| regex_strings::dispatch(name, args, num_rows))
+        .or_else(|| ltree_bridge::dispatch(name, args, num_rows))
         .or_else(|| state_rate_tree::dispatch(name, args, num_rows))
         .or_else(|| prob_statistics::dispatch(name, args, num_rows))
         .or_else(|| matrix_geo::dispatch(name, args, num_rows))
         .or_else(|| financial_ts::dispatch(name, args, num_rows))
         .or_else(|| misc_domains::dispatch(name, args, num_rows))
+        .or_else(|| vector_money_semver::dispatch(name, args, num_rows))
+        .or_else(|| masking_bridge::dispatch(name, args, num_rows))
+        .or_else(|| expectation_metrics::dispatch(name, args, num_rows))
+        .or_else(|| media_bridge::dispatch(name, args, num_rows))
 }
 
 mod bitfield_crypto;
 mod color_fingerprint;
 mod cron_range_time;
+mod expectation_metrics;
 mod financial_ts;
 mod idgen_identifier;
+mod ltree_bridge;
+mod masking_bridge;
 mod matrix_geo;
+mod media_bridge;
 mod misc_domains;
 mod money_quantity;
 mod network_url;
 mod prob_statistics;
 mod regex_strings;
 mod state_rate_tree;
+mod vector_money_semver;
 
 fn one_string_to_bytes<F: Fn(&str) -> Vec<u8>>(args: &[Column], f: F) -> Result<Column> {
     arg_count_check(args, 1)?;

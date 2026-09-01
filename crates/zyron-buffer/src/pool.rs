@@ -204,14 +204,6 @@ impl TreiberFreeList {
     }
 }
 
-/// Information about a dirty page that was evicted from the buffer pool.
-/// Caller must write this to disk to prevent data loss.
-#[derive(Debug)]
-pub struct EvictedPage {
-    pub page_id: PageId,
-    pub data: Box<[u8; PAGE_SIZE]>,
-}
-
 /// Configuration for the buffer pool.
 #[derive(Debug, Clone)]
 pub struct BufferPoolConfig {
@@ -243,10 +235,10 @@ pub struct BufferPool {
     free_list: TreiberFreeList,
     /// Page replacement policy.
     replacer: ClockReplacer,
-    /// Optional write hook to flush a dirty victim during eviction.
-    /// When set, a dirty victim is written to disk before its frame is reused.
-    /// When unset, the dirty victim is returned as an EvictedPage for the caller
-    /// to write.
+    /// Write hook that flushes a dirty victim during eviction. A dirty page
+    /// leaves the pool only through this hook, which writes it before its
+    /// mapping comes down. A pool without one cannot evict a dirty page and
+    /// sweeps past it instead
     evict_writer: OnceLock<EvictWriteFn>,
     /// Serializes flusher-side page writes (background trickle, checkpoint
     /// flush, full flush) so two flushers can never write one page's images
@@ -277,10 +269,16 @@ impl BufferPool {
     }
 
     /// Installs the write hook used to flush a dirty victim during eviction.
-    /// Set once from the pool construction site. With a hook installed, eviction
-    /// of a dirty page writes it to disk through this callback so the write is
-    /// never lost by a caller that drops the EvictedPage. Returns an error if a
-    /// hook was already installed.
+    ///
+    /// Set once from the pool construction site, and required by any pool
+    /// whose working set outgrows its frames. Eviction writes the page
+    /// through this callback while it still holds the frame, so the page is
+    /// on disk before its page table mapping comes down and a reader
+    /// faulting it back in cannot find a stale image. Without a hook there is
+    /// nowhere to put the bytes, so a dirty frame is never taken as a victim
+    /// and a pool of entirely dirty frames reports itself full.
+    ///
+    /// Returns an error if a hook was already installed.
     pub fn set_evict_writer(&self, writer: EvictWriteFn) -> Result<()> {
         self.evict_writer
             .set(writer)
@@ -364,17 +362,17 @@ impl BufferPool {
 
     /// Allocates a frame for a new page.
     ///
-    /// Tries to get a free frame first, then evicts if necessary.
-    /// A dirty victim is flushed to disk through the evict-writer hook before its
-    /// frame is reused. When no hook is installed the dirty victim is returned as
-    /// an EvictedPage for the caller to write.
+    /// Tries to get a free frame first, then evicts if necessary. A dirty
+    /// victim is written to disk through the evict-writer hook before its
+    /// frame is reused, and a pool with no hook does not take a dirty frame
+    /// at all.
     /// Returns a frame owned exclusively by this caller, already pinned once.
     ///
     /// Both paths hand back a claimed frame so the caller never has to
     /// re-acquire it: a free-list frame is pinned here, and an evicted one is
     /// claimed inside the sweep. Handing back an unpinned frame left a window
     /// in which a second sweep could take it.
-    fn allocate_frame(&self) -> Result<(FrameId, Option<EvictedPage>)> {
+    fn allocate_frame(&self) -> Result<FrameId> {
         // Try free list first (lock-free pop). The pop owns the frame id,
         // but an eviction sweep may hold a transient claim on the frame
         // while discovering it has no tenant, so ownership is taken with
@@ -388,7 +386,7 @@ impl BufferPool {
             while !frame.try_claim() {
                 retry_pause(&mut round);
             }
-            return Ok((frame_id, None));
+            return Ok(frame_id);
         }
 
         // Claim the victim in the same step that finds it unpinned, so a
@@ -396,7 +394,13 @@ impl BufferPool {
         // is Acquire on success, so a concurrent pin (also Acquire) orders
         // before this decision and a page a thread is pinning is never taken.
         // A frame with no page belongs to the free list, claiming it here
-        // would give it two owners, so it is skipped
+        // would give it two owners, so it is skipped.
+        //
+        // A dirty page leaves the pool only by being written, and only the
+        // hook can write it. Taking one without a hook would drop its mapping
+        // while its bytes were still nowhere but memory, and the next reader
+        // to fault the page in would install the stale disk image over them
+        let write_through = self.evict_writer.get();
         let victim_id = self.replacer.evict(|fid| {
             let frame = &self.frames[fid.0 as usize];
             if !frame.try_claim() {
@@ -406,44 +410,48 @@ impl BufferPool {
                 frame.unclaim();
                 return false;
             }
+            if write_through.is_none() && frame.is_dirty() {
+                frame.unclaim();
+                return false;
+            }
             true
         });
 
         if let Some(victim_id) = victim_id {
             let frame = &self.frames[victim_id.0 as usize];
 
-            // Flush a dirty victim before reusing its frame. With a write hook
-            // installed the page is written to disk here so the write is never
-            // lost. Without a hook the dirty page is returned to the caller.
-            let mut evicted = None;
-            if frame.is_dirty() {
-                if let Some(page_id) = frame.page_id() {
-                    let mut data = Box::new([0u8; PAGE_SIZE]);
-                    let dirty_lsn = frame.dirty_lsn();
-                    let data_guard = frame.read_data();
-                    data.copy_from_slice(&**data_guard);
-                    drop(data_guard);
+            // Write a dirty victim before reusing its frame, and before its
+            // mapping comes down, so the page is on disk for whoever faults
+            // it back in. The sweep above never offers a dirty frame without
+            // a hook, so a missing one here is a broken invariant rather than
+            // a page to hand away
+            if frame.is_dirty()
+                && let Some(page_id) = frame.page_id()
+            {
+                let mut data = Box::new([0u8; PAGE_SIZE]);
+                let dirty_lsn = frame.dirty_lsn();
+                let data_guard = frame.read_data();
+                data.copy_from_slice(&**data_guard);
+                drop(data_guard);
 
-                    match self.evict_writer.get() {
-                        Some(write) => {
-                            // Write through the hook. On failure the frame is
-                            // released back to the pool, dirty and in the page
-                            // table, and the error surfaces so the dirty page
-                            // is not silently lost. Leaving it claimed would
-                            // hang every later reader of that page on a claim
-                            // that nothing will ever drop
-                            if let Err(e) = write(page_id, &mut data, dirty_lsn) {
-                                frame.unclaim();
-                                self.replacer.record_access(victim_id);
-                                return Err(e);
-                            }
-                            frame.set_dirty(false);
-                        }
-                        None => {
-                            evicted = Some(EvictedPage { page_id, data });
-                        }
-                    }
+                let Some(write) = write_through else {
+                    frame.unclaim();
+                    self.replacer.record_access(victim_id);
+                    return Err(ZyronError::Internal(
+                        "a dirty frame was taken as a victim with no write hook".to_string(),
+                    ));
+                };
+                // On failure the frame is released back to the pool, dirty
+                // and in the page table, and the error surfaces so the dirty
+                // page is not silently lost. Leaving it claimed would hang
+                // every later reader of that page on a claim that nothing
+                // will ever drop
+                if let Err(e) = write(page_id, &mut data, dirty_lsn) {
+                    frame.unclaim();
+                    self.replacer.record_access(victim_id);
+                    return Err(e);
                 }
+                frame.set_dirty(false);
             }
 
             // Remove old page from page table
@@ -451,7 +459,7 @@ impl BufferPool {
                 self.page_table.remove(old_page_id);
             }
 
-            return Ok((victim_id, evicted));
+            return Ok(victim_id);
         }
 
         Err(ZyronError::BufferPoolFull)
@@ -462,22 +470,18 @@ impl BufferPool {
     /// If the page already exists, returns the existing frame.
     /// The page is pinned before being returned.
     ///
-    /// Returns (frame, evicted) where evicted contains any dirty page that was
-    /// evicted to make room. Caller must write evicted pages to disk.
+    /// A dirty page displaced to make room is written by the pool itself, so
+    /// the caller has nothing to flush.
     #[inline]
-    pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, Option<EvictedPage>)> {
-        self.new_page_inner(page_id, None)
-            .map(|(frame, evicted, _)| (frame, evicted))
+    pub fn new_page(&self, page_id: PageId) -> Result<&BufferFrame> {
+        self.new_page_inner(page_id, None).map(|(frame, _)| frame)
     }
 
     /// Like `new_page` but reports whether this call installed the frame.
     /// A caller that initializes a page in place must do so only on a fresh
     /// install, because an existing frame already holds live content.
     #[inline]
-    pub fn new_page_reporting_fresh(
-        &self,
-        page_id: PageId,
-    ) -> Result<(&BufferFrame, Option<EvictedPage>, bool)> {
+    pub fn new_page_reporting_fresh(&self, page_id: PageId) -> Result<(&BufferFrame, bool)> {
         self.new_page_inner(page_id, None)
     }
 
@@ -487,17 +491,7 @@ impl BufferPool {
     /// only on a fresh install, and before the mapping publishes: once the
     /// page table names this frame a concurrent fetch may pin it, and it
     /// must never observe the zeroed frame a later copy would fill
-    fn new_page_inner(
-        &self,
-        page_id: PageId,
-        init: Option<&[u8]>,
-    ) -> Result<(&BufferFrame, Option<EvictedPage>, bool)> {
-        // A retry after a lost install race carries any dirty page an
-        // earlier allocation evicted, the caller still has to write it.
-        // After the lost frame returns to the free list the retry's
-        // allocation takes the free path, so a second eviction cannot pile
-        // a second dirty page on top of this one
-        let mut carried: Option<EvictedPage> = None;
+    fn new_page_inner(&self, page_id: PageId, init: Option<&[u8]>) -> Result<(&BufferFrame, bool)> {
         let mut round: u32 = 0;
         loop {
             // Check if page already exists
@@ -512,7 +506,7 @@ impl BufferPool {
                 }
                 if frame.page_id() == Some(page_id) {
                     self.replacer.record_access(frame_id);
-                    return Ok((frame, carried, false));
+                    return Ok((frame, false));
                 }
                 frame.unpin();
                 retry_pause(&mut round);
@@ -522,15 +516,7 @@ impl BufferPool {
             }
 
             // Allocate a frame
-            let (frame_id, evicted) = self.allocate_frame()?;
-            if let Some(e) = evicted {
-                if carried.is_some() {
-                    return Err(ZyronError::Internal(
-                        "a page install evicted two dirty pages, one would be lost".to_string(),
-                    ));
-                }
-                carried = Some(e);
-            }
+            let frame_id = self.allocate_frame()?;
 
             // Set up the frame. allocate_frame hands it back claimed or
             // pinned, and that ownership is what keeps a concurrent
@@ -551,7 +537,7 @@ impl BufferPool {
             // same id can race here, insert_if_absent resolves both to a
             // single winner.
             match self.page_table.insert_if_absent(page_id, frame_id) {
-                InsertOutcome::Inserted => return Ok((frame, carried, true)),
+                InsertOutcome::Inserted => return Ok((frame, true)),
                 InsertOutcome::Existing(winner_id) => {
                     // Another caller already installed a frame for this id.
                     // The identity clears before the unpin, so an eviction
@@ -565,7 +551,7 @@ impl BufferPool {
                     if winner.try_pin() {
                         if winner.page_id() == Some(page_id) {
                             self.replacer.record_access(winner_id);
-                            return Ok((winner, carried, false));
+                            return Ok((winner, false));
                         }
                         winner.unpin();
                     }
@@ -588,22 +574,18 @@ impl BufferPool {
 
     /// Loads page data into the buffer pool.
     ///
-    /// This is used when reading a page from disk.
-    /// Returns the frame and any evicted dirty page that must be flushed.
+    /// This is used when reading a page from disk. A dirty page displaced to
+    /// make room is written by the pool itself.
     #[inline]
-    pub fn load_page(
-        &self,
-        page_id: PageId,
-        data: &[u8],
-    ) -> Result<(&BufferFrame, Option<EvictedPage>)> {
+    pub fn load_page(&self, page_id: PageId, data: &[u8]) -> Result<&BufferFrame> {
         // Only a freshly installed frame takes the caller's bytes, and it
         // takes them before its mapping publishes. A frame that already
         // held the page, whether found directly or through a lost install
         // race, holds content as new or newer than the disk image, and
         // copying the stale bytes over it would erase committed writes and
         // later flush them durably
-        let (frame, evicted, _fresh) = self.new_page_inner(page_id, Some(data))?;
-        Ok((frame, evicted))
+        let (frame, _fresh) = self.new_page_inner(page_id, Some(data))?;
+        Ok(frame)
     }
 
     /// Unpins a page in the buffer pool.
@@ -880,24 +862,13 @@ impl BufferPool {
 
     /// Allocates frames for multiple new pages in batch.
     ///
-    /// Returns frames and any evicted dirty pages that need flushing.
     /// Single pass through allocation - reduces lock contention.
-    pub fn batch_new_pages(
-        &self,
-        page_ids: &[PageId],
-    ) -> Result<(Vec<&BufferFrame>, Vec<EvictedPage>)> {
+    pub fn batch_new_pages(&self, page_ids: &[PageId]) -> Result<Vec<&BufferFrame>> {
         let mut frames = Vec::with_capacity(page_ids.len());
-        let mut evicted = Vec::new();
-
         for &page_id in page_ids {
-            let (frame, ev) = self.new_page(page_id)?;
-            frames.push(frame);
-            if let Some(e) = ev {
-                evicted.push(e);
-            }
+            frames.push(self.new_page(page_id)?);
         }
-
-        Ok((frames, evicted))
+        Ok(frames)
     }
 
     /// Pre-allocates frame IDs from the free list in bulk.
@@ -1192,7 +1163,7 @@ impl BufferPool {
                 continue;
             };
             match self.load_page(*page_id, &bytes) {
-                Ok((frame, _evicted)) => {
+                Ok(frame) => {
                     // Loading pins the frame. A prefetched page has no reader
                     // yet, so the pin is released immediately and the page is
                     // evictable from the moment it lands
@@ -1347,7 +1318,7 @@ mod tests {
     fn test_dirty_without_lsn_blocks_checkpoint_and_reaches_the_flusher() {
         let pool = create_test_pool(4);
         let pid = PageId::new(0, 3);
-        let (_frame, _) = pool.new_page(pid).expect("new page");
+        pool.new_page(pid).expect("new page");
         pool.unpin_page(pid, true);
 
         assert!(
@@ -1369,7 +1340,7 @@ mod tests {
     fn test_flush_dirty_frame_keeps_a_write_that_lands_during_the_flush() {
         let pool = create_test_pool(4);
         let pid = PageId::new(0, 5);
-        let (_frame, _) = pool.new_page(pid).expect("new page");
+        pool.new_page(pid).expect("new page");
         pool.unpin_page(pid, true);
         pool.mark_dirty_with_lsn(pid, 40);
 
@@ -1402,7 +1373,7 @@ mod tests {
     fn test_flush_all_keeps_a_write_that_lands_during_the_flush() {
         let pool = create_test_pool(4);
         let pid = PageId::new(0, 6);
-        let (_frame, _) = pool.new_page(pid).expect("new page");
+        pool.new_page(pid).expect("new page");
         pool.unpin_page(pid, true);
         pool.mark_dirty_with_lsn(pid, 40);
 
@@ -1447,7 +1418,7 @@ mod tests {
                     for i in 0..40_000u64 {
                         let page_num = (i.wrapping_mul(2654435761).wrapping_add(t)) % pages;
                         let pid = PageId::new(0, page_num);
-                        if let Ok((_, _)) = pool.load_page(pid, &marker_page(page_num)) {
+                        if pool.load_page(pid, &marker_page(page_num)).is_ok() {
                             pool.unpin_page(pid, false);
                         }
                     }
@@ -1548,9 +1519,8 @@ mod tests {
         let pool = create_test_pool(10);
         let page_id = PageId::new(0, 1);
 
-        let (frame, evicted) = pool.new_page(page_id).unwrap();
+        let frame = pool.new_page(page_id).unwrap();
 
-        assert!(evicted.is_none());
         assert_eq!(frame.page_id(), Some(page_id));
         assert!(frame.is_pinned());
         assert_eq!(pool.free_count(), 9);
@@ -1584,7 +1554,7 @@ mod tests {
         let pool = create_test_pool(10);
         let page_id = PageId::new(0, 1);
 
-        let (frame, _) = pool.new_page(page_id).unwrap();
+        let frame = pool.new_page(page_id).unwrap();
         assert!(frame.is_pinned());
 
         pool.unpin_page(page_id, false);
@@ -1619,31 +1589,37 @@ mod tests {
 
         // Add one more page, should evict
         let new_page_id = PageId::new(0, 99);
-        let (_, evicted) = pool.new_page(new_page_id).unwrap();
+        pool.new_page(new_page_id).unwrap();
 
-        assert!(evicted.is_none()); // Evicted page was clean
         assert_eq!(pool.page_count(), 3);
         assert!(pool.contains(new_page_id));
     }
 
     #[test]
     fn test_buffer_pool_eviction_dirty() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
         let pool = create_test_pool(1);
-        let page_id1 = PageId::new(0, 1);
+        let written: Arc<Mutex<Vec<(PageId, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&written);
+        pool.set_evict_writer(Arc::new(move |pid, data: &mut [u8; PAGE_SIZE], _lsn| {
+            sink.lock().unwrap().push((pid, data[0]));
+            Ok(())
+        }))
+        .unwrap();
 
         // Add dirty page with some data
-        let (frame, _) = pool.new_page(page_id1).unwrap();
+        let page_id1 = PageId::new(0, 1);
+        let frame = pool.new_page(page_id1).unwrap();
         frame.write_data()[0] = 0xAB;
         pool.unpin_page(page_id1, true);
 
-        // Add another page, should evict dirty page
+        // Add another page, which evicts the dirty one through the hook
         let page_id2 = PageId::new(0, 2);
-        let (_, evicted) = pool.new_page(page_id2).unwrap();
+        pool.new_page(page_id2).unwrap();
 
-        // Verify evicted page info is captured
-        let evicted = evicted.expect("dirty page should be returned on eviction");
-        assert_eq!(evicted.page_id, page_id1);
-        assert_eq!(evicted.data[0], 0xAB);
+        assert_eq!(written.lock().unwrap().as_slice(), &[(page_id1, 0xAB)]);
     }
 
     #[test]
@@ -1691,7 +1667,7 @@ mod tests {
         let page_id = PageId::new(0, 1);
         let data = [0xABu8; PAGE_SIZE];
 
-        let (frame, _) = pool.load_page(page_id, &data).unwrap();
+        let frame = pool.load_page(page_id, &data).unwrap();
 
         let frame_data = frame.read_data();
         assert_eq!(frame_data[0], 0xAB);
@@ -1855,9 +1831,8 @@ mod tests {
         pool.unpin_page(page_id, false);
 
         // Adding same page again should return existing frame
-        let (frame, evicted) = pool.new_page(page_id).unwrap();
+        let frame = pool.new_page(page_id).unwrap();
 
-        assert!(evicted.is_none()); // No eviction when page already exists
         assert_eq!(frame.page_id(), Some(page_id));
         assert_eq!(pool.page_count(), 1);
     }
@@ -1903,7 +1878,7 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     let page_id = PageId::new(4, round * 100 + t);
                     barrier.wait();
-                    let frame = pool.new_page(page_id).map(|(f, _)| f.frame_id());
+                    let frame = pool.new_page(page_id).map(|f| f.frame_id());
                     (page_id, frame.ok())
                 }));
             }
@@ -1956,7 +1931,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 handles.push(std::thread::spawn(move || {
                     barrier.wait();
-                    let (frame, _) = pool.new_page(page_id).unwrap();
+                    let frame = pool.new_page(page_id).unwrap();
                     let fid = frame.frame_id();
                     pool.unpin_page(page_id, false);
                     fid
@@ -2030,17 +2005,73 @@ mod tests {
 
         // Dirty the only frame
         let page_id1 = PageId::new(0, 1);
-        let (frame, _) = pool.new_page(page_id1).unwrap();
+        let frame = pool.new_page(page_id1).unwrap();
         frame.write_data()[0] = 0xCD;
         pool.unpin_page(page_id1, true);
 
-        // Force eviction. The hook writes the victim, so no EvictedPage is returned.
+        // Force eviction, which writes the victim through the hook
         let page_id2 = PageId::new(0, 2);
-        let (_, evicted) = pool.new_page(page_id2).unwrap();
-        assert!(evicted.is_none());
+        pool.new_page(page_id2).unwrap();
 
         let log = written.lock().unwrap();
         assert_eq!(log.as_slice(), &[(page_id1, 0xCD)]);
+    }
+
+    /// A pool with no write hook refuses the eviction rather than taking a
+    /// dirty page it cannot write.
+    ///
+    /// Eviction used to copy a dirty victim's bytes out for the caller to
+    /// write and take its page table mapping down straight away. Between
+    /// that and the caller's write the page was absent from the pool and
+    /// stale on disk, so a reader faulting it back in installed the stale
+    /// image and every write still only in those bytes was gone. There is
+    /// nowhere to put a dirty page without a hook, so the frame is not taken
+    /// and the pool reports itself full instead.
+    #[test]
+    fn a_pool_with_no_write_hook_refuses_to_evict_a_dirty_page() {
+        let pool = create_test_pool(2);
+
+        let resident = [PageId::new(0, 1), PageId::new(0, 2)];
+        for (i, page_id) in resident.iter().enumerate() {
+            let frame = pool.new_page(*page_id).unwrap();
+            frame.write_data()[0] = 0xA0 + i as u8;
+            pool.unpin_page(*page_id, true);
+        }
+
+        // Both frames hold a dirty page and nothing can write one out
+        let err = pool
+            .new_page(PageId::new(0, 3))
+            .expect_err("a dirty page was evicted with nowhere to write it");
+        assert!(
+            matches!(err, ZyronError::BufferPoolFull),
+            "unexpected error: {err:?}"
+        );
+
+        // Both pages are still where they were, with what they held
+        for (i, page_id) in resident.iter().enumerate() {
+            let frame = pool
+                .fetch_page(*page_id)
+                .expect("a refused eviction left a page out of the pool");
+            assert_eq!(frame.read_data()[0], 0xA0 + i as u8);
+            assert!(frame.is_dirty(), "the page was quietly marked written");
+            pool.unpin_page(*page_id, false);
+        }
+    }
+
+    /// A clean page is still evictable without a hook, because there is
+    /// nothing to write.
+    #[test]
+    fn a_pool_with_no_write_hook_still_evicts_a_clean_page() {
+        let pool = create_test_pool(1);
+
+        let page_id1 = PageId::new(0, 1);
+        pool.new_page(page_id1).unwrap();
+        pool.unpin_page(page_id1, false);
+
+        let page_id2 = PageId::new(0, 2);
+        pool.new_page(page_id2).expect("a clean frame is reusable");
+        pool.unpin_page(page_id2, false);
+        assert!(pool.fetch_page(page_id1).is_none());
     }
 
     #[test]

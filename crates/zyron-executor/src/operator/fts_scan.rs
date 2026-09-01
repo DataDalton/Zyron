@@ -14,7 +14,7 @@ use zyron_common::ZyronError;
 use zyron_parser::ast::LiteralValue;
 use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
-use zyron_search::{Bm25Scorer, FtsQueryParser, SimpleAnalyzer};
+use zyron_search::{Bm25Scorer, FtsQueryParser, PhoneticAlgorithm};
 use zyron_storage::HeapPage;
 
 use crate::batch::{
@@ -67,11 +67,27 @@ impl FulltextScanOperator {
         // The last argument is the query string literal.
         let query_str = extract_query_string(&match_expr)?;
 
-        // Parse and execute the FTS query
-        let fts_query = FtsQueryParser::parse(&query_str)?;
-        let analyzer = SimpleAnalyzer;
+        // Parse and execute the FTS query through the index's own analyzer
+        // so query terms transform exactly like indexed terms did
+        let analyzer = ctx.fts_analyzer(index_id.0);
         let scorer = Bm25Scorer::default();
-        let results = fts_index.search(&fts_query, &analyzer, &scorer, 10000)?;
+        let phonetic_mode = matches!(
+            &match_expr,
+            BoundExpr::Function { name, .. } if name == "match_against_phonetic"
+        );
+        let results = if phonetic_mode && !ctx.fts_phonetic_indexed(index_id.0) {
+            // The index stores literal terms, so match by encoding both the
+            // query terms and the term dictionary at search time
+            fts_index.search_phonetic(
+                &query_str,
+                analyzer.as_ref(),
+                PhoneticAlgorithm::Metaphone,
+                10000,
+            )?
+        } else {
+            let fts_query = FtsQueryParser::parse(&query_str)?;
+            fts_index.search(&fts_query, analyzer.as_ref(), &scorer, 10000)?
+        };
 
         let _table_entry = ctx.get_table_entry(table_id)?;
 

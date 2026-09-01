@@ -565,6 +565,34 @@ impl<'a> Parser<'a> {
                 let column = self.parse_ident()?;
                 let prefix = if self.at_token(&Token::LParen) {
                     self.parse_function_call(format!("{saved_name}.{column}"))?
+                } else if self.at_token(&Token::Dot) {
+                    // Three or more dotted parts: schema.fn(...) stays a
+                    // function call, otherwise the trailing parts read as
+                    // nested field access into a variant or struct value
+                    self.advance()?;
+                    let third = self.parse_ident()?;
+                    if self.at_token(&Token::LParen) {
+                        self.parse_function_call(format!("{saved_name}.{column}.{third}"))?
+                    } else {
+                        let mut chained = Expr::JsonAccess {
+                            left: Box::new(Expr::QualifiedIdentifier {
+                                table: saved_name,
+                                column,
+                            }),
+                            op: JsonOperator::Dot,
+                            right: Box::new(Expr::Literal(LiteralValue::String(third))),
+                        };
+                        while self.at_token(&Token::Dot) {
+                            self.advance()?;
+                            let part = self.parse_ident()?;
+                            chained = Expr::JsonAccess {
+                                left: Box::new(chained),
+                                op: JsonOperator::Dot,
+                                right: Box::new(Expr::Literal(LiteralValue::String(part))),
+                            };
+                        }
+                        chained
+                    }
                 } else {
                     Expr::QualifiedIdentifier {
                         table: saved_name,
@@ -1142,8 +1170,15 @@ impl<'a> Parser<'a> {
             }
             Token::Keyword(Keyword::Streaming) => self.parse_create_streaming_job(),
             Token::Keyword(Keyword::Abac) => self.parse_create_abac_policy(),
+            Token::Keyword(Keyword::Analyzer) => self.parse_create_analyzer(),
+            Token::Keyword(Keyword::Synonym) => self.parse_create_synonym_dictionary(),
+            Token::Keyword(Keyword::Hybrid) => self.parse_create_hybrid_index(),
+            Token::Keyword(Keyword::Bulkhead) => self.parse_create_bulkhead(),
+            Token::Keyword(Keyword::Retry) => self.parse_create_retry_policy(),
+            Token::Keyword(Keyword::Type) => self.parse_create_type(),
+            Token::Keyword(Keyword::Collation) => self.parse_create_collation(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, ENDPOINT, STREAMING, ABAC, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, HYBRID, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, ENDPOINT, STREAMING, ABAC, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, EVENT, ANALYZER, SYNONYM, BULKHEAD, RETRY, TYPE, or COLLATION after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1402,8 +1437,14 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Event) => self.parse_drop_event_handler(),
             Token::Keyword(Keyword::Endpoint) => self.parse_drop_endpoint(),
             Token::Keyword(Keyword::Security) => self.parse_drop_security_map(),
+            Token::Keyword(Keyword::Analyzer) => self.parse_drop_analyzer(),
+            Token::Keyword(Keyword::Synonym) => self.parse_drop_synonym_dictionary(),
+            Token::Keyword(Keyword::Bulkhead) => self.parse_drop_bulkhead(),
+            Token::Keyword(Keyword::Retry) => self.parse_drop_retry_policy(),
+            Token::Keyword(Keyword::Type) => self.parse_drop_type(),
+            Token::Keyword(Keyword::Collation) => self.parse_drop_collation(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, ENDPOINT, SECURITY, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, ENDPOINT, SECURITY, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, EVENT, ANALYZER, SYNONYM, BULKHEAD, RETRY, TYPE, or COLLATION after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -1465,8 +1506,10 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::External) => self.parse_alter_external(),
             Token::Keyword(Keyword::Endpoint) => self.parse_alter_endpoint(),
             Token::Keyword(Keyword::Security) => self.parse_alter_security_map(),
+            Token::Keyword(Keyword::Analyzer) => self.parse_alter_analyzer(),
+            Token::Keyword(Keyword::Synonym) => self.parse_alter_synonym_dictionary(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, CLUSTER, STREAMING, ENDPOINT, SECURITY, or PUBLICATION after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, CLUSTER, STREAMING, ENDPOINT, SECURITY, PUBLICATION, ANALYZER, or SYNONYM after ALTER, found {}",
                 self.current.token
             ))),
         }
@@ -2077,6 +2120,33 @@ impl<'a> Parser<'a> {
         let mut nullable = None;
         let mut default = None;
         let mut constraints = Vec::new();
+        let mut generated = None;
+        let mut encrypted = None;
+        let mut collation = None;
+        let mut media_format = None;
+        let mut media_storage = None;
+
+        // Media columns take FORMAT and STORAGE hints right after the type
+        if matches!(
+            data_type,
+            DataType::Image
+                | DataType::Video
+                | DataType::Audio
+                | DataType::Document
+                | DataType::ExternalRef
+        ) {
+            loop {
+                if self.at_keyword(Keyword::Format) {
+                    self.advance()?;
+                    media_format = Some(self.parse_string_literal()?);
+                } else if self.at_keyword(Keyword::Storage) {
+                    self.advance()?;
+                    media_storage = Some(self.parse_string_literal()?);
+                } else {
+                    break;
+                }
+            }
+        }
 
         // Parse inline column constraints
         loop {
@@ -2119,6 +2189,63 @@ impl<'a> Parser<'a> {
                     on_delete,
                     on_update,
                 });
+            } else if self.at_keyword(Keyword::Generated) {
+                self.advance()?;
+                self.expect_keyword(Keyword::Always)?;
+                self.expect_keyword(Keyword::As)?;
+                self.expect_token(&Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect_token(&Token::RParen)?;
+                let stored = if self.consume_keyword(Keyword::Stored)? {
+                    true
+                } else {
+                    // VIRTUAL is the default when neither keyword is given
+                    let _ = self.consume_keyword(Keyword::Virtual)?;
+                    false
+                };
+                generated = Some(GeneratedColumn { expr, stored });
+            } else if self.at_keyword(Keyword::Encrypted) {
+                self.advance()?;
+                let mut algorithm = None;
+                let mut key_id = None;
+                if self.consume_keyword(Keyword::With)? {
+                    self.expect_token(&Token::LParen)?;
+                    let options = self.parse_comma_separated(|p| p.parse_table_option())?;
+                    self.expect_token(&Token::RParen)?;
+                    for opt in options {
+                        let value = match &opt.value {
+                            TableOptionValue::String(s) | TableOptionValue::Identifier(s) => {
+                                s.clone()
+                            }
+                            other => {
+                                return Err(self.error(&format!(
+                                    "ENCRYPTED option {} must be a string, got {other:?}",
+                                    opt.key
+                                )));
+                            }
+                        };
+                        match opt.key.to_lowercase().as_str() {
+                            "algorithm" => algorithm = Some(value),
+                            "key_id" => key_id = Some(value),
+                            other => {
+                                return Err(self.error(&format!(
+                                    "unknown ENCRYPTED option {other}, expected algorithm or key_id"
+                                )));
+                            }
+                        }
+                    }
+                }
+                encrypted = Some(EncryptedColumn { algorithm, key_id });
+            } else if self.at_keyword(Keyword::Collate) {
+                self.advance()?;
+                collation = Some(match &self.current.token {
+                    Token::String(s) => {
+                        let v = s.clone();
+                        self.advance()?;
+                        v
+                    }
+                    _ => self.parse_ident()?,
+                });
             } else {
                 break;
             }
@@ -2130,6 +2257,12 @@ impl<'a> Parser<'a> {
             nullable,
             default,
             constraints,
+            generated,
+            encrypted,
+            collation,
+            media_format,
+            media_storage,
+            user_type_id: None,
         })
     }
 
@@ -2145,18 +2278,20 @@ impl<'a> Parser<'a> {
         // Set by the foreign key branch, the only kind that takes an
         // ON VIOLATION clause today
         let mut fk_violation = ViolationAction::Fail;
+        // Set by a PRIMARY KEY or UNIQUE list whose last column declared
+        // WITHOUT OVERLAPS, and by a FOREIGN KEY ending in PERIOD
+        let mut without_overlaps = None;
+        let mut fk_period = false;
         let kind = if self.at_keyword(Keyword::Primary) {
             self.advance()?;
             self.expect_keyword(Keyword::Key)?;
-            self.expect_token(&Token::LParen)?;
-            let columns = self.parse_comma_separated(|p| p.parse_ident())?;
-            self.expect_token(&Token::RParen)?;
+            let (columns, overlaps) = self.parse_key_columns_with_overlaps()?;
+            without_overlaps = overlaps;
             TableConstraintKind::PrimaryKey(columns)
         } else if self.at_keyword(Keyword::Unique) {
             self.advance()?;
-            self.expect_token(&Token::LParen)?;
-            let columns = self.parse_comma_separated(|p| p.parse_ident())?;
-            self.expect_token(&Token::RParen)?;
+            let (columns, overlaps) = self.parse_key_columns_with_overlaps()?;
+            without_overlaps = overlaps;
             TableConstraintKind::Unique(columns)
         } else if self.at_keyword(Keyword::Check) {
             self.advance()?;
@@ -2175,6 +2310,11 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::LParen)?;
             let ref_columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
+            // Trailing PERIOD marks the last column pair as matched by
+            // period containment rather than equality
+            if self.consume_keyword(Keyword::Period)? {
+                fk_period = true;
+            }
             let (on_delete, on_update, violation) = self.parse_referential_actions()?;
             fk_violation = violation;
             TableConstraintKind::ForeignKey {
@@ -2208,7 +2348,41 @@ impl<'a> Parser<'a> {
             kind,
             enforced,
             on_violation: fk_violation,
+            without_overlaps,
+            fk_period,
         })
+    }
+
+    /// Parses a parenthesized key column list where the last column may
+    /// declare WITHOUT OVERLAPS, marking it as the temporal period of the
+    /// constraint
+    fn parse_key_columns_with_overlaps(&mut self) -> Result<(Vec<String>, Option<String>)> {
+        self.expect_token(&Token::LParen)?;
+        let mut columns = Vec::new();
+        let mut without_overlaps = None;
+        loop {
+            let column = self.parse_ident()?;
+            if self.consume_keyword(Keyword::Without)? {
+                self.expect_keyword(Keyword::Overlaps)?;
+                if without_overlaps.is_some() {
+                    return Err(
+                        self.error("a constraint declares WITHOUT OVERLAPS on one column only")
+                    );
+                }
+                without_overlaps = Some(column.clone());
+            }
+            columns.push(column);
+            if !self.consume_token(&Token::Comma)? {
+                break;
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        if let Some(overlaps_col) = &without_overlaps
+            && columns.last() != Some(overlaps_col)
+        {
+            return Err(self.error("WITHOUT OVERLAPS goes on the last key column"));
+        }
+        Ok((columns, without_overlaps))
     }
 
     /// Parses optional ON DELETE and ON UPDATE referential action clauses in
@@ -2292,6 +2466,65 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Boolean) => {
                 self.advance()?;
                 Ok(DataType::Boolean)
+            }
+            Token::Keyword(Keyword::Variant) => {
+                self.advance()?;
+                Ok(DataType::Variant)
+            }
+            Token::Keyword(Keyword::Daterange) => {
+                self.advance()?;
+                Ok(DataType::Range(Box::new(DataType::Date)))
+            }
+            Token::Keyword(Keyword::Tstzrange) => {
+                self.advance()?;
+                Ok(DataType::Range(Box::new(DataType::TimestampTz(None))))
+            }
+            Token::Keyword(Keyword::Ltree) => {
+                self.advance()?;
+                Ok(DataType::Ltree)
+            }
+            Token::Keyword(Keyword::Image) => {
+                self.advance()?;
+                Ok(DataType::Image)
+            }
+            Token::Keyword(Keyword::Video) => {
+                self.advance()?;
+                Ok(DataType::Video)
+            }
+            Token::Keyword(Keyword::Audio) => {
+                self.advance()?;
+                Ok(DataType::Audio)
+            }
+            Token::Keyword(Keyword::Document) => {
+                self.advance()?;
+                Ok(DataType::Document)
+            }
+            Token::Keyword(Keyword::ExternalRef) => {
+                self.advance()?;
+                Ok(DataType::ExternalRef)
+            }
+            Token::Keyword(Keyword::Struct) => {
+                self.advance()?;
+                self.expect_token(&Token::Lt)?;
+                let fields = self.parse_comma_separated(|p| {
+                    let name = p.parse_ident()?;
+                    let field_type = p.parse_data_type()?;
+                    Ok((name, field_type))
+                })?;
+                self.expect_token(&Token::Gt)?;
+                if fields.is_empty() {
+                    return Err(self.error("STRUCT declares at least one field"));
+                }
+                Ok(DataType::Struct(fields))
+            }
+            Token::Keyword(Keyword::Map) => {
+                self.advance()?;
+                self.expect_token(&Token::Lt)?;
+                let key_type = self.parse_data_type()?;
+                self.expect_token(&Token::Comma)?;
+                let value_type = self.parse_data_type()?;
+                self.expect_token(&Token::Gt)?;
+                Ok(DataType::Map(Box::new(key_type), Box::new(value_type)))
             }
             Token::Keyword(Keyword::Smallint) => {
                 self.advance()?;
@@ -2509,6 +2742,12 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(DataType::Quantity)
             }
+            // A bare identifier in type position names a user defined type,
+            // resolved against the catalog by the statement handler
+            Token::Ident(_) => {
+                let name = self.parse_qualified_name()?;
+                Ok(DataType::UserDefined(name))
+            }
             _ => Err(self.error(&format!("Expected data type, found {}", self.current.token))),
         }
     }
@@ -2675,6 +2914,25 @@ impl<'a> Parser<'a> {
     /// leading tokens themselves before recognizing an expression.
     fn parse_expr_continuation(&mut self, mut lhs: Expr, min_bp: u8) -> Result<Expr> {
         loop {
+            // COLLATE binds tighter than any infix operator, so
+            // a = b COLLATE 'de_DE' collates the comparison operand
+            if self.at_keyword(Keyword::Collate) {
+                self.advance()?;
+                let collation = match &self.current.token {
+                    Token::String(s) => {
+                        let v = s.clone();
+                        self.advance()?;
+                        v
+                    }
+                    _ => self.parse_ident()?,
+                };
+                lhs = Expr::Collate {
+                    expr: Box::new(lhs),
+                    collation,
+                };
+                continue;
+            }
+
             // Check for postfix-like operators: IS [NOT] NULL, [NOT] IN, [NOT] BETWEEN, [NOT] LIKE
             let (new_lhs, matched) = self.try_parse_postfix(lhs, min_bp)?;
             lhs = new_lhs;
@@ -2980,12 +3238,40 @@ impl<'a> Parser<'a> {
         }
 
         // Check for qualified identifier: name.column, or a schema-qualified
-        // function call: schema.fn(...)
+        // function call: schema.fn(...) or catalog.schema.fn(...)
         if self.at_token(&Token::Dot) {
             self.advance()?;
             let column = self.parse_ident()?;
             if self.at_token(&Token::LParen) {
                 return self.parse_function_call(format!("{name}.{column}"));
+            }
+            if self.at_token(&Token::Dot) {
+                self.advance()?;
+                let third = self.parse_ident()?;
+                if self.at_token(&Token::LParen) {
+                    return self.parse_function_call(format!("{name}.{column}.{third}"));
+                }
+                // A bare chain of three or more parts reads as nested field
+                // access into a variant or struct value. The binder decides
+                // whether the leading parts name table.column or column.field
+                let mut expr = Expr::JsonAccess {
+                    left: Box::new(Expr::QualifiedIdentifier {
+                        table: name,
+                        column,
+                    }),
+                    op: JsonOperator::Dot,
+                    right: Box::new(Expr::Literal(LiteralValue::String(third))),
+                };
+                while self.at_token(&Token::Dot) {
+                    self.advance()?;
+                    let part = self.parse_ident()?;
+                    expr = Expr::JsonAccess {
+                        left: Box::new(expr),
+                        op: JsonOperator::Dot,
+                        right: Box::new(Expr::Literal(LiteralValue::String(part))),
+                    };
+                }
+                return Ok(expr);
             }
             return Ok(Expr::QualifiedIdentifier {
                 table: name,
@@ -5135,27 +5421,17 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 TableOptionValue::Boolean(false)
             }
-            Token::LBracket => {
-                // Parse string list: ['a', 'b', 'c']
+            Token::Float(n) => {
+                let v = TableOptionValue::Float(*n);
                 self.advance()?;
-                let mut items = vec![];
-                loop {
-                    if self.at_token(&Token::RBracket) {
-                        break;
-                    }
-                    if let Token::String(s) = &self.current.token {
-                        items.push(s.clone());
-                        self.advance()?;
-                    } else {
-                        return Err(self.error("Expected string in list"));
-                    }
-                    if !self.consume_token(&Token::Comma)? {
-                        break;
-                    }
-                }
-                self.expect_token(&Token::RBracket)?;
-                TableOptionValue::StringList(items)
+                v
             }
+            Token::Keyword(Keyword::Array) => {
+                // ARRAY['a', 'b'] form of a string list
+                self.advance()?;
+                TableOptionValue::StringList(self.parse_bracketed_string_list()?)
+            }
+            Token::LBracket => TableOptionValue::StringList(self.parse_bracketed_string_list()?),
             _ => {
                 // Try as identifier
                 let ident = self.parse_ident()?;
@@ -5163,6 +5439,330 @@ impl<'a> Parser<'a> {
             }
         };
         Ok(TableOption { key, value })
+    }
+
+    /// Parses a bracketed string list: ['a', 'b', 'c']
+    fn parse_bracketed_string_list(&mut self) -> Result<Vec<String>> {
+        self.expect_token(&Token::LBracket)?;
+        let mut items = vec![];
+        loop {
+            if self.at_token(&Token::RBracket) {
+                break;
+            }
+            if let Token::String(s) = &self.current.token {
+                items.push(s.clone());
+                self.advance()?;
+            } else {
+                return Err(self.error("Expected string in list"));
+            }
+            if !self.consume_token(&Token::Comma)? {
+                break;
+            }
+        }
+        self.expect_token(&Token::RBracket)?;
+        Ok(items)
+    }
+
+    // -----------------------------------------------------------------------
+    // Search surface DDL: analyzers, synonym dictionaries, hybrid indexes
+    // -----------------------------------------------------------------------
+
+    fn parse_if_not_exists_clause(&mut self) -> Result<bool> {
+        if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn parse_if_exists_clause(&mut self) -> Result<bool> {
+        if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn parse_create_analyzer(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Analyzer)?;
+        let if_not_exists = self.parse_if_not_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        self.expect_keyword(Keyword::As)?;
+        self.expect_token(&Token::LParen)?;
+        let options = self.parse_comma_separated(|p| p.parse_table_option())?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::CreateAnalyzer(Box::new(
+            CreateAnalyzerStatement {
+                name,
+                if_not_exists,
+                options,
+            },
+        )))
+    }
+
+    fn parse_alter_analyzer(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Analyzer)?;
+        let name = self.parse_qualified_name()?;
+        self.expect_keyword(Keyword::Set)?;
+        self.expect_token(&Token::LParen)?;
+        let options = self.parse_comma_separated(|p| p.parse_table_option())?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::AlterAnalyzer(Box::new(AlterAnalyzerStatement {
+            name,
+            options,
+        })))
+    }
+
+    fn parse_drop_analyzer(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Analyzer)?;
+        let if_exists = self.parse_if_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropAnalyzer(Box::new(DropAnalyzerStatement {
+            name,
+            if_exists,
+        })))
+    }
+
+    /// One synonym rule: ('car', 'automobile') or ('nyc' => 'new york city')
+    fn parse_synonym_rule(&mut self) -> Result<SynonymRule> {
+        self.expect_token(&Token::LParen)?;
+        let mut terms = vec![self.parse_string_literal()?];
+        if self.consume_token(&Token::FatArrow)? {
+            let mut targets = vec![self.parse_string_literal()?];
+            while self.consume_token(&Token::Comma)? {
+                targets.push(self.parse_string_literal()?);
+            }
+            self.expect_token(&Token::RParen)?;
+            return Ok(SynonymRule { terms, targets });
+        }
+        while self.consume_token(&Token::Comma)? {
+            terms.push(self.parse_string_literal()?);
+        }
+        self.expect_token(&Token::RParen)?;
+        Ok(SynonymRule {
+            terms,
+            targets: vec![],
+        })
+    }
+
+    fn parse_create_synonym_dictionary(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Synonym)?;
+        self.expect_keyword(Keyword::Dictionary)?;
+        let if_not_exists = self.parse_if_not_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        self.expect_token(&Token::LParen)?;
+        let rules = self.parse_comma_separated(|p| p.parse_synonym_rule())?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::CreateSynonymDictionary(Box::new(
+            CreateSynonymDictionaryStatement {
+                name,
+                if_not_exists,
+                rules,
+            },
+        )))
+    }
+
+    fn parse_alter_synonym_dictionary(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Synonym)?;
+        self.expect_keyword(Keyword::Dictionary)?;
+        let name = self.parse_qualified_name()?;
+        let action = if self.consume_keyword(Keyword::Add)? {
+            AlterSynonymDictionaryAction::Add(
+                self.parse_comma_separated(|p| p.parse_synonym_rule())?,
+            )
+        } else if self.consume_keyword(Keyword::Drop)? {
+            let mut terms = vec![self.parse_string_literal()?];
+            while self.consume_token(&Token::Comma)? {
+                terms.push(self.parse_string_literal()?);
+            }
+            AlterSynonymDictionaryAction::Drop(terms)
+        } else {
+            return Err(self.error("Expected ADD or DROP after ALTER SYNONYM DICTIONARY name"));
+        };
+        Ok(Statement::AlterSynonymDictionary(Box::new(
+            AlterSynonymDictionaryStatement { name, action },
+        )))
+    }
+
+    fn parse_drop_synonym_dictionary(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Synonym)?;
+        self.expect_keyword(Keyword::Dictionary)?;
+        let if_exists = self.parse_if_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropSynonymDictionary(Box::new(
+            DropSynonymDictionaryStatement { name, if_exists },
+        )))
+    }
+
+    fn parse_create_hybrid_index(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Hybrid)?;
+        self.expect_keyword(Keyword::Index)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_qualified_name()?;
+        self.expect_token(&Token::LParen)?;
+        let text_column = self.parse_ident()?;
+        self.expect_token(&Token::Comma)?;
+        let vector_column = self.parse_ident()?;
+        self.expect_token(&Token::RParen)?;
+        let mut options = vec![];
+        if self.consume_keyword(Keyword::With)? {
+            self.expect_token(&Token::LParen)?;
+            options = self.parse_comma_separated(|p| p.parse_table_option())?;
+            self.expect_token(&Token::RParen)?;
+        }
+        Ok(Statement::CreateHybridIndex(Box::new(
+            CreateHybridIndexStatement {
+                name,
+                table,
+                text_column,
+                vector_column,
+                options,
+            },
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // Resilience DDL: bulkheads and retry policies
+    // -----------------------------------------------------------------------
+
+    fn parse_create_bulkhead(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Bulkhead)?;
+        let if_not_exists = self.parse_if_not_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        self.expect_token(&Token::LParen)?;
+        let options = self.parse_comma_separated(|p| p.parse_table_option())?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::CreateBulkhead(Box::new(
+            CreateBulkheadStatement {
+                name,
+                if_not_exists,
+                options,
+            },
+        )))
+    }
+
+    fn parse_drop_bulkhead(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Bulkhead)?;
+        let if_exists = self.parse_if_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropBulkhead(Box::new(DropBulkheadStatement {
+            name,
+            if_exists,
+        })))
+    }
+
+    fn parse_create_retry_policy(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Retry)?;
+        self.expect_keyword(Keyword::Policy)?;
+        let if_not_exists = self.parse_if_not_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        self.expect_token(&Token::LParen)?;
+        let options = self.parse_comma_separated(|p| p.parse_table_option())?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::CreateRetryPolicy(Box::new(
+            CreateRetryPolicyStatement {
+                name,
+                if_not_exists,
+                options,
+            },
+        )))
+    }
+
+    fn parse_drop_retry_policy(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Retry)?;
+        self.expect_keyword(Keyword::Policy)?;
+        let if_exists = self.parse_if_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropRetryPolicy(Box::new(
+            DropRetryPolicyStatement { name, if_exists },
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // User defined types and collations
+    // -----------------------------------------------------------------------
+
+    fn parse_create_type(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Type)?;
+        let if_not_exists = self.parse_if_not_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        self.expect_keyword(Keyword::As)?;
+        self.expect_token(&Token::LParen)?;
+        let mut storage = None;
+        let mut check_expr = None;
+        let mut input_cast_expr = None;
+        let mut output_cast_expr = None;
+        loop {
+            let key = self.parse_keyword_or_ident()?.to_lowercase();
+            self.expect_token(&Token::Eq)?;
+            match key.as_str() {
+                "storage" => storage = Some(self.parse_data_type()?),
+                "check" => check_expr = Some(self.parse_string_literal()?),
+                "input_cast" => input_cast_expr = Some(self.parse_string_literal()?),
+                "output_cast" => output_cast_expr = Some(self.parse_string_literal()?),
+                other => {
+                    return Err(self.error(&format!(
+                        "Unknown CREATE TYPE option {other}, expected storage, check, input_cast, or output_cast"
+                    )));
+                }
+            }
+            if !self.consume_token(&Token::Comma)? {
+                break;
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        let storage = match storage {
+            Some(s) => s,
+            None => return Err(self.error("CREATE TYPE requires a storage option")),
+        };
+        Ok(Statement::CreateType(Box::new(CreateTypeStatement {
+            name,
+            if_not_exists,
+            storage,
+            check_expr,
+            input_cast_expr,
+            output_cast_expr,
+        })))
+    }
+
+    fn parse_drop_type(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Type)?;
+        let if_exists = self.parse_if_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropType(Box::new(DropTypeStatement {
+            name,
+            if_exists,
+        })))
+    }
+
+    fn parse_create_collation(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Collation)?;
+        let if_not_exists = self.parse_if_not_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        self.expect_token(&Token::LParen)?;
+        let options = self.parse_comma_separated(|p| p.parse_table_option())?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::CreateCollation(Box::new(
+            CreateCollationStatement {
+                name,
+                if_not_exists,
+                options,
+            },
+        )))
+    }
+
+    fn parse_drop_collation(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Collation)?;
+        let if_exists = self.parse_if_exists_clause()?;
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropCollation(Box::new(DropCollationStatement {
+            name,
+            if_exists,
+        })))
     }
 
     // -----------------------------------------------------------------------
@@ -8948,6 +9548,30 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Connections => Some("connections"),
         Keyword::Protocol => Some("protocol"),
         Keyword::Zyron => Some("zyron"),
+        Keyword::Analyzer => Some("analyzer"),
+        Keyword::Synonym => Some("synonym"),
+        Keyword::Dictionary => Some("dictionary"),
+        Keyword::Hybrid => Some("hybrid"),
+        Keyword::Bulkhead => Some("bulkhead"),
+        Keyword::Retry => Some("retry"),
+        Keyword::Collation => Some("collation"),
+        Keyword::Generated => Some("generated"),
+        Keyword::Always => Some("always"),
+        Keyword::Virtual => Some("virtual"),
+        Keyword::Stored => Some("stored"),
+        Keyword::Encrypted => Some("encrypted"),
+        Keyword::Algorithm => Some("algorithm"),
+        Keyword::Overlaps => Some("overlaps"),
+        Keyword::Struct => Some("struct"),
+        Keyword::Ltree => Some("ltree"),
+        Keyword::Variant => Some("variant"),
+        Keyword::Image => Some("image"),
+        Keyword::Video => Some("video"),
+        Keyword::Audio => Some("audio"),
+        Keyword::Document => Some("document"),
+        Keyword::ExternalRef => Some("external_ref"),
+        Keyword::Daterange => Some("daterange"),
+        Keyword::Tstzrange => Some("tstzrange"),
         _ => None,
     }
 }
@@ -15026,5 +15650,271 @@ mod tests {
         // working
         let stmt = parse_one("SELECT remove FROM t");
         assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn test_create_analyzer_parses() {
+        let stmt = parse_one(
+            "CREATE ANALYZER my_analyzer AS (
+                TOKENIZER = 'ngram(3, 5)',
+                CHAR_FILTERS = ARRAY['html_strip', 'lowercase'],
+                TOKEN_FILTERS = ARRAY['stop', 'stem', 'phonetic:metaphone']
+            )",
+        );
+        let Statement::CreateAnalyzer(a) = stmt else {
+            panic!("expected CreateAnalyzer");
+        };
+        assert_eq!(a.name, "my_analyzer");
+        assert_eq!(a.options.len(), 3);
+        assert_eq!(
+            a.options[1].value,
+            TableOptionValue::StringList(vec!["html_strip".into(), "lowercase".into()])
+        );
+        assert!(matches!(
+            parse_one("DROP ANALYZER IF EXISTS my_analyzer"),
+            Statement::DropAnalyzer(_)
+        ));
+        assert!(matches!(
+            parse_one("ALTER ANALYZER my_analyzer SET (tokenizer = 'standard')"),
+            Statement::AlterAnalyzer(_)
+        ));
+    }
+
+    #[test]
+    fn test_create_synonym_dictionary_parses() {
+        let stmt = parse_one(
+            "CREATE SYNONYM DICTIONARY my_syns (
+                ('car', 'automobile', 'vehicle'),
+                ('nyc' => 'new york city'),
+                ('foo', 'bar')
+            )",
+        );
+        let Statement::CreateSynonymDictionary(d) = stmt else {
+            panic!("expected CreateSynonymDictionary");
+        };
+        assert_eq!(d.rules.len(), 3);
+        assert_eq!(d.rules[0].terms.len(), 3);
+        assert!(d.rules[0].targets.is_empty());
+        assert_eq!(d.rules[1].terms, vec!["nyc".to_string()]);
+        assert_eq!(d.rules[1].targets, vec!["new york city".to_string()]);
+        assert!(matches!(
+            parse_one("ALTER SYNONYM DICTIONARY my_syns ADD ('bike', 'bicycle')"),
+            Statement::AlterSynonymDictionary(_)
+        ));
+        assert!(matches!(
+            parse_one("ALTER SYNONYM DICTIONARY my_syns DROP 'car'"),
+            Statement::AlterSynonymDictionary(_)
+        ));
+        assert!(matches!(
+            parse_one("DROP SYNONYM DICTIONARY my_syns"),
+            Statement::DropSynonymDictionary(_)
+        ));
+    }
+
+    #[test]
+    fn test_create_hybrid_index_parses() {
+        let stmt = parse_one(
+            "CREATE HYBRID INDEX my_hybrid ON t (text_col, vector_col) WITH (
+                fulltext_analyzer = 'standard',
+                vector_distance = 'cosine',
+                fusion_method = 'rrf',
+                rrf_k = 60
+            )",
+        );
+        let Statement::CreateHybridIndex(h) = stmt else {
+            panic!("expected CreateHybridIndex");
+        };
+        assert_eq!(h.text_column, "text_col");
+        assert_eq!(h.vector_column, "vector_col");
+        assert_eq!(h.options.len(), 4);
+    }
+
+    #[test]
+    fn test_resilience_ddl_parses() {
+        let stmt = parse_one(
+            "CREATE BULKHEAD my_bh (max_concurrent = 10, max_wait = '5s', queue_size = 100)",
+        );
+        assert!(matches!(stmt, Statement::CreateBulkhead(_)));
+        let stmt = parse_one(
+            "CREATE RETRY POLICY my_rp (max_attempts = 3, backoff = 'exponential',
+             base_delay = '100ms', max_delay = '10s', jitter = 0.2,
+             retryable_errors = ARRAY['TransientError', 'DeadlockError'])",
+        );
+        let Statement::CreateRetryPolicy(rp) = stmt else {
+            panic!("expected CreateRetryPolicy");
+        };
+        assert!(
+            rp.options
+                .iter()
+                .any(|o| o.key == "jitter" && o.value == TableOptionValue::Float(0.2))
+        );
+        assert!(matches!(
+            parse_one("DROP BULKHEAD my_bh"),
+            Statement::DropBulkhead(_)
+        ));
+        assert!(matches!(
+            parse_one("DROP RETRY POLICY my_rp"),
+            Statement::DropRetryPolicy(_)
+        ));
+    }
+
+    #[test]
+    fn test_create_type_and_collation_parse() {
+        let stmt = parse_one(
+            "CREATE TYPE us_zipcode AS (
+                storage = TEXT,
+                check = 'length(value) >= 5',
+                input_cast = 'TRIM(value)',
+                output_cast = 'UPPER(value)'
+            )",
+        );
+        let Statement::CreateType(t) = stmt else {
+            panic!("expected CreateType");
+        };
+        assert_eq!(t.storage, DataType::Text);
+        assert!(t.check_expr.is_some());
+        assert!(matches!(
+            parse_one("DROP TYPE us_zipcode"),
+            Statement::DropType(_)
+        ));
+        let stmt = parse_one(
+            "CREATE COLLATION my_col (locale = 'de_DE', provider = 'icu',
+             deterministic = true, case_sensitive = false)",
+        );
+        assert!(matches!(stmt, Statement::CreateCollation(_)));
+        assert!(matches!(
+            parse_one("DROP COLLATION my_col"),
+            Statement::DropCollation(_)
+        ));
+    }
+
+    #[test]
+    fn test_new_data_types_parse() {
+        let stmt = parse_one(
+            "CREATE TABLE t (
+                v VARIANT,
+                s STRUCT<a INT, b TEXT>,
+                m MAP<TEXT, INT>,
+                p LTREE,
+                img IMAGE FORMAT 'jpeg' STORAGE 'external',
+                vid VIDEO,
+                aud AUDIO,
+                doc DOCUMENT,
+                ext EXTERNAL_REF STORAGE 's3://bucket/prefix/',
+                period DATERANGE,
+                tz TSTZRANGE
+            )",
+        );
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(ct.columns[0].data_type, DataType::Variant);
+        assert!(matches!(ct.columns[1].data_type, DataType::Struct(ref f) if f.len() == 2));
+        assert!(matches!(ct.columns[2].data_type, DataType::Map(_, _)));
+        assert_eq!(ct.columns[3].data_type, DataType::Ltree);
+        assert_eq!(ct.columns[4].data_type, DataType::Image);
+        assert_eq!(ct.columns[4].media_format.as_deref(), Some("jpeg"));
+        assert_eq!(ct.columns[4].media_storage.as_deref(), Some("external"));
+        assert_eq!(
+            ct.columns[8].media_storage.as_deref(),
+            Some("s3://bucket/prefix/")
+        );
+        assert!(
+            matches!(ct.columns[9].data_type, DataType::Range(ref inner) if **inner == DataType::Date)
+        );
+    }
+
+    #[test]
+    fn test_generated_encrypted_collate_columns_parse() {
+        let stmt = parse_one(
+            "CREATE TABLE people (
+                first_name TEXT,
+                last_name TEXT COLLATE 'de_DE',
+                full_name TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) VIRTUAL,
+                name_hash TEXT GENERATED ALWAYS AS (sha256(first_name)) STORED,
+                ssn VARCHAR(11) ENCRYPTED,
+                cc VARCHAR(20) ENCRYPTED WITH (algorithm = 'aes256_gcm', key_id = '7')
+            )",
+        );
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(ct.columns[1].collation.as_deref(), Some("de_DE"));
+        let generated = ct.columns[2].generated.as_ref().expect("virtual generated");
+        assert!(!generated.stored);
+        assert!(ct.columns[3].generated.as_ref().expect("stored").stored);
+        assert!(ct.columns[4].encrypted.is_some());
+        let enc = ct.columns[5].encrypted.as_ref().expect("encrypted with");
+        assert_eq!(enc.algorithm.as_deref(), Some("aes256_gcm"));
+        assert_eq!(enc.key_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn test_temporal_constraints_parse() {
+        let stmt = parse_one(
+            "CREATE TABLE booking (
+                room_id INT,
+                booking_period DATERANGE,
+                PRIMARY KEY (room_id, booking_period WITHOUT OVERLAPS)
+            )",
+        );
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(
+            ct.constraints[0].without_overlaps.as_deref(),
+            Some("booking_period")
+        );
+        let stmt = parse_one(
+            "CREATE TABLE child (
+                id INT,
+                period DATERANGE,
+                FOREIGN KEY (id, period) REFERENCES parent (id, period) PERIOD
+            )",
+        );
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert!(ct.constraints[0].fk_period);
+    }
+
+    #[test]
+    fn test_three_part_calls_and_dotted_access_parse() {
+        let stmt = parse_one("SELECT zyron_sys.security.masking_ip('192.168.1.100', 24)");
+        assert!(matches!(stmt, Statement::Select(_)));
+        let stmt = parse_one("SELECT v.address.city FROM t");
+        let Statement::Select(sel) = stmt else {
+            panic!("expected Select");
+        };
+        let SelectItem::Expr(expr, _) = &sel.projections[0] else {
+            panic!("expected an expression projection");
+        };
+        assert!(matches!(
+            expr,
+            Expr::JsonAccess {
+                op: JsonOperator::Dot,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_collate_in_expressions_parses() {
+        let stmt = parse_one("SELECT * FROM t WHERE name = 'strasse' COLLATE 'de_DE'");
+        assert!(matches!(stmt, Statement::Select(_)));
+        let stmt = parse_one("SELECT * FROM t ORDER BY name COLLATE 'de_DE'");
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn test_user_defined_type_in_column_position_parses() {
+        let stmt = parse_one("CREATE TABLE t (zip us_zipcode, id INT)");
+        let Statement::CreateTable(ct) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(
+            ct.columns[0].data_type,
+            DataType::UserDefined("us_zipcode".to_string())
+        );
     }
 }

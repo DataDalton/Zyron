@@ -36,6 +36,12 @@ fn col(name: &str, ty: DataType) -> ColumnDef {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }
 }
 

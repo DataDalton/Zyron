@@ -2,12 +2,13 @@
 // Arrow IPC stream format
 // -----------------------------------------------------------------------------
 //
-// Reads and writes Arrow IPC streams. Schema generation uses the shared
-// TypeId to DataType mapping in format/schema.rs. All rows are written as a
-// single RecordBatch and readers iterate over batches to handle files that
-// contain more than one batch.
+// Reads and writes Arrow IPC streams. Field generation routes through
+// format/arrow_ext.rs, which stamps zyron.* extension names onto extended
+// types and defers to the shared mapping in format/schema.rs for plain
+// types. All rows are written as a single RecordBatch and readers iterate
+// over batches to handle files that contain more than one batch.
 
-use super::schema::{arrow_to_type_id, timestamp_arrow_type};
+use super::arrow_ext::{export_field, import_type_id};
 use super::{ColumnSpec, FormatReader, FormatWriter};
 use crate::row_codec::StreamValue;
 use arrow::array::RecordBatch;
@@ -39,16 +40,7 @@ pub struct ArrowIpcWriter;
 
 impl FormatWriter for ArrowIpcWriter {
     fn write_rows(&mut self, rows: &[Vec<StreamValue>], schema: &[ColumnSpec]) -> Result<Vec<u8>> {
-        let fields: Vec<Field> = schema
-            .iter()
-            .map(|c| {
-                Field::new(
-                    &c.name,
-                    timestamp_arrow_type(c.type_id, c.fractional_digits),
-                    true,
-                )
-            })
-            .collect();
+        let fields: Vec<Field> = schema.iter().map(export_field).collect();
         let arrow_schema = Arc::new(Schema::new(fields));
         let batch: RecordBatch =
             super::record_batch::rows_to_batch(rows, schema, arrow_schema.clone())?;
@@ -81,7 +73,7 @@ pub fn infer_arrow_ipc_schema(bytes: &[u8]) -> Result<Vec<ColumnSpec>> {
     let schema = reader.schema();
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        let type_id = arrow_to_type_id(field.data_type())?;
+        let type_id = import_type_id(field)?;
         cols.push(ColumnSpec::new(field.name().to_string(), type_id));
     }
     Ok(cols)
@@ -140,6 +132,62 @@ mod tests {
         assert_eq!(a.value(0), 1_700_000_000_123_456_789);
         assert_eq!(a.value(1), 1, "ps->ns truncates the low 3 digits");
         assert!(a.is_null(2), "null passes through");
+    }
+
+    #[test]
+    fn arrow_ipc_extension_types_roundtrip_schema_and_rows() {
+        use crate::format::ColumnSpec;
+        use crate::row_codec::StreamValue;
+
+        let schema = vec![
+            ColumnSpec::new("u", TypeId::Uuid),
+            ColumnSpec::new("m", TypeId::Money),
+            ColumnSpec::new("v", TypeId::Vector),
+            ColumnSpec::new("mac", TypeId::MacAddr),
+            ColumnSpec::new("iv", TypeId::Interval),
+        ];
+        let rows = vec![
+            vec![
+                StreamValue::Binary(vec![0xAA; 16]),
+                StreamValue::Binary(vec![0x01; 10]),
+                StreamValue::Binary(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+                StreamValue::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]),
+                StreamValue::Binary(vec![0x0F; 16]),
+            ],
+            vec![
+                StreamValue::Null,
+                StreamValue::Binary(vec![0xFF; 10]),
+                StreamValue::Null,
+                StreamValue::Null,
+                StreamValue::Binary(vec![0x00; 16]),
+            ],
+        ];
+        let mut writer = ArrowIpcWriter;
+        let bytes = writer.write_rows(&rows, &schema).unwrap();
+
+        // Schema fidelity, extension metadata restores every TypeId exactly
+        let inferred = infer_arrow_ipc_schema(&bytes).unwrap();
+        assert_eq!(inferred.len(), schema.len());
+        for (a, b) in inferred.iter().zip(schema.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.type_id, b.type_id, "TypeId mismatch for {}", a.name);
+        }
+
+        // Row fidelity, payload bytes come back exactly
+        let mut reader = ArrowIpcReader;
+        let decoded = reader.read_rows(&bytes, &schema).unwrap();
+        assert_rows_equal(&decoded, &rows);
+    }
+
+    #[test]
+    fn arrow_ipc_fixed_width_extension_rejects_wrong_length() {
+        use crate::format::ColumnSpec;
+        use crate::row_codec::StreamValue;
+
+        let schema = vec![ColumnSpec::new("u", TypeId::Uuid)];
+        let rows = vec![vec![StreamValue::Binary(vec![0xAA; 15])]];
+        let mut writer = ArrowIpcWriter;
+        assert!(writer.write_rows(&rows, &schema).is_err());
     }
 
     #[test]

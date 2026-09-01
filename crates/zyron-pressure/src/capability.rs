@@ -465,6 +465,16 @@ impl CoefficientAccumulator {
         }
     }
 
+    /// Records one batch measured as a span rather than a nanosecond count.
+    ///
+    /// The clamp lives here rather than at each caller so a span longer than
+    /// the counter can hold saturates in one place instead of wrapping in
+    /// whichever caller forgot it.
+    #[inline]
+    pub fn record_elapsed(&self, kind: OperatorKind, units: u64, elapsed: std::time::Duration) {
+        self.record(kind, units, elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    }
+
     /// Records one batch of real work. Two relaxed adds, called from inside
     /// operators, so it must stay this cheap.
     #[inline]

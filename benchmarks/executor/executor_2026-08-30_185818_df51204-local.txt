@@ -1,0 +1,343 @@
+# suite:   executor
+# run:     2026-08-30_185818_df51204-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Distinct Correctness Test ===
+
+=== Filter Correctness Test ===
+
+=== Aggregate Correctness Test ===
+
+=== Expression Evaluation Test ===
+
+=== TopN Sort Test ===
+
+=== Limit/Offset Correctness Test ===
+
+=== Hash Join Correctness Test ===
+
+=== Sort Correctness (Multi-Key) Test ===
+
+=== Pipeline Integration Test (Filter -> Sort -> Limit) ===
+
+=== Sort Performance Test ===
+
+=== Set Operations Correctness Test ===
+
+=== Projection Correctness Test ===
+  a + b: [15, 35, 55, 75, 95] [PASS]
+  a * 2: [20, 40, 60, 80, 100] [PASS]
+  LIMIT 10: 10 rows [PASS]
+Rows: 500000
+Validation runs: 5
+  a > b: all true [PASS]
+  LIMIT 10 OFFSET 100: 10 rows, first id=100 [PASS]
+  OFFSET beyond data: 0 rows [PASS]
+  UNION ALL: 10 rows [PASS]
+  IS NULL: row 2 is null [PASS]
+  id < 10: 10 rows [PASS]
+  DISTINCT on 10 rows with 5 unique values: 5 rows [PASS]
+  UNION: 7 rows [PASS]
+  id >= 10 AND id < 20: 10 rows [PASS]
+  INTERSECT: 3 rows [PASS]
+  EXCEPT: 2 rows [PASS]
+  SELECT b, c FROM t: 2 columns, 3 rows [PASS]
+  INNER JOIN: 3 rows [PASS]
+  LEFT JOIN: 5 rows [PASS]
+  Multi-key sort (ASC a, DESC b): verified [PASS]
+  Filter(id<500) -> Sort(val ASC) -> Limit(10): vals 500-509 [PASS]
+  GROUP BY dept with COUNT/SUM/MIN/MAX: 3 groups [PASS]
+  TopN(100) from 10K rows: correct smallest 100 [PASS]
+
+--- Run 1/5 ---
+  Sort: 27,736,635 rows/sec (18.0267ms)
+
+--- Run 2/5 ---
+  Sort: 28,567,674 rows/sec (17.5023ms)
+
+--- Run 3/5 ---
+  Sort: 28,468,940 rows/sec (17.563ms)
+
+--- Run 4/5 ---
+  Sort: 27,993,797 rows/sec (17.8611ms)
+
+--- Run 5/5 ---
+  Sort: 27,954,356 rows/sec (17.8863ms)
+
+=== Sort Validation Results ===
+  Sort throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [27,736,635, 28,567,674, 28,468,940, 27,993,797, 27,954,356]
+    Average: 28,144,280 (target >= 100,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Filter Throughput Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Filter: 23,904,916 rows/sec (41.8324ms), 250000 rows passed
+
+--- Run 2/5 ---
+  Filter: 23,550,580 rows/sec (42.4618ms), 250000 rows passed
+
+--- Run 3/5 ---
+  Filter: 23,820,413 rows/sec (41.9808ms), 250000 rows passed
+
+--- Run 4/5 ---
+  Filter: 23,844,496 rows/sec (41.9384ms), 250000 rows passed
+
+--- Run 5/5 ---
+  Filter: 23,626,866 rows/sec (42.3247ms), 250000 rows passed
+
+=== Filter Validation Results ===
+  Filter throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [23,904,916, 23,550,580, 23,820,413, 23,844,496, 23,626,866]
+    Average: 23,749,454 (target >= 60,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Aggregate Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Aggregate: 1,191,753,069 rows/sec (839.1µs)
+
+--- Run 2/5 ---
+  Aggregate: 1,272,750,414 rows/sec (785.7µs)
+
+--- Run 3/5 ---
+  Aggregate: 1,287,664,177 rows/sec (776.6µs)
+
+--- Run 4/5 ---
+  Aggregate: 1,239,157,373 rows/sec (807µs)
+
+--- Run 5/5 ---
+  Aggregate: 1,285,181,853 rows/sec (778.1µs)
+
+=== Aggregate Validation Results ===
+  Aggregate throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1,191,753,069, 1,272,750,414, 1,287,664,177, 1,239,157,373, 1,285,181,853]
+    Average: 1,255,301,377 (target >= 150,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Hash Build Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Hash Build: 7,033,333 rows/sec (142.1801ms), 1000 groups
+
+--- Run 2/5 ---
+  Hash Build: 7,085,515 rows/sec (141.133ms), 1000 groups
+
+--- Run 3/5 ---
+  Hash Build: 6,825,482 rows/sec (146.5098ms), 1000 groups
+
+--- Run 4/5 ---
+  Hash Build: 6,948,894 rows/sec (143.9078ms), 1000 groups
+
+--- Run 5/5 ---
+  Hash Build: 6,778,374 rows/sec (147.528ms), 1000 groups
+
+=== Hash Build Validation Results ===
+  Hash build throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [7,033,333, 7,085,515, 6,825,482, 6,948,894, 6,778,374]
+    Average: 6,934,320 (target >= 50,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Scan Throughput Performance Test ===
+Rows: 1000000, Columns: 4
+Validation runs: 5
+
+--- Run 1/5 ---
+  Scan: 1,679,261,125 rows/sec (595.5µs)
+
+--- Run 2/5 ---
+  Scan: 1,686,625,063 rows/sec (592.9µs)
+
+--- Run 3/5 ---
+  Scan: 1,674,480,911 rows/sec (597.2µs)
+
+--- Run 4/5 ---
+  Scan: 1,717,032,967 rows/sec (582.4µs)
+
+--- Run 5/5 ---
+  Scan: 1,792,435,920 rows/sec (557.9µs)
+
+=== Scan Validation Results ===
+  Scan throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1,679,261,125, 1,686,625,063, 1,674,480,911, 1,717,032,967, 1,792,435,920]
+    Average: 1,709,967,197 (target >= 75,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== IN-List Predicate Throughput Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  IN-list: 4,874,492 rows/sec
+
+--- Run 2/5 ---
+  IN-list: 4,659,887 rows/sec
+
+--- Run 3/5 ---
+  IN-list: 4,850,176 rows/sec
+
+--- Run 4/5 ---
+  IN-list: 4,785,910 rows/sec
+
+--- Run 5/5 ---
+  IN-list: 4,797,799 rows/sec
+
+=== IN-List Validation Results ===
+  IN-list predicate (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [4,874,492, 4,659,887, 4,850,176, 4,785,910, 4,797,799]
+    Average: 4,793,652 (target >= 35,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Window Explicit Frame Throughput Test ===
+Rows: 200000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Window frame: 5,450,913 rows/sec (36.6911ms)
+
+--- Run 2/5 ---
+  Window frame: 5,779,896 rows/sec (34.6027ms)
+
+--- Run 3/5 ---
+  Window frame: 6,100,518 rows/sec (32.7841ms)
+
+--- Run 4/5 ---
+  Window frame: 5,926,400 rows/sec (33.7473ms)
+
+--- Run 5/5 ---
+  Window frame: 5,997,793 rows/sec (33.3456ms)
+
+=== Window Frame Validation Results ===
+  Window explicit frame throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [5,450,913, 5,779,896, 6,100,518, 5,926,400, 5,997,793]
+    Average: 5,851,104 (target >= 9,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== String Predicate Throughput Test ===
+Rows: 500000
+Validation runs: 5
+
+--- Run 1/5 ---
+  eq 47,230,409 rows/sec, LIKE prefix 1,129,034 rows/sec, LIKE general 898,372 rows/sec, ILIKE 812,403 rows/sec
+
+--- Run 2/5 ---
+  eq 45,792,159 rows/sec, LIKE prefix 1,155,534 rows/sec, LIKE general 913,714 rows/sec, ILIKE 815,330 rows/sec
+
+--- Run 3/5 ---
+  eq 47,225,056 rows/sec, LIKE prefix 1,140,050 rows/sec, LIKE general 896,943 rows/sec, ILIKE 799,586 rows/sec
+
+--- Run 4/5 ---
+  eq 48,150,538 rows/sec, LIKE prefix 1,165,197 rows/sec, LIKE general 919,955 rows/sec, ILIKE 794,610 rows/sec
+
+--- Run 5/5 ---
+  eq 47,604,993 rows/sec, LIKE prefix 1,127,517 rows/sec, LIKE general 907,959 rows/sec, ILIKE 811,498 rows/sec
+
+=== String Predicate Validation Results ===
+  String equality predicate (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [47,230,409, 45,792,159, 47,225,056, 48,150,538, 47,604,993]
+    Average: 47,200,631 (target >= 80,000,000, not applied)
+    Re-run with --release for a number worth comparing
+  LIKE prefix predicate (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1,129,034, 1,155,534, 1,140,050, 1,165,197, 1,127,517]
+    Average: 1,143,466 (target >= 7,000,000, not applied)
+    Re-run with --release for a number worth comparing
+  LIKE underscore predicate (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [898,372, 913,714, 896,943, 919,955, 907,959]
+    Average: 907,389 (target >= 5,000,000, not applied)
+    Re-run with --release for a number worth comparing
+  ILIKE contains predicate (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [812,403, 815,330, 799,586, 794,610, 811,498]
+    Average: 806,686 (target >= 4,500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Residual-Condition Hash Join Throughput Test ===
+Left rows: 200000, Right rows: 20000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Residual join: 5,548,858 rows/sec (39.6478ms), 101811 output rows
+
+--- Run 2/5 ---
+  Residual join: 5,523,350 rows/sec (39.8309ms), 101811 output rows
+
+--- Run 3/5 ---
+  Residual join: 5,556,285 rows/sec (39.5948ms), 101811 output rows
+
+--- Run 4/5 ---
+  Residual join: 5,047,377 rows/sec (43.587ms), 101811 output rows
+
+--- Run 5/5 ---
+  Residual join: 5,583,374 rows/sec (39.4027ms), 101811 output rows
+
+=== Residual Join Validation Results ===
+  Residual-condition join throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [5,548,858, 5,523,350, 5,556,285, 5,047,377, 5,583,374]
+    Average: 5,451,849 (target >= 20,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Hash Join Performance Test ===
+Left rows: 500000, Right rows: 50000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Join: 35,378,420 rows/sec (15.5462ms), 50000 output rows
+
+--- Run 2/5 ---
+  Join: 35,216,453 rows/sec (15.6177ms), 50000 output rows
+
+--- Run 3/5 ---
+  Join: 33,592,915 rows/sec (16.3725ms), 50000 output rows
+
+--- Run 4/5 ---
+  Join: 34,469,792 rows/sec (15.956ms), 50000 output rows
+
+--- Run 5/5 ---
+  Join: 35,711,039 rows/sec (15.4014ms), 50000 output rows
+
+=== Hash Join Validation Results ===
+  Join throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [35,378,420, 35,216,453, 33,592,915, 34,469,792, 35,711,039]
+    Average: 34,873,724 (target >= 100,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Limit Throughput Performance Test ===
+Rows: 1000000, Limit: 100
+Validation runs: 5
+
+--- Run 1/5 ---
+  Limit: 326,317,506,934 rows/sec (612.9µs for 200 samples)
+
+--- Run 2/5 ---
+  Limit: 333,277,787,035 rows/sec (600.1µs for 200 samples)
+
+--- Run 3/5 ---
+  Limit: 325,309,043,591 rows/sec (614.8µs for 200 samples)
+
+--- Run 4/5 ---
+  Limit: 317,813,443,509 rows/sec (629.3µs for 200 samples)
+
+--- Run 5/5 ---
+  Limit: 207,641,196,013 rows/sec (963.2µs for 200 samples)
+
+=== Limit Validation Results ===
+  Limit throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [326,317,506,934, 333,277,787,035, 325,309,043,591, 317,813,443,509, 207,641,196,013]
+    Average: 302,071,795,417 (target >= 200,000,000, not applied)
+    Re-run with --release for a number worth comparing

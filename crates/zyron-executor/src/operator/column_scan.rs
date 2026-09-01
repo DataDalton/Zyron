@@ -25,8 +25,8 @@ use zyron_storage::columnar::{
 use zyron_storage::encoding::{create_encoding, varlen_slice_rows};
 
 use crate::batch::{
-    BATCH_SIZE, DataBatch, create_builders, decode_fixed_scalar, decode_varlen_scalar,
-    finalize_builders,
+    BATCH_SIZE, ColumnBuilder, DataBatch, ResolvedPath, create_builders, decode_fixed_scalar,
+    decode_varlen_scalar, finalize_builders,
 };
 use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
@@ -40,6 +40,25 @@ struct ColPlan {
     type_id: zyron_common::types::TypeId,
     /// Fixed byte width, or 0 for the variable-length canonical layout.
     value_size: usize,
+}
+
+/// One promoted variant path a segment stores as a column of its own, for a
+/// path this statement reads.
+///
+/// The stored values are what the extraction returns, so a read served from
+/// the column and a read that walks the document give the same answer. What
+/// the column cannot answer for is a row whose variant was patched after the
+/// fold, which is resolved from the patched document instead
+#[derive(Clone)]
+struct ShredRead {
+    /// Column of the segment file holding the extracted values
+    seg_column_id: u32,
+    /// Position of the variant column in `col_plans`
+    variant_plan_idx: usize,
+    /// The variant column, as an expression names it
+    variant_column_id: u16,
+    /// Dotted path, as `variant_extract` names it
+    path: String,
 }
 
 /// Reads registered .zyr segments for a table with snapshot visibility and
@@ -68,6 +87,14 @@ pub struct ColumnScanOperator {
     /// them, so a segment rejected by its header or zone maps contributes rows
     /// and bytes of zero.
     io_stats: Option<Arc<zyron_common::TableIOStats>>,
+    /// Which table instance the projected columns belong to, so a resolved
+    /// path is offered to the column references that name this scan's table
+    /// and to no others
+    table_idx: Option<usize>,
+    /// Per segment file, the promoted paths it stores that this statement
+    /// reads. Captured at construction, so the set cannot change under a
+    /// scan that is already running
+    shreds: std::collections::HashMap<u64, Vec<ShredRead>>,
 }
 
 impl ColumnScanOperator {
@@ -170,6 +197,53 @@ impl ColumnScanOperator {
             stats.record_seq_scan();
         }
 
+        // Promoted paths this statement reads, matched against what each
+        // segment actually stores. A path nothing asked for is left on disk,
+        // and a segment written before the path was promoted keeps answering
+        // from its documents
+        let table_idx = columns.first().and_then(|c| c.table_idx);
+        let wanted = ctx.variant_paths();
+        let mut shreds: std::collections::HashMap<u64, Vec<ShredRead>> =
+            std::collections::HashMap::new();
+        if let Some(table_idx) = table_idx
+            && wanted.iter().any(|w| w.table_idx == table_idx)
+        {
+            for seg in &table_entry.columnar.segments {
+                if seg.shredded.is_empty() {
+                    continue;
+                }
+                let mut reads = Vec::new();
+                for sc in &seg.shredded {
+                    let asked = wanted.iter().any(|w| {
+                        w.table_idx == table_idx
+                            && w.column_id == sc.variant_column_id
+                            && w.path == sc.path
+                    });
+                    if !asked {
+                        continue;
+                    }
+                    // The variant column has to be projected, because a row
+                    // patched after the fold is answered from the patched
+                    // document, which means reading that document here
+                    let Some(variant_plan_idx) = col_plans
+                        .iter()
+                        .position(|p| p.column_id == sc.variant_column_id as u32)
+                    else {
+                        continue;
+                    };
+                    reads.push(ShredRead {
+                        seg_column_id: sc.column_id,
+                        variant_plan_idx,
+                        variant_column_id: sc.variant_column_id,
+                        path: sc.path.clone(),
+                    });
+                }
+                if !reads.is_empty() {
+                    shreds.insert(seg.file_id, reads);
+                }
+            }
+        }
+
         Ok(Self {
             ctx,
             table_entry,
@@ -184,6 +258,8 @@ impl ColumnScanOperator {
             pending: std::collections::VecDeque::new(),
             finished: false,
             io_stats,
+            table_idx,
+            shreds,
         })
     }
 
@@ -376,28 +452,46 @@ impl ColumnScanOperator {
         for p in &self.col_plans {
             col_ids.push(p.column_id);
         }
+        // Promoted paths this segment stores that the statement reads. Held
+        // by value so the segment loop owns them while `self` is borrowed
+        // again to queue the batches
+        let shreds: Vec<ShredRead> = self.shreds.get(&file_id).cloned().unwrap_or_default();
+        let shred_base = col_ids.len();
+        for sr in &shreds {
+            col_ids.push(sr.seg_column_id);
+        }
         // Read+decode+drop one column at a time so peak raw memory is a
         // single segment instead of every requested segment held at once.
         // Decoded buffers stay resident because row iteration is row-major
-        // across all projected columns. col_ids order is sys columns then
-        // projected columns, matching the index passed to the callback.
+        // across all projected columns. col_ids order is the sys columns,
+        // the projected columns, then the shredded ones, matching the index
+        // passed to the callback
         let mut decoded: Vec<Option<(Vec<u8>, Vec<u8>)>> =
             (0..col_ids.len()).map(|_| None).collect();
-        // Encoded bytes pulled out of this segment, summed across the sys
-        // columns and the projected columns. A segment rejected above never
-        // reaches here, which is what makes skipping show up as bytes not read.
+        // Encoded bytes pulled out of this segment, summed across every
+        // column it read. A segment rejected above never reaches here, which
+        // is what makes skipping show up as bytes not read
         let mut segment_bytes: u64 = 0;
         reader.read_segments_each(&col_ids, |idx, bytes| {
-            let raw = bytes.ok_or_else(|| {
-                zyron_common::ZyronError::ExecutionError(
-                    "columnar scan: missing segment for column".into(),
-                )
-            })?;
+            let raw = match bytes {
+                Some(raw) => raw,
+                // A promoted path the registry names but this file does not
+                // hold is read out of the documents instead, the same as a
+                // segment written before the path was promoted
+                None if idx >= shred_base => return Ok(()),
+                None => {
+                    return Err(zyron_common::ZyronError::ExecutionError(
+                        "columnar scan: missing segment for column".into(),
+                    ));
+                }
+            };
             segment_bytes += raw.len() as u64;
             let value_size = if idx < 3 {
                 8
-            } else {
+            } else if idx < shred_base {
                 self.col_plans[idx - 3].value_size
+            } else {
+                0
             };
             decoded[idx] = Some(Self::decode_raw(col_ids[idx], raw, row_count, value_size)?);
             Ok(())
@@ -426,6 +520,17 @@ impl ColumnScanOperator {
             } else {
                 varlen_rows.push(None);
             }
+        }
+
+        // The extracted values, one entry per shredded path this segment
+        // serves. A path whose column was absent drops out here, so the
+        // expression falls back to the document walk for it
+        let mut shred_cols: Vec<(&ShredRead, &[u8], Vec<&[u8]>)> = Vec::with_capacity(shreds.len());
+        for (k, sr) in shreds.iter().enumerate() {
+            let Some((bytes, nullbm)) = decoded[shred_base + k].as_ref() else {
+                continue;
+            };
+            shred_cols.push((sr, nullbm, varlen_slice_rows(bytes, row_count)?));
         }
 
         // Snapshot this file's overlay once under a single lock, instead of
@@ -485,6 +590,12 @@ impl ColumnScanOperator {
         };
 
         let mut builders = create_builders(&self.output_columns, row_count.min(BATCH_SIZE));
+        let mut shred_builders: Vec<ColumnBuilder> = shred_cols
+            .iter()
+            .map(|_| {
+                ColumnBuilder::new(zyron_common::types::TypeId::Text, row_count.min(BATCH_SIZE))
+            })
+            .collect();
         let mut locators: Vec<(u64, u64)> = Vec::new();
         let mut in_batch = 0usize;
         // Visible rows this segment yielded, counted before the predicate runs
@@ -574,6 +685,37 @@ impl ColumnScanOperator {
                 );
                 builders[ci].push_owned(sv);
             }
+            for (k, (sr, nullbm, rows)) in shred_cols.iter().enumerate() {
+                // A row whose variant was patched after the fold is answered
+                // from the patched document, because the stored column
+                // describes what the row held when the segment was written
+                let patched = overlay
+                    .map(|ov| ov.patches.contains_key(&(sr.variant_column_id as u32)))
+                    .unwrap_or(false);
+                let value = if patched {
+                    self.extracted_from_document(overlay, sr, r, &decoded_cols, &varlen_rows)
+                } else if !nullbm.is_empty() && (nullbm[r / 8] >> (r % 8)) & 1 == 1 {
+                    None
+                } else {
+                    match std::str::from_utf8(rows[r]) {
+                        Ok(text) => Some(text.to_string()),
+                        // The stored value was written from text, so bytes
+                        // that are not text mean this column is damaged.
+                        // Reading the document is slower and right
+                        Err(_) => self.extracted_from_document(
+                            overlay,
+                            sr,
+                            r,
+                            &decoded_cols,
+                            &varlen_rows,
+                        ),
+                    }
+                };
+                match value {
+                    Some(text) => shred_builders[k].push_owned(ScalarValue::Utf8(text)),
+                    None => shred_builders[k].push_owned(ScalarValue::Null),
+                }
+            }
             if self.emit_locators {
                 locators.push((file_id, sys_rowid));
             }
@@ -585,20 +727,60 @@ impl ColumnScanOperator {
                     &mut builders,
                     create_builders(&self.output_columns, BATCH_SIZE),
                 ));
+                let resolved =
+                    take_resolved(&mut shred_builders, &shred_cols, self.table_idx, BATCH_SIZE);
                 let locs = std::mem::take(&mut locators);
-                self.queue_batch(batch, locs)?;
+                self.queue_batch(batch.with_resolved(resolved), locs)?;
                 in_batch = 0;
             }
         }
 
         if in_batch > 0 {
             let batch = finalize_builders(builders);
-            self.queue_batch(batch, locators)?;
+            let resolved = take_resolved(&mut shred_builders, &shred_cols, self.table_idx, 0);
+            self.queue_batch(batch.with_resolved(resolved), locators)?;
         }
         if let Some(stats) = &self.io_stats {
             stats.record_seq_batch(rows_yielded, segment_bytes);
         }
         Ok(())
+    }
+
+    /// The path read out of one row's document, resolved through the patch
+    /// overlay so a row rewritten after the fold answers with what it holds
+    /// now. This is the answer the stored column stands in for
+    fn extracted_from_document(
+        &self,
+        overlay: Option<&RowOverlay>,
+        shred: &ShredRead,
+        row: usize,
+        decoded_cols: &[(Vec<u8>, Vec<u8>, bool)],
+        varlen_rows: &[Option<Vec<&[u8]>>],
+    ) -> Option<String> {
+        let plan = &self.col_plans[shred.variant_plan_idx];
+        let (bytes, nullbm, is_varlen) = &decoded_cols[shred.variant_plan_idx];
+        let is_null = !nullbm.is_empty() && (nullbm[row / 8] >> (row % 8)) & 1 == 1;
+        let base_bytes: Option<&[u8]> = if is_null {
+            None
+        } else if *is_varlen {
+            Some(varlen_rows[shred.variant_plan_idx].as_ref()?[row])
+        } else {
+            let vs = plan.value_size;
+            Some(&bytes[row * vs..(row + 1) * vs])
+        };
+        match self.resolve_value(
+            overlay,
+            plan.column_id,
+            plan.type_id,
+            plan.value_size,
+            is_null,
+            base_bytes,
+        ) {
+            ScalarValue::Utf8(text) => {
+                crate::variant_shred::extract_scalar_text(&text, &shred.path)
+            }
+            _ => None,
+        }
     }
 
     fn queue_batch(&mut self, batch: DataBatch, locators: Vec<(u64, u64)>) -> Result<()> {
@@ -634,6 +816,36 @@ impl ColumnScanOperator {
         }
         Ok(())
     }
+}
+
+/// Finishes the current batch's extracted values and starts fresh builders
+/// for the next one
+fn take_resolved(
+    builders: &mut Vec<ColumnBuilder>,
+    shreds: &[(&ShredRead, &[u8], Vec<&[u8]>)],
+    table_idx: Option<usize>,
+    capacity: usize,
+) -> Vec<ResolvedPath> {
+    let Some(table_idx) = table_idx else {
+        return Vec::new();
+    };
+    if builders.is_empty() {
+        return Vec::new();
+    }
+    let fresh: Vec<ColumnBuilder> = builders
+        .iter()
+        .map(|_| ColumnBuilder::new(zyron_common::types::TypeId::Text, capacity))
+        .collect();
+    std::mem::replace(builders, fresh)
+        .into_iter()
+        .zip(shreds)
+        .map(|(b, (sr, _, _))| ResolvedPath {
+            table_idx,
+            column_id: sr.variant_column_id,
+            path: sr.path.clone(),
+            values: b.finish(),
+        })
+        .collect()
 }
 
 impl Operator for ColumnScanOperator {

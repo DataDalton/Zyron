@@ -79,6 +79,18 @@ const DDL_CREATE_EVENT_HANDLER: u8 = 0x36;
 const DDL_DROP_EVENT_HANDLER: u8 = 0x37;
 const DDL_CREATE_VERSION_TAG: u8 = 0x38;
 const DDL_DROP_VERSION_TAG: u8 = 0x39;
+const DDL_CREATE_ANALYZER: u8 = 0x3A;
+const DDL_UPDATE_ANALYZER: u8 = 0x3B;
+const DDL_DROP_ANALYZER: u8 = 0x3C;
+const DDL_CREATE_SYNONYM_DICTIONARY: u8 = 0x3D;
+const DDL_UPDATE_SYNONYM_DICTIONARY: u8 = 0x3E;
+const DDL_DROP_SYNONYM_DICTIONARY: u8 = 0x3F;
+const DDL_CREATE_RESILIENCE_POLICY: u8 = 0x40;
+const DDL_DROP_RESILIENCE_POLICY: u8 = 0x41;
+const DDL_CREATE_USER_TYPE: u8 = 0x42;
+const DDL_DROP_USER_TYPE: u8 = 0x43;
+const DDL_CREATE_COLLATION: u8 = 0x44;
+const DDL_DROP_COLLATION: u8 = 0x45;
 
 /// Result of a `drop_table` call. `soft_dropped` is true when the table went
 /// to the recycle bin (entry and backing files retained for UNDROP); false
@@ -104,6 +116,11 @@ pub struct SchemaContents {
     pub functions: Vec<String>,
     pub aggregates: Vec<String>,
     pub procedures: Vec<String>,
+    pub analyzers: Vec<String>,
+    pub synonym_dictionaries: Vec<String>,
+    pub resilience_policies: Vec<String>,
+    pub user_types: Vec<String>,
+    pub collations: Vec<String>,
 }
 
 impl SchemaContents {
@@ -117,20 +134,25 @@ impl SchemaContents {
             && self.functions.is_empty()
             && self.aggregates.is_empty()
             && self.procedures.is_empty()
+            && self.analyzers.is_empty()
+            && self.synonym_dictionaries.is_empty()
+            && self.resilience_policies.is_empty()
+            && self.user_types.is_empty()
+            && self.collations.is_empty()
     }
 
     /// One line naming what the schema holds, at most five names per kind,
     /// so a refused DROP SCHEMA tells the caller exactly what is in the way.
     pub fn describe(&self) -> String {
-        fn kind(parts: &mut Vec<String>, label: &str, names: &[String]) {
+        fn kind(parts: &mut Vec<String>, singular: &str, plural: &str, names: &[String]) {
             if names.is_empty() {
                 return;
             }
             let shown: Vec<&str> = names.iter().take(5).map(|s| s.as_str()).collect();
             let ellipsis = if names.len() > 5 { ", ..." } else { "" };
-            let plural = if names.len() == 1 { "" } else { "s" };
+            let label = if names.len() == 1 { singular } else { plural };
             parts.push(format!(
-                "{} {label}{plural} ({}{ellipsis})",
+                "{} {label} ({}{ellipsis})",
                 names.len(),
                 shown.join(", ")
             ));
@@ -141,14 +163,39 @@ impl SchemaContents {
             .map(|(_, n)| n.clone())
             .collect();
         let mut parts = Vec::new();
-        kind(&mut parts, "table", &self.tables);
-        kind(&mut parts, "recycled table", &recycled_names);
-        kind(&mut parts, "view", &self.views);
-        kind(&mut parts, "materialized view", &self.mviews);
-        kind(&mut parts, "sequence", &self.sequences);
-        kind(&mut parts, "function", &self.functions);
-        kind(&mut parts, "aggregate", &self.aggregates);
-        kind(&mut parts, "procedure", &self.procedures);
+        kind(&mut parts, "table", "tables", &self.tables);
+        kind(
+            &mut parts,
+            "recycled table",
+            "recycled tables",
+            &recycled_names,
+        );
+        kind(&mut parts, "view", "views", &self.views);
+        kind(
+            &mut parts,
+            "materialized view",
+            "materialized views",
+            &self.mviews,
+        );
+        kind(&mut parts, "sequence", "sequences", &self.sequences);
+        kind(&mut parts, "function", "functions", &self.functions);
+        kind(&mut parts, "aggregate", "aggregates", &self.aggregates);
+        kind(&mut parts, "procedure", "procedures", &self.procedures);
+        kind(&mut parts, "analyzer", "analyzers", &self.analyzers);
+        kind(
+            &mut parts,
+            "synonym dictionary",
+            "synonym dictionaries",
+            &self.synonym_dictionaries,
+        );
+        kind(
+            &mut parts,
+            "resilience policy",
+            "resilience policies",
+            &self.resilience_policies,
+        );
+        kind(&mut parts, "user type", "user types", &self.user_types);
+        kind(&mut parts, "collation", "collations", &self.collations);
         parts.join(", ")
     }
 }
@@ -223,6 +270,25 @@ pub struct Catalog {
     /// Named version tags keyed by name (unique) and by id (for drop).
     version_tags_by_name: RwLock<HashMap<String, Arc<crate::schema::VersionTagEntry>>>,
     version_tags_by_id: RwLock<HashMap<u32, Arc<crate::schema::VersionTagEntry>>>,
+    /// Text analyzers keyed by (schema_id, name) and by id (for drop)
+    analyzers_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::AnalyzerEntry>>>,
+    analyzers_by_id: RwLock<HashMap<u32, Arc<crate::schema::AnalyzerEntry>>>,
+    /// Synonym dictionaries keyed by (schema_id, name) and by id (for drop)
+    synonym_dictionaries_by_name:
+        RwLock<HashMap<(u32, String), Arc<crate::schema::SynonymDictionaryEntry>>>,
+    synonym_dictionaries_by_id: RwLock<HashMap<u32, Arc<crate::schema::SynonymDictionaryEntry>>>,
+    /// Resilience policies keyed by (schema_id, name) and by id (for drop).
+    /// Bulkhead and retry policies share one name space within a schema, the
+    /// single map enforces it
+    resilience_policies_by_name:
+        RwLock<HashMap<(u32, String), Arc<crate::schema::ResiliencePolicyEntry>>>,
+    resilience_policies_by_id: RwLock<HashMap<u32, Arc<crate::schema::ResiliencePolicyEntry>>>,
+    /// User-defined types keyed by (schema_id, name) and by id (for drop)
+    user_types_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::UserTypeEntry>>>,
+    user_types_by_id: RwLock<HashMap<u32, Arc<crate::schema::UserTypeEntry>>>,
+    /// Collations keyed by (schema_id, name) and by id (for drop)
+    collations_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::CollationEntry>>>,
+    collations_by_id: RwLock<HashMap<u32, Arc<crate::schema::CollationEntry>>>,
     /// Serializes compliance-log appends so the tamper-evident hash chain is
     /// linear. The load-compute-store sequence runs under this lock so two
     /// concurrent appends cannot read the same tail and fork the chain.
@@ -281,6 +347,16 @@ impl Catalog {
             event_handlers_by_id: RwLock::new(HashMap::new()),
             version_tags_by_name: RwLock::new(HashMap::new()),
             version_tags_by_id: RwLock::new(HashMap::new()),
+            analyzers_by_name: RwLock::new(HashMap::new()),
+            analyzers_by_id: RwLock::new(HashMap::new()),
+            synonym_dictionaries_by_name: RwLock::new(HashMap::new()),
+            synonym_dictionaries_by_id: RwLock::new(HashMap::new()),
+            resilience_policies_by_name: RwLock::new(HashMap::new()),
+            resilience_policies_by_id: RwLock::new(HashMap::new()),
+            user_types_by_name: RwLock::new(HashMap::new()),
+            user_types_by_id: RwLock::new(HashMap::new()),
+            collations_by_name: RwLock::new(HashMap::new()),
+            collations_by_id: RwLock::new(HashMap::new()),
             compliance_append_lock: tokio::sync::Mutex::new(()),
             table_update_locks: scc::HashMap::new(),
             system_catalog: RwLock::new(SystemCatalogIds::default()),
@@ -550,6 +626,41 @@ impl Catalog {
             .into_iter()
             .map(|e| e.id)
             .collect();
+        let mut have_analyzers: HashSet<u32> = self
+            .storage
+            .load_analyzers()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_synonym_dictionaries: HashSet<u32> = self
+            .storage
+            .load_synonym_dictionaries()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_resilience_policies: HashSet<u32> = self
+            .storage
+            .load_resilience_policies()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_user_types: HashSet<u32> = self
+            .storage
+            .load_user_types()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_collations: HashSet<u32> = self
+            .storage
+            .load_collations()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
 
         // Pre-dedupe redo records in LSN order, keeping only the latest
         // record per (entity-kind, id) tuple. Subsequent records for the
@@ -813,6 +924,63 @@ impl Catalog {
                     };
                     Some((24, id as u64))
                 }
+                DDL_CREATE_ANALYZER | DDL_UPDATE_ANALYZER | DDL_DROP_ANALYZER => {
+                    let id: u32 = if ddl_type == DDL_DROP_ANALYZER {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::AnalyzerEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    // analyzer
+                    Some((25, id as u64))
+                }
+                DDL_CREATE_SYNONYM_DICTIONARY
+                | DDL_UPDATE_SYNONYM_DICTIONARY
+                | DDL_DROP_SYNONYM_DICTIONARY => {
+                    let id: u32 = if ddl_type == DDL_DROP_SYNONYM_DICTIONARY {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::SynonymDictionaryEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    // synonym dictionary
+                    Some((26, id as u64))
+                }
+                DDL_CREATE_RESILIENCE_POLICY | DDL_DROP_RESILIENCE_POLICY => {
+                    let id: u32 = if ddl_type == DDL_DROP_RESILIENCE_POLICY {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::ResiliencePolicyEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    // resilience policy
+                    Some((27, id as u64))
+                }
+                DDL_CREATE_USER_TYPE | DDL_DROP_USER_TYPE => {
+                    let id: u32 = if ddl_type == DDL_DROP_USER_TYPE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::UserTypeEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    // user type
+                    Some((28, id as u64))
+                }
+                DDL_CREATE_COLLATION | DDL_DROP_COLLATION => {
+                    let id: u32 = if ddl_type == DDL_DROP_COLLATION {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::CollationEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    // collation
+                    Some((29, id as u64))
+                }
                 _ => None,
             }
         }
@@ -881,6 +1049,18 @@ impl Catalog {
                     | DDL_DROP_EVENT_HANDLER
                     | DDL_CREATE_VERSION_TAG
                     | DDL_DROP_VERSION_TAG
+                    | DDL_CREATE_ANALYZER
+                    | DDL_UPDATE_ANALYZER
+                    | DDL_DROP_ANALYZER
+                    | DDL_CREATE_SYNONYM_DICTIONARY
+                    | DDL_UPDATE_SYNONYM_DICTIONARY
+                    | DDL_DROP_SYNONYM_DICTIONARY
+                    | DDL_CREATE_RESILIENCE_POLICY
+                    | DDL_DROP_RESILIENCE_POLICY
+                    | DDL_CREATE_USER_TYPE
+                    | DDL_DROP_USER_TYPE
+                    | DDL_CREATE_COLLATION
+                    | DDL_DROP_COLLATION
             )
         }
 
@@ -1294,6 +1474,118 @@ impl Catalog {
                         }
                     }
                 }
+                DDL_CREATE_ANALYZER | DDL_UPDATE_ANALYZER => {
+                    if let Ok(entry) = crate::schema::AnalyzerEntry::from_bytes(entry_bytes) {
+                        if have_analyzers.contains(&entry.id) {
+                            let _ = self.storage.update_analyzer(&entry).await;
+                        } else {
+                            let _ = self.storage.store_analyzer(&entry).await;
+                            have_analyzers.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_ANALYZER => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_analyzers.remove(&id) {
+                            let _ = self.storage.delete_analyzer(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_SYNONYM_DICTIONARY | DDL_UPDATE_SYNONYM_DICTIONARY => {
+                    if let Ok(entry) =
+                        crate::schema::SynonymDictionaryEntry::from_bytes(entry_bytes)
+                    {
+                        if have_synonym_dictionaries.contains(&entry.id) {
+                            let _ = self.storage.update_synonym_dictionary(&entry).await;
+                        } else {
+                            let _ = self.storage.store_synonym_dictionary(&entry).await;
+                            have_synonym_dictionaries.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_SYNONYM_DICTIONARY => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_synonym_dictionaries.remove(&id) {
+                            let _ = self.storage.delete_synonym_dictionary(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_RESILIENCE_POLICY => {
+                    if let Ok(entry) = crate::schema::ResiliencePolicyEntry::from_bytes(entry_bytes)
+                    {
+                        if !have_resilience_policies.contains(&entry.id) {
+                            let _ = self.storage.store_resilience_policy(&entry).await;
+                            have_resilience_policies.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_RESILIENCE_POLICY => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_resilience_policies.remove(&id) {
+                            let _ = self.storage.delete_resilience_policy(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_USER_TYPE => {
+                    if let Ok(entry) = crate::schema::UserTypeEntry::from_bytes(entry_bytes) {
+                        if !have_user_types.contains(&entry.id) {
+                            let _ = self.storage.store_user_type(&entry).await;
+                            have_user_types.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_USER_TYPE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_user_types.remove(&id) {
+                            let _ = self.storage.delete_user_type(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_COLLATION => {
+                    if let Ok(entry) = crate::schema::CollationEntry::from_bytes(entry_bytes) {
+                        if !have_collations.contains(&entry.id) {
+                            let _ = self.storage.store_collation(&entry).await;
+                            have_collations.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_COLLATION => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_collations.remove(&id) {
+                            let _ = self.storage.delete_collation(id).await;
+                        }
+                    }
+                }
                 DDL_CREATE_EXTERNAL_SOURCE | DDL_ALTER_EXTERNAL_SOURCE => {
                     if let Ok(entry) = ExternalSourceEntry::from_bytes(entry_bytes) {
                         if have_external_sources.contains(&entry.id.0) {
@@ -1501,6 +1793,11 @@ impl Catalog {
             pipelines,
             event_handlers,
             version_tags,
+            analyzers,
+            synonym_dictionaries,
+            resilience_policies,
+            user_types,
+            collations,
         ) = tokio::try_join!(
             self.storage.load_databases(),
             self.storage.load_schemas(),
@@ -1526,6 +1823,11 @@ impl Catalog {
             self.storage.load_pipelines(),
             self.storage.load_event_handlers(),
             self.storage.load_version_tags(),
+            self.storage.load_analyzers(),
+            self.storage.load_synonym_dictionaries(),
+            self.storage.load_resilience_policies(),
+            self.storage.load_user_types(),
+            self.storage.load_collations(),
         )?;
 
         let mut max_oid: u32 = USER_OID_START;
@@ -1799,6 +2101,81 @@ impl Catalog {
                 }
                 let entry = Arc::new(tag);
                 by_name.insert(entry.name.clone(), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.analyzers_by_name.write();
+            let mut by_id = self.analyzers_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for analyzer in analyzers {
+                if analyzer.id >= max_oid {
+                    max_oid = analyzer.id + 1;
+                }
+                let entry = Arc::new(analyzer);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.synonym_dictionaries_by_name.write();
+            let mut by_id = self.synonym_dictionaries_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for dict in synonym_dictionaries {
+                if dict.id >= max_oid {
+                    max_oid = dict.id + 1;
+                }
+                let entry = Arc::new(dict);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.resilience_policies_by_name.write();
+            let mut by_id = self.resilience_policies_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for policy in resilience_policies {
+                if policy.id >= max_oid {
+                    max_oid = policy.id + 1;
+                }
+                let entry = Arc::new(policy);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.user_types_by_name.write();
+            let mut by_id = self.user_types_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for ut in user_types {
+                if ut.id >= max_oid {
+                    max_oid = ut.id + 1;
+                }
+                let entry = Arc::new(ut);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.collations_by_name.write();
+            let mut by_id = self.collations_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for collation in collations {
+                if collation.id >= max_oid {
+                    max_oid = collation.id + 1;
+                }
+                let entry = Arc::new(collation);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
                 by_id.insert(entry.id, entry);
             }
         }
@@ -2133,6 +2510,51 @@ impl Catalog {
             .collect();
         procedures.sort_unstable();
 
+        let mut analyzers: Vec<String> = self
+            .analyzers_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        analyzers.sort_unstable();
+
+        let mut synonym_dictionaries: Vec<String> = self
+            .synonym_dictionaries_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        synonym_dictionaries.sort_unstable();
+
+        let mut resilience_policies: Vec<String> = self
+            .resilience_policies_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        resilience_policies.sort_unstable();
+
+        let mut user_types: Vec<String> = self
+            .user_types_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        user_types.sort_unstable();
+
+        let mut collations: Vec<String> = self
+            .collations_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        collations.sort_unstable();
+
         SchemaContents {
             tables,
             recycled_tables,
@@ -2142,6 +2564,11 @@ impl Catalog {
             functions,
             aggregates,
             procedures,
+            analyzers,
+            synonym_dictionaries,
+            resilience_policies,
+            user_types,
+            collations,
         }
     }
 
@@ -2259,6 +2686,8 @@ impl Catalog {
                             enforced: true,
                             on_violation: ConstraintViolationAction::Fail,
                             quarantine_table_id: None,
+                            without_overlaps: None,
+                            fk_period: false,
                         });
                     }
                     ColumnConstraint::Unique => {
@@ -2274,6 +2703,8 @@ impl Catalog {
                             enforced: true,
                             on_violation: ConstraintViolationAction::Fail,
                             quarantine_table_id: None,
+                            without_overlaps: None,
+                            fk_period: false,
                         });
                     }
                     ColumnConstraint::NotNull => {
@@ -2289,6 +2720,8 @@ impl Catalog {
                             enforced: true,
                             on_violation: ConstraintViolationAction::Fail,
                             quarantine_table_id: None,
+                            without_overlaps: None,
+                            fk_period: false,
                         });
                     }
                     ColumnConstraint::Check(expr) => {
@@ -2304,6 +2737,8 @@ impl Catalog {
                             enforced: true,
                             on_violation: ConstraintViolationAction::Fail,
                             quarantine_table_id: None,
+                            without_overlaps: None,
+                            fk_period: false,
                         });
                     }
                     ColumnConstraint::References {
@@ -2337,6 +2772,8 @@ impl Catalog {
                             enforced: true,
                             on_violation: ConstraintViolationAction::Fail,
                             quarantine_table_id: None,
+                            without_overlaps: None,
+                            fk_period: false,
                         });
                     }
                     ColumnConstraint::Default(_) => {
@@ -3532,6 +3969,7 @@ impl Catalog {
                     fractional_digits: *fractional_digits,
                     tz_offset_secs: None,
                     element_type: None,
+                    attrs: crate::schema::ColumnAttributes::default(),
                 },
             )
             .collect();
@@ -4540,6 +4978,639 @@ impl Catalog {
         }
     }
 
+    /// Schema name for error text, falling back to the raw id when the
+    /// schema entry is not cached
+    fn schema_label(&self, schema_id: SchemaId) -> String {
+        self.cache
+            .get_schema(schema_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| schema_id.0.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Analyzer operations
+    // -----------------------------------------------------------------------
+
+    /// Creates an analyzer. Assigns an id when the entry carries 0. Errors
+    /// when an analyzer of the same name already exists in the schema.
+    pub async fn create_analyzer(&self, mut entry: crate::schema::AnalyzerEntry) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.analyzers_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "analyzer '{}' already exists in schema '{}'",
+                entry.name,
+                self.schema_label(entry.schema_id)
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_ANALYZER, &entry.to_bytes())?;
+        self.storage.store_analyzer(&entry).await?;
+        let e = Arc::new(entry);
+        self.analyzers_by_name.write().insert(key, Arc::clone(&e));
+        self.analyzers_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves an analyzer by schema and name.
+    pub fn get_analyzer(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::AnalyzerEntry>> {
+        self.analyzers_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves an analyzer by id.
+    pub fn get_analyzer_by_id(&self, id: u32) -> Option<Arc<crate::schema::AnalyzerEntry>> {
+        self.analyzers_by_id.read().get(&id).map(Arc::clone)
+    }
+
+    /// Lists every analyzer.
+    pub fn list_analyzers(&self) -> Vec<Arc<crate::schema::AnalyzerEntry>> {
+        self.analyzers_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Resolves an analyzer by its bare name across all schemas, or by a
+    /// schema-qualified name. Errors when the bare name is ambiguous across
+    /// schemas or not found.
+    pub fn resolve_analyzer(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::schema::AnalyzerEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .analyzers_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "analyzer '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
+        let map = self.analyzers_by_name.read();
+        let mut found: Option<Arc<crate::schema::AnalyzerEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == name {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "analyzer name '{name}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("analyzer '{name}' not found")))
+    }
+
+    /// Replaces an analyzer definition, keyed by its (schema, name).
+    pub async fn update_analyzer(&self, entry: crate::schema::AnalyzerEntry) -> Result<()> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        let existing_id = self
+            .analyzers_by_name
+            .read()
+            .get(&key)
+            .map(|e| e.id)
+            .ok_or_else(|| ZyronError::Internal(format!("analyzer '{}' not found", entry.name)))?;
+
+        let mut entry = entry;
+        entry.id = existing_id;
+
+        self.log_ddl(DDL_UPDATE_ANALYZER, &entry.to_bytes())?;
+        if !self.storage.update_analyzer(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "analyzer '{}' row missing or undecodable on update",
+                entry.name
+            )));
+        }
+
+        let e = Arc::new(entry);
+        self.analyzers_by_name.write().insert(key, Arc::clone(&e));
+        self.analyzers_by_id.write().insert(existing_id, e);
+        Ok(())
+    }
+
+    /// Drops an analyzer and removes its durable entry.
+    pub async fn drop_analyzer(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let entry = self
+            .analyzers_by_name
+            .read()
+            .get(&key)
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("analyzer '{name}' not found")))?;
+
+        let id = entry.id;
+        self.log_ddl(DDL_DROP_ANALYZER, &id.to_le_bytes())?;
+        self.storage.delete_analyzer(id).await?;
+        self.analyzers_by_name.write().remove(&key);
+        self.analyzers_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Synonym dictionary operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a synonym dictionary. Assigns an id when the entry carries 0.
+    /// Errors when a dictionary of the same name already exists in the schema.
+    pub async fn create_synonym_dictionary(
+        &self,
+        mut entry: crate::schema::SynonymDictionaryEntry,
+    ) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.synonym_dictionaries_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "synonym dictionary '{}' already exists in schema '{}'",
+                entry.name,
+                self.schema_label(entry.schema_id)
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_SYNONYM_DICTIONARY, &entry.to_bytes())?;
+        self.storage.store_synonym_dictionary(&entry).await?;
+        let e = Arc::new(entry);
+        self.synonym_dictionaries_by_name
+            .write()
+            .insert(key, Arc::clone(&e));
+        self.synonym_dictionaries_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a synonym dictionary by schema and name.
+    pub fn get_synonym_dictionary(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::SynonymDictionaryEntry>> {
+        self.synonym_dictionaries_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a synonym dictionary by id.
+    pub fn get_synonym_dictionary_by_id(
+        &self,
+        id: u32,
+    ) -> Option<Arc<crate::schema::SynonymDictionaryEntry>> {
+        self.synonym_dictionaries_by_id
+            .read()
+            .get(&id)
+            .map(Arc::clone)
+    }
+
+    /// Lists every synonym dictionary.
+    pub fn list_synonym_dictionaries(&self) -> Vec<Arc<crate::schema::SynonymDictionaryEntry>> {
+        self.synonym_dictionaries_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Resolves a synonym dictionary by its bare name across all schemas, or
+    /// by a schema-qualified name. Errors when the bare name is ambiguous
+    /// across schemas or not found.
+    pub fn resolve_synonym_dictionary(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::schema::SynonymDictionaryEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .synonym_dictionaries_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "synonym dictionary '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
+        let map = self.synonym_dictionaries_by_name.read();
+        let mut found: Option<Arc<crate::schema::SynonymDictionaryEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == name {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "synonym dictionary name '{name}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("synonym dictionary '{name}' not found")))
+    }
+
+    /// Replaces a synonym dictionary definition, keyed by its (schema, name).
+    /// ALTER ADD/DROP rule paths rewrite the whole rule set through this.
+    pub async fn update_synonym_dictionary(
+        &self,
+        entry: crate::schema::SynonymDictionaryEntry,
+    ) -> Result<()> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        let existing_id = self
+            .synonym_dictionaries_by_name
+            .read()
+            .get(&key)
+            .map(|e| e.id)
+            .ok_or_else(|| {
+                ZyronError::Internal(format!("synonym dictionary '{}' not found", entry.name))
+            })?;
+
+        let mut entry = entry;
+        entry.id = existing_id;
+
+        self.log_ddl(DDL_UPDATE_SYNONYM_DICTIONARY, &entry.to_bytes())?;
+        if !self.storage.update_synonym_dictionary(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "synonym dictionary '{}' row missing or undecodable on update",
+                entry.name
+            )));
+        }
+
+        let e = Arc::new(entry);
+        self.synonym_dictionaries_by_name
+            .write()
+            .insert(key, Arc::clone(&e));
+        self.synonym_dictionaries_by_id
+            .write()
+            .insert(existing_id, e);
+        Ok(())
+    }
+
+    /// Drops a synonym dictionary and removes its durable entry.
+    pub async fn drop_synonym_dictionary(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let entry = self
+            .synonym_dictionaries_by_name
+            .read()
+            .get(&key)
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                ZyronError::Internal(format!("synonym dictionary '{name}' not found"))
+            })?;
+
+        let id = entry.id;
+        self.log_ddl(DDL_DROP_SYNONYM_DICTIONARY, &id.to_le_bytes())?;
+        self.storage.delete_synonym_dictionary(id).await?;
+        self.synonym_dictionaries_by_name.write().remove(&key);
+        self.synonym_dictionaries_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Resilience policy operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a resilience policy. Assigns an id when the entry carries 0.
+    /// Bulkhead and retry policies share one name space within a schema, so a
+    /// duplicate name is rejected regardless of kind.
+    pub async fn create_resilience_policy(
+        &self,
+        mut entry: crate::schema::ResiliencePolicyEntry,
+    ) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.resilience_policies_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "resilience policy '{}' already exists in schema '{}'",
+                entry.name,
+                self.schema_label(entry.schema_id)
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_RESILIENCE_POLICY, &entry.to_bytes())?;
+        self.storage.store_resilience_policy(&entry).await?;
+        let e = Arc::new(entry);
+        self.resilience_policies_by_name
+            .write()
+            .insert(key, Arc::clone(&e));
+        self.resilience_policies_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a resilience policy by schema and name.
+    pub fn get_resilience_policy(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::ResiliencePolicyEntry>> {
+        self.resilience_policies_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a resilience policy by id.
+    pub fn get_resilience_policy_by_id(
+        &self,
+        id: u32,
+    ) -> Option<Arc<crate::schema::ResiliencePolicyEntry>> {
+        self.resilience_policies_by_id
+            .read()
+            .get(&id)
+            .map(Arc::clone)
+    }
+
+    /// Lists every resilience policy.
+    pub fn list_resilience_policies(&self) -> Vec<Arc<crate::schema::ResiliencePolicyEntry>> {
+        self.resilience_policies_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Resolves a resilience policy by its bare name across all schemas, or
+    /// by a schema-qualified name. Errors when the bare name is ambiguous
+    /// across schemas or not found.
+    pub fn resolve_resilience_policy(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::schema::ResiliencePolicyEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .resilience_policies_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "resilience policy '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
+        let map = self.resilience_policies_by_name.read();
+        let mut found: Option<Arc<crate::schema::ResiliencePolicyEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == name {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "resilience policy name '{name}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("resilience policy '{name}' not found")))
+    }
+
+    /// Drops a resilience policy and removes its durable entry.
+    pub async fn drop_resilience_policy(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let entry = self
+            .resilience_policies_by_name
+            .read()
+            .get(&key)
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("resilience policy '{name}' not found")))?;
+
+        let id = entry.id;
+        self.log_ddl(DDL_DROP_RESILIENCE_POLICY, &id.to_le_bytes())?;
+        self.storage.delete_resilience_policy(id).await?;
+        self.resilience_policies_by_name.write().remove(&key);
+        self.resilience_policies_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // User type operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a user-defined type. Assigns an id when the entry carries 0.
+    /// Errors when a type of the same name already exists in the schema.
+    pub async fn create_user_type(&self, mut entry: crate::schema::UserTypeEntry) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.user_types_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "user type '{}' already exists in schema '{}'",
+                entry.name,
+                self.schema_label(entry.schema_id)
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_USER_TYPE, &entry.to_bytes())?;
+        self.storage.store_user_type(&entry).await?;
+        let e = Arc::new(entry);
+        self.user_types_by_name.write().insert(key, Arc::clone(&e));
+        self.user_types_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a user type by schema and name.
+    pub fn get_user_type(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::UserTypeEntry>> {
+        self.user_types_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a user type by id.
+    pub fn get_user_type_by_id(&self, id: u32) -> Option<Arc<crate::schema::UserTypeEntry>> {
+        self.user_types_by_id.read().get(&id).map(Arc::clone)
+    }
+
+    /// Lists every user type.
+    pub fn list_user_types(&self) -> Vec<Arc<crate::schema::UserTypeEntry>> {
+        self.user_types_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Resolves a user type by its bare name across all schemas, or by a
+    /// schema-qualified name. Errors when the bare name is ambiguous across
+    /// schemas or not found.
+    pub fn resolve_user_type(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::schema::UserTypeEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .user_types_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "user type '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
+        let map = self.user_types_by_name.read();
+        let mut found: Option<Arc<crate::schema::UserTypeEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == name {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "user type name '{name}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("user type '{name}' not found")))
+    }
+
+    /// Drops a user type and removes its durable entry.
+    pub async fn drop_user_type(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let entry = self
+            .user_types_by_name
+            .read()
+            .get(&key)
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("user type '{name}' not found")))?;
+
+        let id = entry.id;
+        self.log_ddl(DDL_DROP_USER_TYPE, &id.to_le_bytes())?;
+        self.storage.delete_user_type(id).await?;
+        self.user_types_by_name.write().remove(&key);
+        self.user_types_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Collation operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a collation. Assigns an id when the entry carries 0. Errors
+    /// when a collation of the same name already exists in the schema.
+    pub async fn create_collation(&self, mut entry: crate::schema::CollationEntry) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.collations_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "collation '{}' already exists in schema '{}'",
+                entry.name,
+                self.schema_label(entry.schema_id)
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_COLLATION, &entry.to_bytes())?;
+        self.storage.store_collation(&entry).await?;
+        let e = Arc::new(entry);
+        self.collations_by_name.write().insert(key, Arc::clone(&e));
+        self.collations_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a collation by schema and name.
+    pub fn get_collation(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::CollationEntry>> {
+        self.collations_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a collation by id.
+    pub fn get_collation_by_id(&self, id: u32) -> Option<Arc<crate::schema::CollationEntry>> {
+        self.collations_by_id.read().get(&id).map(Arc::clone)
+    }
+
+    /// Lists every collation.
+    pub fn list_collations(&self) -> Vec<Arc<crate::schema::CollationEntry>> {
+        self.collations_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Resolves a collation by its bare name across all schemas, or by a
+    /// schema-qualified name. Errors when the bare name is ambiguous across
+    /// schemas or not found.
+    pub fn resolve_collation(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::schema::CollationEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .collations_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "collation '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
+        let map = self.collations_by_name.read();
+        let mut found: Option<Arc<crate::schema::CollationEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == name {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "collation name '{name}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("collation '{name}' not found")))
+    }
+
+    /// Drops a collation and removes its durable entry.
+    pub async fn drop_collation(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let entry = self
+            .collations_by_name
+            .read()
+            .get(&key)
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("collation '{name}' not found")))?;
+
+        let id = entry.id;
+        self.log_ddl(DDL_DROP_COLLATION, &id.to_le_bytes())?;
+        self.storage.delete_collation(id).await?;
+        self.collations_by_name.write().remove(&key);
+        self.collations_by_id.write().remove(&id);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Trigger operations
     // -----------------------------------------------------------------------
@@ -4581,6 +5652,18 @@ impl Catalog {
             .get(&table_id.0)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Lists every trigger, ordered by id so a listing is stable across calls.
+    pub fn list_triggers(&self) -> Vec<Arc<crate::schema::TriggerEntry>> {
+        let mut out: Vec<Arc<crate::schema::TriggerEntry>> = self
+            .triggers_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect();
+        out.sort_by_key(|t| t.id);
+        out
     }
 
     pub fn find_trigger(
@@ -5420,12 +6503,53 @@ impl Catalog {
 fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<ColumnEntry>> {
     let mut entries = Vec::with_capacity(defs.len());
     for (i, def) in defs.iter().enumerate() {
+        if let zyron_parser::ast::DataType::UserDefined(type_name) = &def.data_type {
+            return Err(ZyronError::ExecutionError(format!(
+                "user defined type {type_name} on column {} was not resolved before the catalog",
+                def.name
+            )));
+        }
         let type_id = def.data_type.to_type_id();
         let max_length = extract_max_length(&def.data_type);
         let nullable = def.nullable.unwrap_or(true);
         // Store the default as re-parseable SQL so INSERT can fill an omitted
         // column with it (a debug rendering would not round-trip).
         let default_expr = def.default.as_ref().map(zyron_parser::expr_to_sql);
+
+        let mut attrs = crate::schema::ColumnAttributes::default();
+        if let Some(generated) = &def.generated {
+            attrs.generation_expr = Some(zyron_parser::expr_to_sql(&generated.expr));
+            attrs.generation_kind = if generated.stored {
+                crate::schema::ColumnAttributes::GENERATION_STORED
+            } else {
+                crate::schema::ColumnAttributes::GENERATION_VIRTUAL
+            };
+        }
+        if let Some(encrypted) = &def.encrypted {
+            // Discriminants match zyron-auth EncryptionAlgorithm:
+            // 0 = AES-128-GCM, 1 = AES-256-GCM
+            attrs.encryption_algorithm = match encrypted.algorithm.as_deref() {
+                None | Some("aes256_gcm") => 1,
+                Some("aes128_gcm") => 0,
+                Some(other) => {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "unknown encryption algorithm {other}, expected aes128_gcm or aes256_gcm"
+                    )));
+                }
+            };
+            // A declared key id is resolved by the server against its key
+            // store after creation; 0 means not yet assigned
+            if let Some(key) = &encrypted.key_id
+                && let Ok(parsed) = key.parse::<u32>()
+            {
+                attrs.encryption_key_id = parsed;
+            }
+        }
+        attrs.collation = def.collation.clone();
+        attrs.media_format = def.media_format.clone();
+        attrs.media_storage = def.media_storage.clone();
+        attrs.user_type_id = def.user_type_id;
+        attrs.nested_shape = extract_nested_shape(&def.data_type);
 
         entries.push(ColumnEntry {
             id: ColumnId(i as u16),
@@ -5439,6 +6563,7 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
             fractional_digits: def.data_type.fractional_digits(),
             tz_offset_secs: None,
             element_type: extract_element_type(&def.data_type),
+            attrs,
         });
     }
     Ok(entries)
@@ -5449,6 +6574,47 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
 #[inline]
 fn extract_element_type(dt: &DataType) -> Option<zyron_common::TypeId> {
     dt.declared_element_type()
+}
+
+/// The declared shape of a STRUCT or MAP column.
+///
+/// Without it the declaration is thrown away at DDL time: a struct value
+/// becomes an untyped blob, nothing can say `s.age` is an integer, and
+/// nothing can refuse a write whose fields are not the fields declared.
+fn extract_nested_shape(dt: &DataType) -> Option<NestedShape> {
+    nested_type_of(dt).shape.map(|boxed| *boxed)
+}
+
+/// One declared type together with whatever it holds, so a declaration that
+/// nests keeps every level rather than flattening to the outermost type.
+fn nested_type_of(dt: &DataType) -> NestedType {
+    let type_id = dt.to_type_id();
+    match dt {
+        DataType::Array(inner) => NestedType {
+            type_id,
+            element: Some(Box::new(nested_type_of(inner))),
+            shape: None,
+        },
+        DataType::Struct(fields) => NestedType {
+            type_id,
+            element: None,
+            shape: Some(Box::new(NestedShape::Struct(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), nested_type_of(ty)))
+                    .collect(),
+            ))),
+        },
+        DataType::Map(key, value) => NestedType {
+            type_id,
+            element: None,
+            shape: Some(Box::new(NestedShape::Map {
+                key: nested_type_of(key),
+                value: nested_type_of(value),
+            })),
+        },
+        _ => NestedType::scalar(type_id),
+    }
 }
 
 /// Extracts the declared size of a sized type.
@@ -5488,6 +6654,11 @@ fn convert_table_constraints(
                 enforced: tc.enforced,
                 on_violation: map_violation_action(tc.on_violation),
                 quarantine_table_id: None,
+                without_overlaps: match &tc.without_overlaps {
+                    Some(col) => Some(resolve_column_ids(std::slice::from_ref(col), columns)?[0]),
+                    None => None,
+                },
+                fk_period: tc.fk_period,
             },
             TableConstraintKind::Unique(col_names) => ConstraintEntry {
                 name: tc
@@ -5504,6 +6675,11 @@ fn convert_table_constraints(
                 enforced: tc.enforced,
                 on_violation: map_violation_action(tc.on_violation),
                 quarantine_table_id: None,
+                without_overlaps: match &tc.without_overlaps {
+                    Some(col) => Some(resolve_column_ids(std::slice::from_ref(col), columns)?[0]),
+                    None => None,
+                },
+                fk_period: tc.fk_period,
             },
             TableConstraintKind::Check(expr) => ConstraintEntry {
                 name: tc.name.clone().unwrap_or_else(|| "ck_table".to_string()),
@@ -5517,6 +6693,11 @@ fn convert_table_constraints(
                 enforced: tc.enforced,
                 on_violation: map_violation_action(tc.on_violation),
                 quarantine_table_id: None,
+                without_overlaps: match &tc.without_overlaps {
+                    Some(col) => Some(resolve_column_ids(std::slice::from_ref(col), columns)?[0]),
+                    None => None,
+                },
+                fk_period: tc.fk_period,
             },
             TableConstraintKind::ForeignKey {
                 columns: col_names,
@@ -5539,6 +6720,11 @@ fn convert_table_constraints(
                 enforced: tc.enforced,
                 on_violation: map_violation_action(tc.on_violation),
                 quarantine_table_id: None,
+                without_overlaps: match &tc.without_overlaps {
+                    Some(col) => Some(resolve_column_ids(std::slice::from_ref(col), columns)?[0]),
+                    None => None,
+                },
+                fk_period: tc.fk_period,
             },
         };
         result.push(entry);
@@ -5602,6 +6788,12 @@ mod tests {
                 nullable: Some(false),
                 default: None,
                 constraints: vec![ColumnConstraint::PrimaryKey],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
             ColumnDef {
                 name: "email".to_string(),
@@ -5609,6 +6801,12 @@ mod tests {
                 nullable: None,
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
         ];
 
@@ -5648,6 +6846,7 @@ mod tests {
                 fractional_digits: None,
                 tz_offset_secs: None,
                 element_type: None,
+                attrs: Default::default(),
             },
             ColumnEntry {
                 id: ColumnId(1),
@@ -5661,6 +6860,7 @@ mod tests {
                 fractional_digits: None,
                 tz_offset_secs: None,
                 element_type: None,
+                attrs: Default::default(),
             },
         ];
         let tcs = vec![
@@ -5669,12 +6869,16 @@ mod tests {
                 kind: TableConstraintKind::PrimaryKey(vec!["a".to_string()]),
                 enforced: true,
                 on_violation: zyron_parser::ast::ViolationAction::Fail,
+                without_overlaps: None,
+                fk_period: false,
             },
             TableConstraint {
                 name: None,
                 kind: TableConstraintKind::Unique(vec!["a".to_string(), "b".to_string()]),
                 enforced: true,
                 on_violation: zyron_parser::ast::ViolationAction::Fail,
+                without_overlaps: None,
+                fk_period: false,
             },
         ];
         let result = convert_table_constraints(&tcs, &cols).unwrap();

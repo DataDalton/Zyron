@@ -146,5 +146,7 @@ fn literal_to_sql(value: &L) -> String {
         L::Boolean(b) => b.to_string(),
         L::Null => "NULL".to_string(),
         L::Interval(_) => "INTERVAL".to_string(),
+        // A stored form has no statement spelling to render back
+        L::Bytes(_) => "NULL".to_string(),
     }
 }

@@ -155,6 +155,13 @@ pub fn expr_to_sql(e: &Expr) -> String {
             )
         }
         Expr::Nested(inner) => format!("({})", expr_to_sql(inner)),
+        Expr::Collate { expr, collation } => {
+            format!(
+                "{} COLLATE '{}'",
+                expr_to_sql(expr),
+                collation.replace('\'', "''")
+            )
+        }
         // Subqueries, window functions, and the like cannot appear in a default
         // or CHECK constraint, so a non-round-tripping rendering is acceptable.
         other => format!("({other:?})"),
@@ -216,6 +223,26 @@ fn data_type_to_sql(dt: &crate::ast::DataType) -> String {
         D::CountMinSketch => "COUNTMINSKETCH".to_string(),
         D::Bitfield => "BITFIELD".to_string(),
         D::Quantity => "QUANTITY".to_string(),
+        D::Variant => "VARIANT".to_string(),
+        D::Struct(fields) => {
+            let rendered: Vec<String> = fields
+                .iter()
+                .map(|(name, dt)| format!("{name} {}", data_type_to_sql(dt)))
+                .collect();
+            format!("STRUCT<{}>", rendered.join(", "))
+        }
+        D::Map(key, value) => format!(
+            "MAP<{}, {}>",
+            data_type_to_sql(key),
+            data_type_to_sql(value)
+        ),
+        D::Ltree => "LTREE".to_string(),
+        D::UserDefined(name) => name.clone(),
+        D::Image => "IMAGE".to_string(),
+        D::Video => "VIDEO".to_string(),
+        D::Audio => "AUDIO".to_string(),
+        D::Document => "DOCUMENT".to_string(),
+        D::ExternalRef => "EXTERNAL_REF".to_string(),
     }
 }
 

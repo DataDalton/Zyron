@@ -1,0 +1,335 @@
+{
+  "id": "2026-09-01_021213_df51204-local",
+  "date": "2026-09-01 02:13:44Z",
+  "ts": 1788228824,
+  "commit": "df51204-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "search_types_media": {
+      "TCP simple query": {
+        "average": 26.111020,
+        "runs": [26.25, 25.96, 26.23, 25.75, 26.35],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "QUIC bridge simple query": {
+        "average": 5.618480,
+        "runs": [5.63, 5.62, 5.65, 5.60, 5.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Hybrid corpus load": {
+        "average": 46524.280100,
+        "runs": [46524.28],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Image metadata via SQL over the stored image": {
+        "average": 9.941120,
+        "runs": [10.09, 9.86, 10.15, 9.84, 9.76],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Refused insert on the large table, check included": {
+        "average": 6.625900,
+        "runs": [6.68, 6.45, 6.55, 6.98, 6.48],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Temporal overlap check per accepted insert, against an unconstrained twin": {
+        "average": 16.803000,
+        "runs": [23.66, 17.93, 9.31, 24.82, 8.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "QUIC vs TCP": {
+      "QUIC over TCP query latency ratio": {
+        "average": 0.215177,
+        "runs": [0.22],
+        "target": 1.050000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Hybrid Search": {
+      "Fused top 10 over the corpus": {
+        "average": 13.562015,
+        "runs": [12.87, 13.30, 14.96, 13.80, 12.88],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "STRUCT Field Read": {
+      "Declared field predicate per row, positional access": {
+        "average": 8.408900,
+        "runs": [11.34, 7.57, 7.96, 7.46, 7.72],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "STRUCT Stored Size": {
+      "Bytes one declared struct value occupies": {
+        "average": 49.000000,
+        "runs": [49.00, 49.00, 49.00, 49.00, 49.00],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Analyzer Pipeline": {
+      "Full analyzer chain per document": {
+        "average": 3.259958,
+        "runs": [3.40, 3.20, 3.24, 3.24, 3.24],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Phonetic Match": {
+      "Phonetic encode and compare": {
+        "average": 49.001760,
+        "runs": [48.88, 48.97, 49.10, 49.05, 49.01],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Media Insert": {
+      "Insert one large image end to end": {
+        "average": 22.709780,
+        "runs": [23.00, 23.49, 21.84, 23.30, 21.91],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Media Read": {
+      "Read one large image end to end": {
+        "average": 10.220240,
+        "runs": [10.94, 9.91, 9.93, 10.17, 10.15],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Media Metadata": {
+      "Extract image metadata": {
+        "average": 0.001503,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Image Resize": {
+      "Resize to 1080p": {
+        "average": 87.509260,
+        "runs": [87.71, 86.73, 85.94, 87.83, 89.34],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Document Extract": {
+      "Extract text from a ten page document": {
+        "average": 0.112800,
+        "runs": [0.15, 0.11, 0.11, 0.09, 0.09],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Vector Math": {
+      "128 dim dot product": {
+        "average": 33.637568,
+        "runs": [33.73, 33.61, 33.66, 33.57, 33.62],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "ICU Collation": {
+      "Locale aware compare": {
+        "average": 75.648810,
+        "runs": [75.52, 75.70, 75.82, 75.64, 75.56],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LTREE Ancestor": {
+      "Ancestor check on 4 to 8 level paths": {
+        "average": 185.204320,
+        "runs": [185.62, 184.45, 185.34, 185.63, 184.98],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Presigned URL": {
+      "HMAC sign of a media handle": {
+        "average": 10.876464,
+        "runs": [10.29, 11.28, 11.24, 10.26, 11.31],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Generated VIRTUAL": {
+      "Inlined expression cost per row": {
+        "average": 11.293400,
+        "runs": [11.17, 11.24, 11.29, 11.36, 11.41],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Composite Cast": {
+      "Output cast cost per row": {
+        "average": 7.785560,
+        "runs": [7.57, 8.47, 8.03, 6.92, 7.94],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Encrypted Write": {
+      "AES-GCM encrypt per value": {
+        "average": 0.054174,
+        "runs": [0.05, 0.05, 0.05, 0.05, 0.05],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Encrypted Read": {
+      "AES-GCM decrypt per value": {
+        "average": 0.048203,
+        "runs": [0.05, 0.05, 0.05, 0.05, 0.05],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Temporal Overlap": {
+      "Overlap check growth from a small table to one a hundred times larger": {
+        "average": 0.314100,
+        "runs": [0.41, 0.27, 0.22, 0.67, 0.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "KMeans Cluster": {
+      "KMEANS_CLUSTER k=10 over four features": {
+        "average": 72.532520,
+        "runs": [77.52, 98.30, 90.38, 68.33, 28.13],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Detect Anomalies": {
+      "Isolation forest over four features": {
+        "average": 154.448620,
+        "runs": [153.63, 154.66, 155.17, 154.91, 153.87],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Money Convert": {
+      "Dated rate lookup and convert": {
+        "average": 86.187580,
+        "runs": [86.15, 86.12, 85.98, 86.49, 86.20],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "VARIANT Read": {
+      "Dotted field predicate per row, JSON extract path": {
+        "average": 15.555600,
+        "runs": [16.08, 14.03, 15.58, 17.04, 15.05],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

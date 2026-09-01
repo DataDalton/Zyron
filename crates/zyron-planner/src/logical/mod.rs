@@ -195,6 +195,8 @@ pub enum LogicalPlan {
         check_constraints: Vec<crate::binder::BoundExpr>,
         /// Data-quality expectations (bound at table_idx 0) applied per row.
         expectations: Vec<crate::binder::BoundExpectation>,
+        /// Stored generated columns (bound at table_idx 0) computed per row.
+        generated_columns: Vec<crate::binder::BoundGeneratedColumn>,
         source: Arc<LogicalPlan>,
     },
 
@@ -210,6 +212,9 @@ pub enum LogicalPlan {
         assignments: Vec<BoundAssignment>,
         /// CHECK constraint predicates (bound at table_idx 0) to enforce per row.
         check_constraints: Vec<crate::binder::BoundExpr>,
+        /// STORED generated columns, recomputed from the updated row image so
+        /// a generated value never outlives the columns it derives from.
+        generated_columns: Vec<crate::binder::BoundGeneratedColumn>,
         child: Arc<LogicalPlan>,
     },
 

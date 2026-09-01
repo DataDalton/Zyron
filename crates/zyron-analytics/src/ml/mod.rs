@@ -7,6 +7,7 @@ pub mod annKnn;
 pub mod decisionTree;
 pub mod evaluation;
 pub mod f64Kernels;
+pub mod feature_encode;
 pub mod gradientBoosting;
 pub mod kmeans;
 pub mod knn;

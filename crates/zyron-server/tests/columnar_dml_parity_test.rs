@@ -31,6 +31,12 @@ fn col(name: &str, ty: DataType) -> ColumnDef {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }
 }
 
@@ -119,6 +125,8 @@ async fn setup() -> Env {
                     on_update: ReferentialAction::Restrict,
                 },
                 enforced: true,
+                without_overlaps: None,
+                fk_period: false,
                 on_violation: zyron_parser::ast::ViolationAction::Fail,
             }],
         )
@@ -1600,6 +1608,8 @@ async fn parent_side_fk_actions_reach_folded_child_rows() {
             on_update: ReferentialAction::Restrict,
         },
         enforced: true,
+        without_overlaps: None,
+        fk_period: false,
         on_violation: zyron_parser::ast::ViolationAction::Fail,
     };
     let cols = || vec![col("k", DataType::BigInt), col("v", DataType::BigInt)];
@@ -1848,6 +1858,8 @@ async fn streaming_upsert_replaces_and_deletes_folded_rows() {
                 name: None,
                 kind: TableConstraintKind::PrimaryKey(vec!["k".into()]),
                 enforced: true,
+                without_overlaps: None,
+                fk_period: false,
                 on_violation: zyron_parser::ast::ViolationAction::Fail,
             }],
         )

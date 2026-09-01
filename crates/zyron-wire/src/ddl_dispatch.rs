@@ -54,6 +54,16 @@ pub fn try_handle_ddl_utility<'a>(
     use zyron_parser::Statement;
 
     match stmt {
+        // The currency rates system table is file backed, so its DML is
+        // handled here instead of the planner
+        Statement::Insert(s) if crate::currency_rates::targets_currency_rates(&s.table) => {
+            Box::pin(async move { Some(crate::currency_rates::handle_insert(s, server).await) })
+        }
+        Statement::Delete(s) if crate::currency_rates::targets_currency_rates(&s.table) => {
+            Box::pin(async move {
+                Some(crate::currency_rates::handle_delete(&s.where_clause, server).await)
+            })
+        }
         // DML statements fall through to planner
         Statement::Select(_)
         | Statement::Insert(_)
@@ -486,6 +496,60 @@ pub fn try_handle_ddl_utility<'a>(
         Statement::CreateAbacPolicy(s) => {
             Box::pin(async move { Some(handle_create_abac_policy(s, server, session).await) })
         }
+        Statement::CreateAnalyzer(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_create_analyzer(s, server, session).await)
+        }),
+        Statement::AlterAnalyzer(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_alter_analyzer(s, server, session).await)
+        }),
+        Statement::DropAnalyzer(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_drop_analyzer(s, server, session).await)
+        }),
+        Statement::CreateSynonymDictionary(s) => Box::pin(async move {
+            Some(
+                crate::search_resilience_ddl::handle_create_synonym_dictionary(s, server, session)
+                    .await,
+            )
+        }),
+        Statement::AlterSynonymDictionary(s) => Box::pin(async move {
+            Some(
+                crate::search_resilience_ddl::handle_alter_synonym_dictionary(s, server, session)
+                    .await,
+            )
+        }),
+        Statement::DropSynonymDictionary(s) => Box::pin(async move {
+            Some(
+                crate::search_resilience_ddl::handle_drop_synonym_dictionary(s, server, session)
+                    .await,
+            )
+        }),
+        Statement::CreateHybridIndex(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_create_hybrid_index(s, server, session).await)
+        }),
+        Statement::CreateBulkhead(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_create_bulkhead(s, server, session).await)
+        }),
+        Statement::DropBulkhead(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_drop_bulkhead(s, server, session).await)
+        }),
+        Statement::CreateRetryPolicy(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_create_retry_policy(s, server, session).await)
+        }),
+        Statement::DropRetryPolicy(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_drop_retry_policy(s, server, session).await)
+        }),
+        Statement::CreateType(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_create_type(s, server, session).await)
+        }),
+        Statement::DropType(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_drop_type(s, server, session).await)
+        }),
+        Statement::CreateCollation(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_create_collation(s, server, session).await)
+        }),
+        Statement::DropCollation(s) => Box::pin(async move {
+            Some(crate::search_resilience_ddl::handle_drop_collation(s, server, session).await)
+        }),
     }
 }
 
@@ -1111,6 +1175,7 @@ async fn alter_lake_table_columns(
                 fractional_digits,
                 tz_offset_secs: None,
                 element_type: None,
+                attrs: Default::default(),
             });
             server
                 .catalog
@@ -1250,76 +1315,54 @@ async fn alter_lake_table_columns(
             // that is the one the write path evaluates
             let result_type = storable.bound.type_id();
             let result_digits = storable.bound.fractional_digits();
-            let mut new_id: u32 = 0;
-            log.commit(attempt, |base| {
-                if base.schema.columns.iter().any(|c| c.name == *name) {
-                    return Err(ZyronError::Internal(format!(
-                        "column \"{name}\" already exists in the lake schema"
-                    )));
-                }
-                // Rows already written hold no value for an expression
-                // declared after them, and a query filtering on the
-                // expression is answered from the stored column, so those
-                // rows would silently stop matching their own expression.
-                // Refusing is the only answer that does not lose them:
-                // filling them in means rewriting every data file, which is
-                // the same rewrite this function refuses for a column type
-                // change
-                let stored_rows: u64 = base.entries.iter().map(|e| e.row_count).sum();
-                if stored_rows > 0 {
-                    return Err(ZyronError::Internal(format!(
-                        "cannot add derived column \"{name}\" to \"{}\": it holds {stored_rows} \
-                         rows written before the expression existed, which have no value for it, \
-                         and a query filtering on the expression would drop them. Declare the \
-                         expression on a table with no rows, or create the table with \
-                         CLUSTER BY (<expression>)",
-                        old_table.name
-                    )));
-                }
-                // One column per expression, so its statistics stay in one
-                // place and two predicates cannot prune from different ones
-                if let Some(existing) = base
-                    .schema
-                    .derived
-                    .iter()
-                    .find(|d| d.canonical_hash == canonical.canonical_hash)
-                {
-                    return Err(ZyronError::Internal(format!(
-                        "expression \"{}\" is already stored by column id {}",
-                        existing.sql, existing.column_id
-                    )));
-                }
-                new_id = base.schema.next_column_id;
-                let mut columns = base.schema.columns.clone();
-                columns.push(zyron_lake::LakeColumn {
-                    id: new_id,
-                    name: name.clone(),
-                    type_id: result_type,
-                    // Rows written before the column existed hold no value
-                    // for it, and an expression over a NULL yields NULL
-                    nullable: true,
-                    fractional_digits: result_digits,
-                    tz_offset_secs: None,
-                    max_length: None,
-                    default_expr: None,
-                });
-                let mut derived = base.schema.derived.clone();
-                derived.push(zyron_lake::DerivedColumn {
-                    column_id: new_id,
-                    canonical_hash: canonical.canonical_hash,
-                    sql: canonical.sql.clone(),
-                    source_columns: canonical.source_columns.clone(),
-                });
-                let schema = zyron_lake::LakeSchema {
-                    schema_id: base.schema.schema_id + 1,
-                    next_column_id: new_id + 1,
-                    columns,
-                    derived,
-                };
-                schema.validate()?;
-                Ok(vec![zyron_lake::LogEntry::SchemaChange(schema)])
-            })
+            // Rows already written hold no value for an expression declared
+            // after them, so the column is computed for every one of them
+            // before it exists to be read. A data file is immutable, so this
+            // is a rewrite: each file's rows are read, the expression is
+            // evaluated over them, and one commit swaps the old files for
+            // ones that carry the new column
+            let bound = std::sync::Arc::new(storable.bound.clone());
+            let backfill_table = std::sync::Arc::clone(&table_arc);
+            let compute = move |schema: &zyron_lake::LakeSchema,
+                                stored: &[zyron_lake::ColumnData],
+                                rows: usize|
+                  -> Result<zyron_lake::ColumnData, ZyronError> {
+                zyron_executor::derived_columns::compute_over_stored(
+                    &backfill_table,
+                    &bound,
+                    schema,
+                    stored,
+                    rows,
+                )
+            };
+            let new_column = zyron_lake::LakeColumn {
+                id: 0,
+                name: name.clone(),
+                type_id: result_type,
+                // Rows written before the column existed hold the expression's
+                // value over their own columns, which can be null
+                nullable: true,
+                fractional_digits: result_digits,
+                tz_offset_secs: None,
+                max_length: None,
+                default_expr: None,
+            };
+            let new_derived = zyron_lake::DerivedColumn {
+                column_id: 0,
+                canonical_hash: canonical.canonical_hash,
+                sql: canonical.sql.clone(),
+                source_columns: canonical.source_columns.clone(),
+            };
+            let outcome = zyron_lake::operations::backfill_derived(
+                &log,
+                attempt,
+                old_table.id.0 as u64,
+                &new_column,
+                &new_derived,
+                &compute,
+            )
             .map_err(ProtocolError::Database)?;
+            let new_id = outcome.column_id;
 
             // Deliberately not added to the catalog's column list. That list
             // is positional: the insert path walks it against the incoming
@@ -1452,6 +1495,7 @@ async fn rewrite_table_columns(
                 fractional_digits,
                 tz_offset_secs: None,
                 element_type: None,
+                attrs: Default::default(),
             });
         }
         Op::DropColumn { name, if_exists } => {
@@ -1622,6 +1666,15 @@ async fn rewrite_table_columns(
                     m.drop_index(idx.id.0);
                 }
             }
+            zyron_catalog::IndexType::Hybrid => {
+                // Both engine halves registered under the hybrid id
+                if let Some(m) = &server.fts_manager {
+                    let _ = m.drop_index(idx.id.0);
+                }
+                if let Some(m) = &server.vector_manager {
+                    let _ = m.drop_index(idx.id.0);
+                }
+            }
         }
     }
 
@@ -1742,6 +1795,61 @@ async fn rewrite_table_columns(
                 if let Some(m) = &server.spatial_manager {
                     let (dims, srid) = decode_spatial_params(&s.parameters);
                     m.create_index(new_id.0, dims, srid);
+                }
+            }
+            zyron_catalog::IndexType::Hybrid => {
+                let new_id = server
+                    .catalog
+                    .create_index_with_params(
+                        table_id,
+                        schema_id,
+                        &s.name,
+                        &s.col_names,
+                        false,
+                        zyron_catalog::IndexType::Hybrid,
+                        s.parameters.clone(),
+                    )
+                    .await
+                    .map_err(ProtocolError::Database)?;
+                let params = zyron_catalog::index_params::decode_hybrid_params(&s.parameters);
+                let text_id = s
+                    .col_names
+                    .first()
+                    .and_then(|n| updated.columns.iter().find(|c| c.name == *n))
+                    .map(|c| c.id.0);
+                let vector_col = s
+                    .col_names
+                    .get(1)
+                    .and_then(|n| updated.columns.iter().find(|c| c.name == *n));
+                if let (Some(m), Some(text_id)) = (&server.fts_manager, text_id) {
+                    m.create_index(new_id.0, table_id.0, vec![text_id])
+                        .map_err(ProtocolError::Database)?;
+                    if let Some(p) = &params {
+                        crate::search_resilience_ddl::install_index_analyzer(
+                            &server.catalog,
+                            m,
+                            new_id.0,
+                            &p.fulltext,
+                        )
+                        .map_err(ProtocolError::Database)?;
+                    }
+                }
+                if let (Some(m), Some(p), Some(col)) = (&server.vector_manager, &params, vector_col)
+                {
+                    let metric = match p.vector_distance.as_str() {
+                        "euclidean" | "l2" => zyron_search::vector::DistanceMetric::Euclidean,
+                        "dot_product" | "dot" => zyron_search::vector::DistanceMetric::DotProduct,
+                        "manhattan" | "l1" => zyron_search::vector::DistanceMetric::Manhattan,
+                        _ => zyron_search::vector::DistanceMetric::Cosine,
+                    };
+                    let config = zyron_search::vector::HnswConfig {
+                        m: 16,
+                        efConstruction: 200,
+                        efSearch: 64,
+                        metric,
+                    };
+                    m.create_index(new_id.0, table_id.0, col.id.0, p.vector_dims, config)
+                        .map_err(ProtocolError::Database)?;
                 }
             }
         }
@@ -2136,6 +2244,8 @@ async fn run_rebuild_insert(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        // Rebuild rows carry their stored generated values as data
+        Vec::new(),
     );
 
     let mut run_result: Result<(), ZyronError> = Ok(());
@@ -2256,6 +2366,11 @@ fn build_constraint_entry(
                 .unwrap_or_else(|| format!("pk_{table_name}_{}", cols.join("_"))),
             constraint_type: ConstraintType::PrimaryKey,
             columns: resolve(cols)?,
+            without_overlaps: match &tc.without_overlaps {
+                Some(col) => Some(resolve(std::slice::from_ref(col))?[0]),
+                None => None,
+            },
+            fk_period: false,
             ref_table_id: None,
             ref_columns: vec![],
             check_expr: None,
@@ -2272,6 +2387,11 @@ fn build_constraint_entry(
                 .unwrap_or_else(|| format!("uq_{table_name}_{}", cols.join("_"))),
             constraint_type: ConstraintType::Unique,
             columns: resolve(cols)?,
+            without_overlaps: match &tc.without_overlaps {
+                Some(col) => Some(resolve(std::slice::from_ref(col))?[0]),
+                None => None,
+            },
+            fk_period: false,
             ref_table_id: None,
             ref_columns: vec![],
             check_expr: None,
@@ -2287,6 +2407,8 @@ fn build_constraint_entry(
                 .clone()
                 .unwrap_or_else(|| format!("ck_{table_name}")),
             constraint_type: ConstraintType::Check,
+            without_overlaps: None,
+            fk_period: false,
             columns: vec![],
             ref_table_id: None,
             ref_columns: vec![],
@@ -2332,6 +2454,8 @@ fn build_constraint_entry(
                     .unwrap_or_else(|| format!("fk_{table_name}_{}", cols.join("_"))),
                 constraint_type: ConstraintType::ForeignKey,
                 columns: resolve(cols)?,
+                without_overlaps: None,
+                fk_period: tc.fk_period,
                 ref_table_id: Some(ref_tbl.id),
                 ref_columns: ref_col_ids,
                 check_expr: None,
@@ -2677,6 +2801,270 @@ async fn handle_create_table_clone(
     Ok(DdlResult::Tag("CREATE TABLE".to_string()))
 }
 
+/// Rebuilds the DataType a user defined type stores as, from its catalog
+/// entry, so the column entry carries the real storage declaration
+fn storage_data_type(
+    entry: &zyron_catalog::UserTypeEntry,
+) -> Result<zyron_parser::ast::DataType, ProtocolError> {
+    use zyron_common::TypeId;
+    use zyron_parser::ast::DataType as D;
+    let max = entry.storage_max_length.map(|l| l as usize);
+    Ok(match entry.storage_type_id {
+        TypeId::Boolean => D::Boolean,
+        TypeId::Int16 => D::SmallInt,
+        TypeId::Int32 => D::Int,
+        TypeId::Int64 => D::BigInt,
+        TypeId::Int128 => D::Int128,
+        TypeId::Float32 => D::Float(None),
+        TypeId::Float64 => D::DoublePrecision,
+        TypeId::Decimal => D::Decimal(
+            max.and_then(|p| u8::try_from(p).ok()),
+            entry.storage_fractional_digits,
+        ),
+        TypeId::Char => D::Char(max),
+        TypeId::Varchar => D::Varchar(max),
+        TypeId::Text => D::Text,
+        TypeId::Date => D::Date,
+        TypeId::Timestamp => D::Timestamp(entry.storage_fractional_digits),
+        TypeId::Uuid => D::Uuid,
+        TypeId::Jsonb => D::Jsonb,
+        TypeId::Bytea => D::Bytea,
+        other => {
+            return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                format!(
+                    "user type {} stores as {other}, which a column cannot declare",
+                    entry.name
+                ),
+            )));
+        }
+    })
+}
+
+/// Collects the bare column names an expression references
+fn referenced_columns(expr: &zyron_parser::ast::Expr, out: &mut Vec<String>) {
+    use zyron_parser::ast::Expr;
+    match expr {
+        Expr::Identifier(name) => out.push(name.clone()),
+        Expr::QualifiedIdentifier { column, .. } => out.push(column.clone()),
+        Expr::BinaryOp { left, right, .. } => {
+            referenced_columns(left, out);
+            referenced_columns(right, out);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Nested(expr) => referenced_columns(expr, out),
+        Expr::Function { args, .. } => {
+            for a in args {
+                if let zyron_parser::ast::FunctionArg::Unnamed(e)
+                | zyron_parser::ast::FunctionArg::Named { value: e, .. } = a
+                {
+                    referenced_columns(e, out);
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(e) = operand {
+                referenced_columns(e, out);
+            }
+            for w in conditions {
+                referenced_columns(&w.condition, out);
+                referenced_columns(&w.result, out);
+            }
+            if let Some(e) = else_result {
+                referenced_columns(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolves user defined column types and validates declared column
+/// behaviors (generation, encryption, collation) before the catalog entry
+/// exists, so a bad declaration refuses the statement whole
+fn prepare_column_declarations(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+    stmt: &zyron_parser::ast::CreateTableStatement,
+) -> Result<Vec<zyron_parser::ast::ColumnDef>, ProtocolError> {
+    let mut columns = stmt.columns.clone();
+    let generated_names: Vec<String> = columns
+        .iter()
+        .filter(|c| c.generated.is_some())
+        .map(|c| c.name.clone())
+        .collect();
+    let all_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    for def in &mut columns {
+        if let zyron_parser::ast::DataType::UserDefined(type_name) = &def.data_type.clone() {
+            let db_id = get_session_database(session)?;
+            let entry = server
+                .catalog
+                .resolve_user_type(db_id, type_name)
+                .map_err(ProtocolError::Database)?;
+            def.data_type = storage_data_type(&entry)?;
+            def.user_type_id = Some(entry.id);
+        }
+        if def.encrypted.is_some() {
+            if !def.data_type.to_type_id().is_string() {
+                return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                    format!(
+                        "column {} declares ENCRYPTED on a non text type, encryption applies to text columns",
+                        def.name
+                    ),
+                )));
+            }
+            if def.generated.is_some() {
+                return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                    format!("column {} cannot be both GENERATED and ENCRYPTED", def.name),
+                )));
+            }
+        }
+        if let Some(generated) = &def.generated {
+            if zyron_parser::ast::expr_contains_subquery(&generated.expr) {
+                return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                    format!("generated column {} may not contain a subquery", def.name),
+                )));
+            }
+            let mut refs = Vec::new();
+            referenced_columns(&generated.expr, &mut refs);
+            for referenced in &refs {
+                if referenced.eq_ignore_ascii_case(&def.name)
+                    || generated_names
+                        .iter()
+                        .any(|g| g.eq_ignore_ascii_case(referenced))
+                {
+                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                        format!(
+                            "generated column {} references generated column {referenced}, \
+                         generation expressions reference only ordinary columns",
+                            def.name
+                        ),
+                    )));
+                }
+                if !all_names.iter().any(|n| n.eq_ignore_ascii_case(referenced)) {
+                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                        format!(
+                            "generated column {} references unknown column {referenced}",
+                            def.name
+                        ),
+                    )));
+                }
+            }
+        }
+        if let Some(collation) = &def.collation {
+            let db_id = get_session_database(session)?;
+            match server.catalog.resolve_collation(db_id, collation) {
+                Ok(entry) => {
+                    zyron_types::collation::validate_collation(
+                        &entry.locale,
+                        &entry.provider,
+                        entry.case_sensitive,
+                    )
+                    .map_err(ProtocolError::Database)?;
+                }
+                Err(_) => {
+                    zyron_types::collation::validate_collation(collation, "icu", true).map_err(
+                        |_| {
+                            ProtocolError::Database(ZyronError::ExecutionError(format!(
+                                "collation {collation} on column {} is neither a CREATE COLLATION \
+                                 name nor a locale tag like de_DE",
+                                def.name
+                            )))
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+    // Key constraints never cover encrypted columns, their ciphertext is
+    // not comparable
+    let encrypted_names: Vec<&str> = columns
+        .iter()
+        .filter(|c| c.encrypted.is_some())
+        .map(|c| c.name.as_str())
+        .collect();
+    if !encrypted_names.is_empty() {
+        for def in &columns {
+            if def.encrypted.is_some()
+                && def.constraints.iter().any(|c| {
+                    matches!(
+                        c,
+                        zyron_parser::ast::ColumnConstraint::PrimaryKey
+                            | zyron_parser::ast::ColumnConstraint::Unique
+                    )
+                })
+            {
+                return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                    format!("encrypted column {} cannot be a key column", def.name),
+                )));
+            }
+        }
+        for constraint in &stmt.constraints {
+            let key_columns: &[String] = match &constraint.kind {
+                zyron_parser::ast::TableConstraintKind::PrimaryKey(cols)
+                | zyron_parser::ast::TableConstraintKind::Unique(cols) => cols,
+                _ => continue,
+            };
+            for key_col in key_columns {
+                if encrypted_names
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(key_col))
+                {
+                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                        format!("encrypted column {key_col} cannot be a key column"),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(columns)
+}
+
+/// Allocates encryption keys for the ENCRYPTED columns of a just created
+/// table that declared none, and stamps the key ids into the catalog
+async fn assign_encryption_keys(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+    name: &str,
+) -> Result<(), ProtocolError> {
+    let entry = server
+        .catalog
+        .get_table(schema_id, name)
+        .map_err(ProtocolError::Database)?;
+    if !entry
+        .columns
+        .iter()
+        .any(|c| c.is_encrypted() && c.attrs.encryption_key_id == 0)
+    {
+        return Ok(());
+    }
+    let mut updated = (*entry).clone();
+    for col in &mut updated.columns {
+        if col.is_encrypted() && col.attrs.encryption_key_id == 0 {
+            let algorithm = match col.attrs.encryption_algorithm {
+                0 => zyron_auth::EncryptionAlgorithm::Aes128Gcm,
+                _ => zyron_auth::EncryptionAlgorithm::Aes256Gcm,
+            };
+            let key_id = server
+                .key_store
+                .create_key(algorithm)
+                .map_err(ProtocolError::Database)?;
+            col.attrs.encryption_key_id = key_id;
+        }
+    }
+    server
+        .catalog
+        .update_table(updated)
+        .await
+        .map_err(ProtocolError::Database)?;
+    Ok(())
+}
+
 async fn handle_create_table(
     stmt: &zyron_parser::ast::CreateTableStatement,
     server: &Arc<ServerState>,
@@ -2705,12 +3093,17 @@ async fn handle_create_table(
     // this node does not run refuses the statement whole
     let lake_format = resolve_create_table_format(server, stmt)?;
 
+    // User type resolution and generation, encryption, and collation
+    // validation, all before the entry exists
+    let columns = prepare_column_declarations(server, session, stmt)?;
+
     match server
         .catalog
-        .create_table(schema_id, &name, &stmt.columns, &stmt.constraints)
+        .create_table(schema_id, &name, &columns, &stmt.constraints)
         .await
     {
         Ok(_) => {
+            assign_encryption_keys(server, schema_id, &name).await?;
             apply_create_table_retention(server, schema_id, &name, &stmt.options).await?;
             // A constraint declared ON VIOLATION QUARANTINE needs its
             // companion table to exist before the first row is rejected
@@ -2885,8 +3278,15 @@ async fn provision_constraint_indexes(
         if !constraint.enforced || constraint.columns.is_empty() {
             continue;
         }
+        // A temporal constraint's rows share their scalar keys across
+        // disjoint periods, so a unique index would reject valid rows. It
+        // takes a non unique one instead, whose keys carry the period in
+        // index form: the write path seeks it to find the one stored period
+        // that could still be open where a new row starts, rather than
+        // reading every row of the table
+        let unique = constraint.without_overlaps.is_none();
         let covered = existing.iter().any(|idx| {
-            idx.unique
+            idx.unique == unique
                 && idx.index_type == zyron_catalog::IndexType::BTree
                 && idx.columns.len() == constraint.columns.len()
                 && idx
@@ -2910,7 +3310,15 @@ async fn provision_constraint_indexes(
             };
             column_names.push(col.name.clone());
         }
-        create_backing_btree(server, schema_id, &table, &constraint.name, &column_names).await?;
+        create_backing_btree(
+            server,
+            schema_id,
+            &table,
+            &constraint.name,
+            &column_names,
+            unique,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2924,6 +3332,7 @@ async fn create_backing_btree(
     table: &Arc<zyron_catalog::schema::TableEntry>,
     index_name: &str,
     column_names: &[String],
+    unique: bool,
 ) -> Result<(), ProtocolError> {
     let index_id = server
         .catalog
@@ -2932,7 +3341,7 @@ async fn create_backing_btree(
             schema_id,
             index_name,
             column_names,
-            true,
+            unique,
             zyron_catalog::IndexType::BTree,
         )
         .await
@@ -3396,6 +3805,7 @@ async fn apply_create_table_lake(
         let value = match &opt.value {
             TableOptionValue::String(s) | TableOptionValue::Identifier(s) => s.clone(),
             TableOptionValue::Integer(i) => i.to_string(),
+            TableOptionValue::Float(f) => f.to_string(),
             TableOptionValue::Boolean(b) => b.to_string(),
             TableOptionValue::StringList(items) => items.join(","),
         };
@@ -4498,6 +4908,15 @@ async fn reclaim_table_storage(
                     m.drop_index(idx.id.0);
                 }
             }
+            zyron_catalog::IndexType::Hybrid => {
+                // Both engine halves registered under the hybrid id
+                if let Some(m) = &server.fts_manager {
+                    let _ = m.drop_index(idx.id.0);
+                }
+                if let Some(m) = &server.vector_manager {
+                    let _ = m.drop_index(idx.id.0);
+                }
+            }
         }
         if idx.index_file_id != 0 {
             if let Err(e) = server.disk_manager.delete_file(idx.index_file_id).await {
@@ -4973,6 +5392,17 @@ async fn handle_create_index(
     for c in &stmt.columns {
         match &c.expr {
             zyron_parser::ast::Expr::Identifier(name) => {
+                if table
+                    .columns
+                    .iter()
+                    .any(|col| col.name == *name && col.is_encrypted())
+                {
+                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                        format!(
+                            "column {name} is ENCRYPTED, its ciphertext is not orderable so it cannot be indexed"
+                        ),
+                    )));
+                }
                 key_columns.push((name.clone(), c.asc == Some(false)));
             }
             other => {
@@ -5438,7 +5868,7 @@ async fn handle_drop_schema(
 /// Resolves a possibly schema-qualified object name to (schema_id, bare name).
 /// `schema.name` resolves the named schema; a bare name uses the session's
 /// default schema.
-fn resolve_qualified_name(
+pub(crate) fn resolve_qualified_name(
     name: &str,
     server: &Arc<ServerState>,
     session: &Option<Session>,
@@ -9443,6 +9873,7 @@ fn cdc_opt_str(options: &[zyron_parser::ast::TableOption], key: &str) -> Option<
             V::String(s) => s.clone(),
             V::Identifier(s) => s.clone(),
             V::Integer(n) => n.to_string(),
+            V::Float(f) => f.to_string(),
             V::Boolean(b) => b.to_string(),
             V::StringList(l) => l.join(","),
         })
@@ -11619,7 +12050,7 @@ fn session_db_and_search_path(
 /// Used by DDL handlers that operate at the database scope (CREATE SCHEMA,
 /// DROP SCHEMA, streaming-job dispatch, etc.) and therefore do not need a
 /// target schema in the session's search_path.
-fn get_session_database(
+pub(crate) fn get_session_database(
     session: &Option<Session>,
 ) -> Result<zyron_catalog::DatabaseId, ProtocolError> {
     let session = session
@@ -11650,16 +12081,31 @@ async fn handle_create_fulltext_index(
         table.id.0,
     )?;
 
+    // An explicit analyzer or synonym dictionary is resolved now and
+    // snapshotted into the index parameters, so a restart rebuilds the same
+    // pipeline. An index created without options keeps the legacy simple
+    // pipeline and stores no parameters
+    let params =
+        crate::search_resilience_ddl::fts_params_from_options(&stmt.options, server, session)?;
+    let encoded = match &params {
+        Some(p) => Some(
+            serde_json::to_vec(p)
+                .map_err(|e| ProtocolError::Database(ZyronError::Internal(e.to_string())))?,
+        ),
+        None => None,
+    };
+
     // Register index in the catalog with IndexType::Fulltext
     let index_id = server
         .catalog
-        .create_index(
+        .create_index_with_params(
             table.id,
             schema_id,
             &stmt.name,
             &stmt.columns,
             false,
             zyron_catalog::IndexType::Fulltext,
+            encoded,
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -11679,6 +12125,18 @@ async fn handle_create_fulltext_index(
             })
             .collect();
         if let Err(e) = fts_mgr.create_index(index_id.0, table.id.0, col_ids) {
+            let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+            return Err(ProtocolError::Database(e));
+        }
+        if let Some(p) = &params
+            && let Err(e) = crate::search_resilience_ddl::install_index_analyzer(
+                &server.catalog,
+                fts_mgr,
+                index_id.0,
+                p,
+            )
+        {
+            let _ = fts_mgr.drop_index(index_id.0);
             let _ = server.catalog.drop_index(table.id, &stmt.name).await;
             return Err(ProtocolError::Database(e));
         }
@@ -11721,6 +12179,7 @@ async fn handle_create_vector_index(
             zyron_parser::ast::TableOptionValue::String(s) => s.to_lowercase(),
             zyron_parser::ast::TableOptionValue::Identifier(s) => s.to_lowercase(),
             zyron_parser::ast::TableOptionValue::Integer(n) => n.to_string(),
+            zyron_parser::ast::TableOptionValue::Float(f) => f.to_string(),
             zyron_parser::ast::TableOptionValue::Boolean(b) => b.to_string(),
             zyron_parser::ast::TableOptionValue::StringList(_) => String::new(),
         };
@@ -11855,6 +12314,7 @@ async fn handle_create_spatial_index(
             zyron_parser::ast::TableOptionValue::String(s) => s.clone(),
             zyron_parser::ast::TableOptionValue::Identifier(s) => s.clone(),
             zyron_parser::ast::TableOptionValue::Integer(n) => n.to_string(),
+            zyron_parser::ast::TableOptionValue::Float(f) => f.to_string(),
             zyron_parser::ast::TableOptionValue::Boolean(b) => b.to_string(),
             zyron_parser::ast::TableOptionValue::StringList(_) => String::new(),
         };
@@ -11977,6 +12437,12 @@ async fn handle_create_graph_schema(
         nullable: Some(false),
         default: None,
         constraints: Vec::new(),
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     };
     let to_props = |properties: &[ColumnDef]| -> Vec<zyron_search::graph::PropertyDef> {
         properties
@@ -13081,10 +13547,26 @@ fn actor_role_id(session: &Option<Session>) -> u32 {
 // External endpoint construction helpers
 // ---------------------------------------------------------------------------
 
+/// Hands the streaming layer the engine's nested codec, so a text format
+/// spells a STRUCT or MAP the same way the query path does. The routines live
+/// in the executor, which sits above streaming, so they are registered rather
+/// than depended on. Registration is once per process and a repeat is ignored.
+pub fn install_nested_codec() {
+    zyron_streaming::nested_render::register(
+        zyron_executor::nested_codec::render_json_text,
+        zyron_executor::nested_codec::encode_json_text,
+    );
+}
+
 /// Converts ColumnEntry slices into streaming-layer ColumnSpec entries.
+///
+/// A STRUCT or MAP column carries its declared shape across, because a text
+/// format has to spell the value and the field names live only in the
+/// declaration. Binary formats never read it and write the layout through.
 fn columns_to_specs(
     cols: &[zyron_catalog::ColumnEntry],
 ) -> Vec<zyron_streaming::format::ColumnSpec> {
+    install_nested_codec();
     cols.iter()
         .map(|c| {
             zyron_streaming::format::ColumnSpec::with_precision(
@@ -13092,6 +13574,7 @@ fn columns_to_specs(
                 c.type_id,
                 c.fractional_digits,
             )
+            .with_nested_shape(c.attrs.nested_shape.clone().map(std::sync::Arc::new))
         })
         .collect()
 }
@@ -15705,6 +16188,9 @@ async fn handle_create_model(
             zyron_parser::ast::TableOptionValue::Integer(n) => {
                 hyperparameters.setF64(&opt.key, *n as f64);
             }
+            zyron_parser::ast::TableOptionValue::Float(f) => {
+                hyperparameters.setF64(&opt.key, *f);
+            }
             zyron_parser::ast::TableOptionValue::Boolean(b) => {
                 hyperparameters.setF64(&opt.key, if *b { 1.0 } else { 0.0 });
             }
@@ -16063,4 +16549,68 @@ fn removeModelFile(server: &Arc<ServerState>, name: &str) -> Result<(), ZyronErr
             .map_err(|e| ZyronError::ExecutionError(format!("model remove: {}", e)))?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod nested_shape_wiring_tests {
+    use super::*;
+    use zyron_catalog::schema::{ColumnAttributes, NestedShape, NestedType};
+    use zyron_catalog::{ColumnEntry, ColumnId, TableId};
+    use zyron_common::TypeId;
+
+    fn column(name: &str, type_id: TypeId, shape: Option<NestedShape>) -> ColumnEntry {
+        ColumnEntry {
+            id: ColumnId(1),
+            table_id: TableId(1),
+            name: name.to_string(),
+            type_id,
+            ordinal: 0,
+            nullable: true,
+            default_expr: None,
+            max_length: None,
+            fractional_digits: None,
+            tz_offset_secs: None,
+            element_type: None,
+            attrs: ColumnAttributes {
+                nested_shape: shape,
+                ..ColumnAttributes::default()
+            },
+        }
+    }
+
+    /// The one production site that turns catalog columns into streaming specs
+    /// has to carry a declared shape across. A text format holds no other copy
+    /// of the field names, so dropping it here is what makes a STRUCT column
+    /// unspellable in csv or json.
+    #[test]
+    fn columns_to_specs_carries_a_declared_shape() {
+        let shape =
+            NestedShape::Struct(vec![("kind".to_string(), NestedType::scalar(TypeId::Text))]);
+        let cols = vec![
+            column("id", TypeId::Int64, None),
+            column("s", TypeId::Struct, Some(shape.clone())),
+        ];
+        let specs = columns_to_specs(&cols);
+
+        assert!(
+            specs[0].nested_shape.is_none(),
+            "a plain column declares no shape"
+        );
+        let carried = specs[1]
+            .nested_shape
+            .as_deref()
+            .expect("the struct column carries its shape");
+        assert_eq!(carried, &shape, "the shape changed crossing into the spec");
+
+        // Building specs also hands the streaming layer the engine's codec,
+        // so the value it just described can actually be spelled
+        assert!(
+            zyron_streaming::nested_render::is_registered(),
+            "building specs registers the nested codec"
+        );
+    }
 }

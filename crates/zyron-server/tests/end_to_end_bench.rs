@@ -174,6 +174,10 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
+        media_store: Arc::new(
+            zyron_media::store::MediaStore::open(tmp.path().join("data"))
+                .expect("media store opens in the test data dir"),
+        ),
         config_lookup: None,
         config_all: None,
         data_dir: data_dir.clone(),

@@ -350,6 +350,10 @@ fn build_server_state(
         columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
+        media_store: Arc::new(
+            zyron_media::store::MediaStore::open(data_dir.to_path_buf())
+                .expect("media store opens in the test data dir"),
+        ),
         config_lookup: None,
         config_all: None,
         data_dir: data_dir.to_path_buf(),

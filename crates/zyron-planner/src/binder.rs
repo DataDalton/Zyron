@@ -1867,6 +1867,10 @@ pub struct BoundInsert {
     /// 0. The executor evaluates each over the inserted rows and applies the
     /// expectation's action to violating rows.
     pub expectations: Vec<BoundExpectation>,
+    /// Stored generated columns bound against the table at table_idx 0.
+    /// The executor computes each over the reshaped rows and writes the
+    /// result into the column's slot before constraints run.
+    pub generated_columns: Vec<BoundGeneratedColumn>,
     pub source: BoundInsertSource,
     pub returning: Option<Vec<BoundSelectItem>>,
 }
@@ -1901,6 +1905,15 @@ pub struct BoundExpectation {
     pub quarantine_table_id: Option<u32>,
 }
 
+/// A stored generated column's expression bound against its own table at
+/// table_idx 0, computed by the write path over the reshaped batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundGeneratedColumn {
+    pub column_id: ColumnId,
+    pub ordinal: u16,
+    pub expr: BoundExpr,
+}
+
 #[derive(Debug, Clone)]
 pub enum BoundInsertSource {
     Values(Vec<Vec<BoundExpr>>),
@@ -1917,6 +1930,11 @@ pub struct BoundUpdate {
     /// executor evaluates each over the updated row image and rejects any row
     /// for which a predicate is false.
     pub check_constraints: Vec<BoundExpr>,
+    /// STORED generated columns, recomputed over the updated row image. A
+    /// generated column derives from its siblings, so an update that moves
+    /// one of those siblings moves the generated value with it rather than
+    /// leaving the stored result behind.
+    pub generated_columns: Vec<BoundGeneratedColumn>,
     pub returning: Option<Vec<BoundSelectItem>>,
 }
 
@@ -2443,6 +2461,10 @@ pub struct Binder<'a> {
     // (name, arity) of SQL functions currently being inlined, to detect a
     // recursive function body and fail rather than recurse without bound.
     function_stack: Vec<(String, usize)>,
+    /// Depth of virtual generated column inlining in progress, bounded so a
+    /// generation expression that references another generated column is
+    /// refused instead of recursing forever
+    generation_inline_depth: usize,
 }
 
 impl<'a> Binder<'a> {
@@ -2455,6 +2477,7 @@ impl<'a> Binder<'a> {
             table_memo: std::sync::Mutex::new(HashMap::new()),
             view_stack: Vec::new(),
             function_stack: Vec::new(),
+            generation_inline_depth: 0,
         }
     }
 
@@ -3766,13 +3789,41 @@ impl<'a> Binder<'a> {
     /// node on the hot path.
     fn bind_atom(&self, ctx: &BindContext, expr: &Expr) -> Option<Result<BoundExpr>> {
         match expr {
-            Expr::Identifier(name) => {
-                Some(self.resolve_column(ctx, name).map(BoundExpr::ColumnRef))
+            Expr::Identifier(name) => match self.resolve_column(ctx, name) {
+                // A virtual generated column or user typed output cast
+                // inlines its expression, which needs the async path
+                Ok(cr)
+                    if Self::virtual_generation_sql(ctx, &cr).is_some()
+                        || self.user_output_cast_sql(ctx, &cr).is_some() =>
+                {
+                    None
+                }
+                // A whole declared STRUCT or MAP reads back as its json, and
+                // building that call needs the shape, so it leaves the fast
+                // path the same way a generated column does
+                Ok(cr) if self.nested_whole_value(ctx, &cr).is_some() => {
+                    self.nested_whole_value(ctx, &cr).map(Ok)
+                }
+                other => Some(other.map(BoundExpr::ColumnRef)),
+            },
+            Expr::QualifiedIdentifier { table, column } => {
+                match self.resolve_qualified_column(ctx, table, column) {
+                    Ok(cr)
+                        if Self::virtual_generation_sql(ctx, &cr).is_some()
+                            || self.user_output_cast_sql(ctx, &cr).is_some() =>
+                    {
+                        None
+                    }
+                    // A two part name that resolves to no table may be a
+                    // field read on a nested typed column, which the slow
+                    // path binds as an extraction
+                    Err(_) if self.nested_column_ref(ctx, table).is_some() => None,
+                    Ok(cr) if self.nested_whole_value(ctx, &cr).is_some() => {
+                        self.nested_whole_value(ctx, &cr).map(Ok)
+                    }
+                    other => Some(other.map(BoundExpr::ColumnRef)),
+                }
             }
-            Expr::QualifiedIdentifier { table, column } => Some(
-                self.resolve_qualified_column(ctx, table, column)
-                    .map(BoundExpr::ColumnRef),
-            ),
             Expr::Literal(lit) => Some(Ok(BoundExpr::Literal {
                 value: lit.clone(),
                 type_id: literal_type(lit),
@@ -3804,10 +3855,56 @@ impl<'a> Binder<'a> {
             match expr {
                 Expr::Identifier(name) => {
                     let cr = self.resolve_column(ctx, name)?;
+                    if let Some(generation_sql) = Self::virtual_generation_sql(ctx, &cr) {
+                        return self
+                            .bind_virtual_generation(ctx, name, &generation_sql)
+                            .await;
+                    }
+                    if let Some(cast_sql) = self.user_output_cast_sql(ctx, &cr) {
+                        return self.bind_user_output_cast(ctx, name, &cast_sql).await;
+                    }
+                    if let Some(rendered) = self.nested_whole_value(ctx, &cr) {
+                        return Ok(rendered);
+                    }
                     Ok(BoundExpr::ColumnRef(cr))
                 }
                 Expr::QualifiedIdentifier { table, column } => {
-                    let cr = self.resolve_qualified_column(ctx, table, column)?;
+                    let cr = match self.resolve_qualified_column(ctx, table, column) {
+                        Ok(cr) => cr,
+                        Err(qualified_err) => {
+                            // No table answers to the first part. A column
+                            // of a nested type does, so the second part
+                            // reads as a field extraction on that column
+                            match self.nested_column_ref(ctx, table) {
+                                Some(base_ref) => {
+                                    return Ok(BoundExpr::Function {
+                                        name: "variant_extract".to_string(),
+                                        args: vec![
+                                            BoundExpr::ColumnRef(base_ref),
+                                            BoundExpr::Literal {
+                                                value: LiteralValue::String(column.clone()),
+                                                type_id: TypeId::Text,
+                                            },
+                                        ],
+                                        return_type: TypeId::Text,
+                                        distinct: false,
+                                    });
+                                }
+                                None => return Err(qualified_err),
+                            }
+                        }
+                    };
+                    if let Some(generation_sql) = Self::virtual_generation_sql(ctx, &cr) {
+                        return self
+                            .bind_virtual_generation(ctx, column, &generation_sql)
+                            .await;
+                    }
+                    if let Some(cast_sql) = self.user_output_cast_sql(ctx, &cr) {
+                        return self.bind_user_output_cast(ctx, column, &cast_sql).await;
+                    }
+                    if let Some(rendered) = self.nested_whole_value(ctx, &cr) {
+                        return Ok(rendered);
+                    }
                     Ok(BoundExpr::ColumnRef(cr))
                 }
                 Expr::Literal(lit) => {
@@ -3817,9 +3914,47 @@ impl<'a> Binder<'a> {
                         type_id,
                     })
                 }
+                Expr::Collate { expr: inner, .. } => {
+                    // Outside a comparison or ORDER BY key the collation
+                    // does not change the value, the comparison and
+                    // ordering call sites read it before binding
+                    Ok(bind_child!(inner))
+                }
                 Expr::BinaryOp { left, op, right } => {
-                    let left_bound = bind_child!(left);
-                    let right_bound = bind_child!(right);
+                    // A collated comparison compares through the collation
+                    // instead of byte order, whether the collation was
+                    // written on an operand or declared on its column
+                    if matches!(
+                        op,
+                        BinaryOperator::Eq
+                            | BinaryOperator::Neq
+                            | BinaryOperator::Lt
+                            | BinaryOperator::Gt
+                            | BinaryOperator::LtEq
+                            | BinaryOperator::GtEq
+                    ) {
+                        let collation = Self::explicit_collation(left)
+                            .or_else(|| Self::explicit_collation(right))
+                            .map(str::to_string)
+                            .or_else(|| self.declared_collation(ctx, left))
+                            .or_else(|| self.declared_collation(ctx, right));
+                        if let Some(name) = collation {
+                            return self
+                                .bind_collated_comparison(ctx, left, *op, right, &name)
+                                .await;
+                        }
+                    }
+                    // A range literal is written as text, and its text only
+                    // says which values it holds once the column it is
+                    // compared with says what kind of element it stores
+                    let left_bound = match self.bind_range_literal_operand(ctx, left, right) {
+                        Some(bound) => bound?,
+                        None => bind_child!(left),
+                    };
+                    let right_bound = match self.bind_range_literal_operand(ctx, right, left) {
+                        Some(bound) => bound?,
+                        None => bind_child!(right),
+                    };
                     let type_id =
                         infer_binary_type(op, left_bound.type_id(), right_bound.type_id())?;
                     Ok(BoundExpr::BinaryOp {
@@ -3914,6 +4049,158 @@ impl<'a> Binder<'a> {
                     args,
                     distinct,
                 } => {
+                    // Resilience special forms carry catalog resolved policy
+                    // configuration into the bound expression, so evaluation
+                    // never needs the catalog and the wrapped operation stays
+                    // unevaluated until admission or retry logic runs it
+                    let lower_name = name.to_lowercase();
+                    if matches!(
+                        lower_name.as_str(),
+                        "bulkhead_call" | "with_retry" | "fallback_chain" | "cache_aside"
+                    ) {
+                        let raw_args: Vec<&Expr> = args
+                            .iter()
+                            .map(|a| match a {
+                                FunctionArg::Unnamed(e) => Ok(e),
+                                FunctionArg::Named { value, .. } => Ok(value),
+                                FunctionArg::Wildcard => Err(ZyronError::PlanError(format!(
+                                    "`*` is not a valid argument to {lower_name}"
+                                ))),
+                            })
+                            .collect::<Result<_>>()?;
+                        let int_lit = |n: i64| BoundExpr::Literal {
+                            value: LiteralValue::Integer(n),
+                            type_id: TypeId::Int64,
+                        };
+                        match lower_name.as_str() {
+                            "bulkhead_call" => {
+                                if raw_args.len() < 2 || raw_args.len() > 3 {
+                                    return Err(ZyronError::PlanError(
+                                        "bulkhead_call takes a bulkhead name, an operation, and an optional fallback".to_string(),
+                                    ));
+                                }
+                                let policy_name = resilience_policy_name(raw_args[0])?;
+                                let policy = self.catalog.resolve_resilience_policy(
+                                    self.resolver.database_id(),
+                                    &policy_name,
+                                )?;
+                                if policy.kind != zyron_catalog::ResiliencePolicyKind::Bulkhead {
+                                    return Err(ZyronError::PlanError(format!(
+                                        "{policy_name} is a retry policy, not a bulkhead"
+                                    )));
+                                }
+                                let operation = bind_child!(raw_args[1]);
+                                let return_type = operation.type_id();
+                                let mut rewritten = vec![
+                                    int_lit(policy.id as i64),
+                                    int_lit(policy.max_concurrent as i64),
+                                    int_lit(policy.queue_size as i64),
+                                    int_lit(policy.max_wait_ms as i64),
+                                    operation,
+                                ];
+                                if let Some(fallback) = raw_args.get(2) {
+                                    rewritten.push(bind_child!(*fallback));
+                                }
+                                return Ok(BoundExpr::Function {
+                                    name: "__bulkhead_call".to_string(),
+                                    args: rewritten,
+                                    return_type,
+                                    distinct: false,
+                                });
+                            }
+                            "with_retry" => {
+                                if raw_args.len() != 2 {
+                                    return Err(ZyronError::PlanError(
+                                        "with_retry takes a retry policy name and an operation"
+                                            .to_string(),
+                                    ));
+                                }
+                                let policy_name = resilience_policy_name(raw_args[0])?;
+                                let policy = self.catalog.resolve_resilience_policy(
+                                    self.resolver.database_id(),
+                                    &policy_name,
+                                )?;
+                                if policy.kind != zyron_catalog::ResiliencePolicyKind::Retry {
+                                    return Err(ZyronError::PlanError(format!(
+                                        "{policy_name} is a bulkhead, not a retry policy"
+                                    )));
+                                }
+                                let backoff_code = match policy.backoff.as_str() {
+                                    "fixed" => 0,
+                                    "linear" => 1,
+                                    _ => 2,
+                                };
+                                let errors_json = json_string_array(&policy.retryable_errors);
+                                let operation = bind_child!(raw_args[1]);
+                                let return_type = operation.type_id();
+                                return Ok(BoundExpr::Function {
+                                    name: "__with_retry".to_string(),
+                                    args: vec![
+                                        int_lit(policy.max_attempts as i64),
+                                        int_lit(backoff_code),
+                                        int_lit(policy.base_delay_ms as i64),
+                                        int_lit(policy.max_delay_ms as i64),
+                                        BoundExpr::Literal {
+                                            value: LiteralValue::Float(policy.jitter),
+                                            type_id: TypeId::Float64,
+                                        },
+                                        BoundExpr::Literal {
+                                            value: LiteralValue::String(errors_json),
+                                            type_id: TypeId::Text,
+                                        },
+                                        operation,
+                                    ],
+                                    return_type,
+                                    distinct: false,
+                                });
+                            }
+                            "fallback_chain" => {
+                                if raw_args.is_empty() {
+                                    return Err(ZyronError::PlanError(
+                                        "fallback_chain takes at least one operation".to_string(),
+                                    ));
+                                }
+                                let mut bound = Vec::with_capacity(raw_args.len());
+                                for a in &raw_args {
+                                    bound.push(bind_child!(*a));
+                                }
+                                let mut return_type = bound[0].type_id();
+                                for b in &bound[1..] {
+                                    return_type = case_result_supertype(return_type, b.type_id())?;
+                                }
+                                return Ok(BoundExpr::Function {
+                                    name: "__fallback_chain".to_string(),
+                                    args: bound,
+                                    return_type,
+                                    distinct: false,
+                                });
+                            }
+                            _ => {
+                                if raw_args.len() != 4 {
+                                    return Err(ZyronError::PlanError(
+                                        "cache_aside takes a key, a fetch expression, a ttl, and a stale ttl".to_string(),
+                                    ));
+                                }
+                                let key = bind_child!(raw_args[0]);
+                                let fetch = bind_child!(raw_args[1]);
+                                let ttl_ms = duration_literal_ms(raw_args[2], "ttl")?;
+                                let stale_ms = duration_literal_ms(raw_args[3], "stale_ttl")?;
+                                let return_type = fetch.type_id();
+                                return Ok(BoundExpr::Function {
+                                    name: "__cache_aside".to_string(),
+                                    args: vec![
+                                        key,
+                                        fetch,
+                                        int_lit(ttl_ms as i64),
+                                        int_lit(stale_ms.max(ttl_ms) as i64),
+                                    ],
+                                    return_type,
+                                    distinct: false,
+                                });
+                            }
+                        }
+                    }
+
                     let is_agg = is_aggregate_function(name);
                     let has_wildcard = args.iter().any(|a| matches!(a, FunctionArg::Wildcard));
 
@@ -4030,6 +4317,17 @@ impl<'a> Binder<'a> {
                             target_type: func.return_type,
                             fractional_digits: None,
                         })
+                    } else if let Some(bare) = system_scalar_function(name) {
+                        // Canonical zyron_sys three part names for the built
+                        // in system function families bind to their bare
+                        // dispatch name
+                        let return_type = infer_function_type(bare, &arg_types)?;
+                        Ok(BoundExpr::Function {
+                            name: bare.to_string(),
+                            args: bound_args,
+                            return_type,
+                            distinct: *distinct,
+                        })
                     } else if name.contains('.') {
                         // A qualified call names a user function or aggregate
                         // in exactly one schema; built-ins are never
@@ -4039,8 +4337,11 @@ impl<'a> Binder<'a> {
                         )))
                     } else {
                         let return_type = infer_function_type(name, &arg_types)?;
+                        // The executor dispatches built ins by their lower
+                        // case names, so an upper case spelling folds here
+                        // rather than failing at evaluation
                         Ok(BoundExpr::Function {
-                            name: name.clone(),
+                            name: name.to_lowercase(),
                             args: bound_args,
                             return_type,
                             distinct: *distinct,
@@ -4172,6 +4473,117 @@ impl<'a> Binder<'a> {
                 }),
                 // JSON access operators bind to distinct functions so the
                 // executor knows which operator was used and its return type.
+                Expr::JsonAccess {
+                    left,
+                    op: JsonOperator::Dot,
+                    right,
+                } => {
+                    // Dotted access into a variant or struct value. The
+                    // chain flattens into one extraction over the base
+                    // column with the full dotted path
+                    let mut segments: Vec<String> = Vec::new();
+                    let field = match right.as_ref() {
+                        Expr::Literal(LiteralValue::String(s)) => s.clone(),
+                        other => {
+                            return Err(ZyronError::PlanError(format!(
+                                "dotted access field must be a name, got {other:?}"
+                            )));
+                        }
+                    };
+                    segments.push(field);
+                    let mut base = left.as_ref();
+                    while let Expr::JsonAccess {
+                        left: inner_left,
+                        op: JsonOperator::Dot,
+                        right: inner_right,
+                    } = base
+                    {
+                        match inner_right.as_ref() {
+                            Expr::Literal(LiteralValue::String(s)) => {
+                                segments.insert(0, s.clone());
+                            }
+                            other => {
+                                return Err(ZyronError::PlanError(format!(
+                                    "dotted access field must be a name, got {other:?}"
+                                )));
+                            }
+                        }
+                        base = inner_left.as_ref();
+                    }
+                    let base_ref = match base {
+                        Expr::QualifiedIdentifier { table, column } => {
+                            match self.resolve_qualified_column(ctx, table, column) {
+                                Ok(cr) => cr,
+                                Err(qualified_err) => match self.resolve_column(ctx, table) {
+                                    Ok(cr) => {
+                                        segments.insert(0, column.clone());
+                                        cr
+                                    }
+                                    Err(_) => return Err(qualified_err),
+                                },
+                            }
+                        }
+                        Expr::Identifier(name) => self.resolve_column(ctx, name)?,
+                        other => {
+                            return Err(ZyronError::PlanError(format!(
+                                "dotted access applies to a variant or struct column, got {other:?}"
+                            )));
+                        }
+                    };
+                    if !matches!(
+                        base_ref.type_id,
+                        TypeId::Variant
+                            | TypeId::Struct
+                            | TypeId::Map
+                            | TypeId::Json
+                            | TypeId::Jsonb
+                    ) {
+                        return Err(ZyronError::PlanError(format!(
+                            "dotted access applies to VARIANT, STRUCT, or MAP values, {} is {}",
+                            segments.join("."),
+                            base_ref.type_id
+                        )));
+                    }
+                    // A declared shape says what the path lands on, so a
+                    // STRUCT<age INT> answers `s.age` as an integer instead
+                    // of the text the extraction hands back. A column with
+                    // no declaration, or a path that leaves it, stays text
+                    // A declared STRUCT or MAP is stored in its binary form,
+                    // so the path is walked step by step: a field by the
+                    // position the declaration fixes, a map entry by its key.
+                    // A VARIANT declares no shape, so it keeps the document
+                    // walk that finds the path by name
+                    if matches!(base_ref.type_id, TypeId::Struct | TypeId::Map)
+                        && let Some(steps) = self.declared_path_steps(ctx, &base_ref, &segments)
+                    {
+                        let mut walked = BoundExpr::ColumnRef(base_ref);
+                        for step in steps {
+                            walked = nested_step_call(walked, &step);
+                        }
+                        return Ok(walked);
+                    }
+                    let declared = self.declared_path_type(ctx, &base_ref, &segments);
+                    let extracted = BoundExpr::Function {
+                        name: "variant_extract".to_string(),
+                        args: vec![
+                            BoundExpr::ColumnRef(base_ref),
+                            BoundExpr::Literal {
+                                value: LiteralValue::String(segments.join(".")),
+                                type_id: TypeId::Text,
+                            },
+                        ],
+                        return_type: TypeId::Text,
+                        distinct: false,
+                    };
+                    Ok(match declared {
+                        Some(target) if target != TypeId::Text => BoundExpr::Cast {
+                            expr: Box::new(extracted),
+                            target_type: target,
+                            fractional_digits: None,
+                        },
+                        _ => extracted,
+                    })
+                }
                 Expr::JsonAccess { left, op, right } => {
                     let bound_left = bind_child!(left);
                     let bound_right = bind_child!(right);
@@ -4180,6 +4592,7 @@ impl<'a> Binder<'a> {
                         JsonOperator::DoubleArrow => ("json_get_text", TypeId::Text),
                         JsonOperator::HashArrow => ("json_get_path", TypeId::Jsonb),
                         JsonOperator::HashDoubleArrow => ("json_get_path_text", TypeId::Text),
+                        JsonOperator::Dot => unreachable!("dot access handled above"),
                     };
                     Ok(BoundExpr::Function {
                         name: name.to_string(),
@@ -4281,8 +4694,14 @@ impl<'a> Binder<'a> {
                         type_id,
                     })
                 }
-                Expr::MatchAgainst { columns, query, .. } => {
-                    // Bind as a function call with the match columns and query
+                Expr::MatchAgainst {
+                    columns,
+                    query,
+                    mode,
+                } => {
+                    // Bind as a function call with the match columns and query.
+                    // A phonetic mode selects the phonetic match function so
+                    // the scan encodes terms instead of comparing them literally
                     let bound_query = bind_child!(query);
                     let mut args = Vec::with_capacity(columns.len() + 1);
                     for col_name in columns {
@@ -4290,8 +4709,16 @@ impl<'a> Binder<'a> {
                         args.push(BoundExpr::ColumnRef(cr));
                     }
                     args.push(bound_query);
+                    let phonetic = mode
+                        .as_ref()
+                        .is_some_and(|m| m.to_ascii_lowercase().contains("phonetic"));
+                    let name = if phonetic {
+                        "match_against_phonetic"
+                    } else {
+                        "match_against"
+                    };
                     Ok(BoundExpr::Function {
-                        name: "match_against".to_string(),
+                        name: name.to_string(),
                         args,
                         return_type: TypeId::Float64,
                         distinct: false,
@@ -4316,6 +4743,271 @@ impl<'a> Binder<'a> {
     // -----------------------------------------------------------------------
 
     /// Resolves an unqualified column name by searching all tables in scope.
+    /// The collation name an expression carries explicitly
+    fn explicit_collation(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Collate { collation, .. } => Some(collation),
+            Expr::Nested(inner) => Self::explicit_collation(inner),
+            _ => None,
+        }
+    }
+
+    /// Strips a COLLATE wrapper, leaving the value expression
+    fn strip_collation(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Collate { expr: inner, .. } => Self::strip_collation(inner),
+            Expr::Nested(inner) => Self::strip_collation(inner),
+            other => other,
+        }
+    }
+
+    /// The collation declared on the column an identifier resolves to
+    fn declared_collation(&self, ctx: &BindContext, expr: &Expr) -> Option<String> {
+        let cref = match expr {
+            Expr::Identifier(name) => self.resolve_column(ctx, name).ok()?,
+            Expr::QualifiedIdentifier { table, column } => {
+                self.resolve_qualified_column(ctx, table, column).ok()?
+            }
+            _ => return None,
+        };
+        let mut scope = Some(ctx);
+        while let Some(current) = scope {
+            for table in &current.tables {
+                if table.table_idx == cref.table_idx {
+                    let entry = table.entry.as_ref()?;
+                    let col = entry.columns.iter().find(|c| c.id == cref.column_id)?;
+                    return col.attrs.collation.clone();
+                }
+            }
+            scope = current.outer.as_deref();
+        }
+        None
+    }
+
+    /// Resolves a collation name to (locale, provider, case_sensitive):
+    /// a CREATE COLLATION object when one matches, otherwise the name is
+    /// taken as an ICU locale tag directly
+    fn resolve_collation_spec(&self, name: &str) -> Result<(String, String, bool)> {
+        if let Ok(entry) = self
+            .catalog
+            .resolve_collation(self.resolver.database_id(), name)
+        {
+            return Ok((
+                entry.locale.clone(),
+                entry.provider.clone(),
+                entry.case_sensitive,
+            ));
+        }
+        let looks_like_locale = {
+            let mut parts = name.split(['_', '-']);
+            let lang_ok = parts.next().is_some_and(|l| {
+                (2..=3).contains(&l.len()) && l.chars().all(|c| c.is_ascii_alphabetic())
+            });
+            let region_ok = match parts.next() {
+                None => true,
+                Some(r) => r.len() == 2 && r.chars().all(|c| c.is_ascii_alphabetic()),
+            };
+            lang_ok && region_ok && parts.next().is_none()
+        };
+        if looks_like_locale {
+            return Ok((name.to_string(), "icu".to_string(), true));
+        }
+        Err(ZyronError::PlanError(format!(
+            "collation {name} is neither a CREATE COLLATION name nor a locale tag like de_DE"
+        )))
+    }
+
+    /// Binds a comparison whose operands compare under a collation. Both
+    /// sides bind stripped of any COLLATE wrapper and the comparison runs
+    /// through the collator, so `a op b` becomes
+    /// `collated_compare(a, b, ...) op 0`
+    async fn bind_collated_comparison(
+        &mut self,
+        ctx: &BindContext,
+        left: &Expr,
+        op: BinaryOperator,
+        right: &Expr,
+        collation_name: &str,
+    ) -> Result<BoundExpr> {
+        let (locale, provider, case_sensitive) = self.resolve_collation_spec(collation_name)?;
+        let left_inner = Self::strip_collation(left).clone();
+        let right_inner = Self::strip_collation(right).clone();
+        let left_bound = self.bind_expr(ctx, &left_inner).await?;
+        let right_bound = self.bind_expr(ctx, &right_inner).await?;
+        for side in [&left_bound, &right_bound] {
+            if !side.type_id().is_string() && side.type_id() != TypeId::Null {
+                return Err(ZyronError::PlanError(format!(
+                    "a collated comparison applies to text values, got {}",
+                    side.type_id()
+                )));
+            }
+        }
+        let compare = BoundExpr::Function {
+            name: "collated_compare".to_string(),
+            args: vec![
+                left_bound,
+                right_bound,
+                BoundExpr::Literal {
+                    value: LiteralValue::String(locale),
+                    type_id: TypeId::Text,
+                },
+                BoundExpr::Literal {
+                    value: LiteralValue::String(provider),
+                    type_id: TypeId::Text,
+                },
+                BoundExpr::Literal {
+                    value: LiteralValue::Boolean(case_sensitive),
+                    type_id: TypeId::Boolean,
+                },
+            ],
+            return_type: TypeId::Int32,
+            distinct: false,
+        };
+        Ok(BoundExpr::BinaryOp {
+            left: Box::new(compare),
+            op,
+            right: Box::new(BoundExpr::Literal {
+                value: LiteralValue::Integer(0),
+                type_id: TypeId::Int32,
+            }),
+            type_id: TypeId::Boolean,
+        })
+    }
+
+    /// Wraps an ORDER BY key in its collation's sort key function, so the
+    /// ordinary byte comparator produces the collated order
+    async fn bind_collated_sort_key(
+        &mut self,
+        ctx: &BindContext,
+        expr: &Expr,
+        collation_name: &str,
+    ) -> Result<BoundExpr> {
+        let (locale, provider, case_sensitive) = self.resolve_collation_spec(collation_name)?;
+        let inner = Self::strip_collation(expr).clone();
+        let bound = self.bind_expr(ctx, &inner).await?;
+        if !bound.type_id().is_string() && bound.type_id() != TypeId::Null {
+            return Err(ZyronError::PlanError(format!(
+                "a collated ordering applies to text values, got {}",
+                bound.type_id()
+            )));
+        }
+        Ok(BoundExpr::Function {
+            name: "collation_sort_key".to_string(),
+            args: vec![
+                bound,
+                BoundExpr::Literal {
+                    value: LiteralValue::String(locale),
+                    type_id: TypeId::Text,
+                },
+                BoundExpr::Literal {
+                    value: LiteralValue::String(provider),
+                    type_id: TypeId::Text,
+                },
+                BoundExpr::Literal {
+                    value: LiteralValue::Boolean(case_sensitive),
+                    type_id: TypeId::Boolean,
+                },
+            ],
+            return_type: TypeId::Bytea,
+            distinct: false,
+        })
+    }
+
+    /// The output cast a user typed column applies on read, or None. Skipped
+    /// while an inlining is in progress so the substituted column reference
+    /// binds raw instead of recursing
+    fn user_output_cast_sql(&self, ctx: &BindContext, cref: &ColumnRef) -> Option<String> {
+        if self.generation_inline_depth > 0 {
+            return None;
+        }
+        let mut scope = Some(ctx);
+        while let Some(current) = scope {
+            for table in &current.tables {
+                if table.table_idx == cref.table_idx {
+                    let entry = table.entry.as_ref()?;
+                    let col = entry.columns.iter().find(|c| c.id == cref.column_id)?;
+                    let type_id = col.attrs.user_type_id?;
+                    return self
+                        .catalog
+                        .get_user_type_by_id(type_id)
+                        .and_then(|t| t.output_cast_expr.clone());
+                }
+            }
+            scope = current.outer.as_deref();
+        }
+        None
+    }
+
+    /// Binds a user type's output cast around a column reference, with the
+    /// type's `value` placeholder substituted for the column
+    async fn bind_user_output_cast(
+        &mut self,
+        ctx: &BindContext,
+        column_name: &str,
+        cast_sql: &str,
+    ) -> Result<BoundExpr> {
+        let parsed = zyron_parser::parse_expr(cast_sql).map_err(|e| {
+            ZyronError::PlanError(format!(
+                "output_cast of column {column_name} does not parse: {e}"
+            ))
+        })?;
+        let substituted = substitute_function_params(
+            &parsed,
+            &["value".to_string()],
+            &[Expr::Identifier(column_name.to_string())],
+        );
+        self.generation_inline_depth += 1;
+        let bound = self.bind_expr(ctx, &substituted).await;
+        self.generation_inline_depth -= 1;
+        bound
+    }
+
+    /// The generation expression of a virtual generated column reference,
+    /// or None for ordinary and stored generated columns
+    fn virtual_generation_sql(ctx: &BindContext, cref: &ColumnRef) -> Option<String> {
+        let mut scope = Some(ctx);
+        while let Some(current) = scope {
+            for table in &current.tables {
+                if table.table_idx == cref.table_idx {
+                    let entry = table.entry.as_ref()?;
+                    let col = entry.columns.iter().find(|c| c.id == cref.column_id)?;
+                    if col.is_virtual_generated() {
+                        return col.attrs.generation_expr.clone();
+                    }
+                    return None;
+                }
+            }
+            scope = current.outer.as_deref();
+        }
+        None
+    }
+
+    /// Inlines a virtual generated column by binding its stored expression
+    /// in the referencing scope
+    async fn bind_virtual_generation(
+        &mut self,
+        ctx: &BindContext,
+        column_name: &str,
+        generation_sql: &str,
+    ) -> Result<BoundExpr> {
+        const MAX_GENERATION_INLINE_DEPTH: usize = 8;
+        if self.generation_inline_depth >= MAX_GENERATION_INLINE_DEPTH {
+            return Err(ZyronError::PlanError(format!(
+                "generated column {column_name} exceeded the inline depth bound, \
+                 generation expressions reference only ordinary columns"
+            )));
+        }
+        let parsed = zyron_parser::parse_expr(generation_sql).map_err(|e| {
+            ZyronError::PlanError(format!(
+                "generated column {column_name} has an unreadable expression: {e}"
+            ))
+        })?;
+        self.generation_inline_depth += 1;
+        let bound = self.bind_expr(ctx, &parsed).await;
+        self.generation_inline_depth -= 1;
+        bound
+    }
+
     fn resolve_column(&self, ctx: &BindContext, name: &str) -> Result<ColumnRef> {
         let mut found: Option<ColumnRef> = None;
         for table in &ctx.tables {
@@ -4349,6 +5041,172 @@ impl<'a> Binder<'a> {
     }
 
     /// Resolves a qualified column reference (table.column).
+    /// The column a bare name resolves to, when that column holds a nested
+    /// type whose fields dotted access can extract. Lets `v.kind` read the
+    /// `kind` field of a VARIANT column `v` when no table answers to `v`
+    fn nested_column_ref(&self, ctx: &BindContext, name: &str) -> Option<ColumnRef> {
+        let cr = self.resolve_column(ctx, name).ok()?;
+        matches!(
+            cr.type_id,
+            TypeId::Variant | TypeId::Struct | TypeId::Map | TypeId::Json | TypeId::Jsonb
+        )
+        .then_some(cr)
+    }
+
+    /// The element kind of a range column an expression names, when it names
+    /// one. A range literal is written as text, and the text only says which
+    /// values it holds once the column says what kind of element it stores
+    fn range_element_kind(
+        &self,
+        ctx: &BindContext,
+        expr: &Expr,
+    ) -> Option<zyron_types::range::RangeElemKind> {
+        let cref = match expr {
+            Expr::Identifier(name) => self.resolve_column(ctx, name).ok()?,
+            Expr::QualifiedIdentifier { table, column } => {
+                self.resolve_qualified_column(ctx, table, column).ok()?
+            }
+            _ => return None,
+        };
+        if cref.type_id != TypeId::Range {
+            return None;
+        }
+        let mut scope = Some(ctx);
+        while let Some(current) = scope {
+            for table in &current.tables {
+                if table.table_idx == cref.table_idx
+                    && let Some(entry) = table.entry.as_ref()
+                    && let Some(col) = entry.columns.iter().find(|c| c.id == cref.column_id)
+                {
+                    return Some(match col.element_type {
+                        Some(TypeId::Date) => zyron_types::range::RangeElemKind::Date,
+                        Some(TypeId::Timestamp) | Some(TypeId::TimestampTz) => {
+                            zyron_types::range::RangeElemKind::TimestampMicros
+                        }
+                        _ => zyron_types::range::RangeElemKind::Int,
+                    });
+                }
+            }
+            scope = current.outer.as_deref();
+        }
+        None
+    }
+
+    /// The type a dotted path lands on, when the column it starts from
+    /// declares a shape that reaches it.
+    ///
+    /// A STRUCT names its fields, so `s.age` is whatever `age` was declared
+    /// as rather than the text the extraction produces. A column with no
+    /// declared shape, or a path that runs past what the declaration
+    /// describes, has no answer here and the extraction stays text.
+    /// A whole declared STRUCT or MAP reads back as the JSON text it was
+    /// written with, so everything downstream of the read sees what it always
+    /// saw. Only a path into the value takes the binary fast route, which is
+    /// where the layout pays.
+    fn nested_whole_value(&self, ctx: &BindContext, cref: &ColumnRef) -> Option<BoundExpr> {
+        if !matches!(cref.type_id, TypeId::Struct | TypeId::Map) {
+            return None;
+        }
+        let shape = self.declared_shape(ctx, cref)?;
+        Some(BoundExpr::Function {
+            name: "nested_json".to_string(),
+            args: vec![
+                BoundExpr::ColumnRef(cref.clone()),
+                BoundExpr::Literal {
+                    value: LiteralValue::Bytes(shape.encode()),
+                    type_id: TypeId::Binary,
+                },
+            ],
+            return_type: TypeId::Text,
+            distinct: false,
+        })
+    }
+
+    /// The shape a column declares, when it declares one.
+    fn declared_shape(
+        &self,
+        ctx: &BindContext,
+        cref: &ColumnRef,
+    ) -> Option<zyron_catalog::schema::NestedShape> {
+        let mut scope = Some(ctx);
+        while let Some(current) = scope {
+            for table in &current.tables {
+                if table.table_idx == cref.table_idx
+                    && let Some(entry) = table.entry.as_ref()
+                    && let Some(col) = entry.columns.iter().find(|c| c.id == cref.column_id)
+                {
+                    return col.attrs.nested_shape.clone();
+                }
+            }
+            scope = current.outer.as_deref();
+        }
+        None
+    }
+
+    fn declared_path_type(
+        &self,
+        ctx: &BindContext,
+        cref: &ColumnRef,
+        path: &[String],
+    ) -> Option<TypeId> {
+        self.declared_path_steps(ctx, cref, path)?
+            .last()
+            .map(|s| s.result_type)
+    }
+
+    /// The steps that reach a declared path, which is what lets the read
+    /// address a field by position instead of searching a document for it.
+    fn declared_path_steps(
+        &self,
+        ctx: &BindContext,
+        cref: &ColumnRef,
+        path: &[String],
+    ) -> Option<Vec<PathStep>> {
+        let mut scope = Some(ctx);
+        while let Some(current) = scope {
+            for table in &current.tables {
+                if table.table_idx == cref.table_idx
+                    && let Some(entry) = table.entry.as_ref()
+                    && let Some(col) = entry.columns.iter().find(|c| c.id == cref.column_id)
+                {
+                    let shape = col.attrs.nested_shape.as_ref()?;
+                    return resolve_declared_path_steps(shape, path);
+                }
+            }
+            scope = current.outer.as_deref();
+        }
+        None
+    }
+
+    /// Parses a range literal written as text against the element kind of the
+    /// column it is compared with, so `period = '[2026-01-01,2026-02-01)'`
+    /// compares stored forms rather than a stored form against its spelling.
+    ///
+    /// Without this the comparison reaches the executor as bytes against a
+    /// string and matches nothing, which is a wrong answer rather than an
+    /// error and so the worse of the two failures.
+    fn bind_range_literal_operand(
+        &self,
+        ctx: &BindContext,
+        literal_side: &Expr,
+        column_side: &Expr,
+    ) -> Option<Result<BoundExpr>> {
+        let Expr::Literal(LiteralValue::String(text)) = literal_side else {
+            return None;
+        };
+        let kind = self.range_element_kind(ctx, column_side)?;
+        Some(
+            zyron_types::range::range_from_text(text, kind)
+                .map(|bytes| BoundExpr::Literal {
+                    value: LiteralValue::Bytes(bytes),
+                    type_id: TypeId::Range,
+                })
+                .map_err(|e| {
+                    ZyronError::PlanError(format!("range literal {text} does not parse: {e}"))
+                }),
+        )
+    }
+
     fn resolve_qualified_column(
         &self,
         ctx: &BindContext,
@@ -4397,6 +5255,59 @@ impl<'a> Binder<'a> {
                     result.push(BoundSelectItem::Expr(bound, alias.clone()));
                 }
                 SelectItem::Wildcard => {
+                    let needs_expansion = ctx.tables.iter().any(|t| {
+                        t.entry.as_ref().is_some_and(|e| {
+                            e.columns
+                                .iter()
+                                .any(|c| c.is_virtual_generated() || c.attrs.user_type_id.is_some())
+                        })
+                    });
+                    if needs_expansion {
+                        // A virtual generated column has no stored value and
+                        // a user typed column reads through its output cast,
+                        // so the wildcard expands and each such column
+                        // inlines its expression under its own name
+                        let expansions: Vec<(ColumnRef, String, Option<String>)> = ctx
+                            .tables
+                            .iter()
+                            .flat_map(|table| {
+                                let entry = table.entry.clone();
+                                table.columns.iter().map(move |col| {
+                                    let generation = entry.as_ref().and_then(|e| {
+                                        e.columns
+                                            .iter()
+                                            .find(|c| c.id == col.column_id)
+                                            .filter(|c| c.is_virtual_generated())
+                                            .and_then(|c| c.attrs.generation_expr.clone())
+                                    });
+                                    (
+                                        ColumnRef {
+                                            table_idx: table.table_idx,
+                                            column_id: col.column_id,
+                                            type_id: col.type_id,
+                                            nullable: col.nullable,
+                                            fractional_digits: col.fractional_digits,
+                                        },
+                                        col.name.clone(),
+                                        generation,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        for (cref, name, generation) in expansions {
+                            let bound = match generation {
+                                Some(sql) => self.bind_virtual_generation(ctx, &name, &sql).await?,
+                                None => match self.user_output_cast_sql(ctx, &cref) {
+                                    Some(cast_sql) => {
+                                        self.bind_user_output_cast(ctx, &name, &cast_sql).await?
+                                    }
+                                    None => BoundExpr::ColumnRef(cref),
+                                },
+                            };
+                            result.push(BoundSelectItem::Expr(bound, Some(name)));
+                        }
+                        continue;
+                    }
                     if ctx.suppressed_columns.is_empty() {
                         result.push(BoundSelectItem::Wildcard);
                     } else {
@@ -4506,12 +5417,23 @@ impl<'a> Binder<'a> {
         ctx: &BindContext,
         order: &OrderByExpr,
     ) -> Result<BoundOrderBy> {
-        let bound_expr = self.bind_scalar(ctx, &order.expr).await?;
+        let bound_expr = match self.order_by_collation(ctx, &order.expr) {
+            Some(name) => self.bind_collated_sort_key(ctx, &order.expr, &name).await?,
+            None => self.bind_scalar(ctx, &order.expr).await?,
+        };
         Ok(BoundOrderBy {
             expr: bound_expr,
             asc: order.asc.unwrap_or(true),
             nulls_first: order.nulls_first.unwrap_or(false),
         })
+    }
+
+    /// The collation an ORDER BY key sorts under: written on the key, or
+    /// declared on the column it names
+    fn order_by_collation(&self, ctx: &BindContext, expr: &Expr) -> Option<String> {
+        Self::explicit_collation(expr)
+            .map(str::to_string)
+            .or_else(|| self.declared_collation(ctx, expr))
     }
 
     /// Binds one ORDER BY term of a SELECT, where the select list is in
@@ -4567,7 +5489,10 @@ impl<'a> Binder<'a> {
 
         let expr = match substituted {
             Some(expr) => expr,
-            None => self.bind_scalar(ctx, &order.expr).await?,
+            None => match self.order_by_collation(ctx, &order.expr) {
+                Some(name) => self.bind_collated_sort_key(ctx, &order.expr, &name).await?,
+                None => self.bind_scalar(ctx, &order.expr).await?,
+            },
         };
         Ok(BoundOrderBy {
             expr,
@@ -4708,6 +5633,136 @@ impl<'a> Binder<'a> {
     /// table_idx 0, the same binding context as CHECK constraints. The bound
     /// predicate carries its violation action and quarantine target so the
     /// executor can route violating rows without another catalog lookup.
+    /// Binds the stored generation expressions of a table, each against the
+    /// table's own columns at table_idx 0, so the write path can compute
+    /// them over the reshaped batch
+    pub async fn bind_generated_columns(
+        &mut self,
+        entry: &TableEntry,
+    ) -> Result<Vec<BoundGeneratedColumn>> {
+        if !entry.columns.iter().any(|c| c.is_stored_generated()) {
+            return Ok(Vec::new());
+        }
+        let columns: Vec<BoundColumnDef> = entry
+            .columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+                fractional_digits: c.fractional_digits,
+            })
+            .collect();
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(entry.id),
+            alias: entry.name.clone(),
+            columns,
+            entry: None,
+        });
+        let mut bound = Vec::new();
+        for col in &entry.columns {
+            if !col.is_stored_generated() {
+                continue;
+            }
+            let Some(generation_sql) = &col.attrs.generation_expr else {
+                return Err(ZyronError::PlanError(format!(
+                    "stored generated column {} has no generation expression",
+                    col.name
+                )));
+            };
+            let expr_ast = zyron_parser::parse_expr(generation_sql).map_err(|e| {
+                ZyronError::PlanError(format!(
+                    "generated column {} has an unreadable expression: {e}",
+                    col.name
+                ))
+            })?;
+            let expr = self.bind_expr(&ctx, &expr_ast).await?;
+            bound.push(BoundGeneratedColumn {
+                column_id: col.id,
+                ordinal: col.ordinal,
+                expr,
+            });
+        }
+        Ok(bound)
+    }
+
+    /// Binds the input casts and value checks of every user typed column,
+    /// each with the type's `value` placeholder substituted for the column.
+    /// Casts return as write transforms, checks as CHECK predicates
+    pub async fn bind_user_type_writes(
+        &mut self,
+        entry: &TableEntry,
+    ) -> Result<(Vec<BoundGeneratedColumn>, Vec<BoundExpr>)> {
+        if !entry.columns.iter().any(|c| c.attrs.user_type_id.is_some()) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let columns: Vec<BoundColumnDef> = entry
+            .columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+                fractional_digits: c.fractional_digits,
+            })
+            .collect();
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(entry.id),
+            alias: entry.name.clone(),
+            columns,
+            entry: None,
+        });
+        let value_param = ["value".to_string()];
+        let mut transforms = Vec::new();
+        let mut checks = Vec::new();
+        for col in &entry.columns {
+            let Some(type_id) = col.attrs.user_type_id else {
+                continue;
+            };
+            let user_type = self.catalog.get_user_type_by_id(type_id).ok_or_else(|| {
+                ZyronError::PlanError(format!(
+                    "column {} references user type id {type_id}, which no longer exists",
+                    col.name
+                ))
+            })?;
+            let column_expr = [Expr::Identifier(col.name.clone())];
+            if let Some(cast_sql) = &user_type.input_cast_expr {
+                let parsed = zyron_parser::parse_expr(cast_sql).map_err(|e| {
+                    ZyronError::PlanError(format!(
+                        "type {} input_cast does not parse: {e}",
+                        user_type.name
+                    ))
+                })?;
+                let substituted = substitute_function_params(&parsed, &value_param, &column_expr);
+                let expr = self.bind_expr(&ctx, &substituted).await?;
+                transforms.push(BoundGeneratedColumn {
+                    column_id: col.id,
+                    ordinal: col.ordinal,
+                    expr,
+                });
+            }
+            if let Some(check_sql) = &user_type.check_expr {
+                let parsed = zyron_parser::parse_expr(check_sql).map_err(|e| {
+                    ZyronError::PlanError(format!(
+                        "type {} check does not parse: {e}",
+                        user_type.name
+                    ))
+                })?;
+                let substituted = substitute_function_params(&parsed, &value_param, &column_expr);
+                checks.push(self.bind_expr(&ctx, &substituted).await?);
+            }
+        }
+        Ok((transforms, checks))
+    }
+
     pub async fn bind_expectations(&mut self, entry: &TableEntry) -> Result<Vec<BoundExpectation>> {
         if entry.expectations.is_empty() {
             return Ok(Vec::new());
@@ -4917,14 +5972,26 @@ impl<'a> Binder<'a> {
 
         let entry = self.rt_memo(schema_name, table_name).await?;
 
-        // Resolve target columns
+        // Resolve target columns. Generated columns are never insert
+        // targets: a bare INSERT skips them and an explicit list naming one
+        // is refused
         let target_columns = if stmt.columns.is_empty() {
-            // All columns in table order
-            entry.columns.iter().map(|c| c.id).collect()
+            entry
+                .columns
+                .iter()
+                .filter(|c| !c.is_generated())
+                .map(|c| c.id)
+                .collect()
         } else {
             let mut ids = Vec::with_capacity(stmt.columns.len());
             for col_name in &stmt.columns {
                 let col = self.resolver.resolve_column(&entry, col_name)?;
+                if col.is_generated() {
+                    return Err(ZyronError::PlanError(format!(
+                        "column {} is GENERATED ALWAYS and cannot be written directly",
+                        col.name
+                    )));
+                }
                 ids.push(col.id);
             }
             ids
@@ -5007,8 +6074,14 @@ impl<'a> Binder<'a> {
             None
         };
 
-        let check_constraints = self.bind_check_constraints(&entry).await?;
+        let mut check_constraints = self.bind_check_constraints(&entry).await?;
         let expectations = self.bind_expectations(&entry).await?;
+        // User defined type input casts run first so generation
+        // expressions see the cast form, and the type checks join the
+        // table's CHECK constraints
+        let (mut generated_columns, user_type_checks) = self.bind_user_type_writes(&entry).await?;
+        check_constraints.extend(user_type_checks);
+        generated_columns.extend(self.bind_generated_columns(&entry).await?);
 
         Ok(BoundInsert {
             table_id: entry.id,
@@ -5017,6 +6090,7 @@ impl<'a> Binder<'a> {
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             source,
             returning,
         })
@@ -5061,7 +6135,35 @@ impl<'a> Binder<'a> {
         let mut assignments = Vec::with_capacity(stmt.assignments.len());
         for a in &stmt.assignments {
             let col = self.resolver.resolve_column(&entry, &a.column)?;
-            let value = self.bind_expr(&ctx, &a.value).await?;
+            if col.is_generated() {
+                return Err(ZyronError::PlanError(format!(
+                    "column {} is GENERATED ALWAYS and cannot be written directly",
+                    col.name
+                )));
+            }
+            // A user typed column's input cast wraps the assigned value
+            let value_expr = match col
+                .attrs
+                .user_type_id
+                .and_then(|id| self.catalog.get_user_type_by_id(id))
+                .and_then(|t| t.input_cast_expr.clone())
+            {
+                Some(cast_sql) => {
+                    let parsed = zyron_parser::parse_expr(&cast_sql).map_err(|e| {
+                        ZyronError::PlanError(format!(
+                            "input_cast of column {} does not parse: {e}",
+                            col.name
+                        ))
+                    })?;
+                    substitute_function_params(
+                        &parsed,
+                        &["value".to_string()],
+                        std::slice::from_ref(&a.value),
+                    )
+                }
+                None => a.value.clone(),
+            };
+            let value = self.bind_expr(&ctx, &value_expr).await?;
             assignments.push(BoundAssignment {
                 column_id: col.id,
                 value,
@@ -5086,6 +6188,7 @@ impl<'a> Binder<'a> {
         };
 
         let check_constraints = self.bind_check_constraints(&entry).await?;
+        let generated_columns = self.bind_generated_columns(&entry).await?;
 
         Ok(BoundUpdate {
             table_id: entry.id,
@@ -5093,6 +6196,7 @@ impl<'a> Binder<'a> {
             assignments,
             where_clause,
             check_constraints,
+            generated_columns,
             returning,
         })
     }
@@ -5925,6 +7029,7 @@ impl<'a> Binder<'a> {
                     fractional_digits: None,
                     tz_offset_secs: None,
                     element_type: None,
+                    attrs: Default::default(),
                 })
                 .collect(),
             _ => Vec::new(),
@@ -6492,6 +7597,7 @@ impl<'a> Binder<'a> {
                         fractional_digits: dt.fractional_digits(),
                         tz_offset_secs: None,
                         element_type: dt.declared_element_type(),
+                        attrs: Default::default(),
                     })
                     .collect();
                 let cols = if !declared.is_empty() {
@@ -6552,6 +7658,7 @@ impl<'a> Binder<'a> {
                         fractional_digits: None,
                         tz_offset_secs: None,
                         element_type: None,
+                        attrs: Default::default(),
                     })
                     .collect();
                 if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
@@ -7720,6 +8827,8 @@ fn literal_type(lit: &LiteralValue) -> TypeId {
         LiteralValue::Boolean(_) => TypeId::Boolean,
         LiteralValue::Null => TypeId::Null,
         LiteralValue::Interval(_) => TypeId::Interval,
+        // Already in stored form, so it carries no spelling to re-read
+        LiteralValue::Bytes(_) => TypeId::Range,
     }
 }
 
@@ -7790,6 +8899,91 @@ fn infer_binary_type(op: &BinaryOperator, left: TypeId, right: TypeId) -> Result
 /// yields the other side, two numeric types promote to their numeric
 /// supertype, otherwise the types must match. Incompatible types are an error
 /// so a CASE never silently truncates or mixes unrelated types.
+/// Built in scalar functions addressed by their canonical three part
+/// zyron_sys name. Each maps to the bare name the executor dispatches
+fn system_scalar_function(name: &str) -> Option<&'static str> {
+    match name.to_lowercase().as_str() {
+        "zyron_sys.security.masking_ip" => Some("masking_ip"),
+        "zyron_sys.security.masking_email" => Some("masking_email"),
+        "zyron_sys.security.masking_phone" => Some("masking_phone"),
+        "zyron_sys.security.masking_ssn" => Some("masking_ssn"),
+        "zyron_sys.security.masking_name" => Some("masking_name"),
+        _ => None,
+    }
+}
+
+/// Renders a JSON array of strings without a JSON dependency, escaping
+/// quotes, backslashes, and control characters
+fn json_string_array(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        for c in value.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+/// The policy argument of a resilience call: an identifier, a
+/// schema.name reference, or a string literal
+fn resilience_policy_name(expr: &Expr) -> Result<String> {
+    match expr {
+        Expr::Identifier(s) => Ok(s.clone()),
+        Expr::QualifiedIdentifier { table, column } => Ok(format!("{table}.{column}")),
+        Expr::Literal(LiteralValue::String(s)) => Ok(s.clone()),
+        _ => Err(ZyronError::PlanError(
+            "the policy argument names a bulkhead or retry policy with an identifier or string literal".to_string(),
+        )),
+    }
+}
+
+/// A ttl argument: a duration string like '5s' or '100ms', or a bare
+/// integer of milliseconds
+fn duration_literal_ms(expr: &Expr, what: &str) -> Result<u64> {
+    match expr {
+        Expr::Literal(LiteralValue::Integer(n)) if *n >= 0 => Ok(*n as u64),
+        Expr::Literal(LiteralValue::String(s)) => {
+            let t = s.trim();
+            let (digits, scale) = if let Some(rest) = t.strip_suffix("ms") {
+                (rest, 1u64)
+            } else if let Some(rest) = t.strip_suffix('s') {
+                (rest, 1_000)
+            } else if let Some(rest) = t.strip_suffix('m') {
+                (rest, 60_000)
+            } else if let Some(rest) = t.strip_suffix('h') {
+                (rest, 3_600_000)
+            } else {
+                (t, 1)
+            };
+            digits
+                .trim()
+                .parse::<u64>()
+                .map(|n| n.saturating_mul(scale))
+                .map_err(|_| {
+                    ZyronError::PlanError(format!(
+                        "{what} wants a duration like '100ms', '5s', '2m', or '1h', got '{s}'"
+                    ))
+                })
+        }
+        _ => Err(ZyronError::PlanError(format!(
+            "{what} must be a duration string or an integer of milliseconds"
+        ))),
+    }
+}
+
 fn case_result_supertype(left: TypeId, right: TypeId) -> Result<TypeId> {
     if left == TypeId::Null {
         return Ok(right);
@@ -7879,8 +9073,37 @@ fn integer_rank(t: TypeId) -> u8 {
 }
 
 /// Infers the return type of an aggregate function.
+/// Types no arithmetic aggregate has a meaning for: opaque payloads and
+/// structured values. Rejected at bind so SUM over an image fails the
+/// statement instead of summing garbage
+fn aggregate_rejects(t: TypeId) -> bool {
+    matches!(
+        t,
+        TypeId::Image
+            | TypeId::Video
+            | TypeId::Audio
+            | TypeId::Document
+            | TypeId::ExternalRef
+            | TypeId::Variant
+            | TypeId::Struct
+            | TypeId::Map
+            | TypeId::Ltree
+            | TypeId::Vector
+            | TypeId::Geometry
+            | TypeId::Matrix
+    )
+}
+
 fn infer_aggregate_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
     let lower = name.to_lowercase();
+    if matches!(lower.as_str(), "sum" | "avg" | "min" | "max")
+        && let Some(&t) = arg_types.first()
+        && aggregate_rejects(t)
+    {
+        return Err(ZyronError::PlanError(format!(
+            "{lower}() does not apply to a {t} value"
+        )));
+    }
     match lower.as_str() {
         "count" => Ok(TypeId::Int64),
         "sum" => {
@@ -7922,6 +9145,9 @@ fn infer_aggregate_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
 fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
     let lower = name.to_lowercase();
     Ok(match lower.as_str() {
+        // Table scoped expectation metric, substituted with its verdict
+        // before evaluation. It types here so an expectation predicate binds
+        "row_count_change" => TypeId::Boolean,
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "truncate" => {
             let arg = arg_types.first().copied().unwrap_or(TypeId::Float64);
             // Rounding an instant by decimal digits has no meaning, and
@@ -7995,6 +9221,19 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
             // Delegate to zyron-types registry for extended scalar functions
             if let Some(t) = zyron_types::infer_types_scalar_return_type(&lower, arg_types) {
                 return Ok(t);
+            }
+            // Scalar analytics functions (PREDICT, ATE, PSI, KS_TEST, ...)
+            // are registered in the analytics registry and evaluated by the
+            // executor's ML scalar path. A Scalar entry with a declared
+            // output column binds to that column's type, one without binds
+            // to FLOAT64, which every current ML scalar produces
+            if let Some(f) = zyron_analytics::default_registry().lookup(name) {
+                if matches!(f.kind, zyron_analytics::AnalyticsFunctionKind::Scalar) {
+                    if let Some((_, label)) = f.output_schema.first() {
+                        return Ok(type_label_to_id(label));
+                    }
+                    return Ok(TypeId::Float64);
+                }
             }
             return Err(ZyronError::PlanError(format!("unknown function: {name}")));
         }
@@ -8475,6 +9714,12 @@ mod tests {
                 nullable: Some(true),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
             ColumnDef {
                 name: "amount".to_string(),
@@ -8482,6 +9727,12 @@ mod tests {
                 nullable: Some(true),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
         ];
         let orders_id = catalog
@@ -8497,6 +9748,12 @@ mod tests {
                 nullable: Some(true),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
             ColumnDef {
                 name: "amount".to_string(),
@@ -8504,6 +9761,12 @@ mod tests {
                 nullable: Some(true),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
         ];
         let vip_id = catalog
@@ -8581,6 +9844,12 @@ mod tests {
                 nullable: Some(false),
                 default: None,
                 constraints: vec![ColumnConstraint::PrimaryKey],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
             ColumnDef {
                 name: "amount".to_string(),
@@ -8588,6 +9857,12 @@ mod tests {
                 nullable: Some(true),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
         ];
         let pk_table_id = catalog
@@ -9836,4 +11111,111 @@ mod tests {
         ));
         assert_eq!(super::literal_to_string(&e).unwrap(), "main");
     }
+}
+
+/// Walks a dotted path through a declared shape and returns the type it lands
+/// on.
+///
+/// A leg naming a field the struct does not have has no answer, and neither
+/// does one reaching past the point where the declaration stops describing
+/// what is there. A map answers every key with its declared value type,
+/// because a map's keys are all alike.
+fn resolve_declared_path(
+    shape: &zyron_catalog::schema::NestedShape,
+    path: &[String],
+) -> Option<TypeId> {
+    resolve_declared_path_steps(shape, path)?
+        .last()
+        .map(|s| s.result_type)
+}
+
+/// The call one path step becomes. The result type rides on the call so the
+/// executor knows how to read the field's bytes back, and on the node so the
+/// rest of the plan types the expression without looking inside it.
+fn nested_step_call(value: BoundExpr, step: &PathStep) -> BoundExpr {
+    let type_arg = |t: TypeId| BoundExpr::Literal {
+        value: LiteralValue::Integer(t as i64),
+        type_id: TypeId::Int64,
+    };
+    match (&step.ordinal, &step.key) {
+        (Some(ordinal), _) => BoundExpr::Function {
+            name: "struct_field".to_string(),
+            args: vec![
+                value,
+                BoundExpr::Literal {
+                    value: LiteralValue::Integer(*ordinal as i64),
+                    type_id: TypeId::Int64,
+                },
+                type_arg(step.result_type),
+            ],
+            return_type: step.result_type,
+            distinct: false,
+        },
+        (None, Some((key, key_type))) => BoundExpr::Function {
+            name: "map_value".to_string(),
+            args: vec![
+                value,
+                BoundExpr::Literal {
+                    value: LiteralValue::String(key.clone()),
+                    type_id: TypeId::Text,
+                },
+                type_arg(*key_type),
+                type_arg(step.result_type),
+            ],
+            return_type: step.result_type,
+            distinct: false,
+        },
+        // A step names neither a field nor a key only if the shape resolver
+        // built one, which it does not
+        (None, None) => value,
+    }
+}
+
+/// One step of a declared path, as the binary form addresses it.
+///
+/// A struct step is a field position, which the declaration fixes, so a read
+/// jumps straight to the field instead of searching for its name. A map step
+/// carries the key, which only the value knows.
+#[derive(Debug, Clone)]
+pub struct PathStep {
+    /// Field position for a struct step
+    pub ordinal: Option<usize>,
+    /// Key text and its declared type for a map step
+    pub key: Option<(String, TypeId)>,
+    /// What this step yields
+    pub result_type: TypeId,
+}
+
+/// Resolves a dotted path against a declared shape into the steps that reach
+/// it, or None when the shape does not declare the path.
+fn resolve_declared_path_steps(
+    shape: &zyron_catalog::schema::NestedShape,
+    path: &[String],
+) -> Option<Vec<PathStep>> {
+    use zyron_catalog::schema::NestedShape;
+    let (first, rest) = path.split_first()?;
+    let found = shape.lookup(first)?;
+    let step = match shape {
+        NestedShape::Struct(fields) => PathStep {
+            ordinal: Some(
+                fields
+                    .iter()
+                    .position(|(name, _)| name.eq_ignore_ascii_case(first))?,
+            ),
+            key: None,
+            result_type: found.type_id,
+        },
+        NestedShape::Map { key, .. } => PathStep {
+            ordinal: None,
+            key: Some((first.clone(), key.type_id)),
+            result_type: found.type_id,
+        },
+    };
+    if rest.is_empty() {
+        return Some(vec![step]);
+    }
+    let mut deeper = resolve_declared_path_steps(found.shape.as_deref()?, rest)?;
+    let mut steps = vec![step];
+    steps.append(&mut deeper);
+    Some(steps)
 }

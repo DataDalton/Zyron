@@ -76,14 +76,14 @@ pub(super) fn dispatch(name: &str, args: &[Column], _num_rows: usize) -> Option<
 // cell encoding
 // ---------------------------------------------------------------------------
 
-fn encode_money(minor_units: i64, currency: u16) -> Vec<u8> {
+pub(super) fn encode_money(minor_units: i64, currency: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(10);
     out.extend_from_slice(&minor_units.to_le_bytes());
     out.extend_from_slice(&currency.to_le_bytes());
     out
 }
 
-fn decode_money(name: &str, cell: &[u8]) -> Result<(i64, u16)> {
+pub(super) fn decode_money(name: &str, cell: &[u8]) -> Result<(i64, u16)> {
     if cell.len() != 10 {
         return Err(ZyronError::ExecutionError(format!(
             "{}: money value must be 10 bytes, got {}",
@@ -138,13 +138,13 @@ fn currency_info_json(info: &zyron_types::money::CurrencyInfo) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 // broadcasts length-1 literal columns across the batch
-fn bidx(len: usize, i: usize) -> usize {
+pub(super) fn bidx(len: usize, i: usize) -> usize {
     if len == 1 { 0 } else { i }
 }
 
 // result row count for broadcast args, every length must equal the max or be
 // 1, an empty column short-circuits to an empty result
-fn out_len(name: &str, lens: &[usize]) -> Result<usize> {
+pub(super) fn out_len(name: &str, lens: &[usize]) -> Result<usize> {
     if lens.iter().any(|&l| l == 0) {
         return Ok(0);
     }

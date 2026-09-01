@@ -142,14 +142,14 @@ async fn read_visible_tuple(
 /// check's future, which the cascade paths already nest under an update
 /// operator.
 #[allow(clippy::too_many_arguments)]
-async fn collect_append_keys(
+/// Walks the rows a branch appended to its own file, which no main page
+/// holds and so no main page walk can reach
+async fn for_each_append_row(
     ctx: &Arc<ExecutionContext>,
     table: &TableEntry,
-    positions: &[usize],
-    types: &[TypeId],
     append_file_id: u32,
     append_pages: u64,
-    keys: &mut HashSet<Vec<u8>>,
+    f: &mut (dyn FnMut(&DataBatch, usize) + Send),
 ) -> Result<()> {
     for page_num in 0..append_pages {
         ctx.check_cancelled()?;
@@ -172,9 +172,7 @@ async fn collect_append_keys(
                 continue;
             }
             let batch = decode_tuple_to_batch(view.data, table);
-            if let Some(key) = encode_composite_key(&batch, 0, positions, types) {
-                keys.insert(key);
-            }
+            f(&batch, 0);
         }
     }
     Ok(())
@@ -187,6 +185,27 @@ async fn collect_visible_keys(
     types: &[TypeId],
 ) -> Result<HashSet<Vec<u8>>> {
     let mut keys = HashSet::new();
+    for_each_visible_row(ctx, table, &mut |batch, row| {
+        if let Some(key) = encode_composite_key(batch, row, positions, types) {
+            keys.insert(key);
+        }
+    })
+    .await?;
+    Ok(keys)
+}
+
+/// Walks every row of a table this statement can see, once.
+///
+/// Three places hold rows and each has its own visibility rule: the main
+/// heap pages under the snapshot, the append file a branch writes its own
+/// rows into, and the columnar segments a fold moved rows into. A collector
+/// built on top of this sees all three, which is what keeps a parent probe
+/// from answering for the main line while a branch holds different rows.
+async fn for_each_visible_row(
+    ctx: &Arc<ExecutionContext>,
+    table: &TableEntry,
+    f: &mut (dyn FnMut(&DataBatch, usize) + Send),
+) -> Result<()> {
     let heap = ctx.get_heap_file(table.id).await?;
     let num_pages = heap.num_pages_cached() as u32;
     // Under a branch the parent's keys are its main rows as the branch sees
@@ -223,9 +242,7 @@ async fn collect_visible_keys(
                 continue;
             }
             let batch = decode_tuple_to_batch(view.data, table);
-            if let Some(key) = encode_composite_key(&batch, 0, positions, types) {
-                keys.insert(key);
-            }
+            f(&batch, 0);
         }
     }
 
@@ -234,16 +251,7 @@ async fn collect_visible_keys(
     // key check, which the cascade paths nest under an update operator, and
     // an inlined frame here is what exhausts the stack in a debug build
     if let Some(file_id) = append_file_id {
-        Box::pin(collect_append_keys(
-            ctx,
-            table,
-            positions,
-            types,
-            file_id,
-            append_pages,
-            &mut keys,
-        ))
-        .await?;
+        Box::pin(for_each_append_row(ctx, table, file_id, append_pages, f)).await?;
     }
 
     // Folded rows live in columnar segments the heap walk cannot see. Drain
@@ -270,13 +278,168 @@ async fn collect_visible_keys(
         )?;
         while let Some(eb) = op.next().await? {
             for row in 0..eb.batch.num_rows {
-                if let Some(key) = encode_composite_key(&eb.batch, row, positions, types) {
-                    keys.insert(key);
-                }
+                f(&eb.batch, row);
             }
         }
     }
-    Ok(keys)
+    Ok(())
+}
+
+/// Every parent period that shares a scalar key, keyed by that key.
+///
+/// A period foreign key matches its last column pair by containment rather
+/// than equality, so the probe needs the parent's periods themselves and not
+/// just the fact that a key exists.
+async fn collect_visible_key_periods(
+    ctx: &Arc<ExecutionContext>,
+    table: &TableEntry,
+    scalar_positions: &[usize],
+    scalar_types: &[TypeId],
+    period_position: usize,
+) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>> {
+    let mut out: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    for_each_visible_row(ctx, table, &mut |batch, row| {
+        let Some(key) = encode_composite_key(batch, row, scalar_positions, scalar_types) else {
+            return;
+        };
+        let Some(column) = batch.columns.get(period_position) else {
+            return;
+        };
+        if column.is_null(row) {
+            return;
+        }
+        if let ScalarValue::Binary(period) = column.get_scalar(row) {
+            out.entry(key).or_default().push(period);
+        }
+    })
+    .await?;
+    Ok(out)
+}
+
+/// Whether the parent's periods together cover `child`.
+///
+/// SQL states temporal referential integrity over the union of the matching
+/// parent rows, not over any single one, so two adjacent parent periods
+/// covering a child period between them satisfy the constraint. The parent
+/// periods are merged in position order and the child is tested against each
+/// merged run, which is what makes the check read the union rather than a
+/// row at a time.
+fn periods_cover(parents: &[Vec<u8>], child: &[u8]) -> bool {
+    use zyron_types::range::{
+        RANGE_ELEM_SIZE, range_adjacent, range_contains_range, range_index_key, range_is_empty,
+        range_overlaps, range_union,
+    };
+
+    if range_is_empty(child) {
+        // An empty period demands nothing of the parent
+        return true;
+    }
+    let mut ordered: Vec<&Vec<u8>> = parents.iter().filter(|p| !range_is_empty(p)).collect();
+    if ordered.is_empty() {
+        return false;
+    }
+    // The index form sorts by position, which is the order a coverage sweep
+    // needs, and it is the same ordering the temporal constraint maintains
+    ordered.sort_by_cached_key(|p| range_index_key(p, RANGE_ELEM_SIZE));
+
+    let mut run: Vec<u8> = ordered[0].to_vec();
+    for next in &ordered[1..] {
+        if range_contains_range(&run, child, RANGE_ELEM_SIZE) {
+            return true;
+        }
+        let joins = range_overlaps(&run, next, RANGE_ELEM_SIZE)
+            || range_adjacent(&run, next, RANGE_ELEM_SIZE);
+        run = if joins {
+            match range_union(&run, next, RANGE_ELEM_SIZE) {
+                Ok(merged) => merged,
+                // Two periods that neither meet nor overlap start a new run
+                Err(_) => next.to_vec(),
+            }
+        } else {
+            next.to_vec()
+        };
+    }
+    range_contains_range(&run, child, RANGE_ELEM_SIZE)
+}
+
+/// The child side of a period foreign key: every row's period has to be
+/// covered by the periods of the parent rows sharing its scalar key.
+///
+/// The parent's periods are read once per statement through the same visible
+/// row walk the plain key probe uses, so a branch's appended rows and its
+/// deletions both count, and a folded columnar parent row counts too.
+#[allow(clippy::too_many_arguments)]
+async fn check_child_period_fk(
+    ctx: &Arc<ExecutionContext>,
+    table: &TableEntry,
+    parent: &TableEntry,
+    con: &ConstraintEntry,
+    batch: &DataBatch,
+    local_pos: &[usize],
+    parent_pos: &[usize],
+    violations: &mut FkViolations,
+) -> Result<()> {
+    // The period is the last column of each side, and the scalar key is
+    // everything before it
+    let Some((&child_period_pos, child_scalar_pos)) = local_pos.split_last() else {
+        return Ok(());
+    };
+    let Some((&parent_period_pos, parent_scalar_pos)) = parent_pos.split_last() else {
+        return Ok(());
+    };
+    if table.columns[child_period_pos].type_id != TypeId::Range
+        || parent.columns[parent_period_pos].type_id != TypeId::Range
+    {
+        return Err(zyron_common::ZyronError::PlanError(format!(
+            "foreign key \"{}\" declares PERIOD but its last column pair is not a range",
+            con.name
+        )));
+    }
+    let child_scalar_types: Vec<TypeId> = child_scalar_pos
+        .iter()
+        .map(|&p| table.columns[p].type_id)
+        .collect();
+    let parent_scalar_types: Vec<TypeId> = parent_scalar_pos
+        .iter()
+        .map(|&p| parent.columns[p].type_id)
+        .collect();
+
+    let parent_periods = collect_visible_key_periods(
+        ctx,
+        parent,
+        parent_scalar_pos,
+        &parent_scalar_types,
+        parent_period_pos,
+    )
+    .await?;
+
+    let num_rows = batch.columns.first().map(|c| c.len()).unwrap_or(0);
+    for row in 0..num_rows {
+        // MATCH SIMPLE: a null anywhere in the key leaves the row
+        // unconstrained, and a null period references nothing
+        if child_scalar_pos
+            .iter()
+            .any(|&p| batch.columns[p].is_null(row))
+            || batch.columns[child_period_pos].is_null(row)
+        {
+            continue;
+        }
+        let Some(key) = encode_composite_key(batch, row, child_scalar_pos, &child_scalar_types)
+        else {
+            continue;
+        };
+        let ScalarValue::Binary(child_period) = batch.columns[child_period_pos].get_scalar(row)
+        else {
+            continue;
+        };
+        let covered = parent_periods
+            .get(&key)
+            .is_some_and(|periods| periods_cover(periods, &child_period));
+        if !covered {
+            violations.record(con, row, &table.name, &parent.name)?;
+        }
+    }
+    Ok(())
 }
 
 /// Probes whether a single visible parent row carries the referenced key. Uses
@@ -596,6 +759,24 @@ pub async fn check_child_fks(
             .map(|&p| parent.columns[p].type_id)
             .collect();
 
+        // A period foreign key matches its last column pair by containment,
+        // so it reads the parent's periods rather than asking whether a key
+        // exists
+        if con.fk_period {
+            check_child_period_fk(
+                ctx,
+                table,
+                &parent,
+                con,
+                batch,
+                &local_pos,
+                &parent_pos,
+                &mut violations,
+            )
+            .await?;
+            continue;
+        }
+
         // A lake parent keeps its keys in data files, not a heap, so the
         // probe reads its manifest statistics instead of a btree or a heap
         // scan. Skipping whole files is what keeps this off the write path
@@ -695,18 +876,20 @@ fn logical_schema(table: &TableEntry) -> Vec<LogicalColumn> {
         .collect()
 }
 
-/// Scans a child table once and gathers every live, visible row whose foreign
-/// key matches one of `target_keys`. Heap-resident and columnar-resident rows
-/// are gathered into separate locator-tracked batches so the DML operators
-/// route each one to its mutation path whole. Returns the batches plus the
-/// total match count. A full scan is used because child foreign keys are
-/// typically non-unique, so an index probe would miss duplicate references.
-async fn gather_matching_children(
+/// Scans a child table once and gathers every live, visible row `keep`
+/// accepts. Heap-resident and columnar-resident rows are gathered into
+/// separate locator-tracked batches so the DML operators route each one to
+/// its mutation path whole. Returns the batches plus the total match count.
+/// A full scan is used because child foreign keys are typically non-unique,
+/// so an index probe would miss duplicate references.
+///
+/// The rows are chosen by a closure rather than a key set because a period
+/// foreign key decides row by row: whether a child is still covered depends
+/// on which periods its parent has left, not on whether a key is present
+async fn gather_children_matching(
     ctx: &Arc<ExecutionContext>,
     child: &TableEntry,
-    fk_positions: &[usize],
-    fk_types: &[TypeId],
-    target_keys: &HashSet<Vec<u8>>,
+    keep: &mut (dyn FnMut(&DataBatch, usize) -> bool + Send),
 ) -> Result<(Vec<ExecutionBatch>, usize)> {
     let schema = logical_schema(child);
     let mut builders = create_builders(&schema, 0);
@@ -732,14 +915,7 @@ async fn gather_matching_children(
                 continue;
             }
             let row = decode_tuple_to_batch(view.data, child);
-            // MATCH SIMPLE: a row with any null FK component references nothing.
-            if fk_positions.iter().any(|&p| row.columns[p].is_null(0)) {
-                continue;
-            }
-            let Some(key) = encode_composite_key(&row, 0, fk_positions, fk_types) else {
-                continue;
-            };
-            if target_keys.contains(&key) {
+            if keep(&row, 0) {
                 for (b, col) in builders.iter_mut().zip(&row.columns) {
                     b.push(&col.get_scalar(0));
                 }
@@ -778,16 +954,7 @@ async fn gather_matching_children(
                 if !loc.is_columnar() {
                     continue;
                 }
-                if fk_positions
-                    .iter()
-                    .any(|&p| eb.batch.columns[p].is_null(row))
-                {
-                    continue;
-                }
-                let Some(key) = encode_composite_key(&eb.batch, row, fk_positions, fk_types) else {
-                    continue;
-                };
-                if target_keys.contains(&key) {
+                if keep(&eb.batch, row) {
                     for (b, col) in col_builders.iter_mut().zip(&eb.batch.columns) {
                         b.push(&col.get_scalar(row));
                     }
@@ -803,6 +970,176 @@ async fn gather_matching_children(
     }
 
     Ok((batches, matched))
+}
+
+/// The plain form of the gather above: every child row whose foreign key is
+/// one of `target_keys`.
+async fn gather_matching_children(
+    ctx: &Arc<ExecutionContext>,
+    child: &TableEntry,
+    fk_positions: &[usize],
+    fk_types: &[TypeId],
+    target_keys: &HashSet<Vec<u8>>,
+) -> Result<(Vec<ExecutionBatch>, usize)> {
+    let mut keep = |batch: &DataBatch, row: usize| {
+        // MATCH SIMPLE: a row with any null FK component references nothing
+        match composite_key_at(batch, row, fk_positions, fk_types) {
+            Some(key) => target_keys.contains(&key),
+            None => false,
+        }
+    };
+    gather_children_matching(ctx, child, &mut keep).await
+}
+
+/// The key at one row, or None when any component is null.
+///
+/// MATCH SIMPLE leaves a row with a null component unconstrained, so a null
+/// anywhere means the row references nothing and no parent write concerns it.
+fn composite_key_at(
+    batch: &DataBatch,
+    row: usize,
+    positions: &[usize],
+    types: &[TypeId],
+) -> Option<Vec<u8>> {
+    if positions.iter().any(|&p| batch.columns[p].is_null(row)) {
+        return None;
+    }
+    encode_composite_key(batch, row, positions, types)
+}
+
+/// The stored range at one row, or None when the cell is null or holds
+/// something that is not a range.
+fn period_bytes(batch: &DataBatch, position: usize, row: usize) -> Option<Vec<u8>> {
+    let column = batch.columns.get(position)?;
+    if column.is_null(row) {
+        return None;
+    }
+    match column.get_scalar(row) {
+        ScalarValue::Binary(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// Splits a period foreign key's columns into the scalar half and the period,
+/// which is the last column of each side.
+fn split_period_key(positions: &[usize]) -> Option<(&[usize], usize)> {
+    let (period, scalar) = positions.split_last()?;
+    Some((scalar, *period))
+}
+
+/// The child rows a parent write leaves without cover.
+///
+/// A period foreign key is satisfied by the union of the parent periods that
+/// share the child's scalar key, so taking one parent period away only
+/// concerns the children it was holding up, and only where no other parent
+/// period covers them. Matching on the declared columns instead compares
+/// periods for equality and finds nothing, which is how a temporal child gets
+/// orphaned by a delete that reported success.
+///
+/// `new_batch` carries the parent rows as the statement leaves them for an
+/// UPDATE and is absent for a DELETE. The surviving periods are what is
+/// visible now, less what the statement takes away, plus what it puts back.
+/// Removing a period the statement has already applied finds it gone and
+/// removes nothing, so this reads the same before and after the parent's own
+/// write and both phases of an action get one answer.
+#[allow(clippy::too_many_arguments)]
+async fn gather_children_losing_cover(
+    ctx: &Arc<ExecutionContext>,
+    parent: &TableEntry,
+    child: &TableEntry,
+    con: &ConstraintEntry,
+    old_batch: &DataBatch,
+    new_batch: Option<&DataBatch>,
+    parent_pos: &[usize],
+    child_pos: &[usize],
+) -> Result<(Vec<ExecutionBatch>, usize)> {
+    let (Some((parent_scalar_pos, parent_period_pos)), Some((child_scalar_pos, child_period_pos))) =
+        (split_period_key(parent_pos), split_period_key(child_pos))
+    else {
+        return Ok((Vec::new(), 0));
+    };
+    if parent.columns[parent_period_pos].type_id != TypeId::Range
+        || child.columns[child_period_pos].type_id != TypeId::Range
+    {
+        return Err(ZyronError::PlanError(format!(
+            "foreign key \"{}\" declares PERIOD but its last column pair is not a range",
+            con.name
+        )));
+    }
+    let parent_scalar_types: Vec<TypeId> = parent_scalar_pos
+        .iter()
+        .map(|&p| parent.columns[p].type_id)
+        .collect();
+    let child_scalar_types: Vec<TypeId> = child_scalar_pos
+        .iter()
+        .map(|&p| child.columns[p].type_id)
+        .collect();
+
+    let mut surviving = collect_visible_key_periods(
+        ctx,
+        parent,
+        parent_scalar_pos,
+        &parent_scalar_types,
+        parent_period_pos,
+    )
+    .await?;
+
+    // Keys this statement touches, and the periods it takes from them. A
+    // period is removed by value, which is exact: the parent's periods for one
+    // key do not overlap, so no two of its rows carry the same one
+    let num_rows = old_batch.columns.first().map(|c| c.len()).unwrap_or(0);
+    let mut touched: HashSet<Vec<u8>> = HashSet::new();
+    for row in 0..num_rows {
+        let Some(key) = composite_key_at(old_batch, row, parent_scalar_pos, &parent_scalar_types)
+        else {
+            continue;
+        };
+        touched.insert(key.clone());
+        let Some(period) = period_bytes(old_batch, parent_period_pos, row) else {
+            continue;
+        };
+        if let Some(periods) = surviving.get_mut(&key)
+            && let Some(at) = periods.iter().position(|held| *held == period)
+        {
+            periods.swap_remove(at);
+        }
+    }
+    if let Some(new_batch) = new_batch {
+        let new_rows = new_batch.columns.first().map(|c| c.len()).unwrap_or(0);
+        for row in 0..new_rows {
+            let Some(key) =
+                composite_key_at(new_batch, row, parent_scalar_pos, &parent_scalar_types)
+            else {
+                continue;
+            };
+            let Some(period) = period_bytes(new_batch, parent_period_pos, row) else {
+                continue;
+            };
+            let periods = surviving.entry(key).or_default();
+            if !periods.iter().any(|held| *held == period) {
+                periods.push(period);
+            }
+        }
+    }
+    if touched.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let mut keep = |batch: &DataBatch, row: usize| {
+        let Some(key) = composite_key_at(batch, row, child_scalar_pos, &child_scalar_types) else {
+            return false;
+        };
+        if !touched.contains(&key) {
+            return false;
+        }
+        // A null period references nothing, so no parent write strands it
+        let Some(period) = period_bytes(batch, child_period_pos, row) else {
+            return false;
+        };
+        let left = surviving.get(&key).map(|p| p.as_slice()).unwrap_or(&[]);
+        !periods_cover(left, &period)
+    };
+    gather_children_matching(ctx, child, &mut keep).await
 }
 
 /// Drives a sub-operator to completion, discarding its output batches.
@@ -857,26 +1194,35 @@ pub async fn enforce_parent_delete(
             .map(|&p| child.columns[p].type_id)
             .collect();
 
-        // Keys of the parent rows being deleted (null components reference no
-        // child, so they are skipped).
-        let mut target_keys = HashSet::new();
-        for row in 0..num_rows {
-            if parent_pos
-                .iter()
-                .any(|&p| old_batch.columns[p].is_null(row))
-            {
+        // A period key is answered by coverage, not by equality: the child
+        // rows that matter are the ones the deleted periods were holding up
+        // and that no remaining parent period covers
+        let (batches, matched_count) = if con.fk_period {
+            gather_children_losing_cover(
+                ctx,
+                parent,
+                &child,
+                &con,
+                old_batch,
+                None,
+                &parent_pos,
+                &child_pos,
+            )
+            .await?
+        } else {
+            // Keys of the parent rows being deleted (null components reference
+            // no child, so they are skipped).
+            let mut target_keys = HashSet::new();
+            for row in 0..num_rows {
+                if let Some(k) = composite_key_at(old_batch, row, &parent_pos, &parent_types) {
+                    target_keys.insert(k);
+                }
+            }
+            if target_keys.is_empty() {
                 continue;
             }
-            if let Some(k) = encode_composite_key(old_batch, row, &parent_pos, &parent_types) {
-                target_keys.insert(k);
-            }
-        }
-        if target_keys.is_empty() {
-            continue;
-        }
-
-        let (batches, matched_count) =
-            gather_matching_children(ctx, &child, &child_pos, &child_types, &target_keys).await?;
+            gather_matching_children(ctx, &child, &child_pos, &child_types, &target_keys).await?
+        };
         if matched_count == 0 {
             continue;
         }
@@ -988,25 +1334,27 @@ async fn drive_set_default(
 /// one it referenced, so the rows are grouped by the key they hold and each
 /// group is written with its own literal. Grouping happens over rows already
 /// gathered, so the child is still scanned once however many keys moved.
+#[allow(clippy::too_many_arguments)]
 async fn drive_cascade_update(
     ctx: &Arc<ExecutionContext>,
     child: &TableEntry,
     con: &ConstraintEntry,
     child_pos: &[usize],
     child_types: &[TypeId],
+    assign_columns: &[ColumnId],
     remap: &HashMap<Vec<u8>, Vec<ScalarValue>>,
     batches: Vec<ExecutionBatch>,
 ) -> Result<()> {
     // The child columns the assignment writes, in the constraint's order, so
     // component i of a new key lands on the column that held component i of
-    // the old one
-    let assign_types: Vec<TypeId> = con
-        .columns
+    // the old one. A period key writes only its scalar half, so the caller
+    // says which columns move rather than the constraint's whole column list
+    let assign_types: Vec<TypeId> = assign_columns
         .iter()
         .filter_map(|cid| child.columns.iter().find(|c| c.id == *cid))
         .map(|c| c.type_id)
         .collect();
-    if assign_types.len() != con.columns.len() {
+    if assign_types.len() != assign_columns.len() {
         return Err(ZyronError::ForeignKeyViolation(format!(
             "constraint \"{}\" names a column table \"{}\" does not have",
             con.name, child.name
@@ -1054,8 +1402,7 @@ async fn drive_cascade_update(
     // literal is a parser value, which cannot hold a UUID, a sixteen-byte
     // integer or a binary key exactly, and a key rewritten through its text
     // rendering is a different key
-    let assignments: Vec<BoundAssignment> = con
-        .columns
+    let assignments: Vec<BoundAssignment> = assign_columns
         .iter()
         .zip(assign_types.iter())
         .enumerate()
@@ -1108,6 +1455,7 @@ async fn drive_child_update_with_params(
         batches: batches.into(),
     });
     let checks = zyron_planner::bind_table_check_constraints(&ctx.catalog, child).await?;
+    let generated = zyron_planner::bind_table_generated_columns(&ctx.catalog, child).await?;
     let mut upd = UpdateOperator::new(
         source,
         Arc::clone(ctx),
@@ -1115,6 +1463,7 @@ async fn drive_child_update_with_params(
         assignments,
         logical_schema(child),
         checks,
+        generated,
     );
     if let Some(params) = params {
         upd = upd.with_params(params);
@@ -1199,11 +1548,28 @@ pub async fn enforce_parent_update(
         let Some(child_pos) = column_positions(&child, &con.columns) else {
             continue;
         };
-        let parent_types: Vec<TypeId> = parent_pos
+        let child_types: Vec<TypeId> = child_pos
+            .iter()
+            .map(|&p| child.columns[p].type_id)
+            .collect();
+
+        // A period key cascades on its scalar half. A child's period is its
+        // own, and the parent's new period is not a value that can be written
+        // onto it, so the remap and the cascade both work on the columns
+        // before the period
+        let (key_parent_pos, key_child_pos) = if con.fk_period {
+            match (split_period_key(&parent_pos), split_period_key(&child_pos)) {
+                (Some((p, _)), Some((c, _))) => (p, c),
+                _ => continue,
+            }
+        } else {
+            (&parent_pos[..], &child_pos[..])
+        };
+        let key_parent_types: Vec<TypeId> = key_parent_pos
             .iter()
             .map(|&p| parent.columns[p].type_id)
             .collect();
-        let child_types: Vec<TypeId> = child_pos
+        let key_child_types: Vec<TypeId> = key_child_pos
             .iter()
             .map(|&p| child.columns[p].type_id)
             .collect();
@@ -1213,15 +1579,16 @@ pub async fn enforce_parent_update(
         // every key of a multi-row update rather than one of them
         let mut remap: HashMap<Vec<u8>, Vec<ScalarValue>> = HashMap::new();
         for row in 0..num_rows {
-            let Some(old_key) = encode_composite_key(old_batch, row, &parent_pos, &parent_types)
+            let Some(old_key) =
+                encode_composite_key(old_batch, row, key_parent_pos, &key_parent_types)
             else {
                 continue;
             };
-            let new_key = encode_composite_key(new_batch, row, &parent_pos, &parent_types);
+            let new_key = encode_composite_key(new_batch, row, key_parent_pos, &key_parent_types);
             if Some(&old_key) == new_key.as_ref() {
                 continue;
             }
-            let new_values: Vec<ScalarValue> = parent_pos
+            let new_values: Vec<ScalarValue> = key_parent_pos
                 .iter()
                 .map(|&p| new_batch.columns[p].get_scalar(row))
                 .collect();
@@ -1239,13 +1606,28 @@ pub async fn enforce_parent_update(
             }
             remap.insert(old_key, new_values);
         }
-        if remap.is_empty() {
-            continue;
-        }
-        let changed_keys: HashSet<Vec<u8>> = remap.keys().cloned().collect();
-
-        let (batches, matched_count) =
-            gather_matching_children(ctx, &child, &child_pos, &child_types, &changed_keys).await?;
+        // A period key is answered by coverage: the parent's period may have
+        // moved without its scalar key moving at all, and the children that
+        // matter are the ones no remaining parent period covers
+        let (batches, matched_count) = if con.fk_period {
+            gather_children_losing_cover(
+                ctx,
+                parent,
+                &child,
+                &con,
+                old_batch,
+                Some(new_batch),
+                &parent_pos,
+                &child_pos,
+            )
+            .await?
+        } else {
+            if remap.is_empty() {
+                continue;
+            }
+            let changed_keys: HashSet<Vec<u8>> = remap.keys().cloned().collect();
+            gather_matching_children(ctx, &child, &child_pos, &child_types, &changed_keys).await?
+        };
         if matched_count == 0 {
             continue;
         }
@@ -1266,13 +1648,41 @@ pub async fn enforce_parent_update(
                     .await?;
             }
             ReferentialAction::Cascade => {
+                // A cascade moves a child to wherever its parent's key went.
+                // A child that lost cover because the parent's period shrank
+                // has a key that did not move, so there is nowhere to move it
+                // to, and writing nothing would leave an orphan behind a
+                // statement that reported success
+                if con.fk_period {
+                    for eb in &batches {
+                        for row in 0..eb.batch.num_rows {
+                            let moved =
+                                composite_key_at(&eb.batch, row, key_child_pos, &key_child_types)
+                                    .is_some_and(|key| remap.contains_key(&key));
+                            if !moved {
+                                return Err(ZyronError::ForeignKeyViolation(format!(
+                                    "update on table \"{}\" leaves a row of \"{}\" outside every period of foreign key constraint \"{}\", and a cascade cannot move a row whose referenced key did not move",
+                                    parent.name, child.name, con.name
+                                )));
+                            }
+                        }
+                    }
+                }
+                // A period key moves its scalar half only, so the
+                // assignment stops before the period column
+                let assign_columns = if con.fk_period {
+                    &con.columns[..con.columns.len().saturating_sub(1)]
+                } else {
+                    &con.columns[..]
+                };
                 run_with_depth_guard(async {
                     drive_cascade_update(
                         ctx,
                         &child,
                         &con,
-                        &child_pos,
-                        &child_types,
+                        key_child_pos,
+                        &key_child_types,
+                        assign_columns,
                         &remap,
                         batches,
                     )

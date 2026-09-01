@@ -21,6 +21,7 @@ pub mod job;
 pub mod job_runner;
 pub mod late_data;
 pub mod metrics;
+pub mod nested_render;
 pub mod record;
 pub mod retry;
 pub mod row_codec;

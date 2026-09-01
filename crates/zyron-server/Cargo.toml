@@ -9,6 +9,7 @@ zyron-mesh = { path = "../zyron-mesh" }
 zyron-raft = { path = "../zyron-raft" }
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
+zyron-media = { path = "../zyron-media" }
 zyron-buffer = { path = "../zyron-buffer" }
 zyron-wal = { path = "../zyron-wal" }
 zyron-storage = { path = "../zyron-storage" }

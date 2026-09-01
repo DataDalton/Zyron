@@ -460,6 +460,70 @@ mod tests {
         async fn delete_version_tag(&self, _: u32) -> Result<bool> {
             unimplemented!()
         }
+        async fn load_analyzers(&self) -> Result<Vec<crate::schema::AnalyzerEntry>> {
+            Ok(vec![])
+        }
+        async fn store_analyzer(&self, _: &crate::schema::AnalyzerEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_analyzer(&self, _: &crate::schema::AnalyzerEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_analyzer(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_synonym_dictionaries(
+            &self,
+        ) -> Result<Vec<crate::schema::SynonymDictionaryEntry>> {
+            Ok(vec![])
+        }
+        async fn store_synonym_dictionary(
+            &self,
+            _: &crate::schema::SynonymDictionaryEntry,
+        ) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_synonym_dictionary(
+            &self,
+            _: &crate::schema::SynonymDictionaryEntry,
+        ) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_synonym_dictionary(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_resilience_policies(
+            &self,
+        ) -> Result<Vec<crate::schema::ResiliencePolicyEntry>> {
+            Ok(vec![])
+        }
+        async fn store_resilience_policy(
+            &self,
+            _: &crate::schema::ResiliencePolicyEntry,
+        ) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_resilience_policy(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_user_types(&self) -> Result<Vec<crate::schema::UserTypeEntry>> {
+            Ok(vec![])
+        }
+        async fn store_user_type(&self, _: &crate::schema::UserTypeEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_user_type(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_collations(&self) -> Result<Vec<crate::schema::CollationEntry>> {
+            Ok(vec![])
+        }
+        async fn store_collation(&self, _: &crate::schema::CollationEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_collation(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
         async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>> {
             Ok(vec![])
         }
@@ -643,6 +707,7 @@ mod tests {
                             fractional_digits: None,
                             tz_offset_secs: None,
                             element_type: None,
+                            attrs: Default::default(),
                         },
                         ColumnEntry {
                             id: ColumnId(1),
@@ -656,6 +721,7 @@ mod tests {
                             fractional_digits: None,
                             tz_offset_secs: None,
                             element_type: None,
+                            attrs: Default::default(),
                         },
                     ],
                     constraints: vec![],

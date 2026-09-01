@@ -505,6 +505,318 @@ where
         .map_err(|_| ZyronError::ExecutionError("hedged operation timed out".to_string()))?
 }
 
+// ---------------------------------------------------------------------------
+// Bulkhead
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct BulkheadStatus {
+    pub active: u32,
+    pub queued: u32,
+    pub max_concurrent: u32,
+    pub queue_size: u32,
+    pub max_wait_ms: u64,
+}
+
+/// Lock free concurrency limiter. Up to max_concurrent callers hold permits
+/// at once, up to queue_size more wait for a slot until max_wait elapses,
+/// everyone else is rejected immediately
+pub struct Bulkhead {
+    max_concurrent: u32,
+    queue_size: u32,
+    max_wait: Duration,
+    active: AtomicU32,
+    queued: AtomicU32,
+}
+
+/// RAII admission ticket, releases the concurrency slot on drop
+pub struct BulkheadPermit<'a> {
+    owner: &'a Bulkhead,
+}
+
+impl Drop for BulkheadPermit<'_> {
+    fn drop(&mut self) {
+        self.owner.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Bulkhead {
+    pub fn new(max_concurrent: u32, queue_size: u32, max_wait: Duration) -> Result<Self> {
+        if max_concurrent == 0 {
+            return Err(ZyronError::InvalidParameter {
+                name: "max_concurrent".to_string(),
+                value: "0".to_string(),
+            });
+        }
+        Ok(Self {
+            max_concurrent,
+            queue_size,
+            max_wait,
+            active: AtomicU32::new(0),
+            queued: AtomicU32::new(0),
+        })
+    }
+
+    /// Claims an active slot if one is free
+    fn try_claim(&self) -> bool {
+        loop {
+            let cur = self.active.load(Ordering::Acquire);
+            if cur >= self.max_concurrent {
+                return false;
+            }
+            if self
+                .active
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Admits the caller immediately when capacity allows, otherwise waits
+    /// in the bounded queue with short sleeps until max_wait elapses
+    pub fn try_enter(&self) -> Result<BulkheadPermit<'_>> {
+        if self.try_claim() {
+            return Ok(BulkheadPermit { owner: self });
+        }
+        loop {
+            let q = self.queued.load(Ordering::Acquire);
+            if q >= self.queue_size {
+                return Err(ZyronError::ExecutionError(
+                    "bulkhead queue full".to_string(),
+                ));
+            }
+            if self
+                .queued
+                .compare_exchange_weak(q, q + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let start = Instant::now();
+        loop {
+            if self.try_claim() {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+                return Ok(BulkheadPermit { owner: self });
+            }
+            if start.elapsed() >= self.max_wait {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+                return Err(ZyronError::ExecutionError(
+                    "bulkhead wait timed out".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    pub fn snapshot(&self) -> BulkheadStatus {
+        BulkheadStatus {
+            active: self.active.load(Ordering::Acquire),
+            queued: self.queued.load(Ordering::Acquire),
+            max_concurrent: self.max_concurrent,
+            queue_size: self.queue_size,
+            max_wait_ms: self.max_wait.as_millis() as u64,
+        }
+    }
+}
+
+pub struct BulkheadRegistry {
+    inner: scc::HashMap<String, Arc<Bulkhead>>,
+}
+
+impl Default for BulkheadRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BulkheadRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: scc::HashMap::new(),
+        }
+    }
+
+    pub fn get_or_create(
+        &self,
+        name: &str,
+        max_concurrent: u32,
+        queue_size: u32,
+        max_wait: Duration,
+    ) -> Result<Arc<Bulkhead>> {
+        if let Some(found) = self.inner.read_sync(name, |_, b| Arc::clone(b)) {
+            return Ok(found);
+        }
+        let new_b = Arc::new(Bulkhead::new(max_concurrent, queue_size, max_wait)?);
+        match self.inner.entry_sync(name.to_string()) {
+            scc::hash_map::Entry::Occupied(o) => Ok(Arc::clone(o.get())),
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(Arc::clone(&new_b));
+                Ok(new_b)
+            }
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<Bulkhead>> {
+        self.inner.read_sync(name, |_, b| Arc::clone(b))
+    }
+
+    pub fn list(&self) -> Vec<(String, BulkheadStatus)> {
+        let mut out = Vec::new();
+        self.inner.iter_sync(|k, v| {
+            out.push((k.clone(), v.snapshot()));
+            true
+        });
+        out
+    }
+
+    pub fn remove(&self, name: &str) -> bool {
+        self.inner.remove_sync(name).is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RetryPolicy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffKind {
+    Fixed,
+    Linear,
+    Exponential,
+}
+
+/// Declarative retry configuration. delays() yields the wait before each
+/// retry attempt, capped at max_delay with optional multiplicative jitter
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub backoff: BackoffKind,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    pub jitter: f64,
+    pub retryable_errors: Vec<String>,
+}
+
+impl RetryPolicy {
+    pub fn new(
+        max_attempts: u32,
+        backoff: BackoffKind,
+        base_delay: Duration,
+        max_delay: Duration,
+        jitter: f64,
+        retryable_errors: Vec<String>,
+    ) -> Result<Self> {
+        if max_attempts == 0 {
+            return Err(ZyronError::InvalidParameter {
+                name: "max_attempts".to_string(),
+                value: "0".to_string(),
+            });
+        }
+        if !jitter.is_finite() || !(0.0..=1.0).contains(&jitter) {
+            return Err(ZyronError::InvalidParameter {
+                name: "jitter".to_string(),
+                value: jitter.to_string(),
+            });
+        }
+        Ok(Self {
+            max_attempts,
+            backoff,
+            base_delay,
+            max_delay,
+            jitter,
+            retryable_errors,
+        })
+    }
+
+    /// Yields one delay per retry, max_attempts - 1 entries. max_delay is a
+    /// hard ceiling applied before and after jitter
+    pub fn delays(&self) -> impl Iterator<Item = Duration> + '_ {
+        let retries = self.max_attempts.saturating_sub(1);
+        (1..=retries).map(move |attempt| {
+            let base_nanos = self.base_delay.as_nanos();
+            let multiplier: u128 = match self.backoff {
+                BackoffKind::Fixed => 1,
+                BackoffKind::Linear => attempt as u128,
+                BackoffKind::Exponential => 1u128 << (attempt - 1).min(127),
+            };
+            let raw = base_nanos.saturating_mul(multiplier);
+            let capped = raw.min(self.max_delay.as_nanos());
+            let jittered = if self.jitter > 0.0 {
+                let mut rng = rand::rng();
+                let factor: f64 = rng.random_range((1.0 - self.jitter)..(1.0 + self.jitter));
+                ((capped as f64 * factor) as u128).min(self.max_delay.as_nanos())
+            } else {
+                capped
+            };
+            Duration::from_nanos(jittered.min(u64::MAX as u128) as u64)
+        })
+    }
+
+    /// Case insensitive substring match against the retryable list, an
+    /// empty list treats every error as retryable
+    pub fn error_is_retryable(&self, error_text: &str) -> bool {
+        if self.retryable_errors.is_empty() {
+            return true;
+        }
+        let lower = error_text.to_lowercase();
+        self.retryable_errors
+            .iter()
+            .any(|pattern| lower.contains(&pattern.to_lowercase()))
+    }
+}
+
+pub struct RetryPolicyRegistry {
+    inner: scc::HashMap<String, Arc<RetryPolicy>>,
+}
+
+impl Default for RetryPolicyRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RetryPolicyRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: scc::HashMap::new(),
+        }
+    }
+
+    pub fn get_or_create(&self, name: &str, policy: RetryPolicy) -> Arc<RetryPolicy> {
+        if let Some(found) = self.inner.read_sync(name, |_, p| Arc::clone(p)) {
+            return found;
+        }
+        let new_p = Arc::new(policy);
+        match self.inner.entry_sync(name.to_string()) {
+            scc::hash_map::Entry::Occupied(o) => Arc::clone(o.get()),
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(Arc::clone(&new_p));
+                new_p
+            }
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<RetryPolicy>> {
+        self.inner.read_sync(name, |_, p| Arc::clone(p))
+    }
+
+    pub fn list(&self) -> Vec<(String, RetryPolicy)> {
+        let mut out = Vec::new();
+        self.inner.iter_sync(|k, v| {
+            out.push((k.clone(), (**v).clone()));
+            true
+        });
+        out
+    }
+
+    pub fn remove(&self, name: &str) -> bool {
+        self.inner.remove_sync(name).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,5 +959,254 @@ mod tests {
             Duration::from_millis(500),
         );
         assert_eq!(r.unwrap(), 99);
+    }
+
+    // Bulkhead
+    #[test]
+    fn bulkhead_admits_up_to_max_concurrent() {
+        let bh = Bulkhead::new(2, 0, Duration::from_millis(1)).unwrap();
+        let p1 = bh.try_enter().unwrap();
+        let p2 = bh.try_enter().unwrap();
+        assert_eq!(bh.snapshot().active, 2);
+        // queue_size 0 rejects the overflow caller immediately
+        let err = bh.try_enter();
+        match err {
+            Err(ZyronError::ExecutionError(msg)) => assert_eq!(msg, "bulkhead queue full"),
+            other => panic!("expected queue full, got {:?}", other.map(|_| ())),
+        }
+        drop(p1);
+        drop(p2);
+        assert_eq!(bh.snapshot().active, 0);
+    }
+
+    #[test]
+    fn bulkhead_permit_release_frees_slot() {
+        let bh = Bulkhead::new(1, 0, Duration::from_millis(1)).unwrap();
+        {
+            let _p = bh.try_enter().unwrap();
+            assert!(bh.try_enter().is_err());
+        }
+        assert!(bh.try_enter().is_ok());
+    }
+
+    #[test]
+    fn bulkhead_queued_caller_times_out() {
+        let bh = Bulkhead::new(1, 4, Duration::from_millis(20)).unwrap();
+        let _held = bh.try_enter().unwrap();
+        let start = Instant::now();
+        let err = bh.try_enter();
+        match err {
+            Err(ZyronError::ExecutionError(msg)) => assert_eq!(msg, "bulkhead wait timed out"),
+            other => panic!("expected timeout, got {:?}", other.map(|_| ())),
+        }
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert_eq!(bh.snapshot().queued, 0);
+    }
+
+    #[test]
+    fn bulkhead_queued_caller_gets_freed_slot() {
+        let bh = Arc::new(Bulkhead::new(1, 1, Duration::from_millis(500)).unwrap());
+        let permit_holder = Arc::clone(&bh);
+        let held = permit_holder.try_enter().unwrap();
+        let waiter = Arc::clone(&bh);
+        let handle = std::thread::spawn(move || waiter.try_enter().map(|_| ()).is_ok());
+        std::thread::sleep(Duration::from_millis(20));
+        drop(held);
+        assert!(handle.join().unwrap());
+    }
+
+    #[test]
+    fn bulkhead_zero_concurrency_rejected() {
+        assert!(Bulkhead::new(0, 4, Duration::from_millis(1)).is_err());
+    }
+
+    #[test]
+    fn bulkhead_registry_round_trip() {
+        let reg = BulkheadRegistry::new();
+        let b = reg
+            .get_or_create("io", 4, 8, Duration::from_millis(50))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &b,
+            &reg.get_or_create("io", 4, 8, Duration::from_millis(50))
+                .unwrap()
+        ));
+        assert!(reg.get("io").is_some());
+        assert_eq!(reg.list().len(), 1);
+        assert!(reg.remove("io"));
+        assert!(reg.get("io").is_none());
+        assert!(!reg.remove("io"));
+    }
+
+    // RetryPolicy
+    #[test]
+    fn retry_policy_validation() {
+        assert!(
+            RetryPolicy::new(
+                0,
+                BackoffKind::Fixed,
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+                0.0,
+                Vec::new()
+            )
+            .is_err()
+        );
+        assert!(
+            RetryPolicy::new(
+                3,
+                BackoffKind::Fixed,
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+                1.5,
+                Vec::new()
+            )
+            .is_err()
+        );
+        assert!(
+            RetryPolicy::new(
+                3,
+                BackoffKind::Fixed,
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+                -0.1,
+                Vec::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retry_policy_exponential_schedule_caps_at_max_delay() {
+        let policy = RetryPolicy::new(
+            6,
+            BackoffKind::Exponential,
+            Duration::from_millis(10),
+            Duration::from_millis(35),
+            0.0,
+            Vec::new(),
+        )
+        .unwrap();
+        let delays: Vec<Duration> = policy.delays().collect();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(35),
+                Duration::from_millis(35),
+                Duration::from_millis(35),
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_policy_fixed_and_linear_schedules() {
+        let fixed = RetryPolicy::new(
+            4,
+            BackoffKind::Fixed,
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+            0.0,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            fixed.delays().collect::<Vec<_>>(),
+            vec![Duration::from_millis(5); 3]
+        );
+        let linear = RetryPolicy::new(
+            4,
+            BackoffKind::Linear,
+            Duration::from_millis(5),
+            Duration::from_millis(12),
+            0.0,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            linear.delays().collect::<Vec<_>>(),
+            vec![
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+                Duration::from_millis(12),
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_policy_jittered_delays_stay_capped() {
+        let policy = RetryPolicy::new(
+            10,
+            BackoffKind::Exponential,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+            0.5,
+            Vec::new(),
+        )
+        .unwrap();
+        for delay in policy.delays() {
+            assert!(delay <= Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn retry_policy_single_attempt_has_no_delays() {
+        let policy = RetryPolicy::new(
+            1,
+            BackoffKind::Fixed,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            0.0,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(policy.delays().count(), 0);
+    }
+
+    #[test]
+    fn retry_policy_error_matching() {
+        let policy = RetryPolicy::new(
+            3,
+            BackoffKind::Fixed,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            0.0,
+            vec!["timeout".to_string(), "Connection Reset".to_string()],
+        )
+        .unwrap();
+        assert!(policy.error_is_retryable("request TIMEOUT after 5s"));
+        assert!(policy.error_is_retryable("connection reset by peer"));
+        assert!(!policy.error_is_retryable("permission denied"));
+        let open = RetryPolicy::new(
+            3,
+            BackoffKind::Fixed,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            0.0,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(open.error_is_retryable("anything at all"));
+    }
+
+    #[test]
+    fn retry_policy_registry_round_trip() {
+        let reg = RetryPolicyRegistry::new();
+        let policy = RetryPolicy::new(
+            3,
+            BackoffKind::Fixed,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            0.0,
+            Vec::new(),
+        )
+        .unwrap();
+        let stored = reg.get_or_create("db", policy.clone());
+        assert!(Arc::ptr_eq(&stored, &reg.get_or_create("db", policy)));
+        assert!(reg.get("db").is_some());
+        assert_eq!(reg.list().len(), 1);
+        assert!(reg.remove("db"));
+        assert!(reg.get("db").is_none());
     }
 }

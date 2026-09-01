@@ -195,6 +195,7 @@ fn fold_plan(plan: &LogicalPlan) -> Option<LogicalPlan> {
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             source,
         } => {
             let folded_source = fold_plan(source)?;
@@ -204,6 +205,7 @@ fn fold_plan(plan: &LogicalPlan) -> Option<LogicalPlan> {
                 column_defaults: column_defaults.clone(),
                 check_constraints: check_constraints.clone(),
                 expectations: expectations.clone(),
+                generated_columns: generated_columns.clone(),
                 source: Arc::new(folded_source),
             })
         }
@@ -211,6 +213,7 @@ fn fold_plan(plan: &LogicalPlan) -> Option<LogicalPlan> {
             table_id,
             assignments,
             check_constraints,
+            generated_columns,
             child,
         } => {
             let folded_child = fold_plan(child)?;
@@ -218,6 +221,7 @@ fn fold_plan(plan: &LogicalPlan) -> Option<LogicalPlan> {
                 table_id: *table_id,
                 assignments: assignments.clone(),
                 check_constraints: check_constraints.clone(),
+                generated_columns: generated_columns.clone(),
                 child: Arc::new(folded_child),
             })
         }

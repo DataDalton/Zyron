@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use zyron_pressure::capability::OperatorKind;
+use zyron_pressure::capability::{CoefficientAccumulator, OperatorKind};
 use zyron_pressure::pressure_control::PressureController;
 
 /// Times one operator batch and records it on drop.
@@ -19,17 +19,33 @@ use zyron_pressure::pressure_control::PressureController;
 /// Recording in Drop rather than at an explicit call means an operator that
 /// returns early, or errors, still reports the time it spent, which is exactly
 /// the work the node did and would otherwise vanish from the measurement.
+///
+/// The accumulator is held rather than looked up, so a caller measuring
+/// against its own can say so. Serving code takes the process controller's
+/// through `start`, which is a pointer copy and costs nothing over reaching
+/// for the global inside `drop`.
 pub struct BatchTimer {
+    sink: &'static CoefficientAccumulator,
     kind: OperatorKind,
     started: Instant,
     units: u64,
 }
 
 impl BatchTimer {
-    /// Begins timing a batch of the given operator kind.
+    /// Begins timing a batch of the given operator kind, reporting to the
+    /// process controller.
     #[inline]
     pub fn start(kind: OperatorKind) -> Self {
+        Self::start_on(PressureController::global().coefficients(), kind)
+    }
+
+    /// Begins timing a batch that reports to `sink` instead of the process
+    /// controller, for a caller that has to read its own measurements back
+    /// without the rest of the process writing into them.
+    #[inline]
+    pub fn start_on(sink: &'static CoefficientAccumulator, kind: OperatorKind) -> Self {
         Self {
+            sink,
             kind,
             started: Instant::now(),
             units: 0,
@@ -57,25 +73,42 @@ impl Drop for BatchTimer {
         if self.units == 0 {
             return;
         }
-        PressureController::global().record_operator(self.kind, self.units, self.started.elapsed());
+        self.sink
+            .record_elapsed(self.kind, self.units, self.started.elapsed());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// An accumulator of this test's own.
+    ///
+    /// The process controller's is written to by every operator in the crate,
+    /// including whatever else the test binary is running at the time, so a
+    /// test that read a count back from it would be reading other tests'
+    /// traffic as well as its own. Each caller gets a separate one, so two
+    /// tests naming the same operator kind still cannot see each other.
+    macro_rules! private_sink {
+        () => {{
+            static SINK: OnceLock<CoefficientAccumulator> = OnceLock::new();
+            SINK.get_or_init(CoefficientAccumulator::new)
+        }};
+    }
 
     #[test]
     fn a_batch_with_rows_moves_the_coefficient() {
-        let controller = PressureController::global();
-        let before = controller.coefficients().samples(OperatorKind::SetOp);
+        let sink = private_sink!();
+        let before = sink.samples(OperatorKind::SetOp);
         {
-            let mut timer = BatchTimer::start(OperatorKind::SetOp);
+            let mut timer = BatchTimer::start_on(sink, OperatorKind::SetOp);
             timer.rows(1_000);
         }
-        controller.drain_calibration();
-        assert!(
-            controller.coefficients().samples(OperatorKind::SetOp) >= before + 1_000,
+        sink.drain();
+        assert_eq!(
+            sink.samples(OperatorKind::SetOp),
+            before + 1_000,
             "the batch was not recorded"
         );
     }
@@ -84,21 +117,30 @@ mod tests {
     /// folded in as though it did.
     #[test]
     fn an_empty_batch_records_nothing() {
-        let controller = PressureController::global();
-        let before = controller.coefficients().samples(OperatorKind::Window);
+        let sink = private_sink!();
+        let before = sink.samples(OperatorKind::Window);
         {
-            let _timer = BatchTimer::start(OperatorKind::Window);
+            let _timer = BatchTimer::start_on(sink, OperatorKind::Window);
         }
-        controller.drain_calibration();
-        assert_eq!(
-            controller.coefficients().samples(OperatorKind::Window),
-            before
+        sink.drain();
+        assert_eq!(sink.samples(OperatorKind::Window), before);
+    }
+
+    /// The default target is the process controller, so serving code that
+    /// calls `start` is measured where the planner reads.
+    #[test]
+    fn the_default_target_is_the_process_controller() {
+        let controller = PressureController::global();
+        let timer = BatchTimer::start(OperatorKind::Project);
+        assert!(
+            std::ptr::eq(timer.sink, controller.coefficients()),
+            "start reported somewhere other than the process controller"
         );
     }
 
     #[test]
     fn rows_accumulate_across_a_piecewise_fill() {
-        let mut timer = BatchTimer::start(OperatorKind::Project);
+        let mut timer = BatchTimer::start_on(private_sink!(), OperatorKind::Project);
         timer.add_rows(100);
         timer.add_rows(150);
         assert_eq!(timer.units, 250);

@@ -20,12 +20,39 @@ pub const BATCH_SIZE: usize = 1024;
 // DataBatch
 // ---------------------------------------------------------------------------
 
+/// One JSON path a scan already pulled out of a variant column, held
+/// alongside the batch it belongs to.
+///
+/// A columnar segment can store a promoted path as a column of its own, in
+/// which case the scan reads the values instead of walking every document.
+/// The values it carries are what the walk would have produced, so an
+/// expression served from here and the same expression served from the
+/// document give the same answer
+#[derive(Debug, Clone)]
+pub struct ResolvedPath {
+    /// Which table in the batch's schema the variant column belongs to,
+    /// spelled the way a `ColumnRef` spells it
+    pub table_idx: usize,
+    /// The variant column the path was read out of
+    pub column_id: u16,
+    /// Dotted path, as `variant_extract` spells it
+    pub path: String,
+    /// One value per row of the batch, null where the document had no
+    /// scalar at the path
+    pub values: Column,
+}
+
 /// A columnar batch of rows. Each column holds a typed vector of values
 /// with a null bitmap. All columns have the same number of rows.
 #[derive(Debug, Clone)]
 pub struct DataBatch {
     pub columns: Vec<Column>,
     pub num_rows: usize,
+    /// Variant paths already extracted for these rows, in the same row order
+    /// as `columns`. Empty on every batch not built by a scan reading a
+    /// segment that stores the path, and an empty list costs an expression
+    /// only the document walk it would have done anyway
+    pub resolved: Vec<ResolvedPath>,
 }
 
 impl DataBatch {
@@ -34,7 +61,9 @@ impl DataBatch {
     pub fn approx_bytes(&self) -> u64 {
         self.columns
             .iter()
-            .map(|c| c.data.approx_bytes() + (self.num_rows as u64).div_ceil(8))
+            .map(|c| &c.data)
+            .chain(self.resolved.iter().map(|r| &r.values.data))
+            .map(|d| d.approx_bytes() + (self.num_rows as u64).div_ceil(8))
             .sum()
     }
 
@@ -42,7 +71,11 @@ impl DataBatch {
     pub fn new(columns: Vec<Column>) -> Self {
         let num_rows = columns.first().map_or(0, |c| c.len());
         debug_assert!(columns.iter().all(|c| c.len() == num_rows));
-        Self { columns, num_rows }
+        Self {
+            columns,
+            num_rows,
+            resolved: Vec::new(),
+        }
     }
 
     /// Creates an empty batch with no rows and no columns.
@@ -50,6 +83,7 @@ impl DataBatch {
         Self {
             columns: Vec::new(),
             num_rows: 0,
+            resolved: Vec::new(),
         }
     }
 
@@ -60,7 +94,36 @@ impl DataBatch {
         Self {
             columns: Vec::new(),
             num_rows,
+            resolved: Vec::new(),
         }
+    }
+
+    /// Attaches variant paths a scan resolved for these rows.
+    ///
+    /// Every entry holds one value per row of the batch, in the same order,
+    /// or the substitution would answer with another row's value
+    pub fn with_resolved(mut self, resolved: Vec<ResolvedPath>) -> Self {
+        debug_assert!(resolved.iter().all(|r| r.values.len() == self.num_rows));
+        self.resolved = resolved;
+        self
+    }
+
+    /// The values a scan already extracted for one variant column and path,
+    /// or None when nothing resolved it and the caller has to read the
+    /// documents.
+    ///
+    /// An entry whose length is not this batch's row count is not offered.
+    /// It would answer with another row's value, and reading the documents is
+    /// always available and always right
+    pub fn resolved_path(&self, table_idx: usize, column_id: u16, path: &str) -> Option<&Column> {
+        if self.num_rows == 0 {
+            return None;
+        }
+        self.resolved
+            .iter()
+            .find(|r| r.column_id == column_id && r.table_idx == table_idx && r.path == path)
+            .map(|r| &r.values)
+            .filter(|values| values.len() == self.num_rows)
     }
 
     /// Returns a single column by index.
@@ -74,17 +137,28 @@ impl DataBatch {
     }
 
     /// Selects rows where mask[i] is true.
+    ///
+    /// Resolved paths take the same selection as the columns, which is what
+    /// keeps a value lined up with the row it came from
     pub fn filter(&self, mask: &[bool]) -> Self {
         let columns: Vec<Column> = self.columns.iter().map(|c| c.filter(mask)).collect();
         let num_rows = columns.first().map_or(0, |c| c.len());
-        Self { columns, num_rows }
+        Self {
+            columns,
+            num_rows,
+            resolved: self.map_resolved(|c| c.filter(mask)),
+        }
     }
 
     /// Reorders rows by indices.
     pub fn take(&self, indices: &[u32]) -> Self {
         let columns: Vec<Column> = self.columns.iter().map(|c| c.take(indices)).collect();
         let num_rows = indices.len();
-        Self { columns, num_rows }
+        Self {
+            columns,
+            num_rows,
+            resolved: self.map_resolved(|c| c.take(indices)),
+        }
     }
 
     /// Extracts a contiguous sub-range.
@@ -98,7 +172,25 @@ impl DataBatch {
         Self {
             columns,
             num_rows: actual_len,
+            resolved: self.map_resolved(|c| c.slice(offset, actual_len)),
         }
+    }
+
+    /// Applies one row transform to every resolved path, skipping the work
+    /// for the batches that carry none
+    fn map_resolved(&self, f: impl Fn(&Column) -> Column) -> Vec<ResolvedPath> {
+        if self.resolved.is_empty() {
+            return Vec::new();
+        }
+        self.resolved
+            .iter()
+            .map(|r| ResolvedPath {
+                table_idx: r.table_idx,
+                column_id: r.column_id,
+                path: r.path.clone(),
+                values: f(&r.values),
+            })
+            .collect()
     }
 }
 
@@ -280,8 +372,16 @@ pub fn decode_tuple_into_builders(
                 let value_bytes = &data[offset..offset + len];
                 if let Some(b) = builder_idx {
                     // push_owned moves the freshly decoded text or binary
-                    // allocation into the column instead of copying it again
-                    let scalar = decode_varlen_scalar(col.type_id, value_bytes);
+                    // allocation into the column instead of copying it again.
+                    // An ENCRYPTED column stores ciphertext, decoding those
+                    // bytes by the logical text type would corrupt them
+                    // through the lossy utf8 conversion, so they stay binary
+                    // for the scan-side decrypt
+                    let scalar = if col.is_encrypted() {
+                        ScalarValue::Binary(value_bytes.to_vec())
+                    } else {
+                        decode_varlen_scalar(col.type_id, value_bytes)
+                    };
                     builders[b].push_owned(scalar);
                 }
                 offset += len;
@@ -413,9 +513,13 @@ pub fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
 /// Decodes a variable-length value from raw bytes into a ScalarValue.
 pub fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-            ScalarValue::Utf8(String::from_utf8_lossy(bytes).into_owned())
-        }
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => ScalarValue::Utf8(String::from_utf8_lossy(bytes).into_owned()),
         // Every other variable-length type (geometry, matrix, range, the
         // sketch family, and future additions) is byte-backed. A type list
         // here would silently turn unlisted values into NULL
@@ -627,6 +731,7 @@ mod row_filter_tests {
             fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
+            attrs: Default::default(),
         }
     }
 

@@ -54,8 +54,9 @@ pub fn type_id_to_pg_oid(type_id: TypeId) -> i32 {
         TypeId::Interval => PG_INTERVAL_OID,
         TypeId::Uuid => PG_UUID_OID,
         TypeId::Json => PG_JSON_OID,
-        TypeId::Jsonb => PG_JSONB_OID,
+        TypeId::Jsonb | TypeId::Variant => PG_JSONB_OID,
         TypeId::Array | TypeId::Composite => PG_TEXT_OID,
+        TypeId::Struct | TypeId::Map | TypeId::Ltree => PG_TEXT_OID,
         // Custom OID for vector type (matches pgvector convention).
         TypeId::Vector => 16385,
         // Extended types: map to bytea for binary types, text for text-representable types.
@@ -70,7 +71,12 @@ pub fn type_id_to_pg_oid(type_id: TypeId) -> i32 {
         | TypeId::Cidr
         | TypeId::MacAddr
         | TypeId::Money
-        | TypeId::Quantity => PG_BYTEA_OID,
+        | TypeId::Quantity
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef => PG_BYTEA_OID,
         TypeId::Color | TypeId::Bitfield => PG_INT4_OID,
         TypeId::SemVer => PG_TEXT_OID,
     }

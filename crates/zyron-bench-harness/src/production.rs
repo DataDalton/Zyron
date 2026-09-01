@@ -20,6 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use zyron_buffer::BufferPoolConfig;
 use zyron_common::config::StorageConfig;
 use zyron_storage::DiskManagerConfig;
@@ -39,6 +41,37 @@ pub fn buffer_pool_config() -> BufferPoolConfig {
     BufferPoolConfig {
         num_frames: StorageConfig::default().buffer_pool_pages,
     }
+}
+
+/// Installs the eviction write hook the server installs at startup.
+///
+/// A dirty page leaves the pool only through this hook, which writes it
+/// before the page's mapping comes down, so a reader faulting the page back
+/// in cannot find a stale image. A pool without one cannot evict a dirty page
+/// at all, so a suite that skipped this would stall where the product writes.
+/// The WAL barrier runs first, the same as at startup, because an evicted
+/// page's log has to be durable before its bytes land. A pool with no WAL
+/// beside it has no such ordering to keep, so it passes None.
+///
+/// Installing twice is a no-op, so a harness may call it on a pool a caller
+/// already configured
+pub fn install_evict_writer(
+    pool: &zyron_buffer::BufferPool,
+    disk: &Arc<zyron_storage::DiskManager>,
+    wal: Option<&Arc<zyron_wal::WalWriter>>,
+) {
+    let disk = Arc::clone(disk);
+    let wal = wal.map(Arc::clone);
+    let writer: zyron_buffer::EvictWriteFn = Arc::new(move |page_id, data, dirty_lsn| {
+        if let Some(wal) = &wal
+            && dirty_lsn > 0
+            && wal.flushed_lsn().0 < dirty_lsn
+        {
+            wal.wait_for_flush(zyron_wal::Lsn(dirty_lsn))?;
+        }
+        disk.write_page_sync(page_id, data)
+    });
+    let _ = pool.set_evict_writer(writer);
 }
 
 /// The disk manager the server runs, pointed at `data_dir`

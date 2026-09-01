@@ -190,6 +190,15 @@ pub struct ExecutionContext {
     /// durably; a transaction that wrote nothing commits without a WAL commit
     /// record or a flush wait.
     wrote_wal: AtomicBool,
+    /// Paths this statement reads out of variant columns, collected from the
+    /// plan before the operator tree is built.
+    ///
+    /// A columnar scan takes the ones naming its own table and reads those
+    /// promoted paths out of the segment columns holding them, leaving the
+    /// promoted paths nothing asked for on disk. Set per plan, so a nested
+    /// plan replaces it with its own and a scan that already captured its
+    /// share is unaffected
+    variant_paths: std::sync::RwLock<Arc<[zyron_planner::physical::variant_paths::VariantPath]>>,
     /// When true, operators collect per-operator metrics (rows, timing).
     pub analyze: bool,
     /// Optional CDC hook invoked by DML operators after mutations.
@@ -234,6 +243,14 @@ pub struct ExecutionContext {
     /// FTS manager reference for DML index maintenance. DML operators use this
     /// to look up which FTS indexes exist for a table and update them.
     pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
+    /// Key store for column level encryption, present when the server
+    /// configured one. Encrypted columns encrypt on write and decrypt on
+    /// scan through it
+    pub key_store: Option<Arc<dyn zyron_auth::KeyStore>>,
+    /// Content addressed media store, present on a running server. Media
+    /// columns externalize oversized payloads into it on write and read
+    /// them back at scan
+    pub media_store: Option<Arc<zyron_media::store::MediaStore>>,
     /// Security manager reference for search privilege checks at query time.
     /// Operators use this to verify FulltextSearch, VectorSearch, GraphTraverse,
     /// and GraphAlgorithm privileges before executing search operations.
@@ -355,6 +372,7 @@ impl ExecutionContext {
             spill: None,
             node_memory_held: AtomicU64::new(0),
             wrote_wal: AtomicBool::new(false),
+            variant_paths: std::sync::RwLock::new(Arc::from(Vec::new())),
             analyze: false,
             cdc_hook: None,
             replication: None,
@@ -366,6 +384,8 @@ impl ExecutionContext {
             indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
             fts_manager: None,
+            key_store: None,
+            media_store: None,
             security_manager: None,
             vector_manager: None,
             graph_manager: None,
@@ -386,6 +406,27 @@ impl ExecutionContext {
             trigger_depth: 0,
             undo_log: None,
             read_only: false,
+        }
+    }
+
+    /// Records the variant paths the plan about to be built reads, replacing
+    /// whatever a previous plan on this context recorded
+    pub fn set_variant_paths(
+        &self,
+        paths: Vec<zyron_planner::physical::variant_paths::VariantPath>,
+    ) {
+        if let Ok(mut slot) = self.variant_paths.write() {
+            *slot = Arc::from(paths);
+        }
+    }
+
+    /// The variant paths recorded for the plan being built. A scan captures
+    /// its share at construction, so a nested plan recording its own later
+    /// cannot change what an already-built scan reads
+    pub fn variant_paths(&self) -> Arc<[zyron_planner::physical::variant_paths::VariantPath]> {
+        match self.variant_paths.read() {
+            Ok(slot) => Arc::clone(&slot),
+            Err(_) => Arc::from(Vec::new()),
         }
     }
 
@@ -415,6 +456,7 @@ impl ExecutionContext {
             // the parent's total would release it twice
             node_memory_held: AtomicU64::new(0),
             wrote_wal: AtomicBool::new(false),
+            variant_paths: std::sync::RwLock::new(self.variant_paths()),
             analyze: false,
             cdc_hook: self.cdc_hook.clone(),
             replication: self.replication.clone(),
@@ -426,6 +468,8 @@ impl ExecutionContext {
             indexes: self.indexes.clone(),
             fts_indexes: self.fts_indexes.clone(),
             fts_manager: self.fts_manager.clone(),
+            key_store: self.key_store.clone(),
+            media_store: self.media_store.clone(),
             security_manager: self.security_manager.clone(),
             vector_manager: self.vector_manager.clone(),
             graph_manager: self.graph_manager.clone(),
@@ -871,6 +915,33 @@ impl ExecutionContext {
     /// through the manager on demand. DML operators use fts_indexes_for_table().
     pub fn set_fts_manager(&mut self, mgr: Arc<zyron_search::FtsManager>) {
         self.fts_manager = Some(mgr);
+    }
+
+    /// Sets the key store column encryption resolves keys through
+    pub fn set_key_store(&mut self, store: Arc<dyn zyron_auth::KeyStore>) {
+        self.key_store = Some(store);
+    }
+
+    /// Sets the media store media columns externalize through
+    pub fn set_media_store(&mut self, store: Arc<zyron_media::store::MediaStore>) {
+        self.media_store = Some(store);
+    }
+
+    /// Resolves the analyzer for an FTS index. Falls back to the simple
+    /// pipeline when no manager is attached, matching how unconfigured
+    /// indexes were always analyzed
+    pub fn fts_analyzer(&self, index_id: u32) -> Arc<dyn zyron_search::Analyzer> {
+        match self.fts_manager.as_ref() {
+            Some(mgr) => mgr.analyzer_for_index(index_id),
+            None => Arc::new(zyron_search::SimpleAnalyzer),
+        }
+    }
+
+    /// Reports whether an FTS index already stores phonetic codes as terms
+    pub fn fts_phonetic_indexed(&self, index_id: u32) -> bool {
+        self.fts_manager
+            .as_ref()
+            .is_some_and(|mgr| mgr.index_phonetic_indexed(index_id))
     }
 
     /// Sets the security manager for search privilege checks at query time.

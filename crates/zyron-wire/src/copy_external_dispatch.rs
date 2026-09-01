@@ -94,68 +94,12 @@ fn parse_columns_encoding(raw: &str) -> Result<Vec<ColumnSpec>> {
     Ok(out)
 }
 
-// Maps the raw u8 back to a TypeId. TypeId is #[repr(u8)] so the round trip is
-// defined by the discriminant values. Uses a match to avoid unsafe transmute.
+// Maps the raw u8 back to a TypeId through the shared discriminant table,
+// so a variant added to zyron_common::TypeId is accepted here without a
+// parallel list to keep in sync
 fn type_id_from_u8(v: u8) -> Result<TypeId> {
-    // Exhaustively map every defined discriminant. Keep this in sync with
-    // zyron_common::TypeId.
-    let ids = [
-        TypeId::Null,
-        TypeId::Boolean,
-        TypeId::Int8,
-        TypeId::Int16,
-        TypeId::Int32,
-        TypeId::Int64,
-        TypeId::Int128,
-        TypeId::UInt8,
-        TypeId::UInt16,
-        TypeId::UInt32,
-        TypeId::UInt64,
-        TypeId::UInt128,
-        TypeId::Float32,
-        TypeId::Float64,
-        TypeId::Decimal,
-        TypeId::Char,
-        TypeId::Varchar,
-        TypeId::Text,
-        TypeId::Binary,
-        TypeId::Varbinary,
-        TypeId::Bytea,
-        TypeId::Date,
-        TypeId::Time,
-        TypeId::Timestamp,
-        TypeId::TimestampTz,
-        TypeId::Interval,
-        TypeId::Uuid,
-        TypeId::Json,
-        TypeId::Jsonb,
-        TypeId::Array,
-        TypeId::Composite,
-        TypeId::Vector,
-        TypeId::Geometry,
-        TypeId::Matrix,
-        TypeId::Color,
-        TypeId::SemVer,
-        TypeId::Inet,
-        TypeId::Cidr,
-        TypeId::MacAddr,
-        TypeId::Money,
-        TypeId::Range,
-        TypeId::HyperLogLog,
-        TypeId::BloomFilter,
-        TypeId::TDigest,
-        TypeId::CountMinSketch,
-        TypeId::Bitfield,
-        TypeId::Quantity,
-    ];
-    for t in ids {
-        if t as u8 == v {
-            return Ok(t);
-        }
-    }
-    Err(ZyronError::PlanError(format!(
-        "COPY COLUMNS declared unknown type id {v}"
-    )))
+    TypeId::from_u8(v)
+        .ok_or_else(|| ZyronError::PlanError(format!("COPY COLUMNS declared unknown type id {v}")))
 }
 
 // -----------------------------------------------------------------------------
@@ -422,7 +366,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_type_id() {
-        let err = parse_columns_encoding("x:250").unwrap_err();
+        let err = parse_columns_encoding("x:249").unwrap_err();
         match err {
             ZyronError::PlanError(msg) => assert!(msg.contains("unknown type id")),
             _ => panic!("unexpected error: {err:?}"),

@@ -148,16 +148,59 @@ const REGIONS: i64 = 64;
 /// than the thing named, and their sections would interleave
 static BENCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Bounds missed inside the section now open, reported when it closes.
+static VIOLATIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_violation(message: String) {
+    VIOLATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(message);
+}
+
+/// Holds the suite lock for a section and fails the test when it closes if
+/// any bound was missed inside it.
+///
+/// Failing where a bound is checked ends the test at the first miss, so every
+/// later comparison in that test is never run and the run file is missing
+/// metrics that were never in question. `Range scan, wide` and the indexed
+/// point lookup went unmeasured for exactly that reason. Collecting lets the
+/// section finish and take every measurement, then fails with each miss
+/// listed, so the verdict is the same and the data is whole
+struct Section {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for Section {
+    fn drop(&mut self) {
+        let missed: Vec<String> = {
+            let mut held = VIOLATIONS.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *held)
+        };
+        // A panic already unwinding carries its own cause, and panicking
+        // again here would replace it with this one
+        if missed.is_empty() || std::thread::panicking() {
+            return;
+        }
+        panic!(
+            "{} bound(s) outside their limit:\n  {}",
+            missed.len(),
+            missed.join("\n  ")
+        );
+    }
+}
+
 /// Opens a section and takes the suite lock for its duration.
 ///
 /// Deliberately unnumbered: the test harness decides what runs when, so a
 /// number here would claim a sequence the log does not have
-fn section(title: &str) -> std::sync::MutexGuard<'static, ()> {
+fn section(title: &str) -> Section {
     let guard = BENCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    VIOLATIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     init("cross_format");
     tprintln!("");
     tprintln!("=== {} ===", title);
-    guard
+    Section { _guard: guard }
 }
 
 // =============================================================================
@@ -469,15 +512,16 @@ fn ratio_of(test: &str, metric: &str, heap_avg: f64, lake_avg: f64, bound: Optio
                 (Format::Heap, heap_avg),
                 bound,
             );
-            assert!(
-                admits,
-                "{} {} ratio {} is outside its bound, from lake {} and heap {}",
-                test,
-                metric,
-                lake_avg / heap_avg,
-                lake_avg,
-                heap_avg
-            );
+            if !admits {
+                record_violation(format!(
+                    "{} {} ratio {} is outside its bound, from lake {} and heap {}",
+                    test,
+                    metric,
+                    lake_avg / heap_avg,
+                    lake_avg,
+                    heap_avg
+                ));
+            }
             Some(lake_avg / heap_avg)
         }
         None => record_ratio(

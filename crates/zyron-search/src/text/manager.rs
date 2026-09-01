@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use zyron_common::{Result, ZyronError};
 
-use super::analyzer::{Analyzer, StandardAnalyzer};
+use super::analyzer::{Analyzer, SimpleAnalyzer, StandardAnalyzer};
 use super::inverted_index::InvertedIndex;
 use super::scoring::{Bm25Scorer, RelevanceScorer};
 
@@ -18,8 +18,16 @@ pub struct FtsManager {
     /// Reverse map: table_id -> list of index_ids. Updated on create/drop
     /// to avoid O(n) scans of all indexes on every DML operation.
     table_indexes: scc::HashMap<u32, Vec<u32>>,
+    /// Per index analyzer pipelines for indexes created with an explicit
+    /// analyzer configuration, plus whether the pipeline already encodes
+    /// terms phonetically. Index time and query time both resolve through
+    /// this map so the two always agree.
+    index_analyzers: scc::HashMap<u32, (Arc<dyn Analyzer>, bool)>,
     /// Default analyzer for indexes without explicit configuration.
     default_analyzer: Arc<dyn Analyzer>,
+    /// Analyzer applied to indexes with no stored configuration. Matches
+    /// the historical hardcoded write path pipeline, tokenize + lowercase.
+    unconfigured_analyzer: Arc<dyn Analyzer>,
     /// Default scorer for search queries.
     default_scorer: Arc<dyn RelevanceScorer>,
     /// Data directory for .zyfts file storage.
@@ -32,7 +40,9 @@ impl FtsManager {
         Self {
             indexes: scc::HashMap::new(),
             table_indexes: scc::HashMap::new(),
+            index_analyzers: scc::HashMap::new(),
             default_analyzer: Arc::new(StandardAnalyzer),
+            unconfigured_analyzer: Arc::new(SimpleAnalyzer),
             default_scorer: Arc::new(Bm25Scorer::default()),
             data_dir: None,
         }
@@ -43,10 +53,50 @@ impl FtsManager {
         Self {
             indexes: scc::HashMap::new(),
             table_indexes: scc::HashMap::new(),
+            index_analyzers: scc::HashMap::new(),
             default_analyzer: Arc::new(StandardAnalyzer),
+            unconfigured_analyzer: Arc::new(SimpleAnalyzer),
             default_scorer: Arc::new(Bm25Scorer::default()),
             data_dir: Some(data_dir),
         }
+    }
+
+    /// Registers the analyzer pipeline an index was created with. Every
+    /// write and query against the index resolves through this analyzer.
+    /// `phonetic_indexed` records that the pipeline already replaces terms
+    /// with phonetic codes, so phonetic queries use the plain search path
+    pub fn set_index_analyzer(
+        &self,
+        index_id: u32,
+        analyzer: Arc<dyn Analyzer>,
+        phonetic_indexed: bool,
+    ) {
+        if self
+            .index_analyzers
+            .update_sync(&index_id, |_, entry| {
+                *entry = (Arc::clone(&analyzer), phonetic_indexed)
+            })
+            .is_none()
+        {
+            let _ = self
+                .index_analyzers
+                .insert_sync(index_id, (analyzer, phonetic_indexed));
+        }
+    }
+
+    /// Resolves the analyzer for an index. Indexes without a stored
+    /// configuration analyze with the simple pipeline
+    pub fn analyzer_for_index(&self, index_id: u32) -> Arc<dyn Analyzer> {
+        self.index_analyzers
+            .read_sync(&index_id, |_, (a, _)| Arc::clone(a))
+            .unwrap_or_else(|| Arc::clone(&self.unconfigured_analyzer))
+    }
+
+    /// Reports whether an index stores phonetic codes as its terms
+    pub fn index_phonetic_indexed(&self, index_id: u32) -> bool {
+        self.index_analyzers
+            .read_sync(&index_id, |_, (_, phonetic)| *phonetic)
+            .unwrap_or(false)
     }
 
     /// Creates a new FTS index instance and registers it.
@@ -80,6 +130,7 @@ impl FtsManager {
     pub fn drop_index(&self, index_id: u32) -> Result<()> {
         // Find and remove from the index map, capturing the table_id.
         let table_id = self.indexes.read_sync(&index_id, |_, idx| idx.table_id);
+        let _ = self.index_analyzers.remove_sync(&index_id);
         match self.indexes.remove_sync(&index_id) {
             Some(_) => {
                 // Remove from the table -> indexes reverse map.

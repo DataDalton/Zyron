@@ -805,8 +805,7 @@ impl PressureController {
         units: u64,
         elapsed: Duration,
     ) {
-        self.coefficients
-            .record(kind, units, elapsed.as_nanos().min(u64::MAX as u128) as u64);
+        self.coefficients.record_elapsed(kind, units, elapsed);
     }
 
     /// Folds what the accumulator has gathered into the live coefficients.

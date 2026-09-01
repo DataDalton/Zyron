@@ -103,22 +103,53 @@ pub async fn analyze_table(
     let mut total_row_bytes: u64 = 0;
 
     // Per-column accumulators
-    let null_counts = vec![0u64; col_count];
+    let mut null_counts = vec![0u64; col_count];
     let mut total_widths = vec![0u64; col_count];
     let mut all_values: Vec<Vec<Vec<u8>>> = vec![Vec::new(); col_count];
 
+    // A heap tuple is a null bitmap of one bit per column, then each
+    // column's value: fixed width types occupy their width, varlen types a
+    // 4 byte little endian length prefix and the payload. Null values still
+    // occupy their space so the walk stays aligned
+    let null_bitmap_len = col_count.div_ceil(8);
     let guard = heap.scan()?;
     guard.for_each(|_tid, view| {
         row_count += 1;
         let data = view.data;
         total_row_bytes += data.len() as u64;
 
-        // Store entire tuple bytes as the value for column 0.
-        // Full per-column extraction requires the tuple format to be finalized.
-        if col_count > 0 {
-            let value = data.to_vec();
-            total_widths[0] += value.len() as u64;
-            all_values[0].push(value);
+        if data.len() < null_bitmap_len {
+            return;
+        }
+        let null_bitmap = &data[..null_bitmap_len];
+        let mut offset = null_bitmap_len;
+        for (i, col) in table.columns.iter().enumerate() {
+            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let value_len = if let Some(fixed) = col.type_id.fixed_size() {
+                fixed
+            } else {
+                if data.len() < offset + 4 {
+                    return;
+                }
+                let len = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize;
+                offset += 4;
+                len
+            };
+            if data.len() < offset + value_len {
+                return;
+            }
+            if is_null {
+                null_counts[i] += 1;
+            } else {
+                total_widths[i] += value_len as u64;
+                all_values[i].push(data[offset..offset + value_len].to_vec());
+            }
+            offset += value_len;
         }
     });
 

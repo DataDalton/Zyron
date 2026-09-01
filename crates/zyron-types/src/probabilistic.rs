@@ -225,6 +225,33 @@ pub fn bloom_false_positive_rate(filter: &[u8]) -> Result<f64> {
     Ok(ratio.powi(k as i32))
 }
 
+/// Estimates how many distinct items the Bloom filter holds via
+/// n = -(m/k) * ln(1 - X/m) where X is the set bit count. A saturated
+/// filter clamps X to m - 1 so the logarithm stays finite, the result is
+/// rounded to the nearest count and never negative
+pub fn bloom_filter_estimate_count(filter: &[u8]) -> Result<i64> {
+    let (k, m) = bloom_validate(filter)?;
+    let mut set_bits: u64 = 0;
+    for &byte in &filter[9..] {
+        set_bits += byte.count_ones() as u64;
+    }
+    let m_f = m as f64;
+    let x = if set_bits >= m as u64 {
+        (m as u64 - 1) as f64
+    } else {
+        set_bits as f64
+    };
+    let estimate = -(m_f / k as f64) * (1.0 - x / m_f).ln();
+    let rounded = estimate.round();
+    if !rounded.is_finite() || rounded <= 0.0 {
+        Ok(0)
+    } else if rounded >= i64::MAX as f64 {
+        Ok(i64::MAX)
+    } else {
+        Ok(rounded as i64)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T-Digest (simplified implementation)
 // ---------------------------------------------------------------------------
@@ -643,6 +670,46 @@ mod tests {
         let filter = bloom_create(100, 0.01).unwrap();
         // Empty filter should have fpr = 0
         assert_eq!(bloom_false_positive_rate(&filter).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_bloom_estimate_empty() {
+        let filter = bloom_create(1000, 0.01).unwrap();
+        assert_eq!(bloom_filter_estimate_count(&filter).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_bloom_estimate_within_five_percent() {
+        let mut filter = bloom_create(2000, 0.01).unwrap();
+        let inserted = 1000i64;
+        for i in 0..inserted {
+            bloom_add(&mut filter, format!("item-{}", i).as_bytes()).unwrap();
+        }
+        let estimate = bloom_filter_estimate_count(&filter).unwrap();
+        let error = (estimate - inserted).abs() as f64 / inserted as f64;
+        assert!(
+            error < 0.05,
+            "estimate {} deviates {:.1}% from {}",
+            estimate,
+            error * 100.0,
+            inserted
+        );
+    }
+
+    #[test]
+    fn test_bloom_estimate_saturated_filter_is_finite() {
+        // force every bit on so the logarithm guard engages
+        let mut filter = bloom_create(1, 0.5).unwrap();
+        for byte in filter.iter_mut().skip(9) {
+            *byte = 0xFF;
+        }
+        let estimate = bloom_filter_estimate_count(&filter).unwrap();
+        assert!(estimate >= 0);
+    }
+
+    #[test]
+    fn test_bloom_estimate_invalid_input() {
+        assert!(bloom_filter_estimate_count(b"junk").is_err());
     }
 
     // T-Digest tests

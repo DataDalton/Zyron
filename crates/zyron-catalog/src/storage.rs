@@ -72,6 +72,16 @@ const EVENT_HANDLERS_HEAP_FILE_ID: u32 = 176;
 const EVENT_HANDLERS_FSM_FILE_ID: u32 = 177;
 const VERSION_TAGS_HEAP_FILE_ID: u32 = 178;
 const VERSION_TAGS_FSM_FILE_ID: u32 = 179;
+const ANALYZERS_HEAP_FILE_ID: u32 = 180;
+const ANALYZERS_FSM_FILE_ID: u32 = 181;
+const SYNONYM_DICTIONARIES_HEAP_FILE_ID: u32 = 182;
+const SYNONYM_DICTIONARIES_FSM_FILE_ID: u32 = 183;
+const RESILIENCE_POLICIES_HEAP_FILE_ID: u32 = 184;
+const RESILIENCE_POLICIES_FSM_FILE_ID: u32 = 185;
+const USER_TYPES_HEAP_FILE_ID: u32 = 186;
+const USER_TYPES_FSM_FILE_ID: u32 = 187;
+const COLLATIONS_HEAP_FILE_ID: u32 = 188;
+const COLLATIONS_FSM_FILE_ID: u32 = 189;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
@@ -216,6 +226,33 @@ pub trait CatalogStorage: Send + Sync {
     async fn store_version_tag(&self, entry: &VersionTagEntry) -> Result<TupleId>;
     async fn delete_version_tag(&self, id: u32) -> Result<bool>;
 
+    // Analyzer operations
+    async fn load_analyzers(&self) -> Result<Vec<AnalyzerEntry>>;
+    async fn store_analyzer(&self, entry: &AnalyzerEntry) -> Result<TupleId>;
+    async fn update_analyzer(&self, entry: &AnalyzerEntry) -> Result<bool>;
+    async fn delete_analyzer(&self, id: u32) -> Result<bool>;
+
+    // Synonym dictionary operations
+    async fn load_synonym_dictionaries(&self) -> Result<Vec<SynonymDictionaryEntry>>;
+    async fn store_synonym_dictionary(&self, entry: &SynonymDictionaryEntry) -> Result<TupleId>;
+    async fn update_synonym_dictionary(&self, entry: &SynonymDictionaryEntry) -> Result<bool>;
+    async fn delete_synonym_dictionary(&self, id: u32) -> Result<bool>;
+
+    // Resilience policy operations
+    async fn load_resilience_policies(&self) -> Result<Vec<ResiliencePolicyEntry>>;
+    async fn store_resilience_policy(&self, entry: &ResiliencePolicyEntry) -> Result<TupleId>;
+    async fn delete_resilience_policy(&self, id: u32) -> Result<bool>;
+
+    // User type operations
+    async fn load_user_types(&self) -> Result<Vec<UserTypeEntry>>;
+    async fn store_user_type(&self, entry: &UserTypeEntry) -> Result<TupleId>;
+    async fn delete_user_type(&self, id: u32) -> Result<bool>;
+
+    // Collation operations
+    async fn load_collations(&self) -> Result<Vec<CollationEntry>>;
+    async fn store_collation(&self, entry: &CollationEntry) -> Result<TupleId>;
+    async fn delete_collation(&self, id: u32) -> Result<bool>;
+
     // Streaming job operations
     async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>>;
     async fn store_streaming_job(&self, entry: &StreamingJobEntry) -> Result<TupleId>;
@@ -348,6 +385,11 @@ pub struct HeapCatalogStorage {
     pipelines_heap: HeapFile,
     event_handlers_heap: HeapFile,
     version_tags_heap: HeapFile,
+    analyzers_heap: HeapFile,
+    synonym_dictionaries_heap: HeapFile,
+    resilience_policies_heap: HeapFile,
+    user_types_heap: HeapFile,
+    collations_heap: HeapFile,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
     init_done: std::sync::atomic::AtomicBool,
@@ -593,6 +635,46 @@ impl HeapCatalogStorage {
                 fsm_file_id: VERSION_TAGS_FSM_FILE_ID,
             },
         )?;
+        let analyzers_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: ANALYZERS_HEAP_FILE_ID,
+                fsm_file_id: ANALYZERS_FSM_FILE_ID,
+            },
+        )?;
+        let synonym_dictionaries_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SYNONYM_DICTIONARIES_HEAP_FILE_ID,
+                fsm_file_id: SYNONYM_DICTIONARIES_FSM_FILE_ID,
+            },
+        )?;
+        let resilience_policies_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: RESILIENCE_POLICIES_HEAP_FILE_ID,
+                fsm_file_id: RESILIENCE_POLICIES_FSM_FILE_ID,
+            },
+        )?;
+        let user_types_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: USER_TYPES_HEAP_FILE_ID,
+                fsm_file_id: USER_TYPES_FSM_FILE_ID,
+            },
+        )?;
+        let collations_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: COLLATIONS_HEAP_FILE_ID,
+                fsm_file_id: COLLATIONS_FSM_FILE_ID,
+            },
+        )?;
 
         Ok(Self {
             databases_heap,
@@ -624,6 +706,11 @@ impl HeapCatalogStorage {
             pipelines_heap,
             event_handlers_heap,
             version_tags_heap,
+            analyzers_heap,
+            synonym_dictionaries_heap,
+            resilience_policies_heap,
+            user_types_heap,
+            collations_heap,
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
             init_done: std::sync::atomic::AtomicBool::new(false),
@@ -676,6 +763,11 @@ impl HeapCatalogStorage {
             self.pipelines_heap.init_cache(),
             self.event_handlers_heap.init_cache(),
             self.version_tags_heap.init_cache(),
+            self.analyzers_heap.init_cache(),
+            self.synonym_dictionaries_heap.init_cache(),
+            self.resilience_policies_heap.init_cache(),
+            self.user_types_heap.init_cache(),
+            self.collations_heap.init_cache(),
         )?;
         Ok(())
     }
@@ -787,6 +879,16 @@ impl CatalogStorage for HeapCatalogStorage {
             EVENT_HANDLERS_FSM_FILE_ID,
             VERSION_TAGS_HEAP_FILE_ID,
             VERSION_TAGS_FSM_FILE_ID,
+            ANALYZERS_HEAP_FILE_ID,
+            ANALYZERS_FSM_FILE_ID,
+            SYNONYM_DICTIONARIES_HEAP_FILE_ID,
+            SYNONYM_DICTIONARIES_FSM_FILE_ID,
+            RESILIENCE_POLICIES_HEAP_FILE_ID,
+            RESILIENCE_POLICIES_FSM_FILE_ID,
+            USER_TYPES_HEAP_FILE_ID,
+            USER_TYPES_FSM_FILE_ID,
+            COLLATIONS_HEAP_FILE_ID,
+            COLLATIONS_FSM_FILE_ID,
         ]
         .into_iter()
         .collect();
@@ -1432,6 +1534,201 @@ impl CatalogStorage for HeapCatalogStorage {
         });
         match target {
             Some(tid) => self.version_tags_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_analyzers(&self) -> Result<Vec<AnalyzerEntry>> {
+        scan_decode(&self.analyzers_heap, "analyzer", AnalyzerEntry::from_bytes)
+    }
+
+    async fn store_analyzer(&self, entry: &AnalyzerEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.analyzers_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_analyzer(&self, entry: &AnalyzerEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.analyzers_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(existing) = AnalyzerEntry::from_bytes(row.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.analyzers_heap.delete(tid).await?;
+                let tuple = Tuple::new(entry.to_bytes(), 0);
+                self.analyzers_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_analyzer(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.analyzers_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = AnalyzerEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.analyzers_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_synonym_dictionaries(&self) -> Result<Vec<SynonymDictionaryEntry>> {
+        scan_decode(
+            &self.synonym_dictionaries_heap,
+            "synonym dictionary",
+            SynonymDictionaryEntry::from_bytes,
+        )
+    }
+
+    async fn store_synonym_dictionary(&self, entry: &SynonymDictionaryEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self
+            .synonym_dictionaries_heap
+            .insert_batch(&[tuple])
+            .await?;
+        Ok(ids[0])
+    }
+
+    async fn update_synonym_dictionary(&self, entry: &SynonymDictionaryEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.synonym_dictionaries_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(existing) = SynonymDictionaryEntry::from_bytes(row.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.synonym_dictionaries_heap.delete(tid).await?;
+                let tuple = Tuple::new(entry.to_bytes(), 0);
+                self.synonym_dictionaries_heap
+                    .insert_batch(&[tuple])
+                    .await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_synonym_dictionary(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.synonym_dictionaries_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = SynonymDictionaryEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.synonym_dictionaries_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_resilience_policies(&self) -> Result<Vec<ResiliencePolicyEntry>> {
+        scan_decode(
+            &self.resilience_policies_heap,
+            "resilience policy",
+            ResiliencePolicyEntry::from_bytes,
+        )
+    }
+
+    async fn store_resilience_policy(&self, entry: &ResiliencePolicyEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.resilience_policies_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_resilience_policy(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.resilience_policies_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = ResiliencePolicyEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.resilience_policies_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_user_types(&self) -> Result<Vec<UserTypeEntry>> {
+        scan_decode(
+            &self.user_types_heap,
+            "user type",
+            UserTypeEntry::from_bytes,
+        )
+    }
+
+    async fn store_user_type(&self, entry: &UserTypeEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.user_types_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_user_type(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.user_types_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = UserTypeEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.user_types_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_collations(&self) -> Result<Vec<CollationEntry>> {
+        scan_decode(
+            &self.collations_heap,
+            "collation",
+            CollationEntry::from_bytes,
+        )
+    }
+
+    async fn store_collation(&self, entry: &CollationEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.collations_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_collation(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.collations_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = CollationEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.collations_heap.delete(tid).await,
             None => Ok(false),
         }
     }

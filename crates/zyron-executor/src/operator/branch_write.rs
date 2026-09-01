@@ -251,6 +251,9 @@ pub async fn merge_branch_table_into_main(
             Vec::new(),
             checks,
             Vec::new(),
+            // Stored generated values were computed when the rows entered
+            // the branch, the replay carries them as data
+            Vec::new(),
         );
         if let Some(batch) = insert_op.next().await? {
             if let Some(col) = batch.batch.columns.first() {
@@ -276,10 +279,7 @@ async fn write_page_through_pool(
         ctx.buffer_pool.unpin_page(page_id, true);
         return Ok(());
     }
-    let (_, evicted) = ctx.buffer_pool.load_page(page_id, data)?;
-    if let Some(ev) = evicted {
-        ctx.disk_manager.write_page(ev.page_id, &ev.data).await?;
-    }
+    ctx.buffer_pool.load_page(page_id, data)?;
     ctx.buffer_pool.unpin_page(page_id, true);
     Ok(())
 }

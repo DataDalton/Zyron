@@ -88,6 +88,10 @@ async fn create_test_server_configured(
         Some(num_frames) => zyron_buffer::BufferPoolConfig { num_frames },
     };
     let pool = Arc::new(BufferPool::new(pool_config));
+    // The hook the server installs at startup. A pool without one cannot
+    // evict a dirty page, so a suite that skipped it would run against an
+    // engine that stalls where the product writes
+    zyron_bench_harness::install_evict_writer(&pool, &disk, Some(&wal));
     let storage =
         Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).expect("storage"));
     let cache = Arc::new(CatalogCache::new(256, 64));
@@ -107,6 +111,10 @@ async fn create_test_server_configured(
         .await
         .expect("create zyron_test schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
+
+    // The server installs a presign secret at startup, so PRESIGNED_URL works
+    // against a test server the same way it works against what ships
+    zyron_executor::media_runtime::install_presign_secret([7u8; 32]);
 
     let security_manager = if with_security {
         let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
@@ -137,6 +145,10 @@ async fn create_test_server_configured(
         columnar_maintenance: None,
         security_manager: security_manager.clone(),
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
+        media_store: Arc::new(
+            zyron_media::store::MediaStore::open(std::path::PathBuf::from(tmp.path()))
+                .expect("media store opens in the test data dir"),
+        ),
         config_lookup: None,
         config_all: None,
         data_dir: std::path::PathBuf::from(tmp.path()),
@@ -318,8 +330,14 @@ pub async fn exec_dml_script(
         ctx.memory_budget = server
             .max_query_memory
             .map(zyron_executor::QueryMemoryBudget::new);
+        // The server hands every context the media store, so media columns
+        // externalize on write and inflate on scan through the harness too
+        ctx.set_media_store(Arc::clone(&server.media_store));
         ctx.heap_files = Some(Arc::clone(&server.heap_files));
         ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+        // The server installs its key store on every context, so ENCRYPTED
+        // columns encrypt on write and decrypt on scan through the harness too
+        ctx.set_key_store(Arc::clone(&server.key_store));
         ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
         let ctx = Arc::new(ctx);
         if let Err(e) = zyron_executor::execute(plan, &ctx).await {
@@ -376,8 +394,14 @@ pub async fn exec_dml_result(
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
     ctx.index_io_stats = Some(Arc::clone(&server.index_io_stats));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -444,8 +468,14 @@ pub async fn query_rows(server: &Arc<ServerState>, sql: &str) -> usize {
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
     ctx.index_io_stats = Some(Arc::clone(&server.index_io_stats));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -507,8 +537,14 @@ pub async fn query_error(server: &Arc<ServerState>, sql: &str) -> String {
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
@@ -565,8 +601,14 @@ pub async fn query_result(
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
@@ -626,8 +668,14 @@ pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<Scala
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
     ctx.index_io_stats = Some(Arc::clone(&server.index_io_stats));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -695,8 +743,14 @@ pub async fn try_query_values(
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
     match result {
@@ -762,8 +816,14 @@ pub async fn run_on_branch(
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
     ctx.index_io_stats = Some(Arc::clone(&server.index_io_stats));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
@@ -991,8 +1051,14 @@ pub async fn analyze(
     ctx.memory_budget = server
         .max_query_memory
         .map(zyron_executor::QueryMemoryBudget::new);
+    // The server hands every context the media store, so media columns
+    // externalize on write and inflate on scan through the harness too
+    ctx.set_media_store(Arc::clone(&server.media_store));
     ctx.heap_files = Some(Arc::clone(&server.heap_files));
     ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The server installs its key store on every context, so ENCRYPTED
+    // columns encrypt on write and decrypt on scan through the harness too
+    ctx.set_key_store(Arc::clone(&server.key_store));
     // The only thing that makes the executor wrap its operators in metrics
     // collectors
     ctx.analyze = true;

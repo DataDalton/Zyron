@@ -16,6 +16,10 @@ parking_lot.workspace = true
 crc32fast.workspace = true
 scc.workspace = true
 crossbeam.workspace = true
+# ICU4X collator for locale aware string comparison. compiled_data ships
+# the collation tables inside the binary, no runtime data files
+icu_collator = "1.5"
+icu_locid = "1.5"
 
 [dev-dependencies]
 mimalloc.workspace = true

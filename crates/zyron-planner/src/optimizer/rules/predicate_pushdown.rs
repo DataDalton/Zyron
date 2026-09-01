@@ -317,6 +317,7 @@ fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             source,
         } => {
             let pushed = push_predicates(source)?;
@@ -326,6 +327,7 @@ fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
                 column_defaults: column_defaults.clone(),
                 check_constraints: check_constraints.clone(),
                 expectations: expectations.clone(),
+                generated_columns: generated_columns.clone(),
                 source: Arc::new(pushed),
             })
         }
@@ -333,6 +335,7 @@ fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
             table_id,
             assignments,
             check_constraints,
+            generated_columns,
             child,
         } => {
             let pushed = push_predicates(child)?;
@@ -340,6 +343,7 @@ fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
                 table_id: *table_id,
                 assignments: assignments.clone(),
                 check_constraints: check_constraints.clone(),
+                generated_columns: generated_columns.clone(),
                 child: Arc::new(pushed),
             })
         }

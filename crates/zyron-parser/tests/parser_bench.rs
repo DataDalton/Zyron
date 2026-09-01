@@ -737,6 +737,15 @@ fn expr_to_sql(expr: &Expr) -> String {
             LiteralValue::Decimal { digits, scale } => {
                 zyron_common::format_decimal(*digits, *scale)
             }
+            LiteralValue::Bytes(b) => {
+                let mut out = String::with_capacity(b.len() * 2 + 3);
+                out.push_str("X'");
+                for byte in b {
+                    out.push_str(&format!("{byte:02X}"));
+                }
+                out.push('\'');
+                out
+            }
         },
         Expr::BinaryOp { left, op, right } => {
             let op_str = match op {
@@ -942,6 +951,25 @@ fn datatype_to_sql(dt: &DataType) -> String {
         DataType::Bitfield => "BITFIELD".into(),
         DataType::Quantity => "QUANTITY".into(),
         DataType::Range(inner) => format!("RANGE({})", datatype_to_sql(inner)),
+        DataType::Variant => "VARIANT".into(),
+        DataType::Struct(fields) => format!(
+            "STRUCT<{}>",
+            fields
+                .iter()
+                .map(|(name, ty)| format!("{name} {}", datatype_to_sql(ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DataType::Map(key, value) => {
+            format!("MAP<{}, {}>", datatype_to_sql(key), datatype_to_sql(value))
+        }
+        DataType::Ltree => "LTREE".into(),
+        DataType::Image => "IMAGE".into(),
+        DataType::Video => "VIDEO".into(),
+        DataType::Audio => "AUDIO".into(),
+        DataType::Document => "DOCUMENT".into(),
+        DataType::ExternalRef => "EXTERNAL_REF".into(),
+        DataType::UserDefined(name) => name.clone(),
     }
 }
 

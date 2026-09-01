@@ -73,6 +73,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
+        media_store: Arc::new(
+            zyron_media::store::MediaStore::open(tmp.path().join("data"))
+                .expect("media store opens in the test data dir"),
+        ),
         config_lookup: None,
         config_all: None,
         data_dir: std::path::PathBuf::from(tmp.path()),
@@ -322,6 +326,7 @@ async fn manufacture_segment(
         sys_xmin_hi: 1,
         cluster_spec_id: 0,
         storage_tier: 0,
+        shredded: Vec::new(),
     });
     entry.columnar.next_rowid = rows.len() as u64;
     entry.columnar.next_file_id = 2;

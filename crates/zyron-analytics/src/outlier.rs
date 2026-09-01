@@ -180,27 +180,29 @@ pub fn mad_outlier(values: &[f64], threshold: f64) -> Vec<OutlierDecision> {
 // random split value within the bounding box of the partition. Path length
 // to a leaf is the anomaly signal.
 pub struct IsolationForest {
-    pub trees: Vec<IsolationTree>,
+    trees: Vec<FlatTree>,
     pub sample_size: usize,
     pub n_features: usize,
 }
 
-pub struct IsolationTree {
-    pub root: TreeNode,
-    pub max_depth: u32,
+// One tree flattened into an arena. Scoring walks a hundred trees to depth
+// eight for every row, and following u32 indices through one contiguous
+// buffer is what keeps that walk in cache where boxed child pointers did
+// not
+struct FlatTree {
+    nodes: Vec<FlatNode>,
 }
 
-pub enum TreeNode {
-    Leaf {
-        size: u32,
-    },
-    Internal {
-        feature: usize,
-        threshold: f64,
-        left: Box<TreeNode>,
-        right: Box<TreeNode>,
-    },
+// feature == LEAF_MARKER marks a leaf, and threshold then carries the
+// c_factor(size) path length adjustment so the walk adds it and stops
+struct FlatNode {
+    feature: u32,
+    threshold: f64,
+    left: u32,
+    right: u32,
 }
+
+const LEAF_MARKER: u32 = u32::MAX;
 
 // XorShift64 PRNG for deterministic, dependency free randomness
 struct Xorshift64 {
@@ -234,24 +236,35 @@ impl Xorshift64 {
     }
 }
 
-impl IsolationTree {
+impl FlatTree {
+    fn leaf(nodes: &mut Vec<FlatNode>, size: usize) -> u32 {
+        let idx = nodes.len() as u32;
+        nodes.push(FlatNode {
+            feature: LEAF_MARKER,
+            threshold: c_factor(size),
+            left: 0,
+            right: 0,
+        });
+        idx
+    }
+
+    // Builds one subtree into the arena and returns its node index. The
+    // rng call order matches the boxed builder this replaced, so a fitted
+    // forest scores identically for a given seed
     fn build(
+        nodes: &mut Vec<FlatNode>,
         rows: &[Vec<f64>],
         indices: Vec<usize>,
         depth: u32,
         max_depth: u32,
         rng: &mut Xorshift64,
-    ) -> TreeNode {
+    ) -> u32 {
         if depth >= max_depth || indices.len() <= 1 {
-            return TreeNode::Leaf {
-                size: indices.len() as u32,
-            };
+            return Self::leaf(nodes, indices.len());
         }
         let n_features = rows[indices[0]].len();
         if n_features == 0 {
-            return TreeNode::Leaf {
-                size: indices.len() as u32,
-            };
+            return Self::leaf(nodes, indices.len());
         }
         let feature = rng.next_in_range(0, n_features);
         let mut lo = f64::INFINITY;
@@ -266,9 +279,7 @@ impl IsolationTree {
             }
         }
         if lo == hi {
-            return TreeNode::Leaf {
-                size: indices.len() as u32,
-            };
+            return Self::leaf(nodes, indices.len());
         }
         let threshold = lo + rng.next_f64() * (hi - lo);
         let mut left = Vec::new();
@@ -280,33 +291,34 @@ impl IsolationTree {
                 right.push(i);
             }
         }
-        TreeNode::Internal {
-            feature,
+        let idx = nodes.len() as u32;
+        nodes.push(FlatNode {
+            feature: feature as u32,
             threshold,
-            left: Box::new(Self::build(rows, left, depth + 1, max_depth, rng)),
-            right: Box::new(Self::build(rows, right, depth + 1, max_depth, rng)),
-        }
+            left: 0,
+            right: 0,
+        });
+        let left_idx = Self::build(nodes, rows, left, depth + 1, max_depth, rng);
+        let right_idx = Self::build(nodes, rows, right, depth + 1, max_depth, rng);
+        nodes[idx as usize].left = left_idx;
+        nodes[idx as usize].right = right_idx;
+        idx
     }
 
     fn path_length(&self, row: &[f64]) -> f64 {
-        Self::walk(&self.root, row, 0)
-    }
-
-    fn walk(node: &TreeNode, row: &[f64], depth: u32) -> f64 {
-        match node {
-            TreeNode::Leaf { size } => depth as f64 + c_factor(*size as usize),
-            TreeNode::Internal {
-                feature,
-                threshold,
-                left,
-                right,
-            } => {
-                if row[*feature] < *threshold {
-                    Self::walk(left, row, depth + 1)
-                } else {
-                    Self::walk(right, row, depth + 1)
-                }
+        let mut idx = 0u32;
+        let mut depth = 0.0f64;
+        loop {
+            let node = &self.nodes[idx as usize];
+            if node.feature == LEAF_MARKER {
+                return depth + node.threshold;
             }
+            idx = if row[node.feature as usize] < node.threshold {
+                node.left
+            } else {
+                node.right
+            };
+            depth += 1.0;
         }
     }
 }
@@ -338,8 +350,9 @@ impl IsolationForest {
                 chosen.insert(key, idx);
             }
             let indices: Vec<usize> = chosen.into_values().collect();
-            let root = IsolationTree::build(rows, indices, 0, max_depth, &mut rng);
-            trees.push(IsolationTree { root, max_depth });
+            let mut nodes = Vec::with_capacity(2 * target.max(1));
+            FlatTree::build(&mut nodes, rows, indices, 0, max_depth, &mut rng);
+            trees.push(FlatTree { nodes });
         }
         Self {
             trees,
@@ -362,11 +375,31 @@ impl IsolationForest {
         2f64.powf(-avg / cn)
     }
 
-    // Apply contamination threshold: rows with score >= threshold are
-    // marked as outliers. Threshold is the score at the (1-c) quantile.
-    pub fn predict(&self, rows: &[Vec<f64>], contamination: f64) -> Vec<OutlierDecision> {
-        let scores: Vec<f64> = rows.iter().map(|r| self.score(r)).collect();
-        let mut sorted = scores.clone();
+    // Scores every row in one pass, tree outer and rows inner, so each
+    // tree's arena stays hot across the whole batch instead of every row
+    // touching all hundred trees cold
+    pub fn score_all(&self, rows: &[Vec<f64>]) -> Vec<f64> {
+        let cn = c_factor(self.sample_size);
+        if self.trees.is_empty() || cn == 0.0 {
+            return vec![0.0; rows.len()];
+        }
+        let mut sums = vec![0.0f64; rows.len()];
+        for tree in &self.trees {
+            for (i, row) in rows.iter().enumerate() {
+                sums[i] += tree.path_length(row);
+            }
+        }
+        let inv_trees = 1.0 / self.trees.len() as f64;
+        sums.into_iter()
+            .map(|sum| 2f64.powf(-(sum * inv_trees) / cn))
+            .collect()
+    }
+
+    // Applies the contamination threshold to already computed scores: the
+    // score at the (1-c) quantile becomes the cutoff and everything at or
+    // above it is an outlier
+    pub fn decisions_from_scores(scores: &[f64], contamination: f64) -> Vec<OutlierDecision> {
+        let mut sorted = scores.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let cutoff_idx =
             ((1.0 - contamination).clamp(0.0, 1.0) * sorted.len() as f64).floor() as usize;
@@ -375,15 +408,19 @@ impl IsolationForest {
             .copied()
             .unwrap_or(0.5);
         scores
-            .into_iter()
+            .iter()
             .map(|s| {
-                if s >= threshold {
+                if *s >= threshold {
                     OutlierDecision::Outlier
                 } else {
                     OutlierDecision::Inlier
                 }
             })
             .collect()
+    }
+
+    pub fn predict(&self, rows: &[Vec<f64>], contamination: f64) -> Vec<OutlierDecision> {
+        Self::decisions_from_scores(&self.score_all(rows), contamination)
     }
 }
 

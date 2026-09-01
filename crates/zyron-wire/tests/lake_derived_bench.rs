@@ -396,3 +396,97 @@ async fn test_a_clustering_expression_costs_the_write_and_prunes_the_read() {
         derived_over_tsonly
     );
 }
+
+/// What declaring an expression on a table that already holds rows costs.
+///
+/// A data file never changes, so the declaration is a rewrite: every file is
+/// read, the expression is evaluated over its rows, and a replacement
+/// carrying the new column is written. The cost is therefore proportional to
+/// the table, which is inherent, and the number worth having is the rate.
+///
+/// It is measured against the load that produced the rows, because that is
+/// the comparison an operator actually makes: a backfill that costs many
+/// times the original write is one they would rather schedule than run.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_b_declaring_an_expression_backfills_the_rows_already_there() {
+    let _section = section("Derived Column Backfill");
+    let n = rows();
+
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE backfilled (ts TIMESTAMP(6)) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+
+    let load_us = timed_load(&server, &insert_statements("backfilled", n, false)).await;
+
+    // The declaration, over rows that were written before it existed
+    let start = Instant::now();
+    exec_ddl(
+        &server,
+        &mut session,
+        "ALTER TABLE backfilled ADD DERIVED COLUMN yr AS date_part('year', ts)",
+    )
+    .await
+    .expect("the rows already stored are backfilled");
+    let backfill_us = start.elapsed().as_secs_f64() * 1e6;
+
+    // Every row survived the rewrite and answers the expression it was
+    // written before. A backfill that lost or mis-valued rows is worse than
+    // one that is slow
+    let kept = count_of(&query_values(&server, "SELECT count(*) FROM backfilled").await);
+    assert_eq!(kept, n as i64, "the rewrite lost rows");
+    let probed = count_of(
+        &query_values(
+            &server,
+            &format!(
+                "SELECT count(*) FROM backfilled WHERE date_part('year', ts) = {}",
+                FIRST_YEAR
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        probed,
+        expected_probe_rows(n),
+        "a backfilled row stopped matching its own expression"
+    );
+
+    let rows_per_sec = n as f64 / (backfill_us / 1e6);
+    tprintln!(
+        "  backfilled {n} rows in {:.0} us, {:.0} rows/sec",
+        backfill_us,
+        rows_per_sec
+    );
+    tprintln!(
+        "  the load that wrote them took {:.0} us, so the backfill is {:.2}x the write",
+        load_us,
+        backfill_us / load_us.max(f64::MIN_POSITIVE)
+    );
+    record_metric(
+        SUITE,
+        "Backfill, rows per second",
+        "rows/sec",
+        vec![rows_per_sec],
+    );
+    record_metric(SUITE, "Backfill, elapsed", "us", vec![backfill_us]);
+
+    // A rewrite reads and writes every row once, so a few times the original
+    // load is the shape to expect. Many times it would mean the pass does
+    // something per row that the write path does per batch
+    assert!(
+        check_performance(
+            SUITE,
+            "Backfill ratio, declaring an expression over the load that wrote the rows",
+            backfill_us / load_us.max(f64::MIN_POSITIVE),
+            6.0,
+            false,
+        ),
+        "backfilling {n} rows cost {:.2}x the load that wrote them",
+        backfill_us / load_us.max(f64::MIN_POSITIVE)
+    );
+}

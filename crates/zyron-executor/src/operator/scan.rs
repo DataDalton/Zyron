@@ -21,8 +21,7 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_storage::{BTreeIndex, DiskManager, HeapPage, TupleId};
 
 use crate::batch::{
-    DataBatch, build_column_to_builder_map, create_builders, decode_tuple_into_builders,
-    finalize_builders,
+    DataBatch, build_column_to_builder_map, decode_tuple_into_builders, finalize_builders,
 };
 use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
@@ -47,16 +46,57 @@ pub(crate) async fn read_page_through_pool(
         return Ok(data);
     }
     let disk_data = disk.read_page(page_id).await?;
-    let (frame, evicted) = pool.load_page(page_id, &disk_data)?;
-    if let Some(evicted_page) = evicted {
-        disk.write_page(evicted_page.page_id, &evicted_page.data)
-            .await?;
-    }
+    // A pool with no frame to spare is a capacity limit, not a failed read.
+    // The page's bytes are already in hand, so the caller gets them and the
+    // page simply goes uncached, which is what the heap's own whole-file scan
+    // does with the same refusal. Failing here instead would turn a small
+    // pool into a query that cannot run
+    let frame = match pool.load_page(page_id, &disk_data) {
+        Ok(loaded) => loaded,
+        Err(zyron_common::ZyronError::BufferPoolFull) => return Ok(disk_data),
+        Err(e) => return Err(e),
+    };
     let guard = frame.read_data();
     let data: [u8; PAGE_SIZE] = **guard;
     drop(guard);
     pool.unpin_page(page_id, false);
     Ok(data)
+}
+
+/// Builders for a heap scan's output columns. An ENCRYPTED column gets a
+/// binary container because its stored cells are ciphertext, which the
+/// tuple decoder hands over as bytes. The scan-side decrypt then swaps in
+/// the logical text column before anything reads the batch. A text
+/// container would silently drop every ciphertext cell on the type
+/// mismatch and the decrypt would have nothing to decrypt
+pub(crate) fn scan_builders(
+    output_columns: &[LogicalColumn],
+    table_columns: &[zyron_catalog::ColumnEntry],
+    capacity: usize,
+) -> Vec<crate::batch::ColumnBuilder> {
+    output_columns
+        .iter()
+        .map(|col| {
+            let encrypted = table_columns
+                .iter()
+                .any(|c| c.id == col.column_id && c.is_encrypted());
+            if encrypted {
+                crate::batch::ColumnBuilder::new(TypeId::Bytea, capacity)
+            } else {
+                let phys = TypeId::timestamp_physical_type_id(col.type_id, col.fractional_digits);
+                if phys != col.type_id || col.fractional_digits.is_some() {
+                    crate::batch::ColumnBuilder::new_ts(
+                        col.type_id,
+                        phys,
+                        col.fractional_digits,
+                        capacity,
+                    )
+                } else {
+                    crate::batch::ColumnBuilder::new(col.type_id, capacity)
+                }
+            }
+        })
+        .collect()
 }
 
 /// Resolves a branch's append overlay file id and page count for a table, or
@@ -233,7 +273,8 @@ impl Operator for SeqScanOperator {
             let batch_size = self.ctx.batch_size;
             let count_only =
                 self.output_columns.is_empty() && self.predicate.is_none() && !self.track_tuple_ids;
-            let mut builders = create_builders(&self.output_columns, batch_size);
+            let mut builders =
+                scan_builders(&self.output_columns, &self.table_entry.columns, batch_size);
             let mut tuple_ids: Vec<TupleId> = if self.track_tuple_ids {
                 Vec::with_capacity(batch_size)
             } else {
@@ -369,7 +410,25 @@ impl Operator for SeqScanOperator {
                 ))));
             }
 
-            let batch = finalize_builders(builders);
+            let mut batch = finalize_builders(builders);
+
+            // ENCRYPTED columns decrypt before anything reads the batch, so
+            // predicates evaluate over plaintext. Pushdown into encrypted
+            // storage is impossible, this is where the fallback lands
+            decrypt_encrypted_columns(
+                &self.ctx,
+                &mut batch,
+                &self.table_entry.columns,
+                &self.output_columns,
+            )?;
+            // Media descriptors inflate back to their original payloads
+            inflate_media_columns(
+                &self.ctx,
+                &mut batch,
+                &self.table_entry.columns,
+                &self.output_columns,
+            )?;
+            let batch = batch;
 
             // Apply predicate filter if present. The predicate runs on the
             // real (unmasked) values; column-level security is applied to the
@@ -401,6 +460,171 @@ impl Operator for SeqScanOperator {
             }
         })
     }
+}
+
+/// Decrypts the ENCRYPTED columns present in a scan's output batch, turning
+/// stored ciphertext back into the column's logical text value. A missing
+/// key store or key fails the scan loudly rather than serving ciphertext
+pub(crate) fn decrypt_encrypted_columns(
+    ctx: &ExecutionContext,
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+    output_columns: &[LogicalColumn],
+) -> Result<()> {
+    for (idx, out_col) in output_columns.iter().enumerate() {
+        let Some(entry) = table_columns.iter().find(|c| c.id == out_col.column_id) else {
+            continue;
+        };
+        if !entry.is_encrypted() || idx >= batch.columns.len() {
+            continue;
+        }
+        let Some(store) = ctx.key_store.as_ref() else {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "column {} is ENCRYPTED but the server has no key store",
+                entry.name
+            )));
+        };
+        let key = store.get_key(entry.attrs.encryption_key_id)?;
+        let algorithm = match entry.attrs.encryption_algorithm {
+            0 => zyron_auth::EncryptionAlgorithm::Aes128Gcm,
+            1 => zyron_auth::EncryptionAlgorithm::Aes256Gcm,
+            other => {
+                return Err(zyron_common::ZyronError::ExecutionError(format!(
+                    "column {} declares unknown encryption algorithm {other}",
+                    entry.name
+                )));
+            }
+        };
+        let mut aad = [0u8; 6];
+        aad[..4].copy_from_slice(&entry.table_id.0.to_le_bytes());
+        aad[4..].copy_from_slice(&entry.id.0.to_le_bytes());
+        let source = &batch.columns[idx];
+        let rows = batch.num_rows;
+        let mut out = Vec::with_capacity(rows);
+        let mut nulls = crate::column::NullBitmap::none(rows);
+        for row in 0..rows {
+            if source.nulls.is_null(row) {
+                nulls.set_null(row);
+                out.push(String::new());
+                continue;
+            }
+            let ciphertext = match source.get_scalar(row) {
+                crate::column::ScalarValue::Binary(b) => b,
+                other => {
+                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                        "encrypted column {} holds unexpected stored value {other:?}",
+                        entry.name
+                    )));
+                }
+            };
+            let plaintext =
+                zyron_auth::encryption::decrypt_value(&ciphertext, &key, algorithm, &aad)?;
+            out.push(String::from_utf8(plaintext).map_err(|_| {
+                zyron_common::ZyronError::ExecutionError(format!(
+                    "decrypted value of column {} is not valid text",
+                    entry.name
+                ))
+            })?);
+        }
+        batch.columns[idx] = crate::column::Column::with_nulls(
+            crate::column::ColumnData::Utf8(out),
+            nulls,
+            out_col.type_id,
+        );
+    }
+    Ok(())
+}
+
+/// Inflates media descriptors in a scan's output back to the original
+/// payload bytes: inline descriptors carry them, TOAST and external ones
+/// read the content addressed store, and URI references fetch through the
+/// external fetcher. A SELECT of a media column always answers with the
+/// bytes that were inserted
+pub(crate) fn inflate_media_columns(
+    ctx: &ExecutionContext,
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+    output_columns: &[LogicalColumn],
+) -> Result<()> {
+    use zyron_common::TypeId as T;
+    for (idx, out_col) in output_columns.iter().enumerate() {
+        if !matches!(
+            out_col.type_id,
+            T::Image | T::Video | T::Audio | T::Document | T::ExternalRef
+        ) || idx >= batch.columns.len()
+        {
+            continue;
+        }
+        let Some(entry) = table_columns.iter().find(|c| c.id == out_col.column_id) else {
+            continue;
+        };
+        let source = &batch.columns[idx];
+        let rows = batch.num_rows;
+        let mut out = Vec::with_capacity(rows);
+        let mut nulls = crate::column::NullBitmap::none(rows);
+        for row in 0..rows {
+            if source.nulls.is_null(row) {
+                nulls.set_null(row);
+                out.push(Vec::new());
+                continue;
+            }
+            let stored = match source.get_scalar(row) {
+                ScalarValue::Binary(b) => b,
+                other => {
+                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                        "media column {} holds unexpected stored value {other:?}",
+                        entry.name
+                    )));
+                }
+            };
+            if !zyron_media::descriptor::is_descriptor(&stored) {
+                // A pre-descriptor payload reads back as it was stored
+                out.push(stored);
+                continue;
+            }
+            let (descriptor, inline_payload) =
+                zyron_media::descriptor::MediaDescriptor::from_bytes(&stored)
+                    .map_err(zyron_common::ZyronError::from)?;
+            use zyron_media::descriptor::StorageMode;
+            let payload = match descriptor.mode {
+                StorageMode::Inline => inline_payload.ok_or_else(|| {
+                    zyron_common::ZyronError::ExecutionError(format!(
+                        "inline media descriptor of column {} carries no payload",
+                        entry.name
+                    ))
+                })?,
+                StorageMode::Toast | StorageMode::External => {
+                    let Some(store) = ctx.media_store.as_ref() else {
+                        return Err(zyron_common::ZyronError::ExecutionError(format!(
+                            "column {} needs the media store, which only a running server opens",
+                            entry.name
+                        )));
+                    };
+                    store
+                        .get(&descriptor.sha256)
+                        .map_err(zyron_common::ZyronError::from)?
+                }
+                StorageMode::ExternalUri => {
+                    let uri = descriptor.uri.as_deref().ok_or_else(|| {
+                        zyron_common::ZyronError::ExecutionError(format!(
+                            "external reference of column {} carries no URI",
+                            entry.name
+                        ))
+                    })?;
+                    crate::media_runtime::external_fetcher()
+                        .fetch(uri)
+                        .map_err(zyron_common::ZyronError::from)?
+                }
+            };
+            out.push(payload);
+        }
+        batch.columns[idx] = crate::column::Column::with_nulls(
+            crate::column::ColumnData::Binary(out),
+            nulls,
+            out_col.type_id,
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +819,8 @@ impl<'a> PageRangeScanner<'a> {
         while self.page_cursor < self.end_page {
             self.ctx.check_cancelled()?;
 
-            let mut builders = create_builders(self.output_columns, batch_size);
+            let mut builders =
+                scan_builders(self.output_columns, &self.table_entry.columns, batch_size);
             let mut row_count = 0usize;
             // Pages fetched for this batch, folded into the table counters once
             // when the batch is done rather than once per page.
@@ -676,7 +901,16 @@ impl<'a> PageRangeScanner<'a> {
                 return Ok(Some(DataBatch::with_row_count(row_count)));
             }
 
-            let batch = finalize_builders(builders);
+            let mut batch = finalize_builders(builders);
+            // ENCRYPTED columns decrypt before anything reads the batch, so
+            // the predicate below evaluates over plaintext
+            decrypt_encrypted_columns(
+                self.ctx,
+                &mut batch,
+                &self.table_entry.columns,
+                self.output_columns,
+            )?;
+            let batch = batch;
             if let Some(pred) = self.predicate {
                 let mask_col = evaluate(pred, &batch, self.output_columns, &self.ctx.params)?;
                 let mask = column_to_mask(&mask_col);
@@ -774,6 +1008,12 @@ fn literal_to_key_bytes(value: &LiteralValue) -> Option<Vec<u8>> {
         // Interval has no order-preserving fixed encoding, so no bound is
         // built and CREATE INDEX refuses interval key columns
         LiteralValue::Interval(_) => None,
+        // A range reaches an index in its order preserving form, which is a
+        // reordering of the stored bytes this literal carries, so no bound
+        // is offered from here and the predicate is answered by the scan
+        // filter instead. Seeking with the stored form would look in the
+        // wrong place and miss rows
+        LiteralValue::Bytes(_) => None,
     }
 }
 
@@ -1457,7 +1697,8 @@ impl IndexScanState {
         self.ctx.check_cancelled()?;
 
         let batch_size = self.ctx.batch_size;
-        let mut builders = create_builders(&self.output_columns, batch_size);
+        let mut builders =
+            scan_builders(&self.output_columns, &self.table_entry.columns, batch_size);
         let mut result_locators: Vec<zyron_common::RowLocator> = if self.track_tuple_ids {
             Vec::with_capacity(batch_size)
         } else {
@@ -1506,13 +1747,7 @@ impl IndexScanState {
                     let frame_present = self.ctx.buffer_pool.fetch_page(phys_page).is_some();
                     if !frame_present {
                         let disk_data = self.ctx.disk_manager.read_page(phys_page).await?;
-                        let (_, evicted) = self.ctx.buffer_pool.load_page(phys_page, &disk_data)?;
-                        if let Some(ev) = evicted {
-                            self.ctx
-                                .disk_manager
-                                .write_page(ev.page_id, &ev.data)
-                                .await?;
-                        }
+                        self.ctx.buffer_pool.load_page(phys_page, &disk_data)?;
                         // load_page pinned, frame_present path's fetch_page also
                         // pinned, in both cases we have one extra pin to balance
                     }
@@ -1583,7 +1818,16 @@ impl IndexScanState {
             return Ok(None);
         }
 
-        let batch = finalize_builders(builders);
+        let mut batch = finalize_builders(builders);
+        // ENCRYPTED columns decrypt before anything reads the batch, so the
+        // post-filter below evaluates over plaintext
+        decrypt_encrypted_columns(
+            &self.ctx,
+            &mut batch,
+            &self.table_entry.columns,
+            &self.output_columns,
+        )?;
+        let batch = batch;
 
         // Apply remaining predicate as a post-filter.
         if let Some(ref pred) = self.remaining_predicate {

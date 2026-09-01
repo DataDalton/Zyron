@@ -9,8 +9,10 @@ pub mod text;
 pub mod vector;
 
 pub use text::analyzer::{
-    AnalysisBuffer, Analyzer, CustomAnalyzer, SimpleAnalyzer, StandardAnalyzer, Token, TokenFilter,
-    Tokenizer, WhitespaceAnalyzer,
+    AnalysisBuffer, Analyzer, AnalyzerConfig, CharFilter, CustomAnalyzer, EdgeNGramTokenizer,
+    HtmlStripCharFilter, LowercaseCharFilter, NGramTokenizer, PhoneticAlgorithm, PhoneticFilter,
+    SimpleAnalyzer, StandardAnalyzer, Token, TokenFilter, Tokenizer, WhitespaceAnalyzer,
+    build_analyzer,
 };
 pub use text::autocomplete::PrefixIndex;
 pub use text::highlight::{HighlightConfig, highlight};

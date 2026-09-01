@@ -78,7 +78,7 @@ pub fn cell_family(physical: TypeId) -> CellFamily {
         | TypeId::UInt128
         | TypeId::SemVer => CellFamily::UnsignedInt,
         TypeId::Float32 | TypeId::Float64 => CellFamily::Float,
-        TypeId::Char | TypeId::Varchar | TypeId::Text => CellFamily::Str,
+        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Ltree => CellFamily::Str,
         TypeId::Binary | TypeId::Varbinary | TypeId::Bytea | TypeId::Uuid | TypeId::MacAddr => {
             CellFamily::Bytes
         }

@@ -30,6 +30,18 @@ pub struct ZyronConfig {
     /// describes one, and a node with it off behaves exactly as it did
     /// before there were groups
     pub cluster: ClusterSection,
+    /// External media tooling: paths to the binaries media operations
+    /// invoke when configured
+    pub media: MediaSection,
+}
+
+/// External tool paths for media operations. An unset path makes the
+/// operation answer with an actionable error naming this key
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MediaSection {
+    pub ffmpeg_path: Option<PathBuf>,
+    pub tesseract_path: Option<PathBuf>,
 }
 
 impl Default for ZyronConfig {
@@ -47,6 +59,7 @@ impl Default for ZyronConfig {
             query: QuerySection::default(),
             mesh: zyron_pressure::provisioner::MeshSection::default(),
             cluster: ClusterSection::default(),
+            media: MediaSection::default(),
         }
     }
 }
@@ -403,6 +416,11 @@ impl ZyronConfig {
                 "format" => self.logging.format = value.into(),
                 "output" => self.logging.output = value.into(),
                 "file_path" => self.logging.file_path = Some(PathBuf::from(value)),
+                _ => return unknown_key(section, key),
+            },
+            "media" => match key {
+                "ffmpeg_path" => self.media.ffmpeg_path = Some(PathBuf::from(value)),
+                "tesseract_path" => self.media.tesseract_path = Some(PathBuf::from(value)),
                 _ => return unknown_key(section, key),
             },
             "metrics" => match key {
@@ -856,6 +874,17 @@ impl ZyronConfig {
             "metrics.enabled" => Some(self.metrics.enabled.to_string()),
             "metrics.port" => Some(self.metrics.port.to_string()),
             "metrics.path" => Some(self.metrics.path.clone()),
+            // Media tooling
+            "media.ffmpeg_path" => self
+                .media
+                .ffmpeg_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            "media.tesseract_path" => self
+                .media
+                .tesseract_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
             // Compaction
             "compaction.enabled" => Some(self.compaction.enabled.to_string()),
             "compaction.threshold_rows" => Some(self.compaction.threshold_rows.to_string()),
@@ -1156,7 +1185,8 @@ impl Default for ServerSection {
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
-            quic_enabled: false,
+            // HTTP/3 over QUIC is the primary transport
+            quic_enabled: true,
             quic_port: None,
             quic_zero_rtt: false,
             quic_idle_timeout_secs: 300,

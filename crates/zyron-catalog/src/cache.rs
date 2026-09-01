@@ -545,6 +545,12 @@ impl CatalogCache {
                         }
                         IndexType::Fulltext => s.fts.push(entry.id),
                         IndexType::Vector => s.vector.push(entry.id),
+                        // A hybrid index answers both full-text and vector
+                        // lookups, so it registers in both lists
+                        IndexType::Hybrid => {
+                            s.fts.push(entry.id);
+                            s.vector.push(entry.id);
+                        }
                     }
                 }
                 Arc::new(s)
@@ -1045,6 +1051,7 @@ mod tests {
                 fractional_digits: None,
                 tz_offset_secs: None,
                 element_type: None,
+                attrs: Default::default(),
             }],
             constraints: vec![],
             created_at: 0,

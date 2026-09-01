@@ -36,7 +36,12 @@ pub async fn build(
         ("core", "columns") => build_columns(server),
         ("core", "system_view_documentation") => build_documentation(),
         ("storage", "indexes") => build_indexes(server),
-        ("query", "recommend_indexes") => build_recommend_indexes(server),
+        ("storage", "variant_shredding_stats") => build_variant_shredding_stats(server),
+        ("sql", "triggers") => build_triggers(server),
+        ("session", "prepared_statements") => {
+            crate::system_views::build_session_prepared_statements(server)
+        }
+        ("expectation", "results") => build_expectation_results(server),
         ("ml", "feature_groups") => build_feature_groups(server),
         ("ml", "feature_definitions") => build_feature_definitions(server),
         ("ml", "models") => build_models(server),
@@ -341,6 +346,56 @@ fn build_indexes(server: &ServerState) -> ViewRows {
     (fields, rows)
 }
 
+/// Builds zyron_sys.storage.variant_shredding_stats.
+/// Columns: table_id, table_name, column_id, column_name, path, occurrences,
+///          coverage_percent, value_kind, shredded.
+///
+/// Reads the executor's process-wide variant path tracker for every variant
+/// column the catalog holds, so the rows describe the JSON shapes this node
+/// has actually been asked to store. Rows are ordered by table, column, and
+/// descending occurrences, which puts each column's strongest promotion
+/// candidate first
+fn build_variant_shredding_stats(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("column_id", PG_INT4_OID, 4),
+        make_field("column_name", PG_TEXT_OID, -1),
+        make_field("path", PG_TEXT_OID, -1),
+        make_field("occurrences", PG_INT8_OID, 8),
+        make_field("coverage_percent", PG_TEXT_OID, -1),
+        make_field("value_kind", PG_TEXT_OID, -1),
+        make_field("shredded", PG_TEXT_OID, -1),
+    ];
+    let mut tables = server.catalog.list_all_tables();
+    tables.sort_by_key(|t| t.id.0);
+    let mut rows = Vec::new();
+    for table in tables {
+        let mut columns: Vec<_> = table
+            .columns
+            .iter()
+            .filter(|c| c.type_id == zyron_common::TypeId::Variant)
+            .collect();
+        columns.sort_by_key(|c| c.id.0);
+        for column in columns {
+            for stat in zyron_executor::variant_shred::paths_for(table.id.0, column.id.0) {
+                rows.push(vec![
+                    cell(table.id.0),
+                    cell(&table.name),
+                    cell(column.id.0),
+                    cell(&column.name),
+                    cell(&stat.path),
+                    cell(stat.occurrences),
+                    cell(format!("{:.2}", stat.coverage_percent)),
+                    cell(stat.value_kind),
+                    cell(stat.shredded),
+                ]);
+            }
+        }
+    }
+    (fields, rows)
+}
+
 // ---------------------------------------------------------------------------
 // query
 // ---------------------------------------------------------------------------
@@ -353,20 +408,45 @@ fn build_indexes(server: &ServerState) -> ViewRows {
 /// what this node has actually been asked to scan rather than a static
 /// analysis of the schema. The rendered CREATE INDEX statement is the
 /// recommendation in the form the operator would run it.
-fn build_recommend_indexes(server: &ServerState) -> ViewRows {
+pub(crate) fn build_recommend_indexes(
+    server: &ServerState,
+    schema_filter: Option<&str>,
+) -> ViewRows {
     let fields = vec![
         make_field("table_id", PG_INT4_OID, 4),
         make_field("table_name", PG_TEXT_OID, -1),
-        make_field("columns", PG_TEXT_OID, -1),
+        make_field("column_names", PG_TEXT_OID, -1),
         make_field("scan_count", PG_INT8_OID, 8),
         make_field("estimated_selectivity", PG_TEXT_OID, -1),
+        make_field("estimated_benefit_score", PG_TEXT_OID, -1),
+        make_field("sample_query", PG_TEXT_OID, -1),
         make_field("reason", PG_TEXT_OID, -1),
         make_field("create_statement", PG_TEXT_OID, -1),
     ];
+    let schema_id_filter = schema_filter.and_then(|name| {
+        server
+            .catalog
+            .list_schemas()
+            .into_iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .map(|s| s.id)
+    });
     let advisor = zyron_planner::optimizer::rules::global_index_advisor();
     let rows = advisor
         .recommendations(&server.catalog)
         .into_iter()
+        .filter(|rec| {
+            match (schema_filter, schema_id_filter) {
+                // A named schema that does not exist filters everything out
+                (Some(_), None) => false,
+                (_, Some(schema_id)) => server
+                    .catalog
+                    .get_table_by_id(rec.table_id)
+                    .map(|t| t.schema_id == schema_id)
+                    .unwrap_or(false),
+                (None, None) => true,
+            }
+        })
         .map(|rec| {
             let table = server.catalog.get_table_by_id(rec.table_id).ok();
             let table_name = table
@@ -392,14 +472,122 @@ fn build_recommend_indexes(server: &ServerState) -> ViewRows {
                 table_name,
                 joined
             );
+            // Benefit grows with how often the column is scanned and how
+            // selective an index on it would be
+            let benefit = rec.scan_count as f64 * (1.0 - rec.estimated_selectivity);
+            let sample_query = column_names
+                .first()
+                .map(|first| format!("SELECT * FROM {table_name} WHERE {first} = $1"))
+                .unwrap_or_default();
             vec![
                 cell(rec.table_id.0),
                 cell(table_name),
                 cell(joined),
                 cell(rec.scan_count),
                 cell(format!("{:.6}", rec.estimated_selectivity)),
+                cell(format!("{benefit:.3}")),
+                cell(sample_query),
                 cell(&rec.reason),
                 cell(suggested),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_sys.expectation.results.
+/// Columns: table_id, table_name, expectation_name, evaluation_time,
+///          passed, details.
+fn build_expectation_results(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("expectation_name", PG_TEXT_OID, -1),
+        make_field("evaluation_time", PG_INT8_OID, 8),
+        make_field("passed", PG_TEXT_OID, -1),
+        make_field("details", PG_TEXT_OID, -1),
+    ];
+    let rows = zyron_executor::expectation_results::snapshot()
+        .into_iter()
+        .map(|o| {
+            let table_name = server
+                .catalog
+                .get_table_by_id(zyron_catalog::TableId(o.table_id))
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|_| format!("table_{}", o.table_id));
+            let details = format!(
+                "{{\"rows_checked\":{},\"violations\":{},\"action\":\"{}\"}}",
+                o.rows_checked, o.violations, o.action
+            );
+            vec![
+                cell(o.table_id),
+                cell(table_name),
+                cell(&o.expectation_name),
+                cell(o.evaluated_at_micros),
+                cell(o.passed),
+                cell(details),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_sys.sql.triggers.
+/// Columns: trigger_id, trigger_name, table_id, table_name, timing, events,
+///          for_each, execute_function, enabled.
+fn build_triggers(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("trigger_id", PG_INT4_OID, 4),
+        make_field("trigger_name", PG_TEXT_OID, -1),
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("timing", PG_TEXT_OID, -1),
+        make_field("events", PG_TEXT_OID, -1),
+        make_field("for_each", PG_TEXT_OID, -1),
+        make_field("execute_function", PG_TEXT_OID, -1),
+        make_field("enabled", PG_TEXT_OID, -1),
+    ];
+    let rows = server
+        .catalog
+        .list_triggers()
+        .into_iter()
+        .map(|t| {
+            let table_name = server
+                .catalog
+                .get_table_by_id(zyron_catalog::TableId(t.table_id))
+                .map(|te| te.name.clone())
+                .unwrap_or_else(|_| format!("table_{}", t.table_id));
+            let timing = match t.timing {
+                zyron_catalog::TriggerEntry::TIMING_BEFORE => "before",
+                zyron_catalog::TriggerEntry::TIMING_AFTER => "after",
+                zyron_catalog::TriggerEntry::TIMING_INSTEAD_OF => "instead_of",
+                _ => "unknown",
+            };
+            let mut events = Vec::new();
+            if t.events & zyron_catalog::TriggerEntry::EVENT_INSERT != 0 {
+                events.push("insert");
+            }
+            if t.events & zyron_catalog::TriggerEntry::EVENT_UPDATE != 0 {
+                events.push("update");
+            }
+            if t.events & zyron_catalog::TriggerEntry::EVENT_DELETE != 0 {
+                events.push("delete");
+            }
+            let for_each = if t.for_each == zyron_catalog::TriggerEntry::FOR_EACH_STATEMENT {
+                "statement"
+            } else {
+                "row"
+            };
+            vec![
+                cell(t.id),
+                cell(&t.name),
+                cell(t.table_id),
+                cell(table_name),
+                cell(timing),
+                cell(events.join(",")),
+                cell(for_each),
+                cell(&t.execute_function),
+                cell(t.enabled),
             ]
         })
         .collect();

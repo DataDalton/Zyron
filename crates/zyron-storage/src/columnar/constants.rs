@@ -71,6 +71,17 @@ pub const SYS_COL_SUPERSEDE: u32 = u32::MAX - 2;
 /// never reach this range.
 pub const SYS_COL_MIN: u32 = u32::MAX - 2;
 
+/// First column id a shredded VARIANT path takes.
+///
+/// User column ids are catalog ordinals, which are u16, so the range above
+/// them is free. Shredded ids are handed out in order within one fold and
+/// recorded on the segment beside the path they hold, so nothing has to
+/// derive an id from a path and no two paths can land on the same column.
+pub const SHRED_COL_BASE: u32 = 1 << 20;
+
+/// Highest column id a shredded path may take, one below the system range.
+pub const SHRED_COL_MAX: u32 = SYS_COL_MIN - 1;
+
 /// All three system columns are 8-byte values.
 pub const SYS_COL_VALUE_SIZE: usize = 8;
 

@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod checkpoint;
 pub mod encoding;
 pub mod ids;
+pub mod index_params;
 pub mod resolver;
 pub mod schema;
 pub mod sequence;
@@ -27,16 +28,18 @@ pub use ids::{
 pub use resolver::NameResolver;
 pub use schema::SequenceEntry;
 pub use schema::{
-    AggregateEntry, BackpressurePolicy, CatalogClassification, CatalogStreamingWriteMode,
-    ColumnEntry, CommentEntry, ConstraintEntry, ConstraintType, DatabaseEntry, EndpointAuthMode,
-    EndpointEntry, EndpointKind, EndpointMessageFormat, EndpointOutputFormat, EventHandlerEntry,
-    ExpectationAction, ExpectationEntry, ExternalBackend, ExternalFormat, ExternalMode,
-    ExternalSinkEntry, ExternalSourceEntry, FunctionEntry, HttpMethod, IndexColumnEntry,
-    IndexEntry, IndexType, MaterializedViewEntry, PipelineEntry, ProcedureEntry, PublicationEntry,
-    PublicationTableEntry, RateLimitPeriod, RateLimitScope, RateLimitSpec, ReferentialAction,
-    RowFormat, ScheduleEntry, SchemaEntry, SecurityMapEntry, SecurityMapKind, StreamingJobEntry,
-    StreamingJobStatus, SubscriptionEntry, SubscriptionMode, SubscriptionState, TableEntry,
-    TriggerEntry, VersionTagEntry, ViewEntry,
+    AggregateEntry, AnalyzerEntry, BackpressurePolicy, CatalogClassification,
+    CatalogStreamingWriteMode, CollationEntry, ColumnAttributes, ColumnEntry, CommentEntry,
+    ConstraintEntry, ConstraintType, DatabaseEntry, EndpointAuthMode, EndpointEntry, EndpointKind,
+    EndpointMessageFormat, EndpointOutputFormat, EventHandlerEntry, ExpectationAction,
+    ExpectationEntry, ExternalBackend, ExternalFormat, ExternalMode, ExternalSinkEntry,
+    ExternalSourceEntry, FunctionEntry, HttpMethod, IndexColumnEntry, IndexEntry, IndexType,
+    MaterializedViewEntry, PipelineEntry, ProcedureEntry, PublicationEntry, PublicationTableEntry,
+    RateLimitPeriod, RateLimitScope, RateLimitSpec, ReferentialAction, ResiliencePolicyEntry,
+    ResiliencePolicyKind, RowFormat, ScheduleEntry, SchemaEntry, SecurityMapEntry, SecurityMapKind,
+    StreamingJobEntry, StreamingJobStatus, SubscriptionEntry, SubscriptionMode, SubscriptionState,
+    SynonymDictionaryEntry, SynonymRuleEntry, TableEntry, TriggerEntry, UserTypeEntry,
+    VersionTagEntry, ViewEntry,
 };
 pub use sequence::LiveSequence;
 pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};

@@ -225,6 +225,13 @@ pub async fn reconcile_columnar(
                 // writes into the columnar root, so a re-registered segment
                 // is hot
                 storage_tier: 0,
+                // Which paths the file shredded is not in the WAL record
+                // either, and a segment registered without them is read the
+                // way an unshredded one is: the path comes back out of the
+                // json, which is the same answer the column holds. So this
+                // costs the speedup until the next pass rewrites the file,
+                // and never an answer
+                shredded: Vec::new(),
             });
             entry.columnar.next_rowid = entry.columnar.next_rowid.max(e.next_rowid);
             entry.columnar.next_file_id = entry.columnar.next_file_id.max(e.file_id + 1);

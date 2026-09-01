@@ -4,6 +4,9 @@
 //! Operations prevent mixed-currency arithmetic bugs by returning errors
 //! on currency mismatch (except explicit conversion).
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use zyron_common::{Result, ZyronError};
 
 /// Currency information: name, symbol, decimal places, ISO numeric code.
@@ -162,6 +165,379 @@ pub fn money_currency_symbol(cur: u16) -> &'static str {
 /// Returns the number of decimal places used by the currency.
 pub fn money_minor_digits(cur: u16) -> u8 {
     currency_by_numeric(cur).map(|c| c.decimals).unwrap_or(2)
+}
+
+/// Rounds a money value to the given number of decimal places using half
+/// away from zero. Places at or above the currency's minor digits leave the
+/// value unchanged, negative places round into the major units
+pub fn money_round(val: i64, cur: u16, decimal_places: i32) -> Result<(i64, u16)> {
+    let info = currency_by_numeric(cur)
+        .ok_or_else(|| ZyronError::ExecutionError(format!("Unknown currency: {}", cur)))?;
+    if !(-18..=18).contains(&decimal_places) {
+        return Err(ZyronError::InvalidParameter {
+            name: "decimal_places".to_string(),
+            value: decimal_places.to_string(),
+        });
+    }
+    let decimals = info.decimals as i32;
+    if decimal_places >= decimals {
+        return Ok((val, cur));
+    }
+    let drop = (decimals - decimal_places) as u32;
+    let unit = 10i128.pow(drop);
+    let v = val as i128;
+    let rem = v % unit;
+    let base = v - rem;
+    let rounded = if rem.abs() * 2 >= unit {
+        if v >= 0 { base + unit } else { base - unit }
+    } else {
+        base
+    };
+    i64::try_from(rounded)
+        .map(|r| (r, cur))
+        .map_err(|_| ZyronError::ExecutionError(format!("Money value out of range: {}", rounded)))
+}
+
+// ---------------------------------------------------------------------------
+// Locale aware money parsing
+// ---------------------------------------------------------------------------
+
+/// Number formatting rules and fallback currency for a parse locale
+struct LocaleFormat {
+    thousands: &'static [char],
+    decimal: char,
+    default_currency: &'static str,
+}
+
+fn locale_format(locale: &str) -> Result<LocaleFormat> {
+    match locale.to_ascii_lowercase().as_str() {
+        "en_us" => Ok(LocaleFormat {
+            thousands: &[','],
+            decimal: '.',
+            default_currency: "USD",
+        }),
+        "en_gb" => Ok(LocaleFormat {
+            thousands: &[','],
+            decimal: '.',
+            default_currency: "GBP",
+        }),
+        "de_de" => Ok(LocaleFormat {
+            thousands: &['.'],
+            decimal: ',',
+            default_currency: "EUR",
+        }),
+        "fr_fr" => Ok(LocaleFormat {
+            thousands: &[' ', '\u{00A0}', '\u{202F}'],
+            decimal: ',',
+            default_currency: "EUR",
+        }),
+        "ja_jp" => Ok(LocaleFormat {
+            thousands: &[','],
+            decimal: '.',
+            default_currency: "JPY",
+        }),
+        _ => Err(ZyronError::InvalidParameter {
+            name: "locale".to_string(),
+            value: locale.to_string(),
+        }),
+    }
+}
+
+/// Strips a leading or trailing ISO alpha code and returns the currency it
+/// names. The code must be exactly three letters standing apart from the
+/// number
+fn strip_iso_code<'a>(rest: &'a str) -> Option<(CurrencyInfo, &'a str)> {
+    let leading: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    if leading.len() == 3 {
+        if let Some(info) = currency_lookup(&leading) {
+            return Some((info, rest[leading.len()..].trim_start()));
+        }
+    }
+    let trailing: String = rest
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if trailing.len() == 3 {
+        if let Some(info) = currency_lookup(&trailing) {
+            return Some((info, rest[..rest.len() - trailing.len()].trim_end()));
+        }
+    }
+    None
+}
+
+/// Strips a leading or trailing currency symbol. Ambiguous symbols resolve
+/// to the locale's default currency when its symbol matches, then to the
+/// longest matching symbol in table order
+fn strip_symbol<'a>(rest: &'a str, default_currency: &str) -> Option<(CurrencyInfo, &'a str)> {
+    let mut best: Option<(bool, usize, CurrencyInfo, &'a str)> = None;
+    for info in CURRENCIES {
+        let candidates = [
+            rest.strip_prefix(info.symbol).map(|r| r.trim_start()),
+            rest.strip_suffix(info.symbol).map(|r| r.trim_end()),
+        ];
+        for remainder in candidates.into_iter().flatten() {
+            let is_default = info.code == default_currency;
+            let len = info.symbol.len();
+            let better = match &best {
+                None => true,
+                Some((bd, bl, _, _)) => (is_default, len) > (*bd, *bl),
+            };
+            if better {
+                best = Some((is_default, len, *info, remainder));
+            }
+        }
+    }
+    best.map(|(_, _, info, remainder)| (info, remainder))
+}
+
+/// Parses a localized money string like "$1,234.56", "1.234,56 EUR", or
+/// "\u{00A5}1,000" into (minor_units, numeric_code). The locale sets the
+/// separator characters and the currency assumed when the text names none
+pub fn parse_money(text: &str, locale: &str) -> Result<(i64, u16)> {
+    let fmt = locale_format(locale)?;
+    let invalid = || ZyronError::InvalidParameter {
+        name: "text".to_string(),
+        value: text.to_string(),
+    };
+
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+
+    let mut negative = false;
+    if let Some(r) = rest.strip_prefix('-') {
+        negative = true;
+        rest = r.trim_start();
+    } else if let Some(r) = rest.strip_prefix('+') {
+        rest = r.trim_start();
+    }
+
+    let detected = strip_iso_code(rest).or_else(|| strip_symbol(rest, fmt.default_currency));
+    let info = match detected {
+        Some((info, remainder)) => {
+            rest = remainder;
+            info
+        }
+        None => currency_lookup(fmt.default_currency).ok_or_else(invalid)?,
+    };
+
+    // the sign may also sit between the currency marker and the digits
+    if !negative {
+        if let Some(r) = rest.strip_prefix('-') {
+            negative = true;
+            rest = r.trim_start();
+        }
+    }
+
+    // split into integer digits and fraction digits per the locale rules
+    let mut int_digits = String::new();
+    let mut frac_digits = String::new();
+    let mut seen_decimal = false;
+    for c in rest.chars() {
+        if c.is_ascii_digit() {
+            if seen_decimal {
+                frac_digits.push(c);
+            } else {
+                int_digits.push(c);
+            }
+        } else if c == fmt.decimal && !seen_decimal {
+            seen_decimal = true;
+        } else if !seen_decimal && fmt.thousands.contains(&c) {
+            // grouping separators are dropped, they carry no value
+        } else {
+            return Err(invalid());
+        }
+    }
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return Err(invalid());
+    }
+
+    let d = info.decimals as u32;
+    let scale = 10u128.pow(d);
+    let int_val: u128 = if int_digits.is_empty() {
+        0
+    } else {
+        int_digits.parse().map_err(|_| invalid())?
+    };
+    let mut units = int_val
+        .checked_mul(scale)
+        .ok_or_else(|| ZyronError::ExecutionError(format!("Money value out of range: {}", text)))?;
+    let range_err = || ZyronError::ExecutionError(format!("Money value out of range: {}", text));
+    if frac_digits.len() as u32 <= d {
+        let frac_val: u128 = if frac_digits.is_empty() {
+            0
+        } else {
+            frac_digits.parse().map_err(|_| invalid())?
+        };
+        units = units
+            .checked_add(frac_val * 10u128.pow(d - frac_digits.len() as u32))
+            .ok_or_else(range_err)?;
+    } else {
+        let keep = &frac_digits[..d as usize];
+        let keep_val: u128 = if keep.is_empty() {
+            0
+        } else {
+            keep.parse().map_err(|_| invalid())?
+        };
+        units = units.checked_add(keep_val).ok_or_else(range_err)?;
+        // half away from zero on the first dropped digit
+        let next = frac_digits.as_bytes()[d as usize] - b'0';
+        if next >= 5 {
+            units = units.checked_add(1).ok_or_else(range_err)?;
+        }
+    }
+
+    let magnitude = i64::try_from(units)
+        .map_err(|_| ZyronError::ExecutionError(format!("Money value out of range: {}", text)))?;
+    let value = if negative { -magnitude } else { magnitude };
+    Ok((value, info.numeric))
+}
+
+// ---------------------------------------------------------------------------
+// Currency rate store
+// ---------------------------------------------------------------------------
+
+/// One exchange rate observation, dated in days since 1970-01-01
+#[derive(Debug, Clone)]
+pub struct CurrencyRate {
+    pub from: String,
+    pub to: String,
+    pub rate_date_days: i32,
+    pub rate: f64,
+}
+
+/// Process global exchange rate table with lock free reads. Keys are
+/// (from, to) alpha code pairs, each holding rates ordered by date
+pub struct CurrencyRateStore {
+    inner: scc::HashMap<(String, String), BTreeMap<i32, f64>>,
+}
+
+impl Default for CurrencyRateStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CurrencyRateStore {
+    pub fn new() -> Self {
+        Self {
+            inner: scc::HashMap::new(),
+        }
+    }
+
+    /// Replaces the entire rate table with a new snapshot
+    pub fn replace_all(&self, rates: Vec<CurrencyRate>) {
+        let mut grouped: std::collections::HashMap<(String, String), BTreeMap<i32, f64>> =
+            std::collections::HashMap::new();
+        for rate in rates {
+            grouped
+                .entry((rate.from.to_ascii_uppercase(), rate.to.to_ascii_uppercase()))
+                .or_default()
+                .insert(rate.rate_date_days, rate.rate);
+        }
+        self.inner.clear_sync();
+        for (key, dates) in grouped {
+            let _ = self.inner.insert_sync(key, dates);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Latest rate at or before the given date for the stored direction,
+    /// or the latest overall when no date is given
+    fn direct_rate(&self, from: &str, to: &str, date_days: Option<i32>) -> Option<f64> {
+        self.inner
+            .read_sync(
+                &(from.to_string(), to.to_string()),
+                |_, dates| match date_days {
+                    Some(d) => dates.range(..=d).next_back().map(|(_, &r)| r),
+                    None => dates.iter().next_back().map(|(_, &r)| r),
+                },
+            )
+            .flatten()
+    }
+
+    /// Resolves a rate for the pair. Identity pairs are 1.0, a pair stored
+    /// only in the reverse direction falls back to the reciprocal
+    pub fn rate_at(&self, from: &str, to: &str, date_days: Option<i32>) -> Option<f64> {
+        let from_u = from.to_ascii_uppercase();
+        let to_u = to.to_ascii_uppercase();
+        if from_u == to_u {
+            return Some(1.0);
+        }
+        if let Some(rate) = self.direct_rate(&from_u, &to_u, date_days) {
+            return Some(rate);
+        }
+        self.direct_rate(&to_u, &from_u, date_days)
+            .filter(|r| r.is_finite() && *r != 0.0)
+            .map(|r| 1.0 / r)
+    }
+}
+
+/// Global rate store fed by the currency rate catalog
+pub fn currency_rate_store() -> &'static CurrencyRateStore {
+    static STORE: OnceLock<CurrencyRateStore> = OnceLock::new();
+    STORE.get_or_init(CurrencyRateStore::new)
+}
+
+/// Converts a money value between currencies using the global rate store.
+/// from_ccy must name the money's own currency. A dated request uses the
+/// latest rate at or before that date, falling back to the latest rate on
+/// record when none is that old
+pub fn convert_currency(
+    val: i64,
+    cur: u16,
+    from_ccy: &str,
+    to_ccy: &str,
+    rate_date_days: Option<i32>,
+) -> Result<(i64, u16)> {
+    let from_info = currency_lookup(from_ccy).ok_or_else(|| ZyronError::InvalidParameter {
+        name: "from_currency".to_string(),
+        value: from_ccy.to_string(),
+    })?;
+    let to_info = currency_lookup(to_ccy).ok_or_else(|| ZyronError::InvalidParameter {
+        name: "to_currency".to_string(),
+        value: to_ccy.to_string(),
+    })?;
+    if from_info.numeric != cur {
+        return Err(ZyronError::ExecutionError(format!(
+            "convert_currency: source currency {} does not match money currency {}",
+            from_info.code,
+            money_currency_code(cur)
+        )));
+    }
+    if from_info.numeric == to_info.numeric {
+        return Ok((val, cur));
+    }
+    let store = currency_rate_store();
+    let rate = store
+        .rate_at(from_info.code, to_info.code, rate_date_days)
+        .or_else(|| rate_date_days.and_then(|_| store.rate_at(from_info.code, to_info.code, None)))
+        .ok_or_else(|| {
+            if store.is_empty() {
+                ZyronError::InvalidParameter {
+                    name: "currency_rates".to_string(),
+                    value: "rate store is empty, populate zyron_sys.cost.currency_rates"
+                        .to_string(),
+                }
+            } else {
+                ZyronError::InvalidParameter {
+                    name: "currency_pair".to_string(),
+                    value: format!("no rate for {}/{}", from_info.code, to_info.code),
+                }
+            }
+        })?;
+    money_convert(val, cur, to_info.numeric, rate)
 }
 
 // ISO 4217 currency table (subset of commonly-used currencies)
@@ -656,5 +1032,231 @@ mod tests {
         let (val, cur) = money_create(99.99, "USD").unwrap();
         let formatted = money_format(val, cur);
         assert_eq!(formatted, "$99.99");
+    }
+
+    // money_round
+    #[test]
+    fn test_money_round_noop_at_or_above_minor_digits() {
+        assert_eq!(money_round(1999, 840, 2).unwrap(), (1999, 840));
+        assert_eq!(money_round(1999, 840, 5).unwrap(), (1999, 840));
+    }
+
+    #[test]
+    fn test_money_round_half_away_from_zero() {
+        // $19.50 to zero places rounds away to $20.00
+        assert_eq!(money_round(1950, 840, 0).unwrap(), (2000, 840));
+        // -$19.50 rounds away to -$20.00
+        assert_eq!(money_round(-1950, 840, 0).unwrap(), (-2000, 840));
+        // $19.49 rounds down to $19.00
+        assert_eq!(money_round(1949, 840, 0).unwrap(), (1900, 840));
+        // $19.95 to one place rounds to $20.00
+        assert_eq!(money_round(1995, 840, 1).unwrap(), (2000, 840));
+        // $19.94 to one place rounds to $19.90
+        assert_eq!(money_round(1994, 840, 1).unwrap(), (1990, 840));
+    }
+
+    #[test]
+    fn test_money_round_three_decimal_currency() {
+        // BHD 12.345 to two places rounds the half digit away from zero
+        assert_eq!(money_round(12345, 48, 2).unwrap(), (12350, 48));
+        assert_eq!(money_round(12344, 48, 2).unwrap(), (12340, 48));
+    }
+
+    #[test]
+    fn test_money_round_negative_places() {
+        // $123.00 to -1 places rounds to $120.00
+        assert_eq!(money_round(12300, 840, -1).unwrap(), (12000, 840));
+        // $125.00 to -1 places rounds away to $130.00
+        assert_eq!(money_round(12500, 840, -1).unwrap(), (13000, 840));
+    }
+
+    #[test]
+    fn test_money_round_places_out_of_range() {
+        assert!(money_round(100, 840, 40).is_err());
+        assert!(money_round(100, 840, -40).is_err());
+    }
+
+    // parse_money
+    #[test]
+    fn test_parse_money_en_us() {
+        assert_eq!(parse_money("$1,234.56", "en_US").unwrap(), (123456, 840));
+        assert_eq!(parse_money("1234.56", "en_US").unwrap(), (123456, 840));
+        assert_eq!(parse_money("-$5.00", "en_US").unwrap(), (-500, 840));
+        assert_eq!(parse_money("USD 12.34", "en_US").unwrap(), (1234, 840));
+    }
+
+    #[test]
+    fn test_parse_money_en_gb() {
+        assert_eq!(
+            parse_money("\u{00A3}1,234.56", "en_GB").unwrap(),
+            (123456, 826)
+        );
+        assert_eq!(parse_money("99.99", "en_GB").unwrap(), (9999, 826));
+    }
+
+    #[test]
+    fn test_parse_money_de_de() {
+        // German grouping uses dots and a comma decimal
+        assert_eq!(
+            parse_money("1.234,56 \u{20AC}", "de_DE").unwrap(),
+            (123456, 978)
+        );
+        assert_eq!(parse_money("\u{20AC}99,50", "de_DE").unwrap(), (9950, 978));
+    }
+
+    #[test]
+    fn test_parse_money_fr_fr() {
+        assert_eq!(
+            parse_money("1 234,56 \u{20AC}", "fr_FR").unwrap(),
+            (123456, 978)
+        );
+        assert_eq!(
+            parse_money("1\u{202F}234,56", "fr_FR").unwrap(),
+            (123456, 978)
+        );
+    }
+
+    #[test]
+    fn test_parse_money_ja_jp() {
+        // JPY has zero minor digits
+        assert_eq!(parse_money("\u{00A5}1,000", "ja_JP").unwrap(), (1000, 392));
+        assert_eq!(parse_money("1000", "ja_JP").unwrap(), (1000, 392));
+        assert_eq!(parse_money("JPY 500", "en_US").unwrap(), (500, 392));
+    }
+
+    #[test]
+    fn test_parse_money_iso_code_overrides_locale_default() {
+        assert_eq!(parse_money("EUR 10.00", "en_US").unwrap(), (1000, 978));
+    }
+
+    #[test]
+    fn test_parse_money_rounds_excess_fraction() {
+        assert_eq!(parse_money("$1.005", "en_US").unwrap(), (101, 840));
+        assert_eq!(parse_money("$1.004", "en_US").unwrap(), (100, 840));
+    }
+
+    #[test]
+    fn test_parse_money_unknown_locale() {
+        assert!(matches!(
+            parse_money("$1.00", "xx_XX"),
+            Err(ZyronError::InvalidParameter { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parse_money_unparseable() {
+        assert!(parse_money("hello", "en_US").is_err());
+        assert!(parse_money("", "en_US").is_err());
+        assert!(parse_money("$1.2.3", "en_US").is_err());
+    }
+
+    // convert_currency, serialized because the store is process global
+    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+        STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn test_convert_currency_identity() {
+        let _guard = store_guard();
+        currency_rate_store().replace_all(Vec::new());
+        // identity pairs need no stored rate
+        assert_eq!(
+            convert_currency(1000, 840, "USD", "USD", None).unwrap(),
+            (1000, 840)
+        );
+    }
+
+    #[test]
+    fn test_convert_currency_empty_store_errors() {
+        let _guard = store_guard();
+        currency_rate_store().replace_all(Vec::new());
+        let err = convert_currency(1000, 840, "USD", "EUR", None);
+        match err {
+            Err(ZyronError::InvalidParameter { value, .. }) => {
+                assert!(value.contains("zyron_sys.cost.currency_rates"));
+            }
+            other => panic!("expected InvalidParameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_currency_direct_and_inverse() {
+        let _guard = store_guard();
+        currency_rate_store().replace_all(vec![CurrencyRate {
+            from: "USD".to_string(),
+            to: "EUR".to_string(),
+            rate_date_days: 20000,
+            rate: 0.8,
+        }]);
+        // direct pair
+        assert_eq!(
+            convert_currency(10000, 840, "USD", "EUR", None).unwrap(),
+            (8000, 978)
+        );
+        // reverse pair falls back to the reciprocal
+        assert_eq!(
+            convert_currency(8000, 978, "EUR", "USD", None).unwrap(),
+            (10000, 840)
+        );
+    }
+
+    #[test]
+    fn test_convert_currency_date_selection_and_fallback() {
+        let _guard = store_guard();
+        currency_rate_store().replace_all(vec![
+            CurrencyRate {
+                from: "USD".to_string(),
+                to: "EUR".to_string(),
+                rate_date_days: 20000,
+                rate: 0.8,
+            },
+            CurrencyRate {
+                from: "USD".to_string(),
+                to: "EUR".to_string(),
+                rate_date_days: 20100,
+                rate: 0.9,
+            },
+        ]);
+        // at or before 20050 selects the 20000 rate
+        assert_eq!(
+            convert_currency(10000, 840, "USD", "EUR", Some(20050)).unwrap(),
+            (8000, 978)
+        );
+        // after both dates selects the 20100 rate
+        assert_eq!(
+            convert_currency(10000, 840, "USD", "EUR", Some(30000)).unwrap(),
+            (9000, 978)
+        );
+        // before every dated rate falls back to the latest on record
+        assert_eq!(
+            convert_currency(10000, 840, "USD", "EUR", Some(10000)).unwrap(),
+            (9000, 978)
+        );
+        // no date means latest overall
+        assert_eq!(
+            convert_currency(10000, 840, "USD", "EUR", None).unwrap(),
+            (9000, 978)
+        );
+    }
+
+    #[test]
+    fn test_convert_currency_missing_pair_errors() {
+        let _guard = store_guard();
+        currency_rate_store().replace_all(vec![CurrencyRate {
+            from: "USD".to_string(),
+            to: "EUR".to_string(),
+            rate_date_days: 20000,
+            rate: 0.8,
+        }]);
+        assert!(convert_currency(1000, 840, "USD", "JPY", None).is_err());
+    }
+
+    #[test]
+    fn test_convert_currency_source_mismatch_errors() {
+        let _guard = store_guard();
+        // money carries USD but from_ccy claims EUR
+        assert!(convert_currency(1000, 840, "EUR", "GBP", None).is_err());
     }
 }

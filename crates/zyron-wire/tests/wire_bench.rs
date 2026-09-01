@@ -13,16 +13,16 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use zyron_buffer::{BufferPool, BufferPoolConfig};
+use zyron_buffer::BufferPool;
 use zyron_catalog::{Catalog, CatalogCache, HeapCatalogStorage};
 use zyron_common::ZyronError;
 use zyron_common::types::TypeId;
 use zyron_executor::batch::DataBatch;
 use zyron_executor::column::{Column, ColumnData, NullBitmap, ScalarValue};
 use zyron_planner::logical::LogicalColumn;
+use zyron_storage::DiskManager;
 use zyron_storage::txn::TransactionManager;
-use zyron_storage::{DiskManager, DiskManagerConfig};
-use zyron_wal::{WalWriter, WalWriterConfig};
+use zyron_wal::WalWriter;
 
 use zyron_wire::auth::{
     AuthResult, Authenticator, CleartextAuthenticator, Md5Authenticator, TrustAuthenticator,
@@ -124,6 +124,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
+        media_store: Arc::new(
+            zyron_media::store::MediaStore::open(tmp.path().join("data"))
+                .expect("media store opens in the test data dir"),
+        ),
         config_lookup: None,
         config_all: None,
         data_dir: std::path::PathBuf::from(tmp.path()),

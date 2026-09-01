@@ -5,8 +5,10 @@
 // Comma-separated values with a header row. The reader matches headers to
 // schema names and coerces each field to StreamValue per the declared
 // TypeId. The writer emits a header row followed by one data row per input
-// row. Null values become empty cells. Vector, Array, Composite, Uuid,
-// Interval, and Binary columns are unsupported and yield an error.
+// row. Null values become empty cells. A declared STRUCT or MAP is spelled as
+// json text through the engine's nested codec, which is the same routine the
+// query path renders with. Vector, Array, Composite, Uuid, Interval, and
+// Binary columns are unsupported and yield an error.
 
 use super::{ColumnSpec, FormatReader, FormatWriter};
 use crate::row_codec::StreamValue;
@@ -43,7 +45,7 @@ impl FormatReader for CsvReader {
                     Some(i) => record.get(*i).unwrap_or(""),
                     None => "",
                 };
-                row.push(text_to_value(text, col.type_id)?);
+                row.push(cell_to_value(text, col)?);
             }
             out.push(row);
         }
@@ -73,7 +75,7 @@ impl FormatWriter for CsvWriter {
             }
             let mut fields: Vec<String> = Vec::with_capacity(schema.len());
             for (col, v) in schema.iter().zip(row.iter()) {
-                fields.push(value_to_text(v, col.type_id)?);
+                fields.push(value_to_cell(v, col)?);
             }
             wtr.write_record(&fields)
                 .map_err(|e| ZyronError::StreamingError(format!("csv: row write error: {e}")))?;
@@ -88,6 +90,47 @@ impl FormatWriter for CsvWriter {
 // -----------------------------------------------------------------------------
 // Coercion
 // -----------------------------------------------------------------------------
+
+/// One csv cell as a value for its column.
+///
+/// A declared STRUCT or MAP is json text in csv, so it is encoded back into
+/// the stored layout here through the engine's own codec. Every other type
+/// goes through the scalar coercion below.
+fn cell_to_value(text: &str, col: &ColumnSpec) -> Result<StreamValue> {
+    if matches!(col.type_id, TypeId::Struct | TypeId::Map) {
+        if text.is_empty() {
+            return Ok(StreamValue::Null);
+        }
+        let Some(shape) = col.nested_shape.as_deref() else {
+            return Err(ZyronError::StreamingError(format!(
+                "csv: column {} is {:?} and carries no declared shape, so its json cannot be encoded",
+                col.name, col.type_id
+            )));
+        };
+        return crate::nested_render::parse(text, shape, &col.name).map(StreamValue::Binary);
+    }
+    text_to_value(text, col.type_id)
+}
+
+/// One value as a csv cell.
+///
+/// A declared STRUCT or MAP is spelled as json through the engine's codec,
+/// which is the same routine the query path renders with, so a value reads
+/// the same in a csv file as it does in an answer.
+fn value_to_cell(v: &StreamValue, col: &ColumnSpec) -> Result<String> {
+    if let StreamValue::Binary(bytes) = v
+        && matches!(col.type_id, TypeId::Struct | TypeId::Map)
+    {
+        let Some(shape) = col.nested_shape.as_deref() else {
+            return Err(ZyronError::StreamingError(format!(
+                "csv: column {} is {:?} and carries no declared shape, so its value cannot be spelled",
+                col.name, col.type_id
+            )));
+        };
+        return crate::nested_render::render(bytes, shape);
+    }
+    value_to_text(v, col.type_id)
+}
 
 fn text_to_value(text: &str, t: TypeId) -> Result<StreamValue> {
     if text.is_empty() {
@@ -124,10 +167,19 @@ fn text_to_value(text: &str, t: TypeId) -> Result<StreamValue> {
             .parse::<f64>()
             .map(StreamValue::F64)
             .map_err(|_| ZyronError::StreamingError(format!("csv: bad float '{text}'"))),
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-            Ok(StreamValue::Utf8(text.to_string()))
-        }
-        TypeId::Binary
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => Ok(StreamValue::Utf8(text.to_string())),
+        // A declared STRUCT or MAP is a binary layout, and csv carries text
+        // only, so it is refused with the other binary families rather than
+        // read back as text it is not
+        TypeId::Struct
+        | TypeId::Map
+        | TypeId::Binary
         | TypeId::Varbinary
         | TypeId::Bytea
         | TypeId::Uuid
@@ -150,6 +202,11 @@ fn text_to_value(text: &str, t: TypeId) -> Result<StreamValue> {
         | TypeId::CountMinSketch
         | TypeId::Bitfield
         | TypeId::Quantity
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef
         | TypeId::Null => Err(ZyronError::StreamingError(format!(
             "csv: type {t:?} is not supported"
         ))),

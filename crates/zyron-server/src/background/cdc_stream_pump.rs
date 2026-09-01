@@ -215,6 +215,7 @@ mod tests {
             fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
+            attrs: Default::default(),
         }
     }
 

@@ -41,6 +41,12 @@ fn col(name: &str) -> ColumnDef {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }
 }
 
@@ -122,6 +128,8 @@ async fn setup() -> Env {
             cluster_spec_id: 0,
             // Hot, the tier the fold writes into
             storage_tier: 0,
+            // Nothing was folded into this stand-in, so it shreds nothing
+            shredded: Vec::new(),
         });
     catalog.update_table(te).await.unwrap();
 
@@ -224,6 +232,7 @@ async fn branch_write_copies_pre_fork_main_patches_and_shields_later_ones() {
         Arc::clone(&env.ctx_branch),
         env.table,
         vec![assign],
+        vec![],
         vec![],
         vec![],
     );

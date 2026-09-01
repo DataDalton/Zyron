@@ -103,7 +103,7 @@ fn measure_hit_rate(pool: &BufferPool, disk: &Disk, sequence: &[PageId]) -> f64 
         }
         let bytes = disk.read(*page_id).expect("page exists");
         match pool.load_page(*page_id, &bytes) {
-            Ok((frame, _evicted)) => {
+            Ok(frame) => {
                 frame.unpin();
             }
             Err(e) => panic!("load failed: {e}"),
@@ -205,7 +205,7 @@ fn the_manifest_prefers_pages_the_clock_saw_touched() {
     for page_num in 0..400u64 {
         let page_id = PageId::new(0, page_num);
         let bytes = disk.read(page_id).expect("page");
-        let (frame, _) = pool.load_page(page_id, &bytes).expect("load");
+        let frame = pool.load_page(page_id, &bytes).expect("load");
         frame.unpin();
     }
     // Then touch a small set repeatedly, which is what sets the clock's bits
@@ -237,7 +237,7 @@ fn a_prefetch_declines_rather_than_evicting_the_survivor_own_pages() {
     for page_num in 0..POOL_FRAMES as u64 {
         let page_id = PageId::new(7, page_num);
         let bytes = disk.read(page_id).expect("page");
-        let (frame, _) = busy.load_page(page_id, &bytes).expect("load");
+        let frame = busy.load_page(page_id, &bytes).expect("load");
         frame.unpin();
     }
     let resident_before = busy.page_count();
@@ -270,7 +270,7 @@ fn the_report_separates_what_was_read_from_what_was_already_there() {
     let disk = Disk::default();
     let resident = PageId::new(0, 1);
     let bytes = disk.read(resident).expect("page");
-    let (frame, _) = pool.load_page(resident, &bytes).expect("load");
+    let frame = pool.load_page(resident, &bytes).expect("load");
     frame.unpin();
 
     let gone = PageId::new(0, 2);

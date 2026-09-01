@@ -63,11 +63,23 @@ pub enum TypeId {
     Json = 90,
     Jsonb = 91,
 
+    // Schema-on-read semi-structured value, stored as JSON text
+    Variant = 92,
+
     // Array (element type stored separately)
     Array = 100,
 
     // Composite/Struct (field types stored in catalog)
     Composite = 110,
+
+    // Typed nested record, stored as JSON text
+    Struct = 111,
+
+    // Typed key-value map, stored as JSON text
+    Map = 112,
+
+    // Hierarchical label path like 'Top.Science.Astronomy', stored as text
+    Ltree = 113,
 
     // Vector (fixed-dimension float array for similarity search)
     Vector = 120,
@@ -106,6 +118,15 @@ pub enum TypeId {
 
     // Unit-aware quantity (f64 value + u16 unit identifier)
     Quantity = 240,
+
+    // Media payloads or descriptors, opaque binary
+    Image = 250,
+    Video = 251,
+    Audio = 252,
+    Document = 253,
+
+    // Reference descriptor to an externally stored object, opaque binary
+    ExternalRef = 254,
 }
 
 impl TypeId {
@@ -154,7 +175,16 @@ impl TypeId {
             | TypeId::HyperLogLog
             | TypeId::BloomFilter
             | TypeId::TDigest
-            | TypeId::CountMinSketch => None,
+            | TypeId::CountMinSketch
+            | TypeId::Variant
+            | TypeId::Struct
+            | TypeId::Map
+            | TypeId::Ltree
+            | TypeId::Image
+            | TypeId::Video
+            | TypeId::Audio
+            | TypeId::Document
+            | TypeId::ExternalRef => None,
         }
     }
 
@@ -237,8 +267,12 @@ impl TypeId {
             80 => TypeId::Uuid,
             90 => TypeId::Json,
             91 => TypeId::Jsonb,
+            92 => TypeId::Variant,
             100 => TypeId::Array,
             110 => TypeId::Composite,
+            111 => TypeId::Struct,
+            112 => TypeId::Map,
+            113 => TypeId::Ltree,
             120 => TypeId::Vector,
             130 => TypeId::Geometry,
             140 => TypeId::Matrix,
@@ -255,6 +289,11 @@ impl TypeId {
             213 => TypeId::CountMinSketch,
             220 => TypeId::Bitfield,
             240 => TypeId::Quantity,
+            250 => TypeId::Image,
+            251 => TypeId::Video,
+            252 => TypeId::Audio,
+            253 => TypeId::Document,
+            254 => TypeId::ExternalRef,
             _ => return None,
         })
     }
@@ -283,12 +322,25 @@ impl TypeId {
 
     /// Returns true if this type is a string type.
     pub fn is_string(&self) -> bool {
-        matches!(self, TypeId::Char | TypeId::Varchar | TypeId::Text)
+        matches!(
+            self,
+            TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Ltree
+        )
     }
 
     /// Returns true if this type is a binary type.
     pub fn is_binary(&self) -> bool {
-        matches!(self, TypeId::Binary | TypeId::Varbinary | TypeId::Bytea)
+        matches!(
+            self,
+            TypeId::Binary
+                | TypeId::Varbinary
+                | TypeId::Bytea
+                | TypeId::Image
+                | TypeId::Video
+                | TypeId::Audio
+                | TypeId::Document
+                | TypeId::ExternalRef
+        )
     }
 
     /// Returns true if this type is one of the extended types (spatial,
@@ -373,8 +425,12 @@ impl std::fmt::Display for TypeId {
             TypeId::Uuid => "UUID",
             TypeId::Json => "JSON",
             TypeId::Jsonb => "JSONB",
+            TypeId::Variant => "VARIANT",
             TypeId::Array => "ARRAY",
             TypeId::Composite => "COMPOSITE",
+            TypeId::Struct => "STRUCT",
+            TypeId::Map => "MAP",
+            TypeId::Ltree => "LTREE",
             TypeId::Vector => "VECTOR",
             TypeId::Geometry => "GEOMETRY",
             TypeId::Matrix => "MATRIX",
@@ -391,6 +447,11 @@ impl std::fmt::Display for TypeId {
             TypeId::CountMinSketch => "COUNTMINSKETCH",
             TypeId::Bitfield => "BITFIELD",
             TypeId::Quantity => "QUANTITY",
+            TypeId::Image => "IMAGE",
+            TypeId::Video => "VIDEO",
+            TypeId::Audio => "AUDIO",
+            TypeId::Document => "DOCUMENT",
+            TypeId::ExternalRef => "EXTERNAL_REF",
         };
         write!(f, "{}", name)
     }
@@ -458,6 +519,15 @@ mod tests {
         assert_eq!(TypeId::BloomFilter.fixed_size(), None);
         assert_eq!(TypeId::TDigest.fixed_size(), None);
         assert_eq!(TypeId::CountMinSketch.fixed_size(), None);
+        assert_eq!(TypeId::Variant.fixed_size(), None);
+        assert_eq!(TypeId::Struct.fixed_size(), None);
+        assert_eq!(TypeId::Map.fixed_size(), None);
+        assert_eq!(TypeId::Ltree.fixed_size(), None);
+        assert_eq!(TypeId::Image.fixed_size(), None);
+        assert_eq!(TypeId::Video.fixed_size(), None);
+        assert_eq!(TypeId::Audio.fixed_size(), None);
+        assert_eq!(TypeId::Document.fixed_size(), None);
+        assert_eq!(TypeId::ExternalRef.fixed_size(), None);
     }
 
     #[test]
@@ -537,10 +607,14 @@ mod tests {
         assert!(TypeId::Char.is_string());
         assert!(TypeId::Varchar.is_string());
         assert!(TypeId::Text.is_string());
+        assert!(TypeId::Ltree.is_string());
 
         assert!(!TypeId::Binary.is_string());
         assert!(!TypeId::Json.is_string());
         assert!(!TypeId::Int32.is_string());
+        assert!(!TypeId::Variant.is_string());
+        assert!(!TypeId::Struct.is_string());
+        assert!(!TypeId::Map.is_string());
     }
 
     #[test]
@@ -548,9 +622,15 @@ mod tests {
         assert!(TypeId::Binary.is_binary());
         assert!(TypeId::Varbinary.is_binary());
         assert!(TypeId::Bytea.is_binary());
+        assert!(TypeId::Image.is_binary());
+        assert!(TypeId::Video.is_binary());
+        assert!(TypeId::Audio.is_binary());
+        assert!(TypeId::Document.is_binary());
+        assert!(TypeId::ExternalRef.is_binary());
 
         assert!(!TypeId::Text.is_binary());
         assert!(!TypeId::Jsonb.is_binary());
+        assert!(!TypeId::Variant.is_binary());
     }
 
     #[test]
@@ -594,6 +674,15 @@ mod tests {
         assert_eq!(TypeId::CountMinSketch.to_string(), "COUNTMINSKETCH");
         assert_eq!(TypeId::Bitfield.to_string(), "BITFIELD");
         assert_eq!(TypeId::Quantity.to_string(), "QUANTITY");
+        assert_eq!(TypeId::Variant.to_string(), "VARIANT");
+        assert_eq!(TypeId::Struct.to_string(), "STRUCT");
+        assert_eq!(TypeId::Map.to_string(), "MAP");
+        assert_eq!(TypeId::Ltree.to_string(), "LTREE");
+        assert_eq!(TypeId::Image.to_string(), "IMAGE");
+        assert_eq!(TypeId::Video.to_string(), "VIDEO");
+        assert_eq!(TypeId::Audio.to_string(), "AUDIO");
+        assert_eq!(TypeId::Document.to_string(), "DOCUMENT");
+        assert_eq!(TypeId::ExternalRef.to_string(), "EXTERNAL_REF");
     }
 
     #[test]
@@ -664,6 +753,34 @@ mod tests {
         assert_eq!(TypeId::CountMinSketch as u8, 213);
         assert_eq!(TypeId::Bitfield as u8, 220);
         assert_eq!(TypeId::Quantity as u8, 240);
+        assert_eq!(TypeId::Variant as u8, 92);
+        assert_eq!(TypeId::Struct as u8, 111);
+        assert_eq!(TypeId::Map as u8, 112);
+        assert_eq!(TypeId::Ltree as u8, 113);
+        assert_eq!(TypeId::Image as u8, 250);
+        assert_eq!(TypeId::Video as u8, 251);
+        assert_eq!(TypeId::Audio as u8, 252);
+        assert_eq!(TypeId::Document as u8, 253);
+        assert_eq!(TypeId::ExternalRef as u8, 254);
+    }
+
+    #[test]
+    fn test_from_u8_roundtrip_new_variants() {
+        assert_eq!(TypeId::from_u8(92), Some(TypeId::Variant));
+        assert_eq!(TypeId::from_u8(111), Some(TypeId::Struct));
+        assert_eq!(TypeId::from_u8(112), Some(TypeId::Map));
+        assert_eq!(TypeId::from_u8(113), Some(TypeId::Ltree));
+        assert_eq!(TypeId::from_u8(250), Some(TypeId::Image));
+        assert_eq!(TypeId::from_u8(251), Some(TypeId::Video));
+        assert_eq!(TypeId::from_u8(252), Some(TypeId::Audio));
+        assert_eq!(TypeId::from_u8(253), Some(TypeId::Document));
+        assert_eq!(TypeId::from_u8(254), Some(TypeId::ExternalRef));
+        for byte in [92u8, 111, 112, 113, 250, 251, 252, 253, 254] {
+            let decoded = TypeId::from_u8(byte).expect("known discriminant decodes");
+            assert_eq!(decoded as u8, byte);
+        }
+        assert_eq!(TypeId::from_u8(93), None);
+        assert_eq!(TypeId::from_u8(255), None);
     }
 
     #[test]
@@ -749,6 +866,15 @@ mod tests {
             TypeId::CountMinSketch,
             TypeId::Bitfield,
             TypeId::Quantity,
+            TypeId::Variant,
+            TypeId::Struct,
+            TypeId::Map,
+            TypeId::Ltree,
+            TypeId::Image,
+            TypeId::Video,
+            TypeId::Audio,
+            TypeId::Document,
+            TypeId::ExternalRef,
         ];
 
         for type_id in all_types {

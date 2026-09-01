@@ -94,6 +94,12 @@ fn col(name: &str, dt: DataType, pk: bool) -> ColumnDef {
         } else {
             vec![]
         },
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }
 }
 

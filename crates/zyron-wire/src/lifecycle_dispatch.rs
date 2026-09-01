@@ -546,6 +546,7 @@ pub async fn handle_alter_table_options(
             lc_ast::TableOptionValue::String(s) => s.clone(),
             lc_ast::TableOptionValue::Identifier(s) => s.clone(),
             lc_ast::TableOptionValue::Integer(i) => i.to_string(),
+            lc_ast::TableOptionValue::Float(f) => f.to_string(),
             lc_ast::TableOptionValue::Boolean(b) => b.to_string(),
             lc_ast::TableOptionValue::StringList(l) => l.join(","),
         };

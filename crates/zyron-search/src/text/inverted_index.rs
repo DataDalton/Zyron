@@ -227,10 +227,10 @@ impl ScoreAccumulator {
     }
 }
 
-/// Thread-local reusable score accumulator so the dense score buffer is not
-/// reallocated and zeroed on every query. It is prepared per query for the
-/// current id space; only search() borrows it and search() does not recurse
-/// into itself, so there is no reentrancy on the borrow.
+// Thread-local reusable score accumulator so the dense score buffer is not
+// reallocated and zeroed on every query. It is prepared per query for the
+// current id space. Only search() borrows it and search() does not recurse
+// into itself, so there is no reentrancy on the borrow
 thread_local! {
     static SCORE_ACC: std::cell::RefCell<ScoreAccumulator> =
         std::cell::RefCell::new(ScoreAccumulator::new(0));
@@ -951,6 +951,53 @@ impl InvertedIndex {
             FtsQuery::Wildcard(pattern) => self.search_wildcard(pattern, total_docs, avg_dl, acc),
         }
         Ok(())
+    }
+
+    /// Scores documents whose indexed terms share a phonetic code with any
+    /// analyzed query term. Walks the term dictionary encoding each stored
+    /// term, so cost is proportional to vocabulary size
+    pub fn search_phonetic(
+        &self,
+        query_text: &str,
+        analyzer: &dyn Analyzer,
+        algorithm: crate::text::analyzer::PhoneticAlgorithm,
+        limit: usize,
+    ) -> Result<Vec<(DocId, f64)>> {
+        use crate::text::analyzer::PhoneticFilter;
+        let max_id = self.max_doc_id.load(Ordering::Relaxed);
+        SCORE_ACC.with(|cell| {
+            let mut acc = cell.borrow_mut();
+            acc.prepare(max_id);
+            let total_docs = self.doc_count();
+            let avg_dl = self.avg_dl();
+            let mut query_codes: Vec<String> = Vec::new();
+            for token in analyzer.analyze(query_text) {
+                let (primary, alternate) = PhoneticFilter::encode(algorithm, &token.term);
+                if !primary.is_empty() {
+                    query_codes.push(primary);
+                }
+                if let Some(alt) = alternate {
+                    query_codes.push(alt);
+                }
+            }
+            if query_codes.is_empty() {
+                return Ok(Vec::new());
+            }
+            {
+                let postings = self.postings.read();
+                for (term, list) in postings.iter() {
+                    let (primary, alternate) = PhoneticFilter::encode(algorithm, term);
+                    let matched = query_codes.iter().any(|c| *c == primary)
+                        || alternate
+                            .as_ref()
+                            .is_some_and(|a| query_codes.iter().any(|c| c == a));
+                    if matched {
+                        score_postings_simd(list, total_docs, avg_dl, &mut acc);
+                    }
+                }
+            }
+            Ok(top_k_from_accumulator(&acc, limit))
+        })
     }
 
     pub fn prefix_terms(&self, prefix: &str, limit: usize) -> Vec<(String, u32)> {

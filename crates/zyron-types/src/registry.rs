@@ -68,6 +68,12 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         "levenshtein_similarity" | "jaro_similarity" | "jaro_winkler" => Some(TypeId::Float64),
         "soundex" | "metaphone" | "nysiis" => Some(TypeId::Varchar),
         "double_metaphone" => Some(TypeId::Array),
+        "phonetic_match" => Some(TypeId::Boolean),
+        "phonetic_score" => Some(TypeId::Float32),
+
+        // ---------- vector_math ----------
+        "vector_dot" | "vector_norm" | "vector_angle" => Some(TypeId::Float64),
+        "vector_cross" | "vector_normalize" => Some(TypeId::Vector),
 
         // ---------- similarity ----------
         "jaccard_similarity"
@@ -121,6 +127,8 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         "semver_increment_major" | "semver_increment_minor" | "semver_increment_patch" => {
             Some(TypeId::SemVer)
         }
+        "semver_prerelease" => Some(TypeId::Text),
+        "semver_sort" => Some(TypeId::Array),
 
         // ---------- network ----------
         "inet_parse" | "cidr_parse" => Some(TypeId::Inet),
@@ -133,9 +141,8 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         "macaddr_oui" => Some(TypeId::Bytea),
 
         // ---------- money ----------
-        "money_create" | "money_add" | "money_subtract" | "money_multiply" | "money_convert" => {
-            Some(TypeId::Money)
-        }
+        "money_create" | "money_add" | "money_subtract" | "money_multiply" | "money_convert"
+        | "money_round" | "parse_money" | "convert_currency" => Some(TypeId::Money),
         "money_format" | "money_currency_code" | "money_currency_symbol" => Some(TypeId::Varchar),
         "money_minor_digits" => Some(TypeId::Int32),
         "currency_lookup" | "currency_by_numeric" => Some(TypeId::Composite),
@@ -216,16 +223,12 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         | "format_percentage" | "format_ordinal" => Some(TypeId::Varchar),
         "parse_number" | "convert_units" => Some(TypeId::Float64),
 
-        // ---------- hierarchy ----------
-        "materialized_path" => Some(TypeId::Varchar),
-        "path_ancestors"
-        | "closure_table_ancestors"
-        | "closure_table_descendants"
-        | "nested_set_subtree"
-        | "nested_set_rebuild"
-        | "closure_table_insert" => Some(TypeId::Array),
-        "path_depth" | "closure_table_depth" => Some(TypeId::Int32),
-        "is_ancestor" => Some(TypeId::Boolean),
+        // ---------- ltree ----------
+        "nlevel" | "ltree_index" => Some(TypeId::Int64),
+        "subpath" | "lca" | "build_path" => Some(TypeId::Text),
+        "ltree_is_ancestor" | "ltree_is_descendant" | "ltree_matches" | "ltree_matches_any" => {
+            Some(TypeId::Boolean)
+        }
 
         // ---------- data_quality ----------
         "validate_email"
@@ -246,6 +249,7 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         "bloom_create" | "bloom_add" | "bloom_merge" => Some(TypeId::BloomFilter),
         "bloom_contains" => Some(TypeId::Boolean),
         "bloom_false_positive_rate" => Some(TypeId::Float64),
+        "bloom_filter_estimate_count" => Some(TypeId::Int64),
         "tdigest_create" | "tdigest_add" | "tdigest_merge" => Some(TypeId::TDigest),
         "tdigest_quantile" | "tdigest_cdf" => Some(TypeId::Float64),
         "cms_create" | "cms_add" | "cms_merge" => Some(TypeId::CountMinSketch),
@@ -363,6 +367,45 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         // ---------- file detection ----------
         "detect_mime_type" | "detect_encoding" | "file_extension" => Some(TypeId::Varchar),
         "is_binary" => Some(TypeId::Boolean),
+
+        // ---------- masking ----------
+        "masking_ip" | "masking_email" | "masking_phone" | "masking_ssn" | "masking_name" => {
+            Some(TypeId::Text)
+        }
+
+        // ---------- expectation metrics ----------
+        // Batch scoped data quality verdicts for table expectations
+        "null_rate" | "distinct_rate" | "freshness" => Some(TypeId::Boolean),
+
+        // ---------- collation ----------
+        "collated_compare" => Some(TypeId::Int32),
+        "collation_sort_key" => Some(TypeId::Bytea),
+
+        // ---------- variant ----------
+        // Dotted access into VARIANT, STRUCT, and MAP values
+        "variant_extract" => Some(TypeId::Text),
+
+        // ---------- media ----------
+        // Payload inspection returns compact JSON tagged as JSONB
+        "image_metadata" | "video_metadata" | "audio_metadata" | "document_metadata" => {
+            Some(TypeId::Jsonb)
+        }
+        "image_resize"
+        | "image_crop"
+        | "image_rotate"
+        | "image_format"
+        | "video_extract_frame"
+        | "video_thumbnail" => Some(TypeId::Image),
+        "image_ocr"
+        | "audio_transcribe"
+        | "document_extract_text"
+        | "document_to_markdown"
+        | "presigned_url" => Some(TypeId::Text),
+        "image_embed" => Some(TypeId::Vector),
+        "video_transcode" => Some(TypeId::Video),
+        "video_extract_audio" | "audio_transcode" | "audio_trim" => Some(TypeId::Audio),
+        "document_page_count" => Some(TypeId::Int64),
+        "presigned_verify" => Some(TypeId::Boolean),
 
         // circuit breakers are per session objects managed through
         // CREATE CIRCUIT BREAKER and enforced by the session layer, they
@@ -531,7 +574,8 @@ mod tests {
             ("token_bucket_consume", true),
             ("slug", true),
             ("format_currency", true),
-            ("path_depth", true),
+            ("nlevel", true),
+            ("ltree_matches", true),
             ("validate_email", true),
             ("hll_count", true),
             ("matrix_multiply", true),
@@ -540,6 +584,16 @@ mod tests {
             ("time_bucket", true),
             ("st_distance", true),
             ("url_parse", true),
+            ("phonetic_match", true),
+            ("phonetic_score", true),
+            ("vector_dot", true),
+            ("vector_cross", true),
+            ("money_round", true),
+            ("parse_money", true),
+            ("convert_currency", true),
+            ("semver_prerelease", true),
+            ("semver_sort", true),
+            ("bloom_filter_estimate_count", true),
             ("definitely_not_a_function", false),
         ];
 

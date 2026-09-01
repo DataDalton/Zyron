@@ -133,6 +133,7 @@ impl<'a> PhysicalPlanner<'a> {
                 column_defaults,
                 check_constraints,
                 expectations,
+                generated_columns,
                 source,
             } => self.plan_insert(
                 table_id,
@@ -140,6 +141,7 @@ impl<'a> PhysicalPlanner<'a> {
                 column_defaults,
                 check_constraints,
                 expectations,
+                generated_columns,
                 source,
             ),
             LogicalPlan::Values { rows, schema } => self.plan_values(rows, schema),
@@ -147,8 +149,15 @@ impl<'a> PhysicalPlanner<'a> {
                 table_id,
                 assignments,
                 check_constraints,
+                generated_columns,
                 child,
-            } => self.plan_update(table_id, assignments, check_constraints, child),
+            } => self.plan_update(
+                table_id,
+                assignments,
+                check_constraints,
+                generated_columns,
+                child,
+            ),
             LogicalPlan::Delete { table_id, child } => self.plan_delete(table_id, child),
             LogicalPlan::ViewTriggerWrite {
                 view_id,
@@ -543,6 +552,7 @@ impl<'a> PhysicalPlanner<'a> {
         column_defaults: Vec<(zyron_catalog::ColumnId, crate::binder::BoundExpr)>,
         check_constraints: Vec<crate::binder::BoundExpr>,
         expectations: Vec<crate::binder::BoundExpectation>,
+        generated_columns: Vec<crate::binder::BoundGeneratedColumn>,
         source: Arc<LogicalPlan>,
     ) -> Result<PhysicalPlan> {
         let source_plan = self.plan(Arc::unwrap_or_clone(source))?;
@@ -553,6 +563,7 @@ impl<'a> PhysicalPlanner<'a> {
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             source: Box::new(source_plan),
             cost,
         })
@@ -582,6 +593,7 @@ impl<'a> PhysicalPlanner<'a> {
         table_id: zyron_catalog::TableId,
         assignments: Vec<crate::binder::BoundAssignment>,
         check_constraints: Vec<crate::binder::BoundExpr>,
+        generated_columns: Vec<crate::binder::BoundGeneratedColumn>,
         child: Arc<LogicalPlan>,
     ) -> Result<PhysicalPlan> {
         let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
@@ -598,6 +610,7 @@ impl<'a> PhysicalPlanner<'a> {
             table_id,
             assignments,
             check_constraints,
+            generated_columns,
             child: Box::new(child_plan),
             cost,
         })
@@ -2178,7 +2191,11 @@ fn match_index(
 /// Returns the FTS expression and any remaining non-FTS predicate.
 fn extract_match_against(predicate: &BoundExpr) -> Option<(&BoundExpr, Option<&BoundExpr>)> {
     match predicate {
-        BoundExpr::Function { name, .. } if name == "match_against" => Some((predicate, None)),
+        BoundExpr::Function { name, .. }
+            if name == "match_against" || name == "match_against_phonetic" =>
+        {
+            Some((predicate, None))
+        }
         BoundExpr::BinaryOp {
             left,
             op: BinaryOperator::And,
@@ -2410,7 +2427,7 @@ fn compare_bare_match_to_zero(predicate: BoundExpr) -> BoundExpr {
             ref name,
             ref return_type,
             ..
-        } if name == "match_against" => {
+        } if name == "match_against" || name == "match_against_phonetic" => {
             let return_type = *return_type;
             BoundExpr::BinaryOp {
                 left: Box::new(predicate),

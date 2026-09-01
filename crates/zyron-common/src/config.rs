@@ -23,7 +23,9 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Path to TLS key file.
     pub tls_key_path: Option<PathBuf>,
-    /// Enable QUIC transport (requires tls_enabled with cert/key paths).
+    /// Enable the QUIC/HTTP3 transport, the primary transport. Serving it
+    /// requires tls_cert_path and tls_key_path; without them the server
+    /// runs TCP-only and says so at startup.
     pub quic_enabled: bool,
     /// UDP port for QUIC connections. Defaults to tcp port + 1 if not set.
     pub quic_port: Option<u16>,
@@ -57,7 +59,9 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
-            quic_enabled: false,
+            // HTTP/3 over QUIC is the primary transport. It serves once
+            // TLS material is configured; TCP remains as the fallback
+            quic_enabled: true,
             quic_port: None,
             quic_zero_rtt: false,
             quic_idle_timeout_secs: 300,
@@ -209,7 +213,7 @@ mod tests {
         assert!(!config.tls_enabled);
         assert!(config.tls_cert_path.is_none());
         assert!(config.tls_key_path.is_none());
-        assert!(!config.quic_enabled);
+        assert!(config.quic_enabled);
         assert!(config.quic_port.is_none());
         assert!(!config.quic_zero_rtt);
         assert_eq!(config.quic_idle_timeout_secs, 300);

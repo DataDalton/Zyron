@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+zyron-types = { path = "../zyron-types" }
 parking_lot.workspace = true
 scc.workspace = true
 serde.workspace = true

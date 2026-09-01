@@ -18,7 +18,7 @@ use zyron_common::ZyronError;
 
 use crate::connection::ServerState;
 use crate::messages::backend::FieldDescription;
-use crate::types::{PG_INT4_OID, PG_INT8_OID, PG_TEXT_OID};
+use crate::types::{PG_BOOL_OID, PG_INT4_OID, PG_INT8_OID, PG_TEXT_OID};
 
 /// Column schema paired with rendered rows, what every builder returns.
 pub type ViewRows = (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>);
@@ -43,6 +43,84 @@ pub struct SessionRow {
 /// applied here or refused here. Silently dropping a WHERE clause would hand
 /// back every row of a view the caller asked to narrow, which reads as an
 /// answer rather than as a missing feature.
+/// One prepared statement a live connection published for
+/// `zyron_sys.session.prepared_statements`.
+#[derive(Debug, Clone)]
+pub struct PreparedStatementRow {
+    pub pid: i32,
+    pub name: String,
+    pub query: String,
+    pub param_count: usize,
+    /// False for utility statements that bypass the planner
+    pub planned: bool,
+}
+
+type PreparedKey = (usize, i32);
+
+static PREPARED_STATEMENTS: std::sync::OnceLock<
+    scc::HashMap<PreparedKey, Vec<PreparedStatementRow>>,
+> = std::sync::OnceLock::new();
+
+fn prepared_registry() -> &'static scc::HashMap<PreparedKey, Vec<PreparedStatementRow>> {
+    PREPARED_STATEMENTS.get_or_init(scc::HashMap::new)
+}
+
+/// Keys registry entries to one server instance, so two in process servers
+/// never see each other's sessions
+pub(crate) fn prepared_server_key(server: &ServerState) -> usize {
+    server as *const ServerState as usize
+}
+
+/// Replaces the published prepared statement list of one connection
+pub(crate) fn publish_prepared_statements(
+    server_key: usize,
+    pid: i32,
+    rows: Vec<PreparedStatementRow>,
+) {
+    match prepared_registry().entry_sync((server_key, pid)) {
+        scc::hash_map::Entry::Occupied(mut occupied) => {
+            *occupied.get_mut() = rows;
+        }
+        scc::hash_map::Entry::Vacant(vacant) => {
+            vacant.insert_entry(rows);
+        }
+    }
+}
+
+/// Removes a closed connection's published statements
+pub(crate) fn clear_prepared_statements(server_key: usize, pid: i32) {
+    let _ = prepared_registry().remove_sync(&(server_key, pid));
+}
+
+/// The `zyron_sys.session.prepared_statements` view.
+pub(crate) fn build_session_prepared_statements(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("pid", PG_INT4_OID, 4),
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("query", PG_TEXT_OID, -1),
+        make_field("param_count", PG_INT4_OID, 4),
+        make_field("planned", PG_BOOL_OID, 1),
+    ];
+    let server_key = prepared_server_key(server);
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    prepared_registry().iter_sync(|(key, _), statements| {
+        if *key == server_key {
+            for s in statements {
+                rows.push(vec![
+                    Some(s.pid.to_string().into_bytes()),
+                    Some(s.name.as_bytes().to_vec()),
+                    Some(s.query.as_bytes().to_vec()),
+                    Some(s.param_count.to_string().into_bytes()),
+                    Some(s.planned.to_string().into_bytes()),
+                ]);
+            }
+        }
+        true
+    });
+    rows.sort_by(|a, b| a[0].cmp(&b[0]).then(a[1].cmp(&b[1])));
+    (fields, rows)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemViewFilters {
     /// `column = literal` conjuncts in statement order
@@ -166,6 +244,8 @@ fn literal_text(lit: &zyron_parser::LiteralValue) -> Option<String> {
         // different operator this layer does not implement
         zyron_parser::LiteralValue::Null => None,
         zyron_parser::LiteralValue::Interval(i) => Some(i.to_string()),
+        // A system view filter compares text, and a stored form has none
+        zyron_parser::LiteralValue::Bytes(_) => None,
     }
 }
 
@@ -397,6 +477,19 @@ pub async fn query_system_function(
         ("compliance", "report") => {
             crate::system_compliance_report::call(&call.args, server).await?
         }
+        ("query", "recommend_indexes") => {
+            if call.args.len() > 1 {
+                return Err(ZyronError::PlanError(
+                    "zyron_sys.query.recommend_indexes takes at most one argument, \
+                     an optional schema name filter"
+                        .to_string(),
+                ));
+            }
+            crate::system_core_views::build_recommend_indexes(
+                server,
+                call.args.first().map(String::as_str),
+            )
+        }
         (schema, object) => {
             return Err(ZyronError::Internal(format!(
                 "`zyron_sys.{}.{}` is registered but has no implementation",
@@ -482,6 +575,8 @@ pub async fn query_system_view(
         }
         ("stat", object) => build_stat_view(object, server)?,
         ("streaming", object) => crate::system_streaming_views::build(object, server)?,
+        ("retention", object) => crate::system_retention_views::build(object, server).await?,
+        ("cost", "currency_rates") => crate::currency_rates::build_view(server)?,
         (schema, object) => crate::system_core_views::build(schema, object, server).await?,
     };
     let (fields, rows) = built;
@@ -865,6 +960,7 @@ fn build_stat_indexes(server: &ServerState) -> ViewRows {
                 zyron_catalog::IndexType::Fulltext => "fulltext",
                 zyron_catalog::IndexType::Vector => "vector",
                 zyron_catalog::IndexType::Spatial => "spatial",
+                zyron_catalog::IndexType::Hybrid => "hybrid",
             };
             let stats = server.index_io_stats.get_or_create(idx.id.0);
             rows.push(vec![

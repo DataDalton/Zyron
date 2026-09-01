@@ -1,0 +1,297 @@
+{
+  "id": "2026-09-01_022815_df51204-local",
+  "date": "2026-09-01 02:28:26Z",
+  "ts": 1788229706,
+  "commit": "df51204-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "QUIC Channel Bridge": {
+      "QUIC channel write throughput (MB/s)": {
+        "average": 21501.855723,
+        "runs": [18551.80, 22322.21, 19231.35, 25882.64, 21521.29],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "QUIC channel read throughput (MB/s)": {
+        "average": 15384.384940,
+        "runs": [9492.87, 16415.31, 17151.74, 16943.77, 16918.24],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "QUIC PG Handshake": {
+      "QUIC PG handshake latency (us)": {
+        "average": 4.788160,
+        "runs": [5.11, 4.71, 4.68, 4.75, 4.69],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "QUIC Handshake": {
+      "QUIC handshake latency (us)": {
+        "average": 3038.408000,
+        "runs": [3138.21, 2956.70, 3017.27, 2992.64, 3087.22],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Notification Channel": {
+      "notify() throughput (ops/sec)": {
+        "average": 18958813.742902,
+        "runs": [19047619.05, 19062723.99, 18530185.67, 19047365.08, 19106174.92],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Connection Handshake": {
+      "Handshake latency (us)": {
+        "average": 461.370440,
+        "runs": [580.84, 447.61, 367.82, 537.88, 372.70],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Concurrent Connections": {
+      "Connection establishment rate (conns/sec)": {
+        "average": 18236.534758,
+        "runs": [20874.65, 6840.04, 18935.63, 22443.16, 22089.20],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "QUIC Transport Properties": {
+      "QUIC channel round-trip throughput (ops/sec)": {
+        "average": 3779185.340434,
+        "runs": [3731426.82, 3854010.10, 3688934.30, 3840880.02, 3780675.46],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Bind Message": {
+      "Bind message decode latency (us)": {
+        "average": 0.092370,
+        "runs": [0.09, 0.09, 0.09, 0.09, 0.09],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parse Message": {
+      "Parse message decode latency (us)": {
+        "average": 0.056998,
+        "runs": [0.06, 0.06, 0.06, 0.06, 0.06],
+        "target": 8.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Message Decode": {
+      "FrontendMessage decode throughput (ops/sec)": {
+        "average": 25859102.846976,
+        "runs": [25832117.07, 25886415.59, 25849946.23, 25812713.28, 25914322.07],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Row Serialization": {
+      "Row serialization throughput (rows/sec)": {
+        "average": 17282946.070617,
+        "runs": [17278349.02, 17141192.00, 17314548.20, 17406470.68, 17274170.45],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "TOTP Auth": {
+      "TOTP verify throughput (ops/sec)": {
+        "average": 12552225.186420,
+        "runs": [12559027.43, 12557781.49, 12564045.22, 12515910.85, 12564360.94],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "COPY TO": {
+      "COPY TO (text) throughput (rows/sec)": {
+        "average": 29300213.848854,
+        "runs": [26083456.87, 30577934.91, 30760172.79, 30889708.06, 28189796.62],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "COPY FROM": {
+      "COPY FROM (CSV) throughput (rows/sec)": {
+        "average": 24504873.384108,
+        "runs": [14992683.57, 25610555.65, 27382406.26, 27257760.28, 27280961.16],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "DDL Dispatch": {
+      "DDL parse throughput (ops/sec)": {
+        "average": 3185274.532800,
+        "runs": [3136335.89, 3192376.10, 3197324.48, 3193989.17, 3206347.03],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "DataRow Encode": {
+      "DataRow encode throughput (rows/sec)": {
+        "average": 13650696.272652,
+        "runs": [13633358.10, 13649808.70, 13685347.85, 13636871.92, 13648094.79],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "API Key Auth": {
+      "API key verify throughput (ops/sec)": {
+        "average": 26656099.769955,
+        "runs": [26630023.75, 26645847.38, 26670151.57, 26659059.95, 26675416.20],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "JWT Auth": {
+      "JWT decode throughput (ops/sec)": {
+        "average": 3785403.402077,
+        "runs": [3807232.22, 3787741.05, 3782564.57, 3777199.61, 3772279.55],
+        "target": 200000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Simple Query": {
+      "Simple query message latency (us)": {
+        "average": 0.050976,
+        "runs": [0.05, 0.05, 0.05, 0.05, 0.05],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Message Encode": {
+      "BackendMessage encode throughput (ops/sec)": {
+        "average": 39566024.344275,
+        "runs": [39615413.57, 39671205.05, 39857787.41, 39567135.54, 39118580.15],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Execute Message": {
+      "Execute message decode latency (us)": {
+        "average": 0.030614,
+        "runs": [0.03, 0.03, 0.03, 0.03, 0.03],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "QUIC PG Simple Query": {
+      "QUIC PG simple query throughput (qps)": {
+        "average": 173211.714657,
+        "runs": [171212.35, 173456.93, 173910.02, 173667.19, 173812.08],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Result Cell Encode": {
+      "Result cell encode throughput (rows/sec)": {
+        "average": 16276889.899052,
+        "runs": [16486632.64, 16443095.38, 16443406.32, 15438519.57, 16572795.59],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Type Serialization": {
+      "scalar_to_text throughput (ops/sec)": {
+        "average": 124121388.629782,
+        "runs": [123734811.55, 124894776.15, 124139403.58, 123960590.45, 123877361.41],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "scalar_to_binary throughput (ops/sec)": {
+        "average": 191905914.357513,
+        "runs": [201622659.16, 183644610.95, 195202698.48, 191105930.02, 187953673.18],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

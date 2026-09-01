@@ -27,8 +27,8 @@ use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_common::RowLocator;
 use zyron_common::page::PageId;
 use zyron_storage::{
-    BTreeIndex, BufferedBTreeIndex, CheckpointConfig, CheckpointTrigger, DiskManager,
-    DiskManagerConfig, HeapFile, Tuple, TupleId,
+    BTreeIndex, BufferedBTreeIndex, CheckpointConfig, CheckpointTrigger, DiskManager, HeapFile,
+    Tuple, TupleId,
 };
 use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWriterConfig};
 
@@ -275,16 +275,20 @@ async fn test_buffer_pool_eviction() {
         num_frames: NUM_FRAMES,
     });
 
-    let mut dirty_evictions = 0;
+    // A dirty page leaves the pool through the write hook, so counting the
+    // hook's calls counts the dirty evictions
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = std::sync::Arc::clone(&written);
+    pool.set_evict_writer(std::sync::Arc::new(move |_pid, _data, _lsn| {
+        sink.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }))
+    .unwrap();
 
     for i in 0..NUM_PAGES {
         let page_id = PageId::new(0, i as u64);
 
-        let (frame, evicted) = pool.new_page(page_id).unwrap();
-
-        if evicted.is_some() {
-            dirty_evictions += 1;
-        }
+        let frame = pool.new_page(page_id).unwrap();
 
         {
             let mut data = frame.write_data();
@@ -294,6 +298,7 @@ async fn test_buffer_pool_eviction() {
         pool.unpin_page(page_id, true);
     }
 
+    let dirty_evictions = written.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         dirty_evictions > 0,
         "Expected dirty evictions when accessing {} pages with {} frames",
@@ -466,6 +471,7 @@ async fn test_heap_file_100k_tuples() {
         let config = zyron_bench_harness::disk_config(dir.path().to_path_buf());
         let disk = Arc::new(DiskManager::new(config).await.unwrap());
         let pool = Arc::new(BufferPool::auto_sized());
+        zyron_bench_harness::install_evict_writer(&pool, &disk, None);
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
         let mut rng = rand::rng();
@@ -590,6 +596,7 @@ async fn test_heap_file_delete_and_scan() {
     let config = zyron_bench_harness::disk_config(dir.path().to_path_buf());
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
     let pool = Arc::new(BufferPool::auto_sized());
+    zyron_bench_harness::install_evict_writer(&pool, &disk, None);
     let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
     let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
@@ -654,6 +661,7 @@ async fn test_heap_file_space_reuse() {
     let config = zyron_bench_harness::disk_config(dir.path().to_path_buf());
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
     let pool = Arc::new(BufferPool::auto_sized());
+    zyron_bench_harness::install_evict_writer(&pool, &disk, None);
     let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
     // Initial insert batch
@@ -1042,6 +1050,7 @@ async fn test_wal_heap_recovery() {
         let disk_config = zyron_bench_harness::disk_config(heap_dir.clone());
         let disk = Arc::new(DiskManager::new(disk_config).await.unwrap());
         let pool = Arc::new(BufferPool::auto_sized());
+        zyron_bench_harness::install_evict_writer(&pool, &disk, Some(&writer));
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
         for i in 0..TUPLE_COUNT {
@@ -2577,6 +2586,7 @@ async fn test_checkpoint_integration() {
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
+    zyron_bench_harness::install_evict_writer(&pool, &disk, Some(&wal));
 
     // Set up background writer with real disk writes
     let disk_for_writer = Arc::clone(&disk);
@@ -2829,6 +2839,7 @@ async fn test_checkpoint_integration() {
             .await
             .unwrap(),
     );
+    zyron_bench_harness::install_evict_writer(&pool2, &disk2, Some(&wal2));
     let disk2_for_writer = Arc::clone(&disk2);
     let write_fn2: WriteFn =
         Arc::new(move |page_id, data| disk2_for_writer.write_page_sync_no_fsync(page_id, data));
@@ -3048,6 +3059,7 @@ async fn test_checkpoint_scheduler_integration() {
     );
 
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    zyron_bench_harness::install_evict_writer(&pool, &disk, Some(&wal));
 
     let disk_for_write = Arc::clone(&disk);
     let write_fn: WriteFn =

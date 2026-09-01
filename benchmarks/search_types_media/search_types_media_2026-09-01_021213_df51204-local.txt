@@ -1,0 +1,268 @@
+# suite:   search_types_media
+# run:     2026-09-01_021213_df51204-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== QUIC Stream Bridge Against TCP Loopback ===
+  tcp run 1: 26.3 us/query
+  tcp run 2: 26.0 us/query
+  tcp run 3: 26.2 us/query
+  tcp run 4: 25.8 us/query
+  tcp run 5: 26.4 us/query
+  quic run 1: 5.6 us/query
+  quic run 2: 5.6 us/query
+  quic run 3: 5.6 us/query
+  quic run 4: 5.6 us/query
+  quic run 5: 5.6 us/query
+  TCP simple query:
+    Runs: [26.2547us, 25.9641us, 26.2292us, 25.7537us, 26.3534us]
+    Average: 26.1110us (no target set)
+    Min/Max: 25.7537us / 26.3534us, StdDev: 0.2203us
+  QUIC bridge simple query:
+    Runs: [5.6321us, 5.6155us, 5.6470us, 5.5991us, 5.5988us]
+    Average: 5.6185us (no target set)
+    Min/Max: 5.5988us / 5.6470us, StdDev: 0.0188us
+  quic 5.6 us over tcp 26.1 us, ratio 0.215
+  QUIC over TCP query latency ratio [PASS]: 0.2152x <= 1.0500x (target)
+
+=== Hybrid Search Fused Query ===
+  Hybrid corpus load:
+    Runs: [46,524ms]
+    Average: 46,524ms (no target set)
+  1000000 docs loaded in 46524 ms
+  run 1: 12.87 ms/query
+  run 2: 13.30 ms/query
+  run 3: 14.96 ms/query
+  run 4: 13.80 ms/query
+  run 5: 12.88 ms/query
+  Fused top 10 over the corpus [PASS/OK]:
+    Runs: [12.8668ms, 13.3005ms, 14.9613ms, 13.7995ms, 12.8820ms]
+    Average: 13.5620ms <= 50ms (target)
+    Min/Max: 12.8668ms / 14.9613ms, StdDev: 0.7783ms
+
+=== STRUCT Declared Field Reads ===
+  run 1: 11 ns/row
+  run 2: 8 ns/row
+  run 3: 8 ns/row
+  run 4: 7 ns/row
+  run 5: 8 ns/row
+  Declared field predicate per row, positional access [PASS/OK]:
+    Runs: [11.3365ns, 7.5655ns, 7.9615ns, 7.4625ns, 7.7185ns]
+    Average: 8.4089ns <= 1,000ns (target)
+    Min/Max: 7.4625ns / 11.3365ns, StdDev: 1.4734ns
+  stored 49 bytes vs 60 as json, 82% of the json size
+  Bytes one declared struct value occupies [PASS/OK]:
+    Runs: [49bytes, 49bytes, 49bytes, 49bytes, 49bytes]
+    Average: 49bytes <= 60bytes (target)
+    Min/Max: 49bytes / 49bytes, StdDev: 0bytes
+
+=== Analyzer Pipeline and Phonetic Encoding ===
+  run 1: 3.395 us/doc
+  run 2: 3.196 us/doc
+  run 3: 3.235 us/doc
+  run 4: 3.236 us/doc
+  run 5: 3.238 us/doc
+  Full analyzer chain per document [PASS/OK]:
+    Runs: [3.3952us, 3.1958us, 3.2353us, 3.2358us, 3.2376us]
+    Average: 3.2600us <= 5us (target)
+    Min/Max: 3.1958us / 3.3952us, StdDev: 0.0694us
+  run 1: 48.9 ns/encode+match
+  run 2: 49.0 ns/encode+match
+  run 3: 49.1 ns/encode+match
+  run 4: 49.0 ns/encode+match
+  run 5: 49.0 ns/encode+match
+  Phonetic encode and compare [PASS/OK]:
+    Runs: [48.8822ns, 48.9715ns, 49.1011ns, 49.0464ns, 49.0076ns]
+    Average: 49.0018ns <= 1,000ns (target)
+    Min/Max: 48.8822ns / 49.1011ns, StdDev: 0.0736ns
+
+=== Media Write, Read, Metadata, Resize and Extraction ===
+  run 1: 23.0 ms to insert 5071753 bytes
+  run 2: 23.5 ms to insert 5071753 bytes
+  run 3: 21.8 ms to insert 5071753 bytes
+  run 4: 23.3 ms to insert 5071753 bytes
+  run 5: 21.9 ms to insert 5071753 bytes
+  Insert one large image end to end [PASS/OK]:
+    Runs: [23.0036ms, 23.4919ms, 21.8409ms, 23.2978ms, 21.9147ms]
+    Average: 22.7098ms <= 100ms (target)
+    Min/Max: 21.8409ms / 23.4919ms, StdDev: 0.6973ms
+  run 1: 10.9 ms to read the image back
+  run 2: 9.9 ms to read the image back
+  run 3: 9.9 ms to read the image back
+  run 4: 10.2 ms to read the image back
+  run 5: 10.2 ms to read the image back
+  Read one large image end to end [PASS/OK]:
+    Runs: [10.9422ms, 9.9060ms, 9.9294ms, 10.1698ms, 10.1538ms]
+    Average: 10.2202ms <= 50ms (target)
+    Min/Max: 9.9060ms / 10.9422ms, StdDev: 0.3772ms
+  run 1: 10.09 ms for metadata over SQL
+  run 2: 9.86 ms for metadata over SQL
+  run 3: 10.15 ms for metadata over SQL
+  run 4: 9.84 ms for metadata over SQL
+  run 5: 9.76 ms for metadata over SQL
+  Image metadata via SQL over the stored image:
+    Runs: [10.0892ms, 9.8602ms, 10.1534ms, 9.8448ms, 9.7580ms]
+    Average: 9.9411ms (no target set)
+    Min/Max: 9.7580ms / 10.1534ms, StdDev: 0.1525ms
+  run 1: 0.002 ms per extraction
+  run 2: 0.002 ms per extraction
+  run 3: 0.002 ms per extraction
+  run 4: 0.001 ms per extraction
+  run 5: 0.002 ms per extraction
+  Extract image metadata [PASS/OK]:
+    Runs: [0.0015ms, 0.0016ms, 0.0015ms, 0.0014ms, 0.0015ms]
+    Average: 0.0015ms <= 5ms (target)
+    Min/Max: 0.0014ms / 0.0016ms, StdDev: 0.0001ms
+  run 1: 88 ms to resize
+  run 2: 87 ms to resize
+  run 3: 86 ms to resize
+  run 4: 88 ms to resize
+  run 5: 89 ms to resize
+  Resize to 1080p [PASS/OK]:
+    Runs: [87.7140ms, 86.7268ms, 85.9350ms, 87.8314ms, 89.3391ms]
+    Average: 87.5093ms <= 500ms (target)
+    Min/Max: 85.9350ms / 89.3391ms, StdDev: 1.1476ms
+  run 1: 0.15 ms to extract
+  run 2: 0.11 ms to extract
+  run 3: 0.11 ms to extract
+  run 4: 0.09 ms to extract
+  run 5: 0.09 ms to extract
+  Extract text from a ten page document [PASS/OK]:
+    Runs: [0.1529ms, 0.1118ms, 0.1098ms, 0.0948ms, 0.0947ms]
+    Average: 0.1128ms <= 200ms (target)
+    Min/Max: 0.0947ms / 0.1529ms, StdDev: 0.0213ms
+
+=== Vector Math, Collation, LTREE and Presign Kernels ===
+  run 1: 33.7 ns/dot
+  run 2: 33.6 ns/dot
+  run 3: 33.7 ns/dot
+  run 4: 33.6 ns/dot
+  run 5: 33.6 ns/dot
+  128 dim dot product [PASS/OK]:
+    Runs: [33.7269ns, 33.6069ns, 33.6639ns, 33.5723ns, 33.6178ns]
+    Average: 33.6376ns <= 100ns (target)
+    Min/Max: 33.5723ns / 33.7269ns, StdDev: 0.0534ns
+  run 1: 75.5 ns/compare
+  run 2: 75.7 ns/compare
+  run 3: 75.8 ns/compare
+  run 4: 75.6 ns/compare
+  run 5: 75.6 ns/compare
+  Locale aware compare [PASS/OK]:
+    Runs: [75.5201ns, 75.6976ns, 75.8211ns, 75.6423ns, 75.5631ns]
+    Average: 75.6488ns <= 2,000ns (target)
+    Min/Max: 75.5201ns / 75.8211ns, StdDev: 0.1059ns
+  run 1: 185.6 ns/check
+  run 2: 184.5 ns/check
+  run 3: 185.3 ns/check
+  run 4: 185.6 ns/check
+  run 5: 185.0 ns/check
+  Ancestor check on 4 to 8 level paths [PASS/OK]:
+    Runs: [185.6155ns, 184.4515ns, 185.3408ns, 185.6320ns, 184.9818ns]
+    Average: 185.2043ns <= 500ns (target)
+    Min/Max: 184.4515ns / 185.6320ns, StdDev: 0.4442ns
+  run 1: 10.29 us/sign
+  run 2: 11.28 us/sign
+  run 3: 11.24 us/sign
+  run 4: 10.26 us/sign
+  run 5: 11.31 us/sign
+  HMAC sign of a media handle [PASS/OK]:
+    Runs: [10.2912us, 11.2848us, 11.2352us, 10.2570us, 11.3141us]
+    Average: 10.8765us <= 1,000us (target)
+    Min/Max: 10.2570us / 11.3141us, StdDev: 0.4926us
+
+=== Generated, Cast, Encrypted and Temporal Columns ===
+  run 1: 11.2 ns/row over the bare column
+  run 2: 11.2 ns/row over the bare column
+  run 3: 11.3 ns/row over the bare column
+  run 4: 11.4 ns/row over the bare column
+  run 5: 11.4 ns/row over the bare column
+  Inlined expression cost per row [PASS/OK]:
+    Runs: [11.1717ns, 11.2406ns, 11.2871ns, 11.3580ns, 11.4096ns]
+    Average: 11.2934ns <= 100ns (target)
+    Min/Max: 11.1717ns / 11.4096ns, StdDev: 0.0840ns
+  run 1: 7.6 ns/row for the output cast
+  run 2: 8.5 ns/row for the output cast
+  run 3: 8.0 ns/row for the output cast
+  run 4: 6.9 ns/row for the output cast
+  run 5: 7.9 ns/row for the output cast
+  Output cast cost per row [PASS/OK]:
+    Runs: [7.5700ns, 8.4702ns, 8.0322ns, 6.9172ns, 7.9382ns]
+    Average: 7.7856ns <= 500ns (target)
+    Min/Max: 6.9172ns / 8.4702ns, StdDev: 0.5203ns
+  run 1: 0.05 us/encrypt
+  run 2: 0.05 us/encrypt
+  run 3: 0.05 us/encrypt
+  run 4: 0.05 us/encrypt
+  run 5: 0.05 us/encrypt
+  AES-GCM encrypt per value [PASS/OK]:
+    Runs: [0.0544us, 0.0540us, 0.0542us, 0.0541us, 0.0542us]
+    Average: 0.0542us <= 5us (target)
+    Min/Max: 0.0540us / 0.0544us, StdDev: 0.0001us
+  run 1: 0.05 us/decrypt
+  run 2: 0.05 us/decrypt
+  run 3: 0.05 us/decrypt
+  run 4: 0.05 us/decrypt
+  run 5: 0.05 us/decrypt
+  AES-GCM decrypt per value [PASS/OK]:
+    Runs: [0.0484us, 0.0481us, 0.0483us, 0.0479us, 0.0483us]
+    Average: 0.0482us <= 5us (target)
+    Min/Max: 0.0479us / 0.0484us, StdDev: 0.0002us
+  run 1: refused insert 6.68 us at 20000 rows, 6.27 us at 200 rows, growth 0.41 us
+  run 2: refused insert 6.45 us at 20000 rows, 6.17 us at 200 rows, growth 0.27 us
+  run 3: refused insert 6.55 us at 20000 rows, 6.33 us at 200 rows, growth 0.22 us
+  run 4: refused insert 6.98 us at 20000 rows, 6.30 us at 200 rows, growth 0.67 us
+  run 5: refused insert 6.48 us at 20000 rows, 6.53 us at 200 rows, growth 0.00 us
+  Refused insert on the large table, check included:
+    Runs: [6.6820us, 6.4455us, 6.5480us, 6.9765us, 6.4775us]
+    Average: 6.6259us (no target set)
+    Min/Max: 6.4455us / 6.9765us, StdDev: 0.1932us
+  Temporal overlap check per accepted insert, against an unconstrained twin:
+    Runs: [23.6635us, 17.9255us, 9.3140us, 24.8155us, 8.2965us]
+    Average: 16.8030us (no target set)
+    Min/Max: 8.2965us / 24.8155us, StdDev: 6.9422us
+  Overlap check growth from a small table to one a hundred times larger [PASS/OK]:
+    Runs: [0.4090us, 0.2720us, 0.2165us, 0.6730us, 0us]
+    Average: 0.3141us <= 1us (target)
+    Min/Max: 0us / 0.6730us, StdDev: 0.2226us
+
+=== KMeans, Anomaly Detection and Money Conversion ===
+  run 1: 78 ms
+  run 2: 98 ms
+  run 3: 90 ms
+  run 4: 68 ms
+  run 5: 28 ms
+  KMEANS_CLUSTER k=10 over four features [PASS/OK]:
+    Runs: [77.5185ms, 98.2960ms, 90.3845ms, 68.3287ms, 28.1349ms]
+    Average: 72.5325ms <= 500ms (target)
+    Min/Max: 28.1349ms / 98.2960ms, StdDev: 24.4791ms
+  run 1: 154 ms
+  run 2: 155 ms
+  run 3: 155 ms
+  run 4: 155 ms
+  run 5: 154 ms
+  Isolation forest over four features [PASS/OK]:
+    Runs: [153.6327ms, 154.6642ms, 155.1659ms, 154.9114ms, 153.8689ms]
+    Average: 154.4486ms <= 200ms (target)
+    Min/Max: 153.6327ms / 155.1659ms, StdDev: 0.5961ms
+  run 1: 86.1 ns/convert
+  run 2: 86.1 ns/convert
+  run 3: 86.0 ns/convert
+  run 4: 86.5 ns/convert
+  run 5: 86.2 ns/convert
+  Dated rate lookup and convert [PASS/OK]:
+    Runs: [86.1455ns, 86.1233ns, 85.9843ns, 86.4855ns, 86.1993ns]
+    Average: 86.1876ns <= 2,000ns (target)
+    Min/Max: 85.9843ns / 86.4855ns, StdDev: 0.1650ns
+
+=== VARIANT Dotted Field Reads ===
+  run 1: 16 ns/row
+  run 2: 14 ns/row
+  run 3: 16 ns/row
+  run 4: 17 ns/row
+  run 5: 15 ns/row
+  Dotted field predicate per row, JSON extract path [PASS/OK]:
+    Runs: [16.0775ns, 14.0260ns, 15.5775ns, 17.0420ns, 15.0550ns]
+    Average: 15.5556ns <= 5,000ns (target)
+    Min/Max: 14.0260ns / 17.0420ns, StdDev: 1.0072ns

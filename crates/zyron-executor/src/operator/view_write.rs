@@ -9,8 +9,6 @@
 
 use std::sync::Arc;
 
-use zyron_common::Result;
-
 use crate::context::ExecutionContext;
 use crate::operator::modify::count_batch;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};

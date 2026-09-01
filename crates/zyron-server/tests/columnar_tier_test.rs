@@ -35,6 +35,12 @@ fn col(name: &str, ty: DataType) -> ColumnDef {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }
 }
 
@@ -1031,4 +1037,675 @@ async fn compaction_gate_skips_settled_tables_until_writes_return() {
 
     let (rows4, _) = run(&gate);
     assert_eq!(rows4, 4, "new rows fold once the gate reopens");
+}
+
+/// NSM-encodes one row of (k:i64, payload:text) the way the heap and the
+/// compaction materializer read it: null bitmap, then the fixed column,
+/// then the variable-length one.
+fn encode_variant_row(k: i64, payload: &str) -> Vec<u8> {
+    let mut d = Vec::new();
+    d.push(0u8); // null bitmap, 2 cols -> 1 byte, no nulls
+    d.extend_from_slice(&k.to_le_bytes());
+    d.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    d.extend_from_slice(payload.as_bytes());
+    d
+}
+
+/// A promoted VARIANT path is materialized as its own column when the rows
+/// fold, and the segment records which column holds it.
+///
+/// The fold is the only place a shredded column can be written without a
+/// backfill. Every row of the segment passes through it, so the column is
+/// complete the moment it exists: a null in it means the document did not
+/// carry the path, never that the row has not been shredded yet. That is the
+/// property this test pins, by writing documents that deliberately lack the
+/// path and checking the column's null count is exactly those rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promoted_variant_path_folds_into_a_column_of_its_own() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let columnar_dir = data_dir.join("columnar");
+
+    let disk = Arc::new(
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
+
+    let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+    storage.init_cache().await.unwrap();
+    let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
+    let cache = Arc::new(CatalogCache::new(1024, 256));
+    let catalog = Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
+        .await
+        .unwrap();
+    let db = catalog.create_database("db", "admin").await.unwrap();
+    let schema = catalog.create_schema(db, "app", "admin").await.unwrap();
+    let cols = vec![
+        col("k", DataType::BigInt),
+        col("payload", DataType::Variant),
+    ];
+    let table_id = catalog
+        .create_table(schema, "events", &cols, &[])
+        .await
+        .unwrap();
+    let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
+
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let payload_col = te
+        .columns
+        .iter()
+        .find(|c| c.name == "payload")
+        .unwrap()
+        .id
+        .0;
+
+    let heap = HeapFile::new(
+        Arc::clone(&disk),
+        Arc::clone(&pool),
+        HeapFileConfig {
+            heap_file_id: te.heap_file_id,
+            fsm_file_id: te.fsm_file_id,
+        },
+    )
+    .unwrap();
+
+    // Every fourth document leaves the path out, so the shredded column has
+    // a null exactly where the document had nothing to give it
+    const N: i64 = 12;
+    let missing = |k: i64| k % 4 == 3;
+    let mut tuples = Vec::new();
+    for k in 0..N {
+        let payload = if missing(k) {
+            format!(r#"{{"kind":"click","seq":{k}}}"#)
+        } else {
+            format!(r#"{{"kind":"click","user":{{"id":{}}},"seq":{k}}}"#, k * 7)
+        };
+        tuples.push(Tuple::new(encode_variant_row(k, &payload), 1));
+    }
+    heap.insert_batch(&tuples).await.unwrap();
+    heap.flush().await.unwrap();
+
+    // The tracker would promote this path once it had seen enough traffic;
+    // naming it directly keeps the test about what the fold does with a
+    // promoted path rather than about the thresholds
+    zyron_executor::variant_shred::mark_shredded(table_id.0, payload_col, "user.id");
+
+    let cfg = CompactionWorkerConfig {
+        min_rows: 4,
+        columnar_dir: columnar_dir.clone(),
+        ..CompactionWorkerConfig::default()
+    };
+    let (rows, segs) = {
+        let catalog2 = &catalog;
+        let txn2 = &txn;
+        let disk2 = &disk;
+        let pool2 = &pool;
+        let wal2 = &wal;
+        let cfg2 = &cfg;
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            CompactionWorker::run_cycle(
+                &rt, catalog2, txn2, disk2, pool2, wal2, cfg2, None, None, None, None,
+            )
+        })
+    };
+    assert_eq!(rows, N as u64, "every eligible row folded");
+    assert_eq!(segs, 1, "one segment written");
+
+    // The segment says which column holds the path
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let seg = &te.columnar.segments[0];
+    assert_eq!(
+        seg.shredded.len(),
+        1,
+        "the segment did not record the promoted path"
+    );
+    let shred = &seg.shredded[0];
+    assert_eq!(shred.path, "user.id");
+    assert_eq!(shred.variant_column_id, payload_col);
+    assert_eq!(shred.column_id, zyron_storage::columnar::SHRED_COL_BASE);
+
+    // And the column is there, holding one entry per row of the segment,
+    // null exactly where the document had no such path
+    let reader = ZyrFileReader::open(std::path::Path::new(&seg.path)).unwrap();
+    let header = reader
+        .read_segment_header(shred.column_id)
+        .expect("the shredded column is in the file");
+    assert_eq!(
+        reader.header().row_count as usize,
+        N as usize,
+        "the shredded column covers every row of the segment, which is what \
+         makes it complete without a backfill"
+    );
+    let expected_nulls = (0..N).filter(|k| missing(*k)).count() as u64;
+    assert_eq!(
+        header.null_count, expected_nulls,
+        "a null in the shredded column has to mean the document lacked the \
+         path, and nothing else"
+    );
+
+    // A table with no promoted path shreds nothing, so the machinery costs
+    // an empty list rather than a column
+    zyron_executor::variant_shred::clear_column(table_id.0, payload_col);
+}
+
+// ---------------------------------------------------------------------------
+// Reading a shredded path back
+// ---------------------------------------------------------------------------
+
+use zyron_executor::ExecutionContext;
+use zyron_executor::column::ScalarValue;
+use zyron_executor::operator::Operator;
+use zyron_executor::operator::column_scan::ColumnScanOperator;
+use zyron_planner::logical::LogicalColumn;
+use zyron_storage::txn::Snapshot;
+
+/// Builds a table of (k BIGINT, payload VARIANT), inserts documents that
+/// mostly carry `user.id`, promotes that path and folds everything into one
+/// segment. Returns what a read needs plus the documents it was built from
+struct FoldedEvents {
+    catalog: Arc<Catalog>,
+    disk: Arc<DiskManager>,
+    pool: Arc<BufferPool>,
+    wal: Arc<WalWriter>,
+    db: zyron_catalog::DatabaseId,
+    table_id: zyron_catalog::TableId,
+    payload_col: u16,
+    /// The document written for row k, so a read can be checked against what
+    /// it was built from rather than against a second copy of the answer
+    docs: Vec<String>,
+}
+
+async fn folded_variant_events(tmp: &tempfile::TempDir) -> FoldedEvents {
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let columnar_dir = data_dir.join("columnar");
+
+    let disk = Arc::new(
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
+
+    let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+    storage.init_cache().await.unwrap();
+    let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
+    let cache = Arc::new(CatalogCache::new(1024, 256));
+    let catalog = Arc::new(
+        Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
+            .await
+            .unwrap(),
+    );
+    let db = catalog.create_database("db", "admin").await.unwrap();
+    let schema = catalog.create_schema(db, "app", "admin").await.unwrap();
+    let cols = vec![
+        col("k", DataType::BigInt),
+        col("payload", DataType::Variant),
+    ];
+    let table_id = catalog
+        .create_table(schema, "events", &cols, &[])
+        .await
+        .unwrap();
+    let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
+
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let payload_col = te
+        .columns
+        .iter()
+        .find(|c| c.name == "payload")
+        .unwrap()
+        .id
+        .0;
+
+    let heap = HeapFile::new(
+        Arc::clone(&disk),
+        Arc::clone(&pool),
+        HeapFileConfig {
+            heap_file_id: te.heap_file_id,
+            fsm_file_id: te.fsm_file_id,
+        },
+    )
+    .unwrap();
+
+    // Every fourth document leaves the path out, so a read has to answer
+    // null for it whichever side it comes from
+    const N: i64 = 12;
+    let mut docs = Vec::new();
+    let mut tuples = Vec::new();
+    for k in 0..N {
+        let payload = if k % 4 == 3 {
+            format!(r#"{{"kind":"click","seq":{k}}}"#)
+        } else {
+            format!(r#"{{"kind":"click","user":{{"id":{}}},"seq":{k}}}"#, k * 7)
+        };
+        tuples.push(Tuple::new(encode_variant_row(k, &payload), 1));
+        docs.push(payload);
+    }
+    heap.insert_batch(&tuples).await.unwrap();
+    heap.flush().await.unwrap();
+
+    zyron_executor::variant_shred::mark_shredded(table_id.0, payload_col, "user.id");
+
+    let cfg = CompactionWorkerConfig {
+        min_rows: 4,
+        columnar_dir: columnar_dir.clone(),
+        ..CompactionWorkerConfig::default()
+    };
+    let (rows, segs) = {
+        let catalog2 = &catalog;
+        let txn2 = &txn;
+        let disk2 = &disk;
+        let pool2 = &pool;
+        let wal2 = &wal;
+        let cfg2 = &cfg;
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            CompactionWorker::run_cycle(
+                &rt, catalog2, txn2, disk2, pool2, wal2, cfg2, None, None, None, None,
+            )
+        })
+    };
+    assert_eq!(rows, N as u64, "every eligible row folded");
+    assert_eq!(segs, 1, "one segment written");
+
+    FoldedEvents {
+        catalog,
+        disk,
+        pool,
+        wal,
+        db,
+        table_id,
+        payload_col,
+        docs,
+    }
+}
+
+/// The k and payload columns of the folded table, as a scan projects them
+fn event_columns(te: &zyron_catalog::TableEntry) -> Vec<LogicalColumn> {
+    te.columns
+        .iter()
+        .filter(|c| c.name == "k" || c.name == "payload")
+        .map(|c| LogicalColumn {
+            table_idx: Some(0),
+            column_id: c.id,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+        })
+        .collect()
+}
+
+/// `variant_extract(payload, 'user.id')` as the binder builds it for
+/// `p.user.id`
+fn extract_expr(payload_col: u16) -> zyron_planner::binder::BoundExpr {
+    zyron_planner::binder::BoundExpr::Function {
+        name: "variant_extract".to_string(),
+        args: vec![
+            zyron_planner::binder::BoundExpr::ColumnRef(zyron_planner::binder::ColumnRef {
+                table_idx: 0,
+                column_id: zyron_catalog::ColumnId(payload_col),
+                type_id: zyron_common::TypeId::Variant,
+                nullable: true,
+                fractional_digits: None,
+            }),
+            zyron_planner::binder::BoundExpr::Literal {
+                value: zyron_parser::ast::LiteralValue::String("user.id".to_string()),
+                type_id: zyron_common::TypeId::Text,
+            },
+        ],
+        return_type: zyron_common::TypeId::Text,
+        distinct: false,
+    }
+}
+
+/// Scans the folded table, returning per k the path as the batch resolved it
+/// (None when nothing resolved it) and the path as the expression evaluates
+/// it, plus how many batches carried a resolved column
+async fn scan_paths(
+    ctx: Arc<ExecutionContext>,
+    table_id: zyron_catalog::TableId,
+    columns: Vec<LogicalColumn>,
+    payload_col: u16,
+) -> (
+    Vec<(i64, Option<String>)>,
+    Vec<(i64, Option<String>)>,
+    usize,
+) {
+    let expr = extract_expr(payload_col);
+    let mut op = ColumnScanOperator::new(ctx.clone(), table_id, columns.clone(), None).unwrap();
+    let mut from_column = Vec::new();
+    let mut from_expr = Vec::new();
+    let mut resolved_batches = 0usize;
+    while let Some(eb) = op.next().await.unwrap() {
+        let b = eb.batch;
+        let evaluated = zyron_executor::expr::evaluate(&expr, &b, &columns, &[]).unwrap();
+        let resolved = b.resolved_path(0, payload_col, "user.id").cloned();
+        if resolved.is_some() {
+            resolved_batches += 1;
+        }
+        for r in 0..b.num_rows {
+            let ScalarValue::Int64(k) = b.column(0).get_scalar(r) else {
+                panic!("k is a bigint");
+            };
+            let one = |c: &zyron_executor::column::Column| match c.get_scalar(r) {
+                ScalarValue::Utf8(s) => Some(s),
+                _ => None,
+            };
+            from_column.push((k, resolved.as_ref().and_then(one)));
+            from_expr.push((k, one(&evaluated)));
+        }
+    }
+    from_column.sort_by_key(|(k, _)| *k);
+    from_expr.sort_by_key(|(k, _)| *k);
+    (from_column, from_expr, resolved_batches)
+}
+
+/// A promoted path is read out of the column the fold put it in, and reading
+/// it there gives the answer the documents give.
+///
+/// Both halves matter. Without the first, the shredded column is a write
+/// nothing reads. Without the second, it is a faster way to be wrong: the
+/// column is only usable because its values are the extraction's own output,
+/// so the same query served either way has to agree row for row, nulls
+/// included
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promoted_variant_path_is_read_out_of_its_own_column() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let ev = folded_variant_events(&tmp).await;
+    let (catalog, disk, pool, wal) = (&ev.catalog, &ev.disk, &ev.pool, &ev.wal);
+    let (table_id, payload_col, docs) = (ev.table_id, ev.payload_col, &ev.docs);
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let columns = event_columns(&te);
+
+    let context = || {
+        Arc::new(ExecutionContext::new(
+            Arc::clone(catalog),
+            Arc::clone(wal),
+            Arc::clone(pool),
+            Arc::clone(disk),
+            200,
+            Snapshot::new(
+                200,
+                vec![],
+                Arc::new(zyron_storage::TxnStatusMap::all_committed()),
+            ),
+        ))
+    };
+
+    // What the documents say, which is what every path below has to produce
+    let want: Vec<(i64, Option<String>)> = docs
+        .iter()
+        .enumerate()
+        .map(|(k, doc)| {
+            (
+                k as i64,
+                zyron_executor::variant_shred::extract_scalar_text(doc, "user.id"),
+            )
+        })
+        .collect();
+    assert!(
+        want.iter().any(|(_, v)| v.is_none()) && want.iter().any(|(_, v)| v.is_some()),
+        "the documents have to cover both a present and an absent path"
+    );
+
+    // A statement that reads the path gets it out of the segment column
+    let asking = context();
+    asking.set_variant_paths(vec![zyron_planner::physical::variant_paths::VariantPath {
+        table_idx: 0,
+        column_id: payload_col,
+        path: "user.id".to_string(),
+    }]);
+    let (from_column, from_expr, resolved_batches) =
+        scan_paths(asking, table_id, columns.clone(), payload_col).await;
+    assert!(
+        resolved_batches > 0,
+        "the scan read no shredded column, so nothing reads what the fold writes"
+    );
+    assert_eq!(
+        from_column, want,
+        "the shredded column disagrees with the documents it was extracted from"
+    );
+    assert_eq!(
+        from_expr, want,
+        "the expression served from the shredded column gave a different answer"
+    );
+
+    // A statement that reads no path leaves the promoted columns on disk,
+    // and still answers out of the documents
+    let quiet = context();
+    let (from_column, from_expr, resolved_batches) =
+        scan_paths(quiet, table_id, columns, payload_col).await;
+    assert_eq!(
+        resolved_batches, 0,
+        "a scan read a promoted column no expression named"
+    );
+    assert!(
+        from_column.iter().all(|(_, v)| v.is_none()),
+        "a batch reported a resolved path it was never asked for"
+    );
+    assert_eq!(
+        from_expr, want,
+        "the document walk and the shredded column give different answers"
+    );
+}
+
+/// A row whose document was rewritten after the fold reads back its new
+/// value, not the one the segment column was built from.
+///
+/// The stored column describes the row as it stood when the segment was
+/// written. An UPDATE of a folded row goes to the patch overlay and leaves
+/// that column untouched, so serving the path out of it would answer with
+/// the superseded document
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_patched_document_reads_back_its_new_path_value() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let ev = folded_variant_events(&tmp).await;
+    let (catalog, disk, pool, wal) = (&ev.catalog, &ev.disk, &ev.pool, &ev.wal);
+    let (table_id, payload_col, docs) = (ev.table_id, ev.payload_col, &ev.docs);
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let columns = event_columns(&te);
+    let seg = &te.columnar.segments[0];
+
+    // Rewrite the first row's document. Its k is 0, so the fold stored 0 for
+    // user.id and the patch moves it somewhere the old column cannot reach
+    let patched_doc = r#"{"kind":"click","user":{"id":9999},"seq":0}"#;
+    let store =
+        ColumnarPatchManager::store_for_segment(table_id.0 as u64, std::path::Path::new(&seg.path))
+            .unwrap();
+    store
+        .append_value_patch(
+            0,
+            seg.file_id,
+            seg.sys_rowid_lo,
+            payload_col as u32,
+            50,
+            1,
+            patched_doc.as_bytes(),
+        )
+        .unwrap();
+
+    let ctx = Arc::new(ExecutionContext::new(
+        Arc::clone(catalog),
+        Arc::clone(wal),
+        Arc::clone(pool),
+        Arc::clone(disk),
+        200,
+        Snapshot::new(
+            200,
+            vec![],
+            Arc::new(zyron_storage::TxnStatusMap::all_committed()),
+        ),
+    ));
+    ctx.set_variant_paths(vec![zyron_planner::physical::variant_paths::VariantPath {
+        table_idx: 0,
+        column_id: payload_col,
+        path: "user.id".to_string(),
+    }]);
+
+    let (from_column, from_expr, _) = scan_paths(ctx, table_id, columns, payload_col).await;
+    let mut want: Vec<(i64, Option<String>)> = docs
+        .iter()
+        .enumerate()
+        .map(|(k, doc)| {
+            (
+                k as i64,
+                zyron_executor::variant_shred::extract_scalar_text(doc, "user.id"),
+            )
+        })
+        .collect();
+    want[0].1 = zyron_executor::variant_shred::extract_scalar_text(patched_doc, "user.id");
+    assert_eq!(
+        want[0].1.as_deref(),
+        Some("9999"),
+        "the patch has to move the value somewhere the stored column cannot hold"
+    );
+
+    assert_eq!(
+        from_column, want,
+        "a patched row read back the value the fold stored for it"
+    );
+    assert_eq!(
+        from_expr, want,
+        "the expression answered a patched row out of the stale column"
+    );
+}
+
+/// A read-only context over a folded table, at a snapshot that sees the fold
+fn new_context(ev: &FoldedEvents) -> ExecutionContext {
+    ExecutionContext::new(
+        Arc::clone(&ev.catalog),
+        Arc::clone(&ev.wal),
+        Arc::clone(&ev.pool),
+        Arc::clone(&ev.disk),
+        200,
+        Snapshot::new(
+            200,
+            vec![],
+            Arc::new(zyron_storage::TxnStatusMap::all_committed()),
+        ),
+    )
+}
+
+/// The projection of the plan's hybrid scan, wherever it sits in the tree
+fn hybrid_scan_of(plan: &PhysicalPlan) -> Option<Vec<LogicalColumn>> {
+    if let PhysicalPlan::HybridScan { columns, .. } = plan {
+        return Some(columns.clone());
+    }
+    plan.children().into_iter().find_map(hybrid_scan_of)
+}
+
+/// A query reading a promoted path names it in the plan and answers with the
+/// documents' own values.
+///
+/// The operator tests above prove the segment column is read and that it
+/// agrees with the documents. This one closes the loop the statement
+/// actually travels: dotted access binds to an extraction, the plan is
+/// searched for the paths it reads, and the answer that comes back is the
+/// one the documents hold
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_reading_a_promoted_path_names_it_in_the_plan_and_answers_from_the_documents() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let ev = folded_variant_events(&tmp).await;
+
+    let stmt = zyron_parser::parse("SELECT k, payload.user.id FROM events ORDER BY k")
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let plan = zyron_planner::plan(&ev.catalog, ev.db, vec!["app".into()], stmt, None)
+        .await
+        .expect("plan");
+
+    // The path the statement reads is found in the plan, which is what lets
+    // a scan read the one promoted column it needs and leave the rest
+    let found = zyron_planner::physical::variant_paths::variant_paths(&plan);
+    assert!(
+        found.contains(&zyron_planner::physical::variant_paths::VariantPath {
+            table_idx: 0,
+            column_id: ev.payload_col,
+            path: "user.id".to_string(),
+        }),
+        "the plan reads payload.user.id and the search did not find it: {found:?}"
+    );
+
+    // The scan the plan built, given the paths the plan reads, reads the
+    // promoted column. This is the link between the two halves: the paths
+    // are the ones searched out of this plan, and the projection is the one
+    // the planner chose, so a mismatch in either would show up here rather
+    // than as a query that quietly walks every document
+    let scan_ctx = Arc::new(new_context(&ev));
+    scan_ctx.set_variant_paths(found.clone());
+    let scan = hybrid_scan_of(&plan).expect("the query plans as a hybrid scan");
+    let mut op = ColumnScanOperator::new(scan_ctx, ev.table_id, scan, None).unwrap();
+    let mut resolved_batches = 0usize;
+    while let Some(eb) = op.next().await.unwrap() {
+        if eb
+            .batch
+            .resolved_path(0, ev.payload_col, "user.id")
+            .is_some()
+        {
+            resolved_batches += 1;
+        }
+    }
+    assert!(
+        resolved_batches > 0,
+        "the plan's own scan read no promoted column for a path the plan reads"
+    );
+
+    let mut ctx = new_context(&ev);
+    ctx.heap_files = Some(Arc::new(scc::HashMap::new()));
+    ctx.btree_indexes = Some(Arc::new(scc::HashMap::new()));
+    let batches = zyron_executor::execute(plan, &Arc::new(ctx))
+        .await
+        .expect("execute");
+
+    let mut got: Vec<(i64, Option<String>)> = Vec::new();
+    for b in &batches {
+        for r in 0..b.num_rows {
+            let ScalarValue::Int64(k) = b.column(0).get_scalar(r) else {
+                panic!("k is a bigint");
+            };
+            got.push((
+                k,
+                match b.column(1).get_scalar(r) {
+                    ScalarValue::Utf8(s) => Some(s),
+                    _ => None,
+                },
+            ));
+        }
+    }
+    got.sort_by_key(|(k, _)| *k);
+
+    let want: Vec<(i64, Option<String>)> = ev
+        .docs
+        .iter()
+        .enumerate()
+        .map(|(k, doc)| {
+            (
+                k as i64,
+                zyron_executor::variant_shred::extract_scalar_text(doc, "user.id"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got, want,
+        "the query answered with something other than what the documents hold"
+    );
 }

@@ -9,7 +9,7 @@
 use super::schema::{json_to_stream_value, stream_value_to_json};
 use super::{ColumnSpec, FormatReader, FormatWriter};
 use crate::row_codec::StreamValue;
-use zyron_common::{Result, ZyronError};
+use zyron_common::{Result, TypeId, ZyronError};
 
 // -----------------------------------------------------------------------------
 // Reader
@@ -60,6 +60,41 @@ impl FormatWriter for JsonLinesWriter {
 // Helpers shared with json.rs
 // -----------------------------------------------------------------------------
 
+/// One value as the json a reader sees for its column.
+///
+/// A declared STRUCT or MAP becomes the object it holds rather than base64 of
+/// its stored layout, which is what a json consumer expects and what the
+/// query path renders. Without a shape, or in a process with no engine
+/// registered, it stays base64, which is lossless if unlovely.
+fn column_value_to_json(v: &StreamValue, col: &ColumnSpec) -> serde_json::Value {
+    if let StreamValue::Binary(bytes) = v
+        && matches!(col.type_id, TypeId::Struct | TypeId::Map)
+        && let Some(shape) = col.nested_shape.as_deref()
+        && let Ok(text) = crate::nested_render::render(bytes, shape)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        return value;
+    }
+    stream_value_to_json(v, col.type_id)
+}
+
+/// One json value as the stored value for its column.
+///
+/// A declared STRUCT or MAP arrives as the object it holds, so it is encoded
+/// from that object's own text through the engine's codec.
+fn json_to_column_value(v: &serde_json::Value, col: &ColumnSpec) -> Result<StreamValue> {
+    if matches!(col.type_id, TypeId::Struct | TypeId::Map)
+        && let Some(shape) = col.nested_shape.as_deref()
+    {
+        if v.is_null() {
+            return Ok(StreamValue::Null);
+        }
+        return crate::nested_render::parse(&v.to_string(), shape, &col.name)
+            .map(StreamValue::Binary);
+    }
+    json_to_stream_value(v, col.type_id)
+}
+
 pub(crate) fn object_to_row(
     value: &serde_json::Value,
     schema: &[ColumnSpec],
@@ -70,7 +105,7 @@ pub(crate) fn object_to_row(
     let mut row = Vec::with_capacity(schema.len());
     for col in schema {
         match obj.get(&col.name) {
-            Some(v) => row.push(json_to_stream_value(v, col.type_id)?),
+            Some(v) => row.push(json_to_column_value(v, col)?),
             None => row.push(StreamValue::Null),
         }
     }
@@ -90,7 +125,7 @@ pub(crate) fn row_to_object(
     }
     let mut map = serde_json::Map::with_capacity(schema.len());
     for (col, v) in schema.iter().zip(row.iter()) {
-        map.insert(col.name.clone(), stream_value_to_json(v, col.type_id));
+        map.insert(col.name.clone(), column_value_to_json(v, col));
     }
     Ok(serde_json::Value::Object(map))
 }

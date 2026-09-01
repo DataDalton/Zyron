@@ -175,10 +175,20 @@ pub(crate) fn decode_fixed(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
 
 pub(crate) fn decode_varlen(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
     Ok(match ty {
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-            StreamValue::Utf8(String::from_utf8_lossy(bytes).into_owned())
-        }
-        TypeId::Binary
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => StreamValue::Utf8(String::from_utf8_lossy(bytes).into_owned()),
+        // A stored STRUCT or MAP is its binary layout, and reading it back as
+        // text needs the shape the declaration holds. This layer is given
+        // type ids alone, so the value travels as the bytes it is rather than
+        // as text it is not
+        TypeId::Struct
+        | TypeId::Map
+        | TypeId::Binary
         | TypeId::Varbinary
         | TypeId::Bytea
         | TypeId::Array

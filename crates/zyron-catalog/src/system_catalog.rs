@@ -242,6 +242,12 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
         kind: SystemObjectKind::View,
         doc: "Raw lake transaction log entries per table version",
     },
+    SystemObject {
+        schema: "storage",
+        object: "variant_shredding_stats",
+        kind: SystemObjectKind::View,
+        doc: "Observed JSON paths per variant column with occurrences, coverage, and shredding state",
+    },
     // -----------------------------------------------------------------------
     // stat
     // -----------------------------------------------------------------------
@@ -443,8 +449,79 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
     SystemObject {
         schema: "query",
         object: "recommend_indexes",
+        kind: SystemObjectKind::TableFunction,
+        doc: "Indexes the planner's workload tracker would create, with the evidence for each. \
+              Takes an optional schema name filter",
+    },
+    // -----------------------------------------------------------------------
+    // sql
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "sql",
+        object: "triggers",
         kind: SystemObjectKind::View,
-        doc: "Indexes the planner's workload tracker would create, with the evidence for each",
+        doc: "Every trigger with its table, timing, events, and body function",
+    },
+    // -----------------------------------------------------------------------
+    // session
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "session",
+        object: "prepared_statements",
+        kind: SystemObjectKind::View,
+        doc: "Prepared statements of every live connection, keyed by the pid \
+              shown in zyron_sys.stat.activity",
+    },
+    // -----------------------------------------------------------------------
+    // expectation
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "expectation",
+        object: "results",
+        kind: SystemObjectKind::View,
+        doc: "Recent expectation evaluations per table with pass or fail, \
+              violation counts, and the action taken",
+    },
+    // -----------------------------------------------------------------------
+    // cost
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "cost",
+        object: "currency_rates",
+        kind: SystemObjectKind::View,
+        doc: "Currency conversion rates CONVERT_CURRENCY reads. Writable: \
+              INSERT VALUES upserts (from_currency, to_currency, rate_date, \
+              rate) rows, DELETE without a predicate clears the table",
+    },
+    // -----------------------------------------------------------------------
+    // retention
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "retention",
+        object: "storage_by_age",
+        kind: SystemObjectKind::View,
+        doc: "Row age distribution per retention managed table, with byte \
+              estimates from the ANALYZE average row size",
+    },
+    SystemObject {
+        schema: "retention",
+        object: "upcoming_actions",
+        kind: SystemObjectKind::View,
+        doc: "The next action each retention policy will take and how many \
+              rows it would touch now",
+    },
+    SystemObject {
+        schema: "retention",
+        object: "savings_estimate",
+        kind: SystemObjectKind::View,
+        doc: "Rows and bytes an immediate purge of expired data would reclaim \
+              per table",
+    },
+    SystemObject {
+        schema: "retention",
+        object: "compliance_summary",
+        kind: SystemObjectKind::View,
+        doc: "Latest retention job outcome per policy",
     },
     // -----------------------------------------------------------------------
     // ml

@@ -941,6 +941,63 @@ pub fn nysiis(text: &str) -> String {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Phonetic match and score
+// ---------------------------------------------------------------------------
+
+/// Encodes text under the named phonetic algorithm, returning the pair of
+/// codes to compare. Single-code algorithms return the same code twice,
+/// double metaphone returns (primary, alternate)
+fn phonetic_codes(text: &str, algorithm: &str) -> Result<(String, String)> {
+    match algorithm.to_ascii_lowercase().as_str() {
+        "soundex" => {
+            let code = soundex(text);
+            Ok((code.clone(), code))
+        }
+        "metaphone" => {
+            let code = metaphone(text);
+            Ok((code.clone(), code))
+        }
+        "double_metaphone" => Ok(double_metaphone(text)),
+        _ => Err(ZyronError::InvalidParameter {
+            name: "algorithm".to_string(),
+            value: algorithm.to_string(),
+        }),
+    }
+}
+
+/// Returns true when the two strings encode to matching phonetic codes.
+/// Double metaphone matches when either code of one side equals either
+/// code of the other side
+pub fn phonetic_match(a: &str, b: &str, algorithm: &str) -> Result<bool> {
+    let (ap, aa) = phonetic_codes(a, algorithm)?;
+    let (bp, ba) = phonetic_codes(b, algorithm)?;
+    Ok(ap == bp || ap == ba || aa == bp || aa == ba)
+}
+
+/// Scores phonetic similarity in [0, 1]. Equal codes score 1.0, otherwise
+/// the score is the normalized Levenshtein similarity between the codes.
+/// Double metaphone takes the best score across all code pairings
+pub fn phonetic_score(a: &str, b: &str, algorithm: &str) -> Result<f32> {
+    let (ap, aa) = phonetic_codes(a, algorithm)?;
+    let (bp, ba) = phonetic_codes(b, algorithm)?;
+    let mut buf = FuzzyBuffer::new();
+    let mut best = 0.0f64;
+    for left in [&ap, &aa] {
+        for right in [&bp, &ba] {
+            let score = if left == right {
+                1.0
+            } else {
+                levenshtein_similarity(left, right, &mut buf)
+            };
+            if score > best {
+                best = score;
+            }
+        }
+    }
+    Ok(best.clamp(0.0, 1.0) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,5 +1272,61 @@ mod tests {
     fn test_jaro_unicode() {
         let sim = jaro_similarity("hello", "hello");
         assert!((sim - 1.0).abs() < 1e-10);
+    }
+
+    // Phonetic match and score
+    #[test]
+    fn test_phonetic_match_soundex() {
+        assert!(phonetic_match("Robert", "Rupert", "soundex").unwrap());
+        assert!(!phonetic_match("Robert", "Ashcraft", "soundex").unwrap());
+    }
+
+    #[test]
+    fn test_phonetic_match_metaphone() {
+        assert!(phonetic_match("Smith", "Smyth", "metaphone").unwrap());
+        assert!(!phonetic_match("Smith", "Jones", "metaphone").unwrap());
+    }
+
+    #[test]
+    fn test_phonetic_match_double_metaphone() {
+        // matches when either primary or alternate code lines up
+        assert!(phonetic_match("Smith", "Smith", "double_metaphone").unwrap());
+        let (p, a) = double_metaphone("John");
+        assert_ne!(p, a);
+        assert!(phonetic_match("John", "John", "double_metaphone").unwrap());
+        assert!(!phonetic_match("Smith", "Wexford", "double_metaphone").unwrap());
+    }
+
+    #[test]
+    fn test_phonetic_match_case_insensitive_algorithm() {
+        assert!(phonetic_match("Robert", "Rupert", "SOUNDEX").unwrap());
+    }
+
+    #[test]
+    fn test_phonetic_match_unknown_algorithm() {
+        let err = phonetic_match("a", "b", "caverphone");
+        assert!(matches!(err, Err(ZyronError::InvalidParameter { .. })));
+    }
+
+    #[test]
+    fn test_phonetic_score_equal_codes() {
+        assert_eq!(phonetic_score("Robert", "Rupert", "soundex").unwrap(), 1.0);
+        assert_eq!(phonetic_score("Smith", "Smith", "metaphone").unwrap(), 1.0);
+        assert_eq!(
+            phonetic_score("Smith", "Smith", "double_metaphone").unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_phonetic_score_partial() {
+        let score = phonetic_score("Robert", "Ashcraft", "soundex").unwrap();
+        assert!(score < 1.0);
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_phonetic_score_unknown_algorithm() {
+        assert!(phonetic_score("a", "b", "nope").is_err());
     }
 }

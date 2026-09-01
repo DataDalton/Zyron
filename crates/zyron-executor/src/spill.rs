@@ -740,6 +740,7 @@ fn decode_batch(reader: &mut SpillReader) -> Result<(DataBatch, Option<Vec<RowLo
         DataBatch {
             columns,
             num_rows: rows,
+            resolved: Vec::new(),
         },
         locators,
     ))

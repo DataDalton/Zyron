@@ -14,6 +14,7 @@ pub mod error;
 pub mod foreign;
 pub mod interval;
 pub mod io_stats;
+pub mod nested_value;
 pub mod node;
 pub mod obs_metrics;
 pub mod page;
@@ -48,6 +49,7 @@ pub use interval::{
     parse_timestamp_micros, ymd_from_days,
 };
 pub use io_stats::{IndexIOStats, IndexIOStatsRegistry, TableIOStats, TableIOStatsRegistry};
+pub use nested_value::{MapView, StructView};
 pub use node::{
     IDENTITY_FILE, NodeIdentity, PEERS_FILE, PeerEntry, PeerRegistry, peer_timestamp_us,
 };

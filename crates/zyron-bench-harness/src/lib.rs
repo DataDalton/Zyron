@@ -12,7 +12,8 @@ pub use std::time::Instant;
 
 pub mod production;
 pub use production::{
-    buffer_pool_config, compaction_config, create_dirs, data_and_wal_dirs, disk_config, wal_config,
+    buffer_pool_config, compaction_config, create_dirs, data_and_wal_dirs, disk_config,
+    install_evict_writer, wal_config,
 };
 
 // =============================================================================

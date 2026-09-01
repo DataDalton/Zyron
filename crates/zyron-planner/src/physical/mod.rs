@@ -5,6 +5,7 @@
 //! and carries cost estimates for plan comparison.
 
 pub mod builder;
+pub mod variant_paths;
 
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
 use crate::cost::PlanCost;
@@ -362,6 +363,8 @@ pub enum PhysicalPlan {
         check_constraints: Vec<crate::binder::BoundExpr>,
         /// Data-quality expectations (bound at table_idx 0) applied per row.
         expectations: Vec<crate::binder::BoundExpectation>,
+        /// Stored generated columns (bound at table_idx 0) computed per row.
+        generated_columns: Vec<crate::binder::BoundGeneratedColumn>,
         source: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -379,6 +382,9 @@ pub enum PhysicalPlan {
         assignments: Vec<BoundAssignment>,
         /// CHECK constraint predicates (bound at table_idx 0) to enforce per row.
         check_constraints: Vec<crate::binder::BoundExpr>,
+        /// STORED generated columns, recomputed from the updated row image so
+        /// a generated value never outlives the columns it derives from.
+        generated_columns: Vec<crate::binder::BoundGeneratedColumn>,
         child: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -565,34 +571,58 @@ impl PhysicalPlan {
     /// and report whatever it had found so far, which reads as an answer
     /// rather than as a gap
     pub fn children(&self) -> Vec<&PhysicalPlan> {
+        let mut out = Vec::new();
+        self.for_each_child(&mut |child| out.push(child));
+        out
+    }
+
+    /// Hands every child plan to `f`, in execution order.
+    ///
+    /// The same list `children` returns, without building a Vec to hold it,
+    /// for a walk that only needs to reach the children rather than keep
+    /// them. Total over the enum for the same reason `children` is
+    pub fn for_each_child<'a>(&'a self, f: &mut dyn FnMut(&'a PhysicalPlan)) {
         match self {
-            PhysicalPlan::LakeUpdate { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Filter { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Project { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::NestedLoopJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-            PhysicalPlan::LateralJoin { left, .. } => vec![left.as_ref()],
-            PhysicalPlan::HashJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-            PhysicalPlan::MergeJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-            PhysicalPlan::HashAggregate { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::SortAggregate { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::GapFill { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Sort { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Limit { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::HashDistinct { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::LockRows { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::SetOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-            PhysicalPlan::Insert { source, .. } => vec![source.as_ref()],
-            PhysicalPlan::ViewTriggerWrite { source, .. } => vec![source.as_ref()],
-            PhysicalPlan::Update { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Delete { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::ParallelHashJoin { left, right, .. } => {
-                vec![left.as_ref(), right.as_ref()]
+            PhysicalPlan::LakeUpdate { child, .. } => f(child),
+            PhysicalPlan::Filter { child, .. } => f(child),
+            PhysicalPlan::Project { child, .. } => f(child),
+            PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+                f(left);
+                f(right);
             }
-            PhysicalPlan::Gather { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Repartition { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Broadcast { child, .. } => vec![child.as_ref()],
-            PhysicalPlan::Window { child, .. } => vec![child.as_ref()],
-            _ => Vec::new(),
+            PhysicalPlan::LateralJoin { left, .. } => f(left),
+            PhysicalPlan::HashJoin { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            PhysicalPlan::MergeJoin { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            PhysicalPlan::HashAggregate { child, .. } => f(child),
+            PhysicalPlan::SortAggregate { child, .. } => f(child),
+            PhysicalPlan::GapFill { child, .. } => f(child),
+            PhysicalPlan::Sort { child, .. } => f(child),
+            PhysicalPlan::Limit { child, .. } => f(child),
+            PhysicalPlan::HashDistinct { child, .. } => f(child),
+            PhysicalPlan::LockRows { child, .. } => f(child),
+            PhysicalPlan::SetOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            PhysicalPlan::Insert { source, .. } => f(source),
+            PhysicalPlan::ViewTriggerWrite { source, .. } => f(source),
+            PhysicalPlan::Update { child, .. } => f(child),
+            PhysicalPlan::Delete { child, .. } => f(child),
+            PhysicalPlan::ParallelHashJoin { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            PhysicalPlan::Gather { child, .. } => f(child),
+            PhysicalPlan::Repartition { child, .. } => f(child),
+            PhysicalPlan::Broadcast { child, .. } => f(child),
+            PhysicalPlan::Window { child, .. } => f(child),
+            _ => {}
         }
     }
 }

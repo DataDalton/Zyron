@@ -102,6 +102,14 @@ pub(crate) fn encode_btree_key_into(
             buf.extend_from_slice(&sortable.to_be_bytes());
         }
         (ColumnData::Utf8(v), _) => buf.extend_from_slice(v[row_idx].as_bytes()),
+        // A range's storage form leads with inclusivity flags that move
+        // independently of its bounds, so memcmp over stored ranges says
+        // nothing about which one starts first. The index form reorders it
+        // to sort by position, which is what lets an overlap check seek
+        // instead of scan, and it is fixed width so it needs no delimiter
+        (ColumnData::Binary(v), TypeId::Range) => buf.extend_from_slice(
+            &zyron_types::range::range_index_key(&v[row_idx], zyron_types::range::RANGE_ELEM_SIZE),
+        ),
         (ColumnData::Binary(v), _) => buf.extend_from_slice(&v[row_idx]),
         _ => return false,
     }
@@ -118,10 +126,13 @@ const VARLEN_COMPONENT_TERMINATOR: [u8; 2] = [0x00, 0x00];
 /// component built from it needs delimiting when another component follows.
 #[inline]
 fn column_is_varlen(batch: &DataBatch, col_pos: usize) -> bool {
-    matches!(
-        batch.columns.get(col_pos).map(|c| &c.data),
-        Some(ColumnData::Utf8(_)) | Some(ColumnData::Binary(_))
-    )
+    match batch.columns.get(col_pos) {
+        // A range column encodes to the fixed width index form, so its
+        // extent is known without a terminator
+        Some(c) if c.type_id == TypeId::Range => false,
+        Some(c) => matches!(c.data, ColumnData::Utf8(_) | ColumnData::Binary(_)),
+        None => false,
+    }
 }
 
 /// Delimits the variable-length component occupying `buf[start..]`, escaping
@@ -685,6 +696,72 @@ pub(crate) async fn check_unique_constraints(
         }
     }
     Ok(())
+}
+
+/// Whether an index entry still points at a row this statement can see.
+///
+/// An MVCC delete stamps the row and leaves the index entry for vacuum to
+/// remove later, so the presence of an entry proves nothing on its own.
+/// Every check that reads a candidate out of an index confirms it here
+/// before treating it as a conflict, or a deleted row would go on rejecting
+/// writes that no longer collide with anything.
+///
+/// `key_value` is the entry's key without its locator suffix. A columnar row
+/// updated in place keeps its locator, so an entry found under a value the
+/// row no longer holds has to be refuted by reading the row's current value
+/// rather than by its liveness alone.
+pub(crate) async fn index_candidate_is_live(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    key_cols: &[(usize, TypeId)],
+    key_value: &[u8],
+    locator: zyron_common::RowLocator,
+) -> zyron_common::Result<bool> {
+    match locator {
+        zyron_common::RowLocator::Heap { page, slot } => {
+            // Read through the active branch. A row the branch deleted is
+            // tombstoned in the branch's copy of the page while the main
+            // page still shows it live
+            let page_id = ctx.resolve_branch_page(
+                ctx.active_branch_id,
+                zyron_common::page::PageId::new(table_entry.heap_file_id, page.page_num),
+            );
+            let data = crate::operator::scan::read_page_through_pool(
+                &ctx.buffer_pool,
+                &ctx.disk_manager,
+                page_id,
+            )
+            .await?;
+            Ok(
+                match zyron_storage::HeapPage::get_tuple_view_from_slice(
+                    &data,
+                    zyron_storage::SlotId(slot),
+                ) {
+                    Some(view) => ctx.snapshot.is_live_latest(
+                        view.header.xmin as u64,
+                        view.header.xmax as u64,
+                        ctx.txn_id as u64,
+                    ),
+                    None => false,
+                },
+            )
+        }
+        zyron_common::RowLocator::Columnar { file_id, sys_rowid } => {
+            Ok(
+                columnar_row_live_latest(ctx, table_entry, file_id, sys_rowid)?
+                    && columnar_row_currently_holds_value(
+                        ctx,
+                        table_entry,
+                        key_cols,
+                        file_id,
+                        sys_rowid,
+                        key_value,
+                    )
+                    .await?,
+            )
+        }
+        zyron_common::RowLocator::Lake { .. } => Ok(false),
+    }
 }
 
 /// Runs the insert path for one batch of a branch write.
@@ -1255,6 +1332,15 @@ impl Operator for ValuesOperator {
                 .schema
                 .iter()
                 .map(|c| {
+                    // A range cell arrives as SQL text and parses against the
+                    // column's element kind at the write path, which this
+                    // operator cannot see. The cell rides as text so the
+                    // parse happens where the element kind is known. A binary
+                    // container here would drop the text and store an empty
+                    // range that overlaps nothing and reads back as unbounded
+                    if c.type_id == TypeId::Range {
+                        return ColumnData::with_capacity(TypeId::Text, num_rows);
+                    }
                     ColumnData::with_capacity(
                         zyron_common::types::TypeId::timestamp_physical_type_id(
                             c.type_id,
@@ -1293,6 +1379,7 @@ impl Operator for ValuesOperator {
                         let mut batch = DataBatch {
                             columns: Vec::new(),
                             num_rows: 1,
+                            resolved: Vec::new(),
                         };
                         let mut schema: Vec<LogicalColumn> = Vec::new();
                         crate::sequence::materialize_sequences(
@@ -1312,7 +1399,13 @@ impl Operator for ValuesOperator {
 
                     if let Some((exprs, batch, schema)) = &seq_row {
                         let col = evaluate(&exprs[c], batch, schema, &self.params)?;
-                        let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
+                        // A range target keeps its text form, the write path
+                        // parses it against the column's element kind
+                        let col = if col.len() > 0
+                            && col.type_id != target
+                            && target != TypeId::Range
+                            && !col.is_null(0)
+                        {
                             crate::compute::cast_column(&col, target)?
                         } else {
                             col
@@ -1355,10 +1448,13 @@ impl Operator for ValuesOperator {
                         // A decimal target is left to the scaling step below.
                         // The generic cast has no scale to cast onto, so it
                         // would hand an i128 buffer a value of another
-                        // variant and store a zero
+                        // variant and store a zero. A range target keeps its
+                        // text form for the same reason, the parse needs the
+                        // element kind only the write path knows
                         let col = if col.len() > 0
                             && col.type_id != target
                             && target != TypeId::Decimal
+                            && target != TypeId::Range
                             && !col.is_null(0)
                         {
                             crate::compute::cast_column(&col, target)?
@@ -1444,6 +1540,7 @@ pub struct InsertOperator {
     /// carries a violation action: Fail aborts, Warn counts, Drop removes the
     /// row from the insert, Quarantine routes the row to a companion table.
     expectations: Vec<zyron_planner::binder::BoundExpectation>,
+    generated_columns: Vec<zyron_planner::binder::BoundGeneratedColumn>,
     finished: bool,
 }
 
@@ -1456,6 +1553,7 @@ impl InsertOperator {
         column_defaults: Vec<(zyron_catalog::ColumnId, zyron_planner::binder::BoundExpr)>,
         check_constraints: Vec<zyron_planner::binder::BoundExpr>,
         expectations: Vec<zyron_planner::binder::BoundExpectation>,
+        generated_columns: Vec<zyron_planner::binder::BoundGeneratedColumn>,
     ) -> Self {
         Self {
             source,
@@ -1465,6 +1563,7 @@ impl InsertOperator {
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             finished: false,
         }
     }
@@ -1564,11 +1663,948 @@ struct ExpectationResult {
 /// violation; NULL (unknown) passes, matching CHECK semantics. Fail aborts the
 /// statement. Quarantine is evaluated before Drop so a row failing both is
 /// preserved in the quarantine table rather than silently dropped.
+/// Media payloads at or under this size stay inline in the heap tuple
+const MEDIA_INLINE_LIMIT: usize = 8 * 1024;
+/// Above inline and at or under this size, payloads go to the content
+/// addressed store compressed. Larger payloads store uncompressed
+const MEDIA_TOAST_LIMIT: usize = 1024 * 1024;
+
+fn media_kind_of(type_id: zyron_common::TypeId) -> Option<zyron_media::descriptor::MediaKind> {
+    use zyron_media::descriptor::MediaKind;
+    match type_id {
+        zyron_common::TypeId::Image => Some(MediaKind::Image),
+        zyron_common::TypeId::Video => Some(MediaKind::Video),
+        zyron_common::TypeId::Audio => Some(MediaKind::Audio),
+        zyron_common::TypeId::Document => Some(MediaKind::Document),
+        zyron_common::TypeId::ExternalRef => Some(MediaKind::ExternalRef),
+        _ => None,
+    }
+}
+
+fn media_metadata_json(kind: zyron_media::descriptor::MediaKind, bytes: &[u8]) -> (String, String) {
+    use zyron_media::descriptor::MediaKind;
+    let result = match kind {
+        MediaKind::Image => zyron_media::image_meta::image_metadata(bytes),
+        MediaKind::Video => zyron_media::video_meta::video_metadata(bytes),
+        MediaKind::Audio => zyron_media::audio_meta::audio_metadata(bytes),
+        MediaKind::Document => zyron_media::document::document_metadata(bytes),
+        MediaKind::ExternalRef => Ok(serde_json::json!({})),
+    };
+    match result {
+        Ok(value) => {
+            let format = value
+                .get("format")
+                .or_else(|| value.get("codec"))
+                .or_else(|| value.get("mime_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (value.to_string(), format)
+        }
+        // The payload stays storable, what failed is recorded in place of
+        // the metadata so nothing pretends to have parsed it
+        Err(e) => (
+            serde_json::json!({ "metadata_error": e.to_string() }).to_string(),
+            "unknown".to_string(),
+        ),
+    }
+}
+
+fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Drops the store references a row image holds on its media payloads.
+///
+/// A payload that reached the content addressed store took a reference when
+/// it was written, and that reference is what keeps the object on disk.
+/// Rows leaving the table, and old images an update replaces, have to give
+/// theirs back or the store grows without bound and never reclaims an
+/// object nothing points at any more.
+///
+/// An update runs this after the new image has externalized, which is what
+/// makes an unconditional release correct even when both images name the
+/// same object: the new image already took its own reference, so releasing
+/// the old one leaves exactly the count the row deserves. Releasing
+/// conditionally instead would leave two references behind for one row.
+/// Inline payloads own no store object and are skipped.
+fn release_media_references(
+    ctx: &ExecutionContext,
+    batch: &DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) {
+    use zyron_media::descriptor::{MediaDescriptor, StorageMode};
+
+    let Some(store) = ctx.media_store.as_ref() else {
+        return;
+    };
+    for (idx, column) in table_columns.iter().enumerate() {
+        if media_kind_of(column.type_id).is_none() || idx >= batch.columns.len() {
+            continue;
+        }
+        let source = &batch.columns[idx];
+        for row in 0..batch.num_rows {
+            if source.nulls.is_null(row) {
+                continue;
+            }
+            let ScalarValue::Binary(bytes) = source.get_scalar(row) else {
+                continue;
+            };
+            let Ok((descriptor, _)) = MediaDescriptor::from_bytes(&bytes) else {
+                continue;
+            };
+            if matches!(
+                descriptor.mode,
+                StorageMode::Inline | StorageMode::ExternalUri
+            ) {
+                continue;
+            }
+            if let Err(e) = store.release(&descriptor.sha256) {
+                // A reference the store could not drop leaks one object
+                // rather than failing a statement that has already written
+                eprintln!(
+                    "media store could not release the object behind column {}: {e}",
+                    column.name
+                );
+            }
+        }
+    }
+}
+
+/// Externalizes media column payloads: metadata extracts on write, small
+/// payloads stay inline in the tuple, medium ones land compressed in the
+/// content addressed store, large ones land uncompressed, and EXTERNAL_REF
+/// columns resolve to their external location. Every cell becomes a media
+/// descriptor the scan side inflates back to the original bytes
+fn externalize_media_columns(
+    ctx: &ExecutionContext,
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    use zyron_media::descriptor::{MediaDescriptor, MediaKind, StorageMode};
+    for (idx, column) in table_columns.iter().enumerate() {
+        let Some(kind) = media_kind_of(column.type_id) else {
+            continue;
+        };
+        if idx >= batch.columns.len() {
+            continue;
+        }
+        let storage_hint = column.attrs.media_storage.as_deref().unwrap_or("");
+        let source = &batch.columns[idx];
+        let rows = batch.num_rows;
+        let mut out = Vec::with_capacity(rows);
+        let mut nulls = crate::column::NullBitmap::none(rows);
+        for row in 0..rows {
+            if source.nulls.is_null(row) {
+                nulls.set_null(row);
+                out.push(Vec::new());
+                continue;
+            }
+            let cell = match source.get_scalar(row) {
+                ScalarValue::Binary(bytes) => {
+                    if zyron_media::descriptor::is_descriptor(&bytes) {
+                        // Already a descriptor, a replicated or replayed row
+                        out.push(bytes);
+                        continue;
+                    }
+                    let (metadata_json, detected_format) = media_metadata_json(kind, &bytes);
+                    if let Some(hint) = column.attrs.media_format.as_deref()
+                        && !hint.eq_ignore_ascii_case("auto")
+                        && !detected_format.eq_ignore_ascii_case(hint)
+                    {
+                        return Err(zyron_common::ZyronError::CheckViolation(format!(
+                            "column {} declares FORMAT '{hint}' but the payload is {detected_format}",
+                            column.name
+                        )));
+                    }
+                    let sha256 = sha256_of(&bytes);
+                    let byte_len = bytes.len() as u64;
+                    if storage_hint.contains("://") {
+                        // Declared external location: upload and reference
+                        let mut name_hex = String::with_capacity(64);
+                        for b in sha256 {
+                            name_hex.push_str(&format!("{b:02x}"));
+                        }
+                        let uri = crate::media_runtime::external_fetcher()
+                            .put(storage_hint, &name_hex, &bytes)
+                            .map_err(zyron_common::ZyronError::from)?;
+                        MediaDescriptor {
+                            kind,
+                            mode: StorageMode::ExternalUri,
+                            sha256,
+                            byte_len,
+                            format: detected_format,
+                            metadata_json,
+                            uri: Some(uri),
+                        }
+                        .to_bytes(None)
+                        .map_err(zyron_common::ZyronError::from)?
+                    } else {
+                        let forced_mode = match storage_hint {
+                            "inline" => Some(StorageMode::Inline),
+                            "toast" => Some(StorageMode::Toast),
+                            "external" => Some(StorageMode::External),
+                            _ => None,
+                        };
+                        let mode = forced_mode.unwrap_or(if bytes.len() <= MEDIA_INLINE_LIMIT {
+                            StorageMode::Inline
+                        } else if bytes.len() <= MEDIA_TOAST_LIMIT {
+                            StorageMode::Toast
+                        } else {
+                            StorageMode::External
+                        });
+                        match mode {
+                            StorageMode::Inline => MediaDescriptor {
+                                kind,
+                                mode: StorageMode::Inline,
+                                sha256,
+                                byte_len,
+                                format: detected_format,
+                                metadata_json,
+                                uri: None,
+                            }
+                            .to_bytes(Some(&bytes))
+                            .map_err(zyron_common::ZyronError::from)?,
+                            mode => {
+                                let Some(store) = ctx.media_store.as_ref() else {
+                                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                                        "column {} needs the media store, which only a running server opens",
+                                        column.name
+                                    )));
+                                };
+                                let compress = matches!(mode, StorageMode::Toast);
+                                store
+                                    .put(&bytes, compress)
+                                    .map_err(zyron_common::ZyronError::from)?;
+                                store
+                                    .add_ref(&sha256)
+                                    .map_err(zyron_common::ZyronError::from)?;
+                                MediaDescriptor {
+                                    kind,
+                                    mode,
+                                    sha256,
+                                    byte_len,
+                                    format: detected_format,
+                                    metadata_json,
+                                    uri: None,
+                                }
+                                .to_bytes(None)
+                                .map_err(zyron_common::ZyronError::from)?
+                            }
+                        }
+                    }
+                }
+                ScalarValue::Utf8(text) => {
+                    if kind != MediaKind::ExternalRef {
+                        return Err(zyron_common::ZyronError::ExecutionError(format!(
+                            "column {} takes a binary media payload, got text",
+                            column.name
+                        )));
+                    }
+                    // A URI value references the external object directly
+                    zyron_media::descriptor::uri_reference_bytes(&text)
+                        .map_err(zyron_common::ZyronError::from)?
+                }
+                other => {
+                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                        "media column {} holds unexpected value {other:?}",
+                        column.name
+                    )));
+                }
+            };
+            out.push(cell);
+        }
+        batch.columns[idx] = Column::with_nulls(
+            crate::column::ColumnData::Binary(out),
+            nulls,
+            column.type_id,
+        );
+    }
+    Ok(())
+}
+
+/// The element meaning of a range column, from its declared element type
+fn range_elem_kind(column: &zyron_catalog::ColumnEntry) -> zyron_types::range::RangeElemKind {
+    match column.element_type {
+        Some(zyron_common::TypeId::Date) => zyron_types::range::RangeElemKind::Date,
+        Some(zyron_common::TypeId::Timestamp) | Some(zyron_common::TypeId::TimestampTz) => {
+            zyron_types::range::RangeElemKind::TimestampMicros
+        }
+        _ => zyron_types::range::RangeElemKind::Int,
+    }
+}
+
+/// Parses SQL text range literals written into RANGE columns to the stored
+/// binary form, so '[2026-01-01,2026-01-05)' lands as a real range
+fn normalize_range_columns(
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    for (idx, column) in table_columns.iter().enumerate() {
+        if column.type_id != zyron_common::TypeId::Range || idx >= batch.columns.len() {
+            continue;
+        }
+        let needs_parse = match &batch.columns[idx].data {
+            crate::column::ColumnData::Utf8(_) => true,
+            // A batch built from VALUES carries the literal text as bytes
+            // in the binary buffer. An encoded range always begins with a
+            // flag byte at or below 0x1F, so a printable first byte can
+            // only be unparsed text
+            crate::column::ColumnData::Binary(values) => {
+                values.iter().any(|v| v.first().is_some_and(|b| *b > 0x1F))
+            }
+            _ => false,
+        };
+        if !needs_parse {
+            continue;
+        }
+        let kind = range_elem_kind(column);
+        let source = &batch.columns[idx];
+        let rows = batch.num_rows;
+        let mut out = Vec::with_capacity(rows);
+        let mut nulls = crate::column::NullBitmap::none(rows);
+        for row in 0..rows {
+            if source.nulls.is_null(row) {
+                nulls.set_null(row);
+                out.push(Vec::new());
+                continue;
+            }
+            match source.get_scalar(row) {
+                ScalarValue::Utf8(text) => {
+                    out.push(zyron_types::range::range_from_text(&text, kind)?);
+                }
+                ScalarValue::Binary(bytes) => {
+                    if bytes.first().is_some_and(|b| *b > 0x1F) {
+                        let text = std::str::from_utf8(&bytes).map_err(|_| {
+                            zyron_common::ZyronError::ExecutionError(format!(
+                                "range column {} holds bytes that are neither an encoded range nor text",
+                                column.name
+                            ))
+                        })?;
+                        out.push(zyron_types::range::range_from_text(text, kind)?);
+                    } else {
+                        out.push(bytes);
+                    }
+                }
+                other => {
+                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                        "range column {} holds unexpected value {other:?}",
+                        column.name
+                    )));
+                }
+            }
+        }
+        batch.columns[idx] = Column::with_nulls(
+            crate::column::ColumnData::Binary(out),
+            nulls,
+            zyron_common::TypeId::Range,
+        );
+    }
+    Ok(())
+}
+
+/// The overlap check of one WITHOUT OVERLAPS constraint, for the rows a
+/// statement is about to write.
+///
+/// Rows sharing the constraint's scalar key columns may not hold periods
+/// that intersect, neither within the incoming batch nor against what is
+/// already stored. Both halves run off the constraint's backing index key,
+/// whose period component sorts by position rather than by the storage
+/// form's leading flags byte.
+///
+/// The incoming half sorts the batch by that key. Periods that intersect
+/// are then adjacent under it, so one linear pass over the sorted keys
+/// settles the batch instead of comparing every pair.
+///
+/// The stored half seeks the index once per row. A key group's periods are
+/// pairwise disjoint, because that is the invariant this constraint
+/// maintains, so ordering them by upper bound orders them by lower bound
+/// too, and the first entry at or above the probe is the only stored period
+/// that can still be open where the new one starts. The walk stops at the
+/// first entry beginning at or after the new period ends, so it reads a
+/// couple of index entries rather than the table.
+///
+/// `exclude` carries the locators a statement is replacing, so an UPDATE
+/// does not read a row's own stored period as a conflict with itself.
+async fn enforce_temporal_constraints(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    batch: &DataBatch,
+    exclude: &[zyron_common::RowLocator],
+) -> zyron_common::Result<()> {
+    use zyron_types::range::{
+        RANGE_ELEM_SIZE, RANGE_INDEX_KEY_LEN, range_from_index_key, range_is_empty, range_lower,
+        range_overlap_probe, range_overlaps, range_upper,
+    };
+
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    if !table_entry
+        .constraints
+        .iter()
+        .any(|c| c.without_overlaps.is_some() && c.enforced)
+    {
+        return Ok(());
+    }
+    // A decision the leader already made is not remade here, the same rule
+    // the uniqueness check follows. Re-running it could reject a row the
+    // group agreed on and leave this node holding a different table
+    if ctx.replication_apply {
+        return Ok(());
+    }
+    let index_snap = ctx.index_snapshot_for_table(table_entry.id.0);
+    // Stored entries carry btree normalized locators, so the exclusion set
+    // must too or an updated row would read its own old entry as a conflict
+    let exclude: std::collections::HashSet<zyron_common::RowLocator> = exclude
+        .iter()
+        .map(|l| btree_normalize_locator(*l))
+        .collect();
+
+    for constraint in &table_entry.constraints {
+        if constraint.without_overlaps.is_none() || !constraint.enforced {
+            continue;
+        }
+        let Some(key_cols) = index_key_columns(table_entry, &constraint.columns) else {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "temporal constraint {} names a missing column",
+                constraint.name
+            )));
+        };
+        // The period is the constraint's last key column, so its component
+        // is the key's fixed width tail and everything before it is the
+        // scalar key the periods are grouped under
+        if key_cols.last().map(|&(_, t)| t) != Some(TypeId::Range) {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "temporal constraint {} does not end in its period column",
+                constraint.name
+            )));
+        }
+
+        // One encoded constraint key per row. A row with a null anywhere in
+        // the key is out of the constraint entirely, the rule the unique
+        // path applies too
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(batch.num_rows);
+        let mut scratch = Vec::with_capacity(48);
+        for row in 0..batch.num_rows {
+            if encode_btree_index_key_into(batch, row, &key_cols, &mut scratch)
+                && scratch.len() >= RANGE_INDEX_KEY_LEN
+            {
+                keys.push(scratch.clone());
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+
+        // Incoming rows against each other
+        keys.sort_unstable();
+        for pair in keys.windows(2) {
+            let a_split = pair[0].len() - RANGE_INDEX_KEY_LEN;
+            let b_split = pair[1].len() - RANGE_INDEX_KEY_LEN;
+            if pair[0][..a_split] != pair[1][..b_split] {
+                continue;
+            }
+            let (Some(ra), Some(rb)) = (
+                range_from_index_key(&pair[0][a_split..], RANGE_ELEM_SIZE),
+                range_from_index_key(&pair[1][b_split..], RANGE_ELEM_SIZE),
+            ) else {
+                continue;
+            };
+            if range_overlaps(&ra, &rb, RANGE_ELEM_SIZE) {
+                return Err(zyron_common::ZyronError::CheckViolation(format!(
+                    "rows in this statement overlap on temporal constraint \"{}\"",
+                    constraint.name
+                )));
+            }
+        }
+
+        // Incoming rows against the stored ones.
+        //
+        // The shared index carries neither the rows a branch appended nor
+        // the ones it deleted, so a branch write reads the rows instead,
+        // the same rule the foreign key probe follows
+        let backing = if ctx.active_branch_id.is_some() {
+            None
+        } else {
+            index_snap
+                .btree
+                .iter()
+                .find(|spec| spec.columns.as_ref() == constraint.columns.as_slice())
+                .and_then(|spec| ctx.get_index(spec.id))
+        };
+        let Some(index) = backing else {
+            enforce_temporal_by_scan(ctx, table_entry, constraint, batch, &key_cols, &exclude)
+                .await?;
+            continue;
+        };
+
+        for key in &keys {
+            let split = key.len() - RANGE_INDEX_KEY_LEN;
+            let Some(incoming) = range_from_index_key(&key[split..], RANGE_ELEM_SIZE) else {
+                continue;
+            };
+            if range_is_empty(&incoming) {
+                continue;
+            }
+            let prefix = &key[..split];
+            let end = index_key_upper_bound(prefix);
+            let incoming_upper = range_upper(&incoming, RANGE_ELEM_SIZE);
+            let mut seek = Vec::with_capacity(key.len() + INDEX_LOCATOR_SUFFIX_LEN);
+            seek.extend_from_slice(prefix);
+            seek.extend_from_slice(&range_overlap_probe(&incoming, RANGE_ELEM_SIZE));
+
+            // Entries are ordered by period, so the walk wants to stop at
+            // the first one starting after the new period ends. That entry
+            // only proves anything if it is a live row: a deleted row's
+            // entry can sit inside a live row's span, and stopping on it
+            // would step over the row it sits inside. So the walk gathers
+            // candidates up to that marker, settles their liveness, and
+            // resumes past the marker when the marker itself is dead
+            loop {
+                let mut candidates: Vec<(Vec<u8>, zyron_common::RowLocator)> = Vec::new();
+                let mut marker: Option<(Vec<u8>, zyron_common::RowLocator)> = None;
+                index.range_scan_for_each(Some(&seek), end.as_deref(), |stored_key, loc| {
+                    if stored_key.len() != split + RANGE_INDEX_KEY_LEN + INDEX_LOCATOR_SUFFIX_LEN
+                        || stored_key[..split] != prefix[..]
+                    {
+                        return false;
+                    }
+                    if exclude.contains(&loc) {
+                        return true;
+                    }
+                    let Some(stored) = range_from_index_key(
+                        &stored_key[split..split + RANGE_INDEX_KEY_LEN],
+                        RANGE_ELEM_SIZE,
+                    ) else {
+                        return true;
+                    };
+                    if range_overlaps(&stored, &incoming, RANGE_ELEM_SIZE) {
+                        candidates.push((stored_key.to_vec(), loc));
+                        return true;
+                    }
+                    // Everything the seek admits ends after the new period
+                    // starts, so an entry that does not overlap begins at
+                    // or after it ends and marks where the walk can stop
+                    match (
+                        range_lower(&stored, RANGE_ELEM_SIZE),
+                        incoming_upper.as_ref(),
+                    ) {
+                        (Some(lo), Some(hi)) if lo.as_slice() >= hi.as_slice() => {
+                            marker = Some((stored_key.to_vec(), loc));
+                            false
+                        }
+                        _ => true,
+                    }
+                });
+
+                for (candidate_key, loc) in &candidates {
+                    if index_candidate_is_live(
+                        ctx,
+                        table_entry,
+                        &key_cols,
+                        &candidate_key[..split + RANGE_INDEX_KEY_LEN],
+                        *loc,
+                    )
+                    .await?
+                    {
+                        return Err(zyron_common::ZyronError::CheckViolation(format!(
+                            "period overlaps an existing row on temporal constraint \"{}\"",
+                            constraint.name
+                        )));
+                    }
+                }
+
+                match marker {
+                    // The window ran out, so nothing further can conflict
+                    None => break,
+                    Some((marker_key, loc)) => {
+                        if index_candidate_is_live(
+                            ctx,
+                            table_entry,
+                            &key_cols,
+                            &marker_key[..split + RANGE_INDEX_KEY_LEN],
+                            loc,
+                        )
+                        .await?
+                        {
+                            // A live row starting after the new period ends
+                            // proves nothing beyond it reaches back
+                            break;
+                        }
+                        // A dead marker proves nothing, so the walk resumes
+                        // just past it
+                        seek = marker_key;
+                        seek.push(0);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The overlap check against stored rows for a table carrying no backing
+/// index, which reads the rows instead of seeking. Correct but linear in the
+/// table, so it stands behind the index path rather than beside it
+async fn enforce_temporal_by_scan(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    constraint: &zyron_catalog::schema::ConstraintEntry,
+    batch: &DataBatch,
+    key_cols: &[(usize, TypeId)],
+    exclude: &std::collections::HashSet<zyron_common::RowLocator>,
+) -> zyron_common::Result<()> {
+    use zyron_types::range::{
+        RANGE_ELEM_SIZE, RANGE_INDEX_KEY_LEN, range_from_index_key, range_is_empty, range_overlaps,
+    };
+
+    let mut incoming: Vec<Vec<u8>> = Vec::with_capacity(batch.num_rows);
+    let mut scratch = Vec::with_capacity(48);
+    for row in 0..batch.num_rows {
+        if encode_btree_index_key_into(batch, row, key_cols, &mut scratch)
+            && scratch.len() >= RANGE_INDEX_KEY_LEN
+        {
+            incoming.push(scratch.clone());
+        }
+    }
+    if incoming.is_empty() {
+        return Ok(());
+    }
+
+    let scan_columns: Vec<LogicalColumn> = table_entry
+        .columns
+        .iter()
+        .map(|c| LogicalColumn {
+            table_idx: Some(0),
+            column_id: c.id,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+        })
+        .collect();
+    let mut scan = crate::operator::scan::SeqScanOperator::new(
+        Arc::clone(ctx),
+        table_entry.id,
+        scan_columns,
+        None,
+        false,
+        None,
+    )
+    .await?;
+    while let Some(stored) = scan.next().await? {
+        let stored_locators: Vec<zyron_common::RowLocator> = stored
+            .heap_ids()
+            .map(|ids| ids.iter().map(|t| t.locator()).collect())
+            .unwrap_or_default();
+        for row in 0..stored.batch.num_rows {
+            if let Some(loc) = stored_locators.get(row)
+                && exclude.contains(&btree_normalize_locator(*loc))
+            {
+                continue;
+            }
+            if !encode_btree_index_key_into(&stored.batch, row, key_cols, &mut scratch)
+                || scratch.len() < RANGE_INDEX_KEY_LEN
+            {
+                continue;
+            }
+            let split = scratch.len() - RANGE_INDEX_KEY_LEN;
+            let Some(stored_range) = range_from_index_key(&scratch[split..], RANGE_ELEM_SIZE)
+            else {
+                continue;
+            };
+            if range_is_empty(&stored_range) {
+                continue;
+            }
+            for candidate in &incoming {
+                let c_split = candidate.len() - RANGE_INDEX_KEY_LEN;
+                if candidate[..c_split] != scratch[..split] {
+                    continue;
+                }
+                let Some(candidate_range) =
+                    range_from_index_key(&candidate[c_split..], RANGE_ELEM_SIZE)
+                else {
+                    continue;
+                };
+                if range_overlaps(&stored_range, &candidate_range, RANGE_ELEM_SIZE) {
+                    return Err(zyron_common::ZyronError::CheckViolation(format!(
+                        "period overlaps an existing row on temporal constraint \"{}\"",
+                        constraint.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Occurrence and coverage thresholds a variant path clears before it is
+/// promoted to shredded
+const VARIANT_PROMOTION_MIN_OCCURRENCES: u64 = 1000;
+const VARIANT_PROMOTION_MIN_COVERAGE: f64 = 70.0;
+
+/// Feeds every VARIANT column of a reshaped batch into the shredding
+/// tracker and promotes paths that cleared the thresholds
+fn record_variant_columns(batch: &DataBatch, table_columns: &[zyron_catalog::ColumnEntry]) {
+    for (idx, column) in table_columns.iter().enumerate() {
+        if column.type_id != zyron_common::TypeId::Variant || idx >= batch.columns.len() {
+            continue;
+        }
+        let source = &batch.columns[idx];
+        for row in 0..batch.num_rows {
+            if source.nulls.is_null(row) {
+                continue;
+            }
+            if let ScalarValue::Utf8(json) = source.get_scalar(row) {
+                crate::variant_shred::record_variant_write(column.table_id.0, column.id.0, &json);
+            }
+        }
+        for candidate in crate::variant_shred::promotion_candidates(
+            column.table_id.0,
+            column.id.0,
+            VARIANT_PROMOTION_MIN_OCCURRENCES,
+            VARIANT_PROMOTION_MIN_COVERAGE,
+        ) {
+            crate::variant_shred::mark_shredded(column.table_id.0, column.id.0, &candidate.path);
+        }
+    }
+}
+
+/// The AES GCM additional authenticated data of one encrypted cell: the
+/// table and column identity, so a ciphertext cannot be replayed into a
+/// different column and still decrypt
+fn encryption_aad(table_id: u32, column_id: u16) -> [u8; 6] {
+    let mut aad = [0u8; 6];
+    aad[..4].copy_from_slice(&table_id.to_le_bytes());
+    aad[4..].copy_from_slice(&column_id.to_le_bytes());
+    aad
+}
+
+fn encryption_algorithm_of(
+    column: &zyron_catalog::ColumnEntry,
+) -> zyron_common::Result<zyron_auth::EncryptionAlgorithm> {
+    match column.attrs.encryption_algorithm {
+        0 => Ok(zyron_auth::EncryptionAlgorithm::Aes128Gcm),
+        1 => Ok(zyron_auth::EncryptionAlgorithm::Aes256Gcm),
+        other => Err(zyron_common::ZyronError::ExecutionError(format!(
+            "column {} declares unknown encryption algorithm {other}",
+            column.name
+        ))),
+    }
+}
+
+/// Encrypts the declared ENCRYPTED columns of a reshaped batch in place.
+/// Values become ciphertext carried as binary cells, matching the
+/// column's physical layout
+pub(crate) fn encrypt_declared_columns(
+    ctx: &ExecutionContext,
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    for (idx, column) in table_columns.iter().enumerate() {
+        if !column.is_encrypted() || idx >= batch.columns.len() {
+            continue;
+        }
+        let Some(store) = ctx.key_store.as_ref() else {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "column {} is ENCRYPTED but the server has no key store",
+                column.name
+            )));
+        };
+        if column.attrs.encryption_key_id == 0 {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "encrypted column {} has no key assigned",
+                column.name
+            )));
+        }
+        let key = store.get_key(column.attrs.encryption_key_id)?;
+        let algorithm = encryption_algorithm_of(column)?;
+        let aad = encryption_aad(column.table_id.0, column.id.0);
+        let source = &batch.columns[idx];
+        let rows = batch.num_rows;
+        let mut out = Vec::with_capacity(rows);
+        let mut nulls = crate::column::NullBitmap::none(rows);
+        for row in 0..rows {
+            if source.nulls.is_null(row) {
+                nulls.set_null(row);
+                out.push(Vec::new());
+                continue;
+            }
+            let plaintext: Vec<u8> = match source.get_scalar(row) {
+                ScalarValue::Utf8(s) => {
+                    if let Some(max) = column.max_length
+                        && s.chars().count() > max
+                    {
+                        return Err(zyron_common::ZyronError::CheckViolation(format!(
+                            "value too long for encrypted column {} ({} chars, limit {max})",
+                            column.name,
+                            s.chars().count()
+                        )));
+                    }
+                    s.into_bytes()
+                }
+                ScalarValue::Binary(b) => b,
+                other => {
+                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                        "encrypted column {} holds text, got {other:?}",
+                        column.name
+                    )));
+                }
+            };
+            out.push(zyron_auth::encryption::encrypt_value(
+                &plaintext, &key, algorithm, &aad,
+            )?);
+        }
+        batch.columns[idx] = Column::with_nulls(
+            crate::column::ColumnData::Binary(out),
+            nulls,
+            zyron_common::TypeId::Bytea,
+        );
+    }
+    Ok(())
+}
+
+/// Computes each stored generated column over the reshaped batch and
+/// writes the result into the column's slot. Runs after defaults filled
+/// the batch and before constraints, so the computed value is what every
+/// later stage and the heap see
+fn apply_stored_generation(
+    generated: &[zyron_planner::binder::BoundGeneratedColumn],
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+    params: &[crate::column::ScalarValue],
+) -> zyron_common::Result<()> {
+    let schema: Vec<LogicalColumn> = table_columns
+        .iter()
+        .map(|c| LogicalColumn {
+            table_idx: Some(0),
+            column_id: c.id,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+        })
+        .collect();
+    for generated_col in generated {
+        let computed = crate::expr::evaluate(&generated_col.expr, batch, &schema, params)?;
+        let slot = generated_col.ordinal as usize;
+        if slot >= batch.columns.len() {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "generated column ordinal {slot} is outside the reshaped batch"
+            )));
+        }
+        let declared = table_columns
+            .iter()
+            .find(|c| c.id == generated_col.column_id)
+            .map(|c| c.type_id)
+            .unwrap_or(computed.type_id);
+        batch.columns[slot] = if computed.type_id == declared {
+            computed
+        } else {
+            crate::compute::cast_column(&computed, declared)?
+        };
+    }
+    Ok(())
+}
+
+/// Replaces ROW_COUNT_CHANGE(threshold_percent) with its verdict for this
+/// statement: the incoming rows as a percentage of the table's current row
+/// count must stay at or under the threshold. Computed here because the
+/// row wise evaluator has no table context
+fn resolve_row_count_change(
+    expr: &zyron_planner::binder::BoundExpr,
+    batch_rows: u64,
+    table_row_count: u64,
+) -> zyron_planner::binder::BoundExpr {
+    use zyron_planner::binder::BoundExpr;
+    match expr {
+        BoundExpr::Function {
+            name,
+            args,
+            return_type,
+            distinct,
+        } => {
+            if name == "row_count_change" {
+                let threshold = args.first().and_then(|a| match a {
+                    BoundExpr::Literal {
+                        value: zyron_parser::ast::LiteralValue::Float(f),
+                        ..
+                    } => Some(*f),
+                    BoundExpr::Literal {
+                        value: zyron_parser::ast::LiteralValue::Integer(n),
+                        ..
+                    } => Some(*n as f64),
+                    _ => None,
+                });
+                let passed = match threshold {
+                    Some(t) => {
+                        let change_percent =
+                            batch_rows as f64 / table_row_count.max(1) as f64 * 100.0;
+                        change_percent <= t
+                    }
+                    None => false,
+                };
+                return BoundExpr::Literal {
+                    value: zyron_parser::ast::LiteralValue::Boolean(passed),
+                    type_id: zyron_common::TypeId::Boolean,
+                };
+            }
+            BoundExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| resolve_row_count_change(a, batch_rows, table_row_count))
+                    .collect(),
+                return_type: *return_type,
+                distinct: *distinct,
+            }
+        }
+        BoundExpr::BinaryOp {
+            left,
+            op,
+            right,
+            type_id,
+        } => BoundExpr::BinaryOp {
+            left: Box::new(resolve_row_count_change(left, batch_rows, table_row_count)),
+            op: *op,
+            right: Box::new(resolve_row_count_change(right, batch_rows, table_row_count)),
+            type_id: *type_id,
+        },
+        BoundExpr::UnaryOp { op, expr, type_id } => BoundExpr::UnaryOp {
+            op: *op,
+            expr: Box::new(resolve_row_count_change(expr, batch_rows, table_row_count)),
+            type_id: *type_id,
+        },
+        other => other.clone(),
+    }
+}
+
+fn mentions_row_count_change(expr: &zyron_planner::binder::BoundExpr) -> bool {
+    use zyron_planner::binder::BoundExpr;
+    match expr {
+        BoundExpr::Function { name, args, .. } => {
+            name == "row_count_change" || args.iter().any(mentions_row_count_change)
+        }
+        BoundExpr::BinaryOp { left, right, .. } => {
+            mentions_row_count_change(left) || mentions_row_count_change(right)
+        }
+        BoundExpr::UnaryOp { expr, .. } => mentions_row_count_change(expr),
+        _ => false,
+    }
+}
+
 fn evaluate_expectations(
     expectations: &[zyron_planner::binder::BoundExpectation],
     batch: &DataBatch,
     table_columns: &[zyron_catalog::ColumnEntry],
     params: &[crate::column::ScalarValue],
+    table_id: u32,
+    table_row_count: u64,
 ) -> zyron_common::Result<ExpectationResult> {
     use zyron_catalog::ExpectationAction;
 
@@ -1593,14 +2629,54 @@ fn evaluate_expectations(
     let is_violation =
         |sv: crate::column::ScalarValue| matches!(sv, crate::column::ScalarValue::Boolean(false));
 
+    // ROW_COUNT_CHANGE is table scoped, so its verdict is computed once per
+    // statement and substituted into the predicate before row evaluation
+    let resolved: Vec<std::borrow::Cow<zyron_planner::binder::BoundExpr>> = expectations
+        .iter()
+        .map(|exp| {
+            if mentions_row_count_change(&exp.predicate) {
+                std::borrow::Cow::Owned(resolve_row_count_change(
+                    &exp.predicate,
+                    n as u64,
+                    table_row_count,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(&exp.predicate)
+            }
+        })
+        .collect();
+
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let action_name = |a: ExpectationAction| match a {
+        ExpectationAction::Fail => "fail",
+        ExpectationAction::Warn => "warn",
+        ExpectationAction::Drop => "drop",
+        ExpectationAction::Quarantine => "quarantine",
+    };
+    let mut violation_counts = vec![0u64; expectations.len()];
+
     // Fail predicates abort the statement on the first violating row.
-    for exp in expectations {
+    for (i, exp) in expectations.iter().enumerate() {
         if exp.on_violation != ExpectationAction::Fail {
             continue;
         }
-        let result = crate::expr::evaluate(&exp.predicate, batch, &schema, params)?;
+        let result = crate::expr::evaluate(&resolved[i], batch, &schema, params)?;
         for row in 0..n {
             if is_violation(result.get_scalar(row)) {
+                crate::expectation_results::record(
+                    crate::expectation_results::ExpectationOutcome {
+                        table_id,
+                        expectation_name: exp.name.clone(),
+                        evaluated_at_micros: now_micros,
+                        rows_checked: n as u64,
+                        violations: 1,
+                        passed: false,
+                        action: action_name(exp.on_violation).to_string(),
+                    },
+                );
                 return Err(zyron_common::ZyronError::CheckViolation(format!(
                     "row {row} violates expectation \"{}\"",
                     exp.name
@@ -1611,19 +2687,20 @@ fn evaluate_expectations(
 
     // Quarantine predicates route the first-matching violating row to a target
     // table and remove it from the main insert.
-    for exp in expectations {
+    for (i, exp) in expectations.iter().enumerate() {
         if exp.on_violation != ExpectationAction::Quarantine {
             continue;
         }
         let Some(qid) = exp.quarantine_table_id else {
             continue;
         };
-        let result = crate::expr::evaluate(&exp.predicate, batch, &schema, params)?;
+        let result = crate::expr::evaluate(&resolved[i], batch, &schema, params)?;
         for row in 0..n {
             if !keep_mask[row] {
                 continue;
             }
             if is_violation(result.get_scalar(row)) {
+                violation_counts[i] += 1;
                 keep_mask[row] = false;
                 let idx = *q_index.entry(qid).or_insert_with(|| {
                     quarantine.push((qid, Vec::new(), Vec::new()));
@@ -1636,32 +2713,61 @@ fn evaluate_expectations(
     }
 
     // Drop predicates remove violating rows from the main insert.
-    for exp in expectations {
+    for (i, exp) in expectations.iter().enumerate() {
         if exp.on_violation != ExpectationAction::Drop {
             continue;
         }
-        let result = crate::expr::evaluate(&exp.predicate, batch, &schema, params)?;
+        let result = crate::expr::evaluate(&resolved[i], batch, &schema, params)?;
         for row in 0..n {
             if !keep_mask[row] {
                 continue;
             }
             if is_violation(result.get_scalar(row)) {
+                violation_counts[i] += 1;
                 keep_mask[row] = false;
             }
         }
     }
 
     // Warn predicates count violations and keep the rows.
-    for exp in expectations {
+    for (i, exp) in expectations.iter().enumerate() {
         if exp.on_violation != ExpectationAction::Warn {
             continue;
         }
-        let result = crate::expr::evaluate(&exp.predicate, batch, &schema, params)?;
+        let result = crate::expr::evaluate(&resolved[i], batch, &schema, params)?;
         for row in 0..n {
             if is_violation(result.get_scalar(row)) {
+                violation_counts[i] += 1;
                 warn_count += 1;
             }
         }
+    }
+
+    // Every evaluated expectation lands one row in
+    // zyron_sys.expectation.results
+    for (i, exp) in expectations.iter().enumerate() {
+        if exp.on_violation == ExpectationAction::Fail {
+            // A Fail expectation that reached here had no violation
+            crate::expectation_results::record(crate::expectation_results::ExpectationOutcome {
+                table_id,
+                expectation_name: exp.name.clone(),
+                evaluated_at_micros: now_micros,
+                rows_checked: n as u64,
+                violations: 0,
+                passed: true,
+                action: action_name(exp.on_violation).to_string(),
+            });
+            continue;
+        }
+        crate::expectation_results::record(crate::expectation_results::ExpectationOutcome {
+            table_id,
+            expectation_name: exp.name.clone(),
+            evaluated_at_micros: now_micros,
+            rows_checked: n as u64,
+            violations: violation_counts[i],
+            passed: violation_counts[i] == 0,
+            action: action_name(exp.on_violation).to_string(),
+        });
     }
 
     Ok(ExpectationResult {
@@ -1867,6 +2973,89 @@ pub(crate) fn normalize_decimal_columns(
 /// that into an `INT[]` column unchanged would store elements twice as wide
 /// as the declaration asks for. A value already at the declared type is left
 /// alone, so the pass costs one header read per array value in the common
+/// Encodes STRUCT and MAP values into the binary layout their column stores,
+/// checking them against the shape the column declares as it goes.
+///
+/// The declaration is a contract. A column declared `STRUCT<name TEXT, age
+/// INT>` holds those fields at those types, and a read of `s.age` is typed
+/// from the declaration and addressed by position rather than searched for by
+/// name. Accepting a value that does not match would make the declared types
+/// a comment and leave the typed read describing something never written.
+///
+/// A declared field the value omits is null, which is what an absent field
+/// means everywhere else. A field the declaration does not name is refused:
+/// it would be unreachable, since only declared names can be read back, so
+/// storing it silently discards data the writer believed it had written.
+pub(crate) fn encode_nested_columns(
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        if !matches!(column.type_id, TypeId::Struct | TypeId::Map) {
+            continue;
+        }
+        let Some(shape) = column.attrs.nested_shape.as_ref() else {
+            continue;
+        };
+        let Some(data) = batch.columns.get(idx) else {
+            continue;
+        };
+        // A column already holding its binary form is left alone, which is
+        // what an internal write that carried encoded values hands over
+        let mut encoded: Vec<Option<Vec<u8>>> = Vec::with_capacity(data.len());
+        let mut rewrote = false;
+        for row in 0..data.len() {
+            if data.is_null(row) {
+                encoded.push(None);
+                continue;
+            }
+            match data.get_scalar(row) {
+                ScalarValue::Utf8(text) => {
+                    rewrote = true;
+                    encoded.push(Some(crate::nested_codec::encode_json_text(
+                        &text,
+                        shape,
+                        &column.name,
+                    )?));
+                }
+                // A value that already carries its binary form is kept. A
+                // literal reaches a byte backed column as bytes too, so the
+                // two are told apart by the tag the encoding leads with,
+                // which json can never start with
+                ScalarValue::Binary(bytes) => {
+                    if crate::nested_codec::is_encoded(&bytes) {
+                        encoded.push(Some(bytes));
+                    } else {
+                        rewrote = true;
+                        let text = String::from_utf8_lossy(&bytes);
+                        encoded.push(Some(crate::nested_codec::encode_json_text(
+                            &text,
+                            shape,
+                            &column.name,
+                        )?));
+                    }
+                }
+                _ => encoded.push(None),
+            }
+        }
+        if !rewrote {
+            continue;
+        }
+        let mut builder = crate::batch::ColumnBuilder::new(column.type_id, encoded.len());
+        for cell in encoded {
+            match cell {
+                Some(bytes) => builder.push_owned(ScalarValue::Binary(bytes)),
+                None => builder.push_owned(ScalarValue::Null),
+            }
+        }
+        batch.columns[idx] = builder.finish();
+    }
+    Ok(())
+}
+
 /// case and touches no other column.
 pub(crate) fn normalize_array_elements(
     batch: &mut DataBatch,
@@ -2110,6 +3299,7 @@ fn reshape_insert_batch(
     let row_batch = DataBatch {
         columns: Vec::new(),
         num_rows,
+        resolved: Vec::new(),
     };
     let mut columns: Vec<crate::column::Column> = Vec::with_capacity(plan.len());
     for (i, src_pos) in plan.iter().enumerate() {
@@ -2150,6 +3340,7 @@ async fn eval_sequence_default(
     let mut batch = DataBatch {
         columns: Vec::new(),
         num_rows,
+        resolved: Vec::new(),
     };
     let mut schema: Vec<LogicalColumn> = Vec::new();
     crate::sequence::materialize_sequences(&mut exprs, &mut batch, &mut schema, ctx).await?;
@@ -2243,18 +3434,24 @@ impl Operator for InsertOperator {
             // only does work proportional to actual indexes, not catalog
             // lookups.
             let index_snap = self.ctx.index_snapshot_for_table(self.table_id.0);
-            let fts_resolved: Vec<(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)> =
-                if index_snap.fts.is_empty() {
-                    Vec::new()
-                } else if let Some(mgr) = self.ctx.fts_manager.as_ref() {
-                    index_snap
-                        .fts
-                        .iter()
-                        .filter_map(|id| mgr.get_index(id.0).map(|idx| (*id, idx)))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let fts_resolved: Vec<(
+                zyron_catalog::IndexId,
+                Arc<zyron_search::InvertedIndex>,
+                Arc<dyn zyron_search::Analyzer>,
+            )> = if index_snap.fts.is_empty() {
+                Vec::new()
+            } else if let Some(mgr) = self.ctx.fts_manager.as_ref() {
+                index_snap
+                    .fts
+                    .iter()
+                    .filter_map(|id| {
+                        mgr.get_index(id.0)
+                            .map(|idx| (*id, idx, mgr.analyzer_for_index(id.0)))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let vec_resolved: Vec<(u32, Arc<zyron_search::vector::VectorIndex>)> =
                 if index_snap.vector.is_empty() {
                     Vec::new()
@@ -2300,16 +3497,36 @@ impl Operator for InsertOperator {
                     )?;
                 }
 
+                // Stored generated columns materialize from their sibling
+                // columns now, so constraints, expectations, and the write
+                // below all see the computed values
+                if !self.generated_columns.is_empty() {
+                    apply_stored_generation(
+                        &self.generated_columns,
+                        &mut exec_batch.batch,
+                        &table_entry.columns,
+                        &params,
+                    )?;
+                }
+
                 // Apply data-quality expectations before any integrity check or
                 // write. Fail aborts the statement, Quarantine routes violating
                 // rows to a companion table, Drop removes them, Warn counts
                 // them. The surviving rows flow into the checks and write below.
                 if !self.expectations.is_empty() {
+                    let table_row_count = self
+                        .ctx
+                        .catalog
+                        .get_stats(table_entry.id)
+                        .map(|s| s.0.row_count)
+                        .unwrap_or(0);
                     let outcome = evaluate_expectations(
                         &self.expectations,
                         &exec_batch.batch,
                         &table_entry.columns,
                         &params,
+                        table_entry.id.0,
+                        table_row_count,
                     )?;
                     if outcome.warn_count > 0 {
                         eprintln!(
@@ -2335,7 +3552,10 @@ impl Operator for InsertOperator {
                 // Arrays take the element width their column declares before
                 // any check reads the row, so a CHECK sees the stored image
                 normalize_array_elements(&mut exec_batch.batch, &table_entry.columns)?;
+                encode_nested_columns(&mut exec_batch.batch, &table_entry.columns)?;
                 normalize_decimal_columns(&mut exec_batch.batch, &table_entry.columns)?;
+                // Range literals written as text parse to their stored form
+                normalize_range_columns(&mut exec_batch.batch, &table_entry.columns)?;
 
                 // Enforce CHECK constraints on the full-width row image before
                 // any write so a violation aborts the statement with no effect.
@@ -2346,6 +3566,23 @@ impl Operator for InsertOperator {
                     &table_entry.columns,
                     &params,
                 )?;
+
+                // WITHOUT OVERLAPS constraints check periods before any write
+                enforce_temporal_constraints(&self.ctx, &table_entry, &exec_batch.batch, &[])
+                    .await?;
+
+                // VARIANT columns feed the shredding tracker, which is what
+                // decides when a frequently written path is promoted
+                record_variant_columns(&exec_batch.batch, &table_entry.columns);
+
+                // Media payloads externalize by size, becoming descriptors
+                // the scan side inflates back to the original bytes
+                externalize_media_columns(&self.ctx, &mut exec_batch.batch, &table_entry.columns)?;
+
+                // ENCRYPTED columns turn to ciphertext now, after every
+                // check saw the plaintext and before any write path or
+                // index maintenance reads the batch
+                encrypt_declared_columns(&self.ctx, &mut exec_batch.batch, &table_entry.columns)?;
 
                 // A lake table's rows go to its transaction log, never to
                 // heap pages. The reshaped, defaulted, checked batch is
@@ -2560,10 +3797,12 @@ impl Operator for InsertOperator {
                 };
 
                 // Maintain FTS indexes: add each inserted document.
-                let fts_indexes: &[(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)] =
-                    fts_resolved.as_slice();
+                let fts_indexes: &[(
+                    zyron_catalog::IndexId,
+                    Arc<zyron_search::InvertedIndex>,
+                    Arc<dyn zyron_search::Analyzer>,
+                )] = fts_resolved.as_slice();
                 if !fts_indexes.is_empty() {
-                    let analyzer = zyron_search::SimpleAnalyzer;
                     let mut fts_buf = zyron_search::AnalysisBuffer::new();
                     let mut text_buf = String::with_capacity(256);
                     for (row_idx, _tid) in tuple_ids.iter().enumerate() {
@@ -2575,11 +3814,11 @@ impl Operator for InsertOperator {
                             &table_entry.columns,
                             &mut text_buf,
                         );
-                        for (idx_id, fts_idx) in fts_indexes.iter() {
+                        for (idx_id, fts_idx, analyzer) in fts_indexes.iter() {
                             if let Err(e) = fts_idx.add_document_with_buf(
                                 doc_id,
                                 &text_buf,
-                                &analyzer,
+                                analyzer.as_ref(),
                                 &mut fts_buf,
                             ) {
                                 eprintln!("FTS index {} insert failed: {e}", idx_id.0);
@@ -3042,18 +4281,24 @@ pub(crate) fn maintain_lake_search_indexes(
     }
 
     let index_snap = ctx.index_snapshot_for_table(table_entry.id.0);
-    let fts_resolved: Vec<(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)> =
-        if index_snap.fts.is_empty() {
-            Vec::new()
-        } else if let Some(mgr) = ctx.fts_manager.as_ref() {
-            index_snap
-                .fts
-                .iter()
-                .filter_map(|id| mgr.get_index(id.0).map(|idx| (*id, idx)))
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let fts_resolved: Vec<(
+        zyron_catalog::IndexId,
+        Arc<zyron_search::InvertedIndex>,
+        Arc<dyn zyron_search::Analyzer>,
+    )> = if index_snap.fts.is_empty() {
+        Vec::new()
+    } else if let Some(mgr) = ctx.fts_manager.as_ref() {
+        index_snap
+            .fts
+            .iter()
+            .filter_map(|id| {
+                mgr.get_index(id.0)
+                    .map(|idx| (*id, idx, mgr.analyzer_for_index(id.0)))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let vec_resolved: Vec<(u32, Arc<zyron_search::vector::VectorIndex>)> =
         if index_snap.vector.is_empty() {
             Vec::new()
@@ -3079,7 +4324,6 @@ pub(crate) fn maintain_lake_search_indexes(
         ordinal_of[*input_row] = ordinal as u64;
     }
 
-    let analyzer = zyron_search::SimpleAnalyzer;
     let mut fts_buf = zyron_search::AnalysisBuffer::new();
     let mut text_buf = String::with_capacity(256);
     let mut input_row = 0usize;
@@ -3100,10 +4344,13 @@ pub(crate) fn maintain_lake_search_indexes(
             if !fts_resolved.is_empty() {
                 text_buf.clear();
                 extract_fts_text_into(batch, row, &table_entry.columns, &mut text_buf);
-                for (idx_id, fts_idx) in &fts_resolved {
-                    if let Err(e) =
-                        fts_idx.add_document_with_buf(doc_id, &text_buf, &analyzer, &mut fts_buf)
-                    {
+                for (idx_id, fts_idx, analyzer) in &fts_resolved {
+                    if let Err(e) = fts_idx.add_document_with_buf(
+                        doc_id,
+                        &text_buf,
+                        analyzer.as_ref(),
+                        &mut fts_buf,
+                    ) {
                         return Err(ZyronError::ExecutionError(format!(
                             "full text index {} insert failed on a lake row: {e}",
                             idx_id.0
@@ -3620,6 +4867,15 @@ impl Operator for DeleteOperator {
                     continue;
                 }
 
+                // Rows leaving the table give back the store references
+                // their media payloads hold, so an object nothing points at
+                // any more stops occupying the content addressed store
+                release_media_references(
+                    &self.ctx,
+                    &exec_batch.batch,
+                    &self.ctx.get_table_entry(self.table_id)?.columns,
+                );
+
                 // Capture old tuples for CDC hook (batch data is from the scan).
                 let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
                     let table_entry = self.ctx.get_table_entry(self.table_id)?;
@@ -3809,6 +5065,9 @@ pub struct UpdateOperator {
     /// CHECK constraint predicates (bound at table_idx 0) enforced on the
     /// updated row image before it is written.
     check_constraints: Vec<zyron_planner::binder::BoundExpr>,
+    /// STORED generated columns, recomputed over the updated row image so a
+    /// generated value never outlives the columns it derives from.
+    generated_columns: Vec<zyron_planner::binder::BoundGeneratedColumn>,
     /// Set when any assignment value holds a correlated subquery, evaluates
     /// every assignment value per batch with per row subquery execution.
     correlated_values: Option<crate::correlated::CorrelatedValues>,
@@ -3829,6 +5088,7 @@ impl UpdateOperator {
         assignments: Vec<BoundAssignment>,
         input_schema: Vec<LogicalColumn>,
         check_constraints: Vec<zyron_planner::binder::BoundExpr>,
+        generated_columns: Vec<zyron_planner::binder::BoundGeneratedColumn>,
     ) -> Self {
         Self {
             child,
@@ -3837,6 +5097,7 @@ impl UpdateOperator {
             assignments,
             input_schema,
             check_constraints,
+            generated_columns,
             correlated_values: None,
             params: None,
             finished: false,
@@ -4025,7 +5286,22 @@ impl Operator for UpdateOperator {
 
                     let mut updated_batch = DataBatch::new(updated_columns);
                     normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
+                    encode_nested_columns(&mut updated_batch, &table_entry.columns)?;
                     normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
+                    // A stored generated column derives from its siblings, so an
+                    // update that moves one of those siblings recomputes it here
+                    // rather than leaving the previous result behind
+                    if !self.generated_columns.is_empty() {
+                        apply_stored_generation(
+                            &self.generated_columns,
+                            &mut updated_batch,
+                            &table_entry.columns,
+                            self.params(),
+                        )?;
+                    }
+                    // A range literal assigned as text parses to its stored form,
+                    // the same step the insert path runs
+                    normalize_range_columns(&mut updated_batch, &table_entry.columns)?;
                     enforce_check_constraints(
                         &self.ctx,
                         &self.check_constraints,
@@ -4033,6 +5309,34 @@ impl Operator for UpdateOperator {
                         &table_entry.columns,
                         self.params(),
                     )?;
+                    // A period may not collide with another row's, and a row does
+                    // not collide with the period it is replacing, so its own
+                    // locators are excluded from the check
+                    let updated_locators: Vec<zyron_common::RowLocator> = locs
+                        .iter()
+                        .map(|&(file_id, rowid)| zyron_common::RowLocator::Columnar {
+                            file_id,
+                            sys_rowid: rowid,
+                        })
+                        .collect();
+                    enforce_temporal_constraints(
+                        &self.ctx,
+                        &table_entry,
+                        &updated_batch,
+                        &updated_locators,
+                    )
+                    .await?;
+                    // VARIANT columns feed the shredding tracker on every write,
+                    // so a path that only ever arrives through updates still
+                    // earns promotion
+                    record_variant_columns(&updated_batch, &table_entry.columns);
+                    // Media payloads externalize the same way they do on insert,
+                    // and the objects the previous image held are released once
+                    // the new image is known, so replaced payloads stop pinning
+                    // storage nothing points at
+                    externalize_media_columns(&self.ctx, &mut updated_batch, &table_entry.columns)?;
+                    release_media_references(&self.ctx, &exec_batch.batch, &table_entry.columns);
+                    encrypt_declared_columns(&self.ctx, &mut updated_batch, &table_entry.columns)?;
 
                     // Same subsystem sequence as the heap path below, all of
                     // it value based so a folded row behaves exactly like a
@@ -4362,7 +5666,22 @@ impl Operator for UpdateOperator {
 
                 let mut updated_batch = DataBatch::new(updated_columns);
                 normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
+                encode_nested_columns(&mut updated_batch, &table_entry.columns)?;
                 normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
+                // A stored generated column derives from its siblings, so an
+                // update that moves one of those siblings recomputes it here
+                // rather than leaving the previous result behind
+                if !self.generated_columns.is_empty() {
+                    apply_stored_generation(
+                        &self.generated_columns,
+                        &mut updated_batch,
+                        &table_entry.columns,
+                        self.params(),
+                    )?;
+                }
+                // A range literal assigned as text parses to its stored form,
+                // the same step the insert path runs
+                normalize_range_columns(&mut updated_batch, &table_entry.columns)?;
 
                 // Enforce CHECK constraints on the updated row image before any
                 // write so a violating update aborts with no effect.
@@ -4373,6 +5692,29 @@ impl Operator for UpdateOperator {
                     &table_entry.columns,
                     self.params(),
                 )?;
+                // A period may not collide with another row's, and a row does
+                // not collide with the period it is replacing, so its own
+                // locators are excluded from the check
+                let updated_locators: Vec<zyron_common::RowLocator> =
+                    tuple_ids.iter().map(|t| t.locator()).collect();
+                enforce_temporal_constraints(
+                    &self.ctx,
+                    &table_entry,
+                    &updated_batch,
+                    &updated_locators,
+                )
+                .await?;
+                // VARIANT columns feed the shredding tracker on every write,
+                // so a path that only ever arrives through updates still
+                // earns promotion
+                record_variant_columns(&updated_batch, &table_entry.columns);
+                // Media payloads externalize the same way they do on insert,
+                // and the objects the previous image held are released once
+                // the new image is known, so replaced payloads stop pinning
+                // storage nothing points at
+                externalize_media_columns(&self.ctx, &mut updated_batch, &table_entry.columns)?;
+                release_media_references(&self.ctx, &exec_batch.batch, &table_entry.columns);
+                encrypt_declared_columns(&self.ctx, &mut updated_batch, &table_entry.columns)?;
 
                 // Enforce child-side foreign keys on the post-update image
                 // before any write so a violation aborts cleanly.
@@ -4734,13 +6076,19 @@ impl Operator for UpdateOperator {
                         }
                     }
                 }
-                let analyzer = zyron_search::SimpleAnalyzer;
+                let analyzers: Vec<Arc<dyn zyron_search::Analyzer>> = fts_indexes
+                    .iter()
+                    .map(|(id, _)| self.ctx.fts_analyzer(id.0))
+                    .collect();
                 let mut fts_buf = zyron_search::AnalysisBuffer::new();
                 for (doc_id, text) in &deferred_fts_inserts {
-                    for (idx_id, fts_idx) in &fts_indexes {
-                        if let Err(e) =
-                            fts_idx.add_document_with_buf(*doc_id, text, &analyzer, &mut fts_buf)
-                        {
+                    for ((idx_id, fts_idx), analyzer) in fts_indexes.iter().zip(&analyzers) {
+                        if let Err(e) = fts_idx.add_document_with_buf(
+                            *doc_id,
+                            text,
+                            analyzer.as_ref(),
+                            &mut fts_buf,
+                        ) {
                             eprintln!("FTS index {} update-insert failed: {e}", idx_id.0);
                         }
                     }

@@ -122,6 +122,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: None,
             constraints: vec![ColumnConstraint::PrimaryKey],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "name".to_string(),
@@ -129,6 +135,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: None,
             constraints: vec![ColumnConstraint::NotNull],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "email".to_string(),
@@ -136,6 +148,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: None,
             constraints: vec![ColumnConstraint::Unique],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "age".to_string(),
@@ -143,6 +161,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "balance".to_string(),
@@ -150,6 +174,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: Some(Expr::Literal(LiteralValue::Float(0.00))),
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "is_active".to_string(),
@@ -157,6 +187,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: Some(Expr::Literal(LiteralValue::Boolean(true))),
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "created_at".to_string(),
@@ -164,6 +200,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "metadata".to_string(),
@@ -171,6 +213,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "avatar".to_string(),
@@ -178,6 +226,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "tags".to_string(),
@@ -185,6 +239,12 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
     ]
 }
@@ -198,6 +258,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_tinyint".into(),
@@ -205,6 +271,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_smallint".into(),
@@ -212,6 +284,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_int".into(),
@@ -219,6 +297,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_bigint".into(),
@@ -226,6 +310,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_int128".into(),
@@ -233,6 +323,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_uint8".into(),
@@ -240,6 +336,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_uint16".into(),
@@ -247,6 +349,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_uint32".into(),
@@ -254,6 +362,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_uint64".into(),
@@ -261,6 +375,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_uint128".into(),
@@ -268,6 +388,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_real".into(),
@@ -275,6 +401,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_double".into(),
@@ -282,6 +414,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_decimal".into(),
@@ -289,6 +427,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_char".into(),
@@ -296,6 +440,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_varchar".into(),
@@ -303,6 +453,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_text".into(),
@@ -310,6 +466,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_binary".into(),
@@ -317,6 +479,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_varbinary".into(),
@@ -324,6 +492,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_bytea".into(),
@@ -331,6 +505,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_date".into(),
@@ -338,6 +518,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_time".into(),
@@ -345,6 +531,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_timestamp".into(),
@@ -352,6 +544,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_timestamptz".into(),
@@ -359,6 +557,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_interval".into(),
@@ -366,6 +570,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_uuid".into(),
@@ -373,6 +583,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_json".into(),
@@ -380,6 +596,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_jsonb".into(),
@@ -387,6 +609,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "c_vector".into(),
@@ -394,6 +622,12 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
     ]
 }
@@ -576,6 +810,12 @@ async fn test_name_resolution() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let test_users_id = catalog
         .create_table(test_schema_id, "users", &test_users_cols, &[])
@@ -589,6 +829,12 @@ async fn test_name_resolution() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let app_users_id = catalog
         .create_table(app_schema_id, "users", &app_users_cols, &[])
@@ -602,6 +848,12 @@ async fn test_name_resolution() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let app_orders_id = catalog
         .create_table(app_schema_id, "orders", &orders_cols, &[])
@@ -741,6 +993,12 @@ async fn test_column_types() {
         nullable: Some(true),
         default: Some(Expr::Literal(LiteralValue::Float(42.0))),
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let tid = catalog
         .create_table(test_schema_id, "defaults_test", &col_defs_with_default, &[])
@@ -776,6 +1034,12 @@ async fn test_constraints() {
         nullable: Some(false),
         default: None,
         constraints: vec![ColumnConstraint::PrimaryKey],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let pk_table_id = catalog
         .create_table(test_schema_id, "pk_test", &pk_cols, &[])
@@ -798,6 +1062,12 @@ async fn test_constraints() {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "b".to_string(),
@@ -805,6 +1075,12 @@ async fn test_constraints() {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
     ];
     let composite_constraints = vec![TableConstraint {
@@ -812,6 +1088,8 @@ async fn test_constraints() {
         kind: TableConstraintKind::PrimaryKey(vec!["a".to_string(), "b".to_string()]),
         enforced: true,
         on_violation: zyron_parser::ast::ViolationAction::Fail,
+        without_overlaps: None,
+        fk_period: false,
     }];
     let cpk_table_id = catalog
         .create_table(
@@ -839,6 +1117,12 @@ async fn test_constraints() {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
         ColumnDef {
             name: "email".to_string(),
@@ -846,6 +1130,12 @@ async fn test_constraints() {
             nullable: Some(false),
             default: None,
             constraints: vec![ColumnConstraint::Unique],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         },
     ];
     let uq_table_id = catalog
@@ -867,6 +1157,12 @@ async fn test_constraints() {
         nullable: Some(false),
         default: None,
         constraints: vec![ColumnConstraint::NotNull],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let nn_table_id = catalog
         .create_table(test_schema_id, "notnull_test", &nn_cols, &[])
@@ -888,6 +1184,12 @@ async fn test_constraints() {
         nullable: Some(true),
         default: Some(Expr::Literal(LiteralValue::String("active".to_string()))),
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let def_table_id = catalog
         .create_table(test_schema_id, "default_test", &def_cols, &[])
@@ -935,6 +1237,12 @@ async fn test_ddl_create_drop() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let tid = catalog
         .create_table(test_schema_id, "temp_table", &col_defs, &[])
@@ -1044,6 +1352,12 @@ async fn test_statistics() {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let table_id = catalog
         .create_table(test_schema_id, "stats_test", &col_defs, &[])
@@ -1203,6 +1517,12 @@ async fn test_recovery() {
                 nullable: Some(false),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
             ColumnDef {
                 name: "data".to_string(),
@@ -1210,6 +1530,12 @@ async fn test_recovery() {
                 nullable: Some(true),
                 default: None,
                 constraints: vec![],
+                generated: None,
+                encrypted: None,
+                collation: None,
+                media_format: None,
+                media_storage: None,
+                user_type_id: None,
             },
         ];
         table_id = catalog
@@ -1280,6 +1606,12 @@ async fn test_bench_table_lookup() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     catalog
         .create_table(test_schema_id, "bench_table", &col_defs, &[])
@@ -1337,6 +1669,12 @@ async fn test_bench_schema_resolve() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     catalog
         .create_table(app_id, "target", &col_defs, &[])
@@ -1394,6 +1732,12 @@ async fn test_bench_ddl_create() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
 
     let iterations = 200;
@@ -1444,6 +1788,12 @@ async fn test_bench_ddl_drop() {
         nullable: Some(false),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
 
     let iterations = 200;
@@ -1526,6 +1876,12 @@ async fn test_bench_analyze() {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     let table_id = catalog
         .create_table(test_schema_id, "analyze_bench", &col_defs, &[])
@@ -1636,6 +1992,12 @@ async fn test_bench_cache_hit_rate() {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         }];
         catalog
             .create_table(test_schema_id, &format!("cache_t{}", i), &col_defs, &[])
@@ -1724,6 +2086,12 @@ async fn test_bench_recovery() {
             nullable: Some(false),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         }];
         for i in 0..20 {
             catalog

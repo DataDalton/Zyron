@@ -4,6 +4,7 @@
 // correlation statistics, feature store, in-database ML, causal
 // inference, time series forecasting, anomaly detection
 
+pub mod anomaly;
 pub mod causal;
 pub mod cohort;
 pub mod correlation;
@@ -20,9 +21,18 @@ pub mod period_compare;
 pub mod predictive;
 pub mod profiling;
 pub mod registry;
+pub mod stats_tests;
 pub mod value;
 
-pub use causal::{CausalEstimate, ate, ateWithCi, att, diffInDiff, propensityScore};
+pub use anomaly::{
+    AnomalyParams, DriftResult, TimeseriesAnomalyParams, detectAnomalies,
+    detectAnomaliesTimeseries, detectDrift,
+};
+pub use causal::{
+    AbVariantStats, CausalEstimate, CausalImpactPoint, CounterfactualRow, abTestAnalysis,
+    abTestSampleSize, ate, ateWithCi, att, causalImpact, counterfactual, diffInDiff,
+    propensityMatch, propensityScore,
+};
 pub use cohort::retention_analysis as retentionAnalysis;
 pub use cohort::{
     CohortAnalyser, CohortAnalysis, CohortDefinition, CohortEvent, CohortMetric, CohortPeriod,
@@ -54,6 +64,13 @@ pub use grouping::grouping_id_bits as groupingIdBits;
 pub use grouping::{
     GroupingSetExpander, GroupingSetType, GroupingSetsRunner, RowKey, expand_grouping_sets,
     grouping_bit, grouping_id_bits,
+};
+pub use ml::feature_encode::{
+    TextFeatureRow, labelEncode, oneHotEncode, robustScale, targetEncode, textFeatures, tfidf,
+};
+pub use ml::kmeans::{
+    DEFAULT_KMEANS_SEED, KmeansClusterOutput, kmeansCentroids, kmeansCluster, kmeansElbow,
+    kmeansPredict,
 };
 pub use ml::{
     Hyperparameters, ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData,
@@ -95,4 +112,9 @@ pub use profiling::{
 };
 pub use registry::default_registry as defaultRegistry;
 pub use registry::{AnalyticsFunction, AnalyticsFunctionKind, AnalyticsRegistry, default_registry};
+pub use stats_tests::{
+    AndersonDarlingResult, BayesianAbResult, DistributionFit, SequentialLook, andersonDarling,
+    bayesianAnalyze, fitDistribution, ks1Sample, localOutlierFactor, sequentialAnalyze,
+    shapiroWilk,
+};
 pub use value::{AnalyticsRow, AnalyticsValue, MS_PER_DAY, MS_PER_HOUR};

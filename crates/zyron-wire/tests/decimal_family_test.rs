@@ -331,6 +331,7 @@ async fn test_wide_decimal_scale_survives_catalog_roundtrip() {
         fractional_digits: Some(20),
         tz_offset_secs: None,
         element_type: None,
+        attrs: Default::default(),
     };
     let bytes = entry.to_bytes();
     let back = ColumnEntry::from_bytes(&bytes).expect("a stored scale of 20 must read back");

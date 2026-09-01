@@ -580,6 +580,7 @@ pub struct CustomAnalyzer {
     analyzer_name: String,
     tokenizer: Box<dyn Tokenizer>,
     filters: Vec<Box<dyn TokenFilter>>,
+    char_filters: Vec<Box<dyn CharFilter>>,
 }
 
 impl CustomAnalyzer {
@@ -592,13 +593,28 @@ impl CustomAnalyzer {
             analyzer_name: name,
             tokenizer,
             filters,
+            char_filters: Vec::new(),
         }
+    }
+
+    /// Attaches character filters applied to the raw text before tokenization
+    pub fn with_char_filters(mut self, char_filters: Vec<Box<dyn CharFilter>>) -> Self {
+        self.char_filters = char_filters;
+        self
     }
 }
 
 impl Analyzer for CustomAnalyzer {
     fn analyze(&self, text: &str) -> Vec<Token> {
-        let mut tokens = self.tokenizer.tokenize(text);
+        let mut tokens = if self.char_filters.is_empty() {
+            self.tokenizer.tokenize(text)
+        } else {
+            let mut filtered = text.to_string();
+            for cf in &self.char_filters {
+                filtered = cf.filter(&filtered);
+            }
+            self.tokenizer.tokenize(&filtered)
+        };
         for filter in &self.filters {
             tokens = filter.filter(tokens);
         }
@@ -608,6 +624,347 @@ impl Analyzer for CustomAnalyzer {
     fn name(&self) -> &str {
         &self.analyzer_name
     }
+}
+
+// ---------------------------------------------------------------------------
+// Character filters
+// ---------------------------------------------------------------------------
+
+/// Transforms raw text before tokenization
+pub trait CharFilter: Send + Sync {
+    fn filter(&self, text: &str) -> String;
+}
+
+/// Removes HTML tags and decodes the common entities, replacing each tag
+/// with a space so token boundaries survive stripping
+pub struct HtmlStripCharFilter;
+
+impl CharFilter for HtmlStripCharFilter {
+    fn filter(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '<' => {
+                    // Skip to the closing bracket, tolerating quoted attributes
+                    let mut in_quote: Option<char> = None;
+                    for t in chars.by_ref() {
+                        match in_quote {
+                            Some(q) if t == q => in_quote = None,
+                            Some(_) => {}
+                            None if t == '"' || t == '\'' => in_quote = Some(t),
+                            None if t == '>' => break,
+                            None => {}
+                        }
+                    }
+                    out.push(' ');
+                }
+                '&' => {
+                    let mut entity = String::new();
+                    let mut terminated = false;
+                    while let Some(&t) = chars.peek() {
+                        if t == ';' {
+                            chars.next();
+                            terminated = true;
+                            break;
+                        }
+                        if !t.is_ascii_alphanumeric() && t != '#' {
+                            break;
+                        }
+                        entity.push(t);
+                        chars.next();
+                        if entity.len() > 8 {
+                            break;
+                        }
+                    }
+                    if terminated {
+                        match entity.as_str() {
+                            "amp" => out.push('&'),
+                            "lt" => out.push('<'),
+                            "gt" => out.push('>'),
+                            "quot" => out.push('"'),
+                            "apos" | "#39" => out.push('\''),
+                            "nbsp" => out.push(' '),
+                            _ => out.push(' '),
+                        }
+                    } else {
+                        out.push('&');
+                        out.push_str(&entity);
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+}
+
+/// Lowercases the raw text before tokenization
+pub struct LowercaseCharFilter;
+
+impl CharFilter for LowercaseCharFilter {
+    fn filter(&self, text: &str) -> String {
+        text.to_lowercase()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gram tokenizers
+// ---------------------------------------------------------------------------
+
+/// Tokenizes into character n-grams of each word
+pub struct NGramTokenizer {
+    pub min_gram: usize,
+    pub max_gram: usize,
+}
+
+impl Tokenizer for NGramTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        NGramFilter::new(self.min_gram, self.max_gram).filter(StandardTokenizer.tokenize(text))
+    }
+}
+
+/// Tokenizes into prefix n-grams of each word
+pub struct EdgeNGramTokenizer {
+    pub min_gram: usize,
+    pub max_gram: usize,
+}
+
+impl Tokenizer for EdgeNGramTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        EdgeNGramFilter::new(self.min_gram, self.max_gram).filter(StandardTokenizer.tokenize(text))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phonetic filter
+// ---------------------------------------------------------------------------
+
+/// Phonetic encoding algorithm used by [`PhoneticFilter`] and phonetic search
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhoneticAlgorithm {
+    Soundex,
+    Metaphone,
+    DoubleMetaphone,
+}
+
+impl PhoneticAlgorithm {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "soundex" => Ok(PhoneticAlgorithm::Soundex),
+            "metaphone" => Ok(PhoneticAlgorithm::Metaphone),
+            "double_metaphone" => Ok(PhoneticAlgorithm::DoubleMetaphone),
+            other => Err(zyron_common::ZyronError::FtsAnalyzerError(format!(
+                "unknown phonetic algorithm {other}, expected soundex, metaphone, or double_metaphone"
+            ))),
+        }
+    }
+}
+
+/// Replaces each term with its phonetic code so spelling variants of the
+/// same pronunciation index and match identically. Double metaphone emits
+/// its alternate code as a second token at the same position
+pub struct PhoneticFilter {
+    pub algorithm: PhoneticAlgorithm,
+}
+
+impl PhoneticFilter {
+    pub fn new(algorithm: PhoneticAlgorithm) -> Self {
+        Self { algorithm }
+    }
+
+    /// Encodes one term, returning the primary code and, for double
+    /// metaphone, a distinct alternate code when one exists. Terms with no
+    /// alphabetic characters have no phonetic code
+    pub fn encode(algorithm: PhoneticAlgorithm, term: &str) -> (String, Option<String>) {
+        if !term.chars().any(|c| c.is_ascii_alphabetic()) {
+            return (String::new(), None);
+        }
+        match algorithm {
+            PhoneticAlgorithm::Soundex => (zyron_types::fuzzy::soundex(term), None),
+            PhoneticAlgorithm::Metaphone => (zyron_types::fuzzy::metaphone(term), None),
+            PhoneticAlgorithm::DoubleMetaphone => {
+                let (primary, alternate) = zyron_types::fuzzy::double_metaphone(term);
+                let alt = if !alternate.is_empty() && alternate != primary {
+                    Some(alternate)
+                } else {
+                    None
+                };
+                (primary, alt)
+            }
+        }
+    }
+}
+
+impl TokenFilter for PhoneticFilter {
+    fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
+        let mut result = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let (primary, alternate) = Self::encode(self.algorithm, &token.term);
+            if primary.is_empty() {
+                // Non alphabetic terms have no phonetic code, keep them
+                result.push(token);
+                continue;
+            }
+            if let Some(alt) = alternate {
+                result.push(Token {
+                    term: alt,
+                    position: token.position,
+                    start_offset: token.start_offset,
+                    end_offset: token.end_offset,
+                });
+            }
+            result.push(Token {
+                term: primary,
+                position: token.position,
+                start_offset: token.start_offset,
+                end_offset: token.end_offset,
+            });
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configured analyzer construction
+// ---------------------------------------------------------------------------
+
+/// Declarative analyzer pipeline description, as stored by CREATE ANALYZER
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzerConfig {
+    pub tokenizer: String,
+    pub char_filters: Vec<String>,
+    pub token_filters: Vec<String>,
+}
+
+fn parse_gram_spec(spec: &str, prefix: &str) -> Result<(usize, usize)> {
+    let inner = spec
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('('))
+        .and_then(|r| r.strip_suffix(')'))
+        .ok_or_else(|| {
+            zyron_common::ZyronError::FtsAnalyzerError(format!(
+                "malformed gram spec {spec}, expected {prefix}(min, max)"
+            ))
+        })?;
+    let mut parts = inner.split(',');
+    let parse_part = |part: Option<&str>| -> Result<usize> {
+        part.map(str::trim)
+            .and_then(|p| p.parse::<usize>().ok())
+            .ok_or_else(|| {
+                zyron_common::ZyronError::FtsAnalyzerError(format!(
+                    "malformed gram spec {spec}, expected {prefix}(min, max)"
+                ))
+            })
+    };
+    let min = parse_part(parts.next())?;
+    let max = parse_part(parts.next())?;
+    if parts.next().is_some() || min == 0 || min > max {
+        return Err(zyron_common::ZyronError::FtsAnalyzerError(format!(
+            "invalid gram bounds in {spec}, requires 0 < min <= max"
+        )));
+    }
+    Ok((min, max))
+}
+
+fn build_tokenizer(spec: &str) -> Result<Box<dyn Tokenizer>> {
+    let lower = spec.to_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.starts_with("ngram") {
+        let (min, max) = parse_gram_spec(trimmed, "ngram")?;
+        return Ok(Box::new(NGramTokenizer {
+            min_gram: min,
+            max_gram: max,
+        }));
+    }
+    if trimmed.starts_with("edge_ngram") {
+        let (min, max) = parse_gram_spec(trimmed, "edge_ngram")?;
+        return Ok(Box::new(EdgeNGramTokenizer {
+            min_gram: min,
+            max_gram: max,
+        }));
+    }
+    match trimmed {
+        "standard" => Ok(Box::new(StandardTokenizer)),
+        "whitespace" => Ok(Box::new(WhitespaceTokenizer)),
+        "cjk" | "bigram" => Ok(Box::new(CharBigramTokenizer)),
+        other => Err(zyron_common::ZyronError::FtsAnalyzerError(format!(
+            "unknown tokenizer {other}, expected standard, whitespace, cjk, ngram(min, max), or edge_ngram(min, max)"
+        ))),
+    }
+}
+
+fn build_char_filter(spec: &str) -> Result<Box<dyn CharFilter>> {
+    match spec.to_lowercase().trim() {
+        "html_strip" => Ok(Box::new(HtmlStripCharFilter)),
+        "lowercase" => Ok(Box::new(LowercaseCharFilter)),
+        other => Err(zyron_common::ZyronError::FtsAnalyzerError(format!(
+            "unknown char filter {other}, expected html_strip or lowercase"
+        ))),
+    }
+}
+
+fn build_token_filter(
+    spec: &str,
+    synonyms: &mut Option<HashMap<String, Vec<String>>>,
+) -> Result<Box<dyn TokenFilter>> {
+    let lower = spec.to_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.starts_with("ngram") {
+        let (min, max) = parse_gram_spec(trimmed, "ngram")?;
+        return Ok(Box::new(NGramFilter::new(min, max)));
+    }
+    if trimmed.starts_with("edge_ngram") {
+        let (min, max) = parse_gram_spec(trimmed, "edge_ngram")?;
+        return Ok(Box::new(EdgeNGramFilter::new(min, max)));
+    }
+    if let Some(alg) = trimmed.strip_prefix("phonetic:") {
+        return Ok(Box::new(PhoneticFilter::new(PhoneticAlgorithm::from_str(
+            alg,
+        )?)));
+    }
+    if let Some(lang) = trimmed.strip_prefix("stop:") {
+        return Ok(Box::new(StopwordFilter::new(Language::from_str(lang)?)));
+    }
+    match trimmed {
+        "lowercase" => Ok(Box::new(LowercaseFilter)),
+        "stop" => Ok(Box::new(StopwordFilter::new(Language::English))),
+        "stem" => Ok(Box::new(PorterStemmerFilter)),
+        "phonetic" => Ok(Box::new(PhoneticFilter::new(PhoneticAlgorithm::Metaphone))),
+        "synonym" => match synonyms.take() {
+            Some(expansions) => Ok(Box::new(SynonymFilter::new(expansions))),
+            None => Err(zyron_common::ZyronError::FtsAnalyzerError(
+                "synonym filter requires a synonym dictionary attached to the index".to_string(),
+            )),
+        },
+        other => Err(zyron_common::ZyronError::FtsAnalyzerError(format!(
+            "unknown token filter {other}, expected lowercase, stop, stop:<lang>, stem, phonetic:<algorithm>, ngram(min, max), edge_ngram(min, max), or synonym"
+        ))),
+    }
+}
+
+/// Builds a runnable analyzer from its stored configuration. A synonym
+/// dictionary attached to the index is applied through a `synonym` filter
+/// entry when present, or appended to the end of the chain otherwise
+pub fn build_analyzer(
+    name: &str,
+    config: &AnalyzerConfig,
+    synonyms: Option<HashMap<String, Vec<String>>>,
+) -> Result<CustomAnalyzer> {
+    let tokenizer = build_tokenizer(&config.tokenizer)?;
+    let mut char_filters: Vec<Box<dyn CharFilter>> = Vec::with_capacity(config.char_filters.len());
+    for spec in &config.char_filters {
+        char_filters.push(build_char_filter(spec)?);
+    }
+    let mut synonyms = synonyms;
+    let mut filters: Vec<Box<dyn TokenFilter>> = Vec::with_capacity(config.token_filters.len() + 1);
+    for spec in &config.token_filters {
+        filters.push(build_token_filter(spec, &mut synonyms)?);
+    }
+    if let Some(expansions) = synonyms.take() {
+        filters.push(Box::new(SynonymFilter::new(expansions)));
+    }
+    Ok(CustomAnalyzer::new(name.to_string(), tokenizer, filters).with_char_filters(char_filters))
 }
 
 // ---------------------------------------------------------------------------
@@ -1939,5 +2296,116 @@ mod tests {
 
         let analyzer = StandardAnalyzer;
         assert!(analyzer.analyze("").is_empty());
+    }
+
+    #[test]
+    fn test_html_strip_char_filter() {
+        let f = HtmlStripCharFilter;
+        assert_eq!(
+            f.filter("<p class=\"x\">hello</p> &amp; <b>world</b>"),
+            " hello  &  world "
+        );
+        assert_eq!(f.filter("no tags here"), "no tags here");
+        assert_eq!(f.filter("a &lt; b &gt; c"), "a < b > c");
+    }
+
+    #[test]
+    fn test_phonetic_filter_metaphone_matches_variants() {
+        let f = PhoneticFilter::new(PhoneticAlgorithm::Metaphone);
+        let a = f.filter(SimpleAnalyzer.analyze("smith"));
+        let b = f.filter(SimpleAnalyzer.analyze("smyth"));
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            a[0].term, b[0].term,
+            "smith and smyth share a metaphone code"
+        );
+    }
+
+    #[test]
+    fn test_phonetic_filter_keeps_numeric_terms() {
+        let f = PhoneticFilter::new(PhoneticAlgorithm::Soundex);
+        let tokens = f.filter(SimpleAnalyzer.analyze("route 66"));
+        assert!(tokens.iter().any(|t| t.term == "66"));
+    }
+
+    #[test]
+    fn test_build_analyzer_ngram_tokenizer() {
+        let config = AnalyzerConfig {
+            tokenizer: "ngram(3, 5)".to_string(),
+            char_filters: vec!["lowercase".to_string()],
+            token_filters: vec![],
+        };
+        let analyzer = build_analyzer("my_a", &config, None).expect("build");
+        let tokens = analyzer.analyze("Hello");
+        assert!(tokens.iter().any(|t| t.term == "hel"));
+        assert!(tokens.iter().any(|t| t.term == "hello"));
+        assert!(!tokens.iter().any(|t| t.term == "he"));
+        assert_eq!(analyzer.name(), "my_a");
+    }
+
+    #[test]
+    fn test_build_analyzer_full_pipeline() {
+        let config = AnalyzerConfig {
+            tokenizer: "standard".to_string(),
+            char_filters: vec!["html_strip".to_string(), "lowercase".to_string()],
+            token_filters: vec!["stop".to_string(), "stem".to_string()],
+        };
+        let analyzer = build_analyzer("pipeline", &config, None).expect("build");
+        let tokens = analyzer.analyze("<b>The Running</b> dogs");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        assert!(terms.contains(&"run"), "stemmed running, got {terms:?}");
+        assert!(terms.contains(&"dog"), "stemmed dogs, got {terms:?}");
+        assert!(!terms.contains(&"the"), "stopword removed, got {terms:?}");
+    }
+
+    #[test]
+    fn test_build_analyzer_synonym_appended() {
+        let mut expansions = HashMap::new();
+        expansions.insert("car".to_string(), vec!["automobile".to_string()]);
+        let config = AnalyzerConfig {
+            tokenizer: "standard".to_string(),
+            char_filters: vec![],
+            token_filters: vec!["lowercase".to_string()],
+        };
+        let analyzer = build_analyzer("syn", &config, Some(expansions)).expect("build");
+        let terms: Vec<String> = analyzer
+            .analyze("Car")
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert!(terms.contains(&"car".to_string()));
+        assert!(terms.contains(&"automobile".to_string()));
+    }
+
+    #[test]
+    fn test_build_analyzer_rejects_bad_specs() {
+        let bad_tokenizer = AnalyzerConfig {
+            tokenizer: "ngram(5, 3)".to_string(),
+            char_filters: vec![],
+            token_filters: vec![],
+        };
+        assert!(build_analyzer("x", &bad_tokenizer, None).is_err());
+        let bad_filter = AnalyzerConfig {
+            tokenizer: "standard".to_string(),
+            char_filters: vec![],
+            token_filters: vec!["sparkle".to_string()],
+        };
+        assert!(build_analyzer("x", &bad_filter, None).is_err());
+        let missing_synonyms = AnalyzerConfig {
+            tokenizer: "standard".to_string(),
+            char_filters: vec![],
+            token_filters: vec!["synonym".to_string()],
+        };
+        assert!(build_analyzer("x", &missing_synonyms, None).is_err());
+    }
+
+    #[test]
+    fn test_double_metaphone_filter_emits_alternate() {
+        let f = PhoneticFilter::new(PhoneticAlgorithm::DoubleMetaphone);
+        let tokens = f.filter(SimpleAnalyzer.analyze("schmidt"));
+        assert!(!tokens.is_empty());
+        for pair in tokens.windows(2) {
+            assert_eq!(pair[0].position, pair[1].position);
+        }
     }
 }

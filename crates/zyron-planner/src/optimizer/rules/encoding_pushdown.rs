@@ -325,6 +325,7 @@ impl EncodingPushdown {
                 column_defaults,
                 check_constraints,
                 expectations,
+                generated_columns,
                 source,
             } => self
                 .transform(source)
@@ -334,6 +335,7 @@ impl EncodingPushdown {
                     column_defaults: column_defaults.clone(),
                     check_constraints: check_constraints.clone(),
                     expectations: expectations.clone(),
+                    generated_columns: generated_columns.clone(),
                     source: Arc::new(new_source),
                 }),
             LogicalPlan::ViewTriggerWrite {
@@ -353,11 +355,13 @@ impl EncodingPushdown {
                 table_id,
                 assignments,
                 check_constraints,
+                generated_columns,
                 child,
             } => self.transform(child).map(|new_child| LogicalPlan::Update {
                 table_id: *table_id,
                 assignments: assignments.clone(),
                 check_constraints: check_constraints.clone(),
+                generated_columns: generated_columns.clone(),
                 child: Arc::new(new_child),
             }),
             LogicalPlan::Delete { table_id, child } => {

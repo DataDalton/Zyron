@@ -239,6 +239,159 @@ impl KeyStore for LocalKeyStore {
 }
 
 // ---------------------------------------------------------------------------
+// File backed key store
+// ---------------------------------------------------------------------------
+
+const KEY_FILE_MAGIC: &[u8; 8] = b"ZYKEYS\0\0";
+const KEY_FILE_VERSION: u32 = 1;
+
+/// Key store whose wrapped keys persist in a file under the data directory,
+/// so a data key created for an encrypted column survives a restart. Key
+/// material is stored wrapped with the master key, never in the clear.
+/// Every mutation rewrites the file with an fsync before it answers
+pub struct FileKeyStore {
+    inner: LocalKeyStore,
+    path: std::path::PathBuf,
+    write_guard: std::sync::Mutex<()>,
+}
+
+impl FileKeyStore {
+    /// Opens the store at `path`, loading any persisted keys. A missing
+    /// file starts empty, a corrupt one refuses to open
+    pub fn open(master_key: [u8; 32], path: std::path::PathBuf) -> Result<Self> {
+        let inner = LocalKeyStore::new(master_key);
+        let store = Self {
+            inner,
+            path,
+            write_guard: std::sync::Mutex::new(()),
+        };
+        store.load()?;
+        Ok(store)
+    }
+
+    fn load(&self) -> Result<()> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(ZyronError::Internal(format!(
+                    "key file {} unreadable: {e}",
+                    self.path.display()
+                )));
+            }
+        };
+        if bytes.len() < 16 || &bytes[0..8] != KEY_FILE_MAGIC {
+            return Err(ZyronError::Internal(format!(
+                "key file {} has a bad header",
+                self.path.display()
+            )));
+        }
+        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if version != KEY_FILE_VERSION {
+            return Err(ZyronError::Internal(format!(
+                "key file version {version} is not readable by this build"
+            )));
+        }
+        let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        let mut off = 16;
+        let mut max_id = 0u32;
+        for _ in 0..count {
+            let short = || ZyronError::Internal("key file truncated".to_string());
+            let id_bytes: [u8; 4] = bytes
+                .get(off..off + 4)
+                .ok_or_else(short)?
+                .try_into()
+                .map_err(|_| short())?;
+            let key_id = u32::from_le_bytes(id_bytes);
+            off += 4;
+            let algorithm = EncryptionAlgorithm::from_u8(*bytes.get(off).ok_or_else(short)?)?;
+            off += 1;
+            let len_bytes: [u8; 4] = bytes
+                .get(off..off + 4)
+                .ok_or_else(short)?
+                .try_into()
+                .map_err(|_| short())?;
+            let material_len = u32::from_le_bytes(len_bytes) as usize;
+            off += 4;
+            let encrypted_material = bytes
+                .get(off..off + material_len)
+                .ok_or_else(short)?
+                .to_vec();
+            off += material_len;
+            let _ = self.inner.keys.insert_sync(
+                key_id,
+                EncryptedKey {
+                    key_id,
+                    algorithm,
+                    encrypted_material,
+                },
+            );
+            max_id = max_id.max(key_id);
+        }
+        self.inner.next_id.store(max_id + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn save(&self) -> Result<()> {
+        let guard = match self.write_guard.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut entries: Vec<(u32, EncryptedKey)> = Vec::new();
+        self.inner.keys.iter_sync(|id, key| {
+            entries.push((*id, key.clone()));
+            true
+        });
+        entries.sort_by_key(|(id, _)| *id);
+        let mut bytes = Vec::with_capacity(16 + entries.len() * 64);
+        bytes.extend_from_slice(KEY_FILE_MAGIC);
+        bytes.extend_from_slice(&KEY_FILE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (id, key) in &entries {
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.push(key.algorithm as u8);
+            bytes.extend_from_slice(&(key.encrypted_material.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&key.encrypted_material);
+        }
+        let tmp = self.path.with_extension("zykeys.tmp");
+        let io_err =
+            |e: std::io::Error| ZyronError::Internal(format!("key file write failed: {e}"));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp).map_err(io_err)?;
+            file.write_all(&bytes).map_err(io_err)?;
+            file.sync_all().map_err(io_err)?;
+        }
+        std::fs::rename(&tmp, &self.path).map_err(io_err)?;
+        drop(guard);
+        Ok(())
+    }
+}
+
+impl KeyStore for FileKeyStore {
+    fn get_key(&self, key_id: u32) -> Result<Vec<u8>> {
+        self.inner.get_key(key_id)
+    }
+
+    fn create_key(&self, algorithm: EncryptionAlgorithm) -> Result<u32> {
+        let id = self.inner.create_key(algorithm)?;
+        self.save()?;
+        Ok(id)
+    }
+
+    fn delete_key(&self, key_id: u32) -> Result<()> {
+        self.inner.delete_key(key_id)?;
+        self.save()
+    }
+
+    fn rotate_key(&self, key_id: u32) -> Result<u32> {
+        let new_id = self.inner.rotate_key(key_id)?;
+        self.save()?;
+        Ok(new_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AES-GCM implementation
 // ---------------------------------------------------------------------------
 

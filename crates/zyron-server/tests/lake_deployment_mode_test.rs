@@ -63,6 +63,12 @@ async fn harness_with_one_lake_table() -> (Harness, LakePaths) {
         nullable: Some(true),
         default: None,
         constraints: vec![],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }];
     catalog
         .create_table(schema_id, "heap_only", &columns, &[])

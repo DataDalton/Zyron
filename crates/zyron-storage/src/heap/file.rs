@@ -306,14 +306,7 @@ impl HeapFile {
 
         // Load from disk into buffer pool
         let disk_data = self.disk.read_page(page_id).await?;
-        let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
-
-        // Handle evicted dirty page
-        if let Some(evicted_page) = evicted {
-            self.disk
-                .write_page(evicted_page.page_id, &evicted_page.data)
-                .await?;
-        }
+        let frame = self.pool.load_page(page_id, &disk_data)?;
 
         let guard = frame.read_data();
         let data: [u8; PAGE_SIZE] = **guard;
@@ -322,7 +315,7 @@ impl HeapFile {
         Ok(data)
     }
 
-    /// Writes a page through the buffer pool (marks dirty, handles eviction).
+    /// Writes a page through the buffer pool, marking it dirty.
     #[inline]
     async fn write_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
         // Try to fetch existing page from pool
@@ -333,15 +326,7 @@ impl HeapFile {
         }
 
         // Load into pool (load_page already copies data into frame)
-        let (_, evicted) = self.pool.load_page(page_id, data)?;
-
-        // Handle evicted dirty page
-        if let Some(evicted_page) = evicted {
-            self.disk
-                .write_page(evicted_page.page_id, &evicted_page.data)
-                .await?;
-        }
-
+        self.pool.load_page(page_id, data)?;
         self.pool.unpin_page(page_id, true); // Mark dirty
         Ok(())
     }
@@ -397,10 +382,7 @@ impl HeapFile {
                     Err(ZyronError::IoError(_)) => return Ok(false),
                     Err(e) => return Err(e),
                 };
-                let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
-                if let Some(ev) = evicted {
-                    self.disk.write_page(ev.page_id, &ev.data).await?;
-                }
+                let frame = self.pool.load_page(page_id, &disk_data)?;
                 frame
             }
         };
@@ -458,10 +440,7 @@ impl HeapFile {
                         Err(ZyronError::IoError(_)) => continue,
                         Err(e) => return Err(e),
                     };
-                    let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
-                    if let Some(ev) = evicted {
-                        self.disk.write_page(ev.page_id, &ev.data).await?;
-                    }
+                    let frame = self.pool.load_page(page_id, &disk_data)?;
                     frame
                 }
             };
@@ -539,10 +518,7 @@ impl HeapFile {
                         Err(ZyronError::IoError(_)) => continue,
                         Err(e) => return Err(e),
                     };
-                    let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
-                    if let Some(ev) = evicted {
-                        self.disk.write_page(ev.page_id, &ev.data).await?;
-                    }
+                    let frame = self.pool.load_page(page_id, &disk_data)?;
                     frame
                 }
             };
@@ -630,10 +606,7 @@ impl HeapFile {
                     Err(ZyronError::IoError(_)) => return Ok(false),
                     Err(e) => return Err(e),
                 };
-                let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
-                if let Some(ev) = evicted {
-                    self.disk.write_page(ev.page_id, &ev.data).await?;
-                }
+                let frame = self.pool.load_page(page_id, &disk_data)?;
                 frame
             }
         };
@@ -661,10 +634,7 @@ impl HeapFile {
             Some(frame) => frame,
             None => {
                 let disk_data = self.disk.read_page(page_id).await?;
-                let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
-                if let Some(ev) = evicted {
-                    self.disk.write_page(ev.page_id, &ev.data).await?;
-                }
+                let frame = self.pool.load_page(page_id, &disk_data)?;
                 frame
             }
         };
@@ -718,12 +688,7 @@ impl HeapFile {
             }
             let data = self.read_page_from_disk_sync(pid)?;
             match self.pool.load_page(pid, data.as_ref()) {
-                Ok((_, evicted)) => {
-                    if let Some(mut ev) = evicted {
-                        self.write_page_to_disk_sync(ev.page_id, ev.data.as_mut())?;
-                    }
-                    guard.page_ids.push(pid);
-                }
+                Ok(_) => guard.page_ids.push(pid),
                 Err(ZyronError::BufferPoolFull) => guard.owned.push((pid, data)),
                 Err(e) => return Err(e),
             }
@@ -739,19 +704,6 @@ impl HeapFile {
     /// the async read gives for a never-flushed page
     fn read_page_from_disk_sync(&self, page_id: PageId) -> Result<Box<[u8; PAGE_SIZE]>> {
         self.disk.read_page_sync(page_id)
-    }
-
-    /// Writes one page's bytes for the scan path's dirty evictions. Routes
-    /// through the disk manager so the write holds the per-page latch and
-    /// stamps its checksum, and fsync stays with the caller's flush cycle
-    fn write_page_to_disk_sync(&self, page_id: PageId, data: &mut [u8]) -> Result<()> {
-        let data_len = data.len();
-        let page: &mut [u8; PAGE_SIZE] =
-            data.try_into().map_err(|_| ZyronError::PageSizeMismatch {
-                expected: PAGE_SIZE,
-                actual: data_len,
-            })?;
-        self.disk.write_page_sync_no_fsync(page_id, page)
     }
 
     /// Returns the number of pages in the heap file.
@@ -962,7 +914,7 @@ impl HeapFile {
             };
 
             if is_fresh {
-                let (frame, evicted, installed) = self.pool.new_page_reporting_fresh(page_id)?;
+                let (frame, installed) = self.pool.new_page_reporting_fresh(page_id)?;
                 if installed {
                     // Only the page and heap headers are written. Everything
                     // past them is free space this page never reads, so
@@ -973,15 +925,9 @@ impl HeapFile {
                     let raw = unsafe { &mut *frame.data_ptr_mut() };
                     HeapPage::init_fresh_slice_reuse(raw, page_id);
                 }
-                if let Some(ev) = evicted {
-                    self.disk.write_page(ev.page_id, &ev.data).await?;
-                }
             } else if self.pool.fetch_page(page_id).is_none() {
                 let disk_data = self.disk.read_page(page_id).await?;
-                let (_, evicted) = self.pool.load_page(page_id, &disk_data)?;
-                if let Some(ev) = evicted {
-                    self.disk.write_page(ev.page_id, &ev.data).await?;
-                }
+                self.pool.load_page(page_id, &disk_data)?;
             }
 
             let inserted = unsafe {
@@ -1089,10 +1035,7 @@ impl HeapFile {
 
         let mut buf = [0u8; PAGE_SIZE];
         HeapPage::init_fresh_slice_reuse(&mut buf, new_page_id);
-        let (_, evicted) = self.pool.load_page(new_page_id, &buf)?;
-        if let Some(ev) = evicted {
-            self.disk.write_page(ev.page_id, &ev.data).await?;
-        }
+        self.pool.load_page(new_page_id, &buf)?;
         self.pool.unpin_page(new_page_id, true);
 
         match shard.compare_exchange(
@@ -1328,6 +1271,262 @@ mod tests {
         (heap, dir)
     }
 
+    /// Installs the eviction write hook the server installs at startup, so a
+    /// pool under test evicts the way the product's does. Without one a
+    /// dirty frame is never taken as a victim and a pool smaller than the
+    /// heap reports itself full.
+    fn install_evict_writer(pool: &BufferPool, disk: &Arc<DiskManager>) {
+        let disk = Arc::clone(disk);
+        let writer: zyron_buffer::EvictWriteFn =
+            Arc::new(move |page_id, data, _lsn| disk.write_page_sync(page_id, data));
+        let _ = pool.set_evict_writer(writer);
+    }
+
+    /// Reaches every page of a file the way a scan does: through the pool
+    /// when the page is resident, from disk when it is not, writing back
+    /// whatever the install evicted. Returns the tuples the pass saw.
+    ///
+    /// Spelled out here rather than called through the heap's own scan
+    /// because this is the access pattern the executor's scan operators use,
+    /// and it is that pattern the test is about.
+    async fn read_pass_the_way_a_scan_does(
+        disk: &DiskManager,
+        pool: &BufferPool,
+        file_id: u32,
+        num_pages: u32,
+    ) -> Result<usize> {
+        let mut total = 0;
+        for n in 0..num_pages {
+            let page_id = PageId::new(file_id, n as u64);
+            let data: [u8; PAGE_SIZE] = match pool.fetch_page(page_id) {
+                Some(frame) => {
+                    let guard = frame.read_data();
+                    let copy = **guard;
+                    drop(guard);
+                    pool.unpin_page(page_id, false);
+                    copy
+                }
+                None => {
+                    let disk_data = disk.read_page(page_id).await?;
+                    let frame = pool.load_page(page_id, &disk_data)?;
+                    let guard = frame.read_data();
+                    let copy = **guard;
+                    drop(guard);
+                    pool.unpin_page(page_id, false);
+                    copy
+                }
+            };
+            total += count_tuples_in_page(&data);
+        }
+        Ok(total)
+    }
+
+    /// A heap many times the pool, read back pass after pass.
+    ///
+    /// Nothing writes between the passes, so every pass has to see the same
+    /// rows, and that number has to be every row inserted. A page whose
+    /// dirty image never reached disk before its frame was reused shows up
+    /// here as a pass that is short, and a later pass that is not.
+    #[tokio::test]
+    async fn every_read_pass_over_an_evicting_heap_sees_every_row() {
+        let dir = tempdir().unwrap();
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 16 }));
+        install_evict_writer(&pool, &disk);
+        let heap = HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+
+        let rows = 4_000usize;
+        let payload = vec![b'x'; 300];
+        for chunk_start in (0..rows).step_by(200) {
+            let batch: Vec<Tuple> = (chunk_start..(chunk_start + 200).min(rows))
+                .map(|i| Tuple::new(payload.clone(), i as u64))
+                .collect();
+            heap.insert_batch(&batch).await.unwrap();
+        }
+
+        let pages = heap.num_pages_cached();
+        for pass in 0..5 {
+            let seen = read_pass_the_way_a_scan_does(&disk, &pool, heap.heap_file_id(), pages)
+                .await
+                .unwrap();
+            assert_eq!(seen, rows, "read pass {pass} did not see every row");
+        }
+    }
+
+    /// The same read pass, split across tasks the way a parallel scan splits
+    /// it, so several readers install and evict through one pool at once.
+    ///
+    /// A page whose dirty image is still on its way to disk when another
+    /// reader misses it in the page table is read from disk in its old
+    /// state, and the rows written since vanish from that reader's count
+    /// while staying in everyone else's. That is what this looks for: not a
+    /// wrong total once, but two totals that disagree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_read_passes_over_an_evicting_heap_agree() {
+        let dir = tempdir().unwrap();
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 64 }));
+        install_evict_writer(&pool, &disk);
+        let heap = Arc::new(HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).unwrap());
+
+        let rows = 8_000usize;
+        let payload = vec![b'x'; 300];
+        for chunk_start in (0..rows).step_by(200) {
+            let batch: Vec<Tuple> = (chunk_start..(chunk_start + 200).min(rows))
+                .map(|i| Tuple::new(payload.clone(), i as u64))
+                .collect();
+            heap.insert_batch(&batch).await.unwrap();
+        }
+
+        let pages = heap.num_pages_cached();
+        let file_id = heap.heap_file_id();
+        let workers = 8u32;
+        let per_worker = pages.div_ceil(workers);
+
+        for pass in 0..8 {
+            let mut set = tokio::task::JoinSet::new();
+            for w in 0..workers {
+                let start = w * per_worker;
+                let end = ((w + 1) * per_worker).min(pages);
+                if start >= end {
+                    continue;
+                }
+                let disk = Arc::clone(&disk);
+                let pool = Arc::clone(&pool);
+                set.spawn(async move {
+                    let mut total = 0usize;
+                    for n in start..end {
+                        let page_id = PageId::new(file_id, n as u64);
+                        let data: [u8; PAGE_SIZE] = match pool.fetch_page(page_id) {
+                            Some(frame) => {
+                                let guard = frame.read_data();
+                                let copy = **guard;
+                                drop(guard);
+                                pool.unpin_page(page_id, false);
+                                copy
+                            }
+                            None => {
+                                let disk_data = disk.read_page(page_id).await.unwrap();
+                                let frame = match pool.load_page(page_id, &disk_data) {
+                                    Ok(v) => v,
+                                    // A pool with every frame pinned is a
+                                    // capacity limit, not the defect under
+                                    // test, so the page is read straight
+                                    // through instead
+                                    Err(_) => {
+                                        total += count_tuples_in_page(&disk_data);
+                                        continue;
+                                    }
+                                };
+                                let guard = frame.read_data();
+                                let copy = **guard;
+                                drop(guard);
+                                pool.unpin_page(page_id, false);
+                                copy
+                            }
+                        };
+                        total += count_tuples_in_page(&data);
+                    }
+                    total
+                });
+            }
+            let mut seen = 0usize;
+            while let Some(joined) = set.join_next().await {
+                seen += joined.unwrap();
+            }
+            assert_eq!(
+                seen, rows,
+                "concurrent read pass {pass} did not see every row"
+            );
+        }
+    }
+
+    /// Deleting most of a heap, pruning what the delete freed and loading it
+    /// again, then reading the whole file back pass after pass.
+    ///
+    /// Reload is the case the insert-only test cannot reach: pruning
+    /// compacts pages and publishes their free space, so the next load
+    /// writes into pages the file already had rather than only into fresh
+    /// ones. A row placed in a reclaimed page is the one whose page image
+    /// has to survive eviction, and a pass that comes back short means it
+    /// did not.
+    #[tokio::test]
+    async fn read_passes_after_a_prune_and_reload_see_every_row() {
+        let dir = tempdir().unwrap();
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 128 }));
+        install_evict_writer(&pool, &disk);
+        let heap = HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let status = crate::TxnStatusMap::all_committed();
+
+        let rows = 6_000usize;
+        let payload = vec![b'x'; 300];
+        let mut ids: Vec<TupleId> = Vec::with_capacity(rows);
+        for chunk_start in (0..rows).step_by(200) {
+            let batch: Vec<Tuple> = (chunk_start..(chunk_start + 200).min(rows))
+                .map(|i| Tuple::new(payload.clone(), 1))
+                .collect();
+            ids.extend(heap.insert_batch(&batch).await.unwrap());
+        }
+
+        // Three rows in four go, with a horizon above the deleter so the
+        // on-access prune reclaims them and publishes the space
+        let doomed: Vec<TupleId> = ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 4 != 0)
+            .map(|(_, t)| *t)
+            .collect();
+        let kept = rows - doomed.len();
+        heap.mark_deleted_batch(&doomed, 2, 3, Some(&status), false)
+            .await
+            .unwrap();
+
+        let reload = rows;
+        for chunk_start in (0..reload).step_by(200) {
+            let batch: Vec<Tuple> = (chunk_start..(chunk_start + 200).min(reload))
+                .map(|_| Tuple::new(payload.clone(), 1))
+                .collect();
+            heap.insert_batch(&batch).await.unwrap();
+        }
+
+        let expected = kept + reload;
+        let pages = heap.num_pages_cached();
+        for pass in 0..6 {
+            let seen = read_pass_the_way_a_scan_does(&disk, &pool, heap.heap_file_id(), pages)
+                .await
+                .unwrap();
+            assert_eq!(
+                seen, expected,
+                "read pass {pass} did not see every row after the reload"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_heap_file_new() {
         let (heap, _dir) = create_test_heap().await;
@@ -1349,6 +1548,7 @@ mod tests {
         };
         let disk = Arc::new(DiskManager::new(config).await.unwrap());
         let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8 }));
+        install_evict_writer(&pool, &disk);
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
         // ~1.5KB tuples, a handful per 16KB page, spread over far more

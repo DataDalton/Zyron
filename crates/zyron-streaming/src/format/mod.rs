@@ -9,8 +9,11 @@
 // or catalog entries, it only converts between raw bytes and row values.
 
 use crate::row_codec::StreamValue;
+use std::sync::Arc;
+use zyron_catalog::schema::NestedShape;
 use zyron_common::{Result, TypeId};
 
+pub mod arrow_ext;
 pub mod arrow_ipc;
 pub mod avro;
 pub mod csv;
@@ -58,6 +61,12 @@ pub struct ColumnSpec {
     /// one sanctioned lossy narrowing). None / p<=6 is the i64 microsecond
     /// path and is byte-identical to before this field existed.
     pub fractional_digits: Option<u8>,
+    /// What a STRUCT or MAP column declares it holds. A binary format writes
+    /// the stored layout through and never needs this, but a text format has
+    /// to spell the value, and the names and leaf types live only here. None
+    /// for every other type, and for a nested column whose shape was not
+    /// carried this far, which the text formats then refuse.
+    pub nested_shape: Option<Arc<NestedShape>>,
 }
 
 impl ColumnSpec {
@@ -67,6 +76,7 @@ impl ColumnSpec {
             name: name.into(),
             type_id,
             fractional_digits: None,
+            nested_shape: None,
         }
     }
 
@@ -80,7 +90,14 @@ impl ColumnSpec {
             name: name.into(),
             type_id,
             fractional_digits,
+            nested_shape: None,
         }
+    }
+
+    /// The same spec carrying the shape a STRUCT or MAP column declares.
+    pub fn with_nested_shape(mut self, shape: Option<Arc<NestedShape>>) -> Self {
+        self.nested_shape = shape;
+        self
     }
 }
 

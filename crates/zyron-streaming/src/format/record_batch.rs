@@ -11,12 +11,13 @@ use super::ColumnSpec;
 use crate::row_codec::StreamValue;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Decimal128Array,
-    Decimal128Builder, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
-    Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    RecordBatch, StringArray, StringBuilder, TimestampNanosecondBuilder, UInt8Array, UInt8Builder,
-    UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
+    Decimal128Builder, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Float32Array, Float32Builder,
+    Float64Array, Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array,
+    Int32Builder, Int64Array, Int64Builder, RecordBatch, StringArray, StringBuilder,
+    TimestampNanosecondBuilder, UInt8Array, UInt8Builder, UInt16Array, UInt16Builder, UInt32Array,
+    UInt32Builder, UInt64Array, UInt64Builder,
 };
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType as ArrowDataType, Schema};
 use std::sync::Arc;
 use zyron_common::{Result, TypeId, ZyronError};
 
@@ -69,6 +70,11 @@ fn build_column(
             arr
         };
         return Ok(Arc::new(arr) as ArrayRef);
+    }
+    // Extension types with FixedSizeBinary storage build a fixed width array
+    // so the batch matches the declared export schema
+    if let Some(ArrowDataType::FixedSizeBinary(width)) = super::arrow_ext::storage_type_for(t) {
+        return build_fixed_binary(ci, t, *width, rows);
     }
     match t {
         TypeId::Boolean => {
@@ -132,7 +138,13 @@ fn build_column(
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => {
             let mut b = StringBuilder::with_capacity(n, n * 8);
             for row in rows {
                 match &row[ci] {
@@ -143,7 +155,11 @@ fn build_column(
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
-        TypeId::Binary
+        // A declared STRUCT or MAP is written as the positional layout it is
+        // stored in, with the other nested values that carry their own encoding
+        TypeId::Struct
+        | TypeId::Map
+        | TypeId::Binary
         | TypeId::Varbinary
         | TypeId::Bytea
         | TypeId::Uuid
@@ -165,7 +181,12 @@ fn build_column(
         | TypeId::TDigest
         | TypeId::CountMinSketch
         | TypeId::Bitfield
-        | TypeId::Quantity => {
+        | TypeId::Quantity
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef => {
             let mut b = BinaryBuilder::with_capacity(n, n * 8);
             for row in rows {
                 match &row[ci] {
@@ -211,6 +232,27 @@ build_int!(build_u8, UInt8Builder, u8);
 build_int!(build_u16, UInt16Builder, u16);
 build_int!(build_u32, UInt32Builder, u32);
 build_int!(build_u64, UInt64Builder, u64);
+
+fn build_fixed_binary(
+    ci: usize,
+    t: TypeId,
+    width: i32,
+    rows: &[Vec<StreamValue>],
+) -> Result<ArrayRef> {
+    let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), width);
+    for row in rows {
+        match &row[ci] {
+            StreamValue::Null => b.append_null(),
+            StreamValue::Binary(bs) => b.append_value(bs).map_err(|e| {
+                ZyronError::StreamingError(format!(
+                    "record_batch: col {ci} {t:?} expects {width} bytes: {e}"
+                ))
+            })?,
+            other => return Err(col_type_err(ci, t, other)),
+        }
+    }
+    Ok(Arc::new(b.finish()) as ArrayRef)
+}
 
 fn col_type_err(ci: usize, t: TypeId, got: &StreamValue) -> ZyronError {
     ZyronError::StreamingError(format!(
@@ -335,16 +377,22 @@ fn extract_scalar(t: TypeId, arr: &dyn Array, i: usize) -> Result<StreamValue> {
                 .ok_or_else(|| dc_err("Decimal128"))?
                 .value(i),
         )),
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-            Ok(StreamValue::Utf8(
-                arr.as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| dc_err("String"))?
-                    .value(i)
-                    .to_string(),
-            ))
-        }
-        TypeId::Binary
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => Ok(StreamValue::Utf8(
+            arr.as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| dc_err("String"))?
+                .value(i)
+                .to_string(),
+        )),
+        TypeId::Struct
+        | TypeId::Map
+        | TypeId::Binary
         | TypeId::Varbinary
         | TypeId::Bytea
         | TypeId::Uuid
@@ -366,17 +414,89 @@ fn extract_scalar(t: TypeId, arr: &dyn Array, i: usize) -> Result<StreamValue> {
         | TypeId::TDigest
         | TypeId::CountMinSketch
         | TypeId::Bitfield
-        | TypeId::Quantity => Ok(StreamValue::Binary(
-            arr.as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| dc_err("Binary"))?
-                .value(i)
-                .to_vec(),
-        )),
+        | TypeId::Quantity
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef => Ok(StreamValue::Binary(binary_value(arr, i)?)),
         TypeId::Null => Ok(StreamValue::Null),
     }
 }
 
+// Binary family columns arrive as variable length Binary or, for extension
+// types with fixed width storage, as FixedSizeBinary
+fn binary_value(arr: &dyn Array, i: usize) -> Result<Vec<u8>> {
+    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(a.value(i).to_vec());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        return Ok(a.value(i).to_vec());
+    }
+    Err(dc_err("Binary"))
+}
+
 fn dc_err(kind: &str) -> ZyronError {
     ZyronError::StreamingError(format!("record_batch: downcast to {kind} failed"))
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::super::schema::type_id_to_arrow;
+    use super::*;
+    use arrow::datatypes::Field;
+    use zyron_common::nested_value::{encode_map, encode_struct};
+
+    /// A declared STRUCT or MAP reaches this bridge as the positional bytes it
+    /// is stored in. Routing those types into a string builder rejected the
+    /// value and failed the whole job, so the round trip is pinned here.
+    #[test]
+    fn nested_columns_round_trip_as_binary() {
+        let schema = vec![
+            ColumnSpec::new("s", TypeId::Struct),
+            ColumnSpec::new("m", TypeId::Map),
+        ];
+        let seq = 7i32.to_le_bytes();
+        let struct_bytes = encode_struct(&[Some(b"alpha".as_slice()), None, Some(seq.as_slice())]);
+        let map_bytes = encode_map(&[
+            (b"kind".as_slice(), Some(b"ingest".as_slice())),
+            (b"seq".as_slice(), None),
+        ]);
+        let rows = vec![
+            vec![
+                StreamValue::Binary(struct_bytes.clone()),
+                StreamValue::Binary(map_bytes.clone()),
+            ],
+            vec![StreamValue::Null, StreamValue::Null],
+        ];
+
+        let fields: Vec<Field> = schema
+            .iter()
+            .map(|c| Field::new(&c.name, type_id_to_arrow(c.type_id), true))
+            .collect();
+        let batch = rows_to_batch(&rows, &schema, Arc::new(Schema::new(fields)))
+            .expect("a nested column builds");
+
+        // The arrow column carries bytes, so a consumer reads the stored
+        // layout rather than a rendering of it that loses the leaf types
+        assert_eq!(batch.column(0).data_type(), &ArrowDataType::Binary);
+        assert_eq!(batch.column(1).data_type(), &ArrowDataType::Binary);
+
+        let mut out = Vec::new();
+        batch_to_rows(&batch, &schema, &mut out).expect("a nested column reads back");
+        assert_eq!(out.len(), 2);
+        match (&out[0][0], &out[0][1]) {
+            (StreamValue::Binary(s), StreamValue::Binary(m)) => {
+                assert_eq!(s, &struct_bytes, "the struct layout changed in transit");
+                assert_eq!(m, &map_bytes, "the map layout changed in transit");
+            }
+            other => panic!("a nested column came back as {other:?}"),
+        }
+        assert!(matches!(out[1][0], StreamValue::Null));
+        assert!(matches!(out[1][1], StreamValue::Null));
+    }
 }

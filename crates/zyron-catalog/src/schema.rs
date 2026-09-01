@@ -117,14 +117,310 @@ pub struct ColumnEntry {
     /// elements rather than whatever width the constructor's literals bound
     /// to. None on every other column type.
     pub element_type: Option<TypeId>,
+    /// Declared per column behaviors: generation, encryption, collation,
+    /// and user defined type backing. Defaults to all absent.
+    pub attrs: ColumnAttributes,
+}
+
+/// A type declared inside a nested column.
+///
+/// Carries its own type id plus, when that type is itself nested, what it
+/// holds. `STRUCT<tags TEXT[], home STRUCT<city TEXT>>` keeps the element
+/// type of `tags` and the fields of `home`, so a path reaching into either
+/// one still knows what it will find.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedType {
+    pub type_id: TypeId,
+    /// Element type when this is an ARRAY
+    pub element: Option<Box<NestedType>>,
+    /// Field or key and value shape when this is a STRUCT or a MAP
+    pub shape: Option<Box<NestedShape>>,
+}
+
+impl NestedType {
+    /// A leaf: a type that holds nothing further.
+    pub fn scalar(type_id: TypeId) -> Self {
+        Self {
+            type_id,
+            element: None,
+            shape: None,
+        }
+    }
+
+    fn to_bytes(&self, buf: &mut Vec<u8>) {
+        write_u8(buf, self.type_id as u8);
+        let mut flags = 0u8;
+        if self.element.is_some() {
+            flags |= 1;
+        }
+        if self.shape.is_some() {
+            flags |= 2;
+        }
+        write_u8(buf, flags);
+        if let Some(element) = &self.element {
+            element.to_bytes(buf);
+        }
+        if let Some(shape) = &self.shape {
+            shape.to_bytes(buf);
+        }
+    }
+
+    fn from_bytes(data: &[u8], off: &mut usize) -> Result<Self> {
+        let type_id = type_id_from_u8(read_u8(data, off)?)?;
+        let flags = read_u8(data, off)?;
+        let element = if flags & 1 != 0 {
+            Some(Box::new(NestedType::from_bytes(data, off)?))
+        } else {
+            None
+        };
+        let shape = if flags & 2 != 0 {
+            Some(Box::new(NestedShape::from_bytes(data, off)?))
+        } else {
+            None
+        };
+        Ok(Self {
+            type_id,
+            element,
+            shape,
+        })
+    }
+}
+
+/// What a STRUCT or MAP column declares it holds.
+///
+/// The declaration is the only place this appears. Without it a struct value
+/// is an untyped blob: nothing can say that `s.age` is an integer, and
+/// nothing can refuse a write whose fields are not the fields the column was
+/// declared with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NestedShape {
+    /// Field names and types, in declared order
+    Struct(Vec<(String, NestedType)>),
+    /// The type of every key and of every value
+    Map { key: NestedType, value: NestedType },
+}
+
+impl NestedShape {
+    /// Kind byte for a struct in the encoded form.
+    const KIND_STRUCT: u8 = 1;
+    /// Kind byte for a map in the encoded form.
+    const KIND_MAP: u8 = 2;
+
+    /// The declared type of one struct field, by name.
+    pub fn field(&self, name: &str) -> Option<&NestedType> {
+        match self {
+            NestedShape::Struct(fields) => fields
+                .iter()
+                .find(|(field, _)| field.eq_ignore_ascii_case(name))
+                .map(|(_, ty)| ty),
+            NestedShape::Map { .. } => None,
+        }
+    }
+
+    /// The declared type a lookup on this shape yields: a named field for a
+    /// struct, the value type for a map, whose keys are all alike.
+    pub fn lookup(&self, name: &str) -> Option<&NestedType> {
+        match self {
+            NestedShape::Struct(_) => self.field(name),
+            NestedShape::Map { value, .. } => Some(value),
+        }
+    }
+
+    /// The encoded form, which is what carries a shape to a reader that has
+    /// no catalog to look it up in.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.to_bytes(&mut buf);
+        buf
+    }
+
+    /// Reads back a shape written by `encode`.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let mut off = 0usize;
+        NestedShape::from_bytes(data, &mut off)
+    }
+
+    fn to_bytes(&self, buf: &mut Vec<u8>) {
+        match self {
+            NestedShape::Struct(fields) => {
+                write_u8(buf, Self::KIND_STRUCT);
+                write_u16(buf, fields.len() as u16);
+                for (name, ty) in fields {
+                    write_string(buf, name);
+                    ty.to_bytes(buf);
+                }
+            }
+            NestedShape::Map { key, value } => {
+                write_u8(buf, Self::KIND_MAP);
+                key.to_bytes(buf);
+                value.to_bytes(buf);
+            }
+        }
+    }
+
+    fn from_bytes(data: &[u8], off: &mut usize) -> Result<Self> {
+        match read_u8(data, off)? {
+            Self::KIND_STRUCT => {
+                let count = read_u16(data, off)? as usize;
+                let mut fields = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let name = read_string(data, off)?;
+                    let ty = NestedType::from_bytes(data, off)?;
+                    fields.push((name, ty));
+                }
+                Ok(NestedShape::Struct(fields))
+            }
+            Self::KIND_MAP => {
+                let key = NestedType::from_bytes(data, off)?;
+                let value = NestedType::from_bytes(data, off)?;
+                Ok(NestedShape::Map { key, value })
+            }
+            n => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "invalid nested shape kind byte {n}"
+            ))),
+        }
+    }
+}
+
+/// Declared per column behaviors beyond the storage type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnAttributes {
+    /// Generated column expression, re parseable SQL over sibling columns
+    pub generation_expr: Option<String>,
+    /// How a generated column materializes. 0 = not generated,
+    /// 1 = virtual (computed on read), 2 = stored (written like data)
+    pub generation_kind: u8,
+    /// AES GCM encryption algorithm discriminant, 255 = not encrypted
+    pub encryption_algorithm: u8,
+    /// Key id in the server key store, meaningful only when encrypted
+    pub encryption_key_id: u32,
+    /// Collation applied to comparisons and ordering on this column
+    pub collation: Option<String>,
+    /// Backing user defined type id when declared with one
+    pub user_type_id: Option<u32>,
+    /// Declared format hint of a media column, like jpeg or png
+    pub media_format: Option<String>,
+    /// Declared storage mode of a media column: inline, toast, external,
+    /// or a URI prefix for EXTERNAL_REF columns
+    pub media_storage: Option<String>,
+    /// Declared shape of a STRUCT or MAP column, absent on every other type
+    pub nested_shape: Option<NestedShape>,
+}
+
+impl Default for ColumnAttributes {
+    fn default() -> Self {
+        Self {
+            generation_expr: None,
+            generation_kind: Self::GENERATION_NONE,
+            encryption_algorithm: Self::NOT_ENCRYPTED,
+            encryption_key_id: 0,
+            collation: None,
+            user_type_id: None,
+            media_format: None,
+            media_storage: None,
+            nested_shape: None,
+        }
+    }
+}
+
+impl ColumnAttributes {
+    pub const GENERATION_NONE: u8 = 0;
+    pub const GENERATION_VIRTUAL: u8 = 1;
+    pub const GENERATION_STORED: u8 = 2;
+    pub const NOT_ENCRYPTED: u8 = 255;
+
+    pub fn is_default(&self) -> bool {
+        self.generation_expr.is_none()
+            && self.generation_kind == Self::GENERATION_NONE
+            && self.encryption_algorithm == Self::NOT_ENCRYPTED
+            && self.encryption_key_id == 0
+            && self.collation.is_none()
+            && self.user_type_id.is_none()
+            && self.media_format.is_none()
+            && self.media_storage.is_none()
+            && self.nested_shape.is_none()
+    }
+
+    fn to_bytes(&self, buf: &mut Vec<u8>) {
+        write_option_string(buf, &self.generation_expr);
+        write_u8(buf, self.generation_kind);
+        write_u8(buf, self.encryption_algorithm);
+        write_u32(buf, self.encryption_key_id);
+        write_option_string(buf, &self.collation);
+        match self.user_type_id {
+            Some(id) => {
+                write_u8(buf, 1);
+                write_u32(buf, id);
+            }
+            None => write_u8(buf, 0),
+        }
+        write_option_string(buf, &self.media_format);
+        write_option_string(buf, &self.media_storage);
+        // Tail-appended, so a column written before nested columns carried a
+        // declared shape reads back without one rather than failing to decode
+        match &self.nested_shape {
+            Some(shape) => {
+                write_u8(buf, 1);
+                shape.to_bytes(buf);
+            }
+            None => write_u8(buf, 0),
+        }
+    }
+
+    fn from_bytes(data: &[u8], off: &mut usize) -> Result<Self> {
+        let generation_expr = read_option_string(data, off)?;
+        let generation_kind = read_u8(data, off)?;
+        let encryption_algorithm = read_u8(data, off)?;
+        let encryption_key_id = read_u32(data, off)?;
+        let collation = read_option_string(data, off)?;
+        let user_type_id = match read_u8(data, off)? {
+            0 => None,
+            1 => Some(read_u32(data, off)?),
+            n => {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "invalid user_type_id presence byte {n}"
+                )));
+            }
+        };
+        let media_format = read_option_string(data, off)?;
+        let media_storage = read_option_string(data, off)?;
+        let nested_shape = if *off >= data.len() {
+            None
+        } else {
+            match read_u8(data, off)? {
+                0 => None,
+                1 => Some(NestedShape::from_bytes(data, off)?),
+                n => {
+                    return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                        "invalid nested shape presence byte {n}"
+                    )));
+                }
+            }
+        };
+        Ok(Self {
+            generation_expr,
+            generation_kind,
+            encryption_algorithm,
+            encryption_key_id,
+            collation,
+            user_type_id,
+            media_format,
+            media_storage,
+            nested_shape,
+        })
+    }
 }
 
 impl ColumnEntry {
     /// Physical storage TypeId. A TIMESTAMP(p)/TIMESTAMPTZ(p) column with
-    /// p>6 stores i128 picoseconds; everything else is its logical type.
-    /// This is the single key the executor/storage layer uses for byte
-    /// layout, so encode and decode stay consistent.
+    /// p>6 stores i128 picoseconds, an ENCRYPTED column stores opaque
+    /// ciphertext bytes; everything else is its logical type. This is the
+    /// single key the executor/storage layer uses for byte layout, so
+    /// encode and decode stay consistent.
     pub fn physical_type_id(&self) -> TypeId {
+        if self.is_encrypted() {
+            return TypeId::Bytea;
+        }
         TypeId::timestamp_physical_type_id(self.type_id, self.fractional_digits)
     }
 
@@ -151,6 +447,8 @@ impl ColumnEntry {
         // Tail-appended, so a column written before arrays carried an element
         // type reads back as None rather than as a decode failure
         write_u8(&mut buf, self.element_type.map(|t| t as u8).unwrap_or(255));
+        // Tail-appended attribute block, guarded the same way
+        self.attrs.to_bytes(&mut buf);
         buf
     }
 
@@ -190,6 +488,11 @@ impl ColumnEntry {
                 raw => Some(type_id_from_u8(raw)?),
             }
         };
+        let attrs = if off >= data.len() {
+            ColumnAttributes::default()
+        } else {
+            ColumnAttributes::from_bytes(data, &mut off)?
+        };
         Ok(Self {
             id,
             table_id,
@@ -202,7 +505,28 @@ impl ColumnEntry {
             fractional_digits,
             tz_offset_secs,
             element_type,
+            attrs,
         })
+    }
+
+    /// True when the column is GENERATED ALWAYS AS
+    pub fn is_generated(&self) -> bool {
+        self.attrs.generation_kind != ColumnAttributes::GENERATION_NONE
+    }
+
+    /// True when the column recomputes on every read
+    pub fn is_virtual_generated(&self) -> bool {
+        self.attrs.generation_kind == ColumnAttributes::GENERATION_VIRTUAL
+    }
+
+    /// True when the column materializes its expression at write time
+    pub fn is_stored_generated(&self) -> bool {
+        self.attrs.generation_kind == ColumnAttributes::GENERATION_STORED
+    }
+
+    /// True when values encrypt at write and decrypt at read
+    pub fn is_encrypted(&self) -> bool {
+        self.attrs.encryption_algorithm != ColumnAttributes::NOT_ENCRYPTED
     }
 }
 
@@ -304,6 +628,15 @@ pub struct ConstraintEntry {
     /// declared ON VIOLATION QUARANTINE, provisioned at table creation.
     #[serde(default)]
     pub quarantine_table_id: Option<u32>,
+    /// The range column a temporal PRIMARY KEY or UNIQUE declared WITHOUT
+    /// OVERLAPS on. Rows conflict only when the scalar keys match and the
+    /// periods intersect
+    #[serde(default)]
+    pub without_overlaps: Option<ColumnId>,
+    /// True when a FOREIGN KEY ended with PERIOD, matching the last column
+    /// pair by period containment
+    #[serde(default)]
+    pub fk_period: bool,
 }
 
 /// What happens to a row a constraint rejects.
@@ -367,6 +700,14 @@ impl ConstraintEntry {
                 write_u32(&mut buf, id);
             }
         }
+        match self.without_overlaps {
+            None => write_u8(&mut buf, 0),
+            Some(col) => {
+                write_u8(&mut buf, 1);
+                write_u16(&mut buf, col.0);
+            }
+        }
+        write_u8(&mut buf, self.fk_period as u8);
         buf
     }
 
@@ -408,6 +749,16 @@ impl ConstraintEntry {
         } else {
             None
         };
+        let without_overlaps = if *offset < data.len() && read_u8(data, offset)? != 0 {
+            Some(ColumnId(read_u16(data, offset)?))
+        } else {
+            None
+        };
+        let fk_period = if *offset < data.len() {
+            read_u8(data, offset)? != 0
+        } else {
+            false
+        };
         Ok(Self {
             name,
             constraint_type,
@@ -420,6 +771,8 @@ impl ConstraintEntry {
             enforced,
             on_violation,
             quarantine_table_id,
+            without_overlaps,
+            fk_period,
         })
     }
 }
@@ -1115,6 +1468,27 @@ impl LifecycleConfig {
 }
 
 /// One immutable .zyr segment file folded from the heap. The sys_rowid and
+/// A VARIANT path a segment materialized as a column of its own.
+///
+/// Written at fold time, while the rows are being rewritten anyway, so a
+/// segment either carries the path for every row it holds or does not carry
+/// it at all. That is what removes the backfill a table-level shredded
+/// column would need: there is no window in which the column is present but
+/// only partly filled, and so no reading of a null as either "the path was
+/// absent" or "this row was never shredded".
+///
+/// The stored value is the text the extraction itself produces, so reading
+/// the column and reading the path out of the json cannot disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShreddedColumn {
+    /// The VARIANT column the path was read out of
+    pub variant_column_id: u16,
+    /// Dotted path inside the variant value
+    pub path: String,
+    /// Segment column id holding the extracted text
+    pub column_id: u32,
+}
+
 /// sys_xmin ranges drive file-level pruning and the MVCC zone guard.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnarSegmentEntry {
@@ -1142,6 +1516,8 @@ pub struct ColumnarSegmentEntry {
     /// touches the segment, and ALTER TABLE MOVE reads it to report what a
     /// relocation would change.
     pub storage_tier: u8,
+    /// VARIANT paths this segment materialized, empty when it shredded none
+    pub shredded: Vec<ShreddedColumn>,
 }
 
 /// Per-table columnar tier registry. Durable so it survives WAL truncation.
@@ -1173,6 +1549,12 @@ impl ColumnarRegistry {
             write_u64(buf, seg.sys_xmin_hi);
             write_u32(buf, seg.cluster_spec_id);
             buf.push(seg.storage_tier);
+            write_u16(buf, seg.shredded.len() as u16);
+            for shred in &seg.shredded {
+                write_u16(buf, shred.variant_column_id);
+                write_string(buf, &shred.path);
+                write_u32(buf, shred.column_id);
+            }
         }
         write_u64(buf, self.next_rowid);
         write_u64(buf, self.next_file_id);
@@ -1197,6 +1579,18 @@ impl ColumnarRegistry {
             seg.sys_xmin_hi = read_u64(data, off)?;
             seg.cluster_spec_id = read_u32(data, off)?;
             seg.storage_tier = read_u8(data, off)?;
+            let shred_count = read_u16(data, off)? as usize;
+            seg.shredded.reserve(shred_count);
+            for _ in 0..shred_count {
+                let variant_column_id = read_u16(data, off)?;
+                let path = read_string(data, off)?;
+                let column_id = read_u32(data, off)?;
+                seg.shredded.push(ShreddedColumn {
+                    variant_column_id,
+                    path,
+                    column_id,
+                });
+            }
             r.segments.push(seg);
         }
         r.next_rowid = read_u64(data, off)?;
@@ -1438,6 +1832,8 @@ pub enum IndexType {
     Fulltext = 1,
     Vector = 2,
     Spatial = 3,
+    /// Combined full-text plus vector index, config carried in `parameters`
+    Hybrid = 4,
 }
 
 /// A column participating in an index.
@@ -2285,43 +2681,9 @@ impl CommentEntry {
 // ---------------------------------------------------------------------------
 
 fn type_id_from_u8(val: u8) -> Result<TypeId> {
-    match val {
-        0 => Ok(TypeId::Null),
-        1 => Ok(TypeId::Boolean),
-        10 => Ok(TypeId::Int8),
-        11 => Ok(TypeId::Int16),
-        12 => Ok(TypeId::Int32),
-        13 => Ok(TypeId::Int64),
-        14 => Ok(TypeId::Int128),
-        20 => Ok(TypeId::UInt8),
-        21 => Ok(TypeId::UInt16),
-        22 => Ok(TypeId::UInt32),
-        23 => Ok(TypeId::UInt64),
-        24 => Ok(TypeId::UInt128),
-        30 => Ok(TypeId::Float32),
-        31 => Ok(TypeId::Float64),
-        40 => Ok(TypeId::Decimal),
-        50 => Ok(TypeId::Char),
-        51 => Ok(TypeId::Varchar),
-        52 => Ok(TypeId::Text),
-        60 => Ok(TypeId::Binary),
-        61 => Ok(TypeId::Varbinary),
-        62 => Ok(TypeId::Bytea),
-        70 => Ok(TypeId::Date),
-        71 => Ok(TypeId::Time),
-        72 => Ok(TypeId::Timestamp),
-        73 => Ok(TypeId::TimestampTz),
-        74 => Ok(TypeId::Interval),
-        80 => Ok(TypeId::Uuid),
-        90 => Ok(TypeId::Json),
-        91 => Ok(TypeId::Jsonb),
-        100 => Ok(TypeId::Array),
-        110 => Ok(TypeId::Composite),
-        120 => Ok(TypeId::Vector),
-        _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
-            "unknown TypeId value: {val}"
-        ))),
-    }
+    TypeId::from_u8(val).ok_or_else(|| {
+        zyron_common::ZyronError::CatalogCorrupted(format!("unknown TypeId value: {val}"))
+    })
 }
 
 fn constraint_type_from_u8(val: u8) -> Result<ConstraintType> {
@@ -2343,6 +2705,7 @@ fn index_type_from_u8(val: u8) -> Result<IndexType> {
         1 => Ok(IndexType::Fulltext),
         2 => Ok(IndexType::Vector),
         3 => Ok(IndexType::Spatial),
+        4 => Ok(IndexType::Hybrid),
         _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
             "unknown IndexType value: {val}"
         ))),
@@ -3907,6 +4270,381 @@ impl ComplianceLogEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AnalyzerEntry
+// ---------------------------------------------------------------------------
+
+/// Catalog entry for a text analyzer: a tokenizer plus ordered char filter
+/// and token filter chains applied during full-text analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzerEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub tokenizer: String,
+    pub char_filters: Vec<String>,
+    pub token_filters: Vec<String>,
+}
+
+impl AnalyzerEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.tokenizer);
+        write_u32(&mut buf, self.char_filters.len() as u32);
+        for filter in &self.char_filters {
+            write_string(&mut buf, filter);
+        }
+        write_u32(&mut buf, self.token_filters.len() as u32);
+        for filter in &self.token_filters {
+            write_string(&mut buf, filter);
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let tokenizer = read_string(data, &mut off)?;
+        let char_count = read_u32(data, &mut off)? as usize;
+        let mut char_filters = Vec::with_capacity(char_count);
+        for _ in 0..char_count {
+            char_filters.push(read_string(data, &mut off)?);
+        }
+        let token_count = read_u32(data, &mut off)? as usize;
+        let mut token_filters = Vec::with_capacity(token_count);
+        for _ in 0..token_count {
+            token_filters.push(read_string(data, &mut off)?);
+        }
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            tokenizer,
+            char_filters,
+            token_filters,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SynonymDictionaryEntry
+// ---------------------------------------------------------------------------
+
+/// One synonym rule inside a dictionary. `terms` are the matched inputs and
+/// `targets` are the expansions they map to
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SynonymRuleEntry {
+    pub terms: Vec<String>,
+    pub targets: Vec<String>,
+}
+
+/// Catalog entry for a synonym dictionary: a named, ordered set of synonym
+/// rules referenced by full-text analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SynonymDictionaryEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub rules: Vec<SynonymRuleEntry>,
+}
+
+impl SynonymDictionaryEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.rules.len() as u32);
+        for rule in &self.rules {
+            write_u32(&mut buf, rule.terms.len() as u32);
+            for term in &rule.terms {
+                write_string(&mut buf, term);
+            }
+            write_u32(&mut buf, rule.targets.len() as u32);
+            for target in &rule.targets {
+                write_string(&mut buf, target);
+            }
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let rule_count = read_u32(data, &mut off)? as usize;
+        let mut rules = Vec::with_capacity(rule_count);
+        for _ in 0..rule_count {
+            let term_count = read_u32(data, &mut off)? as usize;
+            let mut terms = Vec::with_capacity(term_count);
+            for _ in 0..term_count {
+                terms.push(read_string(data, &mut off)?);
+            }
+            let target_count = read_u32(data, &mut off)? as usize;
+            let mut targets = Vec::with_capacity(target_count);
+            for _ in 0..target_count {
+                targets.push(read_string(data, &mut off)?);
+            }
+            rules.push(SynonymRuleEntry { terms, targets });
+        }
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            rules,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResiliencePolicyEntry
+// ---------------------------------------------------------------------------
+
+/// Kind discriminant for a resilience policy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ResiliencePolicyKind {
+    Bulkhead = 0,
+    Retry = 1,
+}
+
+impl ResiliencePolicyKind {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(ResiliencePolicyKind::Bulkhead),
+            1 => Ok(ResiliencePolicyKind::Retry),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown ResiliencePolicyKind value: {val}"
+            ))),
+        }
+    }
+}
+
+/// Catalog entry for a resilience policy. A bulkhead policy bounds concurrent
+/// admissions with a wait queue; a retry policy re-runs failed work with the
+/// configured backoff. Both kinds share one name space within a schema, so
+/// the fields of the other kind sit at their zero values
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResiliencePolicyEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub kind: ResiliencePolicyKind,
+    pub max_concurrent: u32,
+    pub queue_size: u32,
+    pub max_wait_ms: u64,
+    pub max_attempts: u32,
+    pub backoff: String,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub jitter: f64,
+    pub retryable_errors: Vec<String>,
+}
+
+impl ResiliencePolicyEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(96);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u8(&mut buf, self.kind as u8);
+        write_u32(&mut buf, self.max_concurrent);
+        write_u32(&mut buf, self.queue_size);
+        write_u64(&mut buf, self.max_wait_ms);
+        write_u32(&mut buf, self.max_attempts);
+        write_string(&mut buf, &self.backoff);
+        write_u64(&mut buf, self.base_delay_ms);
+        write_u64(&mut buf, self.max_delay_ms);
+        write_u64(&mut buf, self.jitter.to_bits());
+        write_u32(&mut buf, self.retryable_errors.len() as u32);
+        for err in &self.retryable_errors {
+            write_string(&mut buf, err);
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let kind = ResiliencePolicyKind::from_u8(read_u8(data, &mut off)?)?;
+        let max_concurrent = read_u32(data, &mut off)?;
+        let queue_size = read_u32(data, &mut off)?;
+        let max_wait_ms = read_u64(data, &mut off)?;
+        let max_attempts = read_u32(data, &mut off)?;
+        let backoff = read_string(data, &mut off)?;
+        let base_delay_ms = read_u64(data, &mut off)?;
+        let max_delay_ms = read_u64(data, &mut off)?;
+        let jitter = f64::from_bits(read_u64(data, &mut off)?);
+        let err_count = read_u32(data, &mut off)? as usize;
+        let mut retryable_errors = Vec::with_capacity(err_count);
+        for _ in 0..err_count {
+            retryable_errors.push(read_string(data, &mut off)?);
+        }
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            kind,
+            max_concurrent,
+            queue_size,
+            max_wait_ms,
+            max_attempts,
+            backoff,
+            base_delay_ms,
+            max_delay_ms,
+            jitter,
+            retryable_errors,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UserTypeEntry
+// ---------------------------------------------------------------------------
+
+/// Catalog entry for a user-defined type: a named alias over one of the
+/// built-in storage types with an optional check constraint and optional
+/// input and output cast expressions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTypeEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub storage_type_id: TypeId,
+    pub storage_max_length: Option<u32>,
+    pub storage_fractional_digits: Option<u8>,
+    pub check_expr: Option<String>,
+    pub input_cast_expr: Option<String>,
+    pub output_cast_expr: Option<String>,
+}
+
+impl UserTypeEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u8(&mut buf, self.storage_type_id as u8);
+        match self.storage_max_length {
+            Some(len) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, len);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        match self.storage_fractional_digits {
+            Some(digits) => {
+                write_u8(&mut buf, 1);
+                write_u8(&mut buf, digits);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        write_option_string(&mut buf, &self.check_expr);
+        write_option_string(&mut buf, &self.input_cast_expr);
+        write_option_string(&mut buf, &self.output_cast_expr);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let storage_type_id = type_id_from_u8(read_u8(data, &mut off)?)?;
+        let storage_max_length = match read_u8(data, &mut off)? {
+            0 => None,
+            1 => Some(read_u32(data, &mut off)?),
+            n => {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "invalid storage_max_length presence byte {n}"
+                )));
+            }
+        };
+        let storage_fractional_digits = match read_u8(data, &mut off)? {
+            0 => None,
+            1 => Some(read_u8(data, &mut off)?),
+            n => {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "invalid storage_fractional_digits presence byte {n}"
+                )));
+            }
+        };
+        let check_expr = read_option_string(data, &mut off)?;
+        let input_cast_expr = read_option_string(data, &mut off)?;
+        let output_cast_expr = read_option_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            storage_type_id,
+            storage_max_length,
+            storage_fractional_digits,
+            check_expr,
+            input_cast_expr,
+            output_cast_expr,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CollationEntry
+// ---------------------------------------------------------------------------
+
+/// Catalog entry for a collation: a named locale and provider pair with the
+/// comparison flags string ordering reads
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollationEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub locale: String,
+    pub provider: String,
+    pub deterministic: bool,
+    pub case_sensitive: bool,
+}
+
+impl CollationEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.locale);
+        write_string(&mut buf, &self.provider);
+        write_bool(&mut buf, self.deterministic);
+        write_bool(&mut buf, self.case_sensitive);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let locale = read_string(data, &mut off)?;
+        let provider = read_string(data, &mut off)?;
+        let deterministic = read_bool(data, &mut off)?;
+        let case_sensitive = read_bool(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            locale,
+            provider,
+            deterministic,
+            case_sensitive,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3957,6 +4695,7 @@ mod tests {
             fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
+            attrs: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -3981,6 +4720,7 @@ mod tests {
             fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
+            attrs: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -4010,6 +4750,7 @@ mod tests {
                 fractional_digits: p,
                 tz_offset_secs: off,
                 element_type: None,
+                attrs: Default::default(),
             };
             let decoded = ColumnEntry::from_bytes(&entry.to_bytes()).unwrap();
             assert_eq!(decoded.fractional_digits, p, "precision {p:?}");
@@ -4038,6 +4779,7 @@ mod tests {
                     fractional_digits: None,
                     tz_offset_secs: None,
                     element_type: None,
+                    attrs: Default::default(),
                 },
                 ColumnEntry {
                     id: ColumnId(1),
@@ -4051,6 +4793,7 @@ mod tests {
                     fractional_digits: None,
                     tz_offset_secs: None,
                     element_type: None,
+                    attrs: Default::default(),
                 },
             ],
             constraints: vec![ConstraintEntry {
@@ -4065,6 +4808,8 @@ mod tests {
                 enforced: true,
                 on_violation: ConstraintViolationAction::Fail,
                 quarantine_table_id: None,
+                without_overlaps: None,
+                fk_period: false,
             }],
             created_at: 1700000000,
             versioning_enabled: false,
@@ -4111,6 +4856,8 @@ mod tests {
             enforced: true,
             on_violation: ConstraintViolationAction::Fail,
             quarantine_table_id: None,
+            without_overlaps: None,
+            fk_period: false,
         };
         let bytes = entry.to_bytes();
         let mut off = 0;
@@ -4181,15 +4928,43 @@ mod tests {
             TypeId::Uuid,
             TypeId::Json,
             TypeId::Jsonb,
+            TypeId::Variant,
             TypeId::Array,
             TypeId::Composite,
+            TypeId::Struct,
+            TypeId::Map,
+            TypeId::Ltree,
             TypeId::Vector,
+            TypeId::Geometry,
+            TypeId::Matrix,
+            TypeId::Color,
+            TypeId::SemVer,
+            TypeId::Inet,
+            TypeId::Cidr,
+            TypeId::MacAddr,
+            TypeId::Money,
+            TypeId::Range,
+            TypeId::HyperLogLog,
+            TypeId::BloomFilter,
+            TypeId::TDigest,
+            TypeId::CountMinSketch,
+            TypeId::Bitfield,
+            TypeId::Quantity,
+            TypeId::Image,
+            TypeId::Video,
+            TypeId::Audio,
+            TypeId::Document,
+            TypeId::ExternalRef,
         ];
         for tid in all_types {
             let val = tid as u8;
             let decoded = type_id_from_u8(val).unwrap();
             assert_eq!(decoded, tid, "roundtrip failed for {tid:?}");
         }
+        // Bytes above 120 decode through the shared TypeId table, the
+        // previous hand-maintained match stopped at Vector and rejected them
+        assert_eq!(type_id_from_u8(130).unwrap(), TypeId::Geometry);
+        assert!(type_id_from_u8(255).is_err());
     }
 
     #[test]
@@ -4718,5 +5493,190 @@ mod tests {
         // A pass that accepts nothing leaves the declared set in force
         cluster.set_active_keys(&[]);
         assert_eq!(cluster.effective_keys()[0].column_id, 3);
+    }
+
+    #[test]
+    fn test_analyzer_entry_roundtrip() {
+        let populated = AnalyzerEntry {
+            id: 10001,
+            schema_id: SchemaId(7),
+            name: "english_stem".to_string(),
+            tokenizer: "standard".to_string(),
+            char_filters: vec!["html_strip".to_string(), "lowercase_map".to_string()],
+            token_filters: vec!["stop".to_string(), "porter_stem".to_string()],
+        };
+        let decoded = AnalyzerEntry::from_bytes(&populated.to_bytes()).expect("decodes");
+        assert_eq!(decoded.id, populated.id);
+        assert_eq!(decoded.schema_id, populated.schema_id);
+        assert_eq!(decoded.name, populated.name);
+        assert_eq!(decoded.tokenizer, populated.tokenizer);
+        assert_eq!(decoded.char_filters, populated.char_filters);
+        assert_eq!(decoded.token_filters, populated.token_filters);
+
+        let empty = AnalyzerEntry {
+            id: 10002,
+            schema_id: SchemaId(7),
+            name: "bare".to_string(),
+            tokenizer: "whitespace".to_string(),
+            char_filters: vec![],
+            token_filters: vec![],
+        };
+        let decoded = AnalyzerEntry::from_bytes(&empty.to_bytes()).expect("decodes");
+        assert!(decoded.char_filters.is_empty());
+        assert!(decoded.token_filters.is_empty());
+    }
+
+    #[test]
+    fn test_synonym_dictionary_entry_roundtrip() {
+        let populated = SynonymDictionaryEntry {
+            id: 10010,
+            schema_id: SchemaId(3),
+            name: "product_terms".to_string(),
+            rules: vec![
+                SynonymRuleEntry {
+                    terms: vec!["laptop".to_string(), "notebook".to_string()],
+                    targets: vec!["computer".to_string()],
+                },
+                SynonymRuleEntry {
+                    terms: vec!["tv".to_string()],
+                    targets: vec!["television".to_string(), "display".to_string()],
+                },
+            ],
+        };
+        let decoded = SynonymDictionaryEntry::from_bytes(&populated.to_bytes()).expect("decodes");
+        assert_eq!(decoded.id, populated.id);
+        assert_eq!(decoded.schema_id, populated.schema_id);
+        assert_eq!(decoded.name, populated.name);
+        assert_eq!(decoded.rules.len(), 2);
+        assert_eq!(decoded.rules[0].terms, populated.rules[0].terms);
+        assert_eq!(decoded.rules[0].targets, populated.rules[0].targets);
+        assert_eq!(decoded.rules[1].terms, populated.rules[1].terms);
+        assert_eq!(decoded.rules[1].targets, populated.rules[1].targets);
+
+        let empty = SynonymDictionaryEntry {
+            id: 10011,
+            schema_id: SchemaId(3),
+            name: "empty_dict".to_string(),
+            rules: vec![],
+        };
+        let decoded = SynonymDictionaryEntry::from_bytes(&empty.to_bytes()).expect("decodes");
+        assert!(decoded.rules.is_empty());
+    }
+
+    #[test]
+    fn test_resilience_policy_entry_roundtrip() {
+        let retry = ResiliencePolicyEntry {
+            id: 10020,
+            schema_id: SchemaId(4),
+            name: "retry_flaky".to_string(),
+            kind: ResiliencePolicyKind::Retry,
+            max_concurrent: 0,
+            queue_size: 0,
+            max_wait_ms: 0,
+            max_attempts: 5,
+            backoff: "exponential".to_string(),
+            base_delay_ms: 100,
+            max_delay_ms: 30000,
+            jitter: 0.25,
+            retryable_errors: vec!["timeout".to_string(), "connection_reset".to_string()],
+        };
+        let decoded = ResiliencePolicyEntry::from_bytes(&retry.to_bytes()).expect("decodes");
+        assert_eq!(decoded.id, retry.id);
+        assert_eq!(decoded.schema_id, retry.schema_id);
+        assert_eq!(decoded.name, retry.name);
+        assert_eq!(decoded.kind, ResiliencePolicyKind::Retry);
+        assert_eq!(decoded.max_attempts, retry.max_attempts);
+        assert_eq!(decoded.backoff, retry.backoff);
+        assert_eq!(decoded.base_delay_ms, retry.base_delay_ms);
+        assert_eq!(decoded.max_delay_ms, retry.max_delay_ms);
+        assert_eq!(decoded.jitter.to_bits(), retry.jitter.to_bits());
+        assert_eq!(decoded.retryable_errors, retry.retryable_errors);
+
+        let bulkhead = ResiliencePolicyEntry {
+            id: 10021,
+            schema_id: SchemaId(4),
+            name: "bulkhead_reports".to_string(),
+            kind: ResiliencePolicyKind::Bulkhead,
+            max_concurrent: 8,
+            queue_size: 64,
+            max_wait_ms: 5000,
+            max_attempts: 0,
+            backoff: String::new(),
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter: 0.0,
+            retryable_errors: vec![],
+        };
+        let decoded = ResiliencePolicyEntry::from_bytes(&bulkhead.to_bytes()).expect("decodes");
+        assert_eq!(decoded.kind, ResiliencePolicyKind::Bulkhead);
+        assert_eq!(decoded.max_concurrent, 8);
+        assert_eq!(decoded.queue_size, 64);
+        assert_eq!(decoded.max_wait_ms, 5000);
+        assert!(decoded.retryable_errors.is_empty());
+
+        assert!(ResiliencePolicyKind::from_u8(2).is_err());
+    }
+
+    #[test]
+    fn test_user_type_entry_roundtrip() {
+        let populated = UserTypeEntry {
+            id: 10030,
+            schema_id: SchemaId(2),
+            name: "email".to_string(),
+            storage_type_id: TypeId::Varchar,
+            storage_max_length: Some(320),
+            storage_fractional_digits: None,
+            check_expr: Some("VALUE LIKE '%@%'".to_string()),
+            input_cast_expr: Some("lower(VALUE)".to_string()),
+            output_cast_expr: None,
+        };
+        let decoded = UserTypeEntry::from_bytes(&populated.to_bytes()).expect("decodes");
+        assert_eq!(decoded.id, populated.id);
+        assert_eq!(decoded.schema_id, populated.schema_id);
+        assert_eq!(decoded.name, populated.name);
+        assert_eq!(decoded.storage_type_id, TypeId::Varchar);
+        assert_eq!(decoded.storage_max_length, Some(320));
+        assert_eq!(decoded.storage_fractional_digits, None);
+        assert_eq!(decoded.check_expr, populated.check_expr);
+        assert_eq!(decoded.input_cast_expr, populated.input_cast_expr);
+        assert_eq!(decoded.output_cast_expr, None);
+
+        let bare = UserTypeEntry {
+            id: 10031,
+            schema_id: SchemaId(2),
+            name: "money".to_string(),
+            storage_type_id: TypeId::Decimal,
+            storage_max_length: None,
+            storage_fractional_digits: Some(2),
+            check_expr: None,
+            input_cast_expr: None,
+            output_cast_expr: None,
+        };
+        let decoded = UserTypeEntry::from_bytes(&bare.to_bytes()).expect("decodes");
+        assert_eq!(decoded.storage_type_id, TypeId::Decimal);
+        assert_eq!(decoded.storage_max_length, None);
+        assert_eq!(decoded.storage_fractional_digits, Some(2));
+        assert_eq!(decoded.check_expr, None);
+    }
+
+    #[test]
+    fn test_collation_entry_roundtrip() {
+        let entry = CollationEntry {
+            id: 10040,
+            schema_id: SchemaId(5),
+            name: "en_ci".to_string(),
+            locale: "en-US".to_string(),
+            provider: "icu".to_string(),
+            deterministic: true,
+            case_sensitive: false,
+        };
+        let decoded = CollationEntry::from_bytes(&entry.to_bytes()).expect("decodes");
+        assert_eq!(decoded.id, entry.id);
+        assert_eq!(decoded.schema_id, entry.schema_id);
+        assert_eq!(decoded.name, entry.name);
+        assert_eq!(decoded.locale, entry.locale);
+        assert_eq!(decoded.provider, entry.provider);
+        assert_eq!(decoded.deterministic, true);
+        assert_eq!(decoded.case_sensitive, false);
     }
 }

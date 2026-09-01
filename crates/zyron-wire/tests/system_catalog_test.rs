@@ -530,15 +530,18 @@ async fn test_stat_views_answer_under_their_new_names() {
     }
 }
 
-/// The recommendation view names its canonical target and renders a runnable
-/// statement for each row it produces.
+/// The recommendation function names its canonical target and renders a
+/// runnable statement for each row it produces. It is a table function so
+/// it can take an optional schema name filter.
 #[tokio::test]
 async fn test_recommend_indexes_answers() {
     let (server, _schema, _tmp) = create_test_server().await;
-    let (columns, rows) = read(&server, "SELECT * FROM zyron_sys.query.recommend_indexes")
+    let (columns, rows) = read(&server, "SELECT * FROM zyron_sys.query.recommend_indexes()")
         .await
         .expect("recommendations");
     assert!(columns.contains(&"create_statement".to_string()));
+    assert!(columns.contains(&"estimated_benefit_score".to_string()));
+    assert!(columns.contains(&"sample_query".to_string()));
     for row in &rows {
         let at = columns
             .iter()

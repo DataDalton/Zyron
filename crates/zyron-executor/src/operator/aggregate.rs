@@ -72,6 +72,19 @@ pub(crate) trait Accumulator: std::any::Any + Send {
         Ok(())
     }
 
+    /// Folds one row of an aggregate taking more than one argument.
+    ///
+    /// Most aggregates read a single column and the default hands them that
+    /// one, so only the accumulators that correlate two columns override
+    /// this. A correlation cannot be computed from either column alone, so
+    /// the pairing has to survive as far as the accumulator
+    fn update_row_checked(&mut self, cols: &[Cow<'_, Column>], row: usize) -> Result<()> {
+        match cols.first() {
+            Some(col) => self.update_typed_checked(col.as_ref(), row),
+            None => self.update_checked(&ScalarValue::Int64(1)),
+        }
+    }
+
     fn add_count_checked(&mut self, n: usize) -> Result<()> {
         self.add_count(n);
         Ok(())
@@ -566,6 +579,7 @@ fn eval_const(expr: &BoundExpr) -> Result<ScalarValue> {
     let batch = DataBatch {
         columns: Vec::new(),
         num_rows: 1,
+        resolved: Vec::new(),
     };
     let col = crate::expr::evaluate(expr, &batch, &[], &[])?;
     Ok(col_scalar(&col, 0))
@@ -626,6 +640,7 @@ impl UdaAccumulator {
         let batch = DataBatch {
             columns: vec![state_col, input_col],
             num_rows: 1,
+            resolved: Vec::new(),
         };
         match crate::expr::evaluate(&self.sfunc, &batch, &self.sfunc_schema, &[]) {
             Ok(col) => {
@@ -649,6 +664,7 @@ impl UdaAccumulator {
                 let batch = DataBatch {
                     columns: vec![state_col],
                     num_rows: 1,
+                    resolved: Vec::new(),
                 };
                 let col = crate::expr::evaluate(ff, &batch, &self.final_schema, &[])?;
                 Ok(col_scalar(&col, 0))
@@ -712,6 +728,359 @@ fn create_accumulator(agg: &AggregateExpr) -> Box<dyn Accumulator> {
     }
 }
 
+/// Which sketch a merging accumulator folds, and the primitive that folds
+/// two of them
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SketchKind {
+    HyperLogLog,
+    Bloom,
+    TDigest,
+    CountMinSketch,
+}
+
+impl SketchKind {
+    fn merge_bytes(self, a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            SketchKind::HyperLogLog => zyron_types::probabilistic::hll_merge(a, b),
+            SketchKind::Bloom => zyron_types::probabilistic::bloom_merge(a, b),
+            SketchKind::TDigest => zyron_types::probabilistic::tdigest_merge(a, b),
+            SketchKind::CountMinSketch => zyron_types::probabilistic::cms_merge(a, b),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SketchKind::HyperLogLog => "hll_merge_agg",
+            SketchKind::Bloom => "bloom_merge_agg",
+            SketchKind::TDigest => "tdigest_merge_agg",
+            SketchKind::CountMinSketch => "cms_merge_agg",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "hll_merge_agg" => Some(SketchKind::HyperLogLog),
+            "bloom_merge_agg" => Some(SketchKind::Bloom),
+            "tdigest_merge_agg" => Some(SketchKind::TDigest),
+            "cms_merge_agg" => Some(SketchKind::CountMinSketch),
+            _ => None,
+        }
+    }
+}
+
+/// Folds a group's sketches into one.
+///
+/// A sketch exists so a partial result can be combined without revisiting
+/// the rows behind it, which is what a rollup over pre built sketches needs.
+/// This keeps one merged image and folds each incoming value into it, so its
+/// memory is the size of a single sketch however many rows the group holds,
+/// and merging is associative, so partitions combine without changing the
+/// answer.
+///
+/// A value that is not a sketch of this kind fails the aggregate rather than
+/// being skipped. A merge that quietly dropped an unreadable input would
+/// report a smaller population than the data holds, and a sketch nobody can
+/// tell is wrong is worse than an error.
+pub(crate) struct SketchMergeAccumulator {
+    kind: SketchKind,
+    merged: Option<Vec<u8>>,
+    error: Option<String>,
+}
+
+impl SketchMergeAccumulator {
+    pub(crate) fn new(kind: SketchKind) -> Self {
+        Self {
+            kind,
+            merged: None,
+            error: None,
+        }
+    }
+
+    fn fold(&mut self, bytes: &[u8]) {
+        match self.merged.take() {
+            None => self.merged = Some(bytes.to_vec()),
+            Some(current) => match self.kind.merge_bytes(&current, bytes) {
+                Ok(merged) => self.merged = Some(merged),
+                Err(e) => self.error = Some(format!("{}: {e}", self.kind.name())),
+            },
+        }
+    }
+}
+
+impl Accumulator for SketchMergeAccumulator {
+    fn update(&mut self, value: &ScalarValue) {
+        if self.error.is_some() {
+            return;
+        }
+        match value {
+            ScalarValue::Null => {}
+            ScalarValue::Binary(b) => {
+                let bytes = b.clone();
+                self.fold(&bytes);
+            }
+            other => {
+                self.error = Some(format!(
+                    "{} takes a sketch value, got {other:?}",
+                    self.kind.name()
+                ));
+            }
+        }
+    }
+
+    fn finalize(&self) -> ScalarValue {
+        match &self.merged {
+            Some(bytes) if self.error.is_none() => ScalarValue::Binary(bytes.clone()),
+            _ => ScalarValue::Null,
+        }
+    }
+
+    fn finalize_checked(&self) -> Result<ScalarValue> {
+        match &self.error {
+            Some(message) => Err(ZyronError::ExecutionError(message.clone())),
+            None => Ok(self.finalize()),
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Accumulator) {
+        let peer: &SketchMergeAccumulator = merge_peer(other);
+        if self.error.is_some() {
+            return;
+        }
+        if let Some(message) = &peer.error {
+            self.error = Some(message.clone());
+            return;
+        }
+        if let Some(bytes) = &peer.merged {
+            let bytes = bytes.clone();
+            self.fold(&bytes);
+        }
+    }
+
+    fn supports_parallel_merge(&self) -> bool {
+        true
+    }
+
+    fn reset(&mut self) {
+        self.merged = None;
+        self.error = None;
+    }
+}
+
+/// A row's numeric value, or None when it is null or not a number
+fn numeric_at(col: &Column, row: usize) -> Option<f64> {
+    if col.is_null(row) {
+        return None;
+    }
+    match col.get_scalar(row) {
+        ScalarValue::Int8(v) => Some(v as f64),
+        ScalarValue::Int16(v) => Some(v as f64),
+        ScalarValue::Int32(v) => Some(v as f64),
+        ScalarValue::Int64(v) => Some(v as f64),
+        ScalarValue::Int128(v) => Some(v as f64),
+        ScalarValue::UInt8(v) => Some(v as f64),
+        ScalarValue::UInt16(v) => Some(v as f64),
+        ScalarValue::UInt32(v) => Some(v as f64),
+        ScalarValue::UInt64(v) => Some(v as f64),
+        ScalarValue::Float32(v) => Some(v as f64),
+        ScalarValue::Float64(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Which statistic a paired accumulator reports from the same sums
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairStatistic {
+    Correlation,
+    Covariance,
+}
+
+/// Correlation and covariance over two columns.
+///
+/// Both read the same running sums, so they share one accumulator and
+/// differ only in what they report at the end. The sums are kept in the
+/// shifted form, taking the first pair as the origin, because summing raw
+/// products of large values loses the precision the difference of means
+/// depends on, and a shift costs one subtraction per row.
+///
+/// A row is folded only when both values are present. A pair is what the
+/// statistic is defined over, so a row holding one half of one says
+/// nothing and is skipped rather than counted as a zero.
+pub(crate) struct PairAccumulator {
+    statistic: PairStatistic,
+    count: u64,
+    origin: Option<(f64, f64)>,
+    sum_x: f64,
+    sum_y: f64,
+    sum_xx: f64,
+    sum_yy: f64,
+    sum_xy: f64,
+}
+
+impl PairAccumulator {
+    pub(crate) fn new(statistic: PairStatistic) -> Self {
+        Self {
+            statistic,
+            count: 0,
+            origin: None,
+            sum_x: 0.0,
+            sum_y: 0.0,
+            sum_xx: 0.0,
+            sum_yy: 0.0,
+            sum_xy: 0.0,
+        }
+    }
+
+    fn fold(&mut self, x: f64, y: f64) {
+        let (ox, oy) = *self.origin.get_or_insert((x, y));
+        let dx = x - ox;
+        let dy = y - oy;
+        self.count += 1;
+        self.sum_x += dx;
+        self.sum_y += dy;
+        self.sum_xx += dx * dx;
+        self.sum_yy += dy * dy;
+        self.sum_xy += dx * dy;
+    }
+
+    /// Sum of products of deviations from the mean, in the shifted frame
+    fn centered(&self) -> (f64, f64, f64) {
+        let n = self.count as f64;
+        let sxx = self.sum_xx - self.sum_x * self.sum_x / n;
+        let syy = self.sum_yy - self.sum_y * self.sum_y / n;
+        let sxy = self.sum_xy - self.sum_x * self.sum_y / n;
+        (sxx, syy, sxy)
+    }
+}
+
+impl Accumulator for PairAccumulator {
+    fn update(&mut self, _value: &ScalarValue) {
+        // A single value is half a pair and says nothing on its own. The
+        // operator drives this through update_row_checked instead
+    }
+
+    fn update_row_checked(&mut self, cols: &[Cow<'_, Column>], row: usize) -> Result<()> {
+        let (Some(x), Some(y)) = (cols.first(), cols.get(1)) else {
+            return Err(ZyronError::ExecutionError(
+                "correlation and covariance take two arguments".to_string(),
+            ));
+        };
+        if let (Some(xv), Some(yv)) = (numeric_at(x.as_ref(), row), numeric_at(y.as_ref(), row)) {
+            self.fold(xv, yv);
+        }
+        Ok(())
+    }
+
+    fn finalize(&self) -> ScalarValue {
+        match self.statistic {
+            // A sample covariance needs two pairs to have a denominator
+            PairStatistic::Covariance => {
+                if self.count < 2 {
+                    return ScalarValue::Null;
+                }
+                let (_, _, sxy) = self.centered();
+                ScalarValue::Float64(sxy / (self.count as f64 - 1.0))
+            }
+            // A correlation is undefined when either side never varies,
+            // because the ratio divides by that variation
+            PairStatistic::Correlation => {
+                if self.count < 2 {
+                    return ScalarValue::Null;
+                }
+                let (sxx, syy, sxy) = self.centered();
+                if sxx <= 0.0 || syy <= 0.0 {
+                    return ScalarValue::Null;
+                }
+                ScalarValue::Float64(sxy / (sxx * syy).sqrt())
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.count = 0;
+        self.origin = None;
+        self.sum_x = 0.0;
+        self.sum_y = 0.0;
+        self.sum_xx = 0.0;
+        self.sum_yy = 0.0;
+        self.sum_xy = 0.0;
+    }
+}
+
+/// Time weighted average of a value over the interval each reading covers.
+///
+/// A reading taken every second and one taken every hour do not carry the
+/// same weight in an average over time, so each value is weighted by the
+/// gap to the next reading. The last reading closes no interval and so
+/// contributes no weight, which is what keeps the result the average over
+/// the observed span rather than over an interval that has not finished.
+///
+/// Readings are folded in the order the operator delivers them, so an
+/// ORDER BY on the time column is what makes the weights the real gaps.
+pub(crate) struct TimeWeightAccumulator {
+    previous: Option<(f64, f64)>,
+    weighted: f64,
+    span: f64,
+}
+
+impl TimeWeightAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            previous: None,
+            weighted: 0.0,
+            span: 0.0,
+        }
+    }
+}
+
+impl Accumulator for TimeWeightAccumulator {
+    fn update(&mut self, _value: &ScalarValue) {
+        // A value without its timestamp carries no weight
+    }
+
+    fn update_row_checked(&mut self, cols: &[Cow<'_, Column>], row: usize) -> Result<()> {
+        let (Some(value), Some(time)) = (cols.first(), cols.get(1)) else {
+            return Err(ZyronError::ExecutionError(
+                "time_weight takes a value and a time".to_string(),
+            ));
+        };
+        let (Some(v), Some(t)) = (
+            numeric_at(value.as_ref(), row),
+            numeric_at(time.as_ref(), row),
+        ) else {
+            return Ok(());
+        };
+        if let Some((pv, pt)) = self.previous {
+            let width = t - pt;
+            // Readings out of order would subtract span from the average,
+            // so a step backwards contributes nothing rather than a
+            // negative weight
+            if width > 0.0 {
+                self.weighted += pv * width;
+                self.span += width;
+            }
+        }
+        self.previous = Some((v, t));
+        Ok(())
+    }
+
+    fn finalize(&self) -> ScalarValue {
+        if self.span <= 0.0 {
+            // One reading covers no interval, so its value is the answer
+            return match self.previous {
+                Some((v, _)) => ScalarValue::Float64(v),
+                None => ScalarValue::Null,
+            };
+        }
+        ScalarValue::Float64(self.weighted / self.span)
+    }
+
+    fn reset(&mut self) {
+        self.previous = None;
+        self.weighted = 0.0;
+        self.span = 0.0;
+    }
+}
+
 pub(crate) fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
     match name.to_lowercase().as_str() {
         "count" => {
@@ -743,7 +1112,13 @@ pub(crate) fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumu
             mean: 0.0,
             m2: 0.0,
         }),
-        _ => Box::new(CountAccumulator { count: 0 }),
+        "correlation_agg" => Box::new(PairAccumulator::new(PairStatistic::Correlation)),
+        "covariance_agg" => Box::new(PairAccumulator::new(PairStatistic::Covariance)),
+        "time_weight" => Box::new(TimeWeightAccumulator::new()),
+        other => match SketchKind::from_name(other) {
+            Some(kind) => Box::new(SketchMergeAccumulator::new(kind)),
+            None => Box::new(CountAccumulator { count: 0 }),
+        },
     }
 }
 
@@ -751,7 +1126,7 @@ pub(crate) fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumu
 /// MUST list the same set as the matched arms above; the catch-all there
 /// returns a COUNT accumulator, so callers validate up front and error rather
 /// than silently computing a COUNT for an unimplemented aggregate.
-pub(crate) fn is_supported_aggregate(name: &str) -> bool {
+pub fn is_supported_aggregate(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
         "count"
@@ -766,6 +1141,13 @@ pub(crate) fn is_supported_aggregate(name: &str) -> bool {
             | "stddev_sample_agg"
             | "variance_agg"
             | "variance"
+            | "hll_merge_agg"
+            | "bloom_merge_agg"
+            | "tdigest_merge_agg"
+            | "cms_merge_agg"
+            | "correlation_agg"
+            | "covariance_agg"
+            | "time_weight"
     )
 }
 
@@ -1138,36 +1520,36 @@ impl HashAggregateOperator {
                         // Resolve each aggregate's input column. ColumnRef
                         // arguments borrow directly from the batch so SUM,
                         // AVG, etc. on a base column do not allocate.
-                        let agg_arg_cols: Vec<Option<Cow<'_, Column>>> = self
+                        let agg_arg_cols: Vec<Vec<Cow<'_, Column>>> = self
                             .aggregates
                             .iter()
                             .map(|agg| {
-                                if agg.args.is_empty() {
-                                    Ok(None)
-                                } else {
-                                    Ok(Some(evaluate_borrowed(
-                                        &agg.args[0],
-                                        batch,
-                                        &self.input_schema,
-                                        &[],
-                                    )?))
-                                }
+                                agg.args
+                                    .iter()
+                                    .map(|arg| {
+                                        evaluate_borrowed(arg, batch, &self.input_schema, &[])
+                                    })
+                                    .collect::<Result<Vec<_>>>()
                             })
                             .collect::<Result<Vec<_>>>()?;
 
                         let accs = &mut group_accumulators[0];
                         for (i, acc) in accs.iter_mut().enumerate() {
-                            match &agg_arg_cols[i] {
+                            let cols = &agg_arg_cols[i];
+                            if cols.is_empty() {
                                 // COUNT(*)-style: fold the whole batch in one
                                 // add instead of a per-row loop.
-                                None => acc.add_count_checked(num_rows)?,
+                                acc.add_count_checked(num_rows)?;
+                            } else if cols.len() == 1 {
                                 // Aggregates over a column still walk rows so
                                 // nulls and per-value math are handled.
-                                Some(col) => {
-                                    let c = col.as_ref();
-                                    for row in 0..num_rows {
-                                        acc.update_typed_checked(c, row)?;
-                                    }
+                                let c = cols[0].as_ref();
+                                for row in 0..num_rows {
+                                    acc.update_typed_checked(c, row)?;
+                                }
+                            } else {
+                                for row in 0..num_rows {
+                                    acc.update_row_checked(cols, row)?;
                                 }
                             }
                         }
@@ -1444,19 +1826,13 @@ impl GroupAccumulatorState {
             .iter()
             .map(|expr| evaluate_borrowed(expr, batch, input_schema, &[]))
             .collect::<Result<Vec<_>>>()?;
-        let agg_arg_cols: Vec<Option<Cow<'_, Column>>> = aggregates
+        let agg_arg_cols: Vec<Vec<Cow<'_, Column>>> = aggregates
             .iter()
             .map(|agg| {
-                if agg.args.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(evaluate_borrowed(
-                        &agg.args[0],
-                        batch,
-                        input_schema,
-                        &[],
-                    )?))
-                }
+                agg.args
+                    .iter()
+                    .map(|arg| evaluate_borrowed(arg, batch, input_schema, &[]))
+                    .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1521,10 +1897,7 @@ impl GroupAccumulatorState {
             };
             let accs = &mut group_accumulators[gidx];
             for (i, acc) in accs.iter_mut().enumerate() {
-                match &agg_arg_cols[i] {
-                    Some(col) => acc.update_typed_checked(col.as_ref(), row)?,
-                    None => acc.update_checked(&ScalarValue::Int64(1))?,
-                }
+                acc.update_row_checked(&agg_arg_cols[i], row)?;
             }
         }
 

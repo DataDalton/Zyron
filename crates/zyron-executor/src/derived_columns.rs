@@ -189,6 +189,86 @@ pub async fn derived_column_data(
     Ok(out)
 }
 
+/// Computes one derived column over the rows of one already stored file.
+///
+/// The lake owns the rewrite and asks for the values; evaluating an
+/// expression belongs here. The result is encoded the way the writer takes
+/// it, and by the same route a fresh write takes, so a backfilled row and a
+/// row written after the declaration hold the same bytes.
+pub fn compute_over_stored(
+    table: &Arc<TableEntry>,
+    bound: &BoundExpr,
+    lake_schema: &zyron_lake::LakeSchema,
+    stored: &[zyron_lake::ColumnData],
+    rows: usize,
+) -> Result<zyron_lake::ColumnData> {
+    // The batch mirrors the file's columns in schema order, which is the
+    // order the expression's column references resolve against
+    let mut schema: Vec<LogicalColumn> = Vec::with_capacity(lake_schema.columns.len());
+    let mut columns: Vec<Column> = Vec::with_capacity(lake_schema.columns.len());
+    for (idx, col) in lake_schema.columns.iter().enumerate() {
+        let entry = table.columns.iter().find(|c| c.id.0 as u32 == col.id);
+        schema.push(LogicalColumn {
+            table_idx: Some(0),
+            column_id: zyron_catalog::ColumnId(col.id as u16),
+            name: col.name.clone(),
+            type_id: col.type_id,
+            nullable: col.nullable,
+            fractional_digits: col.fractional_digits,
+        });
+        // Decoded as the lake stores it, which is the physical type. Reading
+        // a p>6 timestamp as its logical type would take the wrong width and
+        // leave the column short of the rows beside it
+        let physical = col.physical_type_id();
+        let mut builder =
+            crate::batch::ColumnBuilder::new_ts(col.type_id, physical, col.fractional_digits, rows);
+        let source = stored.get(idx);
+        for row in 0..rows {
+            let cell = source.and_then(|c| c.cell(row));
+            match cell {
+                None => builder.push_owned(crate::column::ScalarValue::Null),
+                Some(bytes) => {
+                    let value_size = physical.fixed_size().unwrap_or(0);
+                    builder.push_owned(if value_size > 0 {
+                        crate::batch::decode_fixed_scalar(physical, bytes)
+                    } else {
+                        crate::batch::decode_varlen_scalar(physical, bytes)
+                    });
+                }
+            }
+        }
+        let _ = entry;
+        columns.push(builder.finish());
+    }
+    let batch = DataBatch::new(columns);
+
+    let computed = crate::expr::evaluate(bound, &batch, &schema, &[]).map_err(|e| {
+        ZyronError::ExecutionError(format!(
+            "the expression could not be computed over the rows already stored: {e}"
+        ))
+    })?;
+    let type_id = computed.type_id;
+    let value_size = zyron_common::types::TypeId::timestamp_physical_type_id(
+        type_id,
+        computed.fractional_digits,
+    )
+    .fixed_size()
+    .unwrap_or(0);
+    let mut out = zyron_lake::ColumnData::with_capacity(0, value_size, rows);
+    let mut scratch: Vec<u8> = Vec::new();
+    for row in 0..rows {
+        match computed.get_scalar(row) {
+            crate::column::ScalarValue::Null => out.push(None),
+            ref v => {
+                scratch.clear();
+                crate::batch::encode_scalar_value_into(&mut scratch, type_id, v, value_size);
+                out.push(Some(&scratch));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// One expression proved storable, with what a caller needs to register it
 pub struct StorableExpression {
     /// The identity, the text that will be stored, and the columns it reads
@@ -343,6 +423,7 @@ pub fn check_evaluable(
     let batch = DataBatch {
         columns,
         num_rows: 1,
+        resolved: Vec::new(),
     };
     crate::expr::evaluate(bound, &batch, schema, &[]).map(|_| ())
 }

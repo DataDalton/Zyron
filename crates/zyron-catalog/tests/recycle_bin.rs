@@ -47,6 +47,12 @@ fn one_col() -> Vec<ColumnDef> {
         nullable: Some(false),
         default: None,
         constraints: vec![ColumnConstraint::PrimaryKey],
+        generated: None,
+        encrypted: None,
+        collation: None,
+        media_format: None,
+        media_storage: None,
+        user_type_id: None,
     }]
 }
 

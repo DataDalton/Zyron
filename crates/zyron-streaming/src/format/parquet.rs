@@ -4,11 +4,12 @@
 //
 // Reads and writes Apache Parquet files. The reader uses the Arrow record
 // batch reader over an in-memory cursor, the writer packs the rows into a
-// single RecordBatch and passes it to ArrowWriter. Schema mapping follows
-// format/schema.rs, and column conversion routes through record_batch.rs.
+// single RecordBatch and passes it to ArrowWriter. Field generation routes
+// through format/arrow_ext.rs over the shared mapping in format/schema.rs,
+// and column conversion routes through record_batch.rs.
 
+use super::arrow_ext::{export_field, import_type_id};
 use super::record_batch::{batch_to_rows, rows_to_batch};
-use super::schema::{arrow_to_type_id, timestamp_arrow_type};
 use super::{ColumnSpec, FormatReader, FormatWriter};
 use crate::row_codec::StreamValue;
 use arrow::array::RecordBatch;
@@ -43,16 +44,7 @@ pub struct ParquetWriter;
 
 impl FormatWriter for ParquetWriter {
     fn write_rows(&mut self, rows: &[Vec<StreamValue>], schema: &[ColumnSpec]) -> Result<Vec<u8>> {
-        let fields: Vec<Field> = schema
-            .iter()
-            .map(|c| {
-                Field::new(
-                    &c.name,
-                    timestamp_arrow_type(c.type_id, c.fractional_digits),
-                    true,
-                )
-            })
-            .collect();
+        let fields: Vec<Field> = schema.iter().map(export_field).collect();
         let arrow_schema = Arc::new(Schema::new(fields));
         let batch: RecordBatch = rows_to_batch(rows, schema, arrow_schema.clone())?;
         let mut buf: Vec<u8> = Vec::new();
@@ -85,7 +77,7 @@ pub fn infer_parquet_schema(bytes: &[u8]) -> Result<Vec<ColumnSpec>> {
     let schema = builder.schema();
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        let type_id = arrow_to_type_id(field.data_type())?;
+        let type_id = import_type_id(field)?;
         cols.push(ColumnSpec::new(field.name().to_string(), type_id));
     }
     Ok(cols)

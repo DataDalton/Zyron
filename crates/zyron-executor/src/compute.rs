@@ -1503,6 +1503,14 @@ pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
     if col.type_id == TypeId::Decimal && target != TypeId::Decimal {
         return cast_column_from_decimal(col, target);
     }
+    // A range literal is text until the write path parses it against the
+    // column's declared element kind, which the type id alone does not
+    // carry. Pushing the text through the per-scalar cast would land it in
+    // a binary builder as an empty payload, and an empty payload reads as
+    // an unbounded range that overlaps everything
+    if target == TypeId::Range && matches!(col.data, ColumnData::Utf8(_)) {
+        return Ok(col.clone());
+    }
     let len = col.len();
     let mut data = ColumnData::with_capacity(target, len);
     let mut nulls = NullBitmap::none(len);
@@ -1848,6 +1856,27 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
             }
             _ => Err(ZyronError::ExecutionError(format!(
                 "cannot cast {value} to FixedBinary16"
+            ))),
+        },
+        // A text value cast to EXTERNAL_REF is a uri reference and becomes
+        // the descriptor the write path stores, so the uri survives the
+        // binary column buffer between here and the externalize pass
+        TypeId::ExternalRef => match value {
+            ScalarValue::Binary(b) => Ok(ScalarValue::Binary(b.clone())),
+            ScalarValue::Utf8(s) => zyron_media::descriptor::uri_reference_bytes(s)
+                .map(ScalarValue::Binary)
+                .map_err(|e| ZyronError::ExecutionError(e.to_string())),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "cannot cast {value} to EXTERNAL_REF"
+            ))),
+        },
+        // Media payload columns take bytes. Anything else must refuse here,
+        // a binary buffer offered a text value would otherwise store an
+        // empty payload without a word
+        TypeId::Image | TypeId::Video | TypeId::Audio | TypeId::Document => match value {
+            ScalarValue::Binary(b) => Ok(ScalarValue::Binary(b.clone())),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "cannot cast {value} to {target}, a media column takes a binary payload"
             ))),
         },
         _ => Ok(value.clone()),

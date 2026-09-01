@@ -260,6 +260,36 @@ pub enum Statement {
     UntagPublication(Box<UntagPublicationStatement>),
     /// CREATE ABAC POLICY name ON <object-type> <name> WHERE <expr>
     CreateAbacPolicy(Box<CreateAbacPolicyStatement>),
+    /// CREATE ANALYZER name AS (TOKENIZER = '...', CHAR_FILTERS = [...], TOKEN_FILTERS = [...])
+    CreateAnalyzer(Box<CreateAnalyzerStatement>),
+    /// ALTER ANALYZER name SET (option, ...)
+    AlterAnalyzer(Box<AlterAnalyzerStatement>),
+    /// DROP ANALYZER [IF EXISTS] name
+    DropAnalyzer(Box<DropAnalyzerStatement>),
+    /// CREATE SYNONYM DICTIONARY name (('a', 'b'), ('c' => 'd'))
+    CreateSynonymDictionary(Box<CreateSynonymDictionaryStatement>),
+    /// ALTER SYNONYM DICTIONARY name ADD (...) | DROP 'term', ...
+    AlterSynonymDictionary(Box<AlterSynonymDictionaryStatement>),
+    /// DROP SYNONYM DICTIONARY [IF EXISTS] name
+    DropSynonymDictionary(Box<DropSynonymDictionaryStatement>),
+    /// CREATE HYBRID INDEX name ON table (text_col, vector_col) WITH (option, ...)
+    CreateHybridIndex(Box<CreateHybridIndexStatement>),
+    /// CREATE BULKHEAD name (max_concurrent = n, max_wait = '5s', queue_size = n)
+    CreateBulkhead(Box<CreateBulkheadStatement>),
+    /// DROP BULKHEAD [IF EXISTS] name
+    DropBulkhead(Box<DropBulkheadStatement>),
+    /// CREATE RETRY POLICY name (max_attempts = n, backoff = '...', ...)
+    CreateRetryPolicy(Box<CreateRetryPolicyStatement>),
+    /// DROP RETRY POLICY [IF EXISTS] name
+    DropRetryPolicy(Box<DropRetryPolicyStatement>),
+    /// CREATE TYPE name AS (STORAGE = <type>, CHECK = '...', INPUT_CAST = '...', OUTPUT_CAST = '...')
+    CreateType(Box<CreateTypeStatement>),
+    /// DROP TYPE [IF EXISTS] name
+    DropType(Box<DropTypeStatement>),
+    /// CREATE COLLATION name (locale = '...', provider = '...', ...)
+    CreateCollation(Box<CreateCollationStatement>),
+    /// DROP COLLATION [IF EXISTS] name
+    DropCollation(Box<DropCollationStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,9 +2078,130 @@ pub struct TableOption {
 pub enum TableOptionValue {
     String(String),
     Integer(i64),
+    Float(f64),
     Boolean(bool),
     Identifier(String),
     StringList(Vec<String>),
+}
+
+// ---------------------------------------------------------------------------
+// Search surface DDL, resilience DDL, user types, collations
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateAnalyzerStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterAnalyzerStatement {
+    pub name: String,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropAnalyzerStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// One synonym rule. A bidirectional group lists every term in `terms` with
+/// `targets` empty. A one way rule maps each of `terms` to `targets`
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynonymRule {
+    pub terms: Vec<String>,
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSynonymDictionaryStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub rules: Vec<SynonymRule>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterSynonymDictionaryAction {
+    Add(Vec<SynonymRule>),
+    Drop(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterSynonymDictionaryStatement {
+    pub name: String,
+    pub action: AlterSynonymDictionaryAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropSynonymDictionaryStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateHybridIndexStatement {
+    pub name: String,
+    pub table: String,
+    pub text_column: String,
+    pub vector_column: String,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateBulkheadStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropBulkheadStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRetryPolicyStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropRetryPolicyStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTypeStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub storage: DataType,
+    pub check_expr: Option<String>,
+    pub input_cast_expr: Option<String>,
+    pub output_cast_expr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTypeStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateCollationStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCollationStatement {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,6 +2440,12 @@ pub enum Expr {
     },
     /// Literal value.
     Literal(LiteralValue),
+    /// expr COLLATE 'name': the comparison or ordering this expression
+    /// participates in uses the named collation.
+    Collate {
+        expr: Box<Expr>,
+        collation: String,
+    },
     /// Binary operation: left op right.
     BinaryOp {
         left: Box<Expr>,
@@ -2449,6 +2606,7 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
         | Expr::Nested(expr) => expr_contains_subquery(expr),
         Expr::InList { expr, list, .. } => {
             expr_contains_subquery(expr) || list.iter().any(expr_contains_subquery)
@@ -2528,6 +2686,11 @@ pub enum LiteralValue {
     Null,
     /// SQL INTERVAL literal - composite (months, days, nanoseconds) value.
     Interval(zyron_common::Interval),
+    /// A value already in its stored binary form. No statement text produces
+    /// one; the binder emits it where a literal's spelling has to be resolved
+    /// against the column it is compared with before the comparison can
+    /// mean anything, as a range literal's text does.
+    Bytes(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2565,6 +2728,8 @@ pub enum JsonOperator {
     HashArrow,
     /// #>> (get JSON object at path as text)
     HashDoubleArrow,
+    /// Dotted access into a VARIANT or STRUCT value: v.address.city
+    Dot,
 }
 
 /// JSON containment operator types
@@ -2748,6 +2913,35 @@ pub struct ColumnDef {
     pub nullable: Option<bool>,
     pub default: Option<Expr>,
     pub constraints: Vec<ColumnConstraint>,
+    /// GENERATED ALWAYS AS (expr) VIRTUAL or STORED
+    pub generated: Option<GeneratedColumn>,
+    /// ENCRYPTED, optionally WITH (algorithm = ..., key_id = ...)
+    pub encrypted: Option<EncryptedColumn>,
+    /// COLLATE 'locale_or_collation_name'
+    pub collation: Option<String>,
+    /// FORMAT 'jpeg' hint on a media column
+    pub media_format: Option<String>,
+    /// STORAGE 'inline' | 'toast' | 'external' or a URI prefix on a media
+    /// or EXTERNAL_REF column
+    pub media_storage: Option<String>,
+    /// Backing user defined type id, set by the statement handler when it
+    /// resolves a UserDefined data type to its storage type
+    pub user_type_id: Option<u32>,
+}
+
+/// A generated column declaration on a column definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedColumn {
+    pub expr: Expr,
+    /// True for STORED (materialized at write), false for VIRTUAL
+    pub stored: bool,
+}
+
+/// A column-level encryption declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncryptedColumn {
+    pub algorithm: Option<String>,
+    pub key_id: Option<String>,
 }
 
 /// SQL data type as written in a query. Maps to TypeId for storage.
@@ -2823,6 +3017,27 @@ pub enum DataType {
     Bitfield,
     /// Unit-aware quantity (value + unit)
     Quantity,
+    /// Schema-on-read semi-structured value with automatic shredding
+    Variant,
+    /// Typed nested record: STRUCT<a INT, b TEXT>
+    Struct(Vec<(String, DataType)>),
+    /// Typed key-value map: MAP<TEXT, INT>
+    Map(Box<DataType>, Box<DataType>),
+    /// Hierarchical label path: 'Top.Science.Astronomy'
+    Ltree,
+    /// Image payload with codec metadata
+    Image,
+    /// Video payload with codec metadata
+    Video,
+    /// Audio payload with codec metadata
+    Audio,
+    /// Document payload (PDF, DOCX, text) with metadata
+    Document,
+    /// Reference to an externally stored object (S3, GCS, local path, URL)
+    ExternalRef,
+    /// A CREATE TYPE name, resolved to its storage type by the statement
+    /// handler before anything types against it
+    UserDefined(String),
 }
 
 impl DataType {
@@ -2874,6 +3089,9 @@ impl DataType {
     pub fn declared_element_type(&self) -> Option<TypeId> {
         match self {
             DataType::Array(inner) => Some(inner.to_type_id()),
+            // A range's element type drives text parsing and bound
+            // comparison on write
+            DataType::Range(inner) => Some(inner.to_type_id()),
             _ => None,
         }
     }
@@ -2935,6 +3153,19 @@ impl DataType {
             DataType::CountMinSketch => TypeId::CountMinSketch,
             DataType::Bitfield => TypeId::Bitfield,
             DataType::Quantity => TypeId::Quantity,
+            DataType::Variant => TypeId::Variant,
+            // An unresolved user type surfaces as the composite marker so a
+            // path that skipped resolution fails loudly at the catalog
+            // instead of silently storing text
+            DataType::UserDefined(_) => TypeId::Composite,
+            DataType::Struct(_) => TypeId::Struct,
+            DataType::Map(_, _) => TypeId::Map,
+            DataType::Ltree => TypeId::Ltree,
+            DataType::Image => TypeId::Image,
+            DataType::Video => TypeId::Video,
+            DataType::Audio => TypeId::Audio,
+            DataType::Document => TypeId::Document,
+            DataType::ExternalRef => TypeId::ExternalRef,
         }
     }
 }
@@ -2991,6 +3222,13 @@ pub struct TableConstraint {
     /// reaches the catalog and the planner, the engine just does not check
     /// it on write.
     pub enforced: bool,
+    /// The range column a temporal PRIMARY KEY or UNIQUE constraint
+    /// declared WITHOUT OVERLAPS on. Rows are unique over the scalar key
+    /// columns only when their periods intersect
+    pub without_overlaps: Option<String>,
+    /// True when a FOREIGN KEY ended with PERIOD, meaning the last column
+    /// pair matches by period containment rather than equality
+    pub fk_period: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3431,6 +3669,12 @@ mod tests {
             nullable: Some(true),
             default: None,
             constraints: vec![],
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
         });
         assert!(matches!(add_col, AlterTableOperation::AddColumn(_)));
 

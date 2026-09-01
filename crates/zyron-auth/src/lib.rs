@@ -65,7 +65,7 @@ pub use credentials::{
     scram_sha256_secret, scram_sha256_secret_with_salt,
 };
 pub use encryption::{
-    ColumnEncryption, EncryptionAlgorithm, EncryptionStore, KeyStore, LocalKeyStore,
+    ColumnEncryption, EncryptionAlgorithm, EncryptionStore, FileKeyStore, KeyStore, LocalKeyStore,
 };
 pub use external_credentials::{
     SealedCredentials, open_credentials, rotate_credentials, seal_credentials,

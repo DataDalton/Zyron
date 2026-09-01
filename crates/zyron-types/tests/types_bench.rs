@@ -70,9 +70,6 @@ use zyron_types::fuzzy::{
 use zyron_types::geospatial::{
     Geometry, GeometryKind, Point, Polygon, st_contains, st_distance, st_dwithin,
 };
-use zyron_types::hierarchy::{
-    closure_table_ancestors, closure_table_depth, closure_table_descendants, closure_table_insert,
-};
 use zyron_types::id_gen::{snowflake, uuid_v7};
 use zyron_types::matrix::{
     matrix_create, matrix_decode, matrix_determinant, matrix_identity, matrix_inverse,
@@ -905,37 +902,29 @@ fn test_formatting() {
 }
 
 // =============================================================================
-// Hierarchy
+// Hierarchy (LTREE)
 // =============================================================================
 
 #[test]
-fn test_hierarchy() {
+fn test_hierarchy_ltree() {
     zyron_bench_harness::init("types");
     let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Hierarchy (closure table) ===");
+    tprintln!(
+        "
+=== Hierarchy (ltree) ==="
+    );
 
-    // Build tree: root=1 -> A=2 -> B=3, root -> C=4
-    let mut closure: Vec<(i64, i64, i32)> = vec![(1, 1, 0)];
-    closure.extend(closure_table_insert(&closure.clone(), 1, 2)); // A under root
-    closure.extend(closure_table_insert(&closure.clone(), 2, 3)); // B under A
-    closure.extend(closure_table_insert(&closure.clone(), 1, 4)); // C under root
-
-    let ancestors_b = closure_table_ancestors(&closure, 3);
-    tprintln!("  ancestors(B) = {:?}", ancestors_b);
-    // Root first ordering
-    assert_eq!(ancestors_b, vec![1, 2, 3]);
-
-    let desc_root = closure_table_descendants(&closure, 1);
-    tprintln!("  descendants(root) = {:?}", desc_root);
-    let desc_set: std::collections::HashSet<i64> = desc_root.iter().copied().collect();
-    assert!(desc_set.contains(&2));
-    assert!(desc_set.contains(&3));
-    assert!(desc_set.contains(&4));
-
-    let depth_b = closure_table_depth(&closure, 3);
-    tprintln!("  depth(B) = {}", depth_b);
-    assert_eq!(depth_b, 2);
+    let path = "Top.Science.Astronomy";
+    assert_eq!(zyron_types::ltree::nlevel(path).expect("nlevel"), 3);
+    assert_eq!(
+        zyron_types::ltree::subpath(path, 0, Some(2)).expect("subpath"),
+        "Top.Science"
+    );
+    assert!(zyron_types::ltree::is_ancestor("Top", path).expect("ancestor"));
+    let lca = zyron_types::ltree::lca(&[path, "Top.Science.Physics"]).expect("lca");
+    tprintln!("  lca = {:?}", lca);
+    assert_eq!(lca.as_deref(), Some("Top.Science"));
 }
 
 // =============================================================================

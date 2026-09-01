@@ -321,6 +321,12 @@ fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> R
             ColumnData::Interval(vec![*i; num_rows]),
             TypeId::Interval,
         )),
+        // Already the stored form, so it becomes a binary column of that
+        // value repeated, carrying whatever type the binder gave it
+        LiteralValue::Bytes(bytes) => Ok(Column::new(
+            ColumnData::Binary(vec![bytes.clone(); num_rows]),
+            type_id,
+        )),
     }
 }
 
@@ -1322,6 +1328,26 @@ fn coerce_case_branch(col: Column, target: TypeId) -> Result<Column> {
 // Scalar functions
 // ---------------------------------------------------------------------------
 
+/// The values a scan already extracted for `variant_extract(column, 'path')`,
+/// when the call names a column and a literal path and the batch carries that
+/// pair. Anything else reads the documents
+fn resolved_variant_path<'a>(args: &[BoundExpr], batch: &'a DataBatch) -> Option<&'a Column> {
+    if batch.resolved.is_empty() || args.len() != 2 {
+        return None;
+    }
+    let BoundExpr::ColumnRef(cr) = &args[0] else {
+        return None;
+    };
+    let BoundExpr::Literal {
+        value: LiteralValue::String(path),
+        ..
+    } = &args[1]
+    else {
+        return None;
+    };
+    batch.resolved_path(cr.table_idx, cr.column_id.0, path)
+}
+
 fn evaluate_function(
     name: &str,
     args: &[BoundExpr],
@@ -1329,6 +1355,20 @@ fn evaluate_function(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
+    // A scan that read the path out of a stored column already holds the
+    // answer for these rows, so the documents do not get walked a second
+    // time. The stored values are the extraction's own output, which is why
+    // substituting them cannot change the result.
+    //
+    // The batch's own list decides first: it is one load, and it is empty on
+    // every batch but a shredded scan's, so no other call pays for the name
+    // comparison
+    if !batch.resolved.is_empty()
+        && name == "variant_extract"
+        && let Some(col) = resolved_variant_path(args, batch)
+    {
+        return Ok(col.clone());
+    }
     match name {
         // Current transaction wall-clock time. Timestamps are stored as i64
         // microseconds since the Unix epoch (ColumnData::Int64). Broadcast one
@@ -1662,7 +1702,18 @@ fn evaluate_function(
         // an index operator when one covers the table and the read is of the
         // current state; otherwise the storage scan evaluates them here, so
         // an unindexed table and a time-travel read answer the same question
-        "match_against" => eval_match_against(args, batch, schema, params),
+        "match_against" => eval_match_against(args, batch, schema, params, false),
+        "match_against_phonetic" => eval_match_against(args, batch, schema, params, true),
+        // Resilience special forms. The binder resolved the policy and
+        // embedded its configuration, and the wrapped operation stays
+        // unevaluated until admission, retry, or cache state says to run it
+        "row_count_change" => Err(ZyronError::ExecutionError(
+            "ROW_COUNT_CHANGE is only valid inside a table expectation".to_string(),
+        )),
+        "__bulkhead_call" => eval_bulkhead_call(args, batch, schema, params),
+        "__with_retry" => eval_with_retry(args, batch, schema, params),
+        "__fallback_chain" => eval_fallback_chain(args, batch, schema, params),
+        "__cache_aside" => eval_cache_aside(args, batch, schema, params),
         "vector_distance_cosine" | "vector_distance_l2" | "vector_distance_dot" => {
             eval_vector_distance(name, args, batch, schema, params)
         }
@@ -1835,6 +1886,7 @@ fn eval_match_against(
     batch: &DataBatch,
     schema: &[LogicalColumn],
     params: &[ScalarValue],
+    phonetic: bool,
 ) -> Result<Column> {
     let Some((query_arg, column_args)) = args.split_last() else {
         return Err(ZyronError::ExecutionError(
@@ -1850,8 +1902,29 @@ fn eval_match_against(
             )));
         }
     };
-    let query = zyron_search::FtsQueryParser::parse(&query_text)?;
     let analyzer = zyron_search::SimpleAnalyzer;
+    let query = if phonetic {
+        None
+    } else {
+        Some(zyron_search::FtsQueryParser::parse(&query_text)?)
+    };
+    // Phonetic mode compares metaphone codes of the analyzed terms instead
+    // of the terms themselves, so spelling variants still match
+    let query_codes: Vec<String> = if phonetic {
+        zyron_search::Analyzer::analyze(&analyzer, &query_text)
+            .iter()
+            .map(|t| {
+                zyron_search::PhoneticFilter::encode(
+                    zyron_search::PhoneticAlgorithm::Metaphone,
+                    &t.term,
+                )
+            })
+            .filter(|(primary, _)| !primary.is_empty())
+            .map(|(primary, _)| primary)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let text_columns: Vec<Column> = column_args
         .iter()
@@ -1878,14 +1951,295 @@ fn eval_match_against(
             }
         }
         let tokens = zyron_search::Analyzer::analyze(&analyzer, &document);
-        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
-        scores.push(if query.matches_terms(&terms, &analyzer) {
-            1.0
+        let matched = if phonetic {
+            !query_codes.is_empty()
+                && tokens.iter().any(|t| {
+                    let (code, _) = zyron_search::PhoneticFilter::encode(
+                        zyron_search::PhoneticAlgorithm::Metaphone,
+                        &t.term,
+                    );
+                    !code.is_empty() && query_codes.iter().any(|q| *q == code)
+                })
         } else {
-            0.0
-        });
+            let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+            match &query {
+                Some(q) => q.matches_terms(&terms, &analyzer),
+                None => false,
+            }
+        };
+        scores.push(if matched { 1.0 } else { 0.0 });
     }
     Ok(Column::new(ColumnData::Float64(scores), TypeId::Float64))
+}
+
+// ---------------------------------------------------------------------------
+// Resilience special forms
+// ---------------------------------------------------------------------------
+
+fn resilience_lit_i64(expr: &BoundExpr, what: &str) -> Result<i64> {
+    match expr {
+        BoundExpr::Literal {
+            value: LiteralValue::Integer(n),
+            ..
+        } => Ok(*n),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "{what} must arrive as an embedded integer literal"
+        ))),
+    }
+}
+
+fn resilience_lit_f64(expr: &BoundExpr, what: &str) -> Result<f64> {
+    match expr {
+        BoundExpr::Literal {
+            value: LiteralValue::Float(f),
+            ..
+        } => Ok(*f),
+        BoundExpr::Literal {
+            value: LiteralValue::Integer(n),
+            ..
+        } => Ok(*n as f64),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "{what} must arrive as an embedded number literal"
+        ))),
+    }
+}
+
+fn resilience_lit_str(expr: &BoundExpr, what: &str) -> Result<String> {
+    match expr {
+        BoundExpr::Literal {
+            value: LiteralValue::String(s),
+            ..
+        } => Ok(s.clone()),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "{what} must arrive as an embedded string literal"
+        ))),
+    }
+}
+
+/// BULKHEAD_CALL(policy, operation [, fallback]) after binding:
+/// [policy_id, max_concurrent, queue_size, max_wait_ms, operation, fallback?].
+/// The operation evaluates only under an admission permit. Admission
+/// failure runs the fallback when one was given
+fn eval_bulkhead_call(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() < 5 || args.len() > 6 {
+        return Err(ZyronError::ExecutionError(
+            "bulkhead_call takes a bulkhead name, an operation, and an optional fallback"
+                .to_string(),
+        ));
+    }
+    let policy_id = resilience_lit_i64(&args[0], "bulkhead policy id")? as u32;
+    let max_concurrent = resilience_lit_i64(&args[1], "max_concurrent")? as u32;
+    let queue_size = resilience_lit_i64(&args[2], "queue_size")? as u32;
+    let max_wait =
+        std::time::Duration::from_millis(resilience_lit_i64(&args[3], "max_wait")? as u64);
+    let bulkhead =
+        crate::resilience_exec::bulkhead_for(policy_id, max_concurrent, queue_size, max_wait)?;
+    match bulkhead.try_enter() {
+        Ok(_permit) => evaluate(&args[4], batch, schema, params),
+        Err(admission_error) => match args.get(5) {
+            Some(fallback) => evaluate(fallback, batch, schema, params),
+            None => Err(admission_error),
+        },
+    }
+}
+
+/// WITH_RETRY(policy, operation) after binding:
+/// [max_attempts, backoff_code, base_ms, max_ms, jitter, errors_json, operation].
+/// Retries synchronously with the policy's backoff schedule, total sleep
+/// capped by MAX_TOTAL_RETRY_SLEEP
+fn eval_with_retry(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 7 {
+        return Err(ZyronError::ExecutionError(
+            "with_retry takes a retry policy name and an operation".to_string(),
+        ));
+    }
+    let max_attempts = resilience_lit_i64(&args[0], "max_attempts")? as u32;
+    let backoff = match resilience_lit_i64(&args[1], "backoff")? {
+        0 => zyron_types::resilience::BackoffKind::Fixed,
+        1 => zyron_types::resilience::BackoffKind::Linear,
+        _ => zyron_types::resilience::BackoffKind::Exponential,
+    };
+    let base = std::time::Duration::from_millis(resilience_lit_i64(&args[2], "base_delay")? as u64);
+    let max = std::time::Duration::from_millis(resilience_lit_i64(&args[3], "max_delay")? as u64);
+    let jitter = resilience_lit_f64(&args[4], "jitter")?;
+    let errors_json = resilience_lit_str(&args[5], "retryable_errors")?;
+    let retryable: Vec<String> = serde_json::from_str(&errors_json).map_err(|e| {
+        ZyronError::ExecutionError(format!("embedded retryable_errors did not decode: {e}"))
+    })?;
+    let policy = zyron_types::resilience::RetryPolicy::new(
+        max_attempts,
+        backoff,
+        base,
+        max,
+        jitter,
+        retryable,
+    )?;
+    let operation = &args[6];
+    let mut delays = policy.delays();
+    let mut slept = std::time::Duration::ZERO;
+    loop {
+        match evaluate(operation, batch, schema, params) {
+            Ok(column) => return Ok(column),
+            Err(e) => {
+                let text = e.to_string();
+                if !policy.error_is_retryable(&text) {
+                    return Err(e);
+                }
+                let Some(delay) = delays.next() else {
+                    return Err(e);
+                };
+                if slept + delay > crate::resilience_exec::MAX_TOTAL_RETRY_SLEEP {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "retries abandoned after {} of sleep, last error: {text}",
+                        humantime_secs(slept)
+                    )));
+                }
+                std::thread::sleep(delay);
+                slept += delay;
+            }
+        }
+    }
+}
+
+fn humantime_secs(d: std::time::Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
+}
+
+/// FALLBACK_CHAIN(op1, op2, ..., static_fallback): evaluates operations in
+/// order, the first that evaluates without error answers
+fn eval_fallback_chain(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.is_empty() {
+        return Err(ZyronError::ExecutionError(
+            "fallback_chain takes at least one operation".to_string(),
+        ));
+    }
+    let mut last_error = None;
+    for op in args {
+        match evaluate(op, batch, schema, params) {
+            Ok(column) => return Ok(column),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ZyronError::ExecutionError("fallback_chain had no operations to run".to_string())
+    }))
+}
+
+fn scalar_to_cache_key(scalar: ScalarValue) -> String {
+    match scalar {
+        ScalarValue::Utf8(s) => s,
+        ScalarValue::Null => "\u{0}null".to_string(),
+        ScalarValue::Binary(b) => {
+            let mut key = String::with_capacity(b.len() * 2 + 2);
+            key.push_str("\u{0}b");
+            for byte in b {
+                key.push_str(&format!("{byte:02x}"));
+            }
+            key
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// CACHE_ASIDE(key, fetch, ttl, stale_ttl) after binding:
+/// [key_expr, fetch_expr, ttl_ms, stale_ms]. A fresh entry answers without
+/// evaluating the fetch. A stale entry answers from cache when the refresh
+/// fails, so a flaky source degrades to slightly old values instead of
+/// errors until stale_ttl runs out
+fn eval_cache_aside(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    use crate::resilience_exec::CacheLookup;
+    if args.len() != 4 {
+        return Err(ZyronError::ExecutionError(
+            "cache_aside takes a key, a fetch expression, a ttl, and a stale ttl".to_string(),
+        ));
+    }
+    let ttl = std::time::Duration::from_millis(resilience_lit_i64(&args[2], "ttl")? as u64);
+    let stale_ttl =
+        std::time::Duration::from_millis(resilience_lit_i64(&args[3], "stale_ttl")? as u64)
+            .max(ttl);
+    let key_col = evaluate(&args[0], batch, schema, params)?;
+    let rows = batch.num_rows.max(1);
+    let mut lookups = Vec::with_capacity(rows);
+    let mut needs_fetch = false;
+    for row in 0..rows {
+        let key = scalar_to_cache_key(key_col.get_scalar(row));
+        let lookup = crate::resilience_exec::cache_lookup(&key, ttl, stale_ttl);
+        match lookup {
+            CacheLookup::Miss | CacheLookup::Stale(_) => needs_fetch = true,
+            CacheLookup::Fresh(_) => {}
+        }
+        lookups.push((key, lookup));
+    }
+    let fetch_col = if needs_fetch {
+        match evaluate(&args[1], batch, schema, params) {
+            Ok(column) => Some(column),
+            Err(e) => {
+                let every_row_answerable =
+                    lookups.iter().all(|(_, l)| !matches!(l, CacheLookup::Miss));
+                if every_row_answerable {
+                    None
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let out_type = fetch_col
+        .as_ref()
+        .map(|c| c.type_id)
+        .unwrap_or_else(|| args[1].type_id());
+    let mut data = ColumnData::with_capacity(out_type, rows);
+    let mut nulls = NullBitmap::none(rows);
+    for (row, (key, lookup)) in lookups.into_iter().enumerate() {
+        let value = match lookup {
+            CacheLookup::Fresh(v) => v,
+            CacheLookup::Stale(v) => match &fetch_col {
+                Some(fc) => {
+                    let fresh = fc.get_scalar(row);
+                    crate::resilience_exec::cache_store(key, fresh.clone());
+                    fresh
+                }
+                None => v,
+            },
+            CacheLookup::Miss => {
+                let fc = fetch_col.as_ref().ok_or_else(|| {
+                    ZyronError::ExecutionError(
+                        "cache_aside missed the cache with no fetch result".to_string(),
+                    )
+                })?;
+                let fresh = fc.get_scalar(row);
+                crate::resilience_exec::cache_store(key, fresh.clone());
+                fresh
+            }
+        };
+        if matches!(value, ScalarValue::Null) {
+            nulls.set_null(row);
+        }
+        data.push_scalar_owned(value);
+    }
+    Ok(Column::with_nulls(data, nulls, out_type))
 }
 
 /// Row-wise vector distance between a vector column and a query vector.

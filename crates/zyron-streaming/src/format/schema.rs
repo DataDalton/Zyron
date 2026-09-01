@@ -35,9 +35,13 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
         TypeId::UInt64 => ArrowDataType::UInt64,
         TypeId::Float32 => ArrowDataType::Float32,
         TypeId::Float64 => ArrowDataType::Float64,
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-            ArrowDataType::Utf8
-        }
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => ArrowDataType::Utf8,
         TypeId::Binary | TypeId::Varbinary | TypeId::Bytea => ArrowDataType::Binary,
         TypeId::Date => ArrowDataType::Date32,
         TypeId::Time => ArrowDataType::Time64(TimeUnit::Microsecond),
@@ -48,7 +52,12 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
         TypeId::TimestampTz => ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         TypeId::Uuid => ArrowDataType::FixedSizeBinary(16),
         TypeId::Interval => ArrowDataType::FixedSizeBinary(16),
-        TypeId::Array | TypeId::Composite | TypeId::Vector => ArrowDataType::Binary,
+        // A declared STRUCT or MAP travels as the positional layout it is
+        // stored in, which a reader decodes with the shape the declaration
+        // holds rather than by parsing text
+        TypeId::Struct | TypeId::Map | TypeId::Array | TypeId::Composite | TypeId::Vector => {
+            ArrowDataType::Binary
+        }
         // Extended types fall back to Binary for the variable length cases
         // and FixedSizeBinary for the fixed width cases.
         TypeId::Geometry
@@ -57,12 +66,19 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
         | TypeId::HyperLogLog
         | TypeId::BloomFilter
         | TypeId::TDigest
-        | TypeId::CountMinSketch => ArrowDataType::Binary,
+        | TypeId::CountMinSketch
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef => ArrowDataType::Binary,
         TypeId::Color => ArrowDataType::FixedSizeBinary(4),
-        TypeId::SemVer | TypeId::Money | TypeId::Bitfield | TypeId::Quantity => {
-            ArrowDataType::FixedSizeBinary(8)
-        }
-        TypeId::Inet | TypeId::Cidr | TypeId::MacAddr => ArrowDataType::Binary,
+        TypeId::SemVer | TypeId::Bitfield | TypeId::Quantity => ArrowDataType::FixedSizeBinary(8),
+        // Money is 10 physical bytes, amount plus currency, per TypeId::fixed_size
+        TypeId::Money => ArrowDataType::FixedSizeBinary(10),
+        // MacAddr is 6 physical bytes per TypeId::fixed_size
+        TypeId::MacAddr => ArrowDataType::FixedSizeBinary(6),
+        TypeId::Inet | TypeId::Cidr => ArrowDataType::Binary,
     }
 }
 
@@ -137,7 +153,15 @@ pub fn arrow_to_type_id(dt: &ArrowDataType) -> Result<TypeId> {
         | ArrowDataType::FixedSizeList(_, _)
         | ArrowDataType::ListView(_)
         | ArrowDataType::LargeListView(_) => TypeId::Array,
-        ArrowDataType::Struct(_) => TypeId::Composite,
+        // A nested arrow column carries its own field layout, and nothing here
+        // binds it to the shape a declared STRUCT or MAP is read with, so
+        // inference refuses it rather than naming a type whose reader would
+        // fail a downcast further on
+        ArrowDataType::Struct(_) => {
+            return Err(ZyronError::StreamingError(
+                "format inference does not support Struct".to_string(),
+            ));
+        }
         ArrowDataType::Union(_, _) => {
             return Err(ZyronError::StreamingError(
                 "format inference does not support Union".to_string(),
@@ -318,11 +342,21 @@ pub fn json_to_stream_value(v: &serde_json::Value, t: TypeId) -> Result<StreamVa
                 .map_err(|_| type_err("float string", v)),
             _ => Err(type_err("float", v)),
         },
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => match v {
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => match v {
             serde_json::Value::String(s) => Ok(StreamValue::Utf8(s.clone())),
             other => Ok(StreamValue::Utf8(other.to_string())),
         },
-        TypeId::Binary
+        // A declared STRUCT or MAP arrives as base64 of its stored layout,
+        // the same spelling stream_value_to_json writes out
+        TypeId::Struct
+        | TypeId::Map
+        | TypeId::Binary
         | TypeId::Varbinary
         | TypeId::Bytea
         | TypeId::Uuid
@@ -344,7 +378,12 @@ pub fn json_to_stream_value(v: &serde_json::Value, t: TypeId) -> Result<StreamVa
         | TypeId::TDigest
         | TypeId::CountMinSketch
         | TypeId::Bitfield
-        | TypeId::Quantity => match v {
+        | TypeId::Quantity
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef => match v {
             serde_json::Value::String(s) => base64_decode(s).map(StreamValue::Binary),
             serde_json::Value::Array(arr) => {
                 let mut out = Vec::with_capacity(arr.len());
@@ -548,6 +587,25 @@ mod tests {
             Box::new(ArrowDataType::Utf8),
         );
         assert!(arrow_to_type_id(&dt).is_err());
+
+        // A nested arrow column is refused at inference, because the reader
+        // for the type it would name only accepts Binary and FixedSizeBinary
+        use arrow::datatypes::{Field, Fields};
+        use std::sync::Arc;
+        let fields: Fields = vec![Field::new("a", ArrowDataType::Int32, true)].into();
+        assert!(arrow_to_type_id(&ArrowDataType::Struct(fields)).is_err());
+        let entries = Field::new(
+            "entries",
+            ArrowDataType::Struct(
+                vec![
+                    Field::new("keys", ArrowDataType::Utf8, false),
+                    Field::new("values", ArrowDataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        assert!(arrow_to_type_id(&ArrowDataType::Map(Arc::new(entries), false)).is_err());
     }
 
     #[test]

@@ -1,0 +1,37 @@
+[package]
+name = "zyron-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+thiserror.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+scc.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+hex = "0.4.3"
+opendal = { version = "0.55", default-features = false, features = [
+    "services-s3",
+    "services-fs",
+    "services-gcs",
+    "services-azblob",
+    "services-http",
+    "services-memory",
+] }
+image = { version = "0.25.6", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+] }
+kamadak-exif = "0.6.1"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37.5"
+flate2 = "1.1.2"
+lz4_flex = "0.11.3"
+
+[dev-dependencies]
+tempfile = "3"

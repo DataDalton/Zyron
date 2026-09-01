@@ -190,6 +190,135 @@ pub fn semver_increment_patch(packed: u64) -> u64 {
     (major << MAJOR_SHIFT) | (minor << MINOR_SHIFT) | (patch << PATCH_SHIFT) | PRE_FLAG
 }
 
+// ---------------------------------------------------------------------------
+// Full precedence parsing, keeps the prerelease tag the packed form drops
+// ---------------------------------------------------------------------------
+
+/// One dot separated prerelease identifier. Numeric identifiers compare
+/// numerically and sort before alphanumeric ones
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreIdent {
+    Numeric(u64),
+    Alpha(String),
+}
+
+fn invalid_version(text: &str) -> ZyronError {
+    ZyronError::InvalidParameter {
+        name: "version".to_string(),
+        value: text.to_string(),
+    }
+}
+
+/// Parses a version string into components plus the raw prerelease tag.
+/// Build metadata after '+' is accepted and ignored, it carries no
+/// precedence
+fn parse_full(text: &str) -> Result<(u64, u64, u64, Option<String>)> {
+    let trimmed = text.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let without_build = match trimmed.find('+') {
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    };
+    let (version_part, pre) = match without_build.find('-') {
+        Some(idx) => (
+            &without_build[..idx],
+            Some(without_build[idx + 1..].to_string()),
+        ),
+        None => (without_build, None),
+    };
+    if let Some(tag) = &pre {
+        if tag.is_empty() || tag.split('.').any(|id| id.is_empty()) {
+            return Err(invalid_version(text));
+        }
+        let valid_chars = tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+        if !valid_chars {
+            return Err(invalid_version(text));
+        }
+    }
+    let parts: Vec<&str> = version_part.split('.').collect();
+    if parts.len() != 3 {
+        return Err(invalid_version(text));
+    }
+    let mut nums = [0u64; 3];
+    for (slot, part) in nums.iter_mut().zip(parts.iter()) {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+            return Err(invalid_version(text));
+        }
+        *slot = part.parse::<u64>().map_err(|_| invalid_version(text))?;
+    }
+    Ok((nums[0], nums[1], nums[2], pre))
+}
+
+fn prerelease_idents(tag: &str) -> Vec<PreIdent> {
+    tag.split('.')
+        .map(|id| {
+            if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+                match id.parse::<u64>() {
+                    Ok(n) => PreIdent::Numeric(n),
+                    Err(_) => PreIdent::Alpha(id.to_string()),
+                }
+            } else {
+                PreIdent::Alpha(id.to_string())
+            }
+        })
+        .collect()
+}
+
+fn compare_prerelease(a: &[PreIdent], b: &[PreIdent]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (ai, bi) in a.iter().zip(b.iter()) {
+        let ord = match (ai, bi) {
+            (PreIdent::Numeric(x), PreIdent::Numeric(y)) => x.cmp(y),
+            (PreIdent::Numeric(_), PreIdent::Alpha(_)) => Ordering::Less,
+            (PreIdent::Alpha(_), PreIdent::Numeric(_)) => Ordering::Greater,
+            (PreIdent::Alpha(x), PreIdent::Alpha(y)) => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Full SemVer precedence over parsed components. A prerelease sorts before
+/// its release, prerelease tags compare identifier by identifier
+fn compare_full(
+    a: &(u64, u64, u64, Option<String>),
+    b: &(u64, u64, u64, Option<String>),
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let core = (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2));
+    if core != Ordering::Equal {
+        return core;
+    }
+    match (&a.3, &b.3) {
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(x), Some(y)) => compare_prerelease(&prerelease_idents(x), &prerelease_idents(y)),
+    }
+}
+
+/// Extracts the prerelease tag from a version string, None for a release
+pub fn semver_prerelease(text: &str) -> Result<Option<String>> {
+    let (_, _, _, pre) = parse_full(text)?;
+    Ok(pre)
+}
+
+/// Sorts version strings by full SemVer precedence. Prerelease identifiers
+/// follow the spec ordering, 1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-beta <
+/// 1.0.0. Any invalid version fails the call naming the offending value
+pub fn semver_sort(versions: &[&str]) -> Result<Vec<String>> {
+    let mut parsed = Vec::with_capacity(versions.len());
+    for v in versions {
+        parsed.push((parse_full(v)?, v.to_string()));
+    }
+    parsed.sort_by(|a, b| compare_full(&a.0, &b.0));
+    Ok(parsed.into_iter().map(|(_, original)| original).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +476,110 @@ mod tests {
         assert_eq!(semver_major(v), 0);
         assert_eq!(semver_minor(v), 0);
         assert_eq!(semver_patch(v), 0);
+    }
+
+    // semver_prerelease
+    #[test]
+    fn test_prerelease_present() {
+        assert_eq!(
+            semver_prerelease("1.0.0-rc.1").unwrap(),
+            Some("rc.1".to_string())
+        );
+        assert_eq!(
+            semver_prerelease("2.1.0-alpha").unwrap(),
+            Some("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_prerelease_absent() {
+        assert_eq!(semver_prerelease("1.0.0").unwrap(), None);
+        assert_eq!(semver_prerelease("v1.2.3").unwrap(), None);
+    }
+
+    #[test]
+    fn test_prerelease_ignores_build_metadata() {
+        assert_eq!(semver_prerelease("1.0.0+build.5").unwrap(), None);
+        assert_eq!(
+            semver_prerelease("1.0.0-beta.2+build.5").unwrap(),
+            Some("beta.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_prerelease_invalid_version() {
+        assert!(semver_prerelease("1.2").is_err());
+        assert!(semver_prerelease("1.0.0-").is_err());
+        assert!(semver_prerelease("abc").is_err());
+    }
+
+    // semver_sort
+    #[test]
+    fn test_sort_spec_prerelease_chain() {
+        let sorted = semver_sort(&[
+            "1.0.0",
+            "1.0.0-beta",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha",
+            "1.0.0-rc.1",
+        ])
+        .unwrap();
+        assert_eq!(
+            sorted,
+            vec![
+                "1.0.0-alpha".to_string(),
+                "1.0.0-alpha.1".to_string(),
+                "1.0.0-beta".to_string(),
+                "1.0.0-rc.1".to_string(),
+                "1.0.0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sort_numeric_identifiers_compare_numerically() {
+        let sorted = semver_sort(&["1.0.0-rc.10", "1.0.0-rc.2", "1.0.0-rc.1"]).unwrap();
+        assert_eq!(
+            sorted,
+            vec![
+                "1.0.0-rc.1".to_string(),
+                "1.0.0-rc.2".to_string(),
+                "1.0.0-rc.10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sort_numeric_before_alpha_identifier() {
+        let sorted = semver_sort(&["1.0.0-alpha", "1.0.0-1"]).unwrap();
+        assert_eq!(
+            sorted,
+            vec!["1.0.0-1".to_string(), "1.0.0-alpha".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_sort_core_versions_numeric() {
+        let sorted = semver_sort(&["1.10.0", "1.2.3", "0.9.9", "2.0.0"]).unwrap();
+        assert_eq!(
+            sorted,
+            vec![
+                "0.9.9".to_string(),
+                "1.2.3".to_string(),
+                "1.10.0".to_string(),
+                "2.0.0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sort_invalid_names_offender() {
+        let err = semver_sort(&["1.0.0", "not.a.version"]);
+        match err {
+            Err(ZyronError::InvalidParameter { value, .. }) => {
+                assert_eq!(value, "not.a.version");
+            }
+            other => panic!("expected InvalidParameter, got {:?}", other),
+        }
     }
 }

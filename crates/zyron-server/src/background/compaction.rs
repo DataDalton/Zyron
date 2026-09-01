@@ -23,8 +23,8 @@ use zyron_catalog::{Catalog, TableEntry};
 use zyron_common::page::PAGE_SIZE;
 use zyron_common::types::TypeId;
 use zyron_storage::columnar::{
-    BloomPolicy, ColumnDescriptor, CompactionConfig, CompactionInput, SYS_COL_ROWID,
-    SYS_COL_SUPERSEDE, SYS_COL_XMIN, run_compaction_cycle,
+    BloomPolicy, ColumnDescriptor, CompactionConfig, CompactionInput, SHRED_COL_BASE,
+    SYS_COL_ROWID, SYS_COL_SUPERSEDE, SYS_COL_XMIN, run_compaction_cycle,
 };
 use zyron_storage::txn::TransactionManager;
 use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, HeapPage, TupleSlot};
@@ -1076,6 +1076,9 @@ impl CompactionWorker {
                     // A merge writes its output beside the inputs, so the
                     // survivor stays on the tier the input was on
                     storage_tier: seg.storage_tier,
+                    // A merge rewrites the same columns the input had, so it
+                    // carries the same shredded paths forward
+                    shredded: seg.shredded.clone(),
                 });
                 fresh.columnar.next_file_id = fresh.columnar.next_file_id.max(new_file_id + 1);
                 fresh.columnar.low_water = oldest_active;
@@ -1233,11 +1236,7 @@ impl CompactionWorker {
                     // (no background writer pressure) still folds.
                     match rt.block_on(disk_manager.read_page(page_id)) {
                         Ok(d) => {
-                            if let Ok((_, evicted)) = buffer_pool.load_page(page_id, &d) {
-                                if let Some(ev) = evicted {
-                                    let _ =
-                                        rt.block_on(disk_manager.write_page(ev.page_id, &ev.data));
-                                }
+                            if buffer_pool.load_page(page_id, &d).is_ok() {
                                 buffer_pool.unpin_page(page_id, false);
                             }
                             d
@@ -1353,10 +1352,28 @@ impl CompactionWorker {
         let xmin_lo = sys_xmin.iter().copied().min().unwrap_or(0);
         let xmin_hi = sys_xmin.iter().copied().max().unwrap_or(0);
 
-        // Descriptors: user columns then the three system columns. sys_rowid
-        // is the primary key, minted below in stored order, so the file is
-        // rowid ordered whatever the user columns are clustered by and the
-        // encoder skips the sort permutation.
+        // VARIANT paths this table has promoted, materialized as columns of
+        // their own. The fold is already rewriting every row, so the only
+        // cost here is the extraction, and doing it here is what makes a
+        // shredded column complete by construction: a segment carries the
+        // path for all of its rows or for none, so there is never a null to
+        // read as either "absent from the document" or "not shredded yet".
+        let shred_specs: Vec<(usize, u16, String)> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.type_id == TypeId::Variant)
+            .flat_map(|(ci, c)| {
+                zyron_executor::variant_shred::shredded_paths(table.id.0, c.id.0)
+                    .into_iter()
+                    .map(move |path| (ci, c.id.0, path))
+            })
+            .collect();
+
+        // Descriptors: user columns, then any shredded paths, then the three
+        // system columns. sys_rowid is the primary key, minted below in
+        // stored order, so the file is rowid ordered whatever the user
+        // columns are clustered by and the encoder skips the sort
+        // permutation.
         let mut descriptors: Vec<ColumnDescriptor> = Vec::with_capacity(num_cols + 3);
         for col in columns.iter() {
             let phys = col.physical_type_id();
@@ -1364,6 +1381,17 @@ impl CompactionWorker {
                 column_id: col.id.0 as u32,
                 type_id: col.type_id,
                 value_size: phys.fixed_size().unwrap_or(0),
+                is_primary_key: false,
+                bloom_policy: BloomPolicy::Auto,
+            });
+        }
+        for (i, _) in shred_specs.iter().enumerate() {
+            descriptors.push(ColumnDescriptor {
+                column_id: SHRED_COL_BASE + i as u32,
+                // The extraction's own output, so reading the column and
+                // reading the path out of the json cannot disagree
+                type_id: TypeId::Text,
+                value_size: 0,
                 is_primary_key: false,
                 bloom_policy: BloomPolicy::Auto,
             });
@@ -1459,23 +1487,50 @@ impl CompactionWorker {
             None => folded_rids,
         };
 
+        // Each promoted path pulled out of its variant column, in stored
+        // order so it lines up with the rest of the file without a second
+        // permutation. The value is what the extraction itself returns, so a
+        // read served from this column and a read that walks the json give
+        // the same answer by construction.
+        let shred_values: Vec<Vec<Option<Vec<u8>>>> = shred_specs
+            .iter()
+            .map(|(ci, _, path)| {
+                let source = &user_views[*ci];
+                let at = |r: usize| -> Option<Vec<u8>> {
+                    let text = std::str::from_utf8(source[r]?).ok()?;
+                    zyron_executor::variant_shred::extract_scalar_text(text, path)
+                        .map(String::into_bytes)
+                };
+                match &order {
+                    Some(order) => order.iter().map(|&r| at(r as usize)).collect(),
+                    None => (0..row_count).map(at).collect(),
+                }
+            })
+            .collect();
+        let num_shred = shred_specs.len();
+
         // Per-column view provider, invoked inside each column's own encode
         // worker so view materialization is parallel across columns. User
-        // columns borrow their arena; the three sys columns borrow the sys
-        // blobs (supersede is the single shared zero slice).
+        // columns borrow their arena; the shredded and sys columns are built
+        // in stored order already (supersede is one shared zero slice).
         let column_view = |i: usize| -> Vec<Option<&[u8]>> {
             if i < num_cols {
-                // The sys columns below are already built in stored order,
-                // so only the user columns take the permutation here
+                // Everything below is already built in stored order, so only
+                // the user columns take the permutation here
                 match &order {
                     Some(order) => order.iter().map(|&r| user_views[i][r as usize]).collect(),
                     None => user_views[i].clone(),
                 }
-            } else if i == num_cols {
+            } else if i < num_cols + num_shred {
+                shred_values[i - num_cols]
+                    .iter()
+                    .map(|v| v.as_deref())
+                    .collect()
+            } else if i == num_cols + num_shred {
                 (0..row_count)
                     .map(|r| Some(&sys_rowid_blob[r * 8..r * 8 + 8]))
                     .collect()
-            } else if i == num_cols + 1 {
+            } else if i == num_cols + num_shred + 1 {
                 (0..row_count)
                     .map(|r| Some(&sys_xmin_blob[r * 8..r * 8 + 8]))
                     .collect()
@@ -1690,6 +1745,21 @@ impl CompactionWorker {
                 cluster_spec_id,
                 // The fold writes into the columnar root, which is the hot tier
                 storage_tier: 0,
+                // Which promoted paths this file carries, beside the column
+                // holding each. A reader consults this rather than deriving
+                // an id from a path, so two paths can never be read out of
+                // one column
+                shredded: shred_specs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, variant_column_id, path))| {
+                        zyron_catalog::schema::ShreddedColumn {
+                            variant_column_id: *variant_column_id,
+                            path: path.clone(),
+                            column_id: SHRED_COL_BASE + i as u32,
+                        }
+                    })
+                    .collect(),
             });
             fresh.columnar.next_rowid = fresh.columnar.next_rowid.max(next_rowid);
             fresh.columnar.next_file_id = fresh.columnar.next_file_id.max(file_id + 1);
@@ -1856,14 +1926,9 @@ impl CompactionWorker {
                     let disk_data = rt
                         .block_on(disk_manager.read_page(page_id))
                         .map_err(|e| format!("folded heap page read failed: {}", e))?;
-                    let (frame, evicted) = buffer_pool
+                    buffer_pool
                         .load_page(page_id, &disk_data)
-                        .map_err(|e| format!("folded heap page load failed: {}", e))?;
-                    if let Some(ev) = evicted {
-                        rt.block_on(disk_manager.write_page(ev.page_id, &ev.data))
-                            .map_err(|e| format!("evicted page write failed: {}", e))?;
-                    }
-                    frame
+                        .map_err(|e| format!("folded heap page load failed: {}", e))?
                 }
             };
             let mut breached: Option<u16> = None;

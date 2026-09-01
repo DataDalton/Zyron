@@ -479,7 +479,7 @@ mod tests {
         // Dirty some pages with LSN stamps
         for i in 0..10u64 {
             let page_id = PageId::new(0, i);
-            let (_, _) = pool.new_page(page_id).unwrap();
+            pool.new_page(page_id).unwrap();
             pool.unpin_page(page_id, true);
             pool.mark_dirty_with_lsn(page_id, (i + 1) * 100);
         }

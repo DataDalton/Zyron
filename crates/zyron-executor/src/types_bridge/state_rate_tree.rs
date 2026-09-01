@@ -1,4 +1,4 @@
-//! state_machine, rate_limit, and hierarchy dispatch arms
+//! state_machine and rate_limit dispatch arms
 //!
 //! opaque values travel as JSON text bytes inside Binary cells
 //! a state machine def round-trips as the canonical JSON definition sm_parse accepts,
@@ -10,7 +10,7 @@
 
 use crate::column::{Column, ColumnData, NullBitmap};
 use zyron_common::{Result, TypeId, ZyronError};
-use zyron_types::{hierarchy, rate_limit, state_machine};
+use zyron_types::{rate_limit, state_machine};
 
 pub(super) fn dispatch(name: &str, args: &[Column], _num_rows: usize) -> Option<Result<Column>> {
     Some(match name {
@@ -29,16 +29,6 @@ pub(super) fn dispatch(name: &str, args: &[Column], _num_rows: usize) -> Option<
         "sliding_window_count" => sliding_window_count_col(args),
         "sliding_window_check" => sliding_window_check_col(args),
         "fixed_window_count" => fixed_window_count_col(args),
-        "closure_table_ancestors" => closure_table_ancestors_col(args),
-        "closure_table_descendants" => closure_table_descendants_col(args),
-        "closure_table_depth" => closure_table_depth_col(args),
-        "closure_table_insert" => closure_table_insert_col(args),
-        "is_ancestor" => is_ancestor_col(args),
-        "materialized_path" => materialized_path_col(args),
-        "nested_set_rebuild" => nested_set_rebuild_col(args),
-        "nested_set_subtree" => nested_set_subtree_col(args),
-        "path_ancestors" => path_ancestors_col(args),
-        "path_depth" => path_depth_col(args),
         _ => return None,
     })
 }
@@ -260,135 +250,6 @@ fn fixed_window_count_col(args: &[Column]) -> Result<Column> {
 }
 
 // ---------------------------------------------------------------------------
-// hierarchy
-// ---------------------------------------------------------------------------
-
-fn closure_table_ancestors_col(args: &[Column]) -> Result<Column> {
-    let sig = "closure_table_ancestors(array, bigint)";
-    arg_check(args, 2, sig)?;
-    let closures = text_column(&args[0], sig)?;
-    let nodes = int_column(&args[1], sig)?;
-    let n = row_count(args);
-    Ok(nullable_binary(args, n, TypeId::Array, |i| {
-        let closure = parse_closure(closures[i]?)?;
-        Some(json_i64_array(&hierarchy::closure_table_ancestors(
-            &closure, nodes[i],
-        )))
-    }))
-}
-
-fn closure_table_descendants_col(args: &[Column]) -> Result<Column> {
-    let sig = "closure_table_descendants(array, bigint)";
-    arg_check(args, 2, sig)?;
-    let closures = text_column(&args[0], sig)?;
-    let nodes = int_column(&args[1], sig)?;
-    let n = row_count(args);
-    Ok(nullable_binary(args, n, TypeId::Array, |i| {
-        let closure = parse_closure(closures[i]?)?;
-        Some(json_i64_array(&hierarchy::closure_table_descendants(
-            &closure, nodes[i],
-        )))
-    }))
-}
-
-fn closure_table_depth_col(args: &[Column]) -> Result<Column> {
-    let sig = "closure_table_depth(array, bigint)";
-    arg_check(args, 2, sig)?;
-    let closures = text_column(&args[0], sig)?;
-    let nodes = int_column(&args[1], sig)?;
-    let n = row_count(args);
-    Ok(nullable_i32(args, n, |i| {
-        let closure = parse_closure(closures[i]?)?;
-        Some(hierarchy::closure_table_depth(&closure, nodes[i]))
-    }))
-}
-
-fn closure_table_insert_col(args: &[Column]) -> Result<Column> {
-    let sig = "closure_table_insert(array, bigint, bigint)";
-    arg_check(args, 3, sig)?;
-    let closures = text_column(&args[0], sig)?;
-    let parents = int_column(&args[1], sig)?;
-    let children = int_column(&args[2], sig)?;
-    let n = row_count(args);
-    Ok(nullable_binary(args, n, TypeId::Array, |i| {
-        let closure = parse_closure(closures[i]?)?;
-        let rows = hierarchy::closure_table_insert(&closure, parents[i], children[i]);
-        Some(json_closure_rows(&rows))
-    }))
-}
-
-fn is_ancestor_col(args: &[Column]) -> Result<Column> {
-    let sig = "is_ancestor(text, text)";
-    arg_check(args, 2, sig)?;
-    let ancestors = text_column(&args[0], sig)?;
-    let descendants = text_column(&args[1], sig)?;
-    let n = row_count(args);
-    Ok(nullable_bool(args, n, |i| {
-        Some(hierarchy::is_ancestor(ancestors[i]?, descendants[i]?))
-    }))
-}
-
-// input is a JSON array of path segment strings
-fn materialized_path_col(args: &[Column]) -> Result<Column> {
-    let sig = "materialized_path(array)";
-    arg_check(args, 1, sig)?;
-    let segments = text_column(&args[0], sig)?;
-    let n = row_count(args);
-    Ok(nullable_utf8(args, n, |i| {
-        let segs = parse_string_array(segments[i]?)?;
-        let refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
-        Some(hierarchy::materialized_path(&refs))
-    }))
-}
-
-// input is a JSON array of [id, parent] pairs, parent null marks a root
-fn nested_set_rebuild_col(args: &[Column]) -> Result<Column> {
-    let sig = "nested_set_rebuild(array)";
-    arg_check(args, 1, sig)?;
-    let relations = text_column(&args[0], sig)?;
-    let n = row_count(args);
-    Ok(nullable_binary(args, n, TypeId::Array, |i| {
-        let rels = parse_parent_child(relations[i]?)?;
-        Some(json_node_rows(&hierarchy::nested_set_rebuild(&rels)))
-    }))
-}
-
-// input is a JSON array of [id, lft, rgt] triples
-fn nested_set_subtree_col(args: &[Column]) -> Result<Column> {
-    let sig = "nested_set_subtree(array, bigint)";
-    arg_check(args, 2, sig)?;
-    let node_sets = text_column(&args[0], sig)?;
-    let nodes = int_column(&args[1], sig)?;
-    let n = row_count(args);
-    Ok(nullable_binary(args, n, TypeId::Array, |i| {
-        let set = parse_nested_nodes(node_sets[i]?)?;
-        Some(json_i64_array(&hierarchy::nested_set_subtree(
-            &set, nodes[i],
-        )))
-    }))
-}
-
-fn path_ancestors_col(args: &[Column]) -> Result<Column> {
-    let sig = "path_ancestors(text)";
-    arg_check(args, 1, sig)?;
-    let paths = text_column(&args[0], sig)?;
-    let n = row_count(args);
-    Ok(nullable_binary(args, n, TypeId::Array, |i| {
-        Some(json_string_array(&hierarchy::path_ancestors(paths[i]?)))
-    }))
-}
-
-fn path_depth_col(args: &[Column]) -> Result<Column> {
-    let sig = "path_depth(text)";
-    arg_check(args, 1, sig)?;
-    let paths = text_column(&args[0], sig)?;
-    let n = row_count(args);
-    Ok(nullable_i32(args, n, |i| {
-        Some(hierarchy::path_depth(paths[i]?))
-    }))
-}
-
-// ---------------------------------------------------------------------------
 // value codecs
 // ---------------------------------------------------------------------------
 
@@ -487,82 +348,8 @@ fn parse_i64_array(s: &str) -> Option<Vec<i64>> {
     v.as_array()?.iter().map(|e| e.as_i64()).collect()
 }
 
-// JSON array of fixed width integer rows
-fn parse_i64_rows(s: &str, width: usize) -> Option<Vec<Vec<i64>>> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    let rows = v.as_array()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let cells = row.as_array()?;
-        if cells.len() != width {
-            return None;
-        }
-        let mut parsed = Vec::with_capacity(width);
-        for cell in cells {
-            parsed.push(cell.as_i64()?);
-        }
-        out.push(parsed);
-    }
-    Some(out)
-}
-
-// closure rows are [ancestor, descendant, depth]
-fn parse_closure(s: &str) -> Option<Vec<(i64, i64, i32)>> {
-    parse_i64_rows(s, 3)?
-        .into_iter()
-        .map(|r| Some((r[0], r[1], i32::try_from(r[2]).ok()?)))
-        .collect()
-}
-
-// nested set rows are [id, lft, rgt]
-fn parse_nested_nodes(s: &str) -> Option<Vec<(i64, i32, i32)>> {
-    parse_i64_rows(s, 3)?
-        .into_iter()
-        .map(|r| Some((r[0], i32::try_from(r[1]).ok()?, i32::try_from(r[2]).ok()?)))
-        .collect()
-}
-
-fn parse_parent_child(s: &str) -> Option<Vec<(i64, Option<i64>)>> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    let rows = v.as_array()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let cells = row.as_array()?;
-        if cells.len() != 2 {
-            return None;
-        }
-        let id = cells[0].as_i64()?;
-        let parent = match &cells[1] {
-            serde_json::Value::Null => None,
-            other => Some(other.as_i64()?),
-        };
-        out.push((id, parent));
-    }
-    Some(out)
-}
-
-fn parse_string_array(s: &str) -> Option<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    v.as_array()?
-        .iter()
-        .map(|e| e.as_str().map(|x| x.to_string()))
-        .collect()
-}
-
-fn json_i64_array(vals: &[i64]) -> Vec<u8> {
-    serde_json::to_string(vals).unwrap_or_default().into_bytes()
-}
-
 fn json_string_array(vals: &[String]) -> Vec<u8> {
     serde_json::to_string(vals).unwrap_or_default().into_bytes()
-}
-
-fn json_closure_rows(rows: &[(i64, i64, i32)]) -> Vec<u8> {
-    serde_json::to_string(rows).unwrap_or_default().into_bytes()
-}
-
-fn json_node_rows(rows: &[(i64, i32, i32)]) -> Vec<u8> {
-    serde_json::to_string(rows).unwrap_or_default().into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -662,22 +449,6 @@ fn nullable_bool<F: Fn(usize) -> Option<bool>>(args: &[Column], n: usize, f: F) 
         }
     }
     Column::with_nulls(ColumnData::Boolean(data), nulls, TypeId::Boolean)
-}
-
-fn nullable_i32<F: Fn(usize) -> Option<i32>>(args: &[Column], n: usize, f: F) -> Column {
-    let mut data = Vec::with_capacity(n);
-    let mut nulls = NullBitmap::none(n);
-    for i in 0..n {
-        let cell = if any_null(args, i) { None } else { f(i) };
-        match cell {
-            Some(v) => data.push(v),
-            None => {
-                data.push(0);
-                nulls.set_null(i);
-            }
-        }
-    }
-    Column::with_nulls(ColumnData::Int32(data), nulls, TypeId::Int32)
 }
 
 fn nullable_i64<F: Fn(usize) -> Option<i64>>(args: &[Column], n: usize, f: F) -> Column {
@@ -812,73 +583,6 @@ mod tests {
         match &out.data {
             ColumnData::Int64(v) => assert_eq!(v[0], 3),
             other => panic!("expected int64 column, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn closure_insert_links_child_to_ancestors() {
-        let closure = utf8_col(&["[[1,1,0]]"]);
-        let inserted = dispatch(
-            "closure_table_insert",
-            &[closure, int_col(&[1]), int_col(&[2])],
-            1,
-        )
-        .unwrap()
-        .unwrap();
-        let txt = String::from_utf8(binary_cell(&inserted, 0)).unwrap();
-        let rows: Vec<Vec<i64>> = serde_json::from_str(&txt).unwrap();
-        assert!(rows.contains(&vec![2, 2, 0]));
-        assert!(rows.contains(&vec![1, 2, 1]));
-    }
-
-    #[test]
-    fn nested_set_rebuild_root_spans_tree() {
-        let pairs = utf8_col(&["[[1,null],[2,1],[3,1]]"]);
-        let out = dispatch("nested_set_rebuild", &[pairs], 1)
-            .unwrap()
-            .unwrap();
-        let txt = String::from_utf8(binary_cell(&out, 0)).unwrap();
-        let rows: Vec<Vec<i64>> = serde_json::from_str(&txt).unwrap();
-        let root = rows.iter().find(|r| r[0] == 1).unwrap();
-        assert_eq!((root[1], root[2]), (1, 6));
-    }
-
-    #[test]
-    fn path_depth_propagates_null() {
-        let mut nulls = NullBitmap::none(2);
-        nulls.set_null(0);
-        let col = Column::with_nulls(
-            ColumnData::Utf8(vec![String::new(), "/a/b/c".to_string()]),
-            nulls,
-            TypeId::Text,
-        );
-        let out = dispatch("path_depth", &[col], 2).unwrap().unwrap();
-        assert!(out.nulls.is_null(0));
-        assert!(!out.nulls.is_null(1));
-        match &out.data {
-            ColumnData::Int32(v) => assert_eq!(v[1], 3),
-            other => panic!("expected int32 column, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn path_ancestors_and_is_ancestor_agree() {
-        let anc = dispatch("path_ancestors", &[utf8_col(&["/a/b/c"])], 1)
-            .unwrap()
-            .unwrap();
-        let txt = String::from_utf8(binary_cell(&anc, 0)).unwrap();
-        let list: Vec<String> = serde_json::from_str(&txt).unwrap();
-        assert_eq!(list, vec!["/", "/a", "/a/b"]);
-        let flag = dispatch(
-            "is_ancestor",
-            &[utf8_col(&["/a"]), utf8_col(&["/a/b/c"])],
-            1,
-        )
-        .unwrap()
-        .unwrap();
-        match &flag.data {
-            ColumnData::Boolean(v) => assert!(v[0]),
-            other => panic!("expected boolean column, got {:?}", other),
         }
     }
 

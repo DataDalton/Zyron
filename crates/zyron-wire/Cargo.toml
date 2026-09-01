@@ -13,6 +13,7 @@ profile = ["zyron-common/profile"]
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-raft = { path = "../zyron-raft" }
 zyron-common = { path = "../zyron-common" }
+zyron-media = { path = "../zyron-media" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
 zyron-lake = { path = "../zyron-lake" }
@@ -54,6 +55,7 @@ async-trait.workspace = true
 scc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+crc32fast.workspace = true
 memchr = "2"
 
 [dev-dependencies]

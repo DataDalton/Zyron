@@ -2,7 +2,7 @@
 
 use zyron_catalog::schema::{
     ColumnarRegistry, ColumnarSegmentEntry, ComplianceLogEntry, LakeConfig, LegalHoldEntry,
-    LifecycleConfig, RetentionJobEntry, RetentionPolicyEntry,
+    LifecycleConfig, RetentionJobEntry, RetentionPolicyEntry, ShreddedColumn,
 };
 use zyron_catalog::{SchemaId, TableEntry, TableId};
 
@@ -105,6 +105,8 @@ fn table_entry_columnar_registry_roundtrip() {
                 sys_xmin_hi: 9_500,
                 cluster_spec_id: 1,
                 storage_tier: 0,
+                // A segment folded before any path was promoted stores none
+                shredded: Vec::new(),
             },
             ColumnarSegmentEntry {
                 file_id: 2,
@@ -118,6 +120,21 @@ fn table_entry_columnar_registry_roundtrip() {
                 // A relocated segment has to survive the round trip too, or
                 // a restart would read every cold file back as hot
                 storage_tier: 2,
+                // Which promoted paths a segment stores has to survive too,
+                // or a restart would walk the documents for a path already
+                // sitting in a column of its own
+                shredded: vec![
+                    ShreddedColumn {
+                        variant_column_id: 3,
+                        path: "user.id".into(),
+                        column_id: 1 << 20,
+                    },
+                    ShreddedColumn {
+                        variant_column_id: 3,
+                        path: "device.os".into(),
+                        column_id: (1 << 20) + 1,
+                    },
+                ],
             },
         ],
         next_rowid: 1_548_576,
@@ -404,6 +421,8 @@ fn constraint_entry_enforced_tail_roundtrip() {
         enforced: false,
         on_violation: zyron_catalog::schema::ConstraintViolationAction::Quarantine,
         quarantine_table_id: Some(77),
+        without_overlaps: None,
+        fk_period: false,
     };
     let bytes = entry.to_bytes();
     let mut off = 0usize;
@@ -418,8 +437,9 @@ fn constraint_entry_enforced_tail_roundtrip() {
 
     // Bytes written before the modes existed decode as enforced and Fail,
     // which is what they meant. The tail here is enforced, on_violation, the
-    // quarantine presence byte and the table id
-    let truncated = &bytes[..bytes.len() - 7];
+    // quarantine presence byte and its table id, the without-overlaps
+    // presence byte, and the period flag
+    let truncated = &bytes[..bytes.len() - 9];
     let mut off = 0usize;
     let decoded = ConstraintEntry::from_bytes(truncated, &mut off).expect("decode");
     assert!(decoded.enforced);

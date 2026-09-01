@@ -86,3 +86,82 @@ fn every_declared_scalar_name_is_dispatched() {
         unknown.join("\n")
     );
 }
+
+/// Names declared in one section of the registry, read from the source so a
+/// name added there without an executor arm fails this file immediately
+fn declared_names_between(start_fn: &str, end_marker: &str) -> Vec<String> {
+    let src = include_str!("../../zyron-types/src/registry.rs");
+    let start = src
+        .find(start_fn)
+        .unwrap_or_else(|| panic!("{start_fn} present"));
+    let end = src[start..]
+        .find(end_marker)
+        .map(|o| start + o)
+        .unwrap_or(src.len());
+    let section = &src[start..end];
+    let mut names = Vec::new();
+    let mut rest = section;
+    while let Some(open) = rest.find('"') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('"') else { break };
+        let token = &rest[..close];
+        rest = &rest[close + 1..];
+        if !token.is_empty()
+            && token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            names.push(token.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every aggregate the registry types must have a real accumulator.
+///
+/// The aggregate operator refuses an unimplemented name rather than
+/// silently folding it into a COUNT, which is the right behaviour and also
+/// the reason a missing one is invisible until somebody writes the query.
+/// Four sketch merges sat in the registry with no accumulator anywhere
+/// until this test existed
+#[test]
+fn every_declared_aggregate_has_an_accumulator() {
+    let declared = declared_names_between(
+        "fn infer_types_aggregate_return_type",
+        "fn infer_types_window_return_type",
+    );
+    assert!(
+        declared.len() > 4,
+        "the aggregate section scraped almost nothing, the markers moved"
+    );
+    let missing: Vec<&String> = declared
+        .iter()
+        .filter(|name| !zyron_executor::operator::aggregate::is_supported_aggregate(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "aggregates declared in the registry with no accumulator: {missing:?}"
+    );
+}
+
+/// Every window function the registry types must be dispatched by the
+/// window operator
+#[test]
+fn every_declared_window_function_is_dispatched() {
+    let declared = declared_names_between("fn infer_types_window_return_type", "#[cfg(test)]");
+    assert!(
+        declared.len() > 4,
+        "the window section scraped almost nothing, the markers moved"
+    );
+    let source = include_str!("../src/operator/window.rs");
+    let missing: Vec<&String> = declared
+        .iter()
+        .filter(|name| !source.contains(&format!("\"{name}\"")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "window functions declared in the registry the operator does not name: {missing:?}"
+    );
+}

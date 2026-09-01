@@ -150,6 +150,30 @@ fn the_controller_never_reads_the_core_count() {
     );
 }
 
+/// Whether a line that names the registration mode steers on it, rather than
+/// only storing, returning or printing it.
+///
+/// A line whose trimmed form opens with a quote is a match arm or a list
+/// entry keyed by the setting's name, which selects a setting rather than a
+/// provisioner. Everything else counts as steering as soon as it compares
+/// the value or opens a branch on it.
+fn acts_on_the_value(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with('"') {
+        return false;
+    }
+    const STEERING: [&str; 7] = [
+        "==",
+        "!=",
+        "if ",
+        "match ",
+        ".eq(",
+        ".starts_with(",
+        ".contains(",
+    ];
+    STEERING.iter().any(|token| trimmed.contains(token))
+}
+
 /// How a node comes into existence must not decide how the node scales.
 ///
 /// Every mode autoscales. Only the actuator and the ceiling differ, and both
@@ -157,9 +181,17 @@ fn the_controller_never_reads_the_core_count() {
 /// registration mode is a static deployment quietly losing its elasticity.
 ///
 /// The rule has two halves, because the mode has to exist somewhere. Outside
-/// the provisioner the identifier may not appear at all, which is this test.
-/// Inside it, only the places that declare, default, validate, and resolve it
-/// may name it, which is the test below.
+/// the provisioner nothing may act on the value, which is this test. Inside
+/// it, only the places that declare, default, validate, and resolve it may
+/// name it, which is the test below.
+///
+/// Acting on the value means comparing it or steering on it. Carrying it is
+/// something else: an operator sets `mesh.node_registration_mode` and reads
+/// it back, so the config surface stores the string, hands it out and lists
+/// it, and a startup log names the mode the node came up in. None of those
+/// decide anything, and forbidding them would mean the setting could not be
+/// set. What they must never become is a second answer to which provisioner
+/// runs, because the registry already owns that question.
 #[test]
 fn no_registration_mode_branch_outside_the_provisioner() {
     let root = repo_root();
@@ -182,6 +214,9 @@ fn no_registration_mode_branch_outside_the_provisioner() {
                 continue;
             }
             for (line, text) in offending_lines(&file, "node_registration_mode") {
+                if !acts_on_the_value(&text) {
+                    continue;
+                }
                 offenders.push(format!("{name}:{line} {text}"));
             }
         }

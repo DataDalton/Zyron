@@ -295,6 +295,194 @@ fn silhouetteEstimate(data: &TrainingData, assignments: &[u32], k: usize) -> f64
     }
 }
 
+// Seed used when a caller does not supply one, keeps repeated runs stable
+pub const DEFAULT_KMEANS_SEED: u64 = 42;
+
+#[derive(Debug, Clone)]
+pub struct KmeansClusterOutput {
+    // per row (clusterId, euclidean distance to that centroid)
+    pub assignments: Vec<(usize, f64)>,
+    pub centroids: Vec<Vec<f64>>,
+}
+
+fn flattenValidated(rows: &[Vec<f64>]) -> Result<(Vec<f64>, usize, usize)> {
+    let n = rows.len();
+    if n == 0 {
+        return Err(ZyronError::InvalidParameter {
+            name: "rows".to_string(),
+            value: "empty input".to_string(),
+        });
+    }
+    let p = rows[0].len();
+    if p == 0 {
+        return Err(ZyronError::InvalidParameter {
+            name: "rows".to_string(),
+            value: "rows have no columns".to_string(),
+        });
+    }
+    let mut xs = Vec::with_capacity(n * p);
+    for r in rows {
+        if r.len() != p {
+            return Err(ZyronError::InvalidParameter {
+                name: "rows".to_string(),
+                value: "rows have inconsistent dimensions".to_string(),
+            });
+        }
+        if r.iter().any(|v| !v.is_finite()) {
+            return Err(ZyronError::InvalidParameter {
+                name: "rows".to_string(),
+                value: "rows contain non finite values".to_string(),
+            });
+        }
+        xs.extend_from_slice(r);
+    }
+    Ok((xs, n, p))
+}
+
+fn trainOnRows(
+    xs: &[f64],
+    n: usize,
+    p: usize,
+    k: usize,
+    maxIter: usize,
+    seed: u64,
+) -> Result<TrainedModel> {
+    let ys = vec![0.0f64; n];
+    let data = TrainingData::new(xs, &ys, n, p);
+    let mut config = ModelConfig::new(
+        ModelType::KMeans,
+        (0..p).map(|j| format!("f{}", j)).collect(),
+    );
+    config.hyperparameters.setF64("k", k as f64);
+    config
+        .hyperparameters
+        .setF64("max_iter", maxIter.max(1) as f64);
+    config.hyperparameters.setF64("seed", seed as f64);
+    train(&config, &data)
+}
+
+/// Clusters rows and returns per row assignment with distance plus the
+/// fitted centroids
+pub fn kmeansCluster(
+    rows: &[Vec<f64>],
+    k: usize,
+    maxIter: usize,
+    seed: u64,
+) -> Result<KmeansClusterOutput> {
+    let (xs, n, p) = flattenValidated(rows)?;
+    if k == 0 {
+        return Err(ZyronError::InvalidParameter {
+            name: "k".to_string(),
+            value: "k must be at least 1".to_string(),
+        });
+    }
+    let model = trainOnRows(&xs, n, p, k, maxIter, seed)?;
+    let fitted_k = match model.data {
+        ModelData::KMeans { k, .. } => k,
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "kmeans training returned unexpected model data".to_string(),
+            ));
+        }
+    };
+    let centroids_flat = &model.weights;
+    let mut assignments = Vec::with_capacity(n);
+    for r in rows {
+        let c = predictCluster(centroids_flat, fitted_k, p, r);
+        let cstart = c * p;
+        let dist = sqDistance(r, &centroids_flat[cstart..cstart + p]).sqrt();
+        assignments.push((c, dist));
+    }
+    let centroids = centroids_flat
+        .chunks(p)
+        .take(fitted_k)
+        .map(|c| c.to_vec())
+        .collect();
+    Ok(KmeansClusterOutput {
+        assignments,
+        centroids,
+    })
+}
+
+/// Fitted centroids only
+pub fn kmeansCentroids(
+    rows: &[Vec<f64>],
+    k: usize,
+    maxIter: usize,
+    seed: u64,
+) -> Result<Vec<Vec<f64>>> {
+    Ok(kmeansCluster(rows, k, maxIter, seed)?.centroids)
+}
+
+/// Inertia per candidate k for elbow selection
+/// Each k takes the best of three seeded restarts so the curve stays
+/// close to the optimal nonincreasing shape
+pub fn kmeansElbow(rows: &[Vec<f64>], kRange: &[usize]) -> Result<Vec<(usize, f64)>> {
+    let (xs, n, p) = flattenValidated(rows)?;
+    if kRange.is_empty() {
+        return Err(ZyronError::InvalidParameter {
+            name: "k_range".to_string(),
+            value: "empty k range".to_string(),
+        });
+    }
+    let mut out = Vec::with_capacity(kRange.len());
+    for &k in kRange {
+        if k == 0 || k > n {
+            return Err(ZyronError::InvalidParameter {
+                name: "k_range".to_string(),
+                value: format!("k must be in 1..={}, got {}", n, k),
+            });
+        }
+        let mut best = f64::INFINITY;
+        for offset in 0..3u64 {
+            let model = trainOnRows(&xs, n, p, k, 100, DEFAULT_KMEANS_SEED + offset)?;
+            let inertia = model.metrics.get("inertia").copied().ok_or_else(|| {
+                ZyronError::ExecutionError("kmeans training produced no inertia metric".to_string())
+            })?;
+            if inertia < best {
+                best = inertia;
+            }
+        }
+        out.push((k, best));
+    }
+    Ok(out)
+}
+
+/// Assigns rows to the nearest of the given centroids
+pub fn kmeansPredict(rows: &[Vec<f64>], centroids: &[Vec<f64>]) -> Result<Vec<usize>> {
+    let (_, _, p) = flattenValidated(rows)?;
+    if centroids.is_empty() {
+        return Err(ZyronError::InvalidParameter {
+            name: "centroids".to_string(),
+            value: "empty centroid list".to_string(),
+        });
+    }
+    let mut flat = Vec::with_capacity(centroids.len() * p);
+    for c in centroids {
+        if c.len() != p {
+            return Err(ZyronError::InvalidParameter {
+                name: "centroids".to_string(),
+                value: format!(
+                    "centroid dimension {} does not match row dimension {}",
+                    c.len(),
+                    p
+                ),
+            });
+        }
+        if c.iter().any(|v| !v.is_finite()) {
+            return Err(ZyronError::InvalidParameter {
+                name: "centroids".to_string(),
+                value: "centroids contain non finite values".to_string(),
+            });
+        }
+        flat.extend_from_slice(c);
+    }
+    Ok(rows
+        .iter()
+        .map(|r| predictCluster(&flat, centroids.len(), p, r))
+        .collect())
+}
+
 pub fn predictCluster(centroids: &[f64], k: usize, p: usize, features: &[f64]) -> usize {
     let mut bestC = 0usize;
     let mut bestD = f64::INFINITY;
@@ -347,5 +535,64 @@ mod tests {
             "centroids = {:?}",
             model.weights
         );
+    }
+
+    fn twoBlobRows(seed: u64) -> Vec<Vec<f64>> {
+        let mut rng = Xoshiro256pp::fromSeed(seed);
+        let mut rows = Vec::with_capacity(240);
+        for _ in 0..120 {
+            rows.push(vec![
+                -4.0 + 0.3 * rng.nextNormal(),
+                -4.0 + 0.3 * rng.nextNormal(),
+            ]);
+        }
+        for _ in 0..120 {
+            rows.push(vec![
+                4.0 + 0.3 * rng.nextNormal(),
+                4.0 + 0.3 * rng.nextNormal(),
+            ]);
+        }
+        rows
+    }
+
+    #[test]
+    fn kmeansClusterStableAcrossRunsWithSameSeed() {
+        let rows = twoBlobRows(9);
+        let a = kmeansCluster(&rows, 2, 100, DEFAULT_KMEANS_SEED).expect("first run");
+        let b = kmeansCluster(&rows, 2, 100, DEFAULT_KMEANS_SEED).expect("second run");
+        assert_eq!(a.centroids, b.centroids);
+        for (x, y) in a.assignments.iter().zip(b.assignments.iter()) {
+            assert_eq!(x.0, y.0);
+            assert!((x.1 - y.1).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn kmeansElbowInertiaNonincreasing() {
+        let rows = twoBlobRows(19);
+        let curve = kmeansElbow(&rows, &[1, 2, 3, 4]).expect("elbow");
+        assert_eq!(curve.len(), 4);
+        for i in 1..curve.len() {
+            assert!(
+                curve[i].1 <= curve[i - 1].1 + 1e-9,
+                "inertia rose from k={} ({}) to k={} ({})",
+                curve[i - 1].0,
+                curve[i - 1].1,
+                curve[i].0,
+                curve[i].1
+            );
+        }
+        // the drop from 1 to 2 clusters dominates on two blob data
+        assert!(curve[1].1 < curve[0].1 * 0.2);
+    }
+
+    #[test]
+    fn kmeansPredictMatchesNearestCentroid() {
+        let centroids = vec![vec![-4.0, -4.0], vec![4.0, 4.0]];
+        let rows = vec![vec![-3.5, -4.2], vec![3.9, 4.4], vec![-4.0, -3.9]];
+        let preds = kmeansPredict(&rows, &centroids).expect("predict");
+        assert_eq!(preds, vec![0, 1, 0]);
+        let bad = kmeansPredict(&rows, &[vec![1.0]]);
+        assert!(bad.is_err());
     }
 }

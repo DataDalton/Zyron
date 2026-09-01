@@ -144,6 +144,8 @@ pub async fn apply_insert(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        // Replicated rows carry the leader's computed stored generation
+        Vec::new(),
     );
     drain(Box::new(op)).await
 }

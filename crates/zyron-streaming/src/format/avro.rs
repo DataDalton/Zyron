@@ -92,9 +92,13 @@ fn avro_type_json(t: TypeId) -> &'static str {
         | TypeId::TimestampTz => "\"long\"",
         TypeId::Float32 => "\"float\"",
         TypeId::Float64 => "\"double\"",
-        TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-            "\"string\""
-        }
+        TypeId::Char
+        | TypeId::Varchar
+        | TypeId::Text
+        | TypeId::Json
+        | TypeId::Jsonb
+        | TypeId::Variant
+        | TypeId::Ltree => "\"string\"",
         TypeId::Int128
         | TypeId::Decimal
         | TypeId::UInt128
@@ -104,6 +108,10 @@ fn avro_type_json(t: TypeId) -> &'static str {
         | TypeId::Bytea
         | TypeId::Uuid
         | TypeId::Interval
+        // A stored nested value is its binary layout, and this schema is
+        // built from type ids alone, with no shape to render it back with
+        | TypeId::Struct
+        | TypeId::Map
         | TypeId::Array
         | TypeId::Composite
         | TypeId::Vector
@@ -122,6 +130,11 @@ fn avro_type_json(t: TypeId) -> &'static str {
         | TypeId::CountMinSketch
         | TypeId::Bitfield
         | TypeId::Quantity
+        | TypeId::Image
+        | TypeId::Video
+        | TypeId::Audio
+        | TypeId::Document
+        | TypeId::ExternalRef
         | TypeId::Null => "\"bytes\"",
     }
 }
@@ -156,7 +169,9 @@ fn stream_value_to_avro(v: &StreamValue, t: TypeId) -> Result<AvroValue> {
         | (TypeId::Varchar, StreamValue::Utf8(s))
         | (TypeId::Text, StreamValue::Utf8(s))
         | (TypeId::Json, StreamValue::Utf8(s))
-        | (TypeId::Jsonb, StreamValue::Utf8(s)) => AvroValue::String(s.clone()),
+        | (TypeId::Jsonb, StreamValue::Utf8(s))
+        | (TypeId::Variant, StreamValue::Utf8(s))
+        | (TypeId::Ltree, StreamValue::Utf8(s)) => AvroValue::String(s.clone()),
         (TypeId::Int128, StreamValue::I128(n))
         | (TypeId::Decimal, StreamValue::I128(n))
         | (TypeId::UInt128, StreamValue::I128(n))
@@ -168,7 +183,12 @@ fn stream_value_to_avro(v: &StreamValue, t: TypeId) -> Result<AvroValue> {
         | (TypeId::Interval, StreamValue::Binary(b))
         | (TypeId::Array, StreamValue::Binary(b))
         | (TypeId::Composite, StreamValue::Binary(b))
-        | (TypeId::Vector, StreamValue::Binary(b)) => AvroValue::Bytes(b.clone()),
+        | (TypeId::Vector, StreamValue::Binary(b))
+        | (TypeId::Image, StreamValue::Binary(b))
+        | (TypeId::Video, StreamValue::Binary(b))
+        | (TypeId::Audio, StreamValue::Binary(b))
+        | (TypeId::Document, StreamValue::Binary(b))
+        | (TypeId::ExternalRef, StreamValue::Binary(b)) => AvroValue::Bytes(b.clone()),
         _ => {
             return Err(ZyronError::StreamingError(format!(
                 "avro: cannot encode {v:?} as {t:?}"

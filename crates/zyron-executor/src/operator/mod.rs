@@ -66,6 +66,10 @@ pub(crate) fn apply_column_security(
     };
     let n = batch.num_rows;
     let mut cols = Vec::with_capacity(batch.columns.len());
+    // Columns this pass hands back untouched. A path a scan read out of a
+    // variant column survives only when the column itself did, because a
+    // masked or withheld document must not be readable one field at a time
+    let mut untouched: Vec<u16> = Vec::new();
     for (i, col) in batch.columns.iter().enumerate() {
         if i >= output_columns.len() {
             cols.push(col.clone());
@@ -84,6 +88,7 @@ pub(crate) fn apply_column_security(
             &mut probe,
         );
         if cleared && !has_mask {
+            untouched.push(col_id);
             cols.push(col.clone());
             continue;
         }
@@ -116,7 +121,12 @@ pub(crate) fn apply_column_security(
         }
         cols.push(b.finish());
     }
-    DataBatch::new(cols)
+    let resolved = batch
+        .resolved
+        .into_iter()
+        .filter(|r| untouched.contains(&r.column_id))
+        .collect();
+    DataBatch::new(cols).with_resolved(resolved)
 }
 
 /// Boxed future returned by Operator::next().

@@ -298,10 +298,10 @@ A few more numbers not shown in the charts above:
 | Subsystem | Metric | Result |
 |-----------|--------|--------|
 | MVCC | GC sweep | ~1.8B tuples/sec |
-| Columnar | .zyr scan throughput | ~10.6 GB/sec |
-| Columnar | Compaction pipeline | ~11.1M rows/sec |
-| Columnar | HybridScan overhead vs heap-only | ~-4.3% |
-| Columnar | Metadata-aggregate pruning speedup | ~43.1x |
+| Columnar | .zyr scan throughput | ~10.9 GB/sec |
+| Columnar | Compaction pipeline | ~12.0M rows/sec |
+| Columnar | HybridScan overhead vs heap-only | ~3.9% |
+| Columnar | Metadata-aggregate pruning speedup | ~51.2x |
 | Temporal | Picosecond timestamp decode | ~966M rows/sec |
 | Versioning | Time-travel scan overhead | ~24% |
 | Wire | QUIC PostgreSQL handshake | ~5 us |
@@ -310,20 +310,20 @@ A few more numbers not shown in the charts above:
 | Lake | Commit latency (insert) | ~2.24 ms |
 | Lake | Commit rate (delete predicate) | ~1635 commits/sec |
 | Lake | Derived clustering expression files pruned | ~93% |
-| Lake | Load with clustering expression | ~812K rows/sec |
-| Consensus | Leader election after a kill | ~228 ms |
+| Lake | Load with clustering expression | ~782K rows/sec |
+| Consensus | Leader election after a kill | ~224 ms |
 | Consensus | Single log append | ~0.14 us |
-| Consensus | Snapshot 1GB, create | ~0.95 s |
-| Consensus | Snapshot 1GB, transfer | ~2.54 s |
+| Consensus | Snapshot 1GB, create | ~0.89 s |
+| Consensus | Snapshot 1GB, transfer | ~2.46 s |
 | Replication | Follower keep-up vs leader | ~99.7% |
 | Replication | Worst follower lag | ~162 entries |
 | Transactions | Durable group-commit peak | ~747K txn/sec |
 | Transactions | Group-commit amplification (c=1 to c=512) | ~63.4x |
-| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.5x (heap wins indexed points) |
-| Cross-format | Bulk load to queryable, lake vs heap | ~10.4x (heap wins large batches) |
-| Cross-format | Trickle load to queryable, lake vs heap | ~26.6x (heap wins tiny commits) |
+| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.3x (heap wins indexed points) |
+| Cross-format | Bulk load to queryable, lake vs heap | ~9.9x (heap wins large batches) |
+| Cross-format | Trickle load to queryable, lake vs heap | ~30.3x (heap wins tiny commits) |
 
-36 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+38 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started

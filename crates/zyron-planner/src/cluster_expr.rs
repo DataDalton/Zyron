@@ -371,6 +371,16 @@ fn render_literal(value: &LiteralValue, canonical: &mut String, sql: &mut String
                 interval.months, interval.days, interval.nanoseconds
             );
         }
+        // A stored form reaches a clustering expression only if one were
+        // written from a bound tree, which no statement text can do, so it
+        // canonicalizes to its bytes and has no SQL spelling
+        LiteralValue::Bytes(bytes) => {
+            let _ = write!(canonical, "b{}", bytes.len());
+            for byte in bytes {
+                let _ = write!(canonical, "{byte:02x}");
+            }
+            sql.push_str("NULL");
+        }
     }
 }
 
@@ -410,6 +420,7 @@ mod tests {
             fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
+            attrs: Default::default(),
         }
     }
 

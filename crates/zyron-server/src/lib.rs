@@ -369,10 +369,12 @@ impl Server {
             wal_for_barrier.wait_for_flush(zyron_wal::Lsn(lsn))
         });
 
-        // Flush a dirty victim to disk during eviction so the write is never lost
-        // by a caller that drops the evicted page. Uses a fsync write because the
-        // eviction path has no batched fsync follow-up. The WAL barrier runs
-        // first: an evicted page's log must be durable before its bytes land
+        // Writes a dirty victim to disk during eviction, while the pool still
+        // holds the frame and before the page's mapping comes down, so a
+        // reader faulting the page back in cannot find a stale image. Uses a
+        // fsync write because the eviction path has no batched fsync
+        // follow-up. The WAL barrier runs first, because an evicted page's
+        // log must be durable before its bytes land
         let dm_for_evict = Arc::clone(&disk_manager);
         let barrier_for_evict = Arc::clone(&wal_barrier);
         let evict_writer: zyron_buffer::EvictWriteFn = Arc::new(move |page_id, data, dirty_lsn| {
@@ -657,6 +659,38 @@ impl Server {
         let branch_mgr_arc = Arc::new(branch_mgr);
         let notif_arc = Arc::new(zyron_wire::notifications::NotificationChannels::new());
 
+        // Currency rates: load the persisted table into the process store
+        // CONVERT_CURRENCY reads. A missing file starts empty
+        match zyron_wire::currency_rates::load_into_store(&data_dir) {
+            Ok(count) if count > 0 => info!("loaded {count} currency rates"),
+            Ok(_) => {}
+            Err(e) => error!("currency rates loading failed: {e}"),
+        }
+
+        // Media store: the content addressed home of TOAST and external
+        // media payloads. The presign secret and external tool paths land
+        // in the executor's media runtime for the scalar functions
+        let media_store_arc = Arc::new(
+            zyron_media::store::MediaStore::open(data_dir.clone())
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        );
+        {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(data_dir.to_string_lossy().as_bytes());
+            hasher.update(b"media-presign-secret-v1");
+            let digest = hasher.finalize();
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&digest);
+            zyron_executor::media_runtime::install_presign_secret(secret);
+        }
+        zyron_executor::media_runtime::install_tool_config(
+            zyron_media::skeleton::MediaToolConfig {
+                ffmpeg_path: self.config.media.ffmpeg_path.clone(),
+                tesseract_path: self.config.media.tesseract_path.clone(),
+            },
+        );
+
         // Document registry: load the persisted DocId -> RowLocator map the
         // search indexes address rows through. A missing or corrupt snapshot
         // starts empty, matching the index managers' missing-file behavior.
@@ -679,17 +713,46 @@ impl Server {
             }
             let mgr = zyron_search::FtsManager::with_data_dir(fts_dir.clone());
             let mut fts_entries: Vec<(u32, u32, Vec<u16>)> = Vec::new();
+            // Analyzer snapshots per index id, rebuilt after loading so
+            // every configured index analyzes exactly as it did before the
+            // restart. A hybrid index's text half loads here too
+            let mut analyzer_params: Vec<(u32, zyron_catalog::index_params::FtsIndexParams)> =
+                Vec::new();
             for table in catalog.list_all_tables() {
                 for idx in catalog.get_indexes_for_table(table.id) {
-                    if idx.index_type == zyron_catalog::IndexType::Fulltext {
-                        let col_ids: Vec<u16> = idx.columns.iter().map(|c| c.column_id.0).collect();
-                        fts_entries.push((idx.id.0, table.id.0, col_ids));
+                    match idx.index_type {
+                        zyron_catalog::IndexType::Fulltext => {
+                            let col_ids: Vec<u16> =
+                                idx.columns.iter().map(|c| c.column_id.0).collect();
+                            fts_entries.push((idx.id.0, table.id.0, col_ids));
+                            if let Some(p) =
+                                zyron_catalog::index_params::decode_fts_params(&idx.parameters)
+                            {
+                                analyzer_params.push((idx.id.0, p));
+                            }
+                        }
+                        zyron_catalog::IndexType::Hybrid => {
+                            if let Some(p) =
+                                zyron_catalog::index_params::decode_hybrid_params(&idx.parameters)
+                            {
+                                fts_entries.push((idx.id.0, table.id.0, vec![p.text_column_id]));
+                                analyzer_params.push((idx.id.0, p.fulltext));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             if !fts_entries.is_empty() {
                 if let Err(e) = mgr.load_indexes(&fts_dir, &fts_entries) {
                     error!("FTS index loading failed: {e}");
+                }
+            }
+            for (index_id, params) in &analyzer_params {
+                if let Err(e) = zyron_wire::search_resilience_ddl::install_index_analyzer(
+                    &catalog, &mgr, *index_id, params,
+                ) {
+                    error!("analyzer rebuild for FTS index {index_id} failed: {e}");
                 }
             }
             Arc::new(mgr)
@@ -706,6 +769,38 @@ impl Server {
                 Vec::new();
             for table in catalog.list_all_tables() {
                 for idx in catalog.get_indexes_for_table(table.id) {
+                    // A hybrid index's vector half loads under the hybrid id
+                    if idx.index_type == zyron_catalog::IndexType::Hybrid {
+                        if let Some(p) =
+                            zyron_catalog::index_params::decode_hybrid_params(&idx.parameters)
+                        {
+                            let metric = match p.vector_distance.as_str() {
+                                "euclidean" | "l2" => {
+                                    zyron_search::vector::DistanceMetric::Euclidean
+                                }
+                                "dot_product" | "dot" => {
+                                    zyron_search::vector::DistanceMetric::DotProduct
+                                }
+                                "manhattan" | "l1" => {
+                                    zyron_search::vector::DistanceMetric::Manhattan
+                                }
+                                _ => zyron_search::vector::DistanceMetric::Cosine,
+                            };
+                            vec_entries.push((
+                                idx.id.0,
+                                table.id.0,
+                                p.vector_column_id,
+                                p.vector_dims,
+                                zyron_search::vector::HnswConfig {
+                                    m: 16,
+                                    efConstruction: 200,
+                                    efSearch: 64,
+                                    metric,
+                                },
+                            ));
+                        }
+                        continue;
+                    }
                     if idx.index_type == zyron_catalog::IndexType::Vector {
                         let col_id = idx.columns.first().map(|c| c.column_id.0).unwrap_or(0);
                         let (dims, config) = if let Some(ref param_bytes) = idx.parameters {
@@ -1333,6 +1428,8 @@ impl Server {
                 // Derive a stable master key from the data-dir path. Survives
                 // restarts for the same data directory. An ops deployment
                 // replaces this with a KMS-backed KeyStore via the trait.
+                // Data keys persist wrapped in column_keys.zykeys so an
+                // encrypted column stays readable across restarts
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(data_dir.to_string_lossy().as_bytes());
@@ -1340,8 +1437,17 @@ impl Server {
                 let digest = hasher.finalize();
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&digest);
-                Arc::new(zyron_auth::LocalKeyStore::new(key))
+                match zyron_auth::FileKeyStore::open(key, data_dir.join("column_keys.zykeys")) {
+                    Ok(store) => Arc::new(store) as Arc<dyn zyron_auth::KeyStore>,
+                    Err(e) => {
+                        error!(
+                            "persistent key store failed to open, keys will not survive a restart: {e}"
+                        );
+                        Arc::new(zyron_auth::LocalKeyStore::new(key))
+                    }
+                }
             },
+            media_store: media_store_arc,
             config_lookup: Some(Arc::new(move |key: &str| -> Option<String> {
                 config_for_lookup.get_config_value(key)
             })),
@@ -2701,26 +2807,30 @@ fn install_mesh(
     }
 
     // A static pool claims from the machines the operator declared and never
-    // creates one. Every other mode needs a control plane client this process
-    // does not carry, and the registry hands those an unreachable driver that
-    // says so, which masks the provisioning rung rather than publishing a
-    // request nothing will answer
-    if config.mesh.node_registration_mode == "static" {
-        let members: Vec<zyron_mesh::PoolMember> = peers
-            .peers()
-            .iter()
-            .map(|peer| zyron_mesh::PoolMember {
-                node_id: peer.node_id.unwrap_or(0),
-                name: peer.name.clone(),
-                address: peer.address.clone(),
-            })
-            .collect();
-        let size = members.len();
-        zyron_mesh::provisioner::ProvisionerRegistry::global().install(std::sync::Arc::new(
-            zyron_mesh::StaticPoolProvisioner::new(members),
-        ));
-        tracing::info!(machines = size, "static pool provisioner installed");
-    }
+    // creates one, so this process can build that driver from the peer list
+    // it already has. It is offered to the registry rather than chosen here:
+    // the registry hands it out only to a node whose mode asks for a static
+    // pool, and hands every other mode an unreachable driver that says the
+    // control plane client is missing. Deciding here instead would put a
+    // second answer to "which provisioner" outside the one place that owns
+    // the question
+    let members: Vec<zyron_mesh::PoolMember> = peers
+        .peers()
+        .iter()
+        .map(|peer| zyron_mesh::PoolMember {
+            node_id: peer.node_id.unwrap_or(0),
+            name: peer.name.clone(),
+            address: peer.address.clone(),
+        })
+        .collect();
+    let size = members.len();
+    zyron_mesh::provisioner::ProvisionerRegistry::global().install(std::sync::Arc::new(
+        zyron_mesh::StaticPoolProvisioner::new(members),
+    ));
+    tracing::info!(
+        machines = size,
+        "static pool provisioner offered to the registry"
+    );
 
     let pool = std::sync::Arc::new(WarmPool::new(config.mesh.warm_pool_max_nodes));
     let scheduler = std::sync::Arc::new(MeshScheduler::new(

@@ -4,50 +4,50 @@
   <line x1="70" y1="350.0" x2="930" y2="350.0" stroke="#30363d" stroke-width="1"/>
   <text x="62" y="354.0" text-anchor="end" fill="#8b949e" font-size="11">0</text>
   <line x1="70" y1="292.0" x2="930" y2="292.0" stroke="#30363d" stroke-width="1"/>
-  <text x="62" y="296.0" text-anchor="end" fill="#8b949e" font-size="11">1,417</text>
+  <text x="62" y="296.0" text-anchor="end" fill="#8b949e" font-size="11">1,434</text>
   <line x1="70" y1="234.0" x2="930" y2="234.0" stroke="#30363d" stroke-width="1"/>
-  <text x="62" y="238.0" text-anchor="end" fill="#8b949e" font-size="11">2,833</text>
+  <text x="62" y="238.0" text-anchor="end" fill="#8b949e" font-size="11">2,868</text>
   <line x1="70" y1="176.0" x2="930" y2="176.0" stroke="#30363d" stroke-width="1"/>
-  <text x="62" y="180.0" text-anchor="end" fill="#8b949e" font-size="11">4,250</text>
+  <text x="62" y="180.0" text-anchor="end" fill="#8b949e" font-size="11">4,301</text>
   <line x1="70" y1="118.0" x2="930" y2="118.0" stroke="#30363d" stroke-width="1"/>
-  <text x="62" y="122.0" text-anchor="end" fill="#8b949e" font-size="11">5,666</text>
+  <text x="62" y="122.0" text-anchor="end" fill="#8b949e" font-size="11">5,735</text>
   <line x1="70" y1="60.0" x2="930" y2="60.0" stroke="#30363d" stroke-width="1"/>
-  <text x="62" y="64.0" text-anchor="end" fill="#8b949e" font-size="11">7,083</text>
+  <text x="62" y="64.0" text-anchor="end" fill="#8b949e" font-size="11">7,169</text>
   <text x="62" y="52" text-anchor="end" fill="#8b949e" font-size="11">us</text>
-  <rect x="83.0" y="241.4" width="46.4" height="108.6" fill="#1f6feb" rx="2"/>
-  <text x="106.2" y="237.4" text-anchor="middle" fill="#e6edf3" font-size="10">2,653</text>
-  <rect x="133.4" y="336.4" width="46.4" height="13.6" fill="#a371f7" rx="2"/>
-  <text x="156.6" y="332.4" text-anchor="middle" fill="#e6edf3" font-size="10">333</text>
+  <rect x="83.0" y="325.7" width="46.4" height="24.3" fill="#1f6feb" rx="2"/>
+  <text x="106.2" y="321.7" text-anchor="middle" fill="#e6edf3" font-size="10">601</text>
+  <rect x="133.4" y="342.1" width="46.4" height="7.9" fill="#a371f7" rx="2"/>
+  <text x="156.6" y="338.1" text-anchor="middle" fill="#e6edf3" font-size="10">194</text>
   <text x="131.4" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Point lookup</text>
   <rect x="205.9" y="97.8" width="46.4" height="252.2" fill="#1f6feb" rx="2"/>
-  <text x="229.1" y="93.8" text-anchor="middle" fill="#e6edf3" font-size="10">6,160</text>
-  <rect x="256.3" y="280.2" width="46.4" height="69.8" fill="#a371f7" rx="2"/>
-  <text x="279.5" y="276.2" text-anchor="middle" fill="#e6edf3" font-size="10">1,704</text>
+  <text x="229.1" y="93.8" text-anchor="middle" fill="#e6edf3" font-size="10">6,234</text>
+  <rect x="256.3" y="282.4" width="46.4" height="67.6" fill="#a371f7" rx="2"/>
+  <text x="279.5" y="278.4" text-anchor="middle" fill="#e6edf3" font-size="10">1,672</text>
   <text x="254.3" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Bulk delete</text>
-  <rect x="328.7" y="253.4" width="46.4" height="96.6" fill="#1f6feb" rx="2"/>
-  <text x="351.9" y="249.4" text-anchor="middle" fill="#e6edf3" font-size="10">2,360</text>
-  <rect x="379.1" y="308.6" width="46.4" height="41.4" fill="#a371f7" rx="2"/>
-  <text x="402.4" y="304.6" text-anchor="middle" fill="#e6edf3" font-size="10">1,011</text>
+  <rect x="328.7" y="325.6" width="46.4" height="24.4" fill="#1f6feb" rx="2"/>
+  <text x="351.9" y="321.6" text-anchor="middle" fill="#e6edf3" font-size="10">602</text>
+  <rect x="379.1" y="315.7" width="46.4" height="34.3" fill="#a371f7" rx="2"/>
+  <text x="402.4" y="311.7" text-anchor="middle" fill="#e6edf3" font-size="10">847</text>
   <text x="377.1" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Selective scan</text>
-  <rect x="451.6" y="261.5" width="46.4" height="88.5" fill="#1f6feb" rx="2"/>
-  <text x="474.8" y="257.5" text-anchor="middle" fill="#e6edf3" font-size="10">2,161</text>
-  <rect x="502.0" y="300.4" width="46.4" height="49.6" fill="#a371f7" rx="2"/>
-  <text x="525.2" y="296.4" text-anchor="middle" fill="#e6edf3" font-size="10">1,212</text>
+  <rect x="451.6" y="323.7" width="46.4" height="26.3" fill="#1f6feb" rx="2"/>
+  <text x="474.8" y="319.7" text-anchor="middle" fill="#e6edf3" font-size="10">651</text>
+  <rect x="502.0" y="299.7" width="46.4" height="50.3" fill="#a371f7" rx="2"/>
+  <text x="525.2" y="295.7" text-anchor="middle" fill="#e6edf3" font-size="10">1,244</text>
   <text x="500.0" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Aggregate</text>
-  <rect x="574.4" y="141.3" width="46.4" height="208.7" fill="#1f6feb" rx="2"/>
-  <text x="597.6" y="137.3" text-anchor="middle" fill="#e6edf3" font-size="10">5,098</text>
-  <rect x="624.9" y="258.2" width="46.4" height="91.8" fill="#a371f7" rx="2"/>
-  <text x="648.1" y="254.2" text-anchor="middle" fill="#e6edf3" font-size="10">2,242</text>
+  <rect x="574.4" y="153.8" width="46.4" height="196.2" fill="#1f6feb" rx="2"/>
+  <text x="597.6" y="149.8" text-anchor="middle" fill="#e6edf3" font-size="10">4,851</text>
+  <rect x="624.9" y="257.4" width="46.4" height="92.6" fill="#a371f7" rx="2"/>
+  <text x="648.1" y="253.4" text-anchor="middle" fill="#e6edf3" font-size="10">2,289</text>
   <text x="622.9" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Point update</text>
-  <rect x="697.3" y="139.0" width="46.4" height="211.0" fill="#1f6feb" rx="2"/>
-  <text x="720.5" y="135.0" text-anchor="middle" fill="#e6edf3" font-size="10">5,155</text>
-  <rect x="747.7" y="251.3" width="46.4" height="98.7" fill="#a371f7" rx="2"/>
-  <text x="770.9" y="247.3" text-anchor="middle" fill="#e6edf3" font-size="10">2,411</text>
+  <rect x="697.3" y="216.3" width="46.4" height="133.7" fill="#1f6feb" rx="2"/>
+  <text x="720.5" y="212.3" text-anchor="middle" fill="#e6edf3" font-size="10">3,306</text>
+  <rect x="747.7" y="258.3" width="46.4" height="91.7" fill="#a371f7" rx="2"/>
+  <text x="770.9" y="254.3" text-anchor="middle" fill="#e6edf3" font-size="10">2,268</text>
   <text x="745.7" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Join</text>
-  <rect x="820.1" y="253.1" width="46.4" height="96.9" fill="#1f6feb" rx="2"/>
-  <text x="843.4" y="249.1" text-anchor="middle" fill="#e6edf3" font-size="10">2,368</text>
-  <rect x="870.6" y="292.1" width="46.4" height="57.9" fill="#a371f7" rx="2"/>
-  <text x="893.8" y="288.1" text-anchor="middle" fill="#e6edf3" font-size="10">1,413</text>
+  <rect x="820.1" y="327.5" width="46.4" height="22.5" fill="#1f6feb" rx="2"/>
+  <text x="843.4" y="323.5" text-anchor="middle" fill="#e6edf3" font-size="10">555</text>
+  <rect x="870.6" y="295.4" width="46.4" height="54.6" fill="#a371f7" rx="2"/>
+  <text x="893.8" y="291.4" text-anchor="middle" fill="#e6edf3" font-size="10">1,349</text>
   <text x="868.6" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Wide scan</text>
   <rect x="380.0" y="408.0" width="14" height="14" fill="#1f6feb" rx="3"/>
   <text x="400.0" y="420.0" fill="#e6edf3" font-size="13">Row heap</text>

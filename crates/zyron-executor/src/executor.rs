@@ -512,6 +512,7 @@ fn build_operator_tree(
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             ..
         } => Box::pin(build_insert(
             table_id,
@@ -520,6 +521,7 @@ fn build_operator_tree(
             column_defaults,
             check_constraints,
             expectations,
+            generated_columns,
             analyze,
             ctx,
         )),
@@ -542,12 +544,14 @@ fn build_operator_tree(
             table_id,
             assignments,
             check_constraints,
+            generated_columns,
             child,
             ..
         } => Box::pin(build_update(
             table_id,
             assignments,
             check_constraints,
+            generated_columns,
             child,
             analyze,
             ctx,
@@ -1729,6 +1733,7 @@ async fn build_insert(
     column_defaults: Vec<(zyron_catalog::ColumnId, zyron_planner::binder::BoundExpr)>,
     check_constraints: Vec<zyron_planner::binder::BoundExpr>,
     expectations: Vec<zyron_planner::binder::BoundExpectation>,
+    generated_columns: Vec<zyron_planner::binder::BoundGeneratedColumn>,
     analyze: bool,
     ctx: &Arc<ExecutionContext>,
 ) -> Result<BuildResult> {
@@ -1750,6 +1755,7 @@ async fn build_insert(
         column_defaults,
         check_constraints,
         expectations,
+        generated_columns,
     )));
     Ok(br.with_metrics("Insert", analyze, child_m))
 }
@@ -1805,6 +1811,7 @@ async fn build_update(
     table_id: zyron_catalog::TableId,
     assignments: Vec<zyron_planner::binder::BoundAssignment>,
     check_constraints: Vec<zyron_planner::binder::BoundExpr>,
+    generated_columns: Vec<zyron_planner::binder::BoundGeneratedColumn>,
     child: Box<zyron_planner::physical::PhysicalPlan>,
     analyze: bool,
     ctx: &Arc<ExecutionContext>,
@@ -1852,6 +1859,7 @@ async fn build_update(
         assignments,
         input_schema,
         check_constraints,
+        generated_columns,
     );
     if let Some(cv) = correlated_values {
         op = op.with_correlated_values(cv);
@@ -2299,6 +2307,11 @@ fn build_scan_with_tuple_ids(
 /// Executes a PhysicalPlan and collects all result batches.
 /// Checks for query cancellation between each batch.
 pub async fn execute(plan: PhysicalPlan, ctx: &Arc<ExecutionContext>) -> Result<Vec<DataBatch>> {
+    // Only a promoted path can sit in a column of its own, so a process that
+    // has promoted none has nothing for the search to find
+    if crate::variant_shred::any_shredded() {
+        ctx.set_variant_paths(zyron_planner::physical::variant_paths::variant_paths(&plan));
+    }
     let br = build_operator_tree(plan, ctx).await?;
     let mut root = br.op;
     let mut results = Vec::new();
@@ -2438,6 +2451,11 @@ pub async fn execute_analyze(
     plan: PhysicalPlan,
     ctx: &Arc<ExecutionContext>,
 ) -> Result<(Vec<DataBatch>, Option<Arc<OperatorMetrics>>)> {
+    // Only a promoted path can sit in a column of its own, so a process that
+    // has promoted none has nothing for the search to find
+    if crate::variant_shred::any_shredded() {
+        ctx.set_variant_paths(zyron_planner::physical::variant_paths::variant_paths(&plan));
+    }
     let br = build_operator_tree(plan, ctx).await?;
     let root_metrics = br.metrics.clone();
     let mut root = br.op;

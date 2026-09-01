@@ -380,6 +380,9 @@ pub struct ServerState {
     /// Key store for sealing and opening external-source/sink credentials.
     /// Populated by the server binary from a data-dir-derived master key.
     pub key_store: Arc<dyn zyron_auth::KeyStore>,
+    /// Content addressed media store under data_dir/media, holding TOAST
+    /// and external media payloads
+    pub media_store: Arc<zyron_media::store::MediaStore>,
     /// Config value lookup: returns (key, value) for a dotted key.
     pub config_lookup: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     /// Config entries for SHOW ALL: returns vec of (key, value, description).
@@ -1051,6 +1054,12 @@ impl<T: WireTransport> Drop for Connection<T> {
         // as long as the leader lives, so the group is told to discard the
         // transaction now
         self.abandon_changeset();
+        // Rows published to zyron_sys.session.prepared_statements go away
+        // with the connection
+        crate::system_views::clear_prepared_statements(
+            crate::system_views::prepared_server_key(&self.server),
+            self.process_id,
+        );
     }
 }
 
@@ -1081,6 +1090,30 @@ pub struct CursorState {
 /// READ UNCOMMITTED and READ COMMITTED run as ReadCommitted, REPEATABLE READ
 /// and SNAPSHOT run as SnapshotIsolation. SERIALIZABLE has no engine
 /// equivalent and is rejected rather than silently downgraded.
+/// Opens a table's heap for a maintenance scan, preferring the server's
+/// shared registry so the live page count is visible. A fresh fallback
+/// instance seeds its page count caches from disk before first use,
+/// because a HeapFile starts with a zero cache and would scan no pages.
+async fn open_table_heap(
+    server: &ServerState,
+    table: &zyron_catalog::TableEntry,
+) -> Result<Arc<zyron_storage::HeapFile>, ZyronError> {
+    use zyron_storage::{HeapFile, HeapFileConfig};
+    if let Some(hit) = server.heap_files.get_async(&table.heap_file_id).await {
+        return Ok(Arc::clone(hit.get()));
+    }
+    let heap_file = HeapFile::new(
+        Arc::clone(&server.disk_manager),
+        Arc::clone(&server.buffer_pool),
+        HeapFileConfig {
+            heap_file_id: table.heap_file_id,
+            fsm_file_id: table.fsm_file_id,
+        },
+    )?;
+    heap_file.init_cache().await?;
+    Ok(Arc::new(heap_file))
+}
+
 fn map_isolation_level(level: zyron_parser::TxnIsolation) -> ZyronResult<IsolationLevel> {
     use zyron_parser::TxnIsolation;
     match level {
@@ -1930,6 +1963,7 @@ impl<T: WireTransport> Connection<T> {
                         output_schema: schema,
                     },
                 );
+                self.publish_prepared_statements();
 
                 self.feed(BackendMessage::CommandComplete {
                     tag: "PREPARE".to_string(),
@@ -1980,6 +2014,8 @@ impl<T: WireTransport> Connection<T> {
                     if let Some(ref fts_mgr) = self.server.fts_manager {
                         ctx.set_fts_manager(Arc::clone(fts_mgr));
                     }
+                    ctx.set_key_store(Arc::clone(&self.server.key_store));
+                    ctx.set_media_store(Arc::clone(&self.server.media_store));
                     if let Some(ref vec_mgr) = self.server.vector_manager {
                         ctx.set_vector_manager(Arc::clone(vec_mgr));
                     }
@@ -2056,6 +2092,7 @@ impl<T: WireTransport> Connection<T> {
                 } else if let Some(ref name) = dealloc_stmt.name {
                     self.statements.remove(name);
                 }
+                self.publish_prepared_statements();
                 self.feed(BackendMessage::CommandComplete {
                     tag: "DEALLOCATE".to_string(),
                 })
@@ -3277,6 +3314,7 @@ impl<T: WireTransport> Connection<T> {
                     output_schema: cached.output_schema,
                 },
             );
+            self.publish_prepared_statements();
             self.feed(BackendMessage::ParseComplete).await?;
             return Ok(());
         }
@@ -3356,6 +3394,7 @@ impl<T: WireTransport> Connection<T> {
                 output_schema: schema,
             },
         );
+        self.publish_prepared_statements();
 
         self.feed(BackendMessage::ParseComplete).await?;
         Ok(())
@@ -3532,6 +3571,8 @@ impl<T: WireTransport> Connection<T> {
         if let Some(ref fts_mgr) = self.server.fts_manager {
             ctx_owned.set_fts_manager(Arc::clone(fts_mgr));
         }
+        ctx_owned.set_key_store(Arc::clone(&self.server.key_store));
+        ctx_owned.set_media_store(Arc::clone(&self.server.media_store));
         if let Some(ref vec_mgr) = self.server.vector_manager {
             ctx_owned.set_vector_manager(Arc::clone(vec_mgr));
         }
@@ -3828,6 +3869,25 @@ impl<T: WireTransport> Connection<T> {
         Ok(())
     }
 
+    /// Publishes this connection's prepared statement list for
+    /// `zyron_sys.session.prepared_statements`. Called after every mutation
+    /// of the statements map so the view always shows the live state
+    fn publish_prepared_statements(&self) {
+        let server_key = crate::system_views::prepared_server_key(&self.server);
+        let rows: Vec<crate::system_views::PreparedStatementRow> = self
+            .statements
+            .iter()
+            .map(|(name, ps)| crate::system_views::PreparedStatementRow {
+                pid: self.process_id,
+                name: name.clone(),
+                query: ps.query.clone(),
+                param_count: ps.param_types.len(),
+                planned: ps.plan.is_some(),
+            })
+            .collect();
+        crate::system_views::publish_prepared_statements(server_key, self.process_id, rows);
+    }
+
     async fn handle_close(
         &mut self,
         target: DescribeTarget,
@@ -3836,6 +3896,7 @@ impl<T: WireTransport> Connection<T> {
         match target {
             DescribeTarget::Statement => {
                 self.statements.remove(&name);
+                self.publish_prepared_statements();
             }
             DescribeTarget::Portal => {
                 self.portals.remove(&name);
@@ -4716,7 +4777,7 @@ impl<T: WireTransport> Connection<T> {
     /// instead of running concurrently
     async fn handle_vacuum(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
         use std::sync::atomic::Ordering;
-        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage};
+        use zyron_storage::HeapPage;
 
         // CAS-acquire the vacuum lock. If already held, emit a Notice and
         // complete with success tag, matching PostgreSQL's behaviour for
@@ -4787,14 +4848,7 @@ impl<T: WireTransport> Connection<T> {
         // deleted so stale entries do not accumulate.
         let status_map = self.server.txn_manager.status_map().clone();
         for table in &target_tables {
-            let heap_file = match HeapFile::new(
-                Arc::clone(&self.server.disk_manager),
-                Arc::clone(&self.server.buffer_pool),
-                HeapFileConfig {
-                    heap_file_id: table.heap_file_id,
-                    fsm_file_id: table.fsm_file_id,
-                },
-            ) {
+            let heap_file = match open_table_heap(&self.server, table).await {
                 Ok(hf) => hf,
                 Err(_) => continue,
             };
@@ -5107,7 +5161,7 @@ impl<T: WireTransport> Connection<T> {
     ) -> Result<(), ProtocolError> {
         use std::sync::atomic::Ordering;
         use zyron_common::page::PAGE_SIZE;
-        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleSlot};
+        use zyron_storage::{HeapPage, MvccGc, TupleSlot};
 
         let table_name: &str = &stmt.table;
 
@@ -5202,14 +5256,7 @@ impl<T: WireTransport> Connection<T> {
             };
         }
 
-        let heap_file = match HeapFile::new(
-            Arc::clone(&self.server.disk_manager),
-            Arc::clone(&self.server.buffer_pool),
-            HeapFileConfig {
-                heap_file_id: table.heap_file_id,
-                fsm_file_id: table.fsm_file_id,
-            },
-        ) {
+        let heap_file = match open_table_heap(&self.server, &table).await {
             Ok(hf) => hf,
             Err(e) => {
                 let fields = crate::messages::backend::ErrorFields {
@@ -5350,7 +5397,6 @@ impl<T: WireTransport> Connection<T> {
     /// and column statistics for query planner cost estimation.
     async fn handle_analyze(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
         use zyron_catalog::analyze_table;
-        use zyron_storage::{HeapFile, HeapFileConfig};
 
         let tables = self.server.catalog.list_all_tables();
         let target_tables: Vec<_> = if let Some(name) = table_name {
@@ -5379,14 +5425,7 @@ impl<T: WireTransport> Connection<T> {
         // ANALYZE claim success while the planner runs on outdated statistics.
         let mut failures: Vec<String> = Vec::new();
         for table in &target_tables {
-            let heap_file = match HeapFile::new(
-                Arc::clone(&self.server.disk_manager),
-                Arc::clone(&self.server.buffer_pool),
-                HeapFileConfig {
-                    heap_file_id: table.heap_file_id,
-                    fsm_file_id: table.fsm_file_id,
-                },
-            ) {
+            let heap_file = match open_table_heap(&self.server, table).await {
                 Ok(hf) => hf,
                 Err(e) => {
                     failures.push(format!("{}: {e}", table.name));
@@ -6969,6 +7008,8 @@ fn expr_to_string(expr: &zyron_parser::Expr) -> String {
             zyron_parser::LiteralValue::Boolean(b) => if *b { "on" } else { "off" }.into(),
             zyron_parser::LiteralValue::Null => "".into(),
             zyron_parser::LiteralValue::Interval(i) => i.to_string(),
+            // No setting is written as a stored form
+            zyron_parser::LiteralValue::Bytes(_) => String::new(),
         },
         zyron_parser::Expr::Identifier(name) => name.clone(),
         _ => format!("{:?}", expr),

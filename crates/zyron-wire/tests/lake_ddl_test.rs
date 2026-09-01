@@ -3881,13 +3881,16 @@ async fn test_a_clustering_expression_that_cannot_be_read_back_is_refused() {
     );
 }
 
-/// A derived column added to a table that already holds rows would be null
-/// for every one of them, and a query rewritten onto it would then drop
-/// rows that match. Filling them in means rewriting every data file, which
-/// is the rewrite a lake ALTER refuses, so the statement is refused instead
-/// of quietly losing the rows
+/// A derived column declared on a table that already holds rows is computed
+/// for those rows, not refused.
+///
+/// A data file never changes, so this is a rewrite: every file is read, the
+/// expression is evaluated over its rows, and one commit swaps the old files
+/// for ones carrying the new column. Without it the old rows would read NULL
+/// for an expression they do satisfy, and a query filtering on it, answered
+/// from the stored column, would drop them.
 #[tokio::test]
-async fn test_add_derived_column_on_a_table_with_rows_is_refused() {
+async fn test_add_derived_column_backfills_the_rows_already_stored() {
     let (server, _schema_id, _tmp) = create_test_server().await;
     let mut session = new_session();
     exec_ddl(
@@ -3904,33 +3907,63 @@ async fn test_add_derived_column_on_a_table_with_rows_is_refused() {
     )
     .await;
 
-    let err = exec_ddl(
+    exec_ddl(
         &server,
         &mut session,
         "ALTER TABLE hits ADD DERIVED COLUMN yr AS date_part('year', ts)",
     )
     .await
-    .expect_err("rows written before the expression have no value for it");
-    let text = format!("{err:?}");
-    assert!(
-        text.contains("2 rows") && text.contains("drop them"),
-        "the refusal has to say how many rows are at stake and what would happen to them, \
-         got {text}"
-    );
+    .expect("rows written before the expression are backfilled, not refused");
 
-    // Refused means refused: the table is untouched and its rows still
-    // answer the query they always did
     let entry = server
         .catalog
         .list_all_tables()
         .into_iter()
         .find(|t| t.name == "hits")
         .expect("table");
-    assert!(
-        entry.cluster.derived.is_empty(),
-        "a refused ALTER must not leave a half-registered expression behind"
+    assert_eq!(
+        entry.cluster.derived.len(),
+        1,
+        "the catalog mirror is what the planner matches a query against"
     );
+
+    // Every row still there, and every row answers the expression it was
+    // written before. A row reading NULL here is the defect the backfill
+    // exists to prevent
     assert_eq!(query_rows(&server, "SELECT id FROM hits").await, 2);
+    assert_eq!(
+        query_rows(
+            &server,
+            "SELECT id FROM hits WHERE date_part('year', ts) = 2013"
+        )
+        .await,
+        1,
+        "a row written before the expression stopped matching its own expression"
+    );
+    assert_eq!(
+        query_rows(
+            &server,
+            "SELECT id FROM hits WHERE date_part('year', ts) = 2019"
+        )
+        .await,
+        1
+    );
+
+    // And a row written after the declaration lands beside them
+    exec_dml(
+        &server,
+        "INSERT INTO hits VALUES (3, TIMESTAMP '2013-06-01 00:00:00')",
+    )
+    .await;
+    assert_eq!(
+        query_rows(
+            &server,
+            "SELECT id FROM hits WHERE date_part('year', ts) = 2013"
+        )
+        .await,
+        2,
+        "a backfilled row and a freshly written one have to answer alike"
+    );
 }
 
 /// A derived column declared on an empty table is filled by every write

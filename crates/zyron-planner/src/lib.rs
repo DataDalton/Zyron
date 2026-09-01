@@ -44,6 +44,19 @@ pub async fn bind_table_check_constraints(
     binder.bind_check_constraints(entry).await
 }
 
+/// Binds a table's STORED generated columns, for a write path that builds
+/// its operator directly rather than through a planned statement. A
+/// referential action rewriting a child row still has to recompute what
+/// that row generates.
+pub async fn bind_table_generated_columns(
+    catalog: &Catalog,
+    entry: &TableEntry,
+) -> Result<Vec<binder::BoundGeneratedColumn>> {
+    let resolver = catalog.resolver(DatabaseId(1), zyron_catalog::default_search_path());
+    let mut binder = Binder::new(resolver, catalog);
+    binder.bind_generated_columns(entry).await
+}
+
 /// Binds one predicate against a table (at a canonical table_idx of 0), so a
 /// maintenance command carrying a WHERE clause evaluates it through the same
 /// expression machinery a query would.

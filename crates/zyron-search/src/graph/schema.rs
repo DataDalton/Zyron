@@ -302,43 +302,9 @@ fn read_string(data: &[u8], off: &mut usize) -> Result<String> {
 }
 
 fn type_id_from_u8(val: u8) -> Result<TypeId> {
-    match val {
-        0 => Ok(TypeId::Null),
-        1 => Ok(TypeId::Boolean),
-        10 => Ok(TypeId::Int8),
-        11 => Ok(TypeId::Int16),
-        12 => Ok(TypeId::Int32),
-        13 => Ok(TypeId::Int64),
-        14 => Ok(TypeId::Int128),
-        20 => Ok(TypeId::UInt8),
-        21 => Ok(TypeId::UInt16),
-        22 => Ok(TypeId::UInt32),
-        23 => Ok(TypeId::UInt64),
-        24 => Ok(TypeId::UInt128),
-        30 => Ok(TypeId::Float32),
-        31 => Ok(TypeId::Float64),
-        40 => Ok(TypeId::Decimal),
-        50 => Ok(TypeId::Char),
-        51 => Ok(TypeId::Varchar),
-        52 => Ok(TypeId::Text),
-        60 => Ok(TypeId::Binary),
-        61 => Ok(TypeId::Varbinary),
-        62 => Ok(TypeId::Bytea),
-        70 => Ok(TypeId::Date),
-        71 => Ok(TypeId::Time),
-        72 => Ok(TypeId::Timestamp),
-        73 => Ok(TypeId::TimestampTz),
-        74 => Ok(TypeId::Interval),
-        80 => Ok(TypeId::Uuid),
-        90 => Ok(TypeId::Json),
-        91 => Ok(TypeId::Jsonb),
-        100 => Ok(TypeId::Array),
-        110 => Ok(TypeId::Composite),
-        120 => Ok(TypeId::Vector),
-        _ => Err(ZyronError::GraphQueryError(format!(
-            "unknown TypeId value in graph schema: {val}"
-        ))),
-    }
+    TypeId::from_u8(val).ok_or_else(|| {
+        ZyronError::GraphQueryError(format!("unknown TypeId value in graph schema: {val}"))
+    })
 }
 
 fn read_property_def(data: &[u8], off: &mut usize) -> Result<PropertyDef> {

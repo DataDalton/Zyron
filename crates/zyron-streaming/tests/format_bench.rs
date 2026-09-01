@@ -50,26 +50,10 @@ static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 /// focused on codec cost rather than schema-specific work.
 fn bench_schema() -> Vec<ColumnSpec> {
     vec![
-        ColumnSpec {
-            name: "id".to_string(),
-            type_id: TypeId::Int64,
-            fractional_digits: None,
-        },
-        ColumnSpec {
-            name: "name".to_string(),
-            type_id: TypeId::Varchar,
-            fractional_digits: None,
-        },
-        ColumnSpec {
-            name: "active".to_string(),
-            type_id: TypeId::Boolean,
-            fractional_digits: None,
-        },
-        ColumnSpec {
-            name: "score".to_string(),
-            type_id: TypeId::Float64,
-            fractional_digits: None,
-        },
+        ColumnSpec::new("id", TypeId::Int64),
+        ColumnSpec::new("name", TypeId::Varchar),
+        ColumnSpec::new("active", TypeId::Boolean),
+        ColumnSpec::new("score", TypeId::Float64),
     ]
 }
 

@@ -460,6 +460,325 @@ fn build_default_registry() -> Arc<AnalyticsRegistry> {
         output_schema: &[("term", "TEXT"), ("value", "FLOAT64")],
     });
 
+    // Anomaly and drift detection
+    entries.push(AnalyticsFunction {
+        name: "DETECT_ANOMALIES",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Anomaly detection via isolation_forest, zscore, iqr, or mad",
+        output_schema: &[
+            ("idx", "INT64"),
+            ("is_anomaly", "BOOL"),
+            ("score", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "DETECT_ANOMALIES_TIMESERIES",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Time series anomaly detection via seasonal, moving_average, or ewma residual z-scores",
+        output_schema: &[
+            ("idx", "INT64"),
+            ("is_anomaly", "BOOL"),
+            ("score", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "DETECT_DRIFT",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 4,
+        max_args: None,
+        description: "Distribution drift between two samples via ks_test, chi_square, or psi",
+        output_schema: &[
+            ("method", "TEXT"),
+            ("statistic", "FLOAT64"),
+            ("p_value", "FLOAT64"),
+            ("drifted", "BOOL"),
+        ],
+    });
+
+    // K-means clustering surface
+    entries.push(AnalyticsFunction {
+        name: "KMEANS_CLUSTER",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "K-means cluster assignment with distance per row plus fitted centroids",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("cluster_id", "INT64"),
+            ("distance", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "KMEANS_CENTROIDS",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Fitted k-means centroids in long form",
+        output_schema: &[
+            ("cluster_id", "INT64"),
+            ("feature", "TEXT"),
+            ("value", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "KMEANS_ELBOW",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Inertia per candidate k for elbow selection",
+        output_schema: &[("k", "INT64"), ("inertia", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "KMEANS_PREDICT",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: None,
+        description: "Assigns rows to the nearest of the given centroids",
+        output_schema: &[("row_idx", "INT64"), ("cluster_id", "INT64")],
+    });
+
+    // Causal inference table functions
+    entries.push(AnalyticsFunction {
+        name: "CAUSAL_IMPACT",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 4,
+        max_args: None,
+        description: "Intervention effect via a local level state space model fit on the pre-period",
+        output_schema: &[
+            ("idx", "INT64"),
+            ("actual", "FLOAT64"),
+            ("predicted", "FLOAT64"),
+            ("effect", "FLOAT64"),
+            ("lower", "FLOAT64"),
+            ("upper", "FLOAT64"),
+            ("cumulative_effect", "FLOAT64"),
+            ("cumulative_lower", "FLOAT64"),
+            ("cumulative_upper", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "COUNTERFACTUAL",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 4,
+        max_args: None,
+        description: "Per-row counterfactual outcome via nearest neighbor in the opposite treatment group",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("observed", "FLOAT64"),
+            ("counterfactual", "FLOAT64"),
+            ("effect", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "PROPENSITY_MATCH",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: None,
+        description: "Greedy nearest neighbor propensity score matching within a caliper",
+        output_schema: &[
+            ("treated_idx", "INT64"),
+            ("control_idx", "INT64"),
+            ("score_diff", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "AB_TEST_ANALYSIS",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: None,
+        description: "Per-variant summary with lift, confidence interval, and p-value against the first variant",
+        output_schema: &[
+            ("variant", "TEXT"),
+            ("n", "INT64"),
+            ("mean", "FLOAT64"),
+            ("lift", "FLOAT64"),
+            ("ci_lower", "FLOAT64"),
+            ("ci_upper", "FLOAT64"),
+            ("p_value", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "AB_TEST_SAMPLE_SIZE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 4,
+        max_args: Some(4),
+        description: "Required sample size per variant for a two-proportion test",
+        output_schema: &[("sample_size_per_variant", "INT64")],
+    });
+
+    // Feature encoding
+    entries.push(AnalyticsFunction {
+        name: "TARGET_ENCODE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: None,
+        description: "Target encoding of a categorical column with global-mean smoothing",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("category", "TEXT"),
+            ("encoded", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "TFIDF",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "TF-IDF term scores per document in long form",
+        output_schema: &[("doc_idx", "INT64"), ("term", "TEXT"), ("score", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "LABEL_ENCODE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Integer codes from the sorted distinct category list",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("category", "TEXT"),
+            ("code", "INT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ROBUST_SCALE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Scales a numeric column by median and interquartile range",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("scaled", "FLOAT64"),
+            ("median", "FLOAT64"),
+            ("iqr", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ONE_HOT_ENCODE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "One hot indicators in long form, one row per input row and category",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("category", "TEXT"),
+            ("indicator", "INT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "TEXT_FEATURES",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Length, word, character, sentence, and punctuation statistics per text",
+        output_schema: &[
+            ("row_idx", "INT64"),
+            ("length", "INT64"),
+            ("word_count", "INT64"),
+            ("char_count", "INT64"),
+            ("avg_word_length", "FLOAT64"),
+            ("sentence_count", "INT64"),
+            ("punct_ratio", "FLOAT64"),
+        ],
+    });
+
+    // Statistical tests
+    entries.push(AnalyticsFunction {
+        name: "SHAPIRO_WILK",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Shapiro-Wilk normality test, Royston approximation for 3 to 5000 samples",
+        output_schema: &[("w", "FLOAT64"), ("p_value", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ANDERSON_DARLING",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Anderson-Darling goodness of fit for normal, exp, or logistic with estimated parameters",
+        output_schema: &[
+            ("significance_level", "FLOAT64"),
+            ("critical_value", "FLOAT64"),
+            ("a2", "FLOAT64"),
+            ("rejected", "BOOL"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "KOLMOGOROV_SMIRNOV_1SAMP",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: None,
+        description: "One-sample KS test against normal, exp, uniform, or lognormal with given parameters",
+        output_schema: &[("d", "FLOAT64"), ("p_value", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "FIT_DISTRIBUTION",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "MLE fits of candidate distributions ranked best-first by AIC",
+        output_schema: &[
+            ("distribution", "TEXT"),
+            ("params", "TEXT"),
+            ("log_likelihood", "FLOAT64"),
+            ("aic", "FLOAT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "LOCAL_OUTLIER_FACTOR",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Classic LOF score per row with k-distance and reachability",
+        output_schema: &[("row_idx", "INT64"), ("lof", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "SEQUENTIAL_ANALYZE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 5,
+        max_args: None,
+        description: "Group-sequential two-proportion test with obrien_fleming or pocock alpha spending",
+        output_schema: &[
+            ("look", "INT64"),
+            ("z", "FLOAT64"),
+            ("boundary", "FLOAT64"),
+            ("crossed", "BOOL"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "BAYESIAN_ANALYZE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 4,
+        max_args: None,
+        description: "Beta posterior Monte Carlo comparison of two binomial variants",
+        output_schema: &[
+            ("prob_b_beats_a", "FLOAT64"),
+            ("expected_loss_choosing_a", "FLOAT64"),
+            ("expected_loss_choosing_b", "FLOAT64"),
+            ("mean_a", "FLOAT64"),
+            ("mean_b", "FLOAT64"),
+        ],
+    });
+
+    entries.push(AnalyticsFunction {
+        name: "HYBRID_SEARCH",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: Some(4),
+        description: "Searches both halves of a hybrid index and fuses full text \
+                      and vector scores with the index's fusion method",
+        output_schema: &[
+            ("doc_id", "INT64"),
+            ("score", "FLOAT64"),
+            ("fts_score", "FLOAT64"),
+            ("vector_distance", "FLOAT64"),
+        ],
+    });
+
     // Scalar / window functions
     for (name, kind, args, desc) in [
         (
@@ -613,6 +932,31 @@ mod tests {
             "ZSCORE",
             "CORR",
             "GROUPING",
+            "DETECT_ANOMALIES",
+            "DETECT_ANOMALIES_TIMESERIES",
+            "DETECT_DRIFT",
+            "KMEANS_CLUSTER",
+            "KMEANS_CENTROIDS",
+            "KMEANS_ELBOW",
+            "KMEANS_PREDICT",
+            "CAUSAL_IMPACT",
+            "COUNTERFACTUAL",
+            "PROPENSITY_MATCH",
+            "AB_TEST_ANALYSIS",
+            "AB_TEST_SAMPLE_SIZE",
+            "TARGET_ENCODE",
+            "TFIDF",
+            "LABEL_ENCODE",
+            "ROBUST_SCALE",
+            "ONE_HOT_ENCODE",
+            "TEXT_FEATURES",
+            "SHAPIRO_WILK",
+            "ANDERSON_DARLING",
+            "KOLMOGOROV_SMIRNOV_1SAMP",
+            "FIT_DISTRIBUTION",
+            "LOCAL_OUTLIER_FACTOR",
+            "SEQUENTIAL_ANALYZE",
+            "BAYESIAN_ANALYZE",
         ] {
             assert!(r.lookup(name).is_some(), "missing function {}", name);
         }

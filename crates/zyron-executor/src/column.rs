@@ -554,10 +554,18 @@ impl ColumnData {
             TypeId::UInt128 => ColumnData::Int128(Vec::with_capacity(cap)),
             TypeId::Float32 => ColumnData::Float32(Vec::with_capacity(cap)),
             TypeId::Float64 => ColumnData::Float64(Vec::with_capacity(cap)),
-            TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-                ColumnData::Utf8(Vec::with_capacity(cap))
-            }
-            TypeId::Binary
+            TypeId::Char
+            | TypeId::Varchar
+            | TypeId::Text
+            | TypeId::Json
+            | TypeId::Jsonb
+            | TypeId::Variant
+            | TypeId::Ltree => ColumnData::Utf8(Vec::with_capacity(cap)),
+            // A declared STRUCT or MAP is stored in its binary layout, which
+            // holds no field names and reaches a field by position
+            TypeId::Struct
+            | TypeId::Map
+            | TypeId::Binary
             | TypeId::Varbinary
             | TypeId::Bytea
             | TypeId::Array
@@ -574,7 +582,12 @@ impl ColumnData {
             | TypeId::Cidr
             | TypeId::Money
             | TypeId::Quantity
-            | TypeId::MacAddr => ColumnData::Binary(Vec::with_capacity(cap)),
+            | TypeId::MacAddr
+            | TypeId::Image
+            | TypeId::Video
+            | TypeId::Audio
+            | TypeId::Document
+            | TypeId::ExternalRef => ColumnData::Binary(Vec::with_capacity(cap)),
             TypeId::Uuid => ColumnData::FixedBinary16(Vec::with_capacity(cap)),
             TypeId::Interval => ColumnData::Interval(Vec::with_capacity(cap)),
             TypeId::Null => ColumnData::Boolean(Vec::with_capacity(cap)),
@@ -719,6 +732,10 @@ impl ColumnData {
             (ColumnData::Utf8(v), ScalarValue::Utf8(s)) => v.push(s.clone()),
             (ColumnData::Utf8(v), _) => v.push(String::new()),
             (ColumnData::Binary(v), ScalarValue::Binary(s)) => v.push(s.clone()),
+            // A binary buffer offered text keeps the UTF-8 bytes, so a
+            // stage that knows the column's real encoding can still parse
+            // the value instead of finding an empty payload
+            (ColumnData::Binary(v), ScalarValue::Utf8(s)) => v.push(s.clone().into_bytes()),
             (ColumnData::Binary(v), _) => v.push(Vec::new()),
             (ColumnData::FixedBinary16(v), ScalarValue::FixedBinary16(s)) => v.push(*s),
             (ColumnData::FixedBinary16(v), _) => v.push([0u8; 16]),
@@ -891,10 +908,16 @@ impl ColumnData {
             TypeId::UInt64 | TypeId::SemVer | TypeId::Bitfield => ColumnData::UInt64(vec![0; len]),
             TypeId::Float32 => ColumnData::Float32(vec![0.0; len]),
             TypeId::Float64 => ColumnData::Float64(vec![0.0; len]),
-            TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
-                ColumnData::Utf8(vec![String::new(); len])
-            }
-            TypeId::Binary
+            TypeId::Char
+            | TypeId::Varchar
+            | TypeId::Text
+            | TypeId::Json
+            | TypeId::Jsonb
+            | TypeId::Variant
+            | TypeId::Ltree => ColumnData::Utf8(vec![String::new(); len]),
+            TypeId::Struct
+            | TypeId::Map
+            | TypeId::Binary
             | TypeId::Varbinary
             | TypeId::Bytea
             | TypeId::Array
@@ -911,7 +934,12 @@ impl ColumnData {
             | TypeId::Cidr
             | TypeId::MacAddr
             | TypeId::Money
-            | TypeId::Quantity => ColumnData::Binary(vec![Vec::new(); len]),
+            | TypeId::Quantity
+            | TypeId::Image
+            | TypeId::Video
+            | TypeId::Audio
+            | TypeId::Document
+            | TypeId::ExternalRef => ColumnData::Binary(vec![Vec::new(); len]),
             TypeId::Uuid => ColumnData::FixedBinary16(vec![[0u8; 16]; len]),
             TypeId::Interval => ColumnData::Interval(vec![zyron_common::Interval::ZERO; len]),
             TypeId::Null => ColumnData::Boolean(vec![false; len]),

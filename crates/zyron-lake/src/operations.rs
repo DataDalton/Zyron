@@ -32,8 +32,9 @@ use crate::manifest::{ClusterStrategy, DeletePredicate, ManifestFile, PartitionE
 use crate::paths::{discard_staged_file, parse_data_file_name, parse_index_file_name};
 use crate::predicate::{LakePredicate, PruneDecision};
 use crate::reader::LakeFileReader;
+use crate::schema::{DerivedColumn, LakeColumn, LakeSchema};
 use crate::transaction_log::{CommitAttempt, LogEntry, OperationKind, TransactionLog};
-use crate::writer::{ColumnData, WriteRequest, write_data_file_ordered};
+use crate::writer::{ColumnData, WriteRequest, write_data_file, write_data_file_ordered};
 
 /// Outcome of an append
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1056,6 +1057,189 @@ fn compaction_inputs(base: &ManifestFile, fallback_rows_per_file: u64) -> Vec<&P
     // order the writer's merge expects
     inputs.sort_by_key(|e| e.partition_id);
     inputs
+}
+
+/// What a derived column backfill did.
+pub struct BackfillOutcome {
+    pub version: Option<u64>,
+    /// The id the new column was given, which the commit decides
+    pub column_id: u32,
+    /// Files replaced by one carrying the new column
+    pub files_rewritten: usize,
+    pub rows_backfilled: u64,
+}
+
+/// Adds a derived column and computes it for every row already stored.
+///
+/// A data file never changes, so the rows are not edited in place: each file
+/// is read, its rows are re-written into a new file that carries the extra
+/// column, and one commit swaps the old set for the new one. A reader holding
+/// an earlier version keeps seeing the files it always saw, a failed rewrite
+/// leaves the old set live because the commit never lands, and vacuum reclaims
+/// the replaced files once no reader can reach them.
+///
+/// `compute` is the expression, supplied by the caller because evaluating it
+/// belongs to the executor rather than to the lake. It is handed the stored
+/// columns of one file and returns that file's values for the new column.
+#[allow(clippy::too_many_arguments)]
+pub fn backfill_derived(
+    log: &TransactionLog,
+    attempt: CommitAttempt<'_>,
+    table_id: u64,
+    column: &LakeColumn,
+    derived: &DerivedColumn,
+    compute: &dyn Fn(&LakeSchema, &[ColumnData], usize) -> Result<ColumnData, ZyronError>,
+) -> Result<BackfillOutcome, ZyronError> {
+    let mut attempt = attempt;
+    attempt.operation = OperationKind::SchemaChange;
+    let mut staged: Vec<PathBuf> = Vec::new();
+    // Partition ids registered before their files exist, held until the
+    // commit resolves either way, so a concurrent vacuum never reclaims a
+    // file this commit is about to name
+    let staging_guards: std::cell::RefCell<Vec<crate::transaction_log::StagedPartition<'_>>> =
+        std::cell::RefCell::new(Vec::new());
+    let mut files_rewritten = 0usize;
+    let mut rows_backfilled = 0u64;
+    let mut column_id = 0u32;
+
+    let result = log.commit(attempt, |base| {
+        for path in staged.drain(..) {
+            discard_staged_file(&path);
+        }
+        files_rewritten = 0;
+        rows_backfilled = 0;
+
+        if base.schema.columns.iter().any(|c| c.name == column.name) {
+            return Err(ZyronError::Internal(format!(
+                "column \"{}\" already exists in the lake schema",
+                column.name
+            )));
+        }
+        // One column per expression, so its statistics stay in one place and
+        // two predicates cannot prune from different ones
+        if let Some(existing) = base
+            .schema
+            .derived
+            .iter()
+            .find(|d| d.canonical_hash == derived.canonical_hash)
+        {
+            return Err(ZyronError::Internal(format!(
+                "expression \"{}\" is already stored by column id {}",
+                existing.sql, existing.column_id
+            )));
+        }
+
+        let new_id = base.schema.next_column_id;
+        column_id = new_id;
+        let mut columns = base.schema.columns.clone();
+        let mut added = column.clone();
+        added.id = new_id;
+        columns.push(added);
+        let mut derived_columns = base.schema.derived.clone();
+        let mut added_derived = derived.clone();
+        added_derived.column_id = new_id;
+        derived_columns.push(added_derived);
+        let schema = LakeSchema {
+            schema_id: base.schema.schema_id + 1,
+            next_column_id: new_id + 1,
+            columns,
+            derived: derived_columns,
+        };
+
+        let mut entries: Vec<LogEntry> = vec![LogEntry::SchemaChange(schema.clone())];
+        let sort_keys: Vec<u32> = base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
+        let sort_strategies: Vec<ClusterStrategy> =
+            base.cluster_spec.keys.iter().map(|k| k.strategy).collect();
+
+        // One file at a time, so a table larger than memory backfills in the
+        // footprint of its widest file rather than of the whole table
+        for input in &base.entries {
+            let reader = LakeFileReader::open(log.paths(), input.partition_id)?;
+            let keep = reader.delete_survivors(&base.schema, base, input)?;
+            let decoded: Vec<_> = base
+                .schema
+                .columns
+                .iter()
+                .map(|c| reader.read_column(c))
+                .collect::<Result<_, _>>()?;
+            let mut stored: Vec<ColumnData> = base
+                .schema
+                .columns
+                .iter()
+                .map(|c| {
+                    ColumnData::with_capacity(
+                        c.id,
+                        c.physical_type_id().fixed_size().unwrap_or(0),
+                        0,
+                    )
+                })
+                .collect();
+            for row in 0..reader.row_count() {
+                if keep[row / 8] & (1 << (row % 8)) == 0 {
+                    continue;
+                }
+                for (slot, col) in stored.iter_mut().zip(decoded.iter()) {
+                    slot.push(col.cell(row));
+                }
+            }
+            let rows = stored.first().map(|c| c.len()).unwrap_or(0);
+            entries.push(LogEntry::RemoveFile {
+                partition_id: input.partition_id,
+            });
+            files_rewritten += 1;
+            if rows == 0 {
+                // Every row of this file was already deleted, so it leaves
+                // without a replacement
+                continue;
+            }
+            let mut computed = compute(&base.schema, &stored, rows)?;
+            computed.column_id = new_id;
+            stored.push(computed);
+
+            let partition_id = allocate_partition_id(base);
+            staging_guards
+                .borrow_mut()
+                .push(log.stage_partition(partition_id));
+            let written = write_data_file(
+                log.paths(),
+                &schema,
+                &WriteRequest {
+                    partition_id,
+                    columns: &stored,
+                    sort_keys: &sort_keys,
+                    sort_strategies: &sort_strategies,
+                    cluster_spec_id: base.cluster_spec.spec_id,
+                    table_id,
+                    bloom_columns: &base.bloom_columns(),
+                    index_id: None,
+                },
+            )?;
+            staged.push(log.paths().data_file(partition_id));
+            rows_backfilled += rows as u64;
+            entries.push(LogEntry::AddFile(written));
+        }
+        Ok(entries)
+    });
+
+    match result {
+        Ok(version) => {
+            staged.clear();
+            staging_guards.borrow_mut().clear();
+            Ok(BackfillOutcome {
+                version: Some(version),
+                column_id,
+                files_rewritten,
+                rows_backfilled,
+            })
+        }
+        Err(e) => {
+            for path in staged.drain(..) {
+                discard_staged_file(&path);
+            }
+            staging_guards.borrow_mut().clear();
+            Err(e)
+        }
+    }
 }
 
 /// Rewrites a table toward its target shape.

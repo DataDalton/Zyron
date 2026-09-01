@@ -1120,6 +1120,7 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
         column_defaults: insert.column_defaults.clone(),
         check_constraints: insert.check_constraints.clone(),
         expectations: insert.expectations.clone(),
+        generated_columns: insert.generated_columns.clone(),
         source: Arc::new(source),
     })
 }
@@ -1180,6 +1181,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
         table_id: update.table_id,
         assignments: update.assignments.clone(),
         check_constraints: update.check_constraints.clone(),
+        generated_columns: update.generated_columns.clone(),
         child: Arc::new(plan),
     })
 }
