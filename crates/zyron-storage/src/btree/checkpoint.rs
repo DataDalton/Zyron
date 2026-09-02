@@ -4,12 +4,14 @@
 //! compression for keys. O(pages) for metadata, O(entries) for data.
 //!
 //! File layout (.zyridx):
-//!   Header (40 bytes):
-//!     magic(8), version(4), lsn(8), entry_count(4),
-//!     key_len(2), prefix_len(2), checksum(4), value_width(2), reserved(6)
+//!   Header (40 bytes), the first 20 the universal format envelope:
+//!     magic(4) = "ZCPT", format_version(4), header_length(4), flags(4),
+//!     header_checksum(4), lsn(8), entry_count(4), key_len(2),
+//!     prefix_len(2), value_width(2), reserved(2)
 //!   Key prefix: prefix_len bytes (common prefix of all keys)
 //!   Key suffixes: entry_count * suffix_len bytes
 //!   Values: entry_count * value_width bytes of locator payload
+//!   Footer: body checksum(4)
 //!
 //! value_width is the locator payload width shared by every entry: 7 when the
 //! index addresses heap rows, 17 otherwise. An index holding both kinds is
@@ -19,12 +21,44 @@ use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
 use super::types::LeafPageHeader;
 use std::path::Path;
+use zyron_common::format::envelope::{self, ENVELOPE_FOOTER_LEN, ENVELOPE_HEADER_LEN};
+use zyron_common::format::{FormatKind, FormatVersion};
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
 use zyron_common::{Result, ZyronError};
 
-const ZYIDX_MAGIC: [u8; 8] = *b"ZYIDX\0\0\0";
-const ZYIDX_FORMAT_VERSION: u32 = 11;
+/// Version the checkpoint file is written at. The envelope in the header
+/// carries it, and the format registry declares the same value.
+const ZYIDX_FORMAT_VERSION: FormatVersion = crate::format::CHECKPOINT_FORMAT_VERSION;
+
+/// Envelope header plus the checkpoint's own 20-byte header extension.
 const ZYIDX_HEADER_SIZE: usize = 40;
+
+/// The checkpoint's own header fields, which the envelope carries as its
+/// extension and its header checksum covers.
+///
+/// ```text
+/// [0..8)   checkpoint_lsn u64
+/// [8..12)  entry_count u32
+/// [12..14) key_len u16
+/// [14..16) prefix_len u16
+/// [16..18) value_width u16
+/// [18..20) reserved
+/// ```
+fn checkpoint_extension(
+    checkpoint_lsn: u64,
+    entry_count: u32,
+    key_len: u16,
+    prefix_len: u16,
+    value_width: u16,
+) -> [u8; ZYIDX_HEADER_SIZE - ENVELOPE_HEADER_LEN] {
+    let mut ext = [0u8; ZYIDX_HEADER_SIZE - ENVELOPE_HEADER_LEN];
+    ext[0..8].copy_from_slice(&checkpoint_lsn.to_le_bytes());
+    ext[8..12].copy_from_slice(&entry_count.to_le_bytes());
+    ext[12..14].copy_from_slice(&key_len.to_le_bytes());
+    ext[14..16].copy_from_slice(&prefix_len.to_le_bytes());
+    ext[16..18].copy_from_slice(&value_width.to_le_bytes());
+    ext
+}
 
 const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
 const SLOT_SIZE: usize = 4;
@@ -140,22 +174,23 @@ pub fn write_checkpoint_from_store(
 
     let (mut buf, total_size) = loop {
         let data_size = prefix_len + n * suffix_len + n * value_width;
-        let total_size = ZYIDX_HEADER_SIZE + data_size;
+        let total_size = ZYIDX_HEADER_SIZE + data_size + ENVELOPE_FOOTER_LEN;
 
         let mut buf = vec![0u8; total_size];
-        let bp = buf.as_mut_ptr();
 
-        // Header
-        unsafe {
-            std::ptr::copy_nonoverlapping(ZYIDX_MAGIC.as_ptr(), bp, 8);
-            (bp.add(8) as *mut u32).write_unaligned(ZYIDX_FORMAT_VERSION);
-            (bp.add(12) as *mut u64).write_unaligned(checkpoint_lsn);
-            (bp.add(20) as *mut u32).write_unaligned(total_entries);
-            (bp.add(24) as *mut u16).write_unaligned(key_len);
-            (bp.add(26) as *mut u16).write_unaligned(prefix_len as u16);
-            (bp.add(28) as *mut u32).write_unaligned(0);
-            (bp.add(32) as *mut u16).write_unaligned(value_width as u16);
-        }
+        // Envelope header, then the checkpoint's own header extension
+        let extension = checkpoint_extension(
+            checkpoint_lsn,
+            total_entries,
+            key_len,
+            prefix_len as u16,
+            value_width as u16,
+        );
+        let header =
+            envelope::encode_header(FormatKind::Checkpoint, ZYIDX_FORMAT_VERSION, 0, &extension);
+        buf[0..ENVELOPE_HEADER_LEN].copy_from_slice(&header);
+        buf[ENVELOPE_HEADER_LEN..ZYIDX_HEADER_SIZE].copy_from_slice(&extension);
+        let bp = buf.as_mut_ptr();
 
         // Key prefix
         if prefix_len > 0 {
@@ -233,20 +268,11 @@ pub fn write_checkpoint_from_store(
         }
         value_width = WIDE_VALUE_WIDTH;
     };
-    let bp = buf.as_mut_ptr();
-
-    // Checksum: header section, phase separator, then data section.
-    let checksum = {
-        let mut h = zyron_common::Hasher::new();
-        h.update(&buf[..28]);
-        h.update(&buf[32..ZYIDX_HEADER_SIZE]);
-        h.finish_phase();
-        h.update(&buf[ZYIDX_HEADER_SIZE..]);
-        h.finish32()
-    };
-    unsafe {
-        (bp.add(28) as *mut u32).write_unaligned(checksum);
-    }
+    // Envelope footer checksum over the body. The header carries its own
+    // checksum, stamped when it was encoded.
+    let body_end = total_size - ENVELOPE_FOOTER_LEN;
+    let footer = zyron_common::hash32(&buf[ZYIDX_HEADER_SIZE..body_end]);
+    buf[body_end..total_size].copy_from_slice(&footer.to_le_bytes());
 
     {
         use std::io::Write;
@@ -261,23 +287,19 @@ pub fn write_checkpoint_from_store(
 }
 
 fn write_empty_checkpoint(path: &Path, checkpoint_lsn: u64, fsync: bool) -> Result<u64> {
-    let mut buf = [0u8; ZYIDX_HEADER_SIZE];
-    buf[0..8].copy_from_slice(&ZYIDX_MAGIC);
-    buf[8..12].copy_from_slice(&ZYIDX_FORMAT_VERSION.to_le_bytes());
-    buf[12..20].copy_from_slice(&checkpoint_lsn.to_le_bytes());
-    let checksum = {
-        let mut h = zyron_common::Hasher::new();
-        h.update(&buf[..28]);
-        h.update(&buf[32..ZYIDX_HEADER_SIZE]);
-        h.finish_phase();
-        h.finish32()
-    };
-    buf[28..32].copy_from_slice(&checksum.to_le_bytes());
+    let mut buf = [0u8; ZYIDX_HEADER_SIZE + ENVELOPE_FOOTER_LEN];
+    let extension = checkpoint_extension(checkpoint_lsn, 0, 0, 0, 0);
+    let header =
+        envelope::encode_header(FormatKind::Checkpoint, ZYIDX_FORMAT_VERSION, 0, &extension);
+    buf[0..ENVELOPE_HEADER_LEN].copy_from_slice(&header);
+    buf[ENVELOPE_HEADER_LEN..ZYIDX_HEADER_SIZE].copy_from_slice(&extension);
+    let footer = zyron_common::hash32(&[]);
+    buf[ZYIDX_HEADER_SIZE..].copy_from_slice(&footer.to_le_bytes());
     std::fs::write(path, buf)?;
     if fsync {
         std::fs::File::open(path)?.sync_all()?;
     }
-    Ok(ZYIDX_HEADER_SIZE as u64)
+    Ok(buf.len() as u64)
 }
 
 pub fn load_checkpoint_into_store(
@@ -324,28 +346,38 @@ pub fn load_checkpoint_into_store(
         buf
     };
 
-    if buf.len() < ZYIDX_HEADER_SIZE {
+    if buf.len() < ZYIDX_HEADER_SIZE + ENVELOPE_FOOTER_LEN {
         return Err(ZyronError::RecoveryFailed(
             "checkpoint file too small".into(),
         ));
     }
-    if buf[0..8] != ZYIDX_MAGIC {
-        return Err(ZyronError::RecoveryFailed("invalid magic bytes".into()));
-    }
-    let ver = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    if ver != ZYIDX_FORMAT_VERSION {
+    let (header, extension) = envelope::decode_header(&buf[..ZYIDX_HEADER_SIZE])
+        .map_err(|e| ZyronError::RecoveryFailed(e.to_string()))?;
+    if header.kind != FormatKind::Checkpoint {
         return Err(ZyronError::RecoveryFailed(format!(
-            "unsupported version: {} (expected {})",
-            ver, ZYIDX_FORMAT_VERSION
+            "expected an index checkpoint, found a {} file",
+            header.kind
+        )));
+    }
+    if header.header_length as usize != ZYIDX_HEADER_SIZE {
+        return Err(ZyronError::RecoveryFailed(format!(
+            "checkpoint header declares {} bytes, this binary writes {}",
+            header.header_length, ZYIDX_HEADER_SIZE
+        )));
+    }
+    if header.version != ZYIDX_FORMAT_VERSION {
+        return Err(ZyronError::RecoveryFailed(format!(
+            "checkpoint is at format version {}, this binary writes and reads {}. Upgrade \
+             through a release that still reads {} to move the checkpoint forward first",
+            header.version, ZYIDX_FORMAT_VERSION, header.version
         )));
     }
 
-    let checkpoint_lsn = u64::from_le_bytes(buf[12..20].try_into().unwrap());
-    let entry_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-    let key_len = u16::from_le_bytes([buf[24], buf[25]]);
-    let prefix_len = u16::from_le_bytes([buf[26], buf[27]]) as usize;
-    let stored_checksum = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
-    let value_width = u16::from_le_bytes([buf[32], buf[33]]) as usize;
+    let checkpoint_lsn = u64::from_le_bytes(extension[0..8].try_into().unwrap());
+    let entry_count = u32::from_le_bytes(extension[8..12].try_into().unwrap());
+    let key_len = u16::from_le_bytes([extension[12], extension[13]]);
+    let prefix_len = u16::from_le_bytes([extension[14], extension[15]]) as usize;
+    let value_width = u16::from_le_bytes([extension[16], extension[17]]) as usize;
     if entry_count > 0
         && value_width != zyron_common::RowLocator::NARROW_PAYLOAD_LEN
         && value_width != WIDE_VALUE_WIDTH
@@ -359,22 +391,22 @@ pub fn load_checkpoint_into_store(
     let suffix_len = kl - prefix_len;
     let n = entry_count as usize;
     let data_size = prefix_len + n * suffix_len + n * value_width;
-    let expected_size = ZYIDX_HEADER_SIZE + data_size;
+    let expected_size = ZYIDX_HEADER_SIZE + data_size + ENVELOPE_FOOTER_LEN;
     if buf.len() < expected_size {
         return Err(ZyronError::RecoveryFailed(
             "checkpoint file truncated".into(),
         ));
     }
 
-    // Validate checksum: header section, phase separator, then data section.
-    let computed = {
-        let mut h = zyron_common::Hasher::new();
-        h.update(&buf[..28]);
-        h.update(&buf[32..ZYIDX_HEADER_SIZE]);
-        h.finish_phase();
-        h.update(&buf[ZYIDX_HEADER_SIZE..ZYIDX_HEADER_SIZE + data_size]);
-        h.finish32()
-    };
+    // Envelope footer checksum over the body. The header checksum was
+    // verified when the envelope was decoded.
+    let body_end = ZYIDX_HEADER_SIZE + data_size;
+    let stored_checksum = u32::from_le_bytes(
+        buf[body_end..body_end + ENVELOPE_FOOTER_LEN]
+            .try_into()
+            .map_err(|_| ZyronError::RecoveryFailed("checkpoint footer truncated".into()))?,
+    );
+    let computed = zyron_common::hash32(&buf[ZYIDX_HEADER_SIZE..body_end]);
     if stored_checksum != computed {
         return Err(ZyronError::RecoveryFailed(
             "checkpoint checksum mismatch".into(),

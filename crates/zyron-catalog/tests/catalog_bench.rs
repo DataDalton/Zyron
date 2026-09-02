@@ -1385,7 +1385,15 @@ async fn test_statistics() {
         let batch_end = (batch_start + batch_size as u64).min(row_count);
         let tuples: Vec<Tuple> = (batch_start..batch_end)
             .map(|i| {
-                let data = i.to_le_bytes().to_vec();
+                // The heap row format is a null bitmap of one bit per column
+                // then each value, which is what the executor writes and what
+                // analyze_table reads. One nullable BigInt column is one
+                // bitmap byte and eight value bytes. Writing the bare value
+                // leaves every row too short for the analyzer to decode, so
+                // it walks off the end and collects nothing
+                let mut data = Vec::with_capacity(9);
+                data.push(0u8);
+                data.extend_from_slice(&i.to_le_bytes());
                 Tuple::new(data, 0)
             })
             .collect();

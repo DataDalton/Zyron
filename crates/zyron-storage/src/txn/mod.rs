@@ -376,24 +376,54 @@ impl TransactionManager {
     /// does not leak.
     pub fn begin(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let _s = profile::scope(Phase::TxnBegin);
-        // The slot is claimed BEFORE the id is allocated, under a
-        // conservative placeholder no higher than the id will be. A horizon
-        // scan sampling next_txn_id and then the active set can otherwise
-        // land between the allocation and the claim, compute a horizon above
-        // this transaction, and let vacuum reclaim versions whose deleter
-        // later aborts. The placeholder only ever lowers a horizon, which is
-        // the safe direction
-        let placeholder = self.next_txn_id.load(Ordering::SeqCst);
-        let slot_idx = self.proc_array.claim(placeholder)?;
-        let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-        self.proc_array.set(slot_idx, txn_id);
+        // The slot is claimed BEFORE the id is allocated, so a horizon scan
+        // sampling next_txn_id and then the active set cannot land between
+        // the two, compute a horizon above this transaction, and let vacuum
+        // reclaim versions whose deleter later aborts.
+        //
+        // The claimed value is the id this transaction goes on to take, not
+        // a placeholder standing in for it. The proc array answers two
+        // questions with opposite safety requirements: the vacuum horizon is
+        // a minimum, where a lower value is conservative, and visibility asks
+        // whether one exact id is active, where any other value reads as "not
+        // active". A slot advertising an id the transaction does not hold
+        // makes its own writes fall through to a live commit-status read, and
+        // a commit landing mid-scan then shows a reader part of one
+        // transaction. The id is claimed and allocated as a unit so the two
+        // can never disagree
+        let (slot_idx, txn_id) = loop {
+            let candidate = self.next_txn_id.load(Ordering::SeqCst);
+            let slot_idx = self.proc_array.claim(candidate)?;
+            // Take the id only if no other transaction took it first. On a
+            // loss the slot is handed back and the next id is tried, so the
+            // array never holds a value its owner did not end up with
+            if self
+                .next_txn_id
+                .compare_exchange(candidate, candidate + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break (slot_idx, candidate);
+            }
+            self.proc_array.release(slot_idx);
+        };
 
         // Empty until snapshot_into pushes live txn ids. At low concurrency the
         // active set is usually empty, so starting empty skips a heap allocation
         // on the common begin; snapshot_into grows it only when peers are live.
         let mut active_ids: Vec<u64> = Vec::new();
         self.proc_array.snapshot_into(txn_id, &mut active_ids);
-        let snapshot = Snapshot::new(txn_id, active_ids, Arc::clone(&self.status_map));
+        let snapshot = Snapshot::new(txn_id, active_ids, Arc::clone(&self.status_map))
+            .with_proc_array(self.proc_array_shared());
+
+        // Publish what this transaction can still need before it runs. Until
+        // this lands the slot reads as unpublished and holds the system-wide
+        // horizon at zero, so a concurrent delete cannot prune a version this
+        // snapshot is entitled to during the window between claiming the slot
+        // and capturing the active set. The value only ever describes this
+        // snapshot, and a ReadCommitted refresh moves it up, so it is never
+        // republished: holding the lower bound keeps pruning conservative
+        self.proc_array
+            .publish_horizon(slot_idx, snapshot.visibility_floor());
 
         let lsn = match self.wal.log_begin(txn_id) {
             Ok(lsn) => lsn,
@@ -652,12 +682,35 @@ impl TransactionManager {
         self.proc_array.active_txn_ids()
     }
 
+    /// Lowest `xmax` no live transaction can still need to see, so a version
+    /// below it can be physically reclaimed by vacuum, compaction or an
+    /// on-access prune.
+    ///
+    /// **This is not the oldest active transaction id, and the two are not
+    /// interchangeable.** A transaction still in flight when an older reader
+    /// took its snapshot sits in that reader's active set, so the reader goes
+    /// on seeing the rows it deleted; once it commits and leaves the array,
+    /// the oldest active id can be well above its id while the reader still
+    /// needs those rows. Reclaiming on the id deletes them out from under the
+    /// reader, and its next scan returns fewer rows, down to none when they
+    /// all shared one deleter.
+    ///
+    /// The id fence is sampled before the horizon so a transaction starting
+    /// between the two either publishes a floor the scan sees or takes an id
+    /// at or above the fence. It also bounds the empty-array answer, which is
+    /// `u64::MAX`.
+    pub fn prune_horizon(&self) -> u64 {
+        let id_fence = self.next_txn_id.load(Ordering::SeqCst);
+        self.proc_array.global_prune_horizon().min(id_fence)
+    }
+
     /// Refreshes the snapshot for a ReadCommitted transaction.
     /// Returns a new snapshot reflecting the current active transaction set.
     pub fn refresh_snapshot(&self, txn: &Transaction) -> Snapshot {
         let mut active_ids: Vec<u64> = Vec::with_capacity(16);
         self.proc_array.snapshot_into(txn.txn_id, &mut active_ids);
         Snapshot::new(txn.txn_id, active_ids, Arc::clone(&self.status_map))
+            .with_proc_array(self.proc_array_shared())
     }
 
     /// Returns the shared row-level lock table. The executor takes row locks
@@ -718,6 +771,72 @@ mod tests {
         let writer = WalWriter::new(config).unwrap();
         let mgr = TransactionManager::new(Arc::new(writer));
         (mgr, dir)
+    }
+
+    /// A transaction's slot must advertise the id it actually holds.
+    ///
+    /// Visibility asks whether one exact id is active. A slot holding any
+    /// other value makes that transaction read as not active, its writes
+    /// fall through to a live commit-status read, and a commit landing part
+    /// way through a scan shows the reader half of one transaction. Under
+    /// concurrent begins the ids must all be distinct and every live one
+    /// must be findable in the array
+    #[test]
+    fn test_concurrent_begin_publishes_the_id_it_allocates() {
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+
+        let (mgr, _dir) = create_test_manager();
+        let mgr = Arc::new(mgr);
+        let threads = 8usize;
+        let per_thread = 40usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let mgr = Arc::clone(&mgr);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut seen = Vec::with_capacity(per_thread);
+                barrier.wait();
+                for _ in 0..per_thread {
+                    let mut txn = mgr.begin(IsolationLevel::ReadCommitted).expect("begins");
+                    // While this transaction is live its own id must be in
+                    // the array, under that exact value
+                    let active = mgr.active_txn_ids();
+                    assert!(
+                        active.contains(&txn.txn_id),
+                        "txn {} is live but the proc array does not list it: {active:?}",
+                        txn.txn_id
+                    );
+                    seen.push(txn.txn_id);
+                    mgr.commit_blocking(&mut txn).expect("commits");
+                }
+                seen
+            }));
+        }
+
+        let mut all = Vec::new();
+        for handle in handles {
+            all.extend(handle.join().expect("thread"));
+        }
+
+        // Every id handed out is distinct, so no two transactions ever
+        // shared one and the retry path never issued a duplicate
+        let unique: HashSet<u64> = all.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "an id was handed to more than one transaction"
+        );
+        assert_eq!(all.len(), threads * per_thread);
+
+        // Every slot is handed back, so the retry path leaks none
+        assert!(
+            mgr.active_txn_ids().is_empty(),
+            "slots leaked after every transaction committed: {:?}",
+            mgr.active_txn_ids()
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! concurrent load from multiple transactions.
 
 use crate::durability::DurabilityNotifier;
+use crate::format::WAL_RECORD_VERSION_BYTE;
 use crate::record::{
     LogRecordType, Lsn, backfill_checksums, record_size_for_payload, serialize_raw_deferred,
 };
@@ -1040,7 +1041,7 @@ impl WalWriter {
         txn_id: u64,
         prev_lsn: Lsn,
         record_type: LogRecordType,
-        flags: u8,
+        record_version: u8,
         payload: &[u8],
     ) -> Result<Lsn> {
         if self.flush_io_error.load(Ordering::Acquire) {
@@ -1077,7 +1078,7 @@ impl WalWriter {
                             prev_lsn,
                             txn_id,
                             record_type as u8,
-                            flags,
+                            record_version,
                             payload,
                         );
                     }
@@ -1115,7 +1116,7 @@ impl WalWriter {
                     prev_lsn,
                     txn_id,
                     record_type as u8,
-                    flags,
+                    record_version,
                     payload,
                 );
             }
@@ -1345,13 +1346,25 @@ impl WalWriter {
     /// Logs a transaction begin.
     #[inline]
     pub fn log_begin(&self, txn_id: u64) -> Result<Lsn> {
-        self.append(txn_id, Lsn::INVALID, LogRecordType::Begin, 0, &[])
+        self.append(
+            txn_id,
+            Lsn::INVALID,
+            LogRecordType::Begin,
+            WAL_RECORD_VERSION_BYTE,
+            &[],
+        )
     }
 
     /// Logs a transaction commit.
     #[inline]
     pub fn log_commit(&self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
-        self.append(txn_id, prev_lsn, LogRecordType::Commit, 0, &[])
+        self.append(
+            txn_id,
+            prev_lsn,
+            LogRecordType::Commit,
+            WAL_RECORD_VERSION_BYTE,
+            &[],
+        )
     }
 
     /// Logs a transaction commit that a consensus group agreed to.
@@ -1370,7 +1383,13 @@ impl WalWriter {
     ) -> Result<Lsn> {
         let mut payload = [0u8; AGREED_COMMIT_LEN];
         stamp.encode(&mut payload);
-        self.append(txn_id, prev_lsn, LogRecordType::Commit, 0, &payload)
+        self.append(
+            txn_id,
+            prev_lsn,
+            LogRecordType::Commit,
+            WAL_RECORD_VERSION_BYTE,
+            &payload,
+        )
     }
 
     /// The consensus stamp a commit record carries, or None for a commit that
@@ -1425,13 +1444,25 @@ impl WalWriter {
     /// Logs a transaction abort.
     #[inline]
     pub fn log_abort(&self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
-        self.append(txn_id, prev_lsn, LogRecordType::Abort, 0, &[])
+        self.append(
+            txn_id,
+            prev_lsn,
+            LogRecordType::Abort,
+            WAL_RECORD_VERSION_BYTE,
+            &[],
+        )
     }
 
     /// Logs an insert operation.
     #[inline]
     pub fn log_insert(&self, txn_id: u64, prev_lsn: Lsn, payload: &[u8]) -> Result<Lsn> {
-        self.append(txn_id, prev_lsn, LogRecordType::Insert, 0, payload)
+        self.append(
+            txn_id,
+            prev_lsn,
+            LogRecordType::Insert,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a batch of insert operations with amortized atomic overhead
@@ -1495,7 +1526,13 @@ impl WalWriter {
 
             if needs_rotation {
                 let (txn_id, payload) = inserts[idx];
-                let lsn = self.append(txn_id, Lsn::INVALID, LogRecordType::Insert, 0, payload)?;
+                let lsn = self.append(
+                    txn_id,
+                    Lsn::INVALID,
+                    LogRecordType::Insert,
+                    WAL_RECORD_VERSION_BYTE,
+                    payload,
+                )?;
                 on_lsn(lsn);
                 idx += 1;
                 continue;
@@ -1517,7 +1554,7 @@ impl WalWriter {
                         Lsn::INVALID,
                         txn_id,
                         LogRecordType::Insert as u8,
-                        0,
+                        WAL_RECORD_VERSION_BYTE,
                         payload,
                     );
                 }
@@ -1547,13 +1584,25 @@ impl WalWriter {
     /// Logs an update operation.
     #[inline]
     pub fn log_update(&self, txn_id: u64, prev_lsn: Lsn, payload: &[u8]) -> Result<Lsn> {
-        self.append(txn_id, prev_lsn, LogRecordType::Update, 0, payload)
+        self.append(
+            txn_id,
+            prev_lsn,
+            LogRecordType::Update,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a delete operation.
     #[inline]
     pub fn log_delete(&self, txn_id: u64, prev_lsn: Lsn, payload: &[u8]) -> Result<Lsn> {
-        self.append(txn_id, prev_lsn, LogRecordType::Delete, 0, payload)
+        self.append(
+            txn_id,
+            prev_lsn,
+            LogRecordType::Delete,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a batch of delete operations with amortized atomic overhead.
@@ -1589,7 +1638,13 @@ impl WalWriter {
 
             if needs_rotation {
                 let (txn_id, payload) = deletes[idx];
-                let lsn = self.append(txn_id, Lsn::INVALID, LogRecordType::Delete, 0, payload)?;
+                let lsn = self.append(
+                    txn_id,
+                    Lsn::INVALID,
+                    LogRecordType::Delete,
+                    WAL_RECORD_VERSION_BYTE,
+                    payload,
+                )?;
                 lsns.push(lsn);
                 idx += 1;
                 continue;
@@ -1611,7 +1666,7 @@ impl WalWriter {
                         Lsn::INVALID,
                         txn_id,
                         LogRecordType::Delete as u8,
-                        0,
+                        WAL_RECORD_VERSION_BYTE,
                         payload,
                     );
                 }
@@ -1637,43 +1692,85 @@ impl WalWriter {
     /// Logs a checkpoint begin marker.
     #[inline]
     pub fn log_checkpoint_begin(&self) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::CheckpointBegin, 0, &[])
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::CheckpointBegin,
+            WAL_RECORD_VERSION_BYTE,
+            &[],
+        )
     }
 
     /// Logs a checkpoint end marker.
     #[inline]
     pub fn log_checkpoint_end(&self, payload: &[u8]) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::CheckpointEnd, 0, payload)
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::CheckpointEnd,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a columnar compaction begin marker.
     #[inline]
     pub fn log_compaction_begin(&self, payload: &[u8]) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::CompactionBegin, 0, payload)
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::CompactionBegin,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a columnar compaction end marker. This is the fold commit point.
     #[inline]
     pub fn log_compaction_end(&self, payload: &[u8]) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::CompactionEnd, 0, payload)
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::CompactionEnd,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a columnar merge begin marker.
     #[inline]
     pub fn log_merge_begin(&self, payload: &[u8]) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::MergeBegin, 0, payload)
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::MergeBegin,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a columnar merge end marker. This is the merge commit point.
     #[inline]
     pub fn log_merge_end(&self, payload: &[u8]) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::MergeEnd, 0, payload)
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::MergeEnd,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs an epoch-tagged columnar value patch.
     #[inline]
     pub fn log_columnar_patch(&self, payload: &[u8]) -> Result<Lsn> {
-        self.append(0, Lsn::INVALID, LogRecordType::ColumnarPatch, 0, payload)
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::ColumnarPatch,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
     }
 
     /// Logs a columnar supersede (delete of a columnar-resident row).
@@ -1683,7 +1780,7 @@ impl WalWriter {
             0,
             Lsn::INVALID,
             LogRecordType::ColumnarSupersede,
-            0,
+            WAL_RECORD_VERSION_BYTE,
             payload,
         )
     }
@@ -1695,7 +1792,7 @@ impl WalWriter {
             0,
             Lsn::INVALID,
             LogRecordType::ColumnarPatchRevoke,
-            0,
+            WAL_RECORD_VERSION_BYTE,
             payload,
         )
     }
@@ -1707,7 +1804,7 @@ impl WalWriter {
             0,
             Lsn::INVALID,
             LogRecordType::ColumnarSupersedeRevoke,
-            0,
+            WAL_RECORD_VERSION_BYTE,
             payload,
         )
     }
@@ -1719,7 +1816,7 @@ impl WalWriter {
             0,
             Lsn::INVALID,
             LogRecordType::ColumnarBranchClear,
-            0,
+            WAL_RECORD_VERSION_BYTE,
             payload,
         )
     }

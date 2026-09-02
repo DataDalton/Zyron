@@ -6,6 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
+tracing.workspace = true
 zyron-wal = { path = "../zyron-wal" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-buffer = { path = "../zyron-buffer" }

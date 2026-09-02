@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true

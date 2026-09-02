@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use zyron_common::format::envelope::{self, ENVELOPE_HEADER_LEN};
+use zyron_common::format::{FormatKind, FormatVersion};
 use zyron_common::{Result, ZyronError};
 
 /// Windows write-through flag. Each write is made durable (via the device's
@@ -59,30 +61,36 @@ impl std::fmt::Display for SegmentId {
 
 /// Header at the beginning of each segment file.
 ///
-/// Layout (32 bytes):
+/// The first 20 bytes are the universal format envelope, so a segment file
+/// identifies itself the same way every other Zyron file does. What follows
+/// is the segment's own header extension, covered by the envelope's header
+/// checksum.
+///
+/// Layout (36 bytes):
 /// - magic: 4 bytes ("ZWAL")
-/// - version: 4 bytes
+/// - format_version: 4 bytes (u16 major, u16 minor)
+/// - header_length: 4 bytes (36)
+/// - flags: 4 bytes
+/// - header_checksum: 4 bytes
 /// - segment_id: 4 bytes
 /// - segment_size: 4 bytes
 /// - first_lsn: 8 bytes
-/// - flags: 4 bytes
-/// - checksum: 4 bytes
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[repr(C)]
 pub struct SegmentHeader {
     /// Magic bytes for identification.
     pub magic: [u8; 4],
-    /// Format version.
-    pub version: u32,
+    /// Format version, major and minor.
+    pub version: FormatVersion,
     /// Segment ID.
     pub segment_id: SegmentId,
     /// Maximum size of this segment.
     pub segment_size: u32,
     /// First LSN in this segment.
     pub first_lsn: Lsn,
-    /// Segment flags.
+    /// Envelope flags.
     pub flags: u32,
-    /// Header checksum.
+    /// Envelope header checksum.
     pub checksum: u32,
 }
 
@@ -90,9 +98,12 @@ impl SegmentHeader {
     /// Magic bytes identifying a WAL segment.
     pub const MAGIC: [u8; 4] = *b"ZWAL";
     /// Current format version.
-    pub const VERSION: u32 = 1;
-    /// Size of the header in bytes.
-    pub const SIZE: usize = 32;
+    pub const VERSION: FormatVersion = crate::format::WAL_SEGMENT_FORMAT_VERSION;
+    /// Size of the header in bytes. Every byte is meaningful, so a flip
+    /// anywhere in the header fails the envelope checksum.
+    pub const SIZE: usize = 36;
+    /// Bytes of the segment's own header extension, behind the envelope.
+    const EXTENSION_SIZE: usize = Self::SIZE - ENVELOPE_HEADER_LEN;
 
     /// Creates a new segment header.
     pub fn new(segment_id: SegmentId, segment_size: u32, first_lsn: Lsn) -> Self {
@@ -109,16 +120,25 @@ impl SegmentHeader {
         header
     }
 
-    /// Computes the checksum for this header.
+    /// The segment's own header bytes, which the envelope carries as its
+    /// extension.
+    fn extension(&self) -> [u8; Self::EXTENSION_SIZE] {
+        let mut ext = [0u8; Self::EXTENSION_SIZE];
+        ext[0..4].copy_from_slice(&self.segment_id.0.to_le_bytes());
+        ext[4..8].copy_from_slice(&self.segment_size.to_le_bytes());
+        ext[8..16].copy_from_slice(&self.first_lsn.0.to_le_bytes());
+        ext
+    }
+
+    /// Computes the envelope header checksum for this header.
     fn compute_checksum(&self) -> u32 {
-        let mut data = [0u8; Self::SIZE - 4];
-        data[0..4].copy_from_slice(&self.magic);
-        data[4..8].copy_from_slice(&self.version.to_le_bytes());
-        data[8..12].copy_from_slice(&self.segment_id.0.to_le_bytes());
-        data[12..16].copy_from_slice(&self.segment_size.to_le_bytes());
-        data[16..24].copy_from_slice(&self.first_lsn.0.to_le_bytes());
-        data[24..28].copy_from_slice(&self.flags.to_le_bytes());
-        crate::checksum::wal_checksum(&data, 0)
+        let encoded = envelope::encode_header(
+            FormatKind::WalSegment,
+            self.version,
+            self.flags,
+            &self.extension(),
+        );
+        u32::from_le_bytes([encoded[16], encoded[17], encoded[18], encoded[19]])
     }
 
     /// Validates this header.
@@ -126,13 +146,24 @@ impl SegmentHeader {
         if self.magic != Self::MAGIC {
             return Err(ZyronError::WalCorrupted {
                 lsn: self.first_lsn.0,
-                reason: "invalid magic bytes".to_string(),
+                reason: format!(
+                    "expected a WAL segment with magic {}, found {}",
+                    envelope::printable_magic(&Self::MAGIC),
+                    envelope::printable_magic(&self.magic)
+                ),
             });
         }
         if self.version != Self::VERSION {
             return Err(ZyronError::WalCorrupted {
                 lsn: self.first_lsn.0,
-                reason: format!("unsupported version: {}", self.version),
+                reason: format!(
+                    "segment is at format version {}, this binary writes and reads {}. \
+                     Upgrade through a release that still reads {} to move the segment \
+                     forward first",
+                    self.version,
+                    Self::VERSION,
+                    self.version
+                ),
             });
         }
         let expected_checksum = self.compute_checksum();
@@ -147,32 +178,52 @@ impl SegmentHeader {
 
     /// Serializes the header to bytes.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let extension = self.extension();
+        let encoded =
+            envelope::encode_header(FormatKind::WalSegment, self.version, self.flags, &extension);
         let mut data = [0u8; Self::SIZE];
-        data[0..4].copy_from_slice(&self.magic);
-        data[4..8].copy_from_slice(&self.version.to_le_bytes());
-        data[8..12].copy_from_slice(&self.segment_id.0.to_le_bytes());
-        data[12..16].copy_from_slice(&self.segment_size.to_le_bytes());
-        data[16..24].copy_from_slice(&self.first_lsn.0.to_le_bytes());
-        data[24..28].copy_from_slice(&self.flags.to_le_bytes());
-        data[28..32].copy_from_slice(&self.checksum.to_le_bytes());
+        data[0..ENVELOPE_HEADER_LEN].copy_from_slice(&encoded);
+        data[ENVELOPE_HEADER_LEN..Self::SIZE].copy_from_slice(&extension);
         data
     }
 
     /// Deserializes the header from bytes.
+    ///
+    /// A header whose declared length is not this binary's is read for its
+    /// magic and version alone, so `validate` can name what it found rather
+    /// than reading fields out of a layout that is not there.
     pub fn from_bytes(data: &[u8; Self::SIZE]) -> Self {
         let mut magic = [0u8; 4];
         magic.copy_from_slice(&data[0..4]);
+        let version = FormatVersion::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let header_length = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let checksum = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        if header_length as usize != Self::SIZE {
+            return Self {
+                magic,
+                version,
+                segment_id: SegmentId(0),
+                segment_size: 0,
+                first_lsn: Lsn::INVALID,
+                flags,
+                // A length this binary does not write means the rest of the
+                // header is not where these fields live, so the checksum is
+                // forced to disagree rather than read from the wrong offsets
+                checksum: checksum.wrapping_add(1),
+            };
+        }
 
         Self {
             magic,
-            version: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            segment_id: SegmentId(u32::from_le_bytes([data[8], data[9], data[10], data[11]])),
-            segment_size: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            version,
+            segment_id: SegmentId(u32::from_le_bytes([data[20], data[21], data[22], data[23]])),
+            segment_size: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
             first_lsn: Lsn(u64::from_le_bytes([
-                data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+                data[28], data[29], data[30], data[31], data[32], data[33], data[34], data[35],
             ])),
-            flags: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
-            checksum: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
+            flags,
+            checksum,
         }
     }
 }

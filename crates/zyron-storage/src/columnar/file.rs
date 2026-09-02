@@ -2,19 +2,24 @@
 //!
 //! File layout:
 //!   [0x0000] FILE HEADER (PAGE_SIZE = 16384 bytes)
-//!     [0..8]     magic: "ZYRCOL\0\0"
-//!     [8..12]    format_version: u32
-//!     [12..16]   header_checksum: u32
-//!     [16..20]   column_count: u32
-//!     [20..28]   row_count: u64
-//!     [28..36]   table_id: u64
-//!     [36..44]   xmin_range_lo: u64
-//!     [44..52]   xmin_range_hi: u64
-//!     [52..60]   xmax_range_lo: u64
-//!     [60..68]   xmax_range_hi: u64
-//!     [68..72]   primary_key_column_id: u32
-//!     [72]       sort_order: u8
-//!     [73..128]  reserved (zeroed)
+//!     [0..4]     magic: "ZCOL"
+//!     [4..8]     format_version: u16 major, u16 minor
+//!     [8..12]    header_length: u32 (128)
+//!     [12..16]   envelope flags: u32
+//!     [16..20]   header_checksum: u32
+//!     [20..24]   column_count: u32
+//!     [24..32]   row_count: u64
+//!     [32..40]   table_id: u64
+//!     [40..48]   xmin_range_lo: u64
+//!     [48..56]   xmin_range_hi: u64
+//!     [56..64]   xmax_range_lo: u64
+//!     [64..72]   xmax_range_hi: u64
+//!     [72..76]   primary_key_column_id: u32
+//!     [76]       sort_order: u8
+//!     [77..80]   reserved (zeroed)
+//!     [80..88]   segment_index_offset: u64
+//!     [88..92]   segment_index_size: u32
+//!     [92..128]  reserved (zeroed)
 //!     [128..PAGE_SIZE] padding
 //!
 //!   [PAGE_SIZE+] COLUMN SEGMENTS (each page-aligned)
@@ -30,13 +35,15 @@
 use super::bloom::BloomFilter;
 use super::constants::{
     FILE_HEADER_METADATA_SIZE, FILE_HEADER_SIZE, FOOTER_SIZE, SEGMENT_HEADER_SIZE,
-    SEGMENT_INDEX_ENTRY_SIZE, ZYR_FORMAT_VERSION, ZYR_MAGIC,
+    SEGMENT_INDEX_ENTRY_SIZE, ZYR_FOOTER_SENTINEL, ZYR_FORMAT_VERSION,
 };
 use super::segment::{SegmentHeader, ZoneMapEntry};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use zyron_common::format::envelope::{self, ENVELOPE_HEADER_LEN};
+use zyron_common::format::{FormatKind, FormatVersion};
 use zyron_common::page::PAGE_SIZE;
 use zyron_common::{Result, ZyronError};
 
@@ -77,7 +84,7 @@ impl SortOrder {
 /// Metadata stored in the first PAGE_SIZE bytes of a .zyr file.
 #[derive(Debug, Clone)]
 pub struct ZyrFileHeader {
-    pub format_version: u32,
+    pub format_version: FormatVersion,
     pub column_count: u32,
     pub row_count: u64,
     pub table_id: u64,
@@ -112,112 +119,90 @@ pub struct ZyrFileHeader {
 
 impl ZyrFileHeader {
     /// Serializes the header into a full PAGE_SIZE buffer.
-    /// The header_checksum field at bytes [12..16] covers bytes [0..12] and
-    /// [16..FILE_HEADER_METADATA_SIZE].
+    ///
+    /// Bytes [0..20) are the universal format envelope. Bytes
+    /// [20..FILE_HEADER_METADATA_SIZE) are the file's own header extension,
+    /// which the envelope's header checksum at [16..20) covers along with
+    /// [0..16).
     pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
         let mut buf = [0u8; PAGE_SIZE];
 
-        buf[0..8].copy_from_slice(&ZYR_MAGIC);
-        buf[8..12].copy_from_slice(&self.format_version.to_le_bytes());
-        // [12..16] = header_checksum, filled below.
-        buf[16..20].copy_from_slice(&self.column_count.to_le_bytes());
-        buf[20..28].copy_from_slice(&self.row_count.to_le_bytes());
-        buf[28..36].copy_from_slice(&self.table_id.to_le_bytes());
-        buf[36..44].copy_from_slice(&self.xmin_range_lo.to_le_bytes());
-        buf[44..52].copy_from_slice(&self.xmin_range_hi.to_le_bytes());
-        buf[52..60].copy_from_slice(&self.xmax_range_lo.to_le_bytes());
-        buf[60..68].copy_from_slice(&self.xmax_range_hi.to_le_bytes());
-        buf[68..72].copy_from_slice(&self.primary_key_column_id.to_le_bytes());
-        buf[72] = self.sort_order as u8;
-        // [73..80] reserved, already zeroed.
-        buf[80..88].copy_from_slice(&self.segment_index_offset.to_le_bytes());
-        buf[88..92].copy_from_slice(&self.segment_index_size.to_le_bytes());
-        // [92..128] reserved, already zeroed.
-        // [128..PAGE_SIZE] padding, already zeroed.
-
-        // Checksum covers magic+version [0..12] and metadata [16..FILE_HEADER_METADATA_SIZE].
-        let checksum = {
-            let mut h = zyron_common::Hasher::new();
-            h.update(&buf[0..12]);
-            h.finish_phase();
-            h.update(&buf[16..FILE_HEADER_METADATA_SIZE]);
-            h.finish32()
-        };
-        buf[12..16].copy_from_slice(&checksum.to_le_bytes());
-
+        let extension = self.extension_bytes();
+        let header =
+            envelope::encode_header(FormatKind::ZyrColumnar, self.format_version, 0, &extension);
+        buf[0..ENVELOPE_HEADER_LEN].copy_from_slice(&header);
+        buf[ENVELOPE_HEADER_LEN..FILE_HEADER_METADATA_SIZE].copy_from_slice(&extension);
+        // [128..PAGE_SIZE] padding, already zeroed
         buf
     }
 
-    /// Deserializes a header from a PAGE_SIZE buffer. Validates magic, version,
-    /// and checksum before returning.
+    /// The file's own header fields, which the envelope carries as its
+    /// extension.
+    fn extension_bytes(&self) -> [u8; FILE_HEADER_METADATA_SIZE - ENVELOPE_HEADER_LEN] {
+        let mut ext = [0u8; FILE_HEADER_METADATA_SIZE - ENVELOPE_HEADER_LEN];
+        ext[0..4].copy_from_slice(&self.column_count.to_le_bytes());
+        ext[4..12].copy_from_slice(&self.row_count.to_le_bytes());
+        ext[12..20].copy_from_slice(&self.table_id.to_le_bytes());
+        ext[20..28].copy_from_slice(&self.xmin_range_lo.to_le_bytes());
+        ext[28..36].copy_from_slice(&self.xmin_range_hi.to_le_bytes());
+        ext[36..44].copy_from_slice(&self.xmax_range_lo.to_le_bytes());
+        ext[44..52].copy_from_slice(&self.xmax_range_hi.to_le_bytes());
+        ext[52..56].copy_from_slice(&self.primary_key_column_id.to_le_bytes());
+        ext[56] = self.sort_order as u8;
+        // [57..60] reserved, already zeroed
+        ext[60..68].copy_from_slice(&self.segment_index_offset.to_le_bytes());
+        ext[68..72].copy_from_slice(&self.segment_index_size.to_le_bytes());
+        // [72..108] reserved, already zeroed
+        ext
+    }
+
+    /// Deserializes a header from a PAGE_SIZE buffer. Validates the envelope,
+    /// the version, and the header checksum before returning.
     pub fn from_bytes(buf: &[u8; PAGE_SIZE]) -> Result<Self> {
-        if buf[0..8] != ZYR_MAGIC {
-            return Err(ZyronError::InvalidZyrFile(
-                "invalid magic bytes in file header".into(),
-            ));
-        }
-
-        let formatVersion = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        if formatVersion != ZYR_FORMAT_VERSION {
+        let (header, extension) = envelope::decode_header(&buf[..FILE_HEADER_METADATA_SIZE])
+            .map_err(|e| ZyronError::InvalidZyrFile(e.to_string()))?;
+        if header.kind != FormatKind::ZyrColumnar {
             return Err(ZyronError::InvalidZyrFile(format!(
-                "unsupported format version: {} (expected {})",
-                formatVersion, ZYR_FORMAT_VERSION
+                "expected a columnar file, found a {} file",
+                header.kind
+            )));
+        }
+        if header.header_length as usize != FILE_HEADER_METADATA_SIZE {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "columnar header declares {} bytes, this binary writes {}",
+                header.header_length, FILE_HEADER_METADATA_SIZE
+            )));
+        }
+        if header.version != ZYR_FORMAT_VERSION {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "columnar file is at format version {}, this binary writes and reads {}. \
+                 Upgrade through a release that still reads {} to move the file forward first",
+                header.version, ZYR_FORMAT_VERSION, header.version
             )));
         }
 
-        let storedChecksum = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let computedChecksum = {
-            let mut h = zyron_common::Hasher::new();
-            h.update(&buf[0..12]);
-            h.finish_phase();
-            h.update(&buf[16..FILE_HEADER_METADATA_SIZE]);
-            h.finish32()
+        let formatVersion = header.version;
+        let read_u64 = |range: std::ops::Range<usize>, field: &str| -> Result<u64> {
+            extension[range]
+                .try_into()
+                .map(u64::from_le_bytes)
+                .map_err(|_| ZyronError::InvalidZyrFile(format!("failed to read {field}")))
         };
-        if storedChecksum != computedChecksum {
-            return Err(ZyronError::InvalidZyrFile(format!(
-                "header checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
-                storedChecksum, computedChecksum
-            )));
-        }
 
-        let columnCount = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-        let rowCount = u64::from_le_bytes(
-            buf[20..28]
-                .try_into()
-                .map_err(|_| ZyronError::InvalidZyrFile("failed to read row_count".into()))?,
-        );
-        let tableId = u64::from_le_bytes(
-            buf[28..36]
-                .try_into()
-                .map_err(|_| ZyronError::InvalidZyrFile("failed to read table_id".into()))?,
-        );
-        let xminRangeLo = u64::from_le_bytes(
-            buf[36..44]
-                .try_into()
-                .map_err(|_| ZyronError::InvalidZyrFile("failed to read xmin_range_lo".into()))?,
-        );
-        let xminRangeHi = u64::from_le_bytes(
-            buf[44..52]
-                .try_into()
-                .map_err(|_| ZyronError::InvalidZyrFile("failed to read xmin_range_hi".into()))?,
-        );
-        let xmaxRangeLo = u64::from_le_bytes(
-            buf[52..60]
-                .try_into()
-                .map_err(|_| ZyronError::InvalidZyrFile("failed to read xmax_range_lo".into()))?,
-        );
-        let xmaxRangeHi = u64::from_le_bytes(
-            buf[60..68]
-                .try_into()
-                .map_err(|_| ZyronError::InvalidZyrFile("failed to read xmax_range_hi".into()))?,
-        );
-        let primaryKeyColumnId = u32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]);
-        let sortOrder = SortOrder::from_u8(buf[72])?;
-
-        let segmentIndexOffset = u64::from_le_bytes(buf[80..88].try_into().map_err(|_| {
-            ZyronError::InvalidZyrFile("failed to read segment_index_offset".into())
-        })?);
-        let segmentIndexSize = u32::from_le_bytes([buf[88], buf[89], buf[90], buf[91]]);
+        let columnCount =
+            u32::from_le_bytes([extension[0], extension[1], extension[2], extension[3]]);
+        let rowCount = read_u64(4..12, "row_count")?;
+        let tableId = read_u64(12..20, "table_id")?;
+        let xminRangeLo = read_u64(20..28, "xmin_range_lo")?;
+        let xminRangeHi = read_u64(28..36, "xmin_range_hi")?;
+        let xmaxRangeLo = read_u64(36..44, "xmax_range_lo")?;
+        let xmaxRangeHi = read_u64(44..52, "xmax_range_hi")?;
+        let primaryKeyColumnId =
+            u32::from_le_bytes([extension[52], extension[53], extension[54], extension[55]]);
+        let sortOrder = SortOrder::from_u8(extension[56])?;
+        let segmentIndexOffset = read_u64(60..68, "segment_index_offset")?;
+        let segmentIndexSize =
+            u32::from_le_bytes([extension[68], extension[69], extension[70], extension[71]]);
 
         Ok(Self {
             format_version: formatVersion,
@@ -421,7 +406,7 @@ impl ZyrFileWriter {
 
         // Write magic repeat.
         self.writer
-            .write_all(&ZYR_MAGIC)
+            .write_all(&ZYR_FOOTER_SENTINEL)
             .map_err(|e| ZyronError::IoError(format!("failed to write footer magic: {}", e)))?;
 
         // Footer checksum = CRC of the segment-index region only (computed
@@ -830,7 +815,7 @@ impl ZyrFileReader {
         let footerMagic: [u8; 8] = trailerBuf[8..16]
             .try_into()
             .map_err(|_| ZyronError::InvalidZyrFile("failed to read footer magic".into()))?;
-        if footerMagic != ZYR_MAGIC {
+        if footerMagic != ZYR_FOOTER_SENTINEL {
             return Err(ZyronError::InvalidZyrFile(
                 "invalid magic bytes in footer".into(),
             ));
@@ -1644,8 +1629,8 @@ mod tests {
         assert!(result.is_err());
         let errMsg = format!("{}", result.err().expect("expected error"));
         assert!(
-            errMsg.contains("invalid magic"),
-            "error should mention invalid magic, got: {}",
+            errMsg.contains("magic") && errMsg.contains("no registered format"),
+            "error should name the unrecognized magic, got: {}",
             errMsg
         );
     }

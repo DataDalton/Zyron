@@ -281,6 +281,25 @@ pub async fn start_health_server(
                 }
             }
 
+            // The upgrade subscriptions keep the socket the same way the
+            // pressure stream does, and fall through to the plain GET when
+            // the request carries no upgrade handshake
+            if crate::gateway::upgrade_endpoint::is_upgrade_path(&path) {
+                if let Some(parsed) = crate::gateway::request::parse_request(&raw_bytes, None) {
+                    let served = crate::gateway::upgrade_endpoint::serve_stream(
+                        &mut stream,
+                        &parsed,
+                        &path,
+                        Arc::clone(&stream_shutdown),
+                    )
+                    .await;
+                    if served {
+                        debug!("Upgrade subscription {} from {} ended", path, peer);
+                        return;
+                    }
+                }
+            }
+
             if is_dynamic_endpoint_path(&path, &state) {
                 let response_bytes = handle_dynamic_endpoint(&raw_bytes, &state).await;
                 let _ = stream.write_all(&response_bytes).await;
@@ -420,6 +439,20 @@ fn route_request(request: &str, state: &HealthState) -> (&'static str, &'static 
             "application/json",
             r#"{"error":"/pressure/stream requires a WebSocket upgrade"}"#.into(),
         ),
+        // A plain GET of an upgrade subscription answers with the same
+        // document the subscription pushes, so a dashboard and a curl see
+        // one shape
+        p if crate::gateway::upgrade_endpoint::is_upgrade_path(p) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (
+                "200 OK",
+                "application/json",
+                crate::gateway::upgrade_endpoint::render(p, now),
+            )
+        }
         "/openapi.json" => {
             let endpoints = state
                 .endpoint_catalog

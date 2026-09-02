@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zyron_common::format::FormatKind;
+use zyron_common::format::envelope;
 use zyron_common::{Result, ZyronError};
 use zyron_wal::Lsn;
 
@@ -70,9 +72,16 @@ impl SnapshotExport {
 
         let manifest_path = snap_dir.join(format!("snapshot_{}.json", self.snapshot_lsn));
         let tmp_path = snap_dir.join(format!("snapshot_{}.json.tmp", self.snapshot_lsn));
-        let data = serde_json::to_vec(self).map_err(|e| {
+        let body = serde_json::to_vec(self).map_err(|e| {
             ZyronError::CdcSnapshotFailed(format!("failed to serialize manifest: {e}"))
         })?;
+        // The manifest body is JSON, the envelope around it names the format
+        // and the version and covers both with checksums
+        let data = envelope::encode(
+            FormatKind::Snapshot,
+            crate::format::CDC_SNAPSHOT_FORMAT_VERSION,
+            &body,
+        );
 
         {
             let mut file = File::create(&tmp_path)?;
@@ -90,7 +99,19 @@ impl SnapshotExport {
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
 
-        serde_json::from_slice(&data).map_err(|e| {
+        let parsed = envelope::decode_as(&data, FormatKind::Snapshot).map_err(|e| {
+            ZyronError::CdcSnapshotFailed(format!("snapshot manifest {}, {e}", path.display()))
+        })?;
+        if parsed.header.version != crate::format::CDC_SNAPSHOT_FORMAT_VERSION {
+            return Err(ZyronError::CdcSnapshotFailed(format!(
+                "snapshot manifest is at format version {}, this binary writes and reads {}. \
+                 Upgrade through a release that still reads {} to move it forward first",
+                parsed.header.version,
+                crate::format::CDC_SNAPSHOT_FORMAT_VERSION,
+                parsed.header.version
+            )));
+        }
+        serde_json::from_slice(parsed.body).map_err(|e| {
             ZyronError::CdcSnapshotFailed(format!("failed to parse snapshot manifest: {e}"))
         })
     }

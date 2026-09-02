@@ -6,6 +6,8 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use zyron_common::format::FormatKind;
+use zyron_common::format::text_envelope;
 use zyron_common::{Result, ZyronError};
 
 /// Top-level server configuration loaded from zyron.toml.
@@ -192,10 +194,61 @@ impl ZyronConfig {
                 e
             ))
         })?;
-        let config: ZyronConfig = toml::from_str(&contents)
+        Self::from_toml(&contents, path)
+    }
+
+    /// Parses a config document, checking its declared format envelope
+    /// before any key is read.
+    ///
+    /// A file with no `[format]` section is at the version this binary
+    /// writes: the section is stamped the first time the file is rewritten,
+    /// which `ALTER SYSTEM` does, and a hand-written config is not expected
+    /// to carry one. A section that names a different version fails closed,
+    /// because a value whose meaning changed would otherwise be read under
+    /// the wrong one.
+    pub fn from_toml(contents: &str, path: &Path) -> Result<Self> {
+        match text_envelope::parse(contents) {
+            Ok((kind, version)) => {
+                if kind != FormatKind::ZyronTomlConfig {
+                    return Err(ZyronError::Internal(format!(
+                        "{} declares kind {}, which is not a server configuration",
+                        path.display(),
+                        kind
+                    )));
+                }
+                if version != crate::format::CONFIG_FORMAT_VERSION {
+                    return Err(ZyronError::Internal(format!(
+                        "{} is at format version {}, this binary writes and reads {}. Upgrade \
+                         through a release that still reads {} to move it forward first",
+                        path.display(),
+                        version,
+                        crate::format::CONFIG_FORMAT_VERSION,
+                        version
+                    )));
+                }
+            }
+            Err(zyron_common::format::TextEnvelopeError::Missing) => {}
+            Err(e) => {
+                return Err(ZyronError::Internal(format!(
+                    "{} has an unreadable [format] section, {e}",
+                    path.display()
+                )));
+            }
+        }
+        let config: ZyronConfig = toml::from_str(contents)
             .map_err(|e| ZyronError::Internal(format!("Failed to parse config file: {}", e)))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Stamps a config document with the current format envelope, which is
+    /// what a rewrite does so the version on disk always names itself.
+    pub fn stamp_format(contents: &str) -> String {
+        text_envelope::with_header(
+            FormatKind::ZyronTomlConfig,
+            crate::format::CONFIG_FORMAT_VERSION,
+            contents,
+        )
     }
 
     /// Loads configuration with the following priority:
@@ -236,8 +289,36 @@ impl ZyronConfig {
                 e
             ))
         })?;
-        let overrides: toml::Table = toml::from_str(&contents)
+        // The declared envelope decides which reader runs, the same as for
+        // zyron.toml. An override file with no section predates the stamp and
+        // is at the version this binary writes
+        match text_envelope::parse(&contents) {
+            Ok((kind, version)) => {
+                if kind != FormatKind::ZyronTomlConfig
+                    || version != crate::format::CONFIG_FORMAT_VERSION
+                {
+                    return Err(ZyronError::Internal(format!(
+                        "{} declares {kind} at format version {version}, this binary writes \
+                         and reads {} at {}. Upgrade through a release that still reads \
+                         {version} to move it forward first",
+                        auto_path.display(),
+                        FormatKind::ZyronTomlConfig,
+                        crate::format::CONFIG_FORMAT_VERSION
+                    )));
+                }
+            }
+            Err(zyron_common::format::TextEnvelopeError::Missing) => {}
+            Err(e) => {
+                return Err(ZyronError::Internal(format!(
+                    "{} has an unreadable [format] section, {e}",
+                    auto_path.display()
+                )));
+            }
+        }
+        let mut overrides: toml::Table = toml::from_str(&contents)
             .map_err(|e| ZyronError::Internal(format!("Failed to parse zyron.auto.conf: {}", e)))?;
+        // The envelope is the file's own identity, not an override
+        overrides.remove(zyron_common::format::TEXT_ENVELOPE_SECTION);
         self.apply_overrides_from_table(&overrides).map_err(|e| {
             ZyronError::Internal(format!(
                 "{} refers to {}, fix or remove the entry to boot",
@@ -533,9 +614,14 @@ impl ZyronConfig {
             )));
         }
 
+        // The file is rewritten in full on every ALTER SYSTEM, which is what
+        // makes the config format's eager policy free: the envelope is
+        // stamped here and the next boot reads the version it declares
+        table.remove(zyron_common::format::TEXT_ENVELOPE_SECTION);
         let serialized = toml::to_string_pretty(&table)
             .map_err(|e| ZyronError::Internal(format!("Failed to serialize auto.conf: {}", e)))?;
-        std::fs::write(&auto_path, serialized)
+        let stamped = Self::stamp_format(&serialized);
+        std::fs::write(&auto_path, stamped)
             .map_err(|e| ZyronError::Internal(format!("Failed to write auto.conf: {}", e)))?;
         Ok(())
     }

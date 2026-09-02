@@ -4224,6 +4224,10 @@ pub struct ComplianceLogEntry {
     pub detail: String,
     pub prev_hash: u32,
     pub entry_hash: u32,
+    /// Version tag of the entry encoding. The chain is immutable and
+    /// verified forever, so an entry records the version it was written at
+    /// and both versions verify after an upgrade
+    pub record_version: u8,
 }
 
 impl ComplianceLogEntry {
@@ -4239,6 +4243,7 @@ impl ComplianceLogEntry {
         payload.extend_from_slice(&self.table_id.to_le_bytes());
         payload.extend_from_slice(&self.ts.to_le_bytes());
         payload.extend_from_slice(self.detail.as_bytes());
+        payload.push(self.record_version);
         zyron_common::hash32(&payload)
     }
 
@@ -4252,6 +4257,7 @@ impl ComplianceLogEntry {
         write_string(&mut buf, &self.detail);
         write_u32(&mut buf, self.prev_hash);
         write_u32(&mut buf, self.entry_hash);
+        write_u8(&mut buf, self.record_version);
         buf
     }
 
@@ -4266,6 +4272,7 @@ impl ComplianceLogEntry {
             detail: read_string(data, &mut off)?,
             prev_hash: read_u32(data, &mut off)?,
             entry_hash: read_u32(data, &mut off)?,
+            record_version: read_u8(data, &mut off)?,
         })
     }
 }

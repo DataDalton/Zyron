@@ -16,6 +16,7 @@ pub mod cryptoshred;
 pub mod dryrun;
 pub mod dsar;
 pub mod erasure;
+pub mod format;
 pub mod legal_hold;
 pub mod presets;
 pub mod recyclebin;

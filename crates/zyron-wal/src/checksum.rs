@@ -43,7 +43,7 @@ use zyron_common::checksum::hot::{HotHasher, hot_hash_with_header, hot_hash32};
 /// Usage:
 /// ```ignore
 /// let mut hasher = WalHasher::new(record_total_size);
-/// hasher.write_header_fields(lsn, prev_lsn, txn_id, record_type, flags, payload_len);
+/// hasher.write_header_fields(lsn, prev_lsn, txn_id, record_type, record_version, payload_len);
 /// hasher.write_payload(&payload_bytes);
 /// let checksum = hasher.finish();
 /// ```
@@ -63,7 +63,7 @@ impl WalHasher {
     /// Word order matches how the one-shot verify folds the serialized
     /// header: the leading 16-byte pair sends lsn to lane A and prev_lsn to
     /// lane B, the txn_id word goes to lane A, the four tail bytes
-    /// (record_type, flags, payload_len) fold as one zero-extended 32-bit
+    /// (record_type, record_version, payload_len) fold as one zero-extended 32-bit
     /// word into lane A, then the phase separator marks the header/payload
     /// boundary
     #[inline(always)]
@@ -73,13 +73,14 @@ impl WalHasher {
         prev_lsn: u64,
         txn_id: u64,
         record_type: u8,
-        flags: u8,
+        record_version: u8,
         payload_len: u16,
     ) {
         // The on-disk bytes at [24..28] read as a little-endian u32:
-        // record_type (1) + flags (1) + payload_len (2)
-        let packed_tail: u64 =
-            (record_type as u64) | ((flags as u64) << 8) | ((payload_len.to_le() as u64) << 16);
+        // record_type (1) + record_version (1) + payload_len (2)
+        let packed_tail: u64 = (record_type as u64)
+            | ((record_version as u64) << 8)
+            | ((payload_len.to_le() as u64) << 16);
 
         self.0.mix_word_a(lsn.to_le());
         self.0.mix_word_b(prev_lsn.to_le());
@@ -155,7 +156,7 @@ mod tests {
         let prev_lsn: u64 = 0;
         let txn_id: u64 = 42;
         let record_type: u8 = 10; // Insert
-        let flags: u8 = 0;
+        let record_version: u8 = 0;
         let payload = b"hello world payload!"; // 20 bytes
         let payload_len = payload.len() as u16;
 
@@ -165,7 +166,7 @@ mod tests {
         buf.extend_from_slice(&prev_lsn.to_le_bytes());
         buf.extend_from_slice(&txn_id.to_le_bytes());
         buf.push(record_type);
-        buf.push(flags);
+        buf.push(record_version);
         buf.extend_from_slice(&payload_len.to_le_bytes());
         buf.extend_from_slice(payload);
 
@@ -174,7 +175,14 @@ mod tests {
 
         // Incremental from typed fields
         let mut hasher = WalHasher::new(buf.len());
-        hasher.write_header_fields(lsn, prev_lsn, txn_id, record_type, flags, payload_len);
+        hasher.write_header_fields(
+            lsn,
+            prev_lsn,
+            txn_id,
+            record_type,
+            record_version,
+            payload_len,
+        );
         hasher.write_payload(payload);
         let incremental = hasher.finish();
 
@@ -190,7 +198,7 @@ mod tests {
         let prev_lsn: u64 = 0x0000000100000040;
         let txn_id: u64 = 1;
         let record_type: u8 = 1; // Begin
-        let flags: u8 = 0;
+        let record_version: u8 = 0;
         let payload_len: u16 = 0;
 
         let mut buf = Vec::with_capacity(28);
@@ -198,13 +206,20 @@ mod tests {
         buf.extend_from_slice(&prev_lsn.to_le_bytes());
         buf.extend_from_slice(&txn_id.to_le_bytes());
         buf.push(record_type);
-        buf.push(flags);
+        buf.push(record_version);
         buf.extend_from_slice(&payload_len.to_le_bytes());
 
         let one_shot = wal_checksum(&buf, 28);
 
         let mut hasher = WalHasher::new(buf.len());
-        hasher.write_header_fields(lsn, prev_lsn, txn_id, record_type, flags, payload_len);
+        hasher.write_header_fields(
+            lsn,
+            prev_lsn,
+            txn_id,
+            record_type,
+            record_version,
+            payload_len,
+        );
         hasher.write_payload(&[]);
         let incremental = hasher.finish();
 
@@ -217,7 +232,7 @@ mod tests {
         let prev_lsn: u64 = 0x0000000200000800;
         let txn_id: u64 = 999;
         let record_type: u8 = 20; // FullPage
-        let flags: u8 = 0;
+        let record_version: u8 = 0;
 
         // 8KB payload simulating a full page image
         let payload: Vec<u8> = (0..8192).map(|i| (i * 37 + 13) as u8).collect();
@@ -228,14 +243,21 @@ mod tests {
         buf.extend_from_slice(&prev_lsn.to_le_bytes());
         buf.extend_from_slice(&txn_id.to_le_bytes());
         buf.push(record_type);
-        buf.push(flags);
+        buf.push(record_version);
         buf.extend_from_slice(&payload_len.to_le_bytes());
         buf.extend_from_slice(&payload);
 
         let one_shot = wal_checksum(&buf, 28);
 
         let mut hasher = WalHasher::new(buf.len());
-        hasher.write_header_fields(lsn, prev_lsn, txn_id, record_type, flags, payload_len);
+        hasher.write_header_fields(
+            lsn,
+            prev_lsn,
+            txn_id,
+            record_type,
+            record_version,
+            payload_len,
+        );
         hasher.write_payload(&payload);
         let incremental = hasher.finish();
 
@@ -337,11 +359,18 @@ mod tests {
             let prev_lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
             let txn_id = u64::from_le_bytes(data[16..24].try_into().unwrap());
             let record_type = data[24];
-            let flags = data[25];
+            let record_version = data[25];
             let payload_len = u16::from_le_bytes(data[26..28].try_into().unwrap());
 
             let mut hasher = WalHasher::new(data.len());
-            hasher.write_header_fields(lsn, prev_lsn, txn_id, record_type, flags, payload_len);
+            hasher.write_header_fields(
+                lsn,
+                prev_lsn,
+                txn_id,
+                record_type,
+                record_version,
+                payload_len,
+            );
             hasher.write_payload(&data[28..]);
             assert_eq!(
                 c1,

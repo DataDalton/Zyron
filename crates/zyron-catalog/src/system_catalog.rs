@@ -38,8 +38,17 @@ pub const SYSTEM_SCHEMAS: &[&str] = &[
     "sql",
     "session",
     // Storage tier, holding what the heap, btree, columnar, lake, snapshot,
-    // checkpoint, vacuum, and gc layers expose
+    // checkpoint, vacuum, and gc layers expose, plus the on-disk format
+    // registry, the per-version layouts, and in-flight format migrations
     "storage",
+    // Signature scheme registry and the per-artifact-kind mapping
+    "crypto",
+    // Deprecation lifecycle records and the guides generated from them
+    "deprecation",
+    // Auto-upgrade state, history, and the work an upgrade left to do
+    "upgrade",
+    // Wire protocol versions and their transition state
+    "wire",
     // Distribution / consensus
     "cluster",
     "raft",
@@ -247,6 +256,102 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
         object: "variant_shredding_stats",
         kind: SystemObjectKind::View,
         doc: "Observed JSON paths per variant column with occurrences, coverage, and shredding state",
+    },
+    SystemObject {
+        schema: "storage",
+        object: "format_registry",
+        kind: SystemObjectKind::View,
+        doc: "Every on-disk format, the version written, the versions readable, and the migration policy",
+    },
+    SystemObject {
+        schema: "storage",
+        object: "format_documentation",
+        kind: SystemObjectKind::View,
+        doc: "Per-format on-disk layout with byte offsets, generated from the format modules",
+    },
+    SystemObject {
+        schema: "storage",
+        object: "format_migrations",
+        kind: SystemObjectKind::View,
+        doc: "Format migrations in flight, with progress, bytes remaining, and estimated completion",
+    },
+    SystemObject {
+        schema: "storage",
+        object: "catalog_schema_evolution",
+        kind: SystemObjectKind::View,
+        doc: "Per-catalog-table schema version history and the migration function behind each step",
+    },
+    // -----------------------------------------------------------------------
+    // crypto
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "crypto",
+        object: "scheme_registry",
+        kind: SystemObjectKind::View,
+        doc: "Every registered signature scheme with its numeric tag, status, and retirement date",
+    },
+    SystemObject {
+        schema: "crypto",
+        object: "artifact_scheme_map",
+        kind: SystemObjectKind::View,
+        doc: "Per-artifact-kind current scheme, the outgoing scheme during a rotation, and the overlap end",
+    },
+    // -----------------------------------------------------------------------
+    // deprecation
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "deprecation",
+        object: "registry",
+        kind: SystemObjectKind::View,
+        doc: "Every deprecated item with its warn, error, and removal versions and its replacement",
+    },
+    SystemObject {
+        schema: "deprecation",
+        object: "migration_guides",
+        kind: SystemObjectKind::View,
+        doc: "Migration guide generated for each deprecated item, with before and after examples",
+    },
+    // -----------------------------------------------------------------------
+    // upgrade
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "upgrade",
+        object: "state",
+        kind: SystemObjectKind::View,
+        doc: "Current upgrade phase per node, with the versions it is moving between",
+    },
+    SystemObject {
+        schema: "upgrade",
+        object: "history",
+        kind: SystemObjectKind::View,
+        doc: "Past upgrades with their outcome, the work each ran, and whether it can be undone",
+    },
+    SystemObject {
+        schema: "upgrade",
+        object: "format_migrations",
+        kind: SystemObjectKind::View,
+        doc: "Format migrations this upgrade started, with per-format progress",
+    },
+    SystemObject {
+        schema: "upgrade",
+        object: "user_object_rewrites",
+        kind: SystemObjectKind::View,
+        doc: "User-authored objects an upgrade would rewrite, their class, and where each stands",
+    },
+    SystemObject {
+        schema: "upgrade",
+        object: "deprecation_warnings",
+        kind: SystemObjectKind::View,
+        doc: "Deprecation warnings emitted in the trailing window, per item and tenant",
+    },
+    // -----------------------------------------------------------------------
+    // wire
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "wire",
+        object: "protocol_versions",
+        kind: SystemObjectKind::View,
+        doc: "Wire protocol versions, which are accepted now, and when each was introduced",
     },
     // -----------------------------------------------------------------------
     // stat
@@ -845,9 +950,10 @@ mod tests {
 
     #[test]
     fn test_schema_count_matches_documented_layout() {
-        // 56 documented subsystem schemas plus `pressure`, which the
-        // self-calibration substrate ships its views under
-        assert_eq!(SYSTEM_SCHEMAS.len(), 57);
+        // 56 documented subsystem schemas, `pressure` for the
+        // self-calibration substrate, and four for the format substrate:
+        // crypto, deprecation, upgrade, wire
+        assert_eq!(SYSTEM_SCHEMAS.len(), 61);
     }
 
     #[test]

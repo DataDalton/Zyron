@@ -20,7 +20,7 @@ Under the hood, Rust throughout, with an in-repo write-ahead log, buffer pool, B
 
 Fresh writes land in the MVCC row heap tuned for OLTP. A background thread compacts committed rows into `.zyr` segments with per-column encoding, and analytical queries run directly on the encoded data with predicate pushdown and late materialization. Heap and lake tables are first-class in the same SQL, joined by the same HybridScan operator, whether they live on the local node or across the mesh.
 
-> **Status:** active development. The single-node engine is feature-complete through data lifecycle management, the ZyronLake table format runs beside it with cross-format federation, and Raft consensus with logical DML replication commits writes across a three-node group under one fsync per quorum ack. Next up is sharding, multi-region, and the enterprise stack around them.
+> **Status:** active development. The single-node engine is feature-complete through data lifecycle management, the ZyronLake table format runs beside it with cross-format federation, Raft consensus with logical DML replication commits writes across a three-node group under one fsync per quorum ack, and a format + signature agility substrate carries a versioned envelope on every persistent file and drives automatic migration and rolling upgrade across a Raft group. Next up is sharding, multi-region, and the enterprise stack around them.
 
 ## Table of Contents
 
@@ -55,6 +55,7 @@ Fresh writes land in the MVCC row heap tuned for OLTP. A background thread compa
 - **Time as a first-class dimension.** `AS OF TIMESTAMP` and `VERSION AS OF` queries, copy-on-write branches, slowly changing dimensions, and bitemporal tables are part of the engine, with picosecond-resolution timestamps and hybrid logical clocks underneath.
 - **Security built into the planner.** Three-state privileges, row-level security, column masking, ABAC, and mandatory access control are evaluated inside query planning, not in an application tier.
 - **Drop-in client compatibility.** Implements the PostgreSQL wire protocol v3 over both TCP and QUIC, so existing drivers and tooling connect unchanged.
+- **Format and signature agility.** Every persistent file carries a versioned envelope, every signed artifact declares its scheme, and every reader dispatches on both. Upgrades ship a migration function per format, catalog rows migrate through a schema evolution registry, user SQL objects rewrite through an AST transformer, and a health-baselined rolling upgrade lands new binaries across a Raft group with automatic rollback. Retired readers are refused by CI past their retirement date so old code never lingers.
 
 ## Architecture
 
@@ -242,6 +243,25 @@ The diagram above is one node's internals. In a deployment, Zyron nodes peer ove
 - Background writers stand down inside a group so only the replicated log commits data
 
 </td></tr>
+<tr><td valign="top" colspan="3">
+
+**Format agility, signature agility, and auto-upgrade**
+
+- Versioned envelope on every persistent file, 28 registered format kinds covering WAL, heap, B+tree, `.zyr`, lake manifest, lake indexes, delete predicates, raft log, snapshot transfer, replication apply log, backup archive, `zyron.toml`, secret store, audit hash chain, statistics files, MVCC CLOG, and more
+- Three framings for the same identity, a 20-byte header for standalone files, a 9-byte stamp for records inside a container, and a `[format]` TOML section for hand-editable files
+- Per-format migration policy (`eager`, `lazy`, `coexist`) with steady-state overhead of a single integer compare on file open
+- Reader window carries the current version plus two older readers, with CI failing the build on reader code past its registered retirement date
+- Signature agility for JWTs, X.509 certificates, and custom binary artifacts with per-artifact-kind current and deprecating schemes and an overlap window
+- Six signature schemes registered today (Ed25519, ES256, RS256 and family), infrastructure ready for post-quantum additions without wire or code churn
+- Catalog schema evolution registry across 33 tables with per-row migration functions run in-transaction at upgrade time
+- AST-based user-object rewriter for views, procedures, functions, materialized views, workflows, dashboards, prompts, and data quality rules, with safe, ambiguous, and unsafe categories
+- Per-tenant rewrite policy (`auto_safe`, `notify_all`, `manual_only`) and `EXPLAIN REWRITE FOR OBJECT` dry-run
+- Deprecation lifecycle (`deprecated` → `warn` → `error` → `removed`) with time-bounded windows, per-tenant rate-limited warnings, and auto-generated migration guides
+- Auto-upgrade orchestrator with `stable`, `beta`, `canary`, and `pinned` channels, a signed release manifest, a compatibility gate that plans chained upgrades, rolling upgrade over Raft with drain coordination, health-baselined per-node rollback with cluster-wide auto-pause, and configurable maintenance windows
+- Federation-aware compatibility gate blocks upgrades that would leave a peer cluster on an incompatible version
+- `zyron-ctl format`, `upgrade`, `deprecation`, and `release` subcommands for inspection, batch migration, admin trigger, and CI release verification
+
+</td></tr>
 </table>
 
 ## Performance
@@ -298,32 +318,32 @@ A few more numbers not shown in the charts above:
 | Subsystem | Metric | Result |
 |-----------|--------|--------|
 | MVCC | GC sweep | ~1.8B tuples/sec |
-| Columnar | .zyr scan throughput | ~10.9 GB/sec |
-| Columnar | Compaction pipeline | ~12.0M rows/sec |
-| Columnar | HybridScan overhead vs heap-only | ~3.9% |
-| Columnar | Metadata-aggregate pruning speedup | ~51.2x |
+| Columnar | .zyr scan throughput | ~10.4 GB/sec |
+| Columnar | Compaction pipeline | ~11.8M rows/sec |
+| Columnar | HybridScan overhead vs heap-only | ~0.6% |
+| Columnar | Metadata-aggregate pruning speedup | ~35.1x |
 | Temporal | Picosecond timestamp decode | ~966M rows/sec |
 | Versioning | Time-travel scan overhead | ~24% |
 | Wire | QUIC PostgreSQL handshake | ~5 us |
-| Transactions | Durable commit floor (device write) | ~87.3 us |
-| Lake | Commit rate (insert) | ~2244 commits/sec |
-| Lake | Commit latency (insert) | ~2.24 ms |
-| Lake | Commit rate (delete predicate) | ~1635 commits/sec |
+| Transactions | Durable commit floor (device write) | ~66.4 us |
+| Lake | Commit rate (insert) | ~2738 commits/sec |
+| Lake | Commit latency (insert) | ~2.74 ms |
+| Lake | Commit rate (delete predicate) | ~7531 commits/sec |
 | Lake | Derived clustering expression files pruned | ~93% |
-| Lake | Load with clustering expression | ~782K rows/sec |
-| Consensus | Leader election after a kill | ~224 ms |
-| Consensus | Single log append | ~0.14 us |
-| Consensus | Snapshot 1GB, create | ~0.89 s |
-| Consensus | Snapshot 1GB, transfer | ~2.46 s |
+| Lake | Load with clustering expression | ~779K rows/sec |
+| Consensus | Leader election after a kill | ~234 ms |
+| Consensus | Single log append | ~0.15 us |
+| Consensus | Snapshot 1GB, create | ~0.85 s |
+| Consensus | Snapshot 1GB, transfer | ~2.47 s |
 | Replication | Follower keep-up vs leader | ~99.7% |
 | Replication | Worst follower lag | ~162 entries |
-| Transactions | Durable group-commit peak | ~747K txn/sec |
-| Transactions | Group-commit amplification (c=1 to c=512) | ~63.4x |
-| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.3x (heap wins indexed points) |
-| Cross-format | Bulk load to queryable, lake vs heap | ~9.9x (heap wins large batches) |
-| Cross-format | Trickle load to queryable, lake vs heap | ~30.3x (heap wins tiny commits) |
+| Transactions | Durable group-commit peak | ~741K txn/sec |
+| Transactions | Group-commit amplification (c=1 to c=512) | ~78.0x |
+| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.2x (heap wins indexed points) |
+| Cross-format | Bulk load to queryable, lake vs heap | ~9.6x (heap wins large batches) |
+| Cross-format | Trickle load to queryable, lake vs heap | ~22.9x (heap wins tiny commits) |
 
-38 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+39 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started
@@ -454,7 +474,8 @@ Each area ships with an optimization review and a validation checkpoint with har
 | Analytics & lifecycle | Analytics engine, feature store & ML, data lifecycle management | ✅ Complete |
 | ZyronLake table format | Immutable versioned `.zyr` on a transaction log, branches, time travel, secondary indexes, clustering, constraint enforcement, change feed, cross-format federation | ✅ Complete |
 | Consensus and replication | Raft groups per cluster, quorum-committed writes with one fsync per ack, logical DML replication for heap and version replication for lake, linearizable follower reads through ReadIndex, learner promotion, whole-cluster snapshots | ✅ Complete |
-| SQL surface, type system and media types | Range and multirange types, interval refinements, native media types, additional function coverage, and a silent-bug hardening pass across the engine | 🔨 In progress |
+| SQL surface, type system and media types | Range and multirange types, interval refinements, native media types, additional function coverage, and a silent-bug hardening pass across the engine | ✅ Complete |
+| Format agility and auto-upgrade | Versioned envelope on every persistent file, signature agility for JWTs, X.509 certs, and custom artifacts, catalog schema evolution registry, AST-based user-object rewriter, deprecation lifecycle, and a health-baselined rolling upgrade orchestrator over Raft with automatic rollback and federation-aware compat gating | ✅ Complete |
 | Enterprise & distribution | Sharding and multi-region, secret store and KMS, high availability and DR, observability and compliance, semantic views, schema registry, data contracts, data governance, multi-tenancy and cost tracking, migration tools and ecosystem connectors, Volumes (arbitrary-file storage as catalog objects), enterprise type-system extensions | ⏳ Planned |
 | Serverless mesh and autonomous operations | Base compute mesh, user meshes with compute reservations, workload-aware scheduling, continuous self-tuning and self-healing across every node in the mesh, query engine advances | ⏳ Planned |
 | Wire protocols, API and drivers | ZWP native wire protocol alongside PostgreSQL wire compatibility, Zyron API (unified QUERY / POST / GET / WS surface for apps), native drivers across every supported client language, Zyron Embedded (`libzyron`) for in-process use | ⏳ Planned |

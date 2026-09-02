@@ -1,0 +1,196 @@
+# suite:   planner
+# run:     2026-09-01_151859_50518fd-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Join Ordering ===
+  Planning: SELECT * FROM large JOIN medium ON large.id = medium.id JOIN small ON medium.id = small.id
+  Top-level operator: Join
+  Physical plan top: HashJoin
+  Physical plan cost: 4624.06
+  Join ordering test: PASS
+
+============================================
+  Planner Benchmark Suite - All Tests Complete
+============================================
+  Cores: 24
+  OS: windows/x86_64
+  Run ID: 2026-09-01_151859_50518fd-local
+  Output:  benchmarks/planner/planner_2026-09-01_151859_50518fd-local.json
+  Log:     benchmarks/planner/planner_2026-09-01_151859_50518fd-local.txt
+  Binding:     1 correctness test
+  Logical:     1 correctness test
+  Predicate:   1 correctness test
+  Projection:  1 correctness test
+  Join Order:  1 correctness test
+  Index Sel:   1 correctness test
+  Cost Model:  1 correctness test
+  Complex:     1 correctness test (TPC-H Q1, Q3)
+  Benchmarks:  1 performance test (9 metrics)
+============================================
+
+=== Predicate Pushdown ===
+  Planning: SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x > 10 AND b.y < 5
+  Filter nodes in optimized plan: 2
+  Top-level operator: Join
+  Predicate pushdown test: PASS
+
+=== Spatial Predicate -> SpatialScan ===
+  SQL: SELECT id FROM events WHERE st_dwithin(location, st_make_point(-74.0, 40.7), 5000.0)
+  Physical plan top: Project
+  SpatialScan present in physical plan: PASS
+
+=== Projection Pushdown ===
+  Planning: SELECT col1, col2 FROM wide_table
+  Scan column counts: [2]
+  Narrowest scan reads 2 columns (originally 20)
+  Projection pushed down to scan level
+  Projection pushdown test: PASS
+
+=== Planner Performance Benchmarks ===
+Validation runs: 5
+
+--- Run 1/5 ---
+  Binding: 23.10 us/op
+  Logical plan: 47.36 us/op (pure, excl. binding)
+  Optimization: 85.31 us/op (pure, excl. logical)
+  Physical plan: 31.19 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 438.67 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 400.06 us/op
+
+--- Run 2/5 ---
+  Binding: 20.11 us/op
+  Logical plan: 56.48 us/op (pure, excl. binding)
+  Optimization: 57.16 us/op (pure, excl. logical)
+  Physical plan: 15.00 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 338.19 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 241.89 us/op
+
+--- Run 3/5 ---
+  Binding: 12.84 us/op
+  Logical plan: 34.15 us/op (pure, excl. binding)
+  Optimization: 50.28 us/op (pure, excl. logical)
+  Physical plan: 17.73 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 262.64 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 157.13 us/op
+
+--- Run 4/5 ---
+  Binding: 9.64 us/op
+  Logical plan: 18.79 us/op (pure, excl. binding)
+  Optimization: 31.48 us/op (pure, excl. logical)
+  Physical plan: 10.42 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 159.17 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 154.10 us/op
+
+--- Run 5/5 ---
+  Binding: 10.57 us/op
+  Logical plan: 32.04 us/op (pure, excl. binding)
+  Optimization: 64.04 us/op (pure, excl. logical)
+  Physical plan: 0.01 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 259.31 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 228.01 us/op
+
+=== Planner Performance Results ===
+  Binding latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [23.1005, 20.1141, 12.8354, 9.6422, 10.5749]
+    Average: 15.2534 (target <= 2, not applied)
+    Re-run with --release for a number worth comparing
+  Logical plan latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [47.3642, 56.4823, 34.1475, 18.7915, 32.0388]
+    Average: 37.7649 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+  Optimization latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [85.3054, 57.1637, 50.2780, 31.4781, 64.0447]
+    Average: 57.6540 (target <= 25, not applied)
+    Re-run with --release for a number worth comparing
+  Physical plan latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [31.1860, 15.0043, 17.7255, 10.4213, 0.0100]
+    Average: 14.8694 (target <= 10, not applied)
+    Re-run with --release for a number worth comparing
+  Join reorder latency (us, 5 tables) [NOT MEASURED, unoptimized build]:
+    Runs: [438.6720, 338.1850, 262.6420, 159.1670, 259.3080]
+    Average: 291.5948 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+  Index selection latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [0.0100, 0.0100, 0.0100, 0.0100, 0.0100]
+    Average: 0.0100 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+  Full pipeline latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [400.0564, 241.8887, 157.1257, 154.1014, 228.0070]
+    Average: 236.2358 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+
+--- Plan Cache Simulation ---
+  Plan cache hit rate [NOT MEASURED, unoptimized build]: 0.9990 (target >= 0.9800, not applied)
+
+--- Cardinality Estimation Accuracy ---
+  Cardinality estimation error factor [NOT MEASURED, unoptimized build]: 1 (target <= 2, not applied)
+
+=== All Planner Performance Tests: PASS ===
+
+=== Index Selection ===
+  Planning: SELECT * FROM orders WHERE status = 'pending' (low selectivity, expect IndexScan)
+  Physical operator: IndexScan
+  Cost: 401.50
+  Uses IndexScan: true
+  Planning: SELECT * FROM orders WHERE status != 'pending' (high selectivity, expect SeqScan)
+  Physical operator: Gather
+  Cost: 1430.83
+  Uses SeqScan: true
+  Index selection test: PASS
+
+=== Binding ===
+  Binding: SELECT id, name FROM users WHERE age > 21
+    Projections: 2 (expected 2)
+    Table resolved to OID TableId(10001)
+    WHERE type: Boolean (expected Boolean)
+  Binding: SELECT nonexistent FROM users (expect error)
+    Error: Column not found: nonexistent
+  Binding: SELECT id FROM nonexistent (expect error)
+    Error: relation `nonexistent` does not exist
+  Binding test: PASS
+
+=== Cost Estimation ===
+  Full scan cost (1K rows): 10.10
+  Full scan cost (1M rows): 1430.83
+  Cost ratio: 141.7x
+  SeqScan cost (1K): io=10.00, cpu=10.00, rows=1000
+  SeqScan cost (1M): io=10000.00, cpu=10000.00, rows=1000000
+  IndexScan cost (1M, 1%%): io=400.00, cpu=150.00, rows=10000
+  Cost estimation test: PASS
+
+=== Complex Queries (TPC-H style) ===
+  TPC-H Q1 (aggregation + filter):
+    Top operator: Project
+    Total cost: 17119.90
+    Contains aggregate: true
+  TPC-H Q3 (3-way join):
+    Top operator: Limit
+    Total cost: 35300.96
+    Contains join: true
+  Complex query test: PASS
+
+=== Logical Plan Structure ===
+  Planning: SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10
+  Top-level operator: Limit
+  Child of Limit: Sort
+  Child of Sort: Filter
+    Contains Filter: true
+    Contains Scan: true
+  Planning: SELECT * FROM a JOIN b ON a.id = b.a_id
+  Contains Join: true
+  Logical plan structure test: PASS

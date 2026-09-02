@@ -37,6 +37,12 @@ use zyron_wal::{LogRecordType, WalReader, WalWriter, WalWriterConfig};
 const SNAPSHOT_VISIBILITY_TARGET_NS: f64 = 15.0;
 const LOCK_ACQUIRE_TARGET_NS: f64 = 80.0;
 const SNAPSHOT_CREATE_TARGET_NS: f64 = 200.0;
+// begin claims a slot, allocates an id, captures the active set and publishes
+// the prune horizon, and abort releases the slot. No device write in the loop,
+// so the proc array scan is visible here where the durable phases hide it.
+// Measured 180.6 ns, and 2177.2 ns when the capture scans the whole table
+// instead of stopping at the high water mark, so the gate sits between them.
+const BEGIN_ABORT_TARGET_NS: f64 = 700.0;
 const GC_SWEEP_TARGET_TUPLES_SEC: f64 = 500_000.0;
 
 // A single synchronous durable commit is one device write (write-through FUA,
@@ -1369,6 +1375,101 @@ fn test_transaction_microbenchmarks() {
         "Snapshot::new() latency (ns/op)",
         snap_runs,
         SNAPSHOT_CREATE_TARGET_NS,
+        false,
+    );
+
+    // -----------------------------------------------------------------------
+    // Snapshot capture off the proc array, steady state and after a burst
+    // -----------------------------------------------------------------------
+    // Every begin captures the active transaction set by scanning the proc
+    // array, and the delete path scans it again for the prune horizon. Both
+    // stop at the high water mark of slots ever claimed rather than walking
+    // the whole table, so the cost tracks peak concurrency.
+    //
+    // The durable commit phases above cannot see any of this: they are one
+    // device write per commit and the scan disappears under it. These probe
+    // the capture with no commit in the loop.
+    //
+    // The burst case is the one that matters. A spike that ends leaves the
+    // mark raised while the live set drops back, and an unbounded scan pays
+    // the whole table on every begin from then on.
+    for (live, burst, label, target) in [
+        (
+            1usize,
+            0usize,
+            "snapshot capture, 1 live txn (ns/op)",
+            250.0f64,
+        ),
+        (64, 0, "snapshot capture, 64 live txns (ns/op)", 400.0),
+        (
+            1,
+            512,
+            "snapshot capture, 1 live after 512-txn burst (ns/op)",
+            600.0,
+        ),
+    ] {
+        let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+        for _ in 0..VALIDATION_RUNS {
+            const OPS: usize = 200_000;
+            let (mgr, _wal, _dir) = create_txn_manager();
+
+            // Drive the burst through and let it finish, which leaves the
+            // high water mark raised with the slots free again
+            if burst > 0 {
+                let mut spike: Vec<Transaction> = (0..burst)
+                    .map(|_| mgr.begin(IsolationLevel::SnapshotIsolation).unwrap())
+                    .collect();
+                for txn in spike.iter_mut() {
+                    mgr.abort(txn).unwrap();
+                }
+            }
+
+            let held: Vec<Transaction> = (0..live)
+                .map(|_| mgr.begin(IsolationLevel::SnapshotIsolation).unwrap())
+                .collect();
+            let probe = &held[0];
+
+            for _ in 0..1_000 {
+                std::hint::black_box(mgr.refresh_snapshot(probe));
+            }
+            let start = Instant::now();
+            for _ in 0..OPS {
+                std::hint::black_box(mgr.refresh_snapshot(probe));
+            }
+            let ns_per_op = start.elapsed().as_nanos() as f64 / OPS as f64;
+            runs.push(ns_per_op);
+            drop(held);
+        }
+        validate_metric("Phase 1.5 Microbenchmarks", label, runs, target, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // begin() + abort() latency, no durable commit in the loop
+    // -----------------------------------------------------------------------
+    // The full non-durable transaction lifecycle: claim a slot, allocate an
+    // id, capture the snapshot, publish the prune horizon, then release.
+    let mut lifecycle_runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        const OPS: usize = 200_000;
+        let (mgr, _wal, _dir) = create_txn_manager();
+        for _ in 0..1_000 {
+            let mut t = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+            mgr.abort(&mut t).unwrap();
+        }
+        let start = Instant::now();
+        for _ in 0..OPS {
+            let mut t = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+            std::hint::black_box(t.txn_id);
+            mgr.abort(&mut t).unwrap();
+        }
+        let ns_per_op = start.elapsed().as_nanos() as f64 / OPS as f64;
+        lifecycle_runs.push(ns_per_op);
+    }
+    validate_metric(
+        "Phase 1.5 Microbenchmarks",
+        "begin()+abort() latency (ns/op)",
+        lifecycle_runs,
+        BEGIN_ABORT_TARGET_NS,
         false,
     );
 

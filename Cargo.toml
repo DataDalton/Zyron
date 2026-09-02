@@ -5,7 +5,7 @@ members = ["crates/*", "binaries/*"]
 [workspace.package]
 # The Zyron version. Every crate and binary inherits it, so the release
 # tag, the archive names, and what --version prints all move together.
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.94"
 
@@ -27,6 +27,12 @@ mimalloc = "0.1"
 # and stay resident only where the workload touches them.
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
+# Typed distributed registration. Format, crypto scheme, catalog schema
+# evolution, user object rewrite, and deprecation records are submitted from
+# the module that owns them and collected at startup, so adding one never
+# means editing a central list.
+inventory = "0.3.24"
 
 # Data structures
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -83,6 +89,12 @@ serde_json = "1"
 # Asymmetric crypto (WebAuthn/FIDO2 signature verification)
 p256 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# RSA PKCS#1 v1.5 verification for RS256, which external identity providers
+# sign with. Already in the build as the rustls backend, so naming it here
+# adds no compilation unit. Chosen over the pure Rust rsa crate because its
+# modular arithmetic is constant time, and RUSTSEC-2023-0071 covers that
+# crate's secret-dependent operations
+ring = "0.17"
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = [

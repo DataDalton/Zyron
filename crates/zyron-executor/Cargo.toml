@@ -12,6 +12,7 @@ profile = ["zyron-common/profile"]
 [dependencies]
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 zyron-media = { path = "../zyron-media" }
 sha2.workspace = true
 zyron-parser = { path = "../zyron-parser" }

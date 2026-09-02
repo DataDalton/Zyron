@@ -174,20 +174,23 @@ impl VacuumWorker {
 
             debug!("Vacuum cycle starting");
 
-            // Determine the horizon: oldest active transaction ID.
-            // Tuples deleted by transactions older than this are safe to
-            // reclaim. The id fence is sampled BEFORE the active set: a
-            // transaction beginning between the two samples then either
-            // appears in the active set or holds an id at or above the
-            // fence, so the horizon can never advance past a transaction
-            // that is still starting, whose deleted versions must survive
-            // in case it aborts
-            let id_fence = txn_manager.next_txn_id();
+            // Determine the horizon. This is the lowest xmax no live
+            // transaction can still need, taken over the visibility floors
+            // the transactions publish, NOT the oldest active transaction id.
+            // The two differ: a transaction still in flight when an older
+            // reader took its snapshot sits in that reader's active set, so
+            // the reader keeps seeing the rows it deleted, and once it commits
+            // and leaves the array the oldest active id sits above its id
+            // while the reader still needs those rows. Reclaiming on the id
+            // deletes a live reader's rows out from under it.
+            //
+            // The id fence is folded in by prune_horizon, sampled before the
+            // scan, so a transaction that is still starting cannot be passed
+            let prune_horizon = txn_manager.prune_horizon();
+            // Separate question, asked once per cycle: whether anything was
+            // running at all, which decides if this pass can be recorded as a
+            // clean point for the table
             let active_txns = txn_manager.active_txn_ids();
-            let oldest_active = match active_txns.first() {
-                Some(&oldest) => oldest.min(id_fence),
-                None => id_fence,
-            };
 
             // Record a (now, durable LSN) sample so time-based retention can map
             // a window to a floor LSN. The vacuum interval is the sample
@@ -267,7 +270,7 @@ impl VacuumWorker {
                 }
                 match Self::vacuum_table(
                     &table_entry,
-                    oldest_active,
+                    prune_horizon,
                     config.max_pages_per_cycle,
                     disk_manager,
                     buffer_pool,
@@ -305,8 +308,11 @@ impl VacuumWorker {
                     }
                 }
             }
-            // Dropped tables leave no gate entries behind
-            clean_at.retain(|id, _| tables.iter().any(|t| t.id.0 == *id));
+            // Dropped tables leave no gate entries behind. Set membership
+            // rather than a scan per entry, which would be quadratic in the
+            // number of tables every cycle
+            let live_ids: std::collections::HashSet<u32> = tables.iter().map(|t| t.id.0).collect();
+            clean_at.retain(|id, _| live_ids.contains(id));
 
             // Bound the retention clock: keep samples back to the longest finite
             // retention window across tables; unlimited and unset tables need no
@@ -329,19 +335,19 @@ impl VacuumWorker {
             txn_manager.retention_clock().prune_before(keep_from);
 
             // Advance the frozen horizon: after a clean full sweep, every tuple
-            // below `oldest_active` is committed (aborted inserts reclaimed,
+            // below the horizon is committed (aborted inserts reclaimed,
             // aborted-delete stamps cleared), so visibility can treat ids below
             // it as committed without a status lookup. With the horizon past
             // them, the commit-status segments below it are unreachable and their
             // memory can be reclaimed.
             if full_sweep {
                 let status_map = txn_manager.status_map();
-                status_map.advance_vacuum_frozen(oldest_active);
-                let freed = status_map.truncate_below(oldest_active);
+                status_map.advance_vacuum_frozen(prune_horizon);
+                let freed = status_map.truncate_below(prune_horizon);
                 if freed > 0 {
                     debug!(
                         "Truncated {} commit-status segments below {}",
-                        freed, oldest_active
+                        freed, prune_horizon
                     );
                 }
             }
@@ -388,7 +394,7 @@ impl VacuumWorker {
     #[allow(clippy::too_many_arguments)]
     fn vacuum_table(
         table: &TableEntry,
-        oldest_active: u64,
+        prune_horizon: u64,
         max_pages: usize,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
@@ -430,7 +436,7 @@ impl VacuumWorker {
             status_map.is_aborted(xmin)
                 || (xmax != 0
                     && status_map.is_committed(xmax)
-                    && xmax < oldest_active
+                    && xmax < prune_horizon
                     && status_map.is_reclaimable_below(xmax, retention_floor))
         };
         let is_aborted = |xid: u64| status_map.is_aborted(xid);
@@ -518,7 +524,7 @@ impl Drop for VacuumWorker {
 #[allow(clippy::too_many_arguments)]
 pub fn vacuum_table_immediate(
     table: &TableEntry,
-    oldest_active: u64,
+    prune_horizon: u64,
     disk_manager: &Arc<DiskManager>,
     buffer_pool: &Arc<BufferPool>,
     status_map: &zyron_storage::TxnStatusMap,
@@ -528,7 +534,7 @@ pub fn vacuum_table_immediate(
 ) -> std::result::Result<(u64, u64), String> {
     VacuumWorker::vacuum_table(
         table,
-        oldest_active,
+        prune_horizon,
         0,
         disk_manager,
         buffer_pool,

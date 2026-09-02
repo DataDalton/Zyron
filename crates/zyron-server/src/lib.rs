@@ -10,6 +10,7 @@ pub mod columnar_recovery;
 pub mod columnar_wal_pin;
 pub mod config;
 pub mod feature_persistence;
+pub mod format;
 pub mod gateway;
 pub mod health;
 pub mod hooks;
@@ -17,9 +18,12 @@ pub mod lake_recovery;
 pub mod mesh_node;
 pub mod metrics;
 pub mod raft;
+pub mod release_check;
 pub mod replication;
 pub mod session;
 pub mod signal;
+pub mod startup_validation;
+pub mod upgrade;
 
 #[cfg(test)]
 pub(crate) mod test_sync {
@@ -293,6 +297,13 @@ impl Server {
         let start_time = Instant::now();
         info!("Zyron {} starting", env!("CARGO_PKG_VERSION"));
 
+        // 0. Load and check the format substrate before anything opens a
+        // file. A binary that cannot say which format versions it reads has
+        // no safe way to open a data directory, so this refuses to start
+        // rather than discovering the gap at the first read
+        let substrate_report = crate::startup_validation::validate()?;
+        info!("{}", substrate_report);
+
         // 1. Create data and WAL directories
         let data_dir = &self.config.storage.data_dir;
         let wal_dir = self.config.wal_dir();
@@ -453,6 +464,16 @@ impl Server {
         // connection is accepted. Idempotent: a restart finds the rows and
         // only re-derives the schema id set that keeps DDL out of them
         zyron_catalog::SystemCatalog::init(&catalog).await?;
+
+        // Read back what the last ANALYZE learned. Runs after load() so a
+        // file whose table is gone is recognized as stale and deleted, and
+        // before connections are accepted so the first plan already costs
+        // against real statistics rather than the no-statistics default
+        match catalog.load_persisted_stats().await {
+            Ok(0) => {}
+            Ok(restored) => info!("Restored statistics for {} tables", restored),
+            Err(e) => warn!("Persisted statistics could not be read: {}", e),
+        }
 
         // 7. Create TransactionManager
         let txn_manager = Arc::new(TransactionManager::with_start_txn_id(

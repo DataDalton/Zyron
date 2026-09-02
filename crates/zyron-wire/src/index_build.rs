@@ -238,12 +238,10 @@ pub async fn collect_live_rows(
     table: &TableEntry,
 ) -> Result<LiveRows, ZyronError> {
     let status_map = server.txn_manager.status_map().clone();
-    let active_txns = server.txn_manager.active_txn_ids();
-    let oldest_active = if active_txns.is_empty() {
-        server.txn_manager.next_txn_id()
-    } else {
-        active_txns[0]
-    };
+    // Taken over published visibility floors, not the oldest active txn id: a
+    // committed deleter can sit below the oldest active id while a live reader
+    // that started before it committed still sees its rows
+    let prune_horizon = server.txn_manager.prune_horizon();
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
@@ -258,7 +256,7 @@ pub async fn collect_live_rows(
         status_map.is_aborted(xmin)
             || (x != 0
                 && status_map.is_committed(x)
-                && x < oldest_active
+                && x < prune_horizon
                 && status_map.is_reclaimable_below(x, retention_floor))
     };
 

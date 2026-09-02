@@ -38,8 +38,9 @@ use zyron_common::{Result, ZyronError};
 
 use crate::batch::{DataBatch, encode_row_into};
 
-/// Format of the payload carried by one `Data` entry.
-pub const FORMAT_VERSION: u8 = 1;
+/// Version tag every chunk carries in its first byte, so one log can hold
+/// chunks written by nodes at two versions during a rolling upgrade
+pub const FORMAT_VERSION: u8 = crate::format::APPLY_RECORD_VERSION_BYTE;
 
 /// This chunk completes the transaction, which commits when it applies
 pub const FLAG_LAST: u8 = 0x01;

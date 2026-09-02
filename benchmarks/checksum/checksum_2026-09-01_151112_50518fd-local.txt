@@ -1,0 +1,109 @@
+# suite:   checksum
+# run:     2026-09-01_151112_50518fd-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== hash32 throughput at 16 MB ===
+  Active tier: x86_aes
+  Run 1: 943.7 MB/s
+  Run 2: 942.9 MB/s
+  Run 3: 932.2 MB/s
+  Run 4: 921.9 MB/s
+  Run 5: 921.6 MB/s
+  hash32 16MB throughput (MB/s) [NOT MEASURED, unoptimized build]:
+    Runs: [943.6516, 942.8833, 932.2415, 921.8815, 921.6162]
+    Average: 932.4548 (target >= 6,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Cross-tier consistency (scalar reference vs active tier) ===
+  Active tier: x86_aes
+  All 12 sizes match scalar reference: PASS
+
+=== hash32 throughput at 1 MB ===
+  Active tier: x86_aes
+  Run 1: 908.9 MB/s
+  Run 2: 926.7 MB/s
+  Run 3: 873.0 MB/s
+  Run 4: 902.8 MB/s
+  Run 5: 888.5 MB/s
+  hash32 1MB throughput (MB/s) [NOT MEASURED, unoptimized build]:
+    Runs: [908.8862, 926.7083, 872.9805, 902.8425, 888.5197]
+    Average: 899.9875 (target >= 6,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== hash32 throughput at 1 KB ===
+  Active tier: x86_aes
+  Run 1: 680.1 MB/s
+  Run 2: 603.0 MB/s
+  Run 3: 446.5 MB/s
+  Run 4: 429.7 MB/s
+  Run 5: 461.7 MB/s
+  hash32 1KB throughput (MB/s) [NOT MEASURED, unoptimized build]:
+    Runs: [680.0850, 602.9731, 446.4836, 429.7015, 461.6775]
+    Average: 524.1842 (target >= 3,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Dispatch stability ===
+  Tier stable across 1000 calls: x86_aes PASS
+
+=== Seeded variant overhead vs unseeded ===
+  Run 1: unseeded 779 MB/s, seeded 916 MB/s (overhead -17.5%)
+  Run 2: unseeded 950 MB/s, seeded 894 MB/s (overhead 5.9%)
+  Run 3: unseeded 949 MB/s, seeded 897 MB/s (overhead 5.5%)
+  Run 4: unseeded 953 MB/s, seeded 726 MB/s (overhead 23.8%)
+  Run 5: unseeded 439 MB/s, seeded 430 MB/s (overhead 2.2%)
+  Average overhead: 5.1% (target: <= 20.0%)
+
+=== hash32 small-input (<=32 B) latency ===
+  Active tier: x86_aes
+  Run 1: 222.6 ns/call
+  Run 2: 182.6 ns/call
+  Run 3: 189.8 ns/call
+  Run 4: 184.9 ns/call
+  Run 5: 121.0 ns/call
+  hash32 <=32B latency (ns) [NOT MEASURED, unoptimized build]:
+    Runs: [222.6182, 182.6384, 189.7877, 184.8762, 120.9590]
+    Average: 180.1759 (target <= 120, not applied)
+    Re-run with --release for a number worth comparing
+
+=== hash64 (8-16 byte keys, hashmap pattern) ===
+  Active tier: x86_aes
+  Run 1: 133.1 ns/call
+  Run 2: 132.8 ns/call
+  Run 3: 133.6 ns/call
+  Run 4: 137.2 ns/call
+  Run 5: 135.1 ns/call
+  Average: 134.4 ns/call
+
+=== Seeded hash variants produce distinct outputs ===
+  Distinct seeds produce distinct outputs across all widths: PASS
+
+=== hash128 (Bloom filter insert/probe pattern) ===
+  Active tier: x86_aes
+  Run 1: 132.1 ns/call
+  Run 2: 129.4 ns/call
+  Run 3: 133.7 ns/call
+  Run 4: 129.0 ns/call
+  Run 5: 133.1 ns/call
+  Average: 131.5 ns/call
+
+=== streaming Hasher update+finish throughput at 1 MB ===
+  Active tier: x86_aes
+  Run 1: 883.7 MB/s (chunk=16384B)
+  Run 2: 882.6 MB/s (chunk=16384B)
+  Run 3: 891.2 MB/s (chunk=16384B)
+  Run 4: 904.5 MB/s (chunk=16384B)
+  Run 5: 879.8 MB/s (chunk=16384B)
+  streaming 1MB throughput (MB/s) [NOT MEASURED, unoptimized build]:
+    Runs: [883.6831, 882.5703, 891.1934, 904.4876, 879.8056]
+    Average: 888.3480 (target >= 5,000, not applied)
+    Re-run with --release for a number worth comparing

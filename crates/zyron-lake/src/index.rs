@@ -244,11 +244,16 @@ pub fn write_index_files(
     // Partitions this batch accounted for that produced no entry, because
     // every row of them was deleted. They still have to be declared or the
     // index reads as incomplete forever, so they ride on the first file
+    // The partitions that produced entries are collected once. Scanning the
+    // address list per covered partition costs rows times partitions, which
+    // grows with the data in the batch rather than with the schema
+    let with_entries: std::collections::HashSet<u64> =
+        batch.addresses.iter().map(|a| a.partition_id).collect();
     let mut entryless: Vec<u64> = batch
         .covers
         .iter()
         .copied()
-        .filter(|p| !batch.addresses.iter().any(|a| a.partition_id == *p))
+        .filter(|p| !with_entries.contains(p))
         .collect();
     entryless.sort_unstable();
 

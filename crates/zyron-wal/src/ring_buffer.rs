@@ -488,6 +488,7 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::WAL_RECORD_VERSION_BYTE;
     use crate::record::{
         LogRecord, LogRecordType, record_size_for_payload, serialize_raw_deferred,
     };
@@ -510,7 +511,7 @@ mod tests {
                 Lsn::INVALID,
                 1,
                 LogRecordType::Insert as u8,
-                0,
+                WAL_RECORD_VERSION_BYTE,
                 payload,
             );
         }
@@ -654,7 +655,7 @@ mod tests {
                 Lsn::INVALID,
                 1,
                 LogRecordType::Insert as u8,
-                0,
+                WAL_RECORD_VERSION_BYTE,
                 payload,
             );
         }

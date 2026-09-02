@@ -1696,6 +1696,16 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        // A deprecated item warns before it errors and errors before it is
+        // removed, so the check runs on the text ahead of the parse: an item
+        // in its warn window still parses, and one past removal has no node
+        // left to match on
+        if let Some(refusal) = self.check_deprecations(&sql).await? {
+            self.send_error(&refusal).await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        }
+
         // Parse SQL into statements
         let stmts = match zyron_parser::parse(&sql) {
             Ok(stmts) => stmts,
@@ -4687,7 +4697,27 @@ impl<T: WireTransport> Connection<T> {
                 )
             }
             zyron_parser::Statement::AlterSystemSet(s) => {
-                let val_str = expr_to_string(&s.value);
+                let mut val_str = expr_to_string(&s.value);
+                // An upgrade setting takes effect on the board first, so the
+                // orchestrator sees it immediately, and the value persisted
+                // is the one that took effect rather than the one typed
+                if crate::format_dispatch::owns_setting(&s.name) {
+                    match crate::format_dispatch::apply_upgrade_setting(&s.name, &val_str) {
+                        Ok(stored) => val_str = stored,
+                        Err(err) => {
+                            let fields = ErrorFields {
+                                severity: "ERROR".into(),
+                                code: "22023".into(),
+                                message: err.to_string(),
+                                detail: None,
+                                hint: None,
+                                position: None,
+                            };
+                            let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                            return Some(Ok(()));
+                        }
+                    }
+                }
                 if let Some(ref writer) = self.server.alter_system_set {
                     match writer(&s.name, &val_str) {
                         Ok(()) => Some(
@@ -4769,6 +4799,51 @@ impl<T: WireTransport> Connection<T> {
         }
     }
 
+    /// Checks a statement's text against the deprecation registry.
+    ///
+    /// Returns the error to send when a use is past its warn window, and
+    /// sends a notice for every use still inside it. A use the rate limiter
+    /// has already covered this hour proceeds with no notice, which is what
+    /// keeps a loop over a deprecated call from filling the log.
+    async fn check_deprecations(&mut self, sql: &str) -> Result<Option<ZyronError>, ProtocolError> {
+        let Ok(substrate) = zyron_common::format::substrate() else {
+            return Ok(None);
+        };
+        if substrate.deprecations.records().is_empty() {
+            return Ok(None);
+        }
+        let tenant = self
+            .session
+            .as_ref()
+            .map(|session| session.user.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for (_, outcome) in substrate.scan_sql_for_deprecations(sql, &tenant, now) {
+            match outcome {
+                zyron_common::format::DeprecationOutcome::Warned(message) => {
+                    let fields = crate::messages::backend::ErrorFields {
+                        severity: "WARNING".into(),
+                        code: "01000".into(),
+                        message,
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+                }
+                zyron_common::format::DeprecationOutcome::Refused(message)
+                | zyron_common::format::DeprecationOutcome::Removed(message) => {
+                    return Ok(Some(ZyronError::DeprecatedItem(message)));
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// Handles the VACUUM SQL command
     /// Scans heap pages for dead tuples and reclaims space by zeroing slots
     /// for tuples no longer visible to any active transaction
@@ -4807,12 +4882,10 @@ impl<T: WireTransport> Connection<T> {
             flag: Arc::clone(&self.server.vacuum_running),
         };
 
-        let active_txns = self.server.txn_manager.active_txn_ids();
-        let oldest_active = if active_txns.is_empty() {
-            self.server.txn_manager.next_txn_id()
-        } else {
-            active_txns[0]
-        };
+        // Taken over published visibility floors, not the oldest active txn
+        // id: a committed deleter can sit below the oldest active id while a
+        // live reader that started before it committed still sees its rows
+        let prune_horizon = self.server.txn_manager.prune_horizon();
 
         let tables = self.server.catalog.list_all_tables();
         let target_tables: Vec<_> = if let Some(name) = table_name {
@@ -4882,7 +4955,7 @@ impl<T: WireTransport> Connection<T> {
                 status_map.is_aborted(xmin as u64)
                     || (x != 0
                         && status_map.is_committed(x as u64)
-                        && (x as u64) < oldest_active
+                        && (x as u64) < prune_horizon
                         && status_map.is_reclaimable_below(x as u64, retention_floor))
             };
             let is_aborted = |xid: u64| status_map.is_aborted(xid);
@@ -5190,12 +5263,10 @@ impl<T: WireTransport> Connection<T> {
             flag: Arc::clone(&self.server.vacuum_running),
         };
 
-        let active_txns = self.server.txn_manager.active_txn_ids();
-        let oldest_active = if active_txns.is_empty() {
-            self.server.txn_manager.next_txn_id()
-        } else {
-            active_txns[0]
-        };
+        // Taken over published visibility floors, not the oldest active txn
+        // id: a committed deleter can sit below the oldest active id while a
+        // live reader that started before it committed still sees its rows
+        let prune_horizon = self.server.txn_manager.prune_horizon();
 
         let table = self
             .server
@@ -5316,7 +5387,7 @@ impl<T: WireTransport> Connection<T> {
                 let Some(slot) = HeapPage::live_slot_in_slice(&modified, i) else {
                     continue;
                 };
-                if MvccGc::is_reclaimable(slot.header.xmax, oldest_active) {
+                if MvccGc::is_reclaimable(slot.header.xmax, prune_horizon) {
                     // Clearing the offset empties the slot, the bytes are
                     // reclaimed by the next compaction
                     let slot_offset = HeapPage::DATA_START + (i as usize) * TupleSlot::SIZE;
@@ -5464,7 +5535,9 @@ impl<T: WireTransport> Connection<T> {
                     }
                     self.server
                         .catalog
-                        .put_stats(table.id, table_stats, column_stats);
+                        .persist_stats(table.id, table_stats, column_stats)
+                        .await
+                        .map_err(ProtocolError::Database)?;
                     self.server
                         .table_io_stats
                         .get_or_create(table.id.0)

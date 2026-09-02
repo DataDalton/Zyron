@@ -313,10 +313,11 @@ impl FrontendMessage {
             });
         }
 
-        // Protocol version 3.0 = 0x00030000 = 196608
+        // The registry decides which protocol majors this server still
+        // speaks, so a cutover is a registry change rather than an edit here
         let major = version >> 16;
         let minor = version & 0xFFFF;
-        if major != 3 {
+        if crate::version_registry::negotiate_packed(version).is_err() {
             return Err(ProtocolError::UnsupportedProtocol(version));
         }
 

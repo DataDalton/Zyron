@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 zyron-storage = { path = "../zyron-storage" }
 crc32fast = { workspace = true }
 scc = { workspace = true }

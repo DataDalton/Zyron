@@ -515,10 +515,30 @@ async fn readers_never_see_a_partial_state_during_concurrent_refresh() {
     while !refresher.is_finished() {
         let mut vs = col_i64(&exec(&server, &mut session, "SELECT v FROM mv").await, 0);
         vs.sort_unstable();
-        assert!(
-            vs == old_set || vs == new_set,
-            "a reader saw a partial refresh state: {vs:?}"
-        );
+        // This has failed once under whole-suite load and never reproduced
+        // in isolation, so the message carries what the shape of the torn
+        // read was. Which side it came from says where to look: rows only
+        // from the old set means the delete became visible before the
+        // insert, a mix means one statement saw two commit states, and
+        // anything else means the reader saw a row from neither
+        if vs != old_set && vs != new_set {
+            let from_old: Vec<i64> = vs.iter().copied().filter(|v| old_set.contains(v)).collect();
+            let from_new: Vec<i64> = vs.iter().copied().filter(|v| new_set.contains(v)).collect();
+            let foreign: Vec<i64> = vs
+                .iter()
+                .copied()
+                .filter(|v| !old_set.contains(v) && !new_set.contains(v))
+                .collect();
+            panic!(
+                "a reader saw a partial refresh state: {vs:?}\n  \
+                 rows: {} (old set has {}, new set has {})\n  \
+                 from old: {from_old:?}\n  from new: {from_new:?}\n  \
+                 from neither: {foreign:?}",
+                vs.len(),
+                old_set.len(),
+                new_set.len()
+            );
+        }
         if vs == new_set {
             saw_new = true;
         }
@@ -531,4 +551,124 @@ async fn readers_never_see_a_partial_state_during_concurrent_refresh() {
     vs.sort_unstable();
     assert_eq!(vs, new_set);
     let _ = saw_new;
+}
+
+/// Reproduction harness for the tear that
+/// `readers_never_see_a_partial_state_during_concurrent_refresh` catches
+/// about one run in seventy-five, and only under whole-suite load.
+///
+/// That test refreshes once with one reader. This drives many refresh
+/// cycles with several concurrent readers so the window is entered far more
+/// often per run, and reports the shape of any tear. Ignored by default
+/// because it is a hunting tool: it either finds a real defect or costs
+/// wall clock, and neither belongs in a normal suite run.
+///
+/// Run it with:
+///   cargo test -p zyron-wire --test matview_test tear_hunt -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn tear_hunt_concurrent_refresh() {
+    const CYCLES: usize = 40;
+    const READERS: usize = 4;
+
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM t",
+    )
+    .await;
+    // The index is not implicated: the empty read reproduces at the same
+    // rate with it dropped. It is kept so this mirrors the test it hunts for
+    exec(
+        &server,
+        &mut session,
+        "CREATE UNIQUE INDEX mv_id ON mv (id)",
+    )
+    .await;
+
+    // Two states the view alternates between. Every read must land on one
+    // of them exactly, whichever refresh is in flight
+    let low: Vec<i64> = vec![10, 20, 30];
+    let high: Vec<i64> = vec![1010, 1020, 1030];
+
+    for cycle in 0..CYCLES {
+        let going_high = cycle % 2 == 0;
+        let delta = if going_high { "+ 1000" } else { "- 1000" };
+        exec(
+            &server,
+            &mut session,
+            &format!("UPDATE t SET v = v {delta}"),
+        )
+        .await;
+
+        let refresher = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let mut session = new_session();
+                exec(
+                    &server,
+                    &mut session,
+                    "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+                )
+                .await;
+            })
+        };
+
+        let mut readers = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let server = Arc::clone(&server);
+            let low = low.clone();
+            let high = high.clone();
+            readers.push(tokio::spawn(async move {
+                let mut session = new_session();
+                for _ in 0..60 {
+                    let mut vs = col_i64(&exec(&server, &mut session, "SELECT v FROM mv").await, 0);
+                    vs.sort_unstable();
+                    if vs != low && vs != high {
+                        // Immediately read again. If the rows are back, the
+                        // state was never wrong and one scan failed to see
+                        // them, which points at the scan. If it is still
+                        // empty, the refresh really did leave it that way
+                        let mut again =
+                            col_i64(&exec(&server, &mut session, "SELECT v FROM mv").await, 0);
+                        again.sort_unstable();
+                        // The base table too. If `t` also reads empty then
+                        // the refresh read nothing to copy, and the fault is
+                        // a committed table scanning as empty rather than
+                        // anything specific to the view
+                        let mut base =
+                            col_i64(&exec(&server, &mut session, "SELECT v FROM t").await, 0);
+                        base.sort_unstable();
+                        let from_low: Vec<i64> =
+                            vs.iter().copied().filter(|v| low.contains(v)).collect();
+                        let from_high: Vec<i64> =
+                            vs.iter().copied().filter(|v| high.contains(v)).collect();
+                        let foreign: Vec<i64> = vs
+                            .iter()
+                            .copied()
+                            .filter(|v| !low.contains(v) && !high.contains(v))
+                            .collect();
+                        panic!(
+                            "cycle {cycle}: a reader saw a partial refresh state: {vs:?}\n  \
+                             rows: {} (each state has 3)\n  \
+                             from low: {from_low:?}\n  from high: {from_high:?}\n  \
+                             from neither: {foreign:?}\n  \
+                             immediate re-read of mv: {again:?}\n  \
+                             base table t reads: {base:?}",
+                            vs.len()
+                        );
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        refresher.await.expect("refresh task");
+        for reader in readers {
+            reader.await.expect("reader task");
+        }
+    }
 }

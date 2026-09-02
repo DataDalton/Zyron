@@ -600,9 +600,30 @@ impl CdcStreamManager {
             let mut data = Vec::new();
             file.read_to_end(&mut data)?;
             if !data.is_empty() {
-                let list: Vec<CdcOutputStream> = serde_json::from_slice(&data).map_err(|e| {
-                    ZyronError::CdcStreamError(format!("failed to parse stream state: {e}"))
+                let parsed = zyron_common::format::envelope::decode_as(
+                    &data,
+                    zyron_common::format::FormatKind::StreamingCdcCheckpoint,
+                )
+                .map_err(|e| {
+                    ZyronError::CdcStreamError(format!(
+                        "stream checkpoint {}, {e}",
+                        state_file.display()
+                    ))
                 })?;
+                if parsed.header.version != crate::format::CDC_CHECKPOINT_FORMAT_VERSION {
+                    return Err(ZyronError::CdcStreamError(format!(
+                        "stream checkpoint is at format version {}, this binary writes and \
+                         reads {}. Upgrade through a release that still reads {} to move it \
+                         forward first",
+                        parsed.header.version,
+                        crate::format::CDC_CHECKPOINT_FORMAT_VERSION,
+                        parsed.header.version
+                    )));
+                }
+                let list: Vec<CdcOutputStream> =
+                    serde_json::from_slice(parsed.body).map_err(|e| {
+                        ZyronError::CdcStreamError(format!("failed to parse stream state: {e}"))
+                    })?;
                 for stream in list {
                     let _ = streams.insert_sync(stream.name.clone(), stream);
                 }
@@ -678,9 +699,17 @@ impl CdcStreamManager {
     /// Persists stream state to disk using atomic rename.
     fn persist(&self) -> Result<()> {
         let streams = self.list_streams();
-        let data = serde_json::to_vec(&streams).map_err(|e| {
+        let body = serde_json::to_vec(&streams).map_err(|e| {
             ZyronError::CdcStreamError(format!("failed to serialize stream state: {e}"))
         })?;
+        // Stream progress is a checkpoint: the envelope names the format and
+        // the version, and a checkpoint that does not parse is refused rather
+        // than partly applied
+        let data = zyron_common::format::envelope::encode(
+            zyron_common::format::FormatKind::StreamingCdcCheckpoint,
+            crate::format::CDC_CHECKPOINT_FORMAT_VERSION,
+            &body,
+        );
 
         let tmp_path = self.state_file.with_extension("zystreams.tmp");
         {

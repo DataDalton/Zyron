@@ -1,11 +1,12 @@
 //! WAL log record format.
 
 use crate::constants::{
-    CHECKSUM_SIZE, HEADER_SIZE, MAX_PAYLOAD_SIZE, OFF_FLAGS, OFF_LSN, OFF_PAYLOAD_LEN,
-    OFF_PREV_LSN, OFF_RECORD_TYPE, OFF_TXN_ID,
+    CHECKSUM_SIZE, HEADER_SIZE, MAX_PAYLOAD_SIZE, OFF_LSN, OFF_PAYLOAD_LEN, OFF_PREV_LSN,
+    OFF_RECORD_TYPE, OFF_RECORD_VERSION, OFF_TXN_ID,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
+use zyron_common::format::RecordVersion;
 use zyron_common::zerocopy::{AsBytes, FromBytes};
 use zyron_common::{Result, ZyronError};
 
@@ -18,7 +19,7 @@ struct PackedHeader {
     prev_lsn: u64,
     txn_id: u64,
     record_type: u8,
-    flags: u8,
+    record_version: u8,
     payload_len: u16,
 }
 
@@ -181,7 +182,7 @@ impl TryFrom<u8> for LogRecordType {
 ///   - prev_lsn: 8 bytes (for transaction chaining)
 ///   - txn_id: 8 bytes
 ///   - record_type: 1 byte
-///   - flags: 1 byte
+///   - record_version: 1 byte
 ///   - payload_len: 2 bytes
 /// - payload: variable length
 /// - checksum: 4 bytes (custom WAL checksum of header + payload)
@@ -195,8 +196,10 @@ pub struct LogRecord {
     pub txn_id: u64,
     /// Type of this record.
     pub record_type: LogRecordType,
-    /// Record flags.
-    pub flags: u8,
+    /// Version tag of this record's payload encoding. Written as the raw
+    /// byte so the header stays a single memcpy, read back through
+    /// `version` when the tag has to be checked.
+    pub record_version: u8,
     /// Record payload.
     pub payload: Bytes,
 }
@@ -221,7 +224,7 @@ impl LogRecord {
             prev_lsn,
             txn_id,
             record_type,
-            flags: 0,
+            record_version: crate::format::WAL_RECORD_VERSION_BYTE,
             payload,
         }
     }
@@ -256,6 +259,36 @@ impl LogRecord {
         HEADER_SIZE + self.payload.len() + CHECKSUM_SIZE
     }
 
+    /// The record's version tag, refusing the reserved zero and any version
+    /// this binary carries no reader for.
+    ///
+    /// Recovery calls this once per record it is about to interpret. A
+    /// segment written across a rolling upgrade holds records of more than
+    /// one version, so the tag decides which payload shape to read rather
+    /// than the segment header doing it for the whole file.
+    #[inline]
+    pub fn version(&self) -> Result<RecordVersion> {
+        let Some(tag) = RecordVersion::new(self.record_version) else {
+            return Err(ZyronError::WalCorrupted {
+                lsn: self.lsn.0,
+                reason: "record carries no version tag".to_string(),
+            });
+        };
+        if tag > crate::format::WAL_RECORD_VERSION {
+            return Err(ZyronError::WalCorrupted {
+                lsn: self.lsn.0,
+                reason: format!(
+                    "record is at version {}, this binary reads up to {}. Upgrade through \
+                     a release that still reads {} to replay this segment",
+                    tag.get(),
+                    crate::format::WAL_RECORD_VERSION.get(),
+                    tag.get()
+                ),
+            });
+        }
+        Ok(tag)
+    }
+
     /// Serializes this record to bytes.
     #[inline]
     pub fn serialize(&self) -> Bytes {
@@ -274,7 +307,7 @@ impl LogRecord {
             self.prev_lsn.0,
             self.txn_id,
             self.record_type as u8,
-            self.flags,
+            self.record_version,
             payload_len,
         );
         hasher.write_payload(&self.payload);
@@ -285,7 +318,7 @@ impl LogRecord {
         buf.put_u64_le(self.prev_lsn.0);
         buf.put_u64_le(self.txn_id);
         buf.put_u8(self.record_type as u8);
-        buf.put_u8(self.flags);
+        buf.put_u8(self.record_version);
         buf.put_u16_le(payload_len);
 
         // Write payload
@@ -319,7 +352,7 @@ impl LogRecord {
             data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
         ]);
         let record_type = LogRecordType::try_from(data[24])?;
-        let flags = data[25];
+        let record_version = data[25];
         let payload_len = u16::from_le_bytes([data[26], data[27]]) as usize;
 
         if payload_len > MAX_PAYLOAD_SIZE {
@@ -366,7 +399,7 @@ impl LogRecord {
             prev_lsn,
             txn_id,
             record_type,
-            flags,
+            record_version,
             payload,
         })
     }
@@ -418,13 +451,13 @@ impl LogRecord {
 
         while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
             // SAFETY: bounds check above ensures we can read HEADER_SIZE bytes
-            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, record_version, payload_len) = unsafe {
                 let ptr = base_ptr.add(offset);
                 let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
                 let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
                 let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
                 let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
-                let flags = *ptr.add(OFF_FLAGS);
+                let record_version = *ptr.add(OFF_RECORD_VERSION);
                 let payload_len =
                     std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
                 (
@@ -432,7 +465,7 @@ impl LogRecord {
                     u64::from_le(prev_lsn_raw),
                     u64::from_le(txn_id),
                     record_type_byte,
-                    flags,
+                    record_version,
                     payload_len,
                 )
             };
@@ -496,7 +529,7 @@ impl LogRecord {
                 prev_lsn: Lsn(prev_lsn_raw),
                 txn_id,
                 record_type,
-                flags,
+                record_version,
                 payload,
             });
 
@@ -517,13 +550,13 @@ impl LogRecord {
         let base_ptr = data.as_ptr();
 
         while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
-            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, record_version, payload_len) = unsafe {
                 let ptr = base_ptr.add(offset);
                 let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
                 let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
                 let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
                 let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
-                let flags = *ptr.add(OFF_FLAGS);
+                let record_version = *ptr.add(OFF_RECORD_VERSION);
                 let payload_len =
                     std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
                 (
@@ -531,7 +564,7 @@ impl LogRecord {
                     u64::from_le(prev_lsn_raw),
                     u64::from_le(txn_id),
                     record_type_byte,
-                    flags,
+                    record_version,
                     payload_len,
                 )
             };
@@ -558,7 +591,7 @@ impl LogRecord {
                 prev_lsn: Lsn(prev_lsn_raw),
                 txn_id,
                 record_type,
-                flags,
+                record_version,
                 payload,
             });
 
@@ -585,13 +618,13 @@ impl LogRecord {
 
         while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
             // SAFETY: bounds check above ensures we can read HEADER_SIZE bytes.
-            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, record_version, payload_len) = unsafe {
                 let ptr = base_ptr.add(offset);
                 let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
                 let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
                 let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
                 let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
-                let flags = *ptr.add(OFF_FLAGS);
+                let record_version = *ptr.add(OFF_RECORD_VERSION);
                 let payload_len =
                     std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
                 (
@@ -599,7 +632,7 @@ impl LogRecord {
                     u64::from_le(prev_lsn_raw),
                     u64::from_le(txn_id),
                     record_type_byte,
-                    flags,
+                    record_version,
                     payload_len,
                 )
             };
@@ -657,7 +690,7 @@ impl LogRecord {
                 prev_lsn: Lsn(prev_lsn_raw),
                 txn_id,
                 record_type,
-                flags,
+                record_version,
                 payload,
             });
 
@@ -677,7 +710,7 @@ pub struct LazyLogRecord {
     pub prev_lsn: Lsn,
     pub txn_id: u64,
     pub record_type: LogRecordType,
-    pub flags: u8,
+    pub record_version: u8,
     /// Offset of the payload within the original Bytes buffer.
     payload_offset: u32,
     /// Length of the payload.
@@ -713,13 +746,13 @@ pub fn parse_all_lazy(data: Bytes) -> (Bytes, Vec<LazyLogRecord>) {
     let base_ptr = data.as_ptr();
 
     while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
-        let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+        let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, record_version, payload_len) = unsafe {
             let ptr = base_ptr.add(offset);
             let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
             let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
             let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u64);
             let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
-            let flags = *ptr.add(OFF_FLAGS);
+            let record_version = *ptr.add(OFF_RECORD_VERSION);
             let payload_len =
                 std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
             (
@@ -727,7 +760,7 @@ pub fn parse_all_lazy(data: Bytes) -> (Bytes, Vec<LazyLogRecord>) {
                 u64::from_le(prev_lsn_raw),
                 u64::from_le(txn_id),
                 record_type_byte,
-                flags,
+                record_version,
                 payload_len,
             )
         };
@@ -747,7 +780,7 @@ pub fn parse_all_lazy(data: Bytes) -> (Bytes, Vec<LazyLogRecord>) {
             prev_lsn: Lsn(prev_lsn_raw),
             txn_id,
             record_type,
-            flags,
+            record_version,
             payload_offset: (offset + HEADER_SIZE) as u32,
             payload_len: payload_len as u16,
         });
@@ -783,7 +816,7 @@ pub unsafe fn serialize_raw(
     prev_lsn: Lsn,
     txn_id: u64,
     record_type: u8,
-    flags: u8,
+    record_version: u8,
     payload: &[u8],
 ) -> usize {
     use crate::checksum::WalHasher;
@@ -800,7 +833,14 @@ pub unsafe fn serialize_raw(
 
     // Compute checksum from field values, not from the output buffer
     let mut hasher = WalHasher::new(data_len);
-    hasher.write_header_fields(lsn.0, prev_lsn.0, txn_id, record_type, flags, payload_len);
+    hasher.write_header_fields(
+        lsn.0,
+        prev_lsn.0,
+        txn_id,
+        record_type,
+        record_version,
+        payload_len,
+    );
     hasher.write_payload(payload);
     let checksum = hasher.finish();
 
@@ -809,7 +849,7 @@ pub unsafe fn serialize_raw(
         prev_lsn: prev_lsn.0.to_le(),
         txn_id: txn_id.to_le(),
         record_type,
-        flags,
+        record_version,
         payload_len: payload_len.to_le(),
     };
 
@@ -845,7 +885,7 @@ pub unsafe fn serialize_raw_deferred(
     prev_lsn: Lsn,
     txn_id: u64,
     record_type: u8,
-    flags: u8,
+    record_version: u8,
     payload: &[u8],
 ) -> usize {
     debug_assert!(
@@ -860,13 +900,13 @@ pub unsafe fn serialize_raw_deferred(
     // Direct unaligned writes from registers skip the intermediate
     // PackedHeader stack allocation + copy_from_slice that the previous
     // implementation went through. Each write becomes a single MOV on x86.
-    // Header layout: lsn(8) prev_lsn(8) txn_id(8) record_type(1) flags(1) payload_len(2) = 28 bytes.
+    // Header layout: lsn(8) prev_lsn(8) txn_id(8) record_type(1) record_version(1) payload_len(2) = 28 bytes.
     unsafe {
         std::ptr::write_unaligned(buf as *mut u64, lsn.0.to_le());
         std::ptr::write_unaligned(buf.add(8) as *mut u64, prev_lsn.0.to_le());
         std::ptr::write_unaligned(buf.add(16) as *mut u64, txn_id.to_le());
         *buf.add(24) = record_type;
-        *buf.add(25) = flags;
+        *buf.add(25) = record_version;
         std::ptr::write_unaligned(buf.add(26) as *mut u16, payload_len.to_le());
 
         // Payload copy. Nonoverlapping because `buf` is writer-owned space in

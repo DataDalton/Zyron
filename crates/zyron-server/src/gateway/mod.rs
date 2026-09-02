@@ -21,6 +21,7 @@ pub mod response;
 pub mod router;
 pub mod sse;
 pub mod streaming_endpoint;
+pub mod upgrade_endpoint;
 pub mod websocket;
 
 pub use admin::{

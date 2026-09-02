@@ -1,0 +1,98 @@
+{
+  "id": "2026-09-01_151840_50518fd-local",
+  "date": "2026-09-01 15:18:59Z",
+  "ts": 1788275939,
+  "commit": "50518fd-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "optimizer": {
+      "analyze_1m_ms": {
+        "average": 135.592800,
+        "runs": [135.07, 135.96, 135.29, 135.41, 136.24],
+        "target": 400.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "cardinality_accuracy_ratio": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "encoding_pushdown_speedup_x": {
+        "average": 30.578262,
+        "runs": [30.58, 30.58, 30.58, 30.58, 30.58],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "explain_analyze_overhead_pct": {
+        "average": 30.969507,
+        "runs": [32.01, 30.28, 29.10, 31.25, 32.21],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "explain_latency_us": {
+        "average": 7.198796,
+        "runs": [2.58, 5.10, 8.65, 10.00, 9.66],
+        "target": 20.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "histogram_build_1m_ms": {
+        "average": 9.135880,
+        "runs": [6.57, 9.84, 10.76, 9.62, 8.89],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "parallel_plan_selection_us": {
+        "average": 0.082394,
+        "runs": [0.08, 0.08, 0.08, 0.08, 0.09],
+        "target": 50.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "selectivity_estimate_ns": {
+        "average": 1797.731240,
+        "runs": [1932.53, 1930.53, 1939.43, 1256.06, 1930.11],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "auto_analyze_trigger_ms": {
+        "average": 23.557620,
+        "runs": [22.81, 24.18, 22.36, 24.68, 23.75],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

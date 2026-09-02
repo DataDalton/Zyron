@@ -14,31 +14,31 @@
   <line x1="70" y1="60.0" x2="930" y2="60.0" stroke="#30363d" stroke-width="1"/>
   <text x="62" y="64.0" text-anchor="end" fill="#8b949e" font-size="11">180</text>
   <text x="62" y="52" text-anchor="end" fill="#8b949e" font-size="11">M ops/sec</text>
-  <rect x="93.8" y="282.6" width="48.0" height="67.4" fill="#1f6feb" rx="2"/>
-  <text x="117.8" y="278.6" text-anchor="middle" fill="#e6edf3" font-size="10">41.8</text>
+  <rect x="93.8" y="284.5" width="48.0" height="65.5" fill="#1f6feb" rx="2"/>
+  <text x="117.8" y="280.5" text-anchor="middle" fill="#e6edf3" font-size="10">40.6</text>
   <text x="117.8" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">B+tree insert</text>
-  <rect x="189.3" y="301.2" width="48.0" height="48.8" fill="#1f6feb" rx="2"/>
-  <text x="213.3" y="297.2" text-anchor="middle" fill="#e6edf3" font-size="10">30.3</text>
+  <rect x="189.3" y="301.5" width="48.0" height="48.5" fill="#1f6feb" rx="2"/>
+  <text x="213.3" y="297.5" text-anchor="middle" fill="#e6edf3" font-size="10">30.1</text>
   <text x="213.3" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">B+tree delete</text>
-  <rect x="284.9" y="338.8" width="48.0" height="11.2" fill="#1f6feb" rx="2"/>
-  <text x="308.9" y="334.8" text-anchor="middle" fill="#e6edf3" font-size="10">6.9</text>
+  <rect x="284.9" y="336.3" width="48.0" height="13.7" fill="#1f6feb" rx="2"/>
+  <text x="308.9" y="332.3" text-anchor="middle" fill="#e6edf3" font-size="10">8.5</text>
   <text x="308.9" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Hash join build</text>
   <rect x="380.4" y="97.7" width="48.0" height="252.3" fill="#1f6feb" rx="2"/>
   <text x="404.4" y="93.7" text-anchor="middle" fill="#e6edf3" font-size="10">156.6</text>
   <text x="404.4" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">SCD-2 merge</text>
-  <rect x="476.0" y="310.5" width="48.0" height="39.5" fill="#1f6feb" rx="2"/>
-  <text x="500.0" y="306.5" text-anchor="middle" fill="#e6edf3" font-size="10">24.5</text>
+  <rect x="476.0" y="311.9" width="48.0" height="38.1" fill="#1f6feb" rx="2"/>
+  <text x="500.0" y="307.9" text-anchor="middle" fill="#e6edf3" font-size="10">23.6</text>
   <text x="500.0" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">COPY FROM</text>
-  <rect x="571.6" y="322.2" width="48.0" height="27.8" fill="#1f6feb" rx="2"/>
-  <text x="595.6" y="318.2" text-anchor="middle" fill="#e6edf3" font-size="10">17.3</text>
+  <rect x="571.6" y="321.4" width="48.0" height="28.6" fill="#1f6feb" rx="2"/>
+  <text x="595.6" y="317.4" text-anchor="middle" fill="#e6edf3" font-size="10">17.8</text>
   <text x="595.6" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Row serialize</text>
-  <rect x="667.1" y="345.7" width="48.0" height="4.3" fill="#1f6feb" rx="2"/>
-  <text x="691.1" y="341.7" text-anchor="middle" fill="#e6edf3" font-size="10">2.7</text>
+  <rect x="667.1" y="349.8" width="48.0" height="0.2" fill="#1f6feb" rx="2"/>
+  <text x="691.1" y="345.8" text-anchor="middle" fill="#e6edf3" font-size="10">0.1</text>
   <text x="691.1" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">SQL parse</text>
-  <rect x="762.7" y="341.1" width="48.0" height="8.9" fill="#1f6feb" rx="2"/>
-  <text x="786.7" y="337.1" text-anchor="middle" fill="#e6edf3" font-size="10">5.5</text>
+  <rect x="762.7" y="348.7" width="48.0" height="1.3" fill="#1f6feb" rx="2"/>
+  <text x="786.7" y="344.7" text-anchor="middle" fill="#e6edf3" font-size="10">0.8</text>
   <text x="786.7" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">TTL purge</text>
-  <rect x="858.2" y="277.5" width="48.0" height="72.5" fill="#1f6feb" rx="2"/>
-  <text x="882.2" y="273.5" text-anchor="middle" fill="#e6edf3" font-size="10">45.0</text>
+  <rect x="858.2" y="313.9" width="48.0" height="36.1" fill="#1f6feb" rx="2"/>
+  <text x="882.2" y="309.9" text-anchor="middle" fill="#e6edf3" font-size="10">22.4</text>
   <text x="882.2" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Archive</text>
 </svg>

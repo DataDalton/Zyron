@@ -8,6 +8,7 @@ pub mod derived_columns;
 pub mod executor;
 pub mod expectation_results;
 pub mod expr;
+pub mod format;
 pub mod lake_stats;
 pub mod media_runtime;
 pub mod nested_codec;

@@ -14,6 +14,7 @@ pub mod descriptor;
 pub mod document;
 pub mod error;
 pub mod external;
+pub mod format;
 pub mod image_meta;
 pub mod image_ops;
 pub mod presign;

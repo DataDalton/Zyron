@@ -47,6 +47,7 @@ async fn audit(
         detail: detail.to_string(),
         prev_hash: 0,
         entry_hash: 0,
+        record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
     };
     server
         .catalog

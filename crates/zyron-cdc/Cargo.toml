@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 zyron-auth = { path = "../zyron-auth" }
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 zyron-wal = { path = "../zyron-wal" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-catalog = { path = "../zyron-catalog" }

@@ -111,6 +111,30 @@ pub fn try_handle_ddl_utility<'a>(
             Box::pin(async move { Some(handle_drop_foreign_table(s, server, session).await) })
         }
 
+        // The format substrate answers from its registries rather than from
+        // the catalog, so it is dispatched here
+        Statement::SetSignatureScheme(s) => {
+            Box::pin(async move { Some(crate::format_dispatch::handle_set_signature_scheme(s)) })
+        }
+        Statement::RotateSignatureScheme(s) => {
+            Box::pin(async move { Some(crate::format_dispatch::handle_rotate_signature_scheme(s)) })
+        }
+        Statement::RotateServicePrincipalKey(s) => Box::pin(async move {
+            Some(crate::format_dispatch::handle_rotate_service_principal_key(s).await)
+        }),
+        Statement::ListRegistry(s) => {
+            Box::pin(async move { Some(crate::format_dispatch::handle_list_registry(s)) })
+        }
+        Statement::TriggerUpgrade(s) => {
+            Box::pin(async move { Some(crate::format_dispatch::handle_trigger_upgrade(s)) })
+        }
+        Statement::ShowUpgrade(s) => {
+            Box::pin(async move { Some(crate::format_dispatch::handle_show_upgrade(s)) })
+        }
+        Statement::ExplainRewrite(s) => {
+            Box::pin(async move { Some(crate::format_dispatch::handle_explain_rewrite(s, server)) })
+        }
+
         // Session commands handled by try_handle_session_command
         Statement::SetVariable(_)
         | Statement::Show(_)
@@ -4981,7 +5005,19 @@ async fn reclaim_table_storage(
                 );
             }
         }
-        if let Err(e) = std::fs::remove_dir_all(paths.root()) {
+        // A lake root holds every data file the table ever wrote, so the
+        // recursive removal is unbounded in the number of unlinks. It goes
+        // to the blocking pool rather than holding a runtime worker for the
+        // whole walk while other connections wait behind it
+        let lake_root = paths.root().to_path_buf();
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&lake_root))
+            .await
+            .map_err(|e| {
+                ProtocolError::Database(ZyronError::Internal(format!(
+                    "lake root removal task failed, {e}"
+                )))
+            })?;
+        if let Err(e) = removed {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::error!(
                     target: "zyron::ddl",
@@ -5009,32 +5045,56 @@ async fn reclaim_table_storage(
         let patch_path = columnar_dir
             .as_ref()
             .map(|d| d.join(format!("{}.zyrpatch", columnar_table_id)));
-        for seg in &r.columnar_segments {
-            let seg_path = std::path::Path::new(&seg.path);
-            if let Err(e) = std::fs::remove_file(seg_path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::error!(
-                        target: "zyron::ddl",
-                        segment = %seg.path,
-                        "table drop failed to remove columnar segment: {e}"
-                    );
-                    return Err(ProtocolError::Database(ZyronError::IoError(format!(
-                        "table drop failed to remove columnar segment {}: {e}",
-                        seg.path
-                    ))));
+        // Two unlinks per segment, so the cost scales with the table. They
+        // run as one batch on the blocking pool instead of holding a runtime
+        // worker across every unlink. A missing segment is not an error, the
+        // files are already unreachable once the catalog row is gone
+        let segment_paths: Vec<String> =
+            r.columnar_segments.iter().map(|s| s.path.clone()).collect();
+        let unlink_failures = tokio::task::spawn_blocking(move || {
+            let mut hard_failure = None;
+            let mut sidecar_failures = Vec::new();
+            for path in &segment_paths {
+                let seg_path = std::path::Path::new(path);
+                if let Err(e) = std::fs::remove_file(seg_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound && hard_failure.is_none() {
+                        hard_failure = Some((path.clone(), e.to_string()));
+                    }
+                }
+                let rids = seg_path.with_extension("zyrrids");
+                if let Err(e) = std::fs::remove_file(&rids) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        sidecar_failures.push((path.clone(), e.to_string()));
+                    }
                 }
             }
-            let rids = seg_path.with_extension("zyrrids");
-            if let Err(e) = std::fs::remove_file(&rids) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        target: "zyron::ddl",
-                        segment = %seg.path,
-                        "table drop failed to remove RID sidecar: {e}"
-                    );
-                }
-            }
-            if let Some(pp) = &patch_path {
+            (hard_failure, sidecar_failures)
+        })
+        .await
+        .map_err(|e| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "columnar reclaim task failed, {e}"
+            )))
+        })?;
+        for (segment, error) in &unlink_failures.1 {
+            tracing::warn!(
+                target: "zyron::ddl",
+                segment = %segment,
+                "table drop failed to remove RID sidecar: {error}"
+            );
+        }
+        if let Some((segment, error)) = unlink_failures.0 {
+            tracing::error!(
+                target: "zyron::ddl",
+                segment = %segment,
+                "table drop failed to remove columnar segment: {error}"
+            );
+            return Err(ProtocolError::Database(ZyronError::IoError(format!(
+                "table drop failed to remove columnar segment {segment}: {error}"
+            ))));
+        }
+        if let Some(pp) = &patch_path {
+            for seg in &r.columnar_segments {
                 store
                     .drop_file(seg.file_id, pp)
                     .map_err(ProtocolError::Database)?;

@@ -26,8 +26,9 @@ pub const OFF_TXN_ID: usize = 16;
 /// Offset of record type field in header.
 pub const OFF_RECORD_TYPE: usize = 24;
 
-/// Offset of flags field in header.
-pub const OFF_FLAGS: usize = 25;
+/// Offset of the record version tag in header. Each record carries its own
+/// version so one segment can hold records written across a rolling upgrade.
+pub const OFF_RECORD_VERSION: usize = 25;
 
 /// Offset of payload length field in header.
 pub const OFF_PAYLOAD_LEN: usize = 26;

@@ -2966,6 +2966,7 @@ impl Catalog {
         self.purge_table_triggers(id, &triggers).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
+        self.remove_stats(id);
         Ok(DropOutcome {
             soft_dropped: false,
             table_id: id,
@@ -6240,6 +6241,117 @@ impl Catalog {
     /// refcount bump, never a copy of the stats payload.
     pub fn get_stats(&self, table_id: TableId) -> Option<Arc<(TableStats, Vec<ColumnStats>)>> {
         self.stats.read().get(&table_id).cloned()
+    }
+
+    /// Directory statistics files live in, when the storage has a data
+    /// directory. A storage without one keeps statistics in memory only
+    fn stats_dir(&self) -> Option<std::path::PathBuf> {
+        self.storage
+            .data_dir()
+            .map(|d| d.join(crate::statistics::STATISTICS_DIR))
+    }
+
+    /// Stores statistics and writes them to disk so a restart reads back
+    /// what the last ANALYZE learned.
+    ///
+    /// The in-memory map is updated first, so a reader sees the new numbers
+    /// the moment ANALYZE finishes rather than waiting on the write. The
+    /// serialization runs here and only the write and its fsync go to the
+    /// blocking pool, which keeps an async worker off a device-bound call
+    pub async fn persist_stats(
+        &self,
+        table_id: TableId,
+        table_stats: TableStats,
+        column_stats: Vec<ColumnStats>,
+    ) -> Result<()> {
+        let encoded = match self.stats_dir() {
+            Some(dir) => Some((dir, crate::statistics::encode(&table_stats, &column_stats)?)),
+            None => None,
+        };
+        self.put_stats(table_id, table_stats, column_stats);
+        let Some((dir, bytes)) = encoded else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::statistics::write_encoded(&dir, table_id, &bytes)
+        })
+        .await
+        .map_err(|e| ZyronError::Internal(format!("statistics write task failed, {e}")))?
+    }
+
+    /// Reads persisted statistics back into memory, returning how many
+    /// tables were restored.
+    ///
+    /// Called once at startup after tables are loaded, so the first plans
+    /// after a reboot cost what the last ANALYZE measured instead of the
+    /// no-statistics default. A file whose table is gone is deleted rather
+    /// than loaded, which is how a drop that crashed before its unlink gets
+    /// cleaned up
+    pub async fn load_persisted_stats(&self) -> Result<usize> {
+        let Some(dir) = self.stats_dir() else {
+            return Ok(0);
+        };
+        let sweep_dir = dir.clone();
+        let loaded = tokio::task::spawn_blocking(move || crate::statistics::read_all(&sweep_dir))
+            .await
+            .map_err(|e| ZyronError::Internal(format!("statistics read task failed, {e}")))?;
+
+        // Partition before taking the stats lock, so the table lookups never
+        // run underneath it
+        let mut live = Vec::with_capacity(loaded.len());
+        let mut stale = Vec::new();
+        for (table_id, table_stats, column_stats) in loaded {
+            if self.get_table_by_id(table_id).is_ok() {
+                live.push((table_id, table_stats, column_stats));
+            } else {
+                stale.push(table_id);
+            }
+        }
+
+        let restored = live.len();
+        {
+            let mut guard = self.stats.write();
+            for (table_id, table_stats, column_stats) in live {
+                guard.insert(table_id, Arc::new((table_stats, column_stats)));
+            }
+        }
+
+        if !stale.is_empty() {
+            let count = stale.len();
+            tokio::task::spawn_blocking(move || {
+                for table_id in stale {
+                    crate::statistics::remove_statistics_file(&dir, table_id);
+                }
+            })
+            .await
+            .map_err(|e| ZyronError::Internal(format!("statistics sweep task failed, {e}")))?;
+            tracing::debug!(
+                count,
+                "removed statistics files for tables that no longer exist"
+            );
+        }
+
+        Ok(restored)
+    }
+
+    /// Drops a table's statistics from memory and from disk, which DROP
+    /// TABLE does so the next table to take that id never reads them.
+    ///
+    /// The unlink is not fsynced. A crash losing it leaves a file whose
+    /// table is gone, and the next startup load deletes it
+    pub fn remove_stats(&self, table_id: TableId) {
+        // The unlink runs only for a table that actually had statistics.
+        // Startup loads every file into the map and sweeps the ones whose
+        // table is gone, so an absent entry means an absent file, and DROP
+        // TABLE is a latency path that should not pay a syscall to discover
+        // that. A memory-only entry costs one failed unlink, which is the
+        // rare case rather than every drop
+        if self.stats.write().remove(&table_id).is_none() {
+            return;
+        }
+        if let Some(dir) = self.stats_dir() {
+            crate::statistics::remove_statistics_file(&dir, table_id);
+        }
     }
 
     // -----------------------------------------------------------------------

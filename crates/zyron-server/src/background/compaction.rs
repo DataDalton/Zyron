@@ -431,17 +431,17 @@ impl CompactionWorker {
         btree_indexes: Option<&Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>>,
         gate: Option<&CompactionGate>,
     ) -> (u64, u64) {
-        let active_txns = txn_manager.active_txn_ids();
-        let oldest_active = if active_txns.is_empty() {
-            txn_manager.next_txn_id()
-        } else {
-            active_txns[0]
-        };
+        // Taken over published visibility floors, not the oldest active txn
+        // id: a committed deleter can sit below the oldest active id while a
+        // live reader that started before it committed still sees its rows
+        let prune_horizon = txn_manager.prune_horizon();
 
         let tables = catalog.list_all_tables();
         let mut total_rows = 0u64;
         let mut total_segments = 0u64;
-        let no_active = active_txns.is_empty();
+        // Separate question from the horizon: whether anything was running at
+        // all, which decides if a pass that did no work counts as clean
+        let no_active = txn_manager.active_txn_ids().is_empty();
         // Per table gated this cycle: the write count sampled before the
         // fold and whether any pass did work. Filled only when a gate is
         // supplied, and consumed after the merge pass below
@@ -467,7 +467,7 @@ impl CompactionWorker {
                 rt,
                 catalog,
                 table,
-                oldest_active,
+                prune_horizon,
                 txn_manager.lock_table(),
                 disk_manager,
                 buffer_pool,
@@ -530,7 +530,7 @@ impl CompactionWorker {
                 rt,
                 catalog,
                 table.id,
-                oldest_active,
+                prune_horizon,
                 floor,
                 txn_manager.status_map(),
                 wal,
@@ -566,7 +566,11 @@ impl CompactionWorker {
                         clean.insert(*id, *writes);
                     }
                 }
-                clean.retain(|id, _| tables.iter().any(|t| t.id.0 == *id));
+                // Set membership rather than a scan per entry, which would
+                // be quadratic in the number of tables every cycle
+                let live_ids: std::collections::HashSet<u32> =
+                    tables.iter().map(|t| t.id.0).collect();
+                clean.retain(|id, _| live_ids.contains(id));
             }
         }
         (total_rows, total_segments)
@@ -591,12 +595,7 @@ impl CompactionWorker {
         if te.columnar.segments.is_empty() {
             return Ok(());
         }
-        let active = txn_manager.active_txn_ids();
-        let oldest_active = if active.is_empty() {
-            txn_manager.next_txn_id()
-        } else {
-            active[0]
-        };
+        let prune_horizon = txn_manager.prune_horizon();
         let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
@@ -611,7 +610,7 @@ impl CompactionWorker {
             rt,
             catalog,
             table_id,
-            oldest_active,
+            prune_horizon,
             floor,
             txn_manager.status_map(),
             wal,
@@ -639,17 +638,12 @@ impl CompactionWorker {
         let te = catalog
             .get_table_by_id(table_id)
             .map_err(|e| format!("table reload: {}", e))?;
-        let active = txn_manager.active_txn_ids();
-        let oldest_active = if active.is_empty() {
-            txn_manager.next_txn_id()
-        } else {
-            active[0]
-        };
+        let prune_horizon = txn_manager.prune_horizon();
         Ok(Self::compact_table(
             rt,
             catalog,
             te.as_ref(),
-            oldest_active,
+            prune_horizon,
             txn_manager.lock_table(),
             disk_manager,
             buffer_pool,
@@ -672,7 +666,7 @@ impl CompactionWorker {
         rt: &tokio::runtime::Runtime,
         catalog: &Catalog,
         table_id: zyron_catalog::TableId,
-        oldest_active: u64,
+        prune_horizon: u64,
         floor: u64,
         status_map: &zyron_storage::TxnStatusMap,
         wal: &Arc<WalWriter>,
@@ -701,7 +695,7 @@ impl CompactionWorker {
         let reclaimable = |xid: u64| status_map.is_reclaimable_below(xid, floor);
         // Collapse only reclaimable value-patch history; within-window patches
         // are preserved so a retained version still sees the pre-patch value.
-        store.trim_below(oldest_active, reclaimable);
+        store.trim_below(prune_horizon, reclaimable);
         if store.is_empty() {
             return Ok(false);
         }
@@ -725,15 +719,15 @@ impl CompactionWorker {
             if seg_overlay.is_empty() && branch_rows.is_empty() {
                 continue;
             }
-            // Settled check: every overlay xid for this file < oldest_active.
+            // Settled check: every overlay xid for this file < prune_horizon.
             let mut settled = true;
             for ov in seg_overlay.values() {
-                if ov.supersedes.iter().any(|x| *x >= oldest_active)
+                if ov.supersedes.iter().any(|x| *x >= prune_horizon)
                     || ov
                         .patches
                         .values()
                         .flatten()
-                        .any(|p| p.patch_xid >= oldest_active)
+                        .any(|p| p.patch_xid >= prune_horizon)
                 {
                     settled = false;
                     break;
@@ -809,7 +803,7 @@ impl CompactionWorker {
                         .map(|o| {
                             o.supersedes
                                 .iter()
-                                .any(|x| *x < oldest_active && reclaimable(*x))
+                                .any(|x| *x < prune_horizon && reclaimable(*x))
                         })
                         .unwrap_or(false);
                 if dead {
@@ -823,7 +817,7 @@ impl CompactionWorker {
                         o.supersedes
                             .iter()
                             .copied()
-                            .filter(|x| *x < oldest_active)
+                            .filter(|x| *x < prune_horizon)
                             .filter_map(|x| status_map.commit_lsn(x).map(|cl| (cl, x)))
                             .min()
                             .map(|(_, x)| x)
@@ -847,7 +841,7 @@ impl CompactionWorker {
                     if let Some(o) = ov {
                         if let Some(chain) = o.patches.get(&col_id) {
                             for p in chain {
-                                if p.patch_xid >= oldest_active {
+                                if p.patch_xid >= prune_horizon {
                                     continue;
                                 }
                                 if reclaimable(p.patch_xid) {
@@ -1081,7 +1075,7 @@ impl CompactionWorker {
                     shredded: seg.shredded.clone(),
                 });
                 fresh.columnar.next_file_id = fresh.columnar.next_file_id.max(new_file_id + 1);
-                fresh.columnar.low_water = oldest_active;
+                fresh.columnar.low_water = prune_horizon;
                 rt.block_on(catalog.update_table(fresh))
                     .map_err(|e| format!("registry: {}", e))?;
             }
@@ -1172,7 +1166,7 @@ impl CompactionWorker {
         rt: &tokio::runtime::Runtime,
         catalog: &Catalog,
         table: &TableEntry,
-        oldest_active: u64,
+        prune_horizon: u64,
         lock_table: &zyron_storage::LockTable,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
@@ -1256,9 +1250,9 @@ impl CompactionWorker {
                 let xmax = tuple_slot.header.xmax;
 
                 // Eligibility. This predicate is exactly
-                // Snapshot{txn_id = oldest_active}.is_visible(xmin, xmax) for
+                // Snapshot{txn_id = prune_horizon}.is_visible(xmin, xmax) for
                 // a row whose creator committed below the horizon: xmax == 0
-                // (not deleted), xmin in (0, oldest_active) (committed and
+                // (not deleted), xmin in (0, prune_horizon) (committed and
                 // visible to every current and future snapshot), and the
                 // tuple flags do not mark it deleted. It is the same MVCC
                 // oracle the heap scan uses. Aborted-creator tuples that the
@@ -1266,7 +1260,7 @@ impl CompactionWorker {
                 // undo, the documented honesty boundary, identical to how the
                 // heap scan itself behaves for such tuples.
                 let deleted = flags & 0x0001 != 0;
-                if deleted || xmax != 0 || xmin == 0 || (xmin as u64) >= oldest_active {
+                if deleted || xmax != 0 || xmin == 0 || (xmin as u64) >= prune_horizon {
                     continue;
                 }
 

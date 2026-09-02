@@ -39,6 +39,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam::channel::{Receiver, Sender, TryRecvError, unbounded};
 use zyron_common::checksum::hash32;
 use zyron_common::error::{Result, ZyronError};
+use zyron_common::format::envelope::{self, ENVELOPE_HEADER_LEN};
+use zyron_common::format::{FormatKind, FormatVersion, RecordVersion};
 
 use crate::NodeId;
 use crate::codec::{Cursor, put_bytes, put_str, put_u8, put_u64};
@@ -49,14 +51,17 @@ pub const LOG_FILE: &str = "raft.log";
 /// Where a compaction assembles the retained tail before the rename
 const LOG_TMP_FILE: &str = "raft.log.tmp";
 
-const FILE_MAGIC: [u8; 8] = *b"ZYRAFTLG";
-const FILE_VERSION: u32 = 1;
-/// magic 8, version 4, pad 4, base_index 8, prev_term 8
-const FILE_HEADER_LEN: usize = 32;
+/// Version the log file is written at, declared in the format registry
+const FILE_VERSION: FormatVersion = crate::format::RAFT_LOG_FORMAT_VERSION;
+/// Envelope header 20, base_index 8, prev_term 8
+const FILE_HEADER_LEN: usize = 36;
 
-const RECORD_MAGIC: u32 = 0x5A52_4C47;
-/// magic 4, payload_len 4, term 8, index 8, checksum 4
-const RECORD_HEADER_LEN: usize = 28;
+/// Version tag every record carries, so one log can hold records written
+/// across a rolling upgrade
+const RECORD_VERSION: RecordVersion = crate::format::RAFT_ENTRY_RECORD_VERSION;
+/// magic 4, record_version 1, pad 3, payload_len 4, term 8, index 8,
+/// checksum 4
+const RECORD_HEADER_LEN: usize = 32;
 
 /// Largest single command payload.
 ///
@@ -288,11 +293,13 @@ impl RaftLogEntry {
         let checksum =
             record_checksum(self.term, self.index, &buf[header_at + RECORD_HEADER_LEN..]);
         let header = &mut buf[header_at..header_at + RECORD_HEADER_LEN];
-        header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
-        header[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
-        header[8..16].copy_from_slice(&self.term.to_le_bytes());
-        header[16..24].copy_from_slice(&self.index.to_le_bytes());
-        header[24..28].copy_from_slice(&checksum.to_le_bytes());
+        header[0..4].copy_from_slice(&FormatKind::RaftLog.magic());
+        header[4] = RECORD_VERSION.get();
+        // 5..8 reserved, already zeroed
+        header[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        header[12..20].copy_from_slice(&self.term.to_le_bytes());
+        header[20..28].copy_from_slice(&self.index.to_le_bytes());
+        header[28..32].copy_from_slice(&checksum.to_le_bytes());
     }
 
     /// Reads one record, returning it with the number of bytes it occupied
@@ -302,13 +309,25 @@ impl RaftLogEntry {
                 "raft log record header is truncated".into(),
             ));
         }
-        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        if magic != RECORD_MAGIC {
+        let magic = [data[0], data[1], data[2], data[3]];
+        if magic != FormatKind::RaftLog.magic() {
             return Err(ZyronError::EncodingFailed(format!(
-                "raft log record magic is {magic:#010x}"
+                "raft log record magic is {}",
+                zyron_common::format::envelope::printable_magic(&magic)
             )));
         }
-        let payload_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let record_version = RecordVersion::read(&data[4..])
+            .map_err(|e| ZyronError::EncodingFailed(format!("raft log record version tag, {e}")))?;
+        if record_version > RECORD_VERSION {
+            return Err(ZyronError::EncodingFailed(format!(
+                "raft log record is at version {}, this binary reads up to {}. Upgrade \
+                 through a release that still reads {} to replay this log",
+                record_version.get(),
+                RECORD_VERSION.get(),
+                record_version.get()
+            )));
+        }
+        let payload_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
         if payload_len > MAX_COMMAND_BYTES {
             return Err(ZyronError::EncodingFailed(format!(
                 "raft log record claims a {payload_len} byte payload"
@@ -321,12 +340,12 @@ impl RaftLogEntry {
             ));
         }
         let term = u64::from_le_bytes([
-            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+            data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
         ]);
         let index = u64::from_le_bytes([
-            data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+            data[20], data[21], data[22], data[23], data[24], data[25], data[26], data[27],
         ]);
-        let stored = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        let stored = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
         let payload = &data[RECORD_HEADER_LEN..total];
         let computed = record_checksum(term, index, payload);
         if stored != computed {
@@ -656,11 +675,17 @@ fn dummy_file() -> Result<File> {
 }
 
 fn write_file_header(file: &mut File, base_index: u64, prev_term: u64) -> Result<()> {
+    let mut extension = [0u8; FILE_HEADER_LEN - ENVELOPE_HEADER_LEN];
+    extension[0..8].copy_from_slice(&base_index.to_le_bytes());
+    extension[8..16].copy_from_slice(&prev_term.to_le_bytes());
     let mut header = [0u8; FILE_HEADER_LEN];
-    header[0..8].copy_from_slice(&FILE_MAGIC);
-    header[8..12].copy_from_slice(&FILE_VERSION.to_le_bytes());
-    header[16..24].copy_from_slice(&base_index.to_le_bytes());
-    header[24..32].copy_from_slice(&prev_term.to_le_bytes());
+    header[0..ENVELOPE_HEADER_LEN].copy_from_slice(&envelope::encode_header(
+        FormatKind::RaftLog,
+        FILE_VERSION,
+        0,
+        &extension,
+    ));
+    header[ENVELOPE_HEADER_LEN..].copy_from_slice(&extension);
     file.write_all(&header)
         .map_err(|e| ZyronError::WalWriteFailed(format!("write raft log header: {e}")))
 }
@@ -1007,26 +1032,47 @@ impl RaftLog {
                 .map_err(|e| ZyronError::IoError(format!("seek raft log: {e}")))?;
             file.read_exact(&mut header)
                 .map_err(|e| ZyronError::IoError(format!("read raft log header: {e}")))?;
-            if header[0..8] != FILE_MAGIC {
+            let (parsed, extension) =
+                envelope::decode_header(&header).map_err(|e| ZyronError::RaftLogCorrupted {
+                    index: 0,
+                    reason: e.to_string(),
+                })?;
+            if parsed.kind != FormatKind::RaftLog {
                 return Err(ZyronError::RaftLogCorrupted {
                     index: 0,
-                    reason: "file header magic does not name a raft log".into(),
+                    reason: format!("file header names a {} file, not a raft log", parsed.kind),
                 });
             }
-            let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-            if version != FILE_VERSION {
+            if parsed.version != FILE_VERSION {
                 return Err(ZyronError::RaftLogCorrupted {
                     index: 0,
-                    reason: format!("log format version {version} is not {FILE_VERSION}"),
+                    reason: format!(
+                        "log is at format version {}, this binary writes and reads \
+                         {FILE_VERSION}. Upgrade through a release that still reads {} to \
+                         move the log forward first",
+                        parsed.version, parsed.version
+                    ),
                 });
             }
             base_index = u64::from_le_bytes([
-                header[16], header[17], header[18], header[19], header[20], header[21], header[22],
-                header[23],
+                extension[0],
+                extension[1],
+                extension[2],
+                extension[3],
+                extension[4],
+                extension[5],
+                extension[6],
+                extension[7],
             ]);
             prev_term = u64::from_le_bytes([
-                header[24], header[25], header[26], header[27], header[28], header[29], header[30],
-                header[31],
+                extension[8],
+                extension[9],
+                extension[10],
+                extension[11],
+                extension[12],
+                extension[13],
+                extension[14],
+                extension[15],
             ]);
 
             let mut body = Vec::with_capacity((len as usize).saturating_sub(FILE_HEADER_LEN));

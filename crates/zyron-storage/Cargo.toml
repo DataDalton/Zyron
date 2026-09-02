@@ -16,6 +16,7 @@ bytes.workspace = true
 hashbrown.workspace = true
 scc.workspace = true
 xxhash-rust.workspace = true
+inventory.workspace = true
 
 [features]
 # Compiles in the phase profiler across the build (zyron-common::profile). Pass
@@ -25,5 +26,6 @@ profile = ["zyron-common/profile"]
 [dev-dependencies]
 tempfile = "3.27.0"
 rand = "0.10"
+inventory.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }
 mimalloc.workspace = true

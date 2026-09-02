@@ -8,6 +8,7 @@ pub mod expr_sql;
 pub mod lexer;
 pub mod merge_desugar;
 pub mod parser;
+pub mod rewriter;
 pub mod simd_scan;
 pub mod token;
 

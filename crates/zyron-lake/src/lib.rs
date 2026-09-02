@@ -23,6 +23,7 @@ pub mod curve;
 pub mod encoded_filter;
 pub mod feedback;
 pub mod follow;
+pub mod format;
 pub mod history;
 pub mod index;
 

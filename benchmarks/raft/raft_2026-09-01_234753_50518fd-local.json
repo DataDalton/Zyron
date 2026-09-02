@@ -1,0 +1,161 @@
+{
+  "id": "2026-09-01_234753_50518fd-local",
+  "date": "2026-09-01 23:48:53Z",
+  "ts": 1788306533,
+  "commit": "50518fd-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Election Latency": {
+      "Leader replaced after a kill": {
+        "average": 234.300004,
+        "runs": [240.20, 217.51, 251.38, 254.14, 208.27],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Failover": {
+      "Successor elected after a leader dies": {
+        "average": 237.774100,
+        "runs": [237.77],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Follower Read": {
+      "ReadIndex round trip and local apply wait, p99": {
+        "average": 0.089520,
+        "runs": [0.06, 0.11, 0.07, 0.10, 0.10],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Leader Election": {
+      "First election on a cold group": {
+        "average": 239.204400,
+        "runs": [239.20],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Linearizable Read": {
+      "Follower read after a write, p99": {
+        "average": 0.328600,
+        "runs": [0.33],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Log Append": {
+      "One append into the replicated log": {
+        "average": 0.152250,
+        "runs": [0.19, 0.17, 0.14, 0.12, 0.14],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Entries made durable by group commit": {
+        "average": 662477.356188,
+        "runs": [665128.89, 663836.95, 653647.75, 660789.17, 668984.03],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Membership Change": {
+      "Add a node as learner and promote it": {
+        "average": 0.001546,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Replication Lag": {
+      "Leader commit to follower apply, p99": {
+        "average": 0.087800,
+        "runs": [0.08, 0.09, 0.08, 0.10, 0.09],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Snapshot 1GB": {
+      "Checkpoint one gigabyte of state": {
+        "average": 0.846017,
+        "runs": [0.62, 0.89, 0.83, 0.85, 1.04],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Stream one gigabyte to a node that has none of it": {
+        "average": 2.467919,
+        "runs": [2.57, 2.43, 2.48, 2.41, 2.45],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Write Throughput": {
+      "Committed writes on a three node group": {
+        "average": 209163.208077,
+        "runs": [204934.66, 238545.18, 230133.71, 210014.72, 162187.77],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Write latency p99, group not saturated": {
+        "average": 4.447460,
+        "runs": [1.40, 1.46, 2.34, 1.80, 15.24],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Write latency p99, group saturated": {
+        "average": 6.675200,
+        "runs": [7.54, 3.58, 4.07, 4.49, 13.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

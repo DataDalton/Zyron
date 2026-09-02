@@ -13,6 +13,8 @@ use scc::HashMap as SccHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use zyron_common::format::envelope;
+use zyron_common::format::{FormatKind, FormatVersion};
 use zyron_common::{Result, ZyronError};
 
 /// Supported encryption algorithms.
@@ -242,8 +244,8 @@ impl KeyStore for LocalKeyStore {
 // File backed key store
 // ---------------------------------------------------------------------------
 
-const KEY_FILE_MAGIC: &[u8; 8] = b"ZYKEYS\0\0";
-const KEY_FILE_VERSION: u32 = 1;
+/// Version the key file is written at, declared in the format registry
+const KEY_FILE_VERSION: FormatVersion = crate::format::SECRET_STORE_FORMAT_VERSION;
 
 /// Key store whose wrapped keys persist in a file under the data directory,
 /// so a data key created for an encrypted column survives a restart. Key
@@ -280,20 +282,22 @@ impl FileKeyStore {
                 )));
             }
         };
-        if bytes.len() < 16 || &bytes[0..8] != KEY_FILE_MAGIC {
+        let parsed = envelope::decode_as(&bytes, FormatKind::SecretStorePersistence)
+            .map_err(|e| ZyronError::Internal(format!("key file {}, {e}", self.path.display())))?;
+        if parsed.header.version != KEY_FILE_VERSION {
             return Err(ZyronError::Internal(format!(
-                "key file {} has a bad header",
-                self.path.display()
+                "key file is at format version {}, this binary writes and reads \
+                 {KEY_FILE_VERSION}. Upgrade through a release that still reads {} to move \
+                 it forward first",
+                parsed.header.version, parsed.header.version
             )));
         }
-        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if version != KEY_FILE_VERSION {
-            return Err(ZyronError::Internal(format!(
-                "key file version {version} is not readable by this build"
-            )));
+        let bytes = parsed.body;
+        if bytes.len() < 4 {
+            return Err(ZyronError::Internal("key file truncated".to_string()));
         }
-        let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-        let mut off = 16;
+        let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let mut off = 4;
         let mut max_id = 0u32;
         for _ in 0..count {
             let short = || ZyronError::Internal("key file truncated".to_string());
@@ -343,16 +347,15 @@ impl FileKeyStore {
             true
         });
         entries.sort_by_key(|(id, _)| *id);
-        let mut bytes = Vec::with_capacity(16 + entries.len() * 64);
-        bytes.extend_from_slice(KEY_FILE_MAGIC);
-        bytes.extend_from_slice(&KEY_FILE_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        let mut body = Vec::with_capacity(4 + entries.len() * 64);
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for (id, key) in &entries {
-            bytes.extend_from_slice(&id.to_le_bytes());
-            bytes.push(key.algorithm as u8);
-            bytes.extend_from_slice(&(key.encrypted_material.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&key.encrypted_material);
+            body.extend_from_slice(&id.to_le_bytes());
+            body.push(key.algorithm as u8);
+            body.extend_from_slice(&(key.encrypted_material.len() as u32).to_le_bytes());
+            body.extend_from_slice(&key.encrypted_material);
         }
+        let bytes = envelope::encode(FormatKind::SecretStorePersistence, KEY_FILE_VERSION, &body);
         let tmp = self.path.with_extension("zykeys.tmp");
         let io_err =
             |e: std::io::Error| ZyronError::Internal(format!("key file write failed: {e}"));

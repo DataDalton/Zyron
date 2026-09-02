@@ -3236,6 +3236,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7353,7 +7362,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-analytics"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "mimalloc",
  "parking_lot",
@@ -7365,7 +7374,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-auth"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -7375,6 +7384,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.12.1",
  "httpmock",
+ "inventory",
  "md-5",
  "mimalloc",
  "p256 0.13.2",
@@ -7383,6 +7393,8 @@ dependencies = [
  "rand 0.10.0",
  "regex",
  "reqwest",
+ "ring",
+ "rsa",
  "scc",
  "serde",
  "serde_json",
@@ -7393,6 +7405,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
  "zyron-bench-harness",
  "zyron-buffer",
  "zyron-catalog",
@@ -7403,7 +7416,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-bench-harness"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "zyron-buffer",
  "zyron-common",
@@ -7413,7 +7426,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-buffer"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "parking_lot",
  "sysinfo",
@@ -7424,10 +7437,11 @@ dependencies = [
 
 [[package]]
 name = "zyron-catalog"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "inventory",
  "mimalloc",
  "parking_lot",
  "rand 0.10.0",
@@ -7436,6 +7450,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "zyron-bench-harness",
  "zyron-buffer",
  "zyron-common",
@@ -7446,12 +7461,13 @@ dependencies = [
 
 [[package]]
 name = "zyron-cdc"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "apache-avro",
  "bytes",
  "chrono",
  "hex",
+ "inventory",
  "mimalloc",
  "parking_lot",
  "reqwest",
@@ -7474,7 +7490,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bytes",
  "ctrlc",
@@ -7487,8 +7503,9 @@ dependencies = [
 
 [[package]]
 name = "zyron-common"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
+ "inventory",
  "mimalloc",
  "scc",
  "serde",
@@ -7501,8 +7518,9 @@ dependencies = [
 
 [[package]]
 name = "zyron-ctl"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
+ "tempfile",
  "zyron-common",
  "zyron-server",
  "zyron-tpc",
@@ -7510,9 +7528,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-executor"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "inventory",
  "mimalloc",
  "parking_lot",
  "rand 0.10.0",
@@ -7540,9 +7559,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-lake"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "crc32fast",
+ "inventory",
  "mimalloc",
  "scc",
  "tempfile",
@@ -7554,9 +7574,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-lifecycle"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
+ "inventory",
  "parking_lot",
  "serde",
  "tempfile",
@@ -7578,12 +7599,13 @@ dependencies = [
 
 [[package]]
 name = "zyron-media"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "flate2",
  "hex",
  "hmac 0.12.1",
  "image",
+ "inventory",
  "kamadak-exif",
  "lz4_flex",
  "opendal",
@@ -7601,7 +7623,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-mesh"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7613,8 +7635,9 @@ dependencies = [
 
 [[package]]
 name = "zyron-parser"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
+ "inventory",
  "mimalloc",
  "zyron-bench-harness",
  "zyron-common",
@@ -7622,7 +7645,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-pipeline"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "crossbeam",
  "hashbrown 0.16.1",
@@ -7642,7 +7665,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-planner"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "mimalloc",
  "sha2 0.10.9",
@@ -7664,7 +7687,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-pressure"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "sysinfo",
@@ -7674,9 +7697,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-raft"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "crossbeam",
+ "inventory",
  "mimalloc",
  "parking_lot",
  "serde",
@@ -7688,7 +7712,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-search"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "mimalloc",
  "parking_lot",
@@ -7702,13 +7726,16 @@ dependencies = [
 
 [[package]]
 name = "zyron-server"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "crossbeam",
+ "ed25519-dalek",
+ "inventory",
  "parking_lot",
+ "reqwest",
  "scc",
  "serde",
  "serde_json",
@@ -7748,7 +7775,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-server-bin"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "tokio",
  "zyron-server",
@@ -7756,11 +7783,12 @@ dependencies = [
 
 [[package]]
 name = "zyron-storage"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bytes",
  "crossbeam",
  "hashbrown 0.16.1",
+ "inventory",
  "mimalloc",
  "parking_lot",
  "rand 0.10.0",
@@ -7777,7 +7805,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-streaming"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -7813,11 +7841,11 @@ dependencies = [
 
 [[package]]
 name = "zyron-tpc"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "zyron-types"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -7838,7 +7866,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-versioning"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "mimalloc",
  "parking_lot",
@@ -7855,9 +7883,10 @@ dependencies = [
 
 [[package]]
 name = "zyron-wal"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bytes",
+ "inventory",
  "libc",
  "mimalloc",
  "parking_lot",
@@ -7874,7 +7903,7 @@ dependencies = [
 
 [[package]]
 name = "zyron-wire"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7883,6 +7912,7 @@ dependencies = [
  "crossbeam",
  "futures",
  "hmac 0.12.1",
+ "inventory",
  "itoa",
  "md-5",
  "memchr",

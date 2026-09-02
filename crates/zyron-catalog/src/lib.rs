@@ -7,13 +7,16 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod catalog_schema;
 pub mod checkpoint;
 pub mod encoding;
+pub mod format;
 pub mod ids;
 pub mod index_params;
 pub mod resolver;
 pub mod schema;
 pub mod sequence;
+pub mod statistics;
 pub mod stats;
 pub mod storage;
 pub mod system_catalog;

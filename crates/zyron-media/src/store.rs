@@ -13,12 +13,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use zyron_common::format::stamp::{FORMAT_STAMP_LEN, FormatStamp, stamp_flags};
+use zyron_common::format::{FormatKind, FormatVersion};
 
 use crate::error::{MediaError, MediaResult};
 
-const OBJECT_MAGIC: &[u8; 4] = b"ZYMO";
-const OBJECT_VERSION: u8 = 1;
-const OBJECT_HEADER_LEN: usize = 6;
+/// Version stored objects are written at, declared in the format registry
+/// under the out-of-line extended value kind.
+const OBJECT_VERSION: FormatVersion = crate::format::TOAST_OBJECT_FORMAT_VERSION;
+
+/// Every object opens with the format stamp, magic and version and flags.
+/// The compression bit lives in the stamp's flags rather than in a byte of
+/// its own, so the header is the same nine bytes every embedded Zyron record
+/// carries. Integrity comes from the content address, which the store
+/// verifies against the payload on read.
+const OBJECT_HEADER_LEN: usize = FORMAT_STAMP_LEN;
 
 const REF_RECORD_LEN: usize = 36;
 const REF_LOG_NAME: &str = "refs.zyref";
@@ -151,8 +160,7 @@ impl MediaStore {
         ));
         {
             let mut f = fs::File::create(&tmp)?;
-            f.write_all(OBJECT_MAGIC)?;
-            f.write_all(&[OBJECT_VERSION, u8::from(compressed)])?;
+            f.write_all(&object_stamp(compressed).to_bytes())?;
             f.write_all(stored)?;
             f.sync_all()?;
         }
@@ -314,31 +322,34 @@ fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     sha
 }
 
+/// The stamp an object of one compression state opens with.
+fn object_stamp(compressed: bool) -> FormatStamp {
+    let mut stamp = FormatStamp::new(FormatKind::Toast, OBJECT_VERSION);
+    if compressed {
+        stamp.flags |= stamp_flags::COMPRESSED;
+    }
+    stamp
+}
+
 fn parse_object<'a>(raw: &'a [u8], sha256: &[u8; 32]) -> MediaResult<(bool, &'a [u8])> {
-    if raw.len() < OBJECT_HEADER_LEN || &raw[..4] != OBJECT_MAGIC {
+    let stamp = FormatStamp::from_bytes(raw)
+        .map_err(|e| MediaError::CorruptObject(format!("object {}, {e}", hex::encode(sha256))))?;
+    if stamp.kind != FormatKind::Toast {
         return Err(MediaError::CorruptObject(format!(
-            "object {} has no ZYMO header",
-            hex::encode(sha256)
-        )));
-    }
-    if raw[4] != OBJECT_VERSION {
-        return Err(MediaError::CorruptObject(format!(
-            "object {} has unknown version {}",
+            "object {} is a {} record, not a stored object",
             hex::encode(sha256),
-            raw[4]
+            stamp.kind
         )));
     }
-    let compressed = match raw[5] {
-        0 => false,
-        1 => true,
-        other => {
-            return Err(MediaError::CorruptObject(format!(
-                "object {} has invalid compression flag {other}",
-                hex::encode(sha256)
-            )));
-        }
-    };
-    Ok((compressed, &raw[OBJECT_HEADER_LEN..]))
+    if stamp.version != OBJECT_VERSION {
+        return Err(MediaError::CorruptObject(format!(
+            "object {} is at format version {}, this binary writes and reads {}",
+            hex::encode(sha256),
+            stamp.version,
+            OBJECT_VERSION
+        )));
+    }
+    Ok((stamp.is_compressed(), &raw[OBJECT_HEADER_LEN..]))
 }
 
 fn apply_delta(counts: &scc::HashMap<[u8; 32], i64>, sha: &[u8; 32], delta: i64) -> i64 {

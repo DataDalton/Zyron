@@ -508,6 +508,7 @@ impl RetentionWorker {
                 detail: format!("{detail}: {rows} rows"),
                 prev_hash: 0,
                 entry_hash: 0,
+                record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
             })
             .await;
     }

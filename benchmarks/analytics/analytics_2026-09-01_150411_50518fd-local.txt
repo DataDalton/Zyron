@@ -1,0 +1,304 @@
+# suite:   analytics
+# run:     2026-09-01_150411_50518fd-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Test 1: ROLLUP Correctness ===
+  Grouping sets expanded: 4
+  Grand total = 2747500.00 (expected 2747500.00)
+  Region subtotal rows: 5, sum 2747500.00
+  Hierarchical subtotals verified: PASS
+  GROUPING() flag values verified: PASS
+
+=== Test 2: CUBE Correctness ===
+  Grouping sets expanded: 4
+  GROUPING_ID(grand_total) = 0b11
+  CUBE all combinations present: PASS
+  GROUPING_ID bitmasks verified: PASS
+
+=== Test 8: Outlier Detection Correctness ===
+  ZSCORE: 10/10 injected outliers exceed |z|>3
+  ZSCORE false positives on normal data: 0
+  IQR_OUTLIER: 10 injected detected, 0 false positives in normal data
+  MAD_OUTLIER: 10 injected detected
+  All outlier detectors verified: PASS
+
+=== Test 6: Funnel Analysis Correctness ===
+  Generated 2978 events across 1000 users
+  page_view      users= 1000 conv=1.000 drop=0.000
+  add_to_cart    users=  961 conv=0.961 drop=0.039
+  checkout       users=  642 conv=0.668 drop=0.332
+  purchase       users=  325 conv=0.506 drop=0.494
+  Step counts are monotonically non-increasing: PASS
+  Drop-off + conversion sums to 1.0 per step: PASS
+  step2=642 step3=325 drop=317 late_events=50
+  Window constraint excludes late events: PASS
+
+=== Test 11: CUBE Performance (1M rows, 3 cols) ===
+  Run 1: 1086.05ms
+  Run 2: 1096.98ms
+  Run 3: 1099.37ms
+  Run 4: 1108.29ms
+  Run 5: 1107.92ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [1,086, 1,097, 1,099, 1,108, 1,108]
+    Average: 1,100 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 9: Correlation Correctness ===
+  CORR perfect=1.000000 anti=-1.000000 indep=-0.010949
+  Matrix [0,1]=1.0000 [0,2]=-1.0000 [1,2]=-1.0000
+  CORRELATION_MATRIX symmetry + diagonal verified: PASS
+
+=== Test 12: YOY Performance (10M rows) ===
+  Run 1: 418.08ms
+  Run 2: 443.11ms
+  Run 3: 424.32ms
+  Run 4: 419.13ms
+  Run 5: 428.80ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [418.0846, 443.1062, 424.3219, 419.1308, 428.7997]
+    Average: 426.6886 (target <= 2,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 14: Funnel Performance (10M events, 5 steps) ===
+  Total events: 11799916
+  Run 1: 3693.46ms
+  Run 2: 3991.38ms
+  Run 3: 3629.01ms
+  Run 4: 3640.25ms
+  Run 5: 3673.60ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [3,693, 3,991, 3,629, 3,640, 3,674]
+    Average: 3,726 (target <= 5,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 16: ZSCORE Performance (10M rows) ===
+  Run 1: 112.63ms
+  Run 2: 108.92ms
+  Run 3: 108.47ms
+  Run 4: 108.57ms
+  Run 5: 108.38ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [112.6289, 108.9244, 108.4699, 108.5666, 108.3765]
+    Average: 109.3933 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 5: Cohort Retention Correctness ===
+  Generated 2660 events for 1000 users
+  Cohorts: 10, periods per cohort: 12
+  Each user assigned to exactly one cohort: PASS
+  month_0 values are 100% of each cohort's size: PASS
+  Non-monotonic cohort steps: 3
+  Retention decreases over time: PASS
+
+=== Test 13: Cohort Retention Performance (10M events) ===
+  Generated 2693764 events
+  Run 1: 3063.42ms
+  Run 2: 2867.62ms
+  Run 3: 2836.46ms
+  Run 4: 2865.30ms
+  Run 5: 2862.46ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [3,063, 2,868, 2,836, 2,865, 2,862]
+    Average: 2,899 (target <= 10,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 17: CORR Performance (10M rows) ===
+  Run 1: 105.04ms
+  Run 2: 103.67ms
+  Run 3: 104.02ms
+  Run 4: 103.80ms
+  Run 5: 104.35ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [105.0364, 103.6701, 104.0205, 103.8023, 104.3539]
+    Average: 104.1766 (target <= 300, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 18: CORRELATION_MATRIX Performance (20 cols) ===
+  Run 1: 448.67ms
+  Run 2: 466.94ms
+  Run 3: 457.61ms
+  Run 4: 445.22ms
+  Run 5: 451.36ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [448.6744, 466.9390, 457.6119, 445.2207, 451.3571]
+    Average: 453.9606 (target <= 5,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 7: Data Profiling Correctness ===
+  revenue null_count: profile=5000 actual=5000
+  revenue distinct: estimate=4811 actual=4750 err=0.0128
+  revenue p50: estimate=2524.00 actual=2526.00 err=0.0008
+  MCV count: 64
+  All column-level statistics verified: PASS
+
+=== Test 4: Period-over-Period Comparisons ===
+  YOY value alignment verified for 24 months: PASS
+  YOY_GROWTH percentage verified: PASS
+  MOM previous-month value verified: PASS
+  YTD_SUM resets at year boundary: PASS
+  QTD_SUM bucket boundaries verified: PASS
+  PERIOD_COMPARE generic invocation verified: PASS
+
+=== Test 10: ROLLUP Performance (1M rows, 3 cols) ===
+  Run 1: 474.62ms
+  Run 2: 477.60ms
+  Run 3: 480.92ms
+  Run 4: 486.40ms
+  Run 5: 476.35ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [474.6157, 477.6009, 480.9191, 486.4040, 476.3502]
+    Average: 479.1780 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 19: Feature Group Correctness ===
+  100 entities x 5 features verified: PASS
+
+=== Test 3: GROUPING SETS Correctness ===
+  3 distinct grouping types observed: PASS
+  Grand total matches input sum: PASS
+
+=== Test 15: DATA_PROFILE Performance (10M rows, 20 cols) ===
+  Run 1: 11593.22ms
+  Run 2: 11484.65ms
+  Run 3: 11476.14ms
+  Run 4: 11491.84ms
+  Run 5: 11485.85ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [11,593, 11,485, 11,476, 11,492, 11,486]
+    Average: 11,506 (target <= 30,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 21: Feature Versioning Correctness ===
+  Version 1 = 50, Version 2 = 88: PASS
+  Lineage staleness: PASS
+
+=== Test 20: Point-in-Time Join Correctness ===
+  AS OF Jan 15 = 1500, AS OF Jan 31 = 3100, no leakage: PASS
+
+=== Test 22: Linear Regression Correctness ===
+  Recovered slope = 2.000, intercept = 3.000, R^2 = 1.0000
+
+=== Test 23: Logistic Regression Correctness ===
+  Accuracy = 1.0000: PASS
+
+=== Test 24: Decision Tree Correctness ===
+  Accuracy = 0.9917, nodes = 11: PASS
+
+=== Test 25: Batch Prediction Correctness ===
+  100K predictions, all finite: PASS
+
+=== Test 26: Causal Inference Correctness ===
+  ATE = 0.0796, ATT = 0.0767: PASS
+
+=== Test 27: Forecasting Correctness ===
+  Trend slope = 0.1000, anomaly + ARIMA + decompose: PASS
+
+=== Test 28: Feature Retrieval Performance (1K entities, 10 features) ===
+  Run 1: 7.35ms
+  Run 2: 6.82ms
+  Run 3: 6.85ms
+  Run 4: 6.63ms
+  Run 5: 6.69ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [7.3500, 6.8217, 6.8501, 6.6342, 6.6886]
+    Average: 6.8689 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 29: PIT Join Performance (1M feature points) ===
+  Run 1: 15.26ms
+  Run 2: 13.61ms
+  Run 3: 13.19ms
+  Run 4: 13.47ms
+  Run 5: 13.06ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [15.2572, 13.6083, 13.1858, 13.4749, 13.0581]
+    Average: 13.7169 (target <= 5,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 30: Linear Regression Train (100K rows, 10 features) ===
+  Run 1: 86.56ms (R^2 = 0.9994)
+  Run 2: 85.82ms (R^2 = 0.9994)
+  Run 3: 89.20ms (R^2 = 0.9994)
+  Run 4: 86.26ms (R^2 = 0.9994)
+  Run 5: 90.13ms (R^2 = 0.9994)
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [86.5573, 85.8186, 89.1960, 86.2581, 90.1332]
+    Average: 87.5926 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 31: Logistic Regression Train (100K rows, 10 features) ===
+  Run 1: 1125.71ms (acc = 0.9941)
+  Run 2: 1086.08ms (acc = 0.9941)
+  Run 3: 1112.81ms (acc = 0.9941)
+  Run 4: 1082.88ms (acc = 0.9941)
+  Run 5: 1128.12ms (acc = 0.9941)
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [1,126, 1,086, 1,113, 1,083, 1,128]
+    Average: 1,107 (target <= 1,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 32: Decision Tree Train (100K rows) ===
+  Run 1: 604.27ms (acc = 0.9996)
+  Run 2: 598.42ms (acc = 0.9996)
+  Run 3: 597.21ms (acc = 0.9996)
+  Run 4: 598.53ms (acc = 0.9996)
+  Run 5: 596.63ms (acc = 0.9996)
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [604.2733, 598.4194, 597.2145, 598.5290, 596.6326]
+    Average: 599.0138 (target <= 2,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 33: Batch Predict (1M rows) ===
+  Run 1: 100.10ms
+  Run 2: 100.74ms
+  Run 3: 100.39ms
+  Run 4: 100.18ms
+  Run 5: 99.89ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [100.1032, 100.7360, 100.3909, 100.1759, 99.8920]
+    Average: 100.2596 (target <= 2,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 34: Single Predict Latency ===
+  Run 1: 0.146us per predict
+  Run 2: 0.150us per predict
+  Run 3: 0.146us per predict
+  Run 4: 0.150us per predict
+  Run 5: 0.147us per predict
+  Latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [0.1460, 0.1500, 0.1460, 0.1504, 0.1472]
+    Average: 0.1479 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 35: ATE Estimation (100K observations) ===
+  Run 1: 116.26ms (est = 0.1009)
+  Run 2: 116.83ms (est = 0.1009)
+  Run 3: 115.85ms (est = 0.1009)
+  Run 4: 120.50ms (est = 0.1009)
+  Run 5: 118.43ms (est = 0.1009)
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [116.2622, 116.8296, 115.8455, 120.5045, 118.4325]
+    Average: 117.5749 (target <= 5,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Test 36: Forecast (10K history) ===
+  Run 1: 0.85ms
+  Run 2: 0.71ms
+  Run 3: 0.67ms
+  Run 4: 0.67ms
+  Run 5: 0.65ms
+  Latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [0.8487, 0.7127, 0.6689, 0.6728, 0.6518]
+    Average: 0.7110 (target <= 10,000, not applied)
+    Re-run with --release for a number worth comparing

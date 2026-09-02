@@ -1,0 +1,411 @@
+# suite:   lake
+# run:     2026-09-01_151357_50518fd-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Clustering Pass Skip-Rate Gain ===
+  machine state: 1334us cpu, 763us durable write
+  skip rate after a bucket-ordered pass [PASS]: 0.8750 (bound >= 0.5000)
+  Inputs: 8 files, 32768 rows
+  Outputs: 8 files
+  Skip rate: 0.0000 -> 0.8750
+  Cluster pass:
+    Runs: [74,023us]
+    Average: 74,023us (no target set)
+  Rows rewritten:
+    Runs: [442,674 rows/s]
+    Average: 442,674 rows/s (no target set)
+
+=== Target: Cluster Key Sort Overhead ===
+  machine state: 1342us cpu, 617us durable write
+  Rows per append: 500
+  Clustered append 2991us against plain 2889us over 5 runs each
+  Cluster key ordering pass:
+    Runs: [129.4000us, 124.3000us, 121.7000us, 119.5000us, 118.5000us]
+    Average: 122.6800us (no target set)
+    Min/Max: 118.5000us / 129.4000us, StdDev: 3.9071us
+  Cluster key sort overhead:
+    Runs: [245.3600ns/row]
+    Average: 245.3600ns/row (no target set)
+  Cluster key sort overhead (ns per row) [NOT MEASURED, unoptimized build]: 245.3600 (target <= 160, not applied)
+  Clustered append, batch already in key order:
+    Runs: [2,990us]
+    Average: 2,990us (no target set)
+  Clustered append, batch shuffled:
+    Runs: [3,657us]
+    Average: 3,657us (no target set)
+
+=== Refused Clustering Pass Is Inert ===
+  machine state: 1618us cpu, 799us durable write
+  Candidate: order by bucket, on files already ordered by bucket
+  Expected: refused, since it cannot improve the skip rate
+  Gate decision [PASS]: refused, BelowThreshold { delta: 0.0, required: 0.05 }
+  Active file set [PASS]: unchanged, 4 files, log still at version 5
+
+=== Data File Scan Throughput ===
+  machine state: 1354us cpu, 658us durable write
+  Column 0 is FastLanes, 20 encoded bytes for 131072 raw
+  Rows per data file: 16384
+  Scan throughput:
+    Runs: [45,435,385 rows/s, 45,778,150 rows/s, 45,688,790 rows/s, 45,663,322 rows/s, 45,727,044 rows/s]
+    Average: 45,658,538 rows/s (no target set)
+    Min/Max: 45,435,385 rows/s / 45,778,150 rows/s, StdDev: 118,098 rows/s
+
+=== Target: Commit Latency ===
+  machine state: 1617us cpu, 853us durable write
+  Rows per commit: 500
+  Commit, insert:
+    Runs: [2,879us, 2,853us, 2,670us, 2,683us, 2,606us]
+    Average: 2,738us (no target set)
+    Min/Max: 2,606us / 2,879us, StdDev: 108.1292us
+  Commit insert latency (ms) [NOT MEASURED, unoptimized build]: 2.7383 (target <= 500, not applied)
+  Commit, delete predicate:
+    Runs: [31,476us, 1,537us, 1,569us, 1,501us, 1,571us]
+    Average: 7,531us (no target set)
+    Min/Max: 1,501us / 31,476us, StdDev: 11,973us
+  Commit delete predicate latency (ms) [NOT MEASURED, unoptimized build]: 7.5309 (target <= 200, not applied)
+
+=== Transaction Log Under Concurrency ===
+  machine state: 1550us cpu, 656us durable write
+  Writers: 8
+  Commits: 160
+  Retries: 88 (0.5500 per commit)
+  Commit rate:
+    Runs: [1,014 commits/s]
+    Average: 1,014 commits/s (no target set)
+  Retries:
+    Runs: [0.5500 per commit]
+    Average: 0.5500 per commit (no target set)
+
+=== Encode Scaling ===
+  machine state: 1334us cpu, 693us durable write
+  Encode 1000 rows, all distinct:
+    Runs: [504.8000us, 436.4000us, 433.1000us, 466.6000us, 429.9000us]
+    Average: 454.1600us (no target set)
+    Min/Max: 429.9000us / 504.8000us, StdDev: 28.5189us
+       1000 rows:      454us total, 454.16 ns/row
+  Encode 4000 rows, all distinct:
+    Runs: [1,668us, 1,549us, 1,539us, 1,547us, 1,551us]
+    Average: 1,571us (no target set)
+    Min/Max: 1,539us / 1,668us, StdDev: 48.5629us
+       4000 rows:     1571us total, 392.71 ns/row
+  Cost per row, largest over smallest: 0.86x (4000 rows vs 1000 rows)
+  Encode cost per row, growth over 100x rows:
+    Runs: [0.8647x]
+    Average: 0.8647x (no target set)
+
+=== Target: Repair Fast Lane Trigger ===
+  machine state: 1414us cpu, 599us durable write
+  Fast lane trigger decision:
+    Runs: [16,082us, 578.8000us, 582.5000us, 569.8000us, 708.4000us]
+    Average: 3,704us (no target set)
+    Min/Max: 569.8000us / 16,082us, StdDev: 6,189us
+  Fast lane trigger latency (ms) [NOT MEASURED, unoptimized build]: 3.7042 (target <= 100, not applied)
+
+=== Target: Adaptive Clustering Overhead ===
+  machine state: 1624us cpu, 766us durable write
+  Cluster proposal evaluation:
+    Runs: [918.2000us, 858.4000us, 849.6000us, 851.2000us, 855.3000us]
+    Average: 866.5400us (no target set)
+    Min/Max: 849.6000us / 918.2000us, StdDev: 26.0140us
+  Cluster proposal evaluation latency (ms) [NOT MEASURED, unoptimized build]: 0.8665 (target <= 200, not applied)
+  Workload observer record:
+    Runs: [145.5050ns]
+    Average: 145.5050ns (no target set)
+  Workload observer record (ns) [NOT MEASURED, unoptimized build]: 145.5050 (target <= 20, not applied)
+  Feedback skip-rate measurement:
+    Runs: [143.8200ns]
+    Average: 143.8200ns (no target set)
+  Feedback skip-rate measurement (ns) [NOT MEASURED, unoptimized build]: 143.8200 (target <= 100, not applied)
+
+=== File Pruning Effectiveness ===
+  machine state: 1622us cpu, 818us durable write
+  Files in manifest: 20000
+  point predicate files pruned (fraction) [PASS]: 1.0000 (bound >= 0.9999)
+  strided predicate files pruned (fraction) [PASS]: 0.9375 (bound >= 0.9300)
+
+=== Insert Path Decomposition ===
+  machine state: 1628us cpu, 800us durable write
+  Rows per batch: 500
+  Columns: 2
+  Insert phase, materialize batch:
+    Runs: [37us, 26.5000us, 26.2000us, 26.5000us, 26.3000us]
+    Average: 28.5000us (no target set)
+    Min/Max: 26.2000us / 37us, StdDev: 4.2516us
+  Insert phase, encode columns:
+    Runs: [905.3000us, 658us, 838.7000us, 602.4000us, 630.3000us]
+    Average: 726.9400us (no target set)
+    Min/Max: 602.4000us / 905.3000us, StdDev: 121.5770us
+  Insert phase, encode columns bounded:
+    Runs: [632.1000us, 578.7000us, 581.1000us, 597.4000us, 583.6000us]
+    Average: 594.5800us (no target set)
+    Min/Max: 578.7000us / 632.1000us, StdDev: 19.8502us
+  Exact selection costs 1.22x bounded selection
+  Insert phase, build the value blooms:
+    Runs: [83us, 69.7000us, 69.5000us, 69.7000us, 69.4000us]
+    Average: 72.2600us (no target set)
+    Min/Max: 69.4000us / 83us, StdDev: 5.3713us
+  Insert phase, count distinct values:
+    Runs: [165.7000us, 155us, 163.9000us, 214.6000us, 154.7000us]
+    Average: 170.7800us (no target set)
+    Min/Max: 154.7000us / 214.6000us, StdDev: 22.3647us
+  Insert phase, choose and trial encode:
+    Runs: [172.4000us, 152.7000us, 151.1000us, 151.1000us, 151.6000us]
+    Average: 155.7800us (no target set)
+    Min/Max: 151.1000us / 172.4000us, StdDev: 8.3305us
+  Encode 727us splits into 156us select and trial encode, 72us bloom, 171us sketch
+    leaving 328us for the fused pass that packs the buffer, bounds the zones and counts the nulls
+  Insert phase, place rows in stored order:
+    Runs: [17.3000us, 12.4000us, 12.4000us, 12.3000us, 12.3000us]
+    Average: 13.3400us (no target set)
+    Min/Max: 12.3000us / 17.3000us, StdDev: 1.9805us
+  Insert phase, describe columns:
+    Runs: [6.5000us, 2.1000us, 1.9000us, 2us, 1.9000us]
+    Average: 2.8800us (no target set)
+    Min/Max: 1.9000us / 6.5000us, StdDev: 1.8115us
+  Insert phase, segment IO and fsync:
+    Runs: [1,006us, 781.9000us, 750.6000us, 932.1000us, 771us]
+    Average: 848.4000us (no target set)
+    Min/Max: 750.6000us / 1,006us, StdDev: 101.9289us
+  Insert phase, segment IO without fsync:
+    Runs: [782.6000us, 515.5000us, 377.5000us, 342.7000us, 397us]
+    Average: 483.0600us (no target set)
+    Min/Max: 342.7000us / 782.6000us, StdDev: 160.6404us
+  Data file fsync costs 365us of the 848us segment write
+  Insert phase, ordering pass:
+    Runs: [68.9000us, 50.7000us, 49.6000us, 50us, 49.1000us]
+    Average: 53.6600us (no target set)
+    Min/Max: 49.1000us / 68.9000us, StdDev: 7.6380us
+  Insert phase, write file unsorted:
+    Runs: [2,032us, 1,805us, 1,691us, 1,692us, 1,702us]
+    Average: 1,784us (no target set)
+    Min/Max: 1,691us / 2,032us, StdDev: 130.8454us
+  Insert phase, write file sorted:
+    Runs: [1,906us, 1,805us, 1,739us, 1,661us, 1,844us]
+    Average: 1,791us (no target set)
+    Min/Max: 1,661us / 1,906us, StdDev: 84.7227us
+  Commit primitive, create write fsync a version file:
+    Runs: [921.6000us, 782.6000us, 847.8000us, 820.4000us, 796.8000us]
+    Average: 833.8400us (no target set)
+    Min/Max: 782.6000us / 921.6000us, StdDev: 49.1423us
+  Version file is 265 bytes: 834us to create write and fsync
+  Insert phase, publish a version:
+    Runs: [956.9000us, 1,012us, 877.4000us, 963.5000us, 1,033us]
+    Average: 968.6200us (no target set)
+    Min/Max: 877.4000us / 1,033us, StdDev: 53.9444us
+  Insert phase, append and commit:
+    Runs: [2,900us, 2,906us, 2,559us, 2,445us, 2,469us]
+    Average: 2,656us (no target set)
+    Min/Max: 2,445us / 2,906us, StdDev: 205.0648us
+
+  Phase breakdown of one 500-row insert:
+    materialize batch      28us   1.1%  35087719 cells/sec
+    encode columns        727us  27.4%
+    place rows             13us   0.5%  (scatter read through the sort order)
+    segment IO + fsync    848us  31.9%
+    describe columns        3us   0.1%  (zones, bloom bytes, manifest stats)
+    write file no sort   1784us  67.2%
+    write file sorted    1791us  67.4%
+    ordering pass          54us   2.0%  (measured directly)
+    publish a version     969us  36.5%  (measured directly)
+      against            834us        a version file of the same size written alone
+    append total         2656us        188269 rows/sec
+    caller pays materialize on top: 186270 rows/sec end to end
+  Insert throughput:
+    Runs: [186,270rows/sec]
+    Average: 186,270rows/sec (no target set)
+
+=== Log Head and Manifest Resolution ===
+  machine state: 1620us cpu, 763us durable write
+  Head read:
+    Runs: [6.8880ns, 6.8120ns, 6.8680ns, 6.8090ns, 6.8240ns]
+    Average: 6.8402ns (no target set)
+    Min/Max: 6.8090ns / 6.8880ns, StdDev: 0.0319ns
+  Latest manifest (cached):
+    Runs: [522.9000ns, 511.2000ns, 418ns, 359.1000ns, 359.6000ns]
+    Average: 434.1600ns (no target set)
+    Min/Max: 359.1000ns / 522.9000ns, StdDev: 71.0835ns
+  Prune index build (cold):
+    Runs: [68.4000us]
+    Average: 68.4000us (no target set)
+  Prune index at version (cached):
+    Runs: [482.8000ns, 369.2000ns, 369.5000ns, 374.4000ns, 379.2000ns]
+    Average: 395.0200ns (no target set)
+    Min/Max: 369.2000ns / 482.8000ns, StdDev: 44.0425ns
+
+=== Target: Manifest Load and Commit Throughput ===
+  machine state: 1627us cpu, 746us durable write
+  Files in the manifest: 500
+  Manifest load, 10K files:
+    Runs: [8,534us, 5,585us, 5,502us, 5,377us, 5,242us]
+    Average: 6,048us (no target set)
+    Min/Max: 5,242us / 8,534us, StdDev: 1,248us
+  Manifest load latency (ms) [NOT MEASURED, unoptimized build]: 6.0479 (target <= 200, not applied)
+  Concurrent commits:
+    Runs: [474.9951 commits/sec]
+    Average: 474.9951 commits/sec (no target set)
+  Commit throughput (commits/sec) [NOT MEASURED, unoptimized build]: 474.9951 (target >= 10, not applied)
+
+=== Target: Metadata-Only Commits ===
+  machine state: 1622us cpu, 906us durable write
+  Schema add column:
+    Runs: [998.1000us, 839.5000us, 866.7000us, 988.4000us, 871.7000us]
+    Average: 912.8800us (no target set)
+    Min/Max: 839.5000us / 998.1000us, StdDev: 66.6014us
+  Schema add column latency (ms) [NOT MEASURED, unoptimized build]: 0.9129 (target <= 500, not applied)
+  Key change, no rewrite:
+    Runs: [906.2000us, 837.8000us, 940.6000us, 781.7000us, 862.1000us]
+    Average: 865.6800us (no target set)
+    Min/Max: 781.7000us / 940.6000us, StdDev: 54.9502us
+  Key change without rewrite latency (ms) [NOT MEASURED, unoptimized build]: 0.8657 (target <= 50, not applied)
+  Clone:
+    Runs: [7,903us, 7,664us, 6,555us, 7,760us, 7,820us]
+    Average: 7,540us (no target set)
+    Min/Max: 6,555us / 7,903us, StdDev: 499.0040us
+  Clone latency (ms) [NOT MEASURED, unoptimized build]: 7.5404 (target <= 1,000, not applied)
+
+=== Prune Index Sweep vs Exact Answer ===
+  machine state: 1620us cpu, 884us durable write
+  Files in manifest: 20000
+  Prune index build:
+    Runs: [3,126us, 3,212us, 2,993us, 3,051us, 2,993us]
+    Average: 3,075us (no target set)
+    Min/Max: 2,993us / 3,212us, StdDev: 84.2162us
+  point sweep over 20000 files:
+    Runs: [195.5000us, 194us, 193.9000us, 193.9000us, 193.9000us]
+    Average: 194.2400us (no target set)
+    Min/Max: 193.9000us / 195.5000us, StdDev: 0.6312us
+  range sweep over 20000 files:
+    Runs: [198.8000us, 193.8000us, 193.8000us, 193.8000us, 193.8000us]
+    Average: 194.8000us (no target set)
+    Min/Max: 193.8000us / 198.8000us, StdDev: 2.0000us
+  strided sweep over 20000 files:
+    Runs: [195.7000us, 200.2000us, 197.8000us, 194.1000us, 201us]
+    Average: 197.7600us (no target set)
+    Min/Max: 194.1000us / 201us, StdDev: 2.6112us
+
+=== Target: Repair Max Inputs Scaling ===
+  machine state: 1624us cpu, 799us durable write
+  Files taken: 16 at max_inputs 16, 64 at max_inputs 64
+  Repair max_inputs scaling:
+    Runs: [4x]
+    Average: 4x (no target set)
+  Repair max_inputs scaling (x) [NOT MEASURED, unoptimized build]: 4 (target >= 3.5000, not applied)
+
+=== Target: Rewrite Passes ===
+  machine state: 1622us cpu, 765us durable write
+  OPTIMIZE input files: 20
+  OPTIMIZE, 1000 files:
+    Runs: [12,642us]
+    Average: 12,642us (no target set)
+  OPTIMIZE latency (s) [NOT MEASURED, unoptimized build]: 0.0126 (target <= 60, not applied)
+  Cluster pass rows: 20000, files: 16
+  Cluster pass, 10M rows:
+    Runs: [48,320us]
+    Average: 48,320us (no target set)
+  Cluster pass latency (s) [NOT MEASURED, unoptimized build]: 0.0483 (target <= 90, not applied)
+
+=== Scan Decomposition ===
+  machine state: 1624us cpu, 790us durable write
+  Scan phase, open a 500 row file:
+    Runs: [69.2000us, 198.2000us, 2,254us, 2,161us, 676.2000us]
+    Fastest: 69.2000us (mean 1,072us, taken over 5 runs)
+  500 rows: column 0 is FastLanes, 20 encoded bytes for 4000 raw
+  Scan phase, decode a 500 row column:
+    Runs: [11.8000us, 11.5000us, 11.4000us, 11.5000us, 11.3000us]
+    Average: 11.5000us (no target set)
+    Min/Max: 11.3000us / 11.8000us, StdDev: 0.1673us
+  Scan phase, filter 500 rows on stored bytes:
+    Runs: [55.8000us, 19.4000us, 18.4000us, 18.5000us, 20.1000us]
+    Average: 26.4400us (no target set)
+    Min/Max: 18.4000us / 55.8000us, StdDev: 14.6932us
+     500 rows/file: open   69.2us  decode   11.5us  filter  26.4us  ->  161.40 ns/row scanned
+  Scan phase, open a 2000 row file:
+    Runs: [66.3000us, 27us, 20us, 2,900us, 2,133us]
+    Fastest: 20us (mean 1,029us, taken over 5 runs)
+  2000 rows: column 0 is FastLanes, 20 encoded bytes for 16000 raw
+  Scan phase, decode a 2000 row column:
+    Runs: [44.3000us, 43.9000us, 43.9000us, 44us, 43.8000us]
+    Average: 43.9800us (no target set)
+    Min/Max: 43.8000us / 44.3000us, StdDev: 0.1720us
+  Scan phase, filter 2000 rows on stored bytes:
+    Runs: [79.8000us, 43.2000us, 43.4000us, 43.1000us, 43us]
+    Average: 50.5000us (no target set)
+    Min/Max: 43us / 79.8000us, StdDev: 14.6506us
+    2000 rows/file: open   20.0us  decode   44.0us  filter  50.5us  ->  31.99 ns/row scanned
+
+  Open cost is 69.2us at 500 rows and 20.0us at 2000 rows, so it is per file
+  Scanning in 500-row files costs 5.05x per row what 2000-row files cost
+  Scan cost per row, small files over large:
+    Runs: [5.0453x]
+    Average: 5.0453x (no target set)
+  Scan throughput, large files:
+    Runs: [31,259,769rows/sec]
+    Average: 31,259,769rows/sec (no target set)
+
+=== Secondary Index Probe ===
+  machine state: 1623us cpu, 800us durable write
+  Rows: 65536, data files: 8, index files: 8
+  Probe: index files opened 1 of 8, entries examined 8, rows addressed 8
+  index files opened per point probe [PASS]: 1 (bound <= 1)
+  Point probe through the index:
+    Runs: [254.4000us, 209.3000us, 203.8000us, 203.2000us, 200.5000us]
+    Average: 214.2400us (no target set)
+    Min/Max: 200.5000us / 254.4000us, StdDev: 20.2825us
+  Point lookup by scanning:
+    Runs: [5,277us, 5,089us, 5,016us, 5,047us, 5,168us]
+    Average: 5,119us (no target set)
+    Min/Max: 5,016us / 5,277us, StdDev: 93.8959us
+  Range probe: index files opened 1 of 8, rows addressed 512
+  Range probe through the index:
+    Runs: [857.8000us, 896.5000us, 886.3000us, 887.7000us, 861.5000us]
+    Average: 877.9600us (no target set)
+    Min/Max: 857.8000us / 896.5000us, StdDev: 15.3981us
+
+=== Target: Time Travel Reach Back ===
+  machine state: 1359us cpu, 858us durable write
+  Version 5 resolved in 3333.6us, head 25 in 1768.4us, over 20 versions of history
+  Time travel reach back delta:
+    Runs: [1,565us]
+    Average: 1,565us (no target set)
+  Time travel reach back delta (us) [NOT MEASURED, unoptimized build]: 1,565 (target <= 1,500, not applied)
+  Time travel reach back per version:
+    Runs: [78.2610us/version]
+    Average: 78.2610us/version (no target set)
+  Time travel reach back per version (us) [NOT MEASURED, unoptimized build]: 78.2610 (target <= 10, not applied)
+
+=== Unique Check On Insert ===
+  machine state: 1338us cpu, 660us durable write
+  Rows: 65536, files: 8
+  clustered: files opened 1, decoded 1, bisected 1, rows compared 1
+  Unique check, clustered:
+    Runs: [267.4000us, 262.9000us, 305.8000us, 251.9000us, 244.6000us]
+    Average: 266.5200us (no target set)
+    Min/Max: 244.6000us / 305.8000us, StdDev: 21.2180us
+  unclustered: files opened 1, decoded 1, bisected 0, rows compared 46
+  Unique check, unclustered:
+    Runs: [348.7000us, 342.1000us, 304.7000us, 305.7000us, 308.6000us]
+    Average: 321.9600us (no target set)
+    Min/Max: 304.7000us / 348.7000us, StdDev: 19.2947us
+  rows compared per probed key (clustered) [PASS]: 0.0625 (bound <= 8)
+
+=== Zone Map Row Rejection ===
+  machine state: 1636us cpu, 803us durable write
+  zone map rows rejected (fraction) [PASS]: 1 (bound >= 1)
+  Zone map rejection:
+    Runs: [11.8000us, 9.9000us, 9.3000us, 9.5000us, 9.1000us]
+    Average: 9.9200us (no target set)
+    Min/Max: 9.1000us / 11.8000us, StdDev: 0.9765us
+  Full column decode:
+    Runs: [454.6000us, 448.8000us, 417.7000us, 397.7000us, 402.1000us]
+    Average: 424.1800us (no target set)
+    Min/Max: 397.7000us / 454.6000us, StdDev: 23.5042us

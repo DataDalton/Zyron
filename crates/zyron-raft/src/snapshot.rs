@@ -26,8 +26,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use zyron_common::checksum::hash32;
 use zyron_common::error::{Result, ZyronError};
+use zyron_common::format::envelope;
+use zyron_common::format::{FormatKind, FormatVersion};
 
 use crate::NodeId;
 use crate::codec::{Cursor, put_bool, put_bytes, put_u64};
@@ -36,8 +37,8 @@ use crate::membership::ClusterConfig;
 /// Where the pointer to the current snapshot lives
 pub const SNAPSHOT_META_FILE: &str = "raft.snapshot.meta";
 const SNAPSHOT_META_TMP: &str = "raft.snapshot.meta.tmp";
-const META_MAGIC: [u8; 8] = *b"ZYRAFTSN";
-const META_VERSION: u32 = 1;
+/// Version the snapshot pointer is written at, declared in the format registry
+const META_VERSION: FormatVersion = crate::format::SNAPSHOT_TRANSFER_FORMAT_VERSION;
 
 /// Where a snapshot sits in the log, and what it is worth.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,11 +190,7 @@ impl SnapshotStore {
     fn write_meta(&self, meta: &SnapshotMeta) -> Result<()> {
         let mut body = Vec::with_capacity(128);
         meta.encode(&mut body);
-        let mut out = Vec::with_capacity(body.len() + 16);
-        out.extend_from_slice(&META_MAGIC);
-        out.extend_from_slice(&META_VERSION.to_le_bytes());
-        out.extend_from_slice(&hash32(&body).to_le_bytes());
-        out.extend_from_slice(&body);
+        let out = envelope::encode(FormatKind::SnapshotTransfer, META_VERSION, &body);
 
         let tmp = self.dir.join(SNAPSHOT_META_TMP);
         let mut file = OpenOptions::new()
@@ -314,26 +311,17 @@ impl SnapshotStore {
 }
 
 fn decode_meta_file(bytes: &[u8]) -> Result<SnapshotMeta> {
-    if bytes.len() < 16 || bytes[0..8] != META_MAGIC {
-        return Err(ZyronError::RecoveryFailed(
-            "snapshot pointer magic does not match".into(),
-        ));
-    }
-    let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    if version != META_VERSION {
+    let parsed = envelope::decode_as(bytes, FormatKind::SnapshotTransfer)
+        .map_err(|e| ZyronError::RecoveryFailed(format!("snapshot pointer, {e}")))?;
+    if parsed.header.version != META_VERSION {
         return Err(ZyronError::RecoveryFailed(format!(
-            "snapshot pointer version {version} is not {META_VERSION}"
+            "snapshot pointer is at format version {}, this binary writes and reads \
+             {META_VERSION}. Upgrade through a release that still reads {} to move it \
+             forward first",
+            parsed.header.version, parsed.header.version
         )));
     }
-    let stored = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    let body = &bytes[16..];
-    let computed = hash32(body);
-    if stored != computed {
-        return Err(ZyronError::RecoveryFailed(format!(
-            "snapshot pointer checksum {stored:#010x} does not match computed {computed:#010x}"
-        )));
-    }
-    SnapshotMeta::decode(&mut Cursor::new(body))
+    SnapshotMeta::decode(&mut Cursor::new(parsed.body))
 }
 
 /// One chunk of a snapshot on its way to a follower.

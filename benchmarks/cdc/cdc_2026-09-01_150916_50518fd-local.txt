@@ -1,0 +1,120 @@
+# suite:   cdc
+# run:     2026-09-01_150916_50518fd-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Decoder Formats: All 4 Plugins ===
+  zyron_cdc: 66 bytes, roundtrip OK
+  debezium: 244 bytes, roundtrip OK
+  wal2json: 201 bytes, roundtrip OK
+  avro: 638 bytes, roundtrip OK
+  Formats validated [NOT MEASURED, unoptimized build]: 4 (target >= 4, not applied)
+
+=== Debezium Format: JSON Envelope ===
+  INSERT: op='c', before=null, after=present
+  UPDATE: op='u', before=present, after=present
+  DELETE: op='d', before=present, after=null, ts_ms=3
+  Formats validated [NOT MEASURED, unoptimized build]: 3 (target >= 3, not applied)
+
+=== Benchmark: Replication Slot Advance ===
+  Slot advance latency (us/op) [NOT MEASURED, unoptimized build]:
+    Runs: [0.6929, 0.7078, 0.6863, 0.6957, 0.6935]
+    Average: 0.6952 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Metrics: CDC Observability ===
+  Prometheus output: 2236 bytes, all counters present
+  Metric types rendered [NOT MEASURED, unoptimized build]: 14 (target >= 14, not applied)
+
+=== Benchmark: CDF Query 100K ===
+  Query latency (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [66, 62, 60, 63, 67]
+    Average: 63.6000 (target <= 25, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Logical Decoding 1M ===
+  Decoding throughput (rec/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1,581,517, 1,605,165, 1,628,806, 1,594,125, 1,547,262]
+    Average: 1,591,375 (target >= 500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== CDC Retention: Purge Enforcement ===
+  100 records: 50 old, 50 recent
+  Enforced: 1 tables, 50 purged, 2550 bytes reclaimed
+  50 old purged, 50 recent retained
+  Records purged [NOT MEASURED, unoptimized build]: 50 (target >= 50, not applied)
+
+=== Change Data Feed: Basic Operations ===
+  150 records: 100 insert, 20 preimage, 20 postimage, 10 delete
+  Records stored [NOT MEASURED, unoptimized build]: 150 (target >= 150, not applied)
+
+=== Change Data Feed: Time Range Queries ===
+  T1-T2: 140 records (inserts + updates)
+  T2-T3: 50 records (updates + deletes)
+  Version 101-120: 40 records
+  Queries correct [NOT MEASURED, unoptimized build]: 3 (target >= 3, not applied)
+
+=== Publication: Multi-table Subscriptions ===
+  create, alter add/drop, all_tables verified
+  Operations validated [NOT MEASURED, unoptimized build]: 5 (target >= 5, not applied)
+
+=== Replication Slot: Lifecycle ===
+  Created slot 'test_slot' with zyron_cdc plugin
+  Advanced 1000 times, confirmed_lsn = 100000
+  WAL min_restart_lsn = Some(Lsn(100000))
+  Slot state persisted and recovered
+  Slot lag: 100000 bytes
+  Checks passed [NOT MEASURED, unoptimized build]: 4 (target >= 4, not applied)
+
+=== RETURNING Clause: OLD/NEW Resolution ===
+  UPDATE: old.price=100, new.price=110
+  INSERT: old.price=NULL, new.price=110
+  DELETE: old.price=100, new.price=NULL
+  Tests passed [NOT MEASURED, unoptimized build]: 3 (target >= 3, not applied)
+
+=== Snapshot: Export and Import ===
+  1000 rows exported and imported at LSN 5000
+  Rows exported [NOT MEASURED, unoptimized build]: 1,000 (target >= 1,000, not applied)
+
+=== RETURNING with CTE: Audit Log Population ===
+  CTE audit_log populated with 50 change records
+  Audit rows [NOT MEASURED, unoptimized build]: 50 (target >= 50, not applied)
+
+=== Benchmark: CDF Insert Overhead ===
+  Insert overhead (ns/row) [NOT MEASURED, unoptimized build]:
+    Runs: [339.2520, 360.9890, 360.4180, 335.9980, 345.1010]
+    Average: 348.3516 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Retention Purge 1M ===
+  Purge latency (s) [NOT MEASURED, unoptimized build]:
+    Runs: [0.5757, 0.5665, 0.5652, 0.5572, 0.5728]
+    Average: 0.5675 (target <= 2, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Streams and Ingests: Management ===
+  CDC Stream created: Kafka sink, Debezium format
+  CDC Ingest created: Kafka source, OnConflict::Update
+  State persisted and recovered
+  Components validated [NOT MEASURED, unoptimized build]: 4 (target >= 4, not applied)
+
+=== Benchmark: Debezium Encoding ===
+  Encoding throughput (rec/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [39,635, 40,183, 48,558, 50,686, 59,065]
+    Average: 47,625 (target >= 200,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: RETURNING Clause Overhead ===
+  RETURNING clause overhead (ns/row) [NOT MEASURED, unoptimized build]:
+    Runs: [97.5702, 95.3408, 95.4966, 95.1010, 95.0540]
+    Average: 95.7125 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing

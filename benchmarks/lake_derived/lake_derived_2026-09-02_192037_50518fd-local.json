@@ -1,0 +1,98 @@
+{
+  "id": "2026-09-02_192037_50518fd-local",
+  "date": "2026-09-02 19:20:42Z",
+  "ts": 1788376842,
+  "commit": "50518fd-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "lake_derived": {
+      "Load, materialized column": {
+        "average": 932403.100000,
+        "runs": [932403.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Load, clustering expression": {
+        "average": 778857.000000,
+        "runs": [778857.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Load, timestamp only": {
+        "average": 746519.000000,
+        "runs": [746519.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "expression predicate files pruned (fraction)": {
+        "average": 0.930000,
+        "runs": [0.93],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Load ratio, clustering expression over timestamp only": {
+        "average": 1.043318,
+        "runs": [1.04],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Load ratio, clustering expression over materialized column": {
+        "average": 0.835322,
+        "runs": [0.84],
+        "target": 1.200000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Backfill, rows per second": {
+        "average": 5316063.922479,
+        "runs": [5316063.92],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Backfill, elapsed": {
+        "average": 188109.100000,
+        "runs": [188109.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Backfill ratio, declaring an expression over the load that wrote the rows": {
+        "average": 0.258377,
+        "runs": [0.26],
+        "target": 6.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

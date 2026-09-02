@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::format::kind::FormatKind;
+use crate::format::stamp::{FORMAT_STAMP_LEN, FormatStamp};
+use crate::format::version::FormatVersion;
+
 /// Default page size in bytes (16 KB).
 pub const PAGE_SIZE: usize = 16 * 1024;
 
@@ -133,6 +137,45 @@ pub enum PageType {
     Overflow = 6,
 }
 
+/// The format kind a page type identifies itself as, or None for a page
+/// type that holds no format of its own.
+///
+/// A free page carries no stamp because it holds nothing, and a page type
+/// with no allocated magic cannot be stamped. Adding a page type means
+/// allocating its magic in `format::kind` and adding its arm here.
+pub const fn format_kind_for_page(page_type: PageType) -> Option<FormatKind> {
+    match page_type {
+        PageType::Heap => Some(FormatKind::HeapPage),
+        PageType::BTreeLeaf => Some(FormatKind::BTreeLeaf),
+        PageType::BTreeInternal => Some(FormatKind::BTreeInternal),
+        PageType::FreeSpaceMap => Some(FormatKind::Fsm),
+        PageType::Overflow => Some(FormatKind::Toast),
+        PageType::Free | PageType::VisibilityMap => None,
+    }
+}
+
+/// Version heap pages are written at.
+pub const HEAP_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+/// Version B+tree pages are written at, internal and leaf alike.
+pub const BTREE_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+/// Version free space map pages are written at.
+pub const FSM_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+/// Version out-of-line extended value pages are written at.
+pub const TOAST_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+/// The version a page of one kind is stamped with.
+pub const fn page_format_version(kind: FormatKind) -> FormatVersion {
+    match kind {
+        FormatKind::HeapPage => HEAP_PAGE_FORMAT_VERSION,
+        FormatKind::BTreeInternal | FormatKind::BTreeLeaf => BTREE_PAGE_FORMAT_VERSION,
+        FormatKind::Fsm => FSM_PAGE_FORMAT_VERSION,
+        _ => TOAST_PAGE_FORMAT_VERSION,
+    }
+}
+
 /// Header structure at the beginning of every page.
 ///
 /// Layout (40 bytes total, format v2):
@@ -145,7 +188,12 @@ pub enum PageType {
 /// - tuple_count: 2 bytes
 /// - checksum: 4 bytes
 /// - format_version: 1 byte
-/// - reserved: 9 bytes
+/// - envelope: 9 bytes (format magic, major, minor, envelope flags)
+///
+/// The envelope stamp gives a page the same identity a standalone file
+/// carries in its header, so a page can be recognized and version-dispatched
+/// on its own. It needs no checksum of its own: the page checksum covers
+/// every byte except its own four, these nine included.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[repr(C)]
 pub struct PageHeader {
@@ -165,6 +213,9 @@ pub struct PageHeader {
     pub checksum: u32,
     /// Page header format version (2 = u64 page_num).
     pub format_version: u8,
+    /// Format envelope stamp: magic, major, minor, envelope flags. All zero
+    /// on a page type that holds no format of its own.
+    pub envelope: [u8; FORMAT_STAMP_LEN],
 }
 
 /// Current page header format version.
@@ -174,8 +225,13 @@ impl PageHeader {
     /// Size of the page header in bytes.
     pub const SIZE: usize = 40;
 
-    /// Creates a new page header.
+    /// Creates a new page header, stamped with the format envelope its page
+    /// type identifies.
     pub fn new(page_id: PageId, page_type: PageType) -> Self {
+        let envelope = match format_kind_for_page(page_type) {
+            Some(kind) => FormatStamp::new(kind, page_format_version(kind)).to_bytes(),
+            None => [0u8; FORMAT_STAMP_LEN],
+        };
         Self {
             page_id,
             lsn: 0,
@@ -185,7 +241,31 @@ impl PageHeader {
             tuple_count: 0,
             checksum: 0,
             format_version: PAGE_HEADER_FORMAT_VERSION,
+            envelope,
         }
+    }
+
+    /// The format envelope this page carries, or None when the page type
+    /// holds no format or the stamp is blank.
+    #[inline]
+    pub fn stamp(&self) -> Option<FormatStamp> {
+        if FormatStamp::is_blank(&self.envelope) {
+            return None;
+        }
+        FormatStamp::from_bytes(&self.envelope).ok()
+    }
+
+    /// Replaces the stamp, which a migration does after rewriting the page
+    /// body.
+    #[inline]
+    pub fn set_stamp(&mut self, stamp: FormatStamp) {
+        self.envelope = stamp.to_bytes();
+    }
+
+    /// The format version the page carries, or None when it is unstamped.
+    #[inline]
+    pub fn format_kind_version(&self) -> Option<(FormatKind, FormatVersion)> {
+        self.stamp().map(|s| (s.kind, s.version))
     }
 
     /// Returns the amount of free space available on this page.
@@ -205,7 +285,7 @@ impl PageHeader {
         buf[24..26].copy_from_slice(&self.tuple_count.to_le_bytes());
         buf[26..30].copy_from_slice(&self.checksum.to_le_bytes());
         buf[30] = self.format_version;
-        // bytes 31-39 are reserved (already zeroed)
+        buf[31..40].copy_from_slice(&self.envelope);
         buf
     }
 
@@ -233,6 +313,10 @@ impl PageHeader {
         let tuple_count = u16::from_le_bytes([buf[24], buf[25]]);
         let checksum = u32::from_le_bytes([buf[26], buf[27], buf[28], buf[29]]);
         let format_version = if buf.len() > 30 { buf[30] } else { 1 };
+        let mut envelope = [0u8; FORMAT_STAMP_LEN];
+        if buf.len() >= Self::SIZE {
+            envelope.copy_from_slice(&buf[31..40]);
+        }
 
         Self {
             page_id: PageId::new(file_id, page_num),
@@ -243,6 +327,7 @@ impl PageHeader {
             tuple_count,
             checksum,
             format_version,
+            envelope,
         }
     }
 }
@@ -712,5 +797,69 @@ mod tests {
         assert_eq!(header.page_type, deserialized.page_type);
         assert_eq!(header.tuple_count, deserialized.tuple_count);
         assert_eq!(header.checksum, deserialized.checksum);
+        assert_eq!(header.envelope, deserialized.envelope);
+    }
+
+    #[test]
+    fn test_every_stampable_page_type_carries_its_magic() {
+        for (page_type, kind) in [
+            (PageType::Heap, FormatKind::HeapPage),
+            (PageType::BTreeLeaf, FormatKind::BTreeLeaf),
+            (PageType::BTreeInternal, FormatKind::BTreeInternal),
+            (PageType::FreeSpaceMap, FormatKind::Fsm),
+            (PageType::Overflow, FormatKind::Toast),
+        ] {
+            let header = PageHeader::new(PageId::new(1, 1), page_type);
+            let stamp = header.stamp().expect("stamped");
+            assert_eq!(stamp.kind, kind, "{page_type:?} carries the wrong magic");
+            assert_eq!(stamp.version, page_format_version(kind));
+            assert_eq!(
+                header.format_kind_version(),
+                Some((kind, page_format_version(kind)))
+            );
+        }
+    }
+
+    #[test]
+    fn test_free_pages_carry_no_stamp() {
+        let header = PageHeader::new(PageId::new(1, 1), PageType::Free);
+        assert!(header.stamp().is_none());
+        assert_eq!(header.envelope, [0u8; FORMAT_STAMP_LEN]);
+    }
+
+    #[test]
+    fn test_stamp_round_trips_through_the_header_bytes() {
+        let header = PageHeader::new(PageId::new(7, 11), PageType::Heap);
+        let bytes = header.to_bytes();
+        assert_eq!(&bytes[31..35], b"ZHEP");
+        let read = PageHeader::from_bytes(&bytes);
+        assert_eq!(read.envelope, header.envelope);
+        assert_eq!(read.stamp().expect("stamped").kind, FormatKind::HeapPage);
+    }
+
+    #[test]
+    fn test_the_page_checksum_covers_the_stamp() {
+        let mut page = Box::new([0u8; PAGE_SIZE]);
+        let header = PageHeader::new(PageId::new(2, 3), PageType::Heap);
+        page[..PageHeader::SIZE].copy_from_slice(&header.to_bytes());
+        stamp_page_checksum(&mut page);
+        assert!(verify_page_checksum(&page, header.page_id).is_ok());
+        // Corrupting the magic has to fail the page, which is what makes the
+        // stamp need no checksum of its own
+        page[31] ^= 0x01;
+        assert!(verify_page_checksum(&page, header.page_id).is_err());
+    }
+
+    #[test]
+    fn test_a_migrated_page_can_be_restamped() {
+        let mut header = PageHeader::new(PageId::new(1, 1), PageType::Heap);
+        header.set_stamp(FormatStamp::new(
+            FormatKind::HeapPage,
+            FormatVersion::new(1, 4),
+        ));
+        assert_eq!(
+            header.stamp().expect("stamped").version,
+            FormatVersion::new(1, 4)
+        );
     }
 }

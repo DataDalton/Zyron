@@ -97,7 +97,7 @@ async fn setup() -> Env {
     let writer = ZyrFileWriter::create(
         &seg_path,
         ZyrFileHeader {
-            format_version: 1,
+            format_version: zyron_storage::columnar::constants::ZYR_FORMAT_VERSION,
             column_count: 0,
             row_count: 0,
             table_id: table.0 as u64,

@@ -1,0 +1,100 @@
+{
+  "id": "2026-09-01_151859_50518fd-local",
+  "date": "2026-09-01 15:19:07Z",
+  "ts": 1788275947,
+  "commit": "50518fd-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Planner Performance": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 18.25 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 18.28 },
+      "Binding latency (us)": {
+        "average": 15.253420,
+        "runs": [23.10, 20.11, 12.84, 9.64, 10.57],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Logical plan latency (us)": {
+        "average": 37.764860,
+        "runs": [47.36, 56.48, 34.15, 18.79, 32.04],
+        "target": 5.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Optimization latency (us)": {
+        "average": 57.653980,
+        "runs": [85.31, 57.16, 50.28, 31.48, 64.04],
+        "target": 25.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Physical plan latency (us)": {
+        "average": 14.869420,
+        "runs": [31.19, 15.00, 17.73, 10.42, 0.01],
+        "target": 10.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Join reorder latency (us, 5 tables)": {
+        "average": 291.594800,
+        "runs": [438.67, 338.19, 262.64, 159.17, 259.31],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Index selection latency (us)": {
+        "average": 0.010000,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 5.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Full pipeline latency (us)": {
+        "average": 236.235840,
+        "runs": [400.06, 241.89, 157.13, 154.10, 228.01],
+        "target": 50.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Plan cache hit rate": {
+        "average": 0.999000,
+        "runs": [1.00],
+        "target": 0.980000,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Cardinality estimation error factor": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

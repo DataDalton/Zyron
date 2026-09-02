@@ -51,6 +51,7 @@ pub mod codec;
 pub mod config;
 pub mod consensus;
 pub mod election;
+pub mod format;
 pub mod log;
 pub mod machine;
 pub mod membership;

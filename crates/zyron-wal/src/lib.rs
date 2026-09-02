@@ -10,6 +10,7 @@
 pub mod checksum;
 pub mod constants;
 pub mod durability;
+pub mod format;
 pub mod mapping;
 pub mod reader;
 pub mod record;
@@ -19,6 +20,7 @@ pub mod sequencer;
 pub mod writer;
 
 pub use checksum::{WalHasher, data_checksum, wal_checksum};
+pub use format::{WAL_RECORD_VERSION, WAL_RECORD_VERSION_BYTE, WAL_SEGMENT_FORMAT_VERSION};
 pub use reader::{RecoveryManager, RecoveryResult, WalReader};
 pub use record::{LogRecord, LogRecordType, Lsn};
 pub use segment::{LogSegment, SegmentId};

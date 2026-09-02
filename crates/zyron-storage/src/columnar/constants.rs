@@ -1,19 +1,22 @@
 //! Byte-level constants for the .zyr columnar file format.
 
+use zyron_common::format::FormatVersion;
 use zyron_common::page::PAGE_SIZE;
 
-/// Magic bytes identifying a .zyr columnar file.
-pub const ZYR_MAGIC: [u8; 8] = *b"ZYRCOL\0\0";
+/// Sentinel repeated in the trailer of a .zyr file. Not the file's format
+/// identity, which the envelope in the header carries. This marks where the
+/// trailer is so a truncated tail is told apart from a healthy one.
+pub const ZYR_FOOTER_SENTINEL: [u8; 8] = *b"ZYRCOL\0\0";
 
-/// Current .zyr format version. The field exists so the format can be
-/// versioned in the future. Only the current version is supported (reads of
-/// any other version are rejected).
-pub const ZYR_FORMAT_VERSION: u32 = 1;
+/// Current .zyr format version, registered in the format registry.
+pub const ZYR_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
 
 /// File header occupies one full page for alignment.
 pub const FILE_HEADER_SIZE: usize = PAGE_SIZE;
 
-/// Bytes of metadata in the file header before the padding region.
+/// Bytes of metadata in the file header before the padding region. The
+/// first 20 are the format envelope, the rest are the file's own header
+/// extension, which the envelope's header checksum covers.
 pub const FILE_HEADER_METADATA_SIZE: usize = 128;
 
 /// On-disk size of a SegmentHeader.

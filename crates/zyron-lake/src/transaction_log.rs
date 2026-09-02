@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use zyron_common::ZyronError;
+use zyron_common::format::{FormatKind, FormatVersion};
 
 use crate::codec::{Cursor, corrupt};
 use crate::index::{IndexFileEntry, LakeIndexSpec};
@@ -41,8 +42,8 @@ use crate::predicate::{LakePredicate, PruneDecision};
 use crate::prune_index::PruneIndex;
 use crate::schema::LakeSchema;
 
-pub const LOG_MAGIC: [u8; 5] = *b"ZYLOG";
-pub const LOG_FORMAT_VERSION: u8 = 2;
+/// Version commit records are written at, declared in the format registry
+pub const LOG_FORMAT_VERSION: FormatVersion = crate::format::LAKE_LOG_FORMAT_VERSION;
 pub const COMMIT_HEADER_LEN: usize = 128;
 
 const MAX_COMMIT_ATTEMPTS: u32 = 16;
@@ -402,9 +403,11 @@ pub struct CommitHeader {
 impl CommitHeader {
     fn encode(&self, entry_section_crc: u32) -> [u8; COMMIT_HEADER_LEN] {
         let mut h = [0u8; COMMIT_HEADER_LEN];
-        h[0..5].copy_from_slice(&LOG_MAGIC);
-        h[5] = LOG_FORMAT_VERSION;
-        // 6..8 flags zero, 8..12 header crc patched last
+        // Format identity, the same magic and version prefix every Zyron
+        // file opens with, so a commit record is identified by `envelope::peek`
+        h[0..4].copy_from_slice(&FormatKind::LakeTransactionLog.magic());
+        h[4..8].copy_from_slice(&LOG_FORMAT_VERSION.to_le_bytes());
+        // 8..12 header crc patched last
         h[12..20].copy_from_slice(&self.version.to_le_bytes());
         h[20..28].copy_from_slice(&self.read_version.to_le_bytes());
         h[28..36].copy_from_slice(&self.db_txn_id.to_le_bytes());
@@ -440,13 +443,22 @@ impl CommitHeader {
                 ),
             ));
         }
-        if bytes[0..5] != LOG_MAGIC {
-            return Err(corrupt(ctx, "bad log magic".into()));
-        }
-        if bytes[5] != LOG_FORMAT_VERSION {
+        let (kind, version) =
+            zyron_common::format::envelope::peek(bytes).map_err(|e| corrupt(ctx, e.to_string()))?;
+        if kind != FormatKind::LakeTransactionLog {
             return Err(corrupt(
                 ctx,
-                format!("unsupported log format version {}", bytes[5]),
+                format!("expected a lake commit record, found a {kind} record"),
+            ));
+        }
+        if version != LOG_FORMAT_VERSION {
+            return Err(corrupt(
+                ctx,
+                format!(
+                    "commit record is at format version {version}, this binary writes and \
+                     reads {LOG_FORMAT_VERSION}. Upgrade through a release that still reads \
+                     {version} to replay this log"
+                ),
             ));
         }
         let mut check = [0u8; COMMIT_HEADER_LEN];

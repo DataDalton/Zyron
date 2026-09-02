@@ -374,6 +374,7 @@ fn compliance_log_hash_chain() {
         ts: 100,
         detail: "create legal hold".into(),
         prev_hash: 0,
+        record_version: 1,
         entry_hash: 0,
     };
     e1.entry_hash = e1.compute_hash();
@@ -385,6 +386,7 @@ fn compliance_log_hash_chain() {
         ts: 200,
         detail: "forget user".into(),
         prev_hash: e1.entry_hash,
+        record_version: 1,
         entry_hash: 0,
     };
     e2.entry_hash = e2.compute_hash();

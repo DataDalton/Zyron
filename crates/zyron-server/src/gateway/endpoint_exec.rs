@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use parking_lot::Mutex as PlMutex;
 use tokio::sync::oneshot;
 
 use zyron_auth::SecurityManager;

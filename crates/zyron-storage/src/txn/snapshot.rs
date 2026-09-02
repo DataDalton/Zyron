@@ -29,6 +29,10 @@ pub struct Snapshot {
     /// snapshot, so visibility resolves it with a single comparison and no
     /// status-map lookup. Captured once at snapshot creation.
     frozen_below: u64,
+    /// Live active-transaction registry, when this snapshot came from the
+    /// transaction manager. `prune_horizon` reads the system-wide horizon
+    /// from it, and a snapshot built without one prunes nothing
+    proc_array: Option<Arc<super::proc_array::ProcArray>>,
 }
 
 impl Snapshot {
@@ -53,7 +57,28 @@ impl Snapshot {
             active_txn_ids: active_txns,
             status,
             frozen_below,
+            proc_array: None,
         }
+    }
+
+    /// Attaches the live active-transaction registry, enabling
+    /// `prune_horizon`. The transaction manager calls this for every
+    /// snapshot it hands out
+    pub fn with_proc_array(mut self, proc_array: Arc<super::proc_array::ProcArray>) -> Self {
+        self.proc_array = Some(proc_array);
+        self
+    }
+
+    /// Lowest `xmax` this snapshot can still need to see.
+    ///
+    /// Reading `is_visible` bottom up, a deleted row stays visible here only
+    /// when `xmax >= txn_id`, when `xmax` is in the active set, or when
+    /// `xmax` aborted, and the last two are at or above the frozen horizon.
+    /// So no version below this value is needed, and this is what the
+    /// transaction publishes for the system-wide prune horizon
+    #[inline]
+    pub fn visibility_floor(&self) -> u64 {
+        self.frozen_below.min(self.txn_id)
     }
 
     /// Checks if a tuple version is visible to this snapshot.
@@ -135,15 +160,27 @@ impl Snapshot {
         inserted && !deleted
     }
 
-    /// Returns the prune horizon for this snapshot: every transaction below it
-    /// committed and ended before the oldest transaction active when this
-    /// snapshot was taken. A version with `xmax` below this horizon is a
-    /// committed delete invisible to every live snapshot, so on-access pruning
-    /// can reclaim it. Because the active set is system-wide, this horizon is
-    /// globally safe, not merely safe for this snapshot.
+    /// Returns the system-wide prune horizon: a version whose `xmax` is below
+    /// it is a committed delete invisible to every live transaction, so
+    /// on-access pruning can reclaim its tuple.
+    ///
+    /// This reads the live registry rather than this snapshot's own frozen
+    /// horizon. The frozen horizon is safe only for this snapshot. A
+    /// transaction still in flight when an older reader took its snapshot
+    /// sits in that reader's active set, so the reader goes on seeing the
+    /// rows it deleted, yet once it commits and leaves the registry this
+    /// snapshot's horizon can rise above its id. Pruning on that value
+    /// physically removes tuples the reader is still entitled to, and the
+    /// reader's next scan returns fewer rows, down to none when they all
+    /// shared one deleter
+    ///
+    /// A snapshot with no registry attached returns 0 and prunes nothing
     #[inline]
     pub fn prune_horizon(&self) -> u64 {
-        self.frozen_below
+        match &self.proc_array {
+            Some(pa) => pa.global_prune_horizon(),
+            None => 0,
+        }
     }
 
     /// Returns the shared commit-status map, so callers that prune dead tuples

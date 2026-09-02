@@ -144,10 +144,39 @@ pub struct JsonDiffRow {
 /// dispatch: SELECT path FROM JSON_DIFF_TABLE(a, b) WHERE op = 'replace'
 pub fn json_diff_table(old_json: &str, new_json: &str) -> Result<Vec<JsonDiffRow>> {
     let patch = json_diff(old_json, new_json)?;
-    parse_json_patch_rows(&patch)
+    // The old document is in hand, so the pre-image every remove and replace
+    // op acts on is resolved from it rather than reported as null
+    let old_doc: Option<serde_json::Value> = serde_json::from_str(old_json).ok();
+    parse_json_patch_rows(&patch, old_doc.as_ref())
 }
 
-fn parse_json_patch_rows(patch: &str) -> Result<Vec<JsonDiffRow>> {
+/// Resolves an RFC 6901 JSON Pointer against a document.
+///
+/// The pointer is the `path` an RFC 6902 op carries, so `~1` decodes to `/`
+/// and `~0` to `~`. An empty pointer names the whole document
+fn resolve_pointer<'a>(doc: &'a serde_json::Value, pointer: &str) -> Option<&'a serde_json::Value> {
+    if pointer.is_empty() {
+        return Some(doc);
+    }
+    let mut current = doc;
+    for raw in pointer.trim_start_matches('/').split('/') {
+        let token = raw.replace("~1", "/").replace("~0", "~");
+        current = match current {
+            serde_json::Value::Object(map) => map.get(&token)?,
+            serde_json::Value::Array(items) => {
+                let index: usize = token.parse().ok()?;
+                items.get(index)?
+            }
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn parse_json_patch_rows(
+    patch: &str,
+    old_doc: Option<&serde_json::Value>,
+) -> Result<Vec<JsonDiffRow>> {
     let trimmed = patch.trim();
     if trimmed.is_empty() || trimmed == "[]" {
         return Ok(Vec::new());
@@ -173,11 +202,13 @@ fn parse_json_patch_rows(patch: &str) -> Result<Vec<JsonDiffRow>> {
             .unwrap_or("")
             .to_string();
         let new_value = obj.get("value").map(|v| v.to_string());
-        // RFC 6902 only emits the new value, not the old. We surface old as
-        // None for add/replace and as None for remove (server is free to
-        // enrich this from old_json if it wants pre-images)
+        // RFC 6902 carries only the new value. Remove and replace both act on
+        // something that existed before, so the pre-image comes from the old
+        // document at the same pointer. An add has no pre-image by definition
         let old_value = if op == "remove" || op == "replace" {
-            None
+            old_doc
+                .and_then(|doc| resolve_pointer(doc, &path))
+                .map(|v| v.to_string())
         } else {
             None
         };
@@ -424,6 +455,70 @@ mod tests {
         // Path encoding follows RFC 6901
         assert!(rows.iter().any(|r| r.path == "/b"));
         assert!(rows.iter().any(|r| r.path == "/c"));
+    }
+
+    /// A replace and a remove both act on a value that existed before, so
+    /// each carries its pre-image. An add has none
+    #[test]
+    fn json_diff_table_carries_the_old_value() {
+        let rows = json_diff_table(r#"{"a":1,"b":2}"#, r#"{"a":1,"b":3,"c":4}"#).unwrap();
+        let replaced = rows
+            .iter()
+            .find(|r| r.op == "replace")
+            .expect("b was replaced");
+        assert_eq!(replaced.old_value.as_deref(), Some("2"));
+        assert_eq!(replaced.new_value.as_deref(), Some("3"));
+
+        let added = rows.iter().find(|r| r.op == "add").expect("c was added");
+        assert_eq!(added.old_value, None, "an add has no pre-image");
+
+        let removed = json_diff_table(r#"{"a":1,"gone":"x"}"#, r#"{"a":1}"#).unwrap();
+        let row = removed
+            .iter()
+            .find(|r| r.op == "remove")
+            .expect("gone was removed");
+        assert_eq!(row.old_value.as_deref(), Some("\"x\""));
+    }
+
+    /// A pointer segment holding `/` or `~` is escaped by RFC 6901, so the
+    /// pre-image lookup has to decode it rather than split on the raw text
+    #[test]
+    fn json_diff_table_resolves_an_escaped_pointer() {
+        let rows = json_diff_table(r#"{"a/b":1}"#, r#"{"a/b":2}"#).unwrap();
+        let replaced = rows
+            .iter()
+            .find(|r| r.op == "replace")
+            .expect("the escaped key was replaced");
+        assert_eq!(replaced.path, "/a~1b");
+        assert_eq!(replaced.old_value.as_deref(), Some("1"));
+    }
+
+    /// A nested path resolves through objects. json_diff replaces a changed
+    /// array wholesale rather than indexing into it, so the pre-image is the
+    /// old array
+    #[test]
+    fn json_diff_table_resolves_a_nested_pointer() {
+        let rows = json_diff_table(r#"{"o":{"xs":[10,20]}}"#, r#"{"o":{"xs":[10,99]}}"#).unwrap();
+        let replaced = rows
+            .iter()
+            .find(|r| r.op == "replace")
+            .expect("the nested array was replaced");
+        assert_eq!(replaced.path, "/o/xs");
+        assert_eq!(replaced.old_value.as_deref(), Some("[10,20]"));
+    }
+
+    /// The resolver still walks array indices, which a pointer reaches when
+    /// the diff addresses one directly
+    #[test]
+    fn resolve_pointer_walks_array_indices() {
+        let doc: serde_json::Value = serde_json::from_str(r#"{"o":{"xs":[10,20]}}"#).unwrap();
+        assert_eq!(
+            resolve_pointer(&doc, "/o/xs/1").map(|v| v.to_string()),
+            Some("20".to_string())
+        );
+        assert_eq!(resolve_pointer(&doc, "/o/xs/9"), None);
+        assert_eq!(resolve_pointer(&doc, "/missing"), None);
+        assert_eq!(resolve_pointer(&doc, "").map(|v| v.is_object()), Some(true));
     }
 
     #[test]

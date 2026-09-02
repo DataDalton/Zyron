@@ -13,6 +13,7 @@ profile = ["zyron-common/profile"]
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-raft = { path = "../zyron-raft" }
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 zyron-media = { path = "../zyron-media" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }

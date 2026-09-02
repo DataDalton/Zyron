@@ -553,6 +553,14 @@ pub async fn query_system_view(
         return filters.project(name, fields, rows).map(Some);
     }
 
+    // The format substrate computes its rows off the registries rather than
+    // off ServerState, so it is dispatched before the rest
+    if crate::system_format_views::owns(object.schema, object.object) {
+        let (fields, rows) = crate::system_format_views::build(object.schema, object.object)?;
+        let rows = filters.apply(&fields, rows);
+        return filters.project(name, fields, rows).map(Some);
+    }
+
     let built = match (object.schema, object.object) {
         // The history views scope themselves by table and version so they
         // read only the log versions the query asked about; every other view

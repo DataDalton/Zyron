@@ -93,15 +93,23 @@ impl MvccGc {
         active_txn_ids.first().copied()
     }
 
-    /// Determines if a tuple is reclaimable given the oldest active transaction.
+    /// Determines if a tuple is reclaimable against a prune horizon.
     ///
     /// A tuple is reclaimable when:
     /// - xmax != 0 (tuple has been deleted/updated)
-    /// - xmax < oldest_active (the deleting transaction committed and is no longer
-    ///   visible to any active transaction)
+    /// - xmax < prune_horizon (the deleting transaction committed and no live
+    ///   transaction can still see the row alive)
+    ///
+    /// `prune_horizon` must come from `TransactionManager::prune_horizon`,
+    /// which is the minimum over the visibility floors live transactions
+    /// publish. **Passing the oldest active transaction id is wrong and loses
+    /// data.** A transaction still in flight when an older reader took its
+    /// snapshot is in that reader's active set, so the reader keeps seeing the
+    /// rows it deleted, and once it commits and leaves the array the oldest
+    /// active id sits above its id while the reader still needs those rows.
     #[inline]
-    pub fn is_reclaimable(xmax: u64, oldest_active: u64) -> bool {
-        xmax != 0 && xmax < oldest_active
+    pub fn is_reclaimable(xmax: u64, prune_horizon: u64) -> bool {
+        xmax != 0 && xmax < prune_horizon
     }
 
     /// Determines if a tuple is reclaimable when no transactions are active.

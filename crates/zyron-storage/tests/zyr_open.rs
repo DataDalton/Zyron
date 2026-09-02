@@ -11,11 +11,37 @@
 //! one did, and that a file whose two records of the index position
 //! disagree is refused rather than read at the wrong offset.
 
+use zyron_common::format::envelope::ENVELOPE_HEADER_LEN;
 use zyron_common::types::TypeId;
 use zyron_storage::columnar::{
     BloomPolicy, ColumnSegment, FILE_HEADER_SIZE, FOOTER_SIZE, SEGMENT_INDEX_ENTRY_SIZE,
     SegmentOptions, SortOrder, ZYR_FORMAT_VERSION, ZyrFileHeader, ZyrFileReader, ZyrFileWriter,
 };
+
+/// Rewrites the columnar header fields in place, leaving a file whose only
+/// defect is the one `edit` introduced.
+///
+/// The fields live in the envelope's header extension, so `edit` is handed
+/// the whole header page and works at the same absolute offsets the reader
+/// does. The envelope header checksum covers the fixed header and the
+/// extension behind it, so it is re-stamped afterwards, otherwise the
+/// envelope refuses the file before the check under test is reached. The
+/// body is untouched, so the envelope footer stays valid.
+fn tamper_zyr_header(path: &std::path::Path, edit: impl FnOnce(&mut [u8])) {
+    let mut bytes = std::fs::read(path).expect("read");
+    let header_len = u32::from_le_bytes(bytes[8..12].try_into().expect("header length")) as usize;
+
+    edit(&mut bytes);
+
+    let checksum = {
+        let mut h = zyron_common::checksum::Hasher::new();
+        h.update(&bytes[0..16]);
+        h.update(&bytes[ENVELOPE_HEADER_LEN..header_len]);
+        h.finish32()
+    };
+    bytes[16..20].copy_from_slice(&checksum.to_le_bytes());
+    std::fs::write(path, &bytes).expect("write");
+}
 
 /// Writes a file of `columns` Int64 columns, each holding `rows` values
 fn write_file(path: &std::path::Path, columns: u32, rows: usize) {
@@ -136,21 +162,12 @@ fn a_header_that_disagrees_with_the_footer_is_refused() {
     // Start the index one entry earlier and make it one entry longer, so it
     // still ends where the trailer begins. The read stays inside the file
     // and lands on the real trailer, which leaves the two records of the
-    // index position as the only thing wrong with the file. Re-stamp the
-    // header checksum so its own integrity check cannot be what catches it
-    let mut bytes = std::fs::read(&path).expect("read");
+    // index position as the only thing wrong with the file
     let entry = SEGMENT_INDEX_ENTRY_SIZE as u64;
-    bytes[80..88].copy_from_slice(&(real_offset - entry).to_le_bytes());
-    bytes[88..92].copy_from_slice(&(real_size + entry as u32).to_le_bytes());
-    let checksum = {
-        let mut h = zyron_common::Hasher::new();
-        h.update(&bytes[0..12]);
-        h.finish_phase();
-        h.update(&bytes[16..128]);
-        h.finish32()
-    };
-    bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
-    std::fs::write(&path, &bytes).expect("write");
+    tamper_zyr_header(&path, |b| {
+        b[80..88].copy_from_slice(&(real_offset - entry).to_le_bytes());
+        b[88..92].copy_from_slice(&(real_size + entry as u32).to_le_bytes());
+    });
 
     let message = match ZyrFileReader::open(&path) {
         Ok(_) => panic!("a file whose two index positions disagree must not open"),
@@ -170,17 +187,9 @@ fn an_index_offset_inside_the_header_is_refused() {
     let path = tmp.path().join("overlapping.zyr");
     write_file(&path, 1, 512);
 
-    let mut bytes = std::fs::read(&path).expect("read");
-    bytes[80..88].copy_from_slice(&64u64.to_le_bytes());
-    let checksum = {
-        let mut h = zyron_common::Hasher::new();
-        h.update(&bytes[0..12]);
-        h.finish_phase();
-        h.update(&bytes[16..128]);
-        h.finish32()
-    };
-    bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
-    std::fs::write(&path, &bytes).expect("write");
+    tamper_zyr_header(&path, |b| {
+        b[80..88].copy_from_slice(&64u64.to_le_bytes());
+    });
 
     let message = match ZyrFileReader::open(&path) {
         Ok(_) => panic!("an index inside the header page must not open"),

@@ -14,6 +14,8 @@ use std::sync::Arc;
 use common::{
     create_test_server, exec_ddl, exec_dml, exec_dml_result, new_session, query_error, query_values,
 };
+use zyron_common::format::FormatKind;
+use zyron_common::format::stamp::{FORMAT_STAMP_LEN, FormatStamp};
 use zyron_executor::column::ScalarValue;
 use zyron_wire::connection::ServerState;
 
@@ -577,12 +579,13 @@ async fn test_medium_payload_toasts_compressed_and_round_trips() {
         png.len() as u64
     );
 
-    // The object file header records lz4 compression, which is what
+    // The object stamp records lz4 compression in its flags, which is what
     // separates toast from the uncompressed external mode
     let raw = std::fs::read(object_path(&tmp.path().join("media"), &sha))
         .expect("object file exists on disk");
-    assert_eq!(&raw[..4], b"ZYMO");
-    assert_eq!(raw[5], 1, "toast objects store compressed");
+    let stamp = FormatStamp::from_bytes(&raw).expect("object carries a format stamp");
+    assert_eq!(stamp.kind, FormatKind::Toast);
+    assert!(stamp.is_compressed(), "toast objects store compressed");
 
     let back = one_binary(&query_values(&server, "SELECT img FROM toasted").await);
     assert_eq!(back, png, "toast payload reads back byte identical");
@@ -648,9 +651,17 @@ async fn test_large_payload_goes_external_and_dedups_by_content() {
 
     // External objects store uncompressed
     let raw = std::fs::read(&object).expect("read object file");
-    assert_eq!(&raw[..4], b"ZYMO");
-    assert_eq!(raw[6..], payload[..], "the object body is the raw payload");
-    assert_eq!(raw[5], 0, "external objects store uncompressed");
+    let stamp = FormatStamp::from_bytes(&raw).expect("object carries a format stamp");
+    assert_eq!(stamp.kind, FormatKind::Toast);
+    assert_eq!(
+        raw[FORMAT_STAMP_LEN..],
+        payload[..],
+        "the object body is the raw payload"
+    );
+    assert!(
+        !stamp.is_compressed(),
+        "external objects store uncompressed"
+    );
 
     let rows = query_values(&server, "SELECT doc FROM blobs ORDER BY id").await;
     assert_eq!(rows.len(), 2);

@@ -290,6 +290,111 @@ pub enum Statement {
     CreateCollation(Box<CreateCollationStatement>),
     /// DROP COLLATION [IF EXISTS] name
     DropCollation(Box<DropCollationStatement>),
+
+    // Format, signature, and upgrade substrate.
+    /// SET SIGNATURE SCHEME 'Ed25519' FOR ARTIFACT KIND 'JWT'
+    SetSignatureScheme(Box<SetSignatureSchemeStatement>),
+    /// ROTATE SIGNATURE SCHEME JWT TO 'ML-DSA-65' [OVERLAP '24h']
+    RotateSignatureScheme(Box<RotateSignatureSchemeStatement>),
+    /// ROTATE SERVICE PRINCIPAL KEY sp [SCHEME 'ML-DSA-65'] [OVERLAP '24h']
+    RotateServicePrincipalKey(Box<RotateServicePrincipalKeyStatement>),
+    /// LIST SIGNATURE SCHEMES, LIST ARTIFACT SCHEMES,
+    /// LIST UPGRADE HISTORY [LIMIT n], LIST FORMAT REGISTRY
+    ListRegistry(Box<ListRegistryStatement>),
+    /// TRIGGER MANUAL UPGRADE TO '2.3.1', TRIGGER MANUAL ROLLBACK
+    TriggerUpgrade(Box<TriggerUpgradeStatement>),
+    /// SHOW UPGRADE STATE, SHOW FORMAT MIGRATIONS [FOR FORMAT <kind>]
+    ShowUpgrade(Box<ShowUpgradeStatement>),
+    /// EXPLAIN REWRITE FOR OBJECT <name>
+    ExplainRewrite(Box<ExplainRewriteStatement>),
+}
+
+// ---------------------------------------------------------------------------
+// Format, signature, and upgrade substrate statements
+// ---------------------------------------------------------------------------
+
+/// `SET SIGNATURE SCHEME <scheme> FOR ARTIFACT KIND <kind>`
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetSignatureSchemeStatement {
+    pub scheme: String,
+    pub artifact_kind: String,
+}
+
+/// `ROTATE SIGNATURE SCHEME <artifact_kind> TO <scheme> [OVERLAP <interval>]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct RotateSignatureSchemeStatement {
+    pub artifact_kind: String,
+    pub new_scheme: String,
+    /// The overlap window as written. None takes the 24 hour default.
+    pub overlap: Option<String>,
+}
+
+/// `ROTATE SERVICE PRINCIPAL KEY <sp> [SCHEME <scheme>] [OVERLAP <interval>]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct RotateServicePrincipalKeyStatement {
+    pub principal: String,
+    /// None keeps the scheme the principal already signs with.
+    pub new_scheme: Option<String>,
+    pub overlap: Option<String>,
+}
+
+/// What a `LIST` statement enumerates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRegistryTarget {
+    /// LIST SIGNATURE SCHEMES
+    SignatureSchemes,
+    /// LIST ARTIFACT SCHEMES
+    ArtifactSchemes,
+    /// LIST UPGRADE HISTORY
+    UpgradeHistory,
+    /// LIST FORMAT REGISTRY
+    FormatRegistry,
+    /// LIST DEPRECATIONS
+    Deprecations,
+}
+
+/// `LIST <target> [LIMIT n]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListRegistryStatement {
+    pub target: ListRegistryTarget,
+    /// Only meaningful for history, which is otherwise unbounded.
+    pub limit: Option<u64>,
+}
+
+/// What a `TRIGGER MANUAL` statement asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerUpgradeAction {
+    /// TRIGGER MANUAL UPGRADE TO '<version>'
+    UpgradeTo(String),
+    /// TRIGGER MANUAL ROLLBACK
+    Rollback,
+}
+
+/// `TRIGGER MANUAL UPGRADE TO '<version>'` or `TRIGGER MANUAL ROLLBACK`
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerUpgradeStatement {
+    pub action: TriggerUpgradeAction,
+}
+
+/// What a `SHOW` statement of the substrate asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShowUpgradeTarget {
+    /// SHOW UPGRADE STATE
+    State,
+    /// SHOW FORMAT MIGRATIONS [FOR FORMAT <kind>]
+    FormatMigrations { format_kind: Option<String> },
+}
+
+/// `SHOW UPGRADE STATE` or `SHOW FORMAT MIGRATIONS [FOR FORMAT <kind>]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowUpgradeStatement {
+    pub target: ShowUpgradeTarget,
+}
+
+/// `EXPLAIN REWRITE FOR OBJECT <name>`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainRewriteStatement {
+    pub object_name: String,
 }
 
 // ---------------------------------------------------------------------------

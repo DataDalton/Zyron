@@ -50,6 +50,7 @@ impl AuditChain {
             detail,
             prev_hash,
             entry_hash: 0,
+            record_version: crate::format::AUDIT_RECORD_VERSION_BYTE,
         };
         e.entry_hash = e.compute_hash();
         self.last_hash.store(e.entry_hash, Ordering::Release);

@@ -16,7 +16,7 @@ use std::io::Read;
 
 use zyron_common::ZyronError;
 
-use crate::manifest::{MANIFEST_MAGIC, ManifestFile};
+use crate::manifest::ManifestFile;
 use crate::paths::{VersionFileKind, parse_version_file_name};
 use crate::transaction_log::{TransactionLog, read_commit_header};
 
@@ -123,14 +123,20 @@ fn read_checkpoint_timestamp(log: &TransactionLog, version: u64) -> Result<i64, 
     let mut file = fs::File::open(&path)?;
     let mut head = [0u8; 64];
     file.read_exact(&mut head)?;
-    if head[..4] != MANIFEST_MAGIC {
+    let (kind, _) =
+        zyron_common::format::envelope::peek(&head).map_err(|e| ZyronError::ManifestCorrupted {
+            path: path.to_string_lossy().to_string(),
+            reason: e.to_string(),
+        })?;
+    if kind != zyron_common::format::FormatKind::LakeManifest {
         return Err(ZyronError::ManifestCorrupted {
             path: path.to_string_lossy().to_string(),
-            reason: "bad manifest magic".into(),
+            reason: format!("expected a lake manifest, found a {kind} file"),
         });
     }
+    // Envelope header, schema id, snapshot id, then the timestamp
     let mut ts = [0u8; 8];
-    ts.copy_from_slice(&head[24..32]);
+    ts.copy_from_slice(&head[36..44]);
     Ok(i64::from_le_bytes(ts))
 }
 

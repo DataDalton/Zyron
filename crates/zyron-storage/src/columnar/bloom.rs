@@ -16,6 +16,8 @@
 
 use crate::columnar::constants::*;
 use zyron_common::checksum::hot::hot_hash128;
+use zyron_common::format::stamp::{FORMAT_STAMP_LEN, FormatStamp};
+use zyron_common::format::{FormatKind, FormatVersion};
 use zyron_common::{Result, ZyronError};
 
 /// Hashes one key to the 128-bit (block, probe) pair
@@ -146,14 +148,21 @@ fn probe_batch(
 
 /// Version of the key hash and probe derivation baked into serialized
 /// filters. A stored filter's bits are only meaningful to the scheme that
-/// set them, so every reader checks this field before trusting a probe
-/// answer. Version 2 is the canonical 128-bit key hash with the decoupled
-/// probe derivation in probe_params
-pub const BLOOM_ALGORITHM_VERSION: u32 = 2;
+/// set them, so every reader checks the stamp before trusting a probe
+/// answer. This is the format registry's version for the bloom filter, and
+/// bumping it is what says the probe derivation changed
+pub const BLOOM_FILTER_FORMAT_VERSION: FormatVersion = crate::format::BLOOM_FILTER_FORMAT_VERSION;
 
-/// Serialization header size: algorithm_version(4) + hash_count(4) +
+/// The stamp every serialized filter opens with.
+pub const BLOOM_STAMP: FormatStamp =
+    FormatStamp::new(FormatKind::BloomFilter, BLOOM_FILTER_FORMAT_VERSION);
+
+/// The stamp as bytes, compared directly on the probe path.
+const BLOOM_STAMP_BYTES: [u8; FORMAT_STAMP_LEN] = BLOOM_STAMP.to_bytes_const();
+
+/// Serialization header size: format stamp(9) + hash_count(4) +
 /// num_blocks(4) + num_elements(8)
-const HEADER_SIZE: usize = 20;
+const HEADER_SIZE: usize = FORMAT_STAMP_LEN + 16;
 
 /// Bits per block (BLOOM_BLOCK_SIZE * 8).
 const BLOCK_BITS: u32 = (BLOOM_BLOCK_SIZE * 8) as u32;
@@ -291,13 +300,20 @@ impl BloomFilter {
 
     /// Serializes the bloom filter to bytes.
     ///
-    /// Layout: algorithm_version(4 LE) + hash_count(4 LE) +
-    /// num_blocks(4 LE) + num_elements(8 LE) + bits.
+    /// Layout: format stamp(9) + hash_count(4 LE) + num_blocks(4 LE) +
+    /// num_elements(8 LE) + bits.
+    ///
+    /// The leading nine bytes are the format stamp, magic and version, the
+    /// same identity a standalone file carries in its envelope. A filter is
+    /// embedded in the segment that holds it rather than written on its own,
+    /// so its integrity comes from that segment's checksum. Carrying a body
+    /// checksum here would mean hashing the whole bit array on every probe,
+    /// which is the operation the filter exists to avoid.
     pub fn to_bytes(&self) -> Vec<u8> {
         let totalSize = HEADER_SIZE + self.bits.len();
         let mut buf = Vec::with_capacity(totalSize);
 
-        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
+        buf.extend_from_slice(&BLOOM_STAMP.to_bytes());
         buf.extend_from_slice(&self.hashCount.to_le_bytes());
         buf.extend_from_slice(&self.numBlocks.to_le_bytes());
         buf.extend_from_slice(&self.numElements.to_le_bytes());
@@ -308,8 +324,9 @@ impl BloomFilter {
 
     /// Deserializes a bloom filter from bytes.
     ///
-    /// Validates header fields and buffer length. Returns an error if the
-    /// data is truncated, has zero blocks, or has a mismatched bit array length.
+    /// Validates the stamp, the header fields, and the buffer length. Returns
+    /// an error if the data is truncated, has zero blocks, or has a
+    /// mismatched bit array length.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         if buf.len() < HEADER_SIZE {
             return Err(ZyronError::DecodingFailed(format!(
@@ -319,17 +336,24 @@ impl BloomFilter {
             )));
         }
 
-        let version = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if version != BLOOM_ALGORITHM_VERSION {
+        let stamp =
+            FormatStamp::from_bytes(buf).map_err(|e| ZyronError::DecodingFailed(e.to_string()))?;
+        if stamp.kind != FormatKind::BloomFilter {
             return Err(ZyronError::DecodingFailed(format!(
-                "bloom filter algorithm version {} is not the supported version {}",
-                version, BLOOM_ALGORITHM_VERSION
+                "expected a bloom filter, found a {} record",
+                stamp.kind
             )));
         }
-        let hashCount = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let numBlocks = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if stamp.version != BLOOM_FILTER_FORMAT_VERSION {
+            return Err(ZyronError::DecodingFailed(format!(
+                "bloom filter is at format version {}, this binary writes and reads {}",
+                stamp.version, BLOOM_FILTER_FORMAT_VERSION
+            )));
+        }
+        let hashCount = u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]);
+        let numBlocks = u32::from_le_bytes([buf[13], buf[14], buf[15], buf[16]]);
         let numElements = u64::from_le_bytes([
-            buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+            buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24],
         ]);
 
         if numBlocks == 0 {
@@ -448,14 +472,14 @@ fn validate_serialized(buf: &[u8]) -> Option<(&[u8], u32, u32)> {
     if buf.len() < HEADER_SIZE {
         return None;
     }
-    let version = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let hashCount = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let numBlocks = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    if version != BLOOM_ALGORITHM_VERSION
-        || numBlocks == 0
-        || hashCount == 0
-        || hashCount > BLOOM_HASH_COUNT * 2
-    {
+    // Stamp comparison is a nine-byte memcmp against a constant, so the probe
+    // path pays an integer compare rather than a decode
+    if buf[..FORMAT_STAMP_LEN] != BLOOM_STAMP_BYTES {
+        return None;
+    }
+    let hashCount = u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]);
+    let numBlocks = u32::from_le_bytes([buf[13], buf[14], buf[15], buf[16]]);
+    if numBlocks == 0 || hashCount == 0 || hashCount > BLOOM_HASH_COUNT * 2 {
         return None;
     }
     let bits = &buf[HEADER_SIZE..];
@@ -581,7 +605,7 @@ mod tests {
     #[test]
     fn test_from_bytes_zero_blocks() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
+        buf.extend_from_slice(&BLOOM_STAMP.to_bytes());
         buf.extend_from_slice(&7u32.to_le_bytes()); // hash_count
         buf.extend_from_slice(&0u32.to_le_bytes()); // num_blocks = 0
         buf.extend_from_slice(&0u64.to_le_bytes()); // num_elements
@@ -593,7 +617,7 @@ mod tests {
     #[test]
     fn test_from_bytes_length_mismatch() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
+        buf.extend_from_slice(&BLOOM_STAMP.to_bytes());
         buf.extend_from_slice(&7u32.to_le_bytes()); // hash_count
         buf.extend_from_slice(&2u32.to_le_bytes()); // num_blocks = 2
         buf.extend_from_slice(&0u64.to_le_bytes()); // num_elements
@@ -606,7 +630,7 @@ mod tests {
     #[test]
     fn test_from_bytes_zero_hash_count() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&BLOOM_ALGORITHM_VERSION.to_le_bytes());
+        buf.extend_from_slice(&BLOOM_STAMP.to_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // hash_count = 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
         buf.extend_from_slice(&0u64.to_le_bytes()); // num_elements
@@ -623,7 +647,14 @@ mod tests {
         let mut filter = BloomFilter::new(100);
         filter.insert(b"present");
         let mut serialized = filter.to_bytes();
-        serialized[0..4].copy_from_slice(&(BLOOM_ALGORITHM_VERSION + 1).to_le_bytes());
+        let bumped = FormatStamp::new(
+            FormatKind::BloomFilter,
+            FormatVersion::new(
+                BLOOM_FILTER_FORMAT_VERSION.major,
+                BLOOM_FILTER_FORMAT_VERSION.minor + 1,
+            ),
+        );
+        serialized[..FORMAT_STAMP_LEN].copy_from_slice(&bumped.to_bytes());
 
         assert!(BloomFilter::from_bytes(&serialized).is_err());
         assert!(might_contain_serialized(&serialized, b"present"));

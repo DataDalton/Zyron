@@ -12,6 +12,7 @@ pub mod decimal;
 pub mod doc_registry;
 pub mod error;
 pub mod foreign;
+pub mod format;
 pub mod interval;
 pub mod io_stats;
 pub mod nested_value;
@@ -44,6 +45,13 @@ pub use decimal::{
 pub use doc_registry::DocRegistry;
 pub use error::{Result, ZyronError};
 pub use foreign::ForeignRequest;
+pub use format::{
+    ALL_FORMAT_KINDS, ArtifactKind, BinaryVersion, DeprecationRecord, DeprecationRegistry,
+    DeprecationStage, Envelope, EnvelopeError, FormatKind, FormatMigrator, FormatRegistration,
+    FormatRegistry, FormatStamp, FormatSubstrate, FormatVersion, MigrationPolicy, RecordVersion,
+    SchemeRegistry, UpgradeChannel, UpgradePhase, UpgradeSettings, VersionWindow,
+    WireVersionRegistry,
+};
 pub use interval::{
     Interval, days_from_ymd, days_in_month, is_leap, parse_date_days, parse_interval_string,
     parse_timestamp_micros, ymd_from_days,
@@ -55,8 +63,10 @@ pub use node::{
 };
 pub use obs_metrics::{LabeledMetrics, TlsDirection};
 pub use page::{
-    BranchCatalog, BranchFiles, PAGE_SIZE, PageHeader, PageId, compute_page_checksum,
-    stamp_page_checksum, stored_page_checksum, verify_page_checksum,
+    BTREE_PAGE_FORMAT_VERSION, BranchCatalog, BranchFiles, FSM_PAGE_FORMAT_VERSION,
+    HEAP_PAGE_FORMAT_VERSION, PAGE_SIZE, PageHeader, PageId, TOAST_PAGE_FORMAT_VERSION,
+    compute_page_checksum, format_kind_for_page, page_format_version, stamp_page_checksum,
+    stored_page_checksum, verify_page_checksum,
 };
 pub use prng::{ReservoirL, Xoshiro256pp, splitMix64};
 pub use row_locator::RowLocator;

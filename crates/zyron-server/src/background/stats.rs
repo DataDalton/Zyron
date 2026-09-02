@@ -154,7 +154,16 @@ impl StatsCollector {
                             "Analyzed table {} ({} rows, {} pages)",
                             table_entry.name, table_stats.row_count, table_stats.page_count
                         );
-                        catalog.put_stats(table_entry.id, table_stats, column_stats);
+                        if let Err(e) = rt.block_on(catalog.persist_stats(
+                            table_entry.id,
+                            table_stats,
+                            column_stats,
+                        )) {
+                            debug!(
+                                "Stats for table {} could not be written: {}",
+                                table_entry.name, e
+                            );
+                        }
                         analyzed += 1;
                         // The signature was read before the scan, so writes
                         // landing mid-analysis reopen the gate next cycle
@@ -169,8 +178,12 @@ impl StatsCollector {
                     }
                 }
             }
-            // Dropped tables leave no gate entries behind
-            analyzed_at.retain(|id, _| tables.iter().any(|t| t.id.0 == *id));
+            // Dropped tables leave no gate entries behind. The live ids go
+            // into a set first, because scanning the table list once per
+            // gate entry is quadratic in the number of tables and this runs
+            // every collection cycle
+            let live_ids: std::collections::HashSet<u32> = tables.iter().map(|t| t.id.0).collect();
+            analyzed_at.retain(|id, _| live_ids.contains(id));
 
             if analyzed > 0 {
                 info!("Stats collection complete: analyzed {} tables", analyzed);
@@ -221,7 +234,10 @@ pub async fn analyze_table_immediate(
         .map_err(|e| format!("analyze failed: {}", e))?;
 
     let row_count = table_stats.row_count;
-    catalog.put_stats(table.id, table_stats, column_stats);
+    catalog
+        .persist_stats(table.id, table_stats, column_stats)
+        .await
+        .map_err(|e| format!("statistics could not be written, {e}"))?;
     Ok(row_count)
 }
 

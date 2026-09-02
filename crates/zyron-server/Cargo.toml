@@ -9,6 +9,7 @@ zyron-mesh = { path = "../zyron-mesh" }
 zyron-raft = { path = "../zyron-raft" }
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 zyron-media = { path = "../zyron-media" }
 zyron-buffer = { path = "../zyron-buffer" }
 zyron-wal = { path = "../zyron-wal" }
@@ -42,6 +43,11 @@ crossbeam.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 base64.workspace = true
+# The release feed is fetched over HTTPS. rustls only, no system TLS stack
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
 
 [features]
 # Compiles in the phase profiler across the build (zyron-common::profile). Pass
@@ -54,5 +60,7 @@ profile = [
 
 [dev-dependencies]
 tempfile = "3"
+ed25519-dalek.workspace = true
+sha2.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }
 sysinfo.workspace = true

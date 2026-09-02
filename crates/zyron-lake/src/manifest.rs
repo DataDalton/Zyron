@@ -21,6 +21,8 @@
 use std::collections::BTreeMap;
 
 use zyron_common::ZyronError;
+use zyron_common::format::envelope::{self, ENVELOPE_HEADER_LEN};
+use zyron_common::format::{FormatKind, FormatVersion};
 
 use zyron_storage::columnar::{might_contain_serialized, might_contain_serialized_batch};
 
@@ -32,9 +34,15 @@ use crate::predicate::{
 };
 use crate::schema::LakeSchema;
 
-pub const MANIFEST_MAGIC: [u8; 4] = *b"ZYLK";
-pub const MANIFEST_FORMAT_VERSION: u16 = 2;
+/// Sentinel repeated at the very end of a manifest. Not the file's format
+/// identity, which the envelope in the header carries. It marks a complete
+/// trailer so a truncated write is told apart from a healthy file.
+pub const MANIFEST_TRAILER_SENTINEL: [u8; 4] = *b"ZYLK";
 
+/// Version manifests are written at, declared in the format registry.
+pub const MANIFEST_FORMAT_VERSION: FormatVersion = crate::format::LAKE_MANIFEST_FORMAT_VERSION;
+
+/// Envelope header plus the manifest's own header extension.
 const HEADER_LEN: usize = 64;
 // Eight section offsets, CRC32, trailing magic. Three more than the
 // original five-offset specification: properties, index specs and index
@@ -583,15 +591,23 @@ impl ManifestFile {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_LEN + FOOTER_LEN + 256 * self.entries.len());
 
-        buf.extend_from_slice(&MANIFEST_MAGIC);
-        buf.extend_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
+        // Envelope header, then the manifest's own header fields. The
+        // envelope's header checksum is stamped over the fixed part and the
+        // extension, so it is computed once the extension is filled in below
+        buf.resize(ENVELOPE_HEADER_LEN, 0);
         buf.extend_from_slice(&self.schema.schema_id.to_le_bytes());
         buf.extend_from_slice(&self.snapshot_id.to_le_bytes());
         buf.extend_from_slice(&self.timestamp_us.to_le_bytes());
         buf.extend_from_slice(&self.parent_snapshot_id.to_le_bytes());
         buf.extend_from_slice(&self.cluster_spec.spec_id.to_le_bytes());
         buf.resize(HEADER_LEN, 0);
+        let header = envelope::encode_header(
+            FormatKind::LakeManifest,
+            MANIFEST_FORMAT_VERSION,
+            0,
+            &buf[ENVELOPE_HEADER_LEN..HEADER_LEN],
+        );
+        buf[..ENVELOPE_HEADER_LEN].copy_from_slice(&header);
 
         let schema_off = buf.len() as u64;
         self.schema.encode_into(&mut buf);
@@ -643,7 +659,7 @@ impl ManifestFile {
         buf.extend_from_slice(&footer_off.to_le_bytes());
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&MANIFEST_MAGIC);
+        buf.extend_from_slice(&MANIFEST_TRAILER_SENTINEL);
         buf
     }
 
@@ -659,11 +675,8 @@ impl ManifestFile {
                 ),
             ));
         }
-        if bytes[..4] != MANIFEST_MAGIC {
-            return Err(corrupt(ctx, "bad manifest magic".into()));
-        }
-        if bytes[bytes.len() - 4..] != MANIFEST_MAGIC {
-            return Err(corrupt(ctx, "bad manifest trailing magic".into()));
+        if bytes[bytes.len() - 4..] != MANIFEST_TRAILER_SENTINEL {
+            return Err(corrupt(ctx, "bad manifest trailing sentinel".into()));
         }
         let crc_field = bytes.len() - 8;
         let mut crc_bytes = [0u8; 4];
@@ -680,21 +693,41 @@ impl ManifestFile {
             ));
         }
 
-        let mut h = Cursor::new(&bytes[4..HEADER_LEN], ctx);
-        let format_version = h.u16()?;
-        if format_version != MANIFEST_FORMAT_VERSION {
+        let (header, _) = envelope::decode_header(&bytes[..HEADER_LEN])
+            .map_err(|e| corrupt(ctx, e.to_string()))?;
+        if header.kind != FormatKind::LakeManifest {
             return Err(corrupt(
                 ctx,
-                format!("unsupported manifest format version {}", format_version),
+                format!("expected a lake manifest, found a {} file", header.kind),
             ));
         }
-        let flags = h.u16()?;
-        if flags != 0 {
+        if header.header_length as usize != HEADER_LEN {
             return Err(corrupt(
                 ctx,
-                format!("unknown manifest flags {:#06x}", flags),
+                format!(
+                    "manifest header declares {} bytes, this binary writes {}",
+                    header.header_length, HEADER_LEN
+                ),
             ));
         }
+        if header.version != MANIFEST_FORMAT_VERSION {
+            return Err(corrupt(
+                ctx,
+                format!(
+                    "manifest is at format version {}, this binary writes and reads {}. \
+                     Upgrade through a release that still reads {} to move it forward first",
+                    header.version, MANIFEST_FORMAT_VERSION, header.version
+                ),
+            ));
+        }
+        if header.flags != 0 {
+            return Err(corrupt(
+                ctx,
+                format!("unknown manifest flags {:#010x}", header.flags),
+            ));
+        }
+
+        let mut h = Cursor::new(&bytes[ENVELOPE_HEADER_LEN..HEADER_LEN], ctx);
         let header_schema_id = h.u64()?;
         let snapshot_id = h.u64()?;
         let timestamp_us = h.i64()?;
@@ -1634,24 +1667,60 @@ mod tests {
         assert!(unsorted_stats.validate().is_err());
     }
 
+    /// Restamps the envelope header with a different version or flags and
+    /// repairs both checksums, so the decode fails on the field under test
+    /// rather than on an integrity check ahead of it.
+    fn restamped(bytes: &[u8], version: FormatVersion, flags: u32) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let header = envelope::encode_header(
+            FormatKind::LakeManifest,
+            version,
+            flags,
+            &out[ENVELOPE_HEADER_LEN..HEADER_LEN],
+        );
+        out[..ENVELOPE_HEADER_LEN].copy_from_slice(&header);
+        let crc_field = out.len() - 8;
+        let crc = crc32fast::hash(&out[..crc_field]);
+        out[crc_field..crc_field + 4].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
     #[test]
     fn test_decode_rejects_wrong_version_and_flags() {
         let bytes = sample().encode();
 
-        let mut wrong_version = bytes.clone();
-        wrong_version[4] = 99;
-        let crc_field = wrong_version.len() - 8;
-        let crc = crc32fast::hash(&wrong_version[..crc_field]);
-        wrong_version[crc_field..crc_field + 4].copy_from_slice(&crc.to_le_bytes());
+        let wrong_version = restamped(&bytes, FormatVersion::new(99, 0), 0);
         let err = ManifestFile::decode(&wrong_version, "test.zym").expect_err("rejects");
-        assert!(err.to_string().contains("format version"));
+        assert!(err.to_string().contains("format version"), "{err}");
+        assert!(err.to_string().contains("Upgrade through"), "{err}");
 
-        let mut unknown_flags = bytes.clone();
-        unknown_flags[6] = 1;
-        let crc = crc32fast::hash(&unknown_flags[..crc_field]);
-        unknown_flags[crc_field..crc_field + 4].copy_from_slice(&crc.to_le_bytes());
+        let unknown_flags = restamped(&bytes, MANIFEST_FORMAT_VERSION, 1);
         let err = ManifestFile::decode(&unknown_flags, "test.zym").expect_err("rejects");
-        assert!(err.to_string().contains("flags"));
+        assert!(err.to_string().contains("flags"), "{err}");
+    }
+
+    #[test]
+    fn test_manifest_header_is_an_envelope() {
+        let bytes = sample().encode();
+        let (kind, version) = envelope::peek(&bytes).expect("peeks");
+        assert_eq!(kind, FormatKind::LakeManifest);
+        assert_eq!(version, MANIFEST_FORMAT_VERSION);
+        let (header, extension) = envelope::decode_header(&bytes[..HEADER_LEN]).expect("decodes");
+        assert_eq!(header.header_length as usize, HEADER_LEN);
+        assert_eq!(extension.len(), HEADER_LEN - ENVELOPE_HEADER_LEN);
+    }
+
+    #[test]
+    fn test_a_corrupted_manifest_header_byte_is_caught() {
+        let bytes = sample().encode();
+        for index in 0..HEADER_LEN {
+            let mut corrupted = bytes.clone();
+            corrupted[index] ^= 0x01;
+            assert!(
+                ManifestFile::decode(&corrupted, "test.zym").is_err(),
+                "flipping manifest header byte {index} was not caught"
+            );
+        }
     }
 
     /// A bloom on the leading range-partitioned key removes files the key's

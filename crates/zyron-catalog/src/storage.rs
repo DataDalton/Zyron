@@ -123,6 +123,16 @@ fn scan_decode<T>(
 /// Abstraction over catalog persistence.
 #[async_trait]
 pub trait CatalogStorage: Send + Sync {
+    /// The data directory this storage writes under, when it has one.
+    ///
+    /// Statistics files live beside the heap files rather than inside them,
+    /// so the catalog derives their directory from here. A storage with no
+    /// directory keeps statistics in memory only, which is what the resolver
+    /// mock does
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     // Database operations
     async fn load_databases(&self) -> Result<Vec<DatabaseEntry>>;
     async fn store_database(&self, entry: &DatabaseEntry) -> Result<TupleId>;
@@ -805,6 +815,10 @@ impl HeapCatalogStorage {
 
 #[async_trait]
 impl CatalogStorage for HeapCatalogStorage {
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        Some(self.disk.data_dir())
+    }
+
     async fn init(&self) -> Result<()> {
         // Seed cached heap page counts from on-disk file sizes. Without
         // this, a reopened storage observes cached_heap_pages = 0 even when

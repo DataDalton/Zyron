@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 zyron-pressure = { path = "../zyron-pressure" }
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 bytes.workspace = true

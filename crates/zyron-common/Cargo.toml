@@ -9,6 +9,7 @@ thiserror.workspace = true
 serde.workspace = true
 scc.workspace = true
 sysinfo.workspace = true
+inventory.workspace = true
 
 [features]
 # Compiles in the wall-clock phase profiler (crate::profile). Off by default so

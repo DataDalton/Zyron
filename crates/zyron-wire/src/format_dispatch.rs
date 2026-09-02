@@ -1,0 +1,674 @@
+//! DDL dispatch for the format, signature, and upgrade substrate.
+//!
+//! These statements read and write registries rather than the catalog, so
+//! they are answered here instead of going through the planner. Every one of
+//! them either changes a registry and reports what it became, or reports what
+//! a registry holds, so nothing here can succeed while leaving the caller
+//! guessing what happened
+
+use zyron_common::ZyronError;
+use zyron_common::format::rewrite::{ObjectKind, UserObjectRewritePolicy};
+use zyron_common::format::scheme::ArtifactKind;
+use zyron_common::format::upgrade::parse_duration_secs;
+use zyron_common::format::{FormatKind, UpgradePhase};
+use zyron_parser::ast::{
+    ExplainRewriteStatement, ListRegistryStatement, ListRegistryTarget,
+    RotateServicePrincipalKeyStatement, RotateSignatureSchemeStatement,
+    SetSignatureSchemeStatement, ShowUpgradeStatement, ShowUpgradeTarget, TriggerUpgradeAction,
+    TriggerUpgradeStatement,
+};
+
+use crate::ddl_dispatch::DdlResult;
+use crate::messages::ProtocolError;
+use crate::types::{PG_INT8_OID, PG_TEXT_OID};
+
+/// The settings `ALTER SYSTEM SET` routes to the upgrade board rather than
+/// straight to the config file
+pub const UPGRADE_SETTING_KEYS: &[&str] = &[
+    "upgrade_channel",
+    "pinned_version",
+    "auto_upgrade_enabled",
+    "auto_upgrade_window",
+    "auto_upgrade_paused",
+    "user_object_rewrite_policy",
+    "release_feed_poll_interval",
+    "federation_coordination_timeout",
+    "pre_upgrade_backup_snapshot",
+    "rollback_on_health_fail",
+    "deprecation_warning_rate_limit_per_hour",
+];
+
+/// Whether a setting name is one the upgrade board owns
+pub fn owns_setting(name: &str) -> bool {
+    UPGRADE_SETTING_KEYS
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(name))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn database(e: ZyronError) -> ProtocolError {
+    ProtocolError::Database(e)
+}
+
+fn refused(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::Database(ZyronError::UpgradeRefused(message.into()))
+}
+
+/// `SET SIGNATURE SCHEME <scheme> FOR ARTIFACT KIND <kind>`
+pub fn handle_set_signature_scheme(
+    stmt: &SetSignatureSchemeStatement,
+) -> Result<DdlResult, ProtocolError> {
+    let substrate = zyron_common::format::substrate().map_err(database)?;
+    let kind = ArtifactKind::parse(&stmt.artifact_kind).ok_or_else(|| {
+        refused(format!(
+            "`{}` is not an artifact kind. Read `zyron_sys.crypto.artifact_scheme_map` for \
+             the kinds this cluster signs",
+            stmt.artifact_kind
+        ))
+    })?;
+    substrate
+        .schemes
+        .set_scheme(kind, &stmt.scheme)
+        .map_err(|e| database(e.into()))?;
+    Ok(DdlResult::Tag("SET SIGNATURE SCHEME".to_string()))
+}
+
+/// `ROTATE SIGNATURE SCHEME <kind> TO <scheme> [OVERLAP <interval>]`
+pub fn handle_rotate_signature_scheme(
+    stmt: &RotateSignatureSchemeStatement,
+) -> Result<DdlResult, ProtocolError> {
+    let substrate = zyron_common::format::substrate().map_err(database)?;
+    let kind = ArtifactKind::parse(&stmt.artifact_kind).ok_or_else(|| {
+        refused(format!(
+            "`{}` is not an artifact kind. Read `zyron_sys.crypto.artifact_scheme_map` for \
+             the kinds this cluster signs",
+            stmt.artifact_kind
+        ))
+    })?;
+    let overlap_secs = match &stmt.overlap {
+        Some(text) => parse_duration_secs(text).map_err(refused)?,
+        None => zyron_auth::signature::DEFAULT_ROTATION_OVERLAP_SECS,
+    };
+    let now = now_secs();
+    let binding = substrate
+        .schemes
+        .rotate_scheme(kind, &stmt.new_scheme, now + overlap_secs)
+        .map_err(|e| database(e.into()))?;
+    let columns = vec![
+        ("artifact_kind".to_string(), PG_TEXT_OID),
+        ("current_scheme".to_string(), PG_TEXT_OID),
+        ("deprecating_scheme".to_string(), PG_TEXT_OID),
+        ("overlap_end_secs".to_string(), PG_INT8_OID),
+    ];
+    let rows = vec![vec![
+        kind.catalog_name().to_string(),
+        binding.current_scheme.clone(),
+        binding.deprecating_scheme.clone().unwrap_or_default(),
+        binding
+            .overlap_end_secs
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+    ]];
+    Ok(DdlResult::Rows {
+        tag: "ROTATE SIGNATURE SCHEME".to_string(),
+        columns,
+        rows,
+    })
+}
+
+/// `ROTATE SERVICE PRINCIPAL KEY <sp> [SCHEME <scheme>] [OVERLAP <interval>]`
+pub async fn handle_rotate_service_principal_key(
+    stmt: &RotateServicePrincipalKeyStatement,
+) -> Result<DdlResult, ProtocolError> {
+    let substrate = zyron_common::format::substrate().map_err(database)?;
+    let overlap_secs = match &stmt.overlap {
+        Some(text) => parse_duration_secs(text).map_err(refused)?,
+        None => zyron_auth::signature::DEFAULT_ROTATION_OVERLAP_SECS,
+    };
+    let now = now_secs();
+    let principal = stmt.principal.clone();
+    let new_scheme = stmt.new_scheme.clone();
+
+    // Key generation is CPU bound and its cost depends on the scheme: an
+    // RSA-2048 keypair is a prime search, measured at 40 to 150 ms with no
+    // hard ceiling, against microseconds for Ed25519. Running it inline would
+    // hold an async worker for the whole search, so it goes to the blocking
+    // pool and the runtime keeps serving other connections meanwhile
+    // A principal with no key yet is provisioned rather than refused, which
+    // is what makes this statement the way one is created. `rotate` already
+    // covers that case: with nothing to retire it defaults to Ed25519, issues
+    // once, and reports no previous scheme. Issuing here first would generate
+    // a second keypair, throw the first away, and leave a retiring key that
+    // never signed anything, and it would skip the registry check `rotate`
+    // makes before generating
+    let outcome = tokio::task::spawn_blocking(move || {
+        zyron_auth::signature::principal_keys().rotate(
+            &substrate.schemes,
+            &principal,
+            new_scheme.as_deref(),
+            overlap_secs,
+            now,
+        )
+    })
+    .await
+    .map_err(|e| {
+        database(zyron_common::ZyronError::Internal(format!(
+            "the key rotation task did not complete, {e}"
+        )))
+    })?
+    .map_err(database)?;
+    let columns = vec![
+        ("principal".to_string(), PG_TEXT_OID),
+        ("new_scheme".to_string(), PG_TEXT_OID),
+        ("previous_scheme".to_string(), PG_TEXT_OID),
+        ("overlap_end_secs".to_string(), PG_INT8_OID),
+    ];
+    let rows = vec![vec![
+        outcome.principal,
+        outcome.new_scheme,
+        outcome.previous_scheme.unwrap_or_default(),
+        outcome.overlap_end_secs.to_string(),
+    ]];
+    Ok(DdlResult::Rows {
+        tag: "ROTATE SERVICE PRINCIPAL KEY".to_string(),
+        columns,
+        rows,
+    })
+}
+
+/// `LIST SIGNATURE SCHEMES`, `LIST ARTIFACT SCHEMES`,
+/// `LIST UPGRADE HISTORY [LIMIT n]`, `LIST FORMAT REGISTRY`,
+/// `LIST DEPRECATIONS`
+pub fn handle_list_registry(stmt: &ListRegistryStatement) -> Result<DdlResult, ProtocolError> {
+    let (schema, object, tag) = match stmt.target {
+        ListRegistryTarget::SignatureSchemes => {
+            ("crypto", "scheme_registry", "LIST SIGNATURE SCHEMES")
+        }
+        ListRegistryTarget::ArtifactSchemes => {
+            ("crypto", "artifact_scheme_map", "LIST ARTIFACT SCHEMES")
+        }
+        ListRegistryTarget::UpgradeHistory => ("upgrade", "history", "LIST UPGRADE HISTORY"),
+        ListRegistryTarget::FormatRegistry => {
+            ("storage", "format_registry", "LIST FORMAT REGISTRY")
+        }
+        ListRegistryTarget::Deprecations => ("deprecation", "registry", "LIST DEPRECATIONS"),
+    };
+    let (fields, rows) = crate::system_format_views::build(schema, object).map_err(database)?;
+    let mut rendered = render_rows(rows);
+    if let Some(limit) = stmt.limit {
+        rendered.truncate(limit as usize);
+    }
+    Ok(DdlResult::Rows {
+        tag: tag.to_string(),
+        columns: fields
+            .into_iter()
+            .map(|field| (field.name, field.type_oid))
+            .collect(),
+        rows: rendered,
+    })
+}
+
+/// `TRIGGER MANUAL UPGRADE TO '<version>'` or `TRIGGER MANUAL ROLLBACK`
+///
+/// Both record the operator's intent on the upgrade board. The orchestrator
+/// is what carries it out, and reads the board on its next pass
+pub fn handle_trigger_upgrade(stmt: &TriggerUpgradeStatement) -> Result<DdlResult, ProtocolError> {
+    let board = zyron_common::format::upgrade_board();
+    let now = now_secs();
+    match &stmt.action {
+        TriggerUpgradeAction::UpgradeTo(version) => {
+            if zyron_common::format::BinaryVersion::parse(version).is_none() {
+                return Err(refused(format!(
+                    "`{version}` is not a major.minor.patch version"
+                )));
+            }
+            let settings = board.settings();
+            if settings.paused {
+                return Err(refused(
+                    "auto_upgrade_paused is true. Set it false before triggering an upgrade",
+                ));
+            }
+            board.set_node_state(zyron_common::format::NodeUpgradeState {
+                node_id: "this-node".to_string(),
+                from_version: env!("CARGO_PKG_VERSION").to_string(),
+                to_version: version.clone(),
+                phase: UpgradePhase::Detected,
+                started_at_secs: now,
+                updated_at_secs: now,
+                is_leader: false,
+                message: format!("manual upgrade to {version} requested"),
+            });
+            Ok(DdlResult::Tag(format!("TRIGGER MANUAL UPGRADE {version}")))
+        }
+        TriggerUpgradeAction::Rollback => {
+            let states = board.node_states();
+            if states.is_empty() {
+                return Err(refused(
+                    "there is no upgrade to roll back. `SHOW UPGRADE STATE` reports what \
+                     this node is doing",
+                ));
+            }
+            for mut state in states {
+                state.phase = UpgradePhase::RollingBack;
+                state.updated_at_secs = now;
+                state.message = "manual rollback requested".to_string();
+                board.set_node_state(state);
+            }
+            Ok(DdlResult::Tag("TRIGGER MANUAL ROLLBACK".to_string()))
+        }
+    }
+}
+
+/// `SHOW UPGRADE STATE` and `SHOW FORMAT MIGRATIONS [FOR FORMAT <kind>]`
+pub fn handle_show_upgrade(stmt: &ShowUpgradeStatement) -> Result<DdlResult, ProtocolError> {
+    match &stmt.target {
+        ShowUpgradeTarget::State => {
+            let (fields, rows) =
+                crate::system_format_views::build("upgrade", "state").map_err(database)?;
+            Ok(DdlResult::Rows {
+                tag: "SHOW UPGRADE STATE".to_string(),
+                columns: fields
+                    .into_iter()
+                    .map(|field| (field.name, field.type_oid))
+                    .collect(),
+                rows: render_rows(rows),
+            })
+        }
+        ShowUpgradeTarget::FormatMigrations { format_kind } => {
+            if let Some(named) = format_kind {
+                if FormatKind::from_catalog_name(named).is_none() {
+                    return Err(refused(format!(
+                        "`{named}` is not a format kind. Read \
+                         `zyron_sys.storage.format_registry` for the kinds this binary writes"
+                    )));
+                }
+            }
+            let (fields, rows) = crate::system_format_views::build("storage", "format_migrations")
+                .map_err(database)?;
+            let mut rendered = render_rows(rows);
+            if let Some(named) = format_kind {
+                rendered.retain(|row| {
+                    row.first()
+                        .map(|value| value.eq_ignore_ascii_case(named))
+                        .unwrap_or(false)
+                });
+            }
+            Ok(DdlResult::Rows {
+                tag: "SHOW FORMAT MIGRATIONS".to_string(),
+                columns: fields
+                    .into_iter()
+                    .map(|field| (field.name, field.type_oid))
+                    .collect(),
+                rows: rendered,
+            })
+        }
+    }
+}
+
+/// `EXPLAIN REWRITE FOR OBJECT <name>`
+///
+/// A dry run over every registered rewriter, applying nothing. Running it
+/// twice returns the same rows
+pub fn handle_explain_rewrite(
+    stmt: &ExplainRewriteStatement,
+    server: &crate::connection::ServerState,
+) -> Result<DdlResult, ProtocolError> {
+    let (kind, sql) = lookup_user_object(&stmt.object_name, server)?;
+    let proposals = zyron_parser::rewriter::dry_run(&stmt.object_name, kind, &sql)
+        .map_err(|e| refused(e.to_string()))?;
+    let columns = vec![
+        ("object_name".to_string(), PG_TEXT_OID),
+        ("object_kind".to_string(), PG_TEXT_OID),
+        ("rewriter".to_string(), PG_TEXT_OID),
+        ("category".to_string(), PG_TEXT_OID),
+        ("sites".to_string(), PG_INT8_OID),
+        ("description".to_string(), PG_TEXT_OID),
+        ("diff".to_string(), PG_TEXT_OID),
+    ];
+    let rows = proposals
+        .into_iter()
+        .map(|proposal| {
+            vec![
+                proposal.object_name,
+                proposal.object_kind.catalog_name().to_string(),
+                proposal.rewriter_name.to_string(),
+                proposal.category.label().to_string(),
+                proposal.sites.to_string(),
+                proposal.description.to_string(),
+                proposal.diff,
+            ]
+        })
+        .collect();
+    Ok(DdlResult::Rows {
+        tag: "EXPLAIN REWRITE".to_string(),
+        columns,
+        rows,
+    })
+}
+
+/// Finds a user-authored object's kind and stored SQL
+fn lookup_user_object(
+    name: &str,
+    server: &crate::connection::ServerState,
+) -> Result<(ObjectKind, String), ProtocolError> {
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    for view in server.catalog.list_views() {
+        if view.name.eq_ignore_ascii_case(bare) {
+            return Ok((
+                ObjectKind::View,
+                format!("CREATE VIEW {} AS {}", view.name, view.definition_sql),
+            ));
+        }
+    }
+    for mview in server.catalog.list_mviews() {
+        if mview.name.eq_ignore_ascii_case(bare) {
+            return Ok((
+                ObjectKind::MaterializedView,
+                format!(
+                    "CREATE MATERIALIZED VIEW {} AS {}",
+                    mview.name, mview.definition_sql
+                ),
+            ));
+        }
+    }
+    Err(refused(format!(
+        "`{name}` is not a user-authored object this node holds. \
+         `EXPLAIN REWRITE FOR OBJECT` reads views and materialized views"
+    )))
+}
+
+/// Turns the wire encoding a view builder produces into the text rows the
+/// DDL result carries
+fn render_rows(rows: Vec<Vec<Option<Vec<u8>>>>) -> Vec<Vec<String>> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| match value {
+                    Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    None => String::new(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Applies one `ALTER SYSTEM SET` of an upgrade setting to the board.
+///
+/// Returns the value as it was stored, so the caller persists exactly what
+/// took effect rather than what was typed
+pub fn apply_upgrade_setting(name: &str, value: &str) -> Result<String, ProtocolError> {
+    let board = zyron_common::format::upgrade_board();
+    let lowered = name.to_ascii_lowercase();
+    let trimmed = value.trim().trim_matches('\'').trim_matches('"');
+    match lowered.as_str() {
+        "upgrade_channel" => {
+            let channel =
+                zyron_common::format::UpgradeChannel::parse(trimmed).ok_or_else(|| {
+                    refused(format!(
+                        "`{trimmed}` is not a channel, use stable, beta, canary, or pinned"
+                    ))
+                })?;
+            board.update_settings(|settings| settings.channel = channel.clone());
+            Ok(channel.label().to_string())
+        }
+        "pinned_version" => {
+            if zyron_common::format::BinaryVersion::parse(trimmed).is_none() {
+                return Err(refused(format!(
+                    "`{trimmed}` is not a major.minor.patch version"
+                )));
+            }
+            board.update_settings(|settings| {
+                settings.pinned_version = Some(trimmed.to_string());
+            });
+            Ok(trimmed.to_string())
+        }
+        "auto_upgrade_enabled"
+        | "auto_upgrade_paused"
+        | "pre_upgrade_backup_snapshot"
+        | "rollback_on_health_fail" => {
+            let flag = parse_bool(trimmed)?;
+            board.update_settings(|settings| match lowered.as_str() {
+                "auto_upgrade_enabled" => settings.auto_upgrade_enabled = flag,
+                "auto_upgrade_paused" => settings.paused = flag,
+                "pre_upgrade_backup_snapshot" => settings.pre_upgrade_backup_snapshot = flag,
+                _ => settings.rollback_on_health_fail = flag,
+            });
+            Ok(flag.to_string())
+        }
+        "auto_upgrade_window" => {
+            let schedule =
+                zyron_common::format::MaintenanceSchedule::parse(trimmed).map_err(refused)?;
+            let rendered = schedule.to_string();
+            board.update_settings(|settings| settings.window = schedule.clone());
+            Ok(rendered)
+        }
+        "user_object_rewrite_policy" => {
+            let policy = UserObjectRewritePolicy::parse(trimmed).ok_or_else(|| {
+                refused(format!(
+                    "`{trimmed}` is not a rewrite policy, use auto_safe, notify_all, or \
+                     manual_only"
+                ))
+            })?;
+            board.update_settings(|settings| settings.user_object_rewrite_policy = policy);
+            Ok(policy.label().to_string())
+        }
+        "release_feed_poll_interval" | "federation_coordination_timeout" => {
+            let secs = parse_duration_secs(trimmed).map_err(refused)?;
+            board.update_settings(|settings| match lowered.as_str() {
+                "release_feed_poll_interval" => settings.release_feed_poll_interval_secs = secs,
+                _ => settings.federation_coordination_timeout_secs = secs,
+            });
+            Ok(secs.to_string())
+        }
+        "deprecation_warning_rate_limit_per_hour" => {
+            let limit: u32 = trimmed
+                .parse()
+                .map_err(|_| refused(format!("`{trimmed}` is not a whole number of warnings")))?;
+            board.update_settings(|settings| {
+                settings.deprecation_warning_rate_limit_per_hour = limit;
+            });
+            if let Ok(substrate) = zyron_common::format::substrate() {
+                substrate.warning_limiter.set_limit(limit);
+            }
+            Ok(limit.to_string())
+        }
+        other => Err(refused(format!(
+            "`{other}` is not an upgrade setting this node owns"
+        ))),
+    }
+}
+
+fn parse_bool(text: &str) -> Result<bool, ProtocolError> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        other => Err(refused(format!("`{other}` is not true or false"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_upgrade_settings_round_trip_through_the_board() {
+        let board = zyron_common::format::upgrade_board();
+        assert_eq!(
+            apply_upgrade_setting("upgrade_channel", "'beta'").expect("sets"),
+            "beta"
+        );
+        assert_eq!(board.settings().channel.label(), "beta");
+        assert_eq!(
+            apply_upgrade_setting("upgrade_channel", "stable").expect("sets"),
+            "stable"
+        );
+        assert_eq!(board.settings().channel.label(), "stable");
+
+        apply_upgrade_setting("auto_upgrade_paused", "true").expect("sets");
+        assert!(board.settings().paused);
+        apply_upgrade_setting("auto_upgrade_paused", "false").expect("sets");
+        assert!(!board.settings().paused);
+
+        assert_eq!(
+            apply_upgrade_setting("auto_upgrade_window", "'02:00-04:00 UTC'").expect("sets"),
+            "02:00-04:00 UTC"
+        );
+        assert!(!board.settings().window.is_open(15 * 3_600));
+        apply_upgrade_setting("auto_upgrade_window", "").expect("clears");
+        assert!(board.settings().window.is_open(15 * 3_600));
+    }
+
+    /// The statement executes, not just parses. It provisions a principal
+    /// that has no key, rotates it onto RS256, and the key that comes out
+    /// signs something the verifier accepts.
+    ///
+    /// The generation runs on the blocking pool because an RSA keypair is a
+    /// prime search, so this drives the handler through its await rather than
+    /// calling the key store directly, which is the part the store's own
+    /// tests cannot reach
+    #[tokio::test]
+    async fn test_rotate_service_principal_key_provisions_and_rotates_onto_rs256() {
+        let principal = "sp_rotate_exec_test";
+        let store = zyron_auth::signature::principal_keys();
+        assert!(
+            store.current(principal).is_none(),
+            "the test principal has to start with no key"
+        );
+
+        // No key yet, so the statement provisions one
+        let provision = RotateServicePrincipalKeyStatement {
+            principal: principal.to_string(),
+            new_scheme: None,
+            overlap: None,
+        };
+        let result = handle_rotate_service_principal_key(&provision)
+            .await
+            .expect("provisions");
+        match result {
+            DdlResult::Rows { ref tag, .. } => {
+                assert_eq!(tag, "ROTATE SERVICE PRINCIPAL KEY")
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        assert_eq!(
+            store.current(principal).expect("has a key").scheme_name,
+            "Ed25519",
+            "an unnamed scheme provisions Ed25519"
+        );
+
+        // Now rotate the same principal onto RS256, which is the path that
+        // could not work while key material was a fixed 32-byte field
+        let onto_rs256 = RotateServicePrincipalKeyStatement {
+            principal: principal.to_string(),
+            new_scheme: Some("RS256".to_string()),
+            overlap: Some("1h".to_string()),
+        };
+        handle_rotate_service_principal_key(&onto_rs256)
+            .await
+            .expect("rotates onto RS256");
+
+        let current = store.current(principal).expect("has a key");
+        assert_eq!(current.scheme_name, "RS256");
+        assert!(
+            current.public_key.len() > 32,
+            "an RSA public key does not fit the old fixed field, got {}",
+            current.public_key.len()
+        );
+
+        // The rotated key actually signs
+        let signature = store.sign(principal, b"assertion body").expect("signs");
+        let material = current.verifying_material().expect("material");
+        assert!(
+            zyron_auth::signature::verify_with(&material, b"assertion body", &signature)
+                .expect("verifies")
+        );
+
+        // And the outgoing Ed25519 key is still offered through the overlap
+        let verifying = store.verifying(principal, now_secs());
+        assert_eq!(verifying.len(), 2, "both keys verify during the overlap");
+        assert!(verifying.iter().any(|k| k.scheme_name == "Ed25519"));
+    }
+
+    #[test]
+    fn test_a_bad_setting_value_is_refused_with_guidance() {
+        let err = apply_upgrade_setting("upgrade_channel", "nightly").expect_err("refused");
+        assert!(err.to_string().contains("stable, beta, canary"), "{err}");
+        let err = apply_upgrade_setting("pinned_version", "latest").expect_err("refused");
+        assert!(err.to_string().contains("major.minor.patch"), "{err}");
+        let err =
+            apply_upgrade_setting("user_object_rewrite_policy", "whatever").expect_err("refused");
+        assert!(err.to_string().contains("auto_safe"), "{err}");
+        let err = apply_upgrade_setting("nothing_here", "1").expect_err("refused");
+        assert!(err.to_string().contains("not an upgrade setting"), "{err}");
+    }
+
+    #[test]
+    fn test_owns_setting_covers_the_documented_keys() {
+        for key in UPGRADE_SETTING_KEYS {
+            assert!(owns_setting(key));
+            assert!(owns_setting(&key.to_uppercase()));
+        }
+        assert!(!owns_setting("shared_buffers"));
+    }
+
+    #[test]
+    fn test_list_and_show_answer_from_the_registries() {
+        let listed = handle_list_registry(&ListRegistryStatement {
+            target: ListRegistryTarget::FormatRegistry,
+            limit: Some(3),
+        })
+        .expect("lists");
+        match listed {
+            DdlResult::Rows { rows, columns, .. } => {
+                assert!(rows.len() <= 3);
+                assert!(columns.iter().any(|(name, _)| name == "format_kind"));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        let shown = handle_show_upgrade(&ShowUpgradeStatement {
+            target: ShowUpgradeTarget::State,
+        })
+        .expect("shows");
+        match shown {
+            DdlResult::Rows { rows, .. } => assert!(!rows.is_empty()),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_format_migrations_refuses_an_unknown_kind() {
+        let err = handle_show_upgrade(&ShowUpgradeStatement {
+            target: ShowUpgradeTarget::FormatMigrations {
+                format_kind: Some("nothing_here".to_string()),
+            },
+        })
+        .expect_err("refused");
+        assert!(err.to_string().contains("not a format kind"), "{err}");
+    }
+
+    #[test]
+    fn test_setting_a_signature_scheme_for_an_unknown_artifact_kind_is_refused() {
+        let err = handle_set_signature_scheme(&SetSignatureSchemeStatement {
+            scheme: "Ed25519".to_string(),
+            artifact_kind: "NotAKind".to_string(),
+        })
+        .expect_err("refused");
+        assert!(err.to_string().contains("is not an artifact kind"), "{err}");
+    }
+
+    #[test]
+    fn test_a_manual_upgrade_to_a_bad_version_is_refused() {
+        let err = handle_trigger_upgrade(&TriggerUpgradeStatement {
+            action: TriggerUpgradeAction::UpgradeTo("latest".to_string()),
+        })
+        .expect_err("refused");
+        assert!(err.to_string().contains("major.minor.patch"), "{err}");
+    }
+}

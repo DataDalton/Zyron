@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use zyron_common::format::FormatKind;
+use zyron_common::format::text_envelope;
 use zyron_common::{Hasher, Result, ZyronError};
 
 /// Size of the read/write buffer used when copying files and computing checksums.
@@ -167,10 +169,18 @@ impl BackupManager {
             files,
         };
 
-        // Write manifest to TOML.
-        let manifestToml = toml::to_string(&manifest).map_err(|e| {
+        // Write manifest to TOML, with the format envelope declared at the
+        // top so the file names its own kind and version the way every other
+        // Zyron file does. A manifest is meant to be read by a person, so the
+        // envelope is a declared section rather than a binary header
+        let manifestBody = toml::to_string(&manifest).map_err(|e| {
             ZyronError::Internal(format!("failed to serialize backup manifest: {}", e))
         })?;
+        let manifestToml = text_envelope::with_footer(
+            FormatKind::BackupArchive,
+            crate::format::BACKUP_ARCHIVE_FORMAT_VERSION,
+            &manifestBody,
+        );
         let manifestPath = destDir.join("manifest.toml");
         fs::write(&manifestPath, manifestToml.as_bytes())
             .map_err(|e| ZyronError::IoError(format!("failed to write manifest.toml: {}", e)))?;
@@ -276,6 +286,17 @@ impl RestoreManager {
         })?;
         let manifestStr = String::from_utf8(manifestBytes).map_err(|e| {
             ZyronError::Internal(format!("manifest.toml is not valid UTF-8: {}", e))
+        })?;
+        // The declared envelope decides which reader runs. A backup written
+        // by a version this binary has no reader for is refused rather than
+        // partly restored
+        text_envelope::parse_as(
+            &manifestStr,
+            FormatKind::BackupArchive,
+            crate::format::BACKUP_ARCHIVE_FORMAT_VERSION,
+        )
+        .map_err(|e| {
+            ZyronError::Internal(format!("backup manifest {}, {e}", manifestPath.display()))
         })?;
         let manifest: BackupManifest = toml::from_str(&manifestStr)
             .map_err(|e| ZyronError::Internal(format!("failed to parse manifest.toml: {}", e)))?;

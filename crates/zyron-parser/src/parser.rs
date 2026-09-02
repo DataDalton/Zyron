@@ -98,6 +98,13 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Call) => self.parse_call(),
             Token::Keyword(Keyword::Tag) => self.parse_tag_publication(),
             Token::Keyword(Keyword::Untag) => self.parse_untag_publication(),
+            Token::Keyword(Keyword::Trigger) if self.peek_is_ident("manual") => {
+                self.parse_trigger_upgrade()
+            }
+            // ROTATE and LIST are matched as soft keywords, so a column or a
+            // table called `rotate` or `list` keeps working everywhere else
+            Token::Ident(word) if word.eq_ignore_ascii_case("rotate") => self.parse_rotate(),
+            Token::Ident(word) if word.eq_ignore_ascii_case("list") => self.parse_list_registry(),
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -177,6 +184,45 @@ impl<'a> Parser<'a> {
         match &self.current.token {
             Token::Ident(s) => s.eq_ignore_ascii_case(word),
             _ => false,
+        }
+    }
+
+    /// Whether the token after the current one is this soft keyword.
+    fn peek_is_ident(&self, word: &str) -> bool {
+        match &self.peek.token {
+            Token::Ident(s) => s.eq_ignore_ascii_case(word),
+            _ => false,
+        }
+    }
+
+    /// Consumes a soft keyword, returning whether it was there.
+    fn consume_ident_ignore_case(&mut self, word: &str) -> Result<bool> {
+        if self.at_ident_ignore_case(word) {
+            self.advance()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Consumes a soft keyword, erroring with what was expected instead.
+    fn expect_ident_ignore_case(&mut self, word: &str) -> Result<()> {
+        if self.consume_ident_ignore_case(word)? {
+            return Ok(());
+        }
+        Err(self.error(&format!(
+            "Expected `{}`, found {}",
+            word.to_uppercase(),
+            self.current.token
+        )))
+    }
+
+    /// Reads a name that may be written bare or quoted, which every scheme
+    /// and artifact kind in the substrate's DDL accepts.
+    fn parse_name_or_string(&mut self) -> Result<String> {
+        match &self.current.token {
+            Token::String(_) => self.parse_string_literal(),
+            _ => self.parse_ident(),
         }
     }
 
@@ -548,9 +594,9 @@ impl<'a> Parser<'a> {
         // Check for qualified wildcard: ident.*
         if let Token::Ident(ref name) = self.current.token {
             if self.peek.token == Token::Dot {
-                let name = name.clone();
-                // Need to look further: is it ident.* or ident.column?
-                // Save state and check
+                // Taken before the token is advanced past, because the
+                // borrow ends there. One copy serves both the qualified
+                // wildcard and the qualified column arms
                 let saved_name = name.clone();
                 self.advance()?; // consume ident
                 self.advance()?; // consume dot
@@ -2013,6 +2059,19 @@ impl<'a> Parser<'a> {
 
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Explain)?;
+
+        // EXPLAIN REWRITE FOR OBJECT <name> asks what an upgrade would do to
+        // one user-authored object, which is not a plan, so it branches
+        // before the plan options are read
+        if self.at_ident_ignore_case("rewrite") {
+            self.advance()?;
+            self.expect_keyword(Keyword::For)?;
+            self.expect_ident_ignore_case("object")?;
+            let object_name = self.parse_qualified_name()?;
+            return Ok(Statement::ExplainRewrite(Box::new(
+                ExplainRewriteStatement { object_name },
+            )));
+        }
 
         let mut analyze = false;
         let mut costs = true;
@@ -4219,8 +4278,160 @@ impl<'a> Parser<'a> {
     // SET / SHOW
     // -----------------------------------------------------------------------
 
+    /// `SET SIGNATURE SCHEME <scheme> FOR ARTIFACT KIND <kind>`
+    ///
+    /// The scheme and the kind may be written bare or quoted, so
+    /// `SET SIGNATURE SCHEME Ed25519 FOR ARTIFACT KIND JWT` and the quoted
+    /// form in the documentation both parse.
+    fn parse_set_signature_scheme(&mut self) -> Result<Statement> {
+        self.expect_ident_ignore_case("signature")?;
+        self.expect_ident_ignore_case("scheme")?;
+        let scheme = self.parse_name_or_string()?;
+        self.expect_keyword(Keyword::For)?;
+        self.expect_ident_ignore_case("artifact")?;
+        self.expect_ident_ignore_case("kind")?;
+        let artifact_kind = self.parse_name_or_string()?;
+        Ok(Statement::SetSignatureScheme(Box::new(
+            SetSignatureSchemeStatement {
+                scheme,
+                artifact_kind,
+            },
+        )))
+    }
+
+    /// `ROTATE SIGNATURE SCHEME <kind> TO <scheme> [OVERLAP <interval>]` and
+    /// `ROTATE SERVICE PRINCIPAL KEY <sp> [SCHEME <scheme>] [OVERLAP <interval>]`
+    fn parse_rotate(&mut self) -> Result<Statement> {
+        self.expect_ident_ignore_case("rotate")?;
+        if self.consume_ident_ignore_case("signature")? {
+            self.expect_ident_ignore_case("scheme")?;
+            let artifact_kind = self.parse_name_or_string()?;
+            self.expect_keyword(Keyword::To)?;
+            let new_scheme = self.parse_name_or_string()?;
+            let overlap = self.parse_optional_overlap()?;
+            return Ok(Statement::RotateSignatureScheme(Box::new(
+                RotateSignatureSchemeStatement {
+                    artifact_kind,
+                    new_scheme,
+                    overlap,
+                },
+            )));
+        }
+        if self.consume_ident_ignore_case("service")? {
+            self.expect_ident_ignore_case("principal")?;
+            self.expect_keyword(Keyword::Key)?;
+            let principal = self.parse_name_or_string()?;
+            let new_scheme = if self.consume_ident_ignore_case("scheme")? {
+                Some(self.parse_name_or_string()?)
+            } else {
+                None
+            };
+            let overlap = self.parse_optional_overlap()?;
+            return Ok(Statement::RotateServicePrincipalKey(Box::new(
+                RotateServicePrincipalKeyStatement {
+                    principal,
+                    new_scheme,
+                    overlap,
+                },
+            )));
+        }
+        Err(self.error(
+            "Expected `ROTATE SIGNATURE SCHEME <artifact kind> TO <scheme>` or \
+             `ROTATE SERVICE PRINCIPAL KEY <principal>`",
+        ))
+    }
+
+    /// The optional trailing `OVERLAP '<interval>'` both rotations accept.
+    fn parse_optional_overlap(&mut self) -> Result<Option<String>> {
+        if self.consume_ident_ignore_case("overlap")? {
+            Ok(Some(self.parse_name_or_string()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `LIST SIGNATURE SCHEMES`, `LIST ARTIFACT SCHEMES`,
+    /// `LIST UPGRADE HISTORY [LIMIT n]`, `LIST FORMAT REGISTRY`,
+    /// `LIST DEPRECATIONS`
+    fn parse_list_registry(&mut self) -> Result<Statement> {
+        self.expect_ident_ignore_case("list")?;
+        let target = if self.consume_ident_ignore_case("signature")? {
+            self.expect_ident_ignore_case("schemes")?;
+            ListRegistryTarget::SignatureSchemes
+        } else if self.consume_ident_ignore_case("artifact")? {
+            self.expect_ident_ignore_case("schemes")?;
+            ListRegistryTarget::ArtifactSchemes
+        } else if self.consume_ident_ignore_case("upgrade")? {
+            self.expect_ident_ignore_case("history")?;
+            ListRegistryTarget::UpgradeHistory
+        } else if self.consume_keyword(Keyword::Format)? {
+            self.expect_ident_ignore_case("registry")?;
+            ListRegistryTarget::FormatRegistry
+        } else if self.consume_ident_ignore_case("deprecations")? {
+            ListRegistryTarget::Deprecations
+        } else {
+            return Err(self.error(
+                "Expected `LIST SIGNATURE SCHEMES`, `LIST ARTIFACT SCHEMES`, \
+                 `LIST UPGRADE HISTORY`, `LIST FORMAT REGISTRY`, or `LIST DEPRECATIONS`",
+            ));
+        };
+        let limit = if self.consume_keyword(Keyword::Limit)? {
+            Some(self.parse_unsigned_integer()?)
+        } else {
+            None
+        };
+        Ok(Statement::ListRegistry(Box::new(ListRegistryStatement {
+            target,
+            limit,
+        })))
+    }
+
+    /// `TRIGGER MANUAL UPGRADE TO '<version>'` or `TRIGGER MANUAL ROLLBACK`
+    fn parse_trigger_upgrade(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Trigger)?;
+        self.expect_ident_ignore_case("manual")?;
+        if self.consume_ident_ignore_case("upgrade")? {
+            self.expect_keyword(Keyword::To)?;
+            let version = self.parse_name_or_string()?;
+            return Ok(Statement::TriggerUpgrade(Box::new(
+                TriggerUpgradeStatement {
+                    action: TriggerUpgradeAction::UpgradeTo(version),
+                },
+            )));
+        }
+        if self.consume_keyword(Keyword::Rollback)? {
+            return Ok(Statement::TriggerUpgrade(Box::new(
+                TriggerUpgradeStatement {
+                    action: TriggerUpgradeAction::Rollback,
+                },
+            )));
+        }
+        Err(self
+            .error("Expected `TRIGGER MANUAL UPGRADE TO '<version>'` or `TRIGGER MANUAL ROLLBACK`"))
+    }
+
+    /// Reads a non-negative integer literal, which LIMIT needs.
+    fn parse_unsigned_integer(&mut self) -> Result<u64> {
+        match &self.current.token {
+            Token::Integer(value) if *value >= 0 => {
+                let parsed = *value as u64;
+                self.advance()?;
+                Ok(parsed)
+            }
+            other => Err(self.error(&format!(
+                "Expected a non-negative whole number, found {}",
+                other
+            ))),
+        }
+    }
+
     fn parse_set_variable(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Set)?;
+        // SET SIGNATURE SCHEME names a registry rather than a session
+        // variable, so it branches before the variable name is read
+        if self.at_ident_ignore_case("signature") && self.peek_is_ident("scheme") {
+            return self.parse_set_signature_scheme();
+        }
         let name = self.parse_ident()?;
         // SET name = value or SET name TO value
         if self.consume_keyword(Keyword::To)? {
@@ -4359,6 +4570,29 @@ impl<'a> Parser<'a> {
 
     fn parse_show(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Show)?;
+        // SHOW UPGRADE STATE and SHOW FORMAT MIGRATIONS read the substrate
+        // rather than a session variable, so both branch before the variable
+        // name is read
+        if self.at_ident_ignore_case("upgrade") && self.peek_is_ident("state") {
+            self.advance()?;
+            self.advance()?;
+            return Ok(Statement::ShowUpgrade(Box::new(ShowUpgradeStatement {
+                target: ShowUpgradeTarget::State,
+            })));
+        }
+        if self.at_keyword(Keyword::Format) && self.peek_is_ident("migrations") {
+            self.advance()?;
+            self.advance()?;
+            let format_kind = if self.consume_keyword(Keyword::For)? {
+                self.expect_keyword(Keyword::Format)?;
+                Some(self.parse_name_or_string()?)
+            } else {
+                None
+            };
+            return Ok(Statement::ShowUpgrade(Box::new(ShowUpgradeStatement {
+                target: ShowUpgradeTarget::FormatMigrations { format_kind },
+            })));
+        }
         // SHOW CLUSTERING FOR <table> reads state that belongs to a table
         // rather than to the session, so it names its object
         if self.consume_keyword(Keyword::Clustering)? {

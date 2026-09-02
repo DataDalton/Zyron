@@ -18,6 +18,7 @@ pub mod checkpoint_coordinator;
 pub mod columnar;
 mod disk;
 pub mod encoding;
+pub mod format;
 mod freespace;
 mod heap;
 mod tuple;

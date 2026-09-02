@@ -1351,11 +1351,15 @@ async fn test_wal_checksum_integrity() {
         );
     }
 
-    // 5. Full corruption: randomize all data after segment header (32 bytes)
+    // 5. Full corruption: randomize every record byte, leaving the segment
+    // header intact so the reader reaches the records and rejects them one by
+    // one. The bound comes from the header itself rather than a literal: the
+    // header carries a checksum over all of its bytes, so writing into it
+    // fails the open instead of exercising record validation
     {
         let mut corrupted = original_bytes.clone();
         let mut rng = rand::rng();
-        for b in &mut corrupted[32..] {
+        for b in &mut corrupted[zyron_wal::segment::SegmentHeader::SIZE..] {
             *b = rng.random::<u8>();
         }
         std::fs::write(&seg_path, &corrupted).unwrap();

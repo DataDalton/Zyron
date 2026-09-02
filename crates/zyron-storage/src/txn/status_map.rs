@@ -629,12 +629,21 @@ impl TxnStatusMap {
             }
         }
 
+        // Wrap the body in the format envelope so the file identifies itself
+        // and carries its own version, the same way every other Zyron file
+        // does
+        let framed = zyron_common::format::envelope::encode(
+            zyron_common::format::FormatKind::MvccClog,
+            crate::format::MVCC_CLOG_FORMAT_VERSION,
+            &buf,
+        );
+
         let path = Self::file_path(dir);
         let tmp = path.with_extension("zyclog.tmp");
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp).map_err(ZyronError::Io)?;
-            f.write_all(&buf).map_err(ZyronError::Io)?;
+            f.write_all(&framed).map_err(ZyronError::Io)?;
             f.sync_all().map_err(ZyronError::Io)?;
         }
         std::fs::rename(&tmp, &path).map_err(ZyronError::Io)?;
@@ -657,11 +666,31 @@ impl TxnStatusMap {
             return Ok(());
         }
         let path = Self::file_path(dir);
-        let data = match std::fs::read(&path) {
+        let framed = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(ZyronError::Io(e)),
         };
+        // The envelope names the format and the version, and its two
+        // checksums cover the header and the body. A commit log that does not
+        // parse is refused rather than partly applied, because a partly
+        // applied one silently changes which transactions look committed
+        let parsed = zyron_common::format::envelope::decode_as(
+            &framed,
+            zyron_common::format::FormatKind::MvccClog,
+        )
+        .map_err(|e| ZyronError::Internal(format!("commit log at {}, {e}", path.display())))?;
+        if parsed.header.version != crate::format::MVCC_CLOG_FORMAT_VERSION {
+            return Err(ZyronError::Internal(format!(
+                "commit log at {} is at format version {}, this binary writes and reads {}. \
+                 Upgrade through a release that still reads {} to move it forward first",
+                path.display(),
+                parsed.header.version,
+                crate::format::MVCC_CLOG_FORMAT_VERSION,
+                parsed.header.version
+            )));
+        }
+        let data = parsed.body;
         if data.len() < 28 {
             return Ok(());
         }

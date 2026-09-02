@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+inventory.workspace = true
 zyron-catalog = { path = "../zyron-catalog" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-buffer = { path = "../zyron-buffer" }
@@ -28,6 +29,17 @@ tokio.workspace = true
 tracing.workspace = true
 p256.workspace = true
 ed25519-dalek.workspace = true
+ring.workspace = true
+# RSA key generation only, and the signature the RS256 verifier tests check
+# against. Signing and verification both run through ring, whose modular
+# arithmetic is constant time. RUSTSEC-2023-0071 is a timing sidechannel in
+# this crate's private key operations, reachable only by an attacker who can
+# time them, so the operations it covers are never called here. Generation is
+# a one-shot local computation that answers no attacker query
+rsa = { version = "0.9", features = ["sha2"] }
+# Wipes secret key halves on drop and on rotation, so a retired private key
+# does not stay readable in freed heap
+zeroize = { version = "1.8", features = ["alloc"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",

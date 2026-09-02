@@ -8,6 +8,7 @@ pub mod cdc_ingest;
 pub mod cdc_stream;
 pub mod change_feed;
 pub mod decoder;
+pub mod format;
 pub mod metrics;
 pub mod publication;
 pub mod replication_slot;

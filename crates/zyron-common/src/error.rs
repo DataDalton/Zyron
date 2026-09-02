@@ -501,6 +501,30 @@ pub enum ZyronError {
     #[error("Raft transport error: {0}")]
     RaftTransport(String),
 
+    // Format substrate errors
+    #[error("{0}")]
+    FormatEnvelope(String),
+
+    #[error("{0}")]
+    FormatMigration(String),
+
+    #[error("{0}")]
+    FormatRegistry(String),
+
+    #[error("{0}")]
+    SignatureScheme(String),
+
+    #[error("{0}")]
+    WireProtocolVersion(String),
+
+    #[error("upgrade refused: {0}")]
+    UpgradeRefused(String),
+
+    /// A deprecated item was used past its warn window, so the use is an
+    /// error rather than a warning
+    #[error("{0}")]
+    DeprecatedItem(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),
