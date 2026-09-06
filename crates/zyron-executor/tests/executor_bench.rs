@@ -76,16 +76,53 @@ const SCAN_TARGET_ROWS_SEC: f64 = 75_000_000.0;
 const FILTER_TARGET_ROWS_SEC: f64 = 60_000_000.0;
 const HASH_JOIN_TARGET_ROWS_SEC: f64 = 100_000_000.0;
 const HASH_BUILD_TARGET_ROWS_SEC: f64 = 50_000_000.0;
+/// A grouping key with a hundred thousand distinct values, where the group
+/// table no longer fits a cache level and the fold is a table lookup per
+/// row rather than a hit on a hot line. Set above what a map holding a
+/// vector of candidates per hash averaged, so a return to that shape trips
+/// it, and a quarter under what the flat chained index measures
+const HASH_BUILD_MANY_GROUPS_TARGET_ROWS_SEC: f64 = 35_000_000.0;
 const AGGREGATE_TARGET_ROWS_SEC: f64 = 150_000_000.0;
 const SORT_TARGET_ROWS_SEC: f64 = 100_000_000.0;
+/// ORDER BY with a LIMIT, which only has to find the rows the limit keeps.
+/// About half of what the bounded buffer measures, and four times what
+/// sorting every row and truncating measured, so the gate trips on a
+/// return to the full sort rather than on run-to-run spread
+const SORT_TOPN_TARGET_ROWS_SEC: f64 = 450_000_000.0;
 const LIMIT_TARGET_ROWS_SEC: f64 = 200_000_000.0;
 const STRING_EQ_TARGET_ROWS_SEC: f64 = 80_000_000.0;
 const LIKE_PREFIX_TARGET_ROWS_SEC: f64 = 7_000_000.0;
 const LIKE_GENERAL_TARGET_ROWS_SEC: f64 = 5_000_000.0;
 const ILIKE_CONTAINS_TARGET_ROWS_SEC: f64 = 4_500_000.0;
+// Patterns with no '_' in them, which reach the literal matcher rather than
+// the wildcard-aware one. Three shapes, one gate each. Set at about half of
+// what the literal matcher measures, so the gate trips on a change that puts
+// one of these shapes back on a scanning matcher rather than on run-to-run
+// spread, which is under 10% here and under 2% for the substring shape
+const LIKE_LITERAL_PREFIX_TARGET_ROWS_SEC: f64 = 100_000_000.0;
+const LIKE_LITERAL_SUFFIX_TARGET_ROWS_SEC: f64 = 120_000_000.0;
+const LIKE_LITERAL_CONTAINS_TARGET_ROWS_SEC: f64 = 50_000_000.0;
 const IN_LIST_TARGET_ROWS_SEC: f64 = 35_000_000.0;
 const WINDOW_FRAME_TARGET_ROWS_SEC: f64 = 9_000_000.0;
+/// A running SUM over a thousand partitions whose rows arrive in neither
+/// partition nor order-key order, so the sort, the gather and the fold all
+/// do real work. About half of what the hashed partition layout and the
+/// typed running fold measure, and twice what sorting every column by
+/// comparison and boxing a scalar per row measured, so the gate trips on a
+/// return to that rather than on run-to-run spread
+const WINDOW_PARTITIONED_TARGET_ROWS_SEC: f64 = 12_000_000.0;
+/// DISTINCT over a hundred thousand distinct rows in a million, about half
+/// of what the flat chained index measures
+const DISTINCT_TARGET_ROWS_SEC: f64 = 45_000_000.0;
 const RESIDUAL_JOIN_TARGET_ROWS_SEC: f64 = 20_000_000.0;
+/// UNION ALL forwards its branches without buffering, so it is bounded by
+/// the batch plumbing rather than by the rows
+const UNION_ALL_TARGET_ROWS_SEC: f64 = 2_000_000_000.0;
+/// The three materializing set operations hash every row of both branches
+/// into one store, which is the shape a hash join builds its side with
+const UNION_TARGET_ROWS_SEC: f64 = 24_000_000.0;
+const INTERSECT_TARGET_ROWS_SEC: f64 = 38_000_000.0;
+const EXCEPT_TARGET_ROWS_SEC: f64 = 28_000_000.0;
 
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1124,6 +1161,91 @@ async fn test_distinct_correctness() {
 }
 
 // =============================================================================
+// Distinct throughput (5-run validation)
+// =============================================================================
+
+/// SELECT DISTINCT over two columns where a hundred thousand distinct rows
+/// each appear ten times, in stride order so consecutive rows are unrelated
+#[tokio::test]
+async fn test_distinct_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 1_000_000;
+    const DISTINCT: usize = 100_000;
+    /// Coprime with DISTINCT, so a full cycle of rows visits every key once
+    const STRIDE: usize = 7_919;
+
+    tprintln!("\n=== Distinct Throughput Test ===");
+    tprintln!("Rows: {}, distinct: {}", ROW_COUNT, DISTINCT);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let batches = {
+        let mut batches = Vec::new();
+        let mut remaining = ROW_COUNT;
+        let mut row_offset = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let keys: Vec<i64> = (0..chunk)
+                .map(|r| (((row_offset + r) * STRIDE) % DISTINCT) as i64)
+                .collect();
+            // A second column that is a function of the first, so a row is
+            // distinct by its key alone and the comparison still has two
+            // columns to check
+            let payload: Vec<i64> = keys.iter().map(|k| k * 3 + 1).collect();
+            batches.push(DataBatch::new(vec![
+                Column::new(ColumnData::Int64(keys), TypeId::Int64),
+                Column::new(ColumnData::Int64(payload), TypeId::Int64),
+            ]));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+        let child = MemoryOperator::boxed(batches.clone());
+        let mut distinct_op = HashDistinctOperator::new(child);
+        let start = Instant::now();
+        let rows = drain_operator(&mut distinct_op).await;
+        let duration = start.elapsed();
+        assert_eq!(
+            rows,
+            DISTINCT,
+            "Run {}: expected {} distinct rows, got {}",
+            run + 1,
+            DISTINCT,
+            rows
+        );
+        let rows_sec = ROW_COUNT as f64 / duration.as_secs_f64();
+        tprintln!(
+            "  Distinct: {} rows/sec ({:?})",
+            format_with_commas(rows_sec),
+            duration
+        );
+        results.push(rows_sec);
+    }
+    record_test_util("Distinct", util_before, take_util_snapshot());
+
+    tprintln!("\n=== Distinct Validation Results ===");
+    let result = validate_metric(
+        "Distinct",
+        "Distinct throughput (rows/sec)",
+        results,
+        DISTINCT_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(
+        result.passed,
+        "Distinct avg {:.0} < target {:.0}",
+        result.average, DISTINCT_TARGET_ROWS_SEC
+    );
+    assert!(!result.regression_detected, "Distinct regression detected");
+}
+
+// =============================================================================
 // Test 13: Set Operations Correctness
 // =============================================================================
 
@@ -1176,6 +1298,95 @@ async fn test_setop_correctness() {
     let rows = drain_operator(&mut except_op).await;
     assert_eq!(rows, 2, "EXCEPT should produce 2 rows, got {}", rows);
     tprintln!("  EXCEPT: {} rows [PASS]", rows);
+}
+
+/// Throughput of the three materializing set operations.
+///
+/// UNION ALL streams and is the floor every other shape is read against.
+/// UNION DISTINCT, INTERSECT and EXCEPT all build one row store over both
+/// branches and hash every row into it, so they are measured on the same
+/// inputs to keep the comparison about the operation rather than the data.
+///
+/// Reported rather than gated: the operations had no throughput measurement
+/// at all, so there is no number to hold them to yet
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_setop_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROWS_PER_SIDE: usize = 200_000;
+
+    tprintln!("\n=== Set Operation Throughput ===");
+    tprintln!("Rows per side: {}, columns: 2", ROWS_PER_SIDE);
+
+    // Halves that overlap in the middle, so every operation has real work:
+    // the union is not the concatenation, the intersection is not empty and
+    // the difference is not the whole left side
+    let left_batches = build_large_dataset(ROWS_PER_SIDE, 2);
+    let right_batches = {
+        let mut batches = Vec::new();
+        let mut remaining = ROWS_PER_SIDE;
+        let mut row_offset = ROWS_PER_SIDE / 2;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let columns: Vec<Column> = (0..2usize)
+                .map(|col_idx| {
+                    let data: Vec<i64> = (0..chunk)
+                        .map(|r| ((row_offset + r) * 2 + col_idx) as i64)
+                        .collect();
+                    Column::new(ColumnData::Int64(data), TypeId::Int64)
+                })
+                .collect();
+            batches.push(DataBatch::new(columns));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+
+    let cases: &[(&str, SetOpType, bool, f64)] = &[
+        (
+            "UNION ALL",
+            SetOpType::Union,
+            true,
+            UNION_ALL_TARGET_ROWS_SEC,
+        ),
+        ("UNION", SetOpType::Union, false, UNION_TARGET_ROWS_SEC),
+        (
+            "INTERSECT",
+            SetOpType::Intersect,
+            false,
+            INTERSECT_TARGET_ROWS_SEC,
+        ),
+        ("EXCEPT", SetOpType::Except, false, EXCEPT_TARGET_ROWS_SEC),
+    ];
+
+    for (label, op, all, target) in cases {
+        let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+        let mut emitted = 0usize;
+        for _ in 0..VALIDATION_RUNS {
+            let left = MemoryOperator::boxed(left_batches.clone());
+            let right = MemoryOperator::boxed(right_batches.clone());
+            let mut set_op = SetOpOperator::new(left, right, *op, *all);
+            let start = Instant::now();
+            emitted = drain_operator(&mut set_op).await;
+            let duration = start.elapsed();
+            let input_rows = ROWS_PER_SIDE * 2;
+            runs.push(input_rows as f64 / duration.as_secs_f64());
+        }
+        tprintln!("  {} emitted {} rows", label, emitted);
+        let result = validate_metric(
+            "Set Operations",
+            &format!("{} throughput (rows/sec)", label),
+            runs,
+            *target,
+            true,
+        );
+        assert!(
+            result.passed,
+            "{} avg {:.0} < target {:.0}",
+            label, result.average, target
+        );
+    }
 }
 
 // =============================================================================
@@ -1318,6 +1529,123 @@ async fn test_sort_topn() {
         }
     }
     tprintln!("  TopN(100) from 10K rows: correct smallest 100 [PASS]");
+}
+
+// =============================================================================
+// Top-N sort throughput (5-run validation)
+// =============================================================================
+
+/// ORDER BY one column with a LIMIT over a table that carries a payload
+/// column too, which is the shape of every "latest hundred" query. The
+/// payload puts the sort on the gather path rather than the values-only
+/// one, so what is measured is finding the kept rows and gathering them
+#[tokio::test]
+async fn test_sort_topn_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 1_000_000;
+    const KEEP: usize = 100;
+
+    tprintln!("\n=== Top-N Sort Performance Test ===");
+    tprintln!("Rows: {}, limit: {}", ROW_COUNT, KEEP);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let schema = make_schema(&[("val", TypeId::Int64), ("payload", TypeId::Int64)]);
+    let order_by = vec![BoundOrderBy {
+        expr: col_ref(0, 0, TypeId::Int64),
+        asc: true,
+        nulls_first: false,
+    }];
+
+    let mut all_values: Vec<i64> = Vec::with_capacity(ROW_COUNT);
+    let batches = {
+        let mut rng = rand::rng();
+        let mut batches = Vec::new();
+        let mut remaining = ROW_COUNT;
+        let mut row_offset = 0usize;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let vals: Vec<i64> = (0..chunk)
+                .map(|_| rng.random_range(0..ROW_COUNT as i64))
+                .collect();
+            all_values.extend_from_slice(&vals);
+            let payload: Vec<i64> = (0..chunk).map(|r| (row_offset + r) as i64).collect();
+            batches.push(DataBatch::new(vec![
+                Column::new(ColumnData::Int64(vals), TypeId::Int64),
+                Column::new(ColumnData::Int64(payload), TypeId::Int64),
+            ]));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+    let mut expected = all_values.clone();
+    expected.sort_unstable();
+    expected.truncate(KEEP);
+
+    let mut topn_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let child = MemoryOperator::boxed(batches.clone());
+        let mut sort_op =
+            SortOperator::new(child, order_by.clone(), schema.clone(), Some(KEEP as u64));
+
+        let start = Instant::now();
+        let result_batches = collect_batches(&mut sort_op).await;
+        let duration = start.elapsed();
+
+        let mut got: Vec<i64> = Vec::with_capacity(KEEP);
+        let mut payload_rows = 0usize;
+        for b in &result_batches {
+            if let ColumnData::Int64(data) = &b.columns[0].data {
+                got.extend_from_slice(data);
+            }
+            payload_rows += b.columns[1].len();
+        }
+        assert_eq!(
+            got,
+            expected,
+            "Run {}: the limit must keep the smallest {} values in order",
+            run + 1,
+            KEEP
+        );
+        assert_eq!(
+            payload_rows,
+            KEEP,
+            "Run {}: the payload column must be gathered alongside the key",
+            run + 1
+        );
+
+        let rows_sec = ROW_COUNT as f64 / duration.as_secs_f64();
+        tprintln!(
+            "  Top-N sort: {} rows/sec ({:?})",
+            format_with_commas(rows_sec),
+            duration
+        );
+        topn_results.push(rows_sec);
+    }
+    record_test_util("Top-N Sort", util_before, take_util_snapshot());
+
+    tprintln!("\n=== Top-N Sort Validation Results ===");
+    let result = validate_metric(
+        "Top-N Sort",
+        "Top-N sort throughput (rows/sec)",
+        topn_results,
+        SORT_TOPN_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(
+        result.passed,
+        "Top-N Sort avg {:.0} < target {:.0}",
+        result.average, SORT_TOPN_TARGET_ROWS_SEC
+    );
+    assert!(
+        !result.regression_detected,
+        "Top-N Sort regression detected"
+    );
 }
 
 // =============================================================================
@@ -1496,6 +1824,176 @@ async fn test_hash_build_throughput() {
 }
 
 // =============================================================================
+// Hash build throughput over many groups (5-run validation)
+// =============================================================================
+
+/// GROUP BY over a key with a hundred thousand distinct values, with a SUM
+/// and a COUNT so each row folds into two accumulators. Keys arrive as a
+/// stride permutation, so consecutive rows land in unrelated groups and
+/// every lookup is a table access rather than a hit on the line the last
+/// row touched. The same grouping with a lone COUNT(*) is reported beside
+/// the gated shape, so the cost of an accumulator per row is visible on
+/// its own
+#[tokio::test]
+async fn test_hash_build_many_groups_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 1_000_000;
+    const GROUPS: usize = 100_000;
+    /// Coprime with GROUPS, so a full cycle of rows visits every key once
+    const STRIDE: usize = 7_919;
+
+    tprintln!("\n=== Hash Build Many Groups Performance Test ===");
+    tprintln!("Rows: {}, groups: {}", ROW_COUNT, GROUPS);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let schema = make_schema(&[("key", TypeId::Int64), ("val", TypeId::Int64)]);
+    let group_by = vec![col_ref(0, 0, TypeId::Int64)];
+    let aggregates = vec![
+        AggregateExpr {
+            function_name: "sum".to_string(),
+            args: vec![col_ref(0, 1, TypeId::Int64)],
+            distinct: false,
+            return_type: TypeId::Int64,
+            uda: None,
+        },
+        AggregateExpr {
+            function_name: "count".to_string(),
+            args: vec![],
+            distinct: false,
+            return_type: TypeId::Int64,
+            uda: None,
+        },
+    ];
+    let output_schema = make_schema(&[
+        ("key", TypeId::Int64),
+        ("sum", TypeId::Int64),
+        ("count", TypeId::Int64),
+    ]);
+    let count_only = vec![aggregates[1].clone()];
+    let count_only_schema = make_schema(&[("key", TypeId::Int64), ("count", TypeId::Int64)]);
+
+    let batches = {
+        let mut batches = Vec::new();
+        let mut remaining = ROW_COUNT;
+        let mut row_offset = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let keys: Vec<i64> = (0..chunk)
+                .map(|r| (((row_offset + r) * STRIDE) % GROUPS) as i64)
+                .collect();
+            let vals: Vec<i64> = (0..chunk).map(|r| (row_offset + r) as i64).collect();
+            batches.push(DataBatch::new(vec![
+                Column::new(ColumnData::Int64(keys), TypeId::Int64),
+                Column::new(ColumnData::Int64(vals), TypeId::Int64),
+            ]));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+    let rows_per_group = (ROW_COUNT / GROUPS) as i64;
+    let expected_total: i64 = (0..ROW_COUNT as i64).sum();
+
+    let mut build_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let child = MemoryOperator::boxed(batches.clone());
+        let mut agg_op = HashAggregateOperator::new(
+            child,
+            group_by.clone(),
+            aggregates.clone(),
+            schema.clone(),
+            output_schema.clone(),
+        );
+
+        let start = Instant::now();
+        let result = collect_batches(&mut agg_op).await;
+        let duration = start.elapsed();
+
+        let total_groups: usize = result.iter().map(|b| b.num_rows).sum();
+        assert_eq!(
+            total_groups,
+            GROUPS,
+            "Run {}: expected {} groups, got {}",
+            run + 1,
+            GROUPS,
+            total_groups
+        );
+        let mut sum_total = 0i64;
+        for b in &result {
+            if let ColumnData::Int64(sums) = &b.columns[1].data {
+                sum_total += sums.iter().sum::<i64>();
+            }
+            if let ColumnData::Int64(counts) = &b.columns[2].data {
+                assert!(
+                    counts.iter().all(|&c| c == rows_per_group),
+                    "Run {}: every group holds {} rows",
+                    run + 1,
+                    rows_per_group
+                );
+            }
+        }
+        assert_eq!(
+            sum_total,
+            expected_total,
+            "Run {}: the group sums must add up to the sum of every value",
+            run + 1
+        );
+
+        let rows_sec = ROW_COUNT as f64 / duration.as_secs_f64();
+        tprintln!(
+            "  Hash Build (many groups): {} rows/sec ({:?}), {} groups",
+            format_with_commas(rows_sec),
+            duration,
+            total_groups
+        );
+        build_results.push(rows_sec);
+
+        let child = MemoryOperator::boxed(batches.clone());
+        let mut count_op = HashAggregateOperator::new(
+            child,
+            group_by.clone(),
+            count_only.clone(),
+            schema.clone(),
+            count_only_schema.clone(),
+        );
+        let start = Instant::now();
+        let counted = collect_batches(&mut count_op).await;
+        let count_duration = start.elapsed();
+        let counted_groups: usize = counted.iter().map(|b| b.num_rows).sum();
+        assert_eq!(counted_groups, GROUPS);
+        tprintln!(
+            "  Hash Build (many groups, COUNT only): {} rows/sec ({:?})",
+            format_with_commas(ROW_COUNT as f64 / count_duration.as_secs_f64()),
+            count_duration
+        );
+    }
+    record_test_util("Hash Build Many Groups", util_before, take_util_snapshot());
+
+    tprintln!("\n=== Hash Build Many Groups Validation Results ===");
+    let result = validate_metric(
+        "Hash Build Many Groups",
+        "Hash build throughput over many groups (rows/sec)",
+        build_results,
+        HASH_BUILD_MANY_GROUPS_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(
+        result.passed,
+        "Hash Build Many Groups avg {:.0} < target {:.0}",
+        result.average, HASH_BUILD_MANY_GROUPS_TARGET_ROWS_SEC
+    );
+    assert!(
+        !result.regression_detected,
+        "Hash Build Many Groups regression detected"
+    );
+}
+
+// =============================================================================
 // String predicate throughput: equality, LIKE, ILIKE (5-run validation)
 // =============================================================================
 
@@ -1593,8 +2091,41 @@ async fn test_string_predicate_throughput() {
         negated: false,
     };
 
+    // Patterns holding no '_' at all. SQL reads '_' as a single-character
+    // wildcard, so every pattern above carries one and matches through the
+    // wildcard-aware path. These three reach the literal path instead, one
+    // for each of its shapes: anchored at the start, anchored at the end, and
+    // searched for in the middle
+    // name LIKE 'user%': the literal prefix shape, every row matches
+    let like_literal_prefix = BoundExpr::Like {
+        expr: Box::new(col_ref(0, 0, TypeId::Text)),
+        pattern: Box::new(lit_text("user%")),
+        negated: false,
+    };
+    // name LIKE '%99': the literal suffix shape
+    let like_literal_suffix = BoundExpr::Like {
+        expr: Box::new(col_ref(0, 0, TypeId::Text)),
+        pattern: Box::new(lit_text("%99")),
+        negated: false,
+    };
+    // name LIKE '%1234%': the literal substring shape
+    let like_literal_contains = BoundExpr::Like {
+        expr: Box::new(col_ref(0, 0, TypeId::Text)),
+        pattern: Box::new(lit_text("%1234%")),
+        negated: false,
+    };
+
     // Expected counts over user_0..user_499999
     let eq_expected = ROW_COUNT / 1000;
+    let literal_prefix_expected = (0..ROW_COUNT)
+        .filter(|i| format!("user_{i}").starts_with("user"))
+        .count();
+    let literal_suffix_expected = (0..ROW_COUNT)
+        .filter(|i| format!("user_{i}").ends_with("99"))
+        .count();
+    let literal_contains_expected = (0..ROW_COUNT)
+        .filter(|i| format!("user_{i}").contains("1234"))
+        .count();
     let like_prefix_expected = (0..ROW_COUNT)
         .filter(|i| format!("user_{i}").starts_with("user_1"))
         .count();
@@ -1612,6 +2143,9 @@ async fn test_string_predicate_throughput() {
     let mut prefix_results = Vec::with_capacity(VALIDATION_RUNS);
     let mut general_results = Vec::with_capacity(VALIDATION_RUNS);
     let mut ilike_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut literal_prefix_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut literal_suffix_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut literal_contains_results = Vec::with_capacity(VALIDATION_RUNS);
 
     let util_before = take_util_snapshot();
     for run in 0..VALIDATION_RUNS {
@@ -1638,6 +2172,27 @@ async fn test_string_predicate_throughput() {
             ROW_COUNT,
             ilike_expected,
         );
+        let literal_prefix = time_predicate(
+            &like_literal_prefix,
+            &batches,
+            &schema,
+            ROW_COUNT,
+            literal_prefix_expected,
+        );
+        let literal_suffix = time_predicate(
+            &like_literal_suffix,
+            &batches,
+            &schema,
+            ROW_COUNT,
+            literal_suffix_expected,
+        );
+        let literal_contains = time_predicate(
+            &like_literal_contains,
+            &batches,
+            &schema,
+            ROW_COUNT,
+            literal_contains_expected,
+        );
         tprintln!(
             "  eq {} rows/sec, LIKE prefix {} rows/sec, LIKE general {} rows/sec, ILIKE {} rows/sec",
             format_with_commas(eq),
@@ -1645,10 +2200,19 @@ async fn test_string_predicate_throughput() {
             format_with_commas(general),
             format_with_commas(ilike),
         );
+        tprintln!(
+            "  literal prefix {} rows/sec, literal suffix {} rows/sec, literal contains {} rows/sec",
+            format_with_commas(literal_prefix),
+            format_with_commas(literal_suffix),
+            format_with_commas(literal_contains),
+        );
         eq_results.push(eq);
         prefix_results.push(prefix);
         general_results.push(general);
         ilike_results.push(ilike);
+        literal_prefix_results.push(literal_prefix);
+        literal_suffix_results.push(literal_suffix);
+        literal_contains_results.push(literal_contains);
     }
     record_test_util("String Predicate", util_before, take_util_snapshot());
 
@@ -1681,10 +2245,43 @@ async fn test_string_predicate_throughput() {
         ILIKE_CONTAINS_TARGET_ROWS_SEC,
         true,
     );
+    let literal_prefix_result = validate_metric(
+        "LIKE Literal Prefix",
+        "LIKE literal prefix predicate (rows/sec)",
+        literal_prefix_results,
+        LIKE_LITERAL_PREFIX_TARGET_ROWS_SEC,
+        true,
+    );
+    let literal_suffix_result = validate_metric(
+        "LIKE Literal Suffix",
+        "LIKE literal suffix predicate (rows/sec)",
+        literal_suffix_results,
+        LIKE_LITERAL_SUFFIX_TARGET_ROWS_SEC,
+        true,
+    );
+    let literal_contains_result = validate_metric(
+        "LIKE Literal Contains",
+        "LIKE literal contains predicate (rows/sec)",
+        literal_contains_results,
+        LIKE_LITERAL_CONTAINS_TARGET_ROWS_SEC,
+        true,
+    );
     assert!(eq_result.passed, "String equality below target");
     assert!(prefix_result.passed, "LIKE prefix below target");
     assert!(general_result.passed, "LIKE general below target");
     assert!(ilike_result.passed, "ILIKE contains below target");
+    assert!(
+        literal_prefix_result.passed,
+        "LIKE literal prefix below target"
+    );
+    assert!(
+        literal_suffix_result.passed,
+        "LIKE literal suffix below target"
+    );
+    assert!(
+        literal_contains_result.passed,
+        "LIKE literal contains below target"
+    );
 }
 
 // =============================================================================
@@ -1819,6 +2416,149 @@ async fn test_window_frame_throughput() {
     assert!(
         !result.regression_detected,
         "Window frame regression detected"
+    );
+}
+
+// =============================================================================
+// Window partitioned running aggregate throughput (5-run validation)
+// =============================================================================
+
+/// SUM(val) OVER (PARTITION BY key ORDER BY ts), the shape of a running
+/// total per account. Keys arrive as a stride permutation over a thousand
+/// partitions and ts runs backwards, so the rows are in neither partition
+/// nor order-key order and the sort has to move every one of them
+#[tokio::test]
+async fn test_window_partitioned_throughput() {
+    zyron_bench_harness::init("executor");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 500_000;
+    const PARTITIONS: usize = 1_000;
+    /// Coprime with PARTITIONS, so a full cycle of rows visits every key once
+    const STRIDE: usize = 7_919;
+
+    tprintln!("\n=== Window Partitioned Running Sum Throughput Test ===");
+    tprintln!("Rows: {}, partitions: {}", ROW_COUNT, PARTITIONS);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let schema = make_schema(&[
+        ("key", TypeId::Int64),
+        ("ts", TypeId::Int64),
+        ("val", TypeId::Int64),
+    ]);
+    let key_of = |row: usize| (row * STRIDE) % PARTITIONS;
+    let batches = {
+        let mut batches = Vec::new();
+        let mut remaining = ROW_COUNT;
+        let mut row_offset = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(BATCH_SIZE);
+            let keys: Vec<i64> = (0..chunk).map(|r| key_of(row_offset + r) as i64).collect();
+            let ts: Vec<i64> = (0..chunk)
+                .map(|r| (ROW_COUNT - (row_offset + r)) as i64)
+                .collect();
+            let vals: Vec<i64> = (0..chunk).map(|r| (row_offset + r) as i64).collect();
+            batches.push(DataBatch::new(vec![
+                Column::new(ColumnData::Int64(keys), TypeId::Int64),
+                Column::new(ColumnData::Int64(ts), TypeId::Int64),
+                Column::new(ColumnData::Int64(vals), TypeId::Int64),
+            ]));
+            row_offset += chunk;
+            remaining -= chunk;
+        }
+        batches
+    };
+    // The row of each partition with the largest ts is its first row in
+    // input order, and its running sum is the partition's whole total
+    let mut totals = vec![0i64; PARTITIONS];
+    let mut first_row = vec![usize::MAX; PARTITIONS];
+    for row in 0..ROW_COUNT {
+        let key = key_of(row);
+        totals[key] += row as i64;
+        first_row[key] = first_row[key].min(row);
+    }
+
+    let window_expr = BoundExpr::WindowFunction {
+        function: Box::new(BoundExpr::AggregateFunction {
+            name: "sum".to_string(),
+            args: vec![col_ref(0, 2, TypeId::Int64)],
+            distinct: false,
+            return_type: TypeId::Int64,
+            uda: None,
+        }),
+        partition_by: vec![col_ref(0, 0, TypeId::Int64)],
+        order_by: vec![BoundOrderBy {
+            expr: col_ref(0, 1, TypeId::Int64),
+            asc: true,
+            nulls_first: false,
+        }],
+        frame: None,
+        type_id: TypeId::Int64,
+    };
+
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    let util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+        let child = MemoryOperator::boxed(batches.clone());
+        let mut window_op = zyron_executor::operator::window::WindowOperator::new(
+            child,
+            vec![window_expr.clone()],
+            schema.clone(),
+        );
+        let start = Instant::now();
+        let out = collect_batches(&mut window_op).await;
+        let duration = start.elapsed();
+
+        let mut running: Vec<i64> = Vec::with_capacity(ROW_COUNT);
+        for b in &out {
+            let ColumnData::Int64(values) = &b.columns[3].data else {
+                panic!("the running sum is an Int64 column");
+            };
+            running.extend_from_slice(values);
+        }
+        assert_eq!(
+            running.len(),
+            ROW_COUNT,
+            "window emits one row per input row"
+        );
+        for key in 0..PARTITIONS {
+            assert_eq!(
+                running[first_row[key]],
+                totals[key],
+                "Run {}: partition {} ends on its total",
+                run + 1,
+                key
+            );
+        }
+
+        let rows_sec = ROW_COUNT as f64 / duration.as_secs_f64();
+        tprintln!(
+            "  Window partitioned: {} rows/sec ({:?})",
+            format_with_commas(rows_sec),
+            duration
+        );
+        results.push(rows_sec);
+    }
+    record_test_util("Window Partitioned", util_before, take_util_snapshot());
+    // Compiled in by --features profile, gated at runtime by ZYRON_PROFILE
+    zyron_common::profile::dump("window partitioned");
+
+    tprintln!("\n=== Window Partitioned Validation Results ===");
+    let result = validate_metric(
+        "Window Partitioned",
+        "Window partitioned running sum throughput (rows/sec)",
+        results,
+        WINDOW_PARTITIONED_TARGET_ROWS_SEC,
+        true,
+    );
+    assert!(
+        result.passed,
+        "Window Partitioned avg {:.0} < target {:.0}",
+        result.average, WINDOW_PARTITIONED_TARGET_ROWS_SEC
+    );
+    assert!(
+        !result.regression_detected,
+        "Window Partitioned regression detected"
     );
 }
 

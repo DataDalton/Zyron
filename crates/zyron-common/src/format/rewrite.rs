@@ -8,7 +8,9 @@
 use std::fmt;
 
 /// A kind of user-authored object a rewriter can target
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum ObjectKind {
     View,
     MaterializedView,
@@ -82,7 +84,9 @@ impl fmt::Display for ObjectKind {
 }
 
 /// How much judgment a rewrite needs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum RewriteCategory {
     /// A mechanical rename or a syntactic reshuffle that preserves meaning
     Safe,
@@ -120,7 +124,7 @@ impl fmt::Display for RewriteCategory {
 }
 
 /// What a tenant has said should happen to each rewrite class
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum UserObjectRewritePolicy {
     /// Safe applies on its own, ambiguous needs an acknowledgment, unsafe
     /// blocks the upgrade
@@ -221,7 +225,7 @@ impl fmt::Display for RewriteDisposition {
 }
 
 /// Where one queued rewrite has got to
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RewriteStatus {
     Pending,
     Applied,

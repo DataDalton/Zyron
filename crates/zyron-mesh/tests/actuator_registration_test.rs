@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use zyron_mesh::rpc::{
     BeginDrainRequest, CancelProvisioningRequest, DrainStatus, DrainStatusRequest, HotSetChunk,
-    HotSetManifestRequest, MeshFuture, MeshRpc, PrefetchRequest, PrefetchStatus,
-    RelocateSessionRequest, RelocationOutcome,
+    HotSetManifestRequest, MeshFuture, MeshRpc, NodeAck, NodeStatus, NodeStatusRequest,
+    PrefetchRequest, PrefetchStatus, RelocateSessionRequest, RelocationOutcome, RestartRequest,
+    RollbackRequest, SetClusterSettingRequest, StageReleaseRequest,
 };
 use zyron_mesh::{MeshActuator, MeshScheduler, NodeRef, WarmPool};
 use zyron_pressure::extension::{ActuatorExtension, ActuatorResult, ExtensionRegistry};
@@ -80,6 +81,67 @@ impl MeshRpc for Silent {
     }
     fn cancel_provisioning(&self, _r: CancelProvisioningRequest) -> MeshFuture<'_, ()> {
         Box::pin(async move { Ok(()) })
+    }
+    fn node_status(&self, r: NodeStatusRequest) -> MeshFuture<'_, NodeStatus> {
+        Box::pin(async move {
+            Ok(NodeStatus {
+                target: r.target,
+                sequence: r.sequence,
+                version: "0.12.0".into(),
+                staged_version: String::new(),
+                draining: false,
+                accepting: true,
+                queries_in_flight: 0,
+                sessions_attached: 0,
+                transactions_open: 0,
+                p50_latency_us: 0,
+                p99_latency_us: 0,
+                throughput_milli_per_sec: 0,
+                error_rate_ppm: 0,
+                queries_in_window: 0,
+                uptime_secs: 0,
+            })
+        })
+    }
+    fn stage_release(&self, r: StageReleaseRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            Ok(NodeAck {
+                target: r.target,
+                sequence: r.sequence,
+                accepted: true,
+                detail: String::new(),
+            })
+        })
+    }
+    fn set_cluster_setting(&self, r: SetClusterSettingRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            Ok(NodeAck {
+                target: r.target,
+                sequence: r.sequence,
+                accepted: true,
+                detail: String::new(),
+            })
+        })
+    }
+    fn restart_into_staged(&self, r: RestartRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            Ok(NodeAck {
+                target: r.target,
+                sequence: r.sequence,
+                accepted: true,
+                detail: String::new(),
+            })
+        })
+    }
+    fn rollback_to_previous(&self, r: RollbackRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            Ok(NodeAck {
+                target: r.target,
+                sequence: r.sequence,
+                accepted: true,
+                detail: String::new(),
+            })
+        })
     }
 }
 

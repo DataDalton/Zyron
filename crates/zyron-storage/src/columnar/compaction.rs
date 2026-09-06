@@ -12,7 +12,7 @@
 //! default anyone has to configure.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use zyron_common::Result;
 use zyron_common::curve::{normalize_component, ordering_key};
 use zyron_common::types::TypeId;
@@ -470,33 +470,71 @@ where
             })
             .collect()
     } else {
+        // threadCount workers pulling from a shared index, rather than one
+        // thread per column. A thread per column ignores max_encoding_threads
+        // outright, so a two hundred column table starts two hundred OS
+        // threads underneath a server that is still answering queries. Pulling
+        // also balances the work: columns cost very different amounts to
+        // encode, and on a machine whose cores are not all the same speed a
+        // fixed column-to-thread assignment finishes when its unluckiest pair
+        // does
+        let nextColumn = AtomicUsize::new(0);
         std::thread::scope(|s| {
             let column_view = &column_view;
+            let nextColumn = &nextColumn;
             let exactEncoding = config.exact_encoding;
-            let handles: Vec<_> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| {
+            let handles: Vec<_> = (0..threadCount)
+                .map(|_| {
                     s.spawn(move || {
-                        let values = column_view(i);
-                        ColumnSegment::build_with_options(
-                            col.column_id,
-                            col.type_id,
-                            col.value_size,
-                            &values,
-                            SegmentOptions {
-                                bloom: col.bloom_policy,
-                                exact_encoding: exactEncoding,
-                                distinct_sketch: false,
-                            },
-                        )
+                        let mut built: Vec<(usize, Result<ColumnSegment>)> = Vec::new();
+                        loop {
+                            let i = nextColumn.fetch_add(1, Ordering::Relaxed);
+                            let Some(col) = columns.get(i) else {
+                                break;
+                            };
+                            let values = column_view(i);
+                            built.push((
+                                i,
+                                ColumnSegment::build_with_options(
+                                    col.column_id,
+                                    col.type_id,
+                                    col.value_size,
+                                    &values,
+                                    SegmentOptions {
+                                        bloom: col.bloom_policy,
+                                        exact_encoding: exactEncoding,
+                                        distinct_sketch: false,
+                                    },
+                                ),
+                            ));
+                        }
+                        built
                     })
                 })
                 .collect();
-            handles
+
+            // Back into column order. A worker takes whatever columns it wins
+            // the race for, so what it returns is not contiguous
+            let mut slots: Vec<Option<Result<ColumnSegment>>> =
+                (0..columns.len()).map(|_| None).collect();
+            for h in handles {
+                match h.join() {
+                    Ok(built) => {
+                        for (i, segment) in built {
+                            slots[i] = Some(segment);
+                        }
+                    }
+                    Err(_) => {
+                        // The columns that worker claimed stay None and are
+                        // reported below, the rest of the join still runs so
+                        // no thread is left detached
+                    }
+                }
+            }
+            slots
                 .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
+                .map(|slot| {
+                    slot.unwrap_or_else(|| {
                         Err(zyron_common::ZyronError::CompactionFailed(
                             "encoding thread panicked".to_string(),
                         ))

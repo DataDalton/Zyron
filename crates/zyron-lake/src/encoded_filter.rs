@@ -14,24 +14,42 @@
 //! form, so a column whose decoded size is orders of magnitude larger
 //! than its encoded size never materializes the difference.
 //!
+//! A null cell is stored as zero bytes, so a comparison answered on the
+//! payload sees the value zero where the row holds nothing. Every leaf
+//! that reads the payload drops the null rows from its own mask, using the
+//! bitmap that came off the same read, and that applies to a term and to
+//! its inverse alike: SQL says a null satisfies no comparison on either
+//! side of a negation. `IS NULL` and `IS NOT NULL` are that bitmap and
+//! nothing else.
+//!
 //! Everything here produces a superset of the matching rows and never a
-//! subset. The exact row filter still runs on what survives, so a term
-//! that cannot be lowered costs pruning and never correctness. Two things
-//! are deliberately not lowered:
+//! subset, and [`StoredFilter::is_exact`] says when the superset is the
+//! set. Exact means every term lowered, every one of them answers on the
+//! payload rather than on zone bounds alone, and no bound was widened to
+//! reach a form the encodings share. A caller holding an exact mask has
+//! nothing left to check, so the row filter over decoded values, and the
+//! columns projected only to feed it, are work the scan has already done.
 //!
-//! * a float range into the encoding. Stat slots order floats correctly
-//!   now, so a float range still rejects zones, but `Predicate::Range` is
-//!   defined over unsigned byte order and ALP answers one in float order,
-//!   so the encodings do not agree on it. Float equality is byte equality
-//!   and every encoding agrees on that, so it is pushed
+//! What is not exact, and why:
+//!
+//! * a float range. Stat slots order floats correctly, so it still rejects
+//!   zones, but `Predicate::Range` is defined over unsigned byte order and
+//!   ALP answers one in float order, so the encodings do not agree on it
+//!   and nothing is pushed. Float equality is byte equality and every
+//!   encoding agrees on that, so it is pushed and is exact away from NaN
+//! * `<` on a variable-length column. A byte string has no greatest
+//!   predecessor, so the bound stays inclusive and the rows equal to the
+//!   constant are left to the row filter. `>` has an immediate successor,
+//!   the constant with a zero byte appended, and is exact
+//! * a term against a NaN, which no comparison is ever true of, though two
+//!   NaNs with the same bits are the same cell
+//!
 //! Nothing else is held back. A variable-length column prunes zones from
-//! the prefix its slots hold, and a term against a value longer than that
-//! prefix is decided by the exact filter on whatever survives.
+//! the prefix its slots hold, which is a bound in both directions, and the
+//! payload evaluation behind it reads whole values.
 //!
-//! `<>` and `NOT IN` are lowered as the equality mask inverted. A null
-//! row's slot is zero-filled and lands on the keep side of that
-//! inversion, which is the safe direction: the exact filter removes it,
-//! and SQL says a null satisfies no comparison anyway.
+//! `<>` and `NOT IN` are lowered as the equality mask inverted, with the
+//! null rows removed from the result rather than left on the keep side.
 
 use zyron_common::curve::{CellFamily, cell_family};
 use zyron_common::{TypeId, ZyronError};
@@ -58,6 +76,7 @@ const MAX_RANGE_WIDTH: usize = 16;
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredFilter {
     root: StoredNode,
+    exact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,8 +86,62 @@ enum StoredNode {
     /// The term is provably empty
     Nothing,
     Leaf(Leaf),
+    /// Rows whose cell is null, or the rows whose cell is not, read from
+    /// the segment's own null bitmap with no payload decoded
+    Null {
+        column_id: u32,
+        keep_null: bool,
+    },
     And(Vec<StoredNode>),
     Or(Vec<StoredNode>),
+}
+
+/// One lowered term and whether its mask is the matching rows themselves.
+///
+/// Exactness is decided here rather than read back off the tree, because a
+/// conjunction drops the arms that lowered to nothing and the tree it
+/// leaves cannot say an arm was ever there
+struct Lowered {
+    node: StoredNode,
+    /// The mask selects the matching rows and not a superset of them
+    exact: bool,
+}
+
+impl Lowered {
+    /// Nothing was lowered, so every row stands and the term is unanswered
+    fn all() -> Self {
+        Self {
+            node: StoredNode::All,
+            exact: false,
+        }
+    }
+
+    /// The term is provably empty, which is as exact as an answer gets
+    fn nothing() -> Self {
+        Self {
+            node: StoredNode::Nothing,
+            exact: true,
+        }
+    }
+
+    fn leaf(leaf: Leaf, exact: bool) -> Self {
+        Self {
+            node: StoredNode::Leaf(leaf),
+            exact,
+        }
+    }
+
+    /// Every value the column can hold satisfies the term, so what is left
+    /// of it is that a null satisfies no comparison
+    fn not_null(column_id: u32) -> Self {
+        Self {
+            node: StoredNode::Null {
+                column_id,
+                keep_null: false,
+            },
+            exact: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,11 +190,27 @@ impl StoredFilter {
     /// Returns None when nothing could be lowered, which saves every file
     /// the zone map read a filter that admits everything would cost
     pub fn lower(predicate: &LakePredicate, schema: &LakeSchema) -> Option<Self> {
-        let root = lower_node(predicate, schema, false);
-        match root {
+        let lowered = lower_node(predicate, schema, false);
+        match lowered.node {
             StoredNode::All => None,
-            root => Some(Self { root }),
+            root => Some(Self {
+                root,
+                exact: lowered.exact,
+            }),
         }
+    }
+
+    /// Whether the mask this produces is the matching rows themselves
+    /// rather than a superset of them.
+    ///
+    /// Exact means every term lowered, every one of them answers on the
+    /// payload rather than on zone bounds alone, and each leaf drops the
+    /// null rows its comparison cannot match. A caller that holds an exact
+    /// mask has nothing left to check, so the row filter over decoded
+    /// values, and the columns that exist only to feed it, are work the
+    /// scan has already done
+    pub fn is_exact(&self) -> bool {
+        self.exact
     }
 
     /// Column ids the filter reads, so a caller can see what it touches
@@ -137,6 +226,7 @@ impl StoredFilter {
 fn collect_columns(node: &StoredNode, ids: &mut Vec<u32>) {
     match node {
         StoredNode::Leaf(leaf) => ids.push(leaf.column_id),
+        StoredNode::Null { column_id, .. } => ids.push(*column_id),
         StoredNode::And(children) | StoredNode::Or(children) => {
             for c in children {
                 collect_columns(c, ids);
@@ -146,7 +236,7 @@ fn collect_columns(node: &StoredNode, ids: &mut Vec<u32>) {
     }
 }
 
-fn lower_node(predicate: &LakePredicate, schema: &LakeSchema, negated: bool) -> StoredNode {
+fn lower_node(predicate: &LakePredicate, schema: &LakeSchema, negated: bool) -> Lowered {
     match predicate {
         LakePredicate::Not(inner) => lower_node(inner, schema, !negated),
         LakePredicate::Compare {
@@ -157,15 +247,29 @@ fn lower_node(predicate: &LakePredicate, schema: &LakeSchema, negated: bool) -> 
             let op = if negated { op.negated() } else { *op };
             lower_compare(*column_id, op, value, schema)
         }
-        // A null-shaped term is answered by the null bitmap the decode
-        // already returns, so lowering it would read the same bits twice
-        LakePredicate::IsNull { .. } | LakePredicate::IsNotNull { .. } => StoredNode::All,
+        // A segment records its rows' nullness in a bitmap ahead of its
+        // payload, so a null-shaped term is answered by reading that
+        // bitmap and nothing else. It is the whole answer rather than a
+        // bound on it, whatever the column holds
+        LakePredicate::IsNull { column_id } | LakePredicate::IsNotNull { column_id } => {
+            let wants_null = matches!(predicate, LakePredicate::IsNull { .. }) != negated;
+            if schema.column_by_id(*column_id).is_none() {
+                return Lowered::all();
+            }
+            Lowered {
+                node: StoredNode::Null {
+                    column_id: *column_id,
+                    keep_null: wants_null,
+                },
+                exact: true,
+            }
+        }
         LakePredicate::In { column_id, values } if !negated => {
             if values.is_empty() {
-                return StoredNode::Nothing;
+                return Lowered::nothing();
             }
             let Some(shape) = column_shape(*column_id, schema) else {
-                return StoredNode::All;
+                return Lowered::all();
             };
             let mut cells = Vec::with_capacity(values.len());
             for value in values {
@@ -173,17 +277,18 @@ fn lower_node(predicate: &LakePredicate, schema: &LakeSchema, negated: bool) -> 
                     // One member with no provable stored form makes the
                     // whole membership unprovable, since the rows it would
                     // have admitted must not be dropped
-                    None => return StoredNode::All,
+                    None => return Lowered::all(),
                     Some(cell) => cells.push(cell.as_slice().to_vec()),
                 }
             }
-            StoredNode::Leaf(shape.equality_leaf(cells))
+            let exact = values.iter().all(|v| equality_is_exact(&shape, v));
+            Lowered::leaf(shape.equality_leaf(cells), exact)
         }
         // NOT IN is the membership mask inverted. A member with no
         // provable stored form is skipped, which only widens the result
         LakePredicate::In { column_id, values } => {
             let Some(shape) = column_shape(*column_id, schema) else {
-                return StoredNode::All;
+                return Lowered::all();
             };
             let cells: Vec<Vec<u8>> = values
                 .iter()
@@ -194,50 +299,83 @@ fn lower_node(predicate: &LakePredicate, schema: &LakeSchema, negated: bool) -> 
                 .collect();
             if cells.is_empty() {
                 // NOT IN () excludes nothing
-                return StoredNode::All;
+                return Lowered::all();
             }
-            StoredNode::Leaf(shape.inverted_leaf(cells))
+            // A dropped member leaves rows the term excludes on the keep
+            // side, so the mask is a bound rather than the answer
+            let exact =
+                cells.len() == values.len() && values.iter().all(|v| equality_is_exact(&shape, v));
+            Lowered::leaf(shape.inverted_leaf(cells), exact)
         }
         LakePredicate::And(children) | LakePredicate::Or(children) => {
             let conjunction = matches!(predicate, LakePredicate::And(_)) != negated;
-            let lowered: Vec<StoredNode> = children
+            let lowered: Vec<Lowered> = children
                 .iter()
                 .map(|c| lower_node(c, schema, negated))
                 .collect();
+            // Every arm has to answer its own term for the whole to answer
+            // the predicate, in both directions: a dropped conjunct leaves
+            // rows it would have removed, and a widened disjunct is already
+            // wider than the union
+            let exact = lowered.iter().all(|l| l.exact);
             if conjunction {
                 // An arm that lowered to nothing is dropped, which keeps
                 // the result a superset
-                if lowered.contains(&StoredNode::Nothing) {
-                    return StoredNode::Nothing;
+                if lowered.iter().any(|l| l.node == StoredNode::Nothing) {
+                    return Lowered::nothing();
                 }
                 let kept: Vec<StoredNode> = lowered
                     .into_iter()
+                    .map(|l| l.node)
                     .filter(|n| *n != StoredNode::All)
                     .collect();
                 match kept.len() {
-                    0 => StoredNode::All,
-                    1 => kept.into_iter().next().unwrap_or(StoredNode::All),
-                    _ => StoredNode::And(kept),
+                    0 => Lowered::all(),
+                    1 => match kept.into_iter().next() {
+                        Some(node) => Lowered { node, exact },
+                        None => Lowered::all(),
+                    },
+                    _ => Lowered {
+                        node: StoredNode::And(kept),
+                        exact,
+                    },
                 }
             } else {
                 // A disjunction is only as good as its weakest arm: one
                 // arm that admits everything makes the whole term admit
                 // everything
-                if lowered.contains(&StoredNode::All) {
-                    return StoredNode::All;
+                if lowered.iter().any(|l| l.node == StoredNode::All) {
+                    return Lowered::all();
                 }
                 let kept: Vec<StoredNode> = lowered
                     .into_iter()
+                    .map(|l| l.node)
                     .filter(|n| *n != StoredNode::Nothing)
                     .collect();
                 match kept.len() {
-                    0 => StoredNode::Nothing,
-                    1 => kept.into_iter().next().unwrap_or(StoredNode::All),
-                    _ => StoredNode::Or(kept),
+                    0 => Lowered::nothing(),
+                    1 => match kept.into_iter().next() {
+                        Some(node) => Lowered { node, exact },
+                        None => Lowered::all(),
+                    },
+                    _ => Lowered {
+                        node: StoredNode::Or(kept),
+                        exact,
+                    },
                 }
             }
         }
     }
+}
+
+/// Whether byte equality against this constant is the comparison SQL
+/// defines.
+///
+/// It is, for every value with a stored form, except a NaN. Two NaNs with
+/// the same bits are the same cell and compare unequal all the same, so a
+/// term against one is answered by the row filter rather than here
+fn equality_is_exact(shape: &ColumnShape, value: &LakeValue) -> bool {
+    !(shape.float && matches!(value, LakeValue::Float(v) if v.is_nan()))
 }
 
 /// What one column's stored bytes look like, or None when they carry no
@@ -315,25 +453,24 @@ fn column_shape(column_id: u32, schema: &LakeSchema) -> Option<ColumnShape> {
     })
 }
 
-fn lower_compare(
-    column_id: u32,
-    op: CompareOp,
-    value: &LakeValue,
-    schema: &LakeSchema,
-) -> StoredNode {
+fn lower_compare(column_id: u32, op: CompareOp, value: &LakeValue, schema: &LakeSchema) -> Lowered {
     let Some(shape) = column_shape(column_id, schema) else {
-        return StoredNode::All;
+        return Lowered::all();
     };
     match op {
         CompareOp::Eq => match equality_cells(&shape, value) {
-            Some(cells) => StoredNode::Leaf(shape.equality_leaf(cells)),
-            None => StoredNode::All,
+            Some(cells) => {
+                Lowered::leaf(shape.equality_leaf(cells), equality_is_exact(&shape, value))
+            }
+            None => Lowered::all(),
         },
         // The mask is the equality mask inverted, which keeps every row
         // the constant does not pin
         CompareOp::NotEq => match equality_cells(&shape, value) {
-            Some(cells) => StoredNode::Leaf(shape.inverted_leaf(cells)),
-            None => StoredNode::All,
+            Some(cells) => {
+                Lowered::leaf(shape.inverted_leaf(cells), equality_is_exact(&shape, value))
+            }
+            None => Lowered::all(),
         },
         _ if shape.varlen => lower_varlen_range(&shape, op, value),
         _ if shape.float => lower_float_range(&shape, op, value),
@@ -382,58 +519,88 @@ fn equality_cells(shape: &ColumnShape, value: &LakeValue) -> Option<Vec<Vec<u8>>
 /// A NaN bound decides nothing, since no comparison against it is ever
 /// true, so it prunes nothing rather than pruning on a value with no
 /// position in the order
-fn lower_float_range(shape: &ColumnShape, op: CompareOp, value: &LakeValue) -> StoredNode {
+fn lower_float_range(shape: &ColumnShape, op: CompareOp, value: &LakeValue) -> Lowered {
     if matches!(value, LakeValue::Float(v) if v.is_nan()) {
-        return StoredNode::All;
+        return Lowered::all();
     }
     let Some(cell) = value_to_cell(shape.physical, shape.value_size, value) else {
-        return StoredNode::All;
+        return Lowered::all();
     };
     let bound = cell.as_slice().to_vec();
     let (low, high) = match op {
         CompareOp::Lt | CompareOp::LtEq => (None, Some(bound)),
         CompareOp::Gt | CompareOp::GtEq => (Some(bound), None),
-        CompareOp::Eq | CompareOp::NotEq => return StoredNode::All,
+        CompareOp::Eq | CompareOp::NotEq => return Lowered::all(),
     };
     if !shape.zone_prunable {
-        return StoredNode::All;
+        return Lowered::all();
     }
-    StoredNode::Leaf(Leaf {
-        column_id: shape.column_id,
-        value_size: shape.value_size,
-        order: shape.order,
-        zone_prunable: true,
-        admits: Admits::Interval(low, high),
-        pushdown: Vec::new(),
-        invert: false,
-    })
+    Lowered::leaf(
+        Leaf {
+            column_id: shape.column_id,
+            value_size: shape.value_size,
+            order: shape.order,
+            zone_prunable: true,
+            admits: Admits::Interval(low, high),
+            pushdown: Vec::new(),
+            invert: false,
+        },
+        false,
+    )
 }
 
 /// A range over a variable-length column, whose stored bytes are ordered
 /// lexicographically by the same rule its values are.
 ///
-/// The bound stays inclusive even for a strict operator, because a byte
-/// string has no predecessor to subtract. That admits the rows equal to
-/// the constant, which the exact filter then removes
-fn lower_varlen_range(shape: &ColumnShape, op: CompareOp, value: &LakeValue) -> StoredNode {
+/// `>` takes the constant's immediate successor, which for a byte string
+/// is the constant with a zero byte appended: nothing sorts between the
+/// two, and every string above the constant is at or above it. That makes
+/// a strict lower bound the answer rather than a bound on it.
+///
+/// `<` has no such form. A byte string has no greatest predecessor,
+/// because appending 0xff bytes to any candidate produces another one
+/// still below the constant, so the bound stays inclusive there and the
+/// rows equal to the constant are left to the exact filter.
+///
+/// Zone bounds keep the inclusive constant either way. Slots hold a
+/// 32-byte prefix, and lengthening the value being compared against a
+/// truncated prefix is not a direction the comparison stays a bound in
+fn lower_varlen_range(shape: &ColumnShape, op: CompareOp, value: &LakeValue) -> Lowered {
     let Some(cell) = value_to_cell(shape.physical, shape.value_size, value) else {
-        return StoredNode::All;
+        return Lowered::all();
     };
     let bound = cell.as_slice().to_vec();
     let (low, high) = match op {
-        CompareOp::Lt | CompareOp::LtEq => (None, Some(bound)),
-        CompareOp::Gt | CompareOp::GtEq => (Some(bound), None),
-        CompareOp::Eq | CompareOp::NotEq => return StoredNode::All,
+        CompareOp::Lt | CompareOp::LtEq => (None, Some(bound.clone())),
+        CompareOp::Gt | CompareOp::GtEq => (Some(bound.clone()), None),
+        CompareOp::Eq | CompareOp::NotEq => return Lowered::all(),
     };
-    StoredNode::Leaf(Leaf {
-        column_id: shape.column_id,
-        value_size: 0,
-        order: shape.order,
-        zone_prunable: shape.zone_prunable,
-        admits: Admits::Interval(low.clone(), high.clone()),
-        pushdown: vec![OwnedPredicate::Range { low, high }],
-        invert: false,
-    })
+    let (pushdown_low, pushdown_high, exact) = match op {
+        CompareOp::Gt => {
+            let mut successor = bound;
+            successor.push(0);
+            (Some(successor), None, true)
+        }
+        CompareOp::GtEq => (Some(bound), None, true),
+        CompareOp::LtEq => (None, Some(bound), true),
+        CompareOp::Lt => (None, Some(bound), false),
+        CompareOp::Eq | CompareOp::NotEq => return Lowered::all(),
+    };
+    Lowered::leaf(
+        Leaf {
+            column_id: shape.column_id,
+            value_size: 0,
+            order: shape.order,
+            zone_prunable: shape.zone_prunable,
+            admits: Admits::Interval(low, high),
+            pushdown: vec![OwnedPredicate::Range {
+                low: pushdown_low,
+                high: pushdown_high,
+            }],
+            invert: false,
+        },
+        exact,
+    )
 }
 
 /// Which side of a column's domain a constant fell on.
@@ -456,10 +623,10 @@ enum Placed<T> {
 /// cell: for a negative value that is its two's complement reading, which
 /// is exactly where the encodings compare it, and it is why a signed
 /// interval spanning zero needs two ranges rather than one
-fn lower_numeric_range(shape: &ColumnShape, op: CompareOp, value: &LakeValue) -> StoredNode {
+fn lower_numeric_range(shape: &ColumnShape, op: CompareOp, value: &LakeValue) -> Lowered {
     let width = shape.value_size;
     if !(1..=MAX_RANGE_WIDTH).contains(&width) {
-        return StoredNode::All;
+        return Lowered::all();
     }
     if shape.order == SlotOrder::TwosComplement {
         lower_signed_range(shape, width, op, value)
@@ -473,7 +640,7 @@ fn lower_unsigned_range(
     width: usize,
     op: CompareOp,
     value: &LakeValue,
-) -> StoredNode {
+) -> Lowered {
     let umax: u128 = if width >= 16 {
         u128::MAX
     } else {
@@ -488,7 +655,7 @@ fn lower_unsigned_range(
         LakeValue::Int128(v) => Placed::In(*v as u128),
         LakeValue::UInt(v) => Placed::In(*v as u128),
         LakeValue::UInt128(v) => Placed::In(*v),
-        _ => return StoredNode::All,
+        _ => return Lowered::all(),
     };
     let placed = match placed {
         Placed::In(k) if k > umax => Placed::Above,
@@ -504,26 +671,29 @@ fn lower_unsigned_range(
         (CompareOp::Gt | CompareOp::GtEq, Placed::Above) => None,
         (CompareOp::Gt, Placed::In(k)) => (k < umax).then(|| (k + 1, umax)),
         (CompareOp::GtEq, Placed::In(k)) => Some((k, umax)),
-        (CompareOp::Eq | CompareOp::NotEq, _) => return StoredNode::All,
+        (CompareOp::Eq | CompareOp::NotEq, _) => return Lowered::all(),
     };
     let Some((lo, hi)) = interval else {
-        return StoredNode::Nothing;
+        return Lowered::nothing();
     };
     if lo == 0 && hi == umax {
-        return StoredNode::All;
+        return Lowered::not_null(shape.column_id);
     }
 
     let low = (lo > 0).then(|| unsigned_le_bytes(lo, width));
     let high = (hi < umax).then(|| unsigned_le_bytes(hi, width));
-    StoredNode::Leaf(Leaf {
-        column_id: shape.column_id,
-        value_size: width,
-        order: shape.order,
-        zone_prunable: shape.zone_prunable,
-        admits: Admits::Interval(low.clone(), high.clone()),
-        pushdown: vec![OwnedPredicate::Range { low, high }],
-        invert: false,
-    })
+    Lowered::leaf(
+        Leaf {
+            column_id: shape.column_id,
+            value_size: width,
+            order: shape.order,
+            zone_prunable: shape.zone_prunable,
+            admits: Admits::Interval(low.clone(), high.clone()),
+            pushdown: vec![OwnedPredicate::Range { low, high }],
+            invert: false,
+        },
+        true,
+    )
 }
 
 fn lower_signed_range(
@@ -531,7 +701,7 @@ fn lower_signed_range(
     width: usize,
     op: CompareOp,
     value: &LakeValue,
-) -> StoredNode {
+) -> Lowered {
     let (smin, smax) = if width >= 16 {
         (i128::MIN, i128::MAX)
     } else {
@@ -548,7 +718,7 @@ fn lower_signed_range(
             Ok(x) => Placed::In(x),
             Err(_) => Placed::Above,
         },
-        _ => return StoredNode::All,
+        _ => return Lowered::all(),
     };
     let placed = match placed {
         Placed::In(k) if k < smin => Placed::Below,
@@ -565,13 +735,13 @@ fn lower_signed_range(
         (CompareOp::Gt | CompareOp::GtEq, Placed::Above) => None,
         (CompareOp::Gt, Placed::In(k)) => (k < smax).then(|| (k + 1, smax)),
         (CompareOp::GtEq, Placed::In(k)) => Some((k, smax)),
-        (CompareOp::Eq | CompareOp::NotEq, _) => return StoredNode::All,
+        (CompareOp::Eq | CompareOp::NotEq, _) => return Lowered::all(),
     };
     let Some((lo, hi)) = interval else {
-        return StoredNode::Nothing;
+        return Lowered::nothing();
     };
     if lo == smin && hi == smax {
-        return StoredNode::All;
+        return Lowered::not_null(shape.column_id);
     }
 
     let bounded_low = (lo > smin).then(|| le_bytes(lo, width));
@@ -595,15 +765,18 @@ fn lower_signed_range(
         });
     }
 
-    StoredNode::Leaf(Leaf {
-        column_id: shape.column_id,
-        value_size: width,
-        order: shape.order,
-        zone_prunable: shape.zone_prunable,
-        admits: Admits::Interval(bounded_low, bounded_high),
-        pushdown,
-        invert: false,
-    })
+    Lowered::leaf(
+        Leaf {
+            column_id: shape.column_id,
+            value_size: width,
+            order: shape.order,
+            zone_prunable: shape.zone_prunable,
+            admits: Admits::Interval(bounded_low, bounded_high),
+            pushdown,
+            invert: false,
+        },
+        true,
+    )
 }
 
 /// The low `width` bytes of an unsigned value
@@ -652,7 +825,22 @@ fn zone_admits(leaf: &Leaf, zone: &ZoneMapEntry) -> bool {
 /// checkable against distributions rather than only against a file
 pub(crate) trait ColumnEvidence {
     fn row_count(&self) -> usize;
-    fn zone_maps(&self, column_id: u32) -> Result<Vec<ZoneMapEntry>, ZyronError>;
+    fn zone_maps(&self, column_id: u32) -> Result<std::sync::Arc<[ZoneMapEntry]>, ZyronError>;
+    /// Which of a column's rows hold a value.
+    ///
+    /// A segment writes its null bitmap immediately ahead of its payload
+    /// and only when it has a null at all, so this is answered from the
+    /// segment header for a column with no nulls and from bytes the
+    /// payload read already pulled for one with them
+    fn validity(&self, column_id: u32) -> Result<Validity, ZyronError>;
+    /// Whether the column's value bloom proves it holds none of `values`.
+    ///
+    /// False when the filter admits one of them and when the segment
+    /// carries no filter at all, which are the same answer here: nothing
+    /// was proven. A segment that carries one is a segment whose values are
+    /// spread widely enough that its bounds narrow nothing, which is
+    /// exactly where an equality otherwise reads the whole payload
+    fn bloom_denies(&self, column_id: u32, values: &[Vec<u8>]) -> Result<bool, ZyronError>;
     /// Rows `start..end` the predicate admits, as a keep mask covering that
     /// range alone, `ceil((end - start) / 8)` bytes.
     ///
@@ -669,6 +857,19 @@ pub(crate) trait ColumnEvidence {
     ) -> Result<Vec<u8>, ZyronError>;
 }
 
+/// Which of a column's rows hold a value.
+///
+/// A column the file predates has no segment at all, so every one of its
+/// rows reads as null and no comparison over it matches
+pub(crate) enum Validity {
+    /// Every row holds a value, so nothing is removed for nullness
+    AllValid,
+    /// Every row is null
+    AllNull,
+    /// Set bit means the row is null, one bit per row of the whole file
+    Nulls(Vec<u8>),
+}
+
 /// Rows the filter admits, as a keep bitmask of ceil(rows/8) bytes.
 ///
 /// None means nothing was decided and every row stands. The mask is a
@@ -681,6 +882,73 @@ pub(crate) fn rows_matching(
     eval_node(&filter.root, evidence)
 }
 
+/// Removes the rows whose cell is null from a mask.
+///
+/// Every comparison SQL defines is false for a null operand, on both
+/// sides of a negation, so this applies to a term and to its inverse
+/// alike. It runs on a mask a payload evaluation already produced, where
+/// the null bitmap came off the same read as the payload
+fn apply_validity(mask: &mut [u8], validity: &Validity, rows: usize) {
+    match validity {
+        Validity::AllValid => {}
+        Validity::AllNull => mask.fill(0),
+        Validity::Nulls(nulls) => {
+            for (m, n) in mask.iter_mut().zip(nulls.iter()) {
+                *m &= !*n;
+            }
+            // A bitmap shorter than the mask leaves rows it says nothing
+            // about, and a row with no recorded nullness is not a row
+            if nulls.len() < mask.len() {
+                for m in mask[nulls.len()..].iter_mut() {
+                    *m = 0;
+                }
+            }
+        }
+    }
+    clear_tail_bits(mask, rows);
+}
+
+/// Clears the bits past the last row, which are not rows
+fn clear_tail_bits(mask: &mut [u8], rows: usize) {
+    if let Some(last) = mask.last_mut() {
+        let used = rows % 8;
+        if used != 0 {
+            *last &= (1u8 << used) - 1;
+        }
+    }
+}
+
+/// The rows a null-shaped term selects, read from the null bitmap alone.
+///
+/// None means every row stands, which is what a column with no null has
+/// to say about IS NOT NULL
+fn eval_null_node(
+    column_id: u32,
+    keep_null: bool,
+    evidence: &dyn ColumnEvidence,
+) -> Result<Option<Vec<u8>>, ZyronError> {
+    let rows = evidence.row_count();
+    let validity = evidence.validity(column_id)?;
+    Ok(match (validity, keep_null) {
+        (Validity::AllValid, true) | (Validity::AllNull, false) => {
+            Some(vec![0u8; rows.div_ceil(8)])
+        }
+        (Validity::AllValid, false) | (Validity::AllNull, true) => None,
+        (Validity::Nulls(nulls), true) => {
+            let mut mask = vec![0u8; rows.div_ceil(8)];
+            let shared = nulls.len().min(mask.len());
+            mask[..shared].copy_from_slice(&nulls[..shared]);
+            clear_tail_bits(&mut mask, rows);
+            Some(mask)
+        }
+        (Validity::Nulls(nulls), false) => {
+            let mut mask = vec![0xffu8; rows.div_ceil(8)];
+            apply_validity(&mut mask, &Validity::Nulls(nulls), rows);
+            Some(mask)
+        }
+    })
+}
+
 fn eval_node(
     node: &StoredNode,
     evidence: &dyn ColumnEvidence,
@@ -690,6 +958,10 @@ fn eval_node(
         StoredNode::All => Ok(None),
         StoredNode::Nothing => Ok(Some(vec![0u8; rows.div_ceil(8)])),
         StoredNode::Leaf(leaf) => eval_leaf(leaf, evidence),
+        StoredNode::Null {
+            column_id,
+            keep_null,
+        } => eval_null_node(*column_id, *keep_null, evidence),
         StoredNode::And(children) => {
             let mut mask: Option<Vec<u8>> = None;
             for child in children {
@@ -800,14 +1072,12 @@ fn eval_inverted_leaf(
     for byte in mask.iter_mut() {
         *byte = !*byte;
     }
-    // Bits past the last row are not rows, so they are cleared rather
-    // than left as whatever the inversion made them
-    if let Some(last) = mask.last_mut() {
-        let used = rows % 8;
-        if used != 0 {
-            *last &= (1u8 << used) - 1;
-        }
-    }
+    // A null cell is zero filled, so it fails the equality and lands on
+    // the keep side of the inversion. `x <> c` is false for a null x the
+    // same way `x = c` is, so the same removal applies here. Bits past the
+    // last row are cleared with it rather than left as the inversion made
+    // them
+    apply_validity(&mut mask, &evidence.validity(leaf.column_id)?, rows);
     Ok(Some(mask))
 }
 
@@ -836,6 +1106,16 @@ fn eval_leaf(leaf: &Leaf, evidence: &dyn ColumnEvidence) -> Result<Option<Vec<u8
     }
     if leaf.pushdown.is_empty() {
         return Ok(None);
+    }
+    // Zone bounds only say a constant falls inside a range they cover, and
+    // a column whose values are spread across its range has a zone covering
+    // every constant. The value bloom answers whether the segment holds the
+    // constant at all, and it is built for exactly those columns, so an
+    // equality that no row satisfies stops before the payload is read
+    if let Admits::Values(values) = &leaf.admits
+        && evidence.bloom_denies(leaf.column_id, values)?
+    {
+        return Ok(Some(vec![0u8; rows.div_ceil(8)]));
     }
     if spans.is_empty() {
         spans.push((0, rows));
@@ -871,6 +1151,10 @@ fn eval_leaf(leaf: &Leaf, evidence: &dyn ColumnEvidence) -> Result<Option<Vec<u8
             }
         }
     }
+    // A null cell is zero filled and compares as the value zero would, so
+    // it can pass a range or an equality the row does not satisfy. The
+    // bitmap that says so came off the same read as the payload
+    apply_validity(&mut acc, &evidence.validity(leaf.column_id)?, rows);
     Ok(Some(acc))
 }
 
@@ -1003,11 +1287,18 @@ mod tests {
     #[test]
     fn test_a_constant_outside_the_width_resolves_rather_than_wrapping() {
         let s = schema(&[TypeId::Int16]);
-        // Every i16 is below this, so there is nothing left to lower
-        assert!(
-            StoredFilter::lower(&cmp(0, CompareOp::Lt, LakeValue::Int(1 << 40)), &s).is_none(),
-            "a bound past the domain admits the whole column"
+        // Every i16 is below this, so what is left of the term is that a
+        // null satisfies no comparison
+        let filter = StoredFilter::lower(&cmp(0, CompareOp::Lt, LakeValue::Int(1 << 40)), &s)
+            .expect("a bound past the domain still excludes the nulls");
+        assert_eq!(
+            filter.root,
+            StoredNode::Null {
+                column_id: 0,
+                keep_null: false
+            }
         );
+        assert!(filter.is_exact());
         // And nothing is below the other end
         let filter = StoredFilter::lower(&cmp(0, CompareOp::Lt, LakeValue::Int(-(1 << 40))), &s)
             .expect("lowers");
@@ -1022,8 +1313,6 @@ mod tests {
         assert!(
             StoredFilter::lower(&cmp(0, CompareOp::Lt, LakeValue::Float(f64::NAN)), &s).is_none()
         );
-        // A null-shaped term is answered by the bitmap the decode returns
-        assert!(StoredFilter::lower(&LakePredicate::IsNull { column_id: 1 }, &s).is_none());
         // NOT IN () excludes nothing
         assert!(
             StoredFilter::lower(
@@ -1097,22 +1386,144 @@ mod tests {
 
     #[test]
     fn test_a_disjunction_is_only_as_good_as_its_weakest_arm() {
-        let s = schema(&[TypeId::Int64, TypeId::Int64]);
-        // A null-shaped arm lowers to nothing, and one arm that admits
-        // everything makes the union admit everything
+        let s = schema(&[TypeId::Int64, TypeId::Float64]);
+        // A NaN bound has no position in the order, so that arm admits
+        // everything and so does the union
         let mixed = LakePredicate::Or(vec![
             cmp(0, CompareOp::Lt, LakeValue::Int(10)),
-            LakePredicate::IsNull { column_id: 1 },
+            cmp(1, CompareOp::Lt, LakeValue::Float(f64::NAN)),
         ]);
         assert!(StoredFilter::lower(&mixed, &s).is_none());
 
-        // A conjunction keeps whatever its arms did lower
+        // A conjunction keeps whatever its arms did lower, and reports
+        // itself short of exact because the dropped arm still selects
         let conj = LakePredicate::And(vec![
             cmp(0, CompareOp::Lt, LakeValue::Int(10)),
-            LakePredicate::IsNull { column_id: 1 },
+            cmp(1, CompareOp::Lt, LakeValue::Float(f64::NAN)),
         ]);
         let filter = StoredFilter::lower(&conj, &s).expect("lowers the arm it can");
         assert_eq!(filter.columns(), vec![0]);
+        assert!(!filter.is_exact());
+    }
+
+    /// A null-shaped term reads the segment's own null bitmap, which is the
+    /// whole answer rather than a bound on it
+    #[test]
+    fn test_a_null_shaped_term_lowers_onto_the_null_bitmap() {
+        let s = schema(&[TypeId::Int64]);
+        let is_null = StoredFilter::lower(&LakePredicate::IsNull { column_id: 0 }, &s)
+            .expect("IS NULL lowers");
+        assert_eq!(
+            is_null.root,
+            StoredNode::Null {
+                column_id: 0,
+                keep_null: true
+            }
+        );
+        assert!(is_null.is_exact());
+
+        let not_null = StoredFilter::lower(&LakePredicate::IsNotNull { column_id: 0 }, &s)
+            .expect("IS NOT NULL lowers");
+        assert_eq!(
+            not_null.root,
+            StoredNode::Null {
+                column_id: 0,
+                keep_null: false
+            }
+        );
+
+        // NOT wrapping either one swaps which side it keeps
+        let negated = StoredFilter::lower(
+            &LakePredicate::Not(Box::new(LakePredicate::IsNull { column_id: 0 })),
+            &s,
+        )
+        .expect("NOT IS NULL lowers");
+        assert_eq!(negated.root, not_null.root);
+
+        // A column the schema does not name has no bitmap to read
+        assert!(StoredFilter::lower(&LakePredicate::IsNull { column_id: 7 }, &s).is_none());
+    }
+
+    /// Exactness is a property of every term at once. One arm that only
+    /// bounds its rows makes the whole mask a bound
+    #[test]
+    fn test_exactness_holds_only_when_every_term_answers_its_own_rows() {
+        let s = schema(&[TypeId::Int64, TypeId::Float64, TypeId::Varchar]);
+        assert!(
+            StoredFilter::lower(&cmp(0, CompareOp::Gt, LakeValue::Int(10)), &s)
+                .expect("lowers")
+                .is_exact(),
+            "an integer range answers on the payload"
+        );
+        // A float range prunes zones and pushes nothing, so it bounds
+        assert!(
+            !StoredFilter::lower(&cmp(1, CompareOp::Gt, LakeValue::Float(1.5)), &s)
+                .expect("lowers")
+                .is_exact()
+        );
+        // A strict lower bound on a byte string has an immediate successor
+        assert!(
+            StoredFilter::lower(
+                &cmp(2, CompareOp::Gt, LakeValue::Str("abc".to_string())),
+                &s
+            )
+            .expect("lowers")
+            .is_exact()
+        );
+        // A strict upper bound has no greatest predecessor, so the rows
+        // equal to the constant stay in
+        assert!(
+            !StoredFilter::lower(
+                &cmp(2, CompareOp::Lt, LakeValue::Str("abc".to_string())),
+                &s
+            )
+            .expect("lowers")
+            .is_exact()
+        );
+        // One inexact arm carries through a conjunction
+        let conj = LakePredicate::And(vec![
+            cmp(0, CompareOp::Gt, LakeValue::Int(10)),
+            cmp(1, CompareOp::Gt, LakeValue::Float(1.5)),
+        ]);
+        assert!(!StoredFilter::lower(&conj, &s).expect("lowers").is_exact());
+    }
+
+    /// A strict lower bound on a byte string admits what is above the
+    /// constant and not the constant itself
+    #[test]
+    fn test_a_strict_string_lower_bound_excludes_the_constant() {
+        let s = schema(&[TypeId::Varchar]);
+        let filter = StoredFilter::lower(
+            &cmp(0, CompareOp::Gt, LakeValue::Str("abc".to_string())),
+            &s,
+        )
+        .expect("lowers");
+        let leaf = leaf_of(&filter);
+        let OwnedPredicate::Range { low, high } = &leaf.pushdown[0] else {
+            panic!("a range lowers to a range");
+        };
+        assert_eq!(low.as_deref(), Some(b"abc\0".as_slice()));
+        assert_eq!(high.as_deref(), None);
+        for (value, expected) in [
+            (b"abc".as_slice(), false),
+            (b"abc\0".as_slice(), true),
+            (b"abcd".as_slice(), true),
+            (b"abd".as_slice(), true),
+            (b"abb".as_slice(), false),
+        ] {
+            assert_eq!(
+                zyron_storage::encoding::range_admits(value, 0, low.as_deref(), high.as_deref()),
+                expected,
+                "{:?} lowered wrong",
+                value
+            );
+        }
+        // Zone bounds keep the inclusive constant, because a slot holds a
+        // truncated prefix and a longer value is not a bound against one
+        let Admits::Interval(zone_low, _) = &leaf.admits else {
+            panic!("a range admits an interval");
+        };
+        assert_eq!(zone_low.as_deref(), Some(b"abc".as_slice()));
     }
 
     #[test]
@@ -1229,14 +1640,24 @@ mod tests {
                 .is_some_and(|f| f.root == StoredNode::Nothing),
             "nothing is below the smallest value"
         );
+        let all_of_them = StoredNode::Null {
+            column_id: 0,
+            keep_null: false,
+        };
         assert!(
             StoredFilter::lower(&cmp(0, CompareOp::LtEq, LakeValue::Int128(i128::MAX)), &s)
-                .is_none(),
-            "everything is at or below the largest value"
+                .is_some_and(|f| f.root == all_of_them),
+            "everything is at or below the largest value, except a null"
         );
         assert!(
-            StoredFilter::lower(&cmp(1, CompareOp::GtEq, LakeValue::Int(-1)), &s).is_none(),
-            "every unsigned value is at or above a negative bound"
+            StoredFilter::lower(&cmp(1, CompareOp::GtEq, LakeValue::Int(-1)), &s).is_some_and(
+                |f| f.root
+                    == StoredNode::Null {
+                        column_id: 1,
+                        keep_null: false
+                    }
+            ),
+            "every unsigned value is at or above a negative bound, except a null"
         );
         assert!(
             StoredFilter::lower(&cmp(1, CompareOp::Lt, LakeValue::UInt(0)), &s)

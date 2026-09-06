@@ -67,6 +67,76 @@ pub enum Phase {
     // here with idle worker CPU means the load is client/harness-bound, not
     // server-bound.
     WireReadWait,
+
+    // Index checkpoint write, then load. The write walks the leaf chain, then
+    // copies every entry into the columnar body and puts each finished run on
+    // disk in one fused phase, leaving only the header, the key prefix and the
+    // checksummed footer for the trailer write. The load reads the file back
+    // and rebuilds the leaves and the internal levels.
+    CheckpointWriteTotal,
+    CheckpointLoadTotal,
+    CheckpointScan,
+    CheckpointAlloc,
+    CheckpointGather,
+    CheckpointWrite,
+    CheckpointRead,
+    CheckpointRebuildLeaves,
+    CheckpointBuildInternal,
+
+    // Lake scan, per data file the manifest did not prune. The scan opens the
+    // file, resolves which rows survive deletes and the pushed-down filter,
+    // decodes the projected columns over the surviving span, and turns the
+    // decoded columns into batches the exact predicate then filters.
+    LakeLoadFile,
+    LakeOpenFile,
+    LakeOpenMiss,
+    LakeDeleteSurvivors,
+    LakeStoredFilter,
+    LakeDecodeColumns,
+    LakeReadPayload,
+    LakeDecodeRange,
+    LakeBuildBatch,
+    LakeQueueBatch,
+
+    // Read-path decomposition above the storage formats, which is what says
+    // whether a query is bound by producing rows or by folding them. Each
+    // scan phase spans one operator's next(), so the two formats' totals are
+    // the like-for-like comparison the per-file phases above cannot make,
+    // and the aggregate phase is the work both of them feed.
+    ExecLakeScanNext,
+    ExecSeqScanNext,
+    ExecHybridScanNext,
+    ExecParallelScanNext,
+    ExecAggregateFold,
+
+    // Lake write path, per statement: the batches turned into column cells,
+    // the unique probe, the data file (row order, each column's encode, the
+    // segment write, the finalize with its fsync), any index deltas, the
+    // version file (encode, then write and fsync), and what follows the
+    // durable commit (publish, statistics refresh). The exec phases span
+    // whole calls from the executor, the lake phases are the pieces inside
+    ExecLakeMaterialize,
+    ExecLakeUniqueProbe,
+    ExecLakeAppend,
+    LakeWriteFile,
+    LakeStoredOrder,
+    LakeEncodeSegment,
+    LakeWriteSegment,
+    LakeFinalizeFile,
+    LakeIndexDeltas,
+    LakeVersionEncode,
+    LakeVersionWrite,
+    LakePublish,
+    LakeStatsPublish,
+
+    // Window operator, per window expression: the partition ids, the order
+    // sort with its grouping and key gather, the function itself, and the
+    // scatter back to input order
+    ExecWindowPartition,
+    ExecWindowOrder,
+    ExecWindowArgs,
+    ExecWindowFold,
+    ExecWindowScatter,
 }
 
 #[cfg(feature = "profile")]
@@ -80,7 +150,7 @@ mod imp {
     impl Phase {
         /// Every phase, in discriminant order. COUNT and all indexing derive
         /// from this, so adding a phase to the enum and here cannot drift apart.
-        const ALL: [Phase; 27] = [
+        const ALL: [Phase; 69] = [
             Phase::WireRecvParse,
             Phase::WirePlan,
             Phase::WireExecSetup,
@@ -108,6 +178,48 @@ mod imp {
             Phase::ExecHeapInsert,
             Phase::ExecIndexInsert,
             Phase::WireReadWait,
+            Phase::CheckpointWriteTotal,
+            Phase::CheckpointLoadTotal,
+            Phase::CheckpointScan,
+            Phase::CheckpointAlloc,
+            Phase::CheckpointGather,
+            Phase::CheckpointWrite,
+            Phase::CheckpointRead,
+            Phase::CheckpointRebuildLeaves,
+            Phase::CheckpointBuildInternal,
+            Phase::LakeLoadFile,
+            Phase::LakeOpenFile,
+            Phase::LakeOpenMiss,
+            Phase::LakeDeleteSurvivors,
+            Phase::LakeStoredFilter,
+            Phase::LakeDecodeColumns,
+            Phase::LakeReadPayload,
+            Phase::LakeDecodeRange,
+            Phase::LakeBuildBatch,
+            Phase::LakeQueueBatch,
+            Phase::ExecLakeScanNext,
+            Phase::ExecSeqScanNext,
+            Phase::ExecHybridScanNext,
+            Phase::ExecParallelScanNext,
+            Phase::ExecAggregateFold,
+            Phase::ExecLakeMaterialize,
+            Phase::ExecLakeUniqueProbe,
+            Phase::ExecLakeAppend,
+            Phase::LakeWriteFile,
+            Phase::LakeStoredOrder,
+            Phase::LakeEncodeSegment,
+            Phase::LakeWriteSegment,
+            Phase::LakeFinalizeFile,
+            Phase::LakeIndexDeltas,
+            Phase::LakeVersionEncode,
+            Phase::LakeVersionWrite,
+            Phase::LakePublish,
+            Phase::LakeStatsPublish,
+            Phase::ExecWindowPartition,
+            Phase::ExecWindowOrder,
+            Phase::ExecWindowArgs,
+            Phase::ExecWindowFold,
+            Phase::ExecWindowScatter,
         ];
 
         const COUNT: usize = Phase::ALL.len();
@@ -141,6 +253,48 @@ mod imp {
                 Phase::ExecHeapInsert => "exec.heap_insert",
                 Phase::ExecIndexInsert => "exec.index_insert",
                 Phase::WireReadWait => "wire.read_wait",
+                Phase::CheckpointWriteTotal => "ckpt.WRITE TOTAL",
+                Phase::CheckpointLoadTotal => "ckpt.LOAD TOTAL",
+                Phase::CheckpointScan => "ckpt.scan_leaf_chain",
+                Phase::CheckpointAlloc => "ckpt.alloc_body",
+                Phase::CheckpointGather => "ckpt.gather_and_write_body",
+                Phase::CheckpointWrite => "ckpt.write_trailer",
+                Phase::CheckpointRead => "ckpt.read_file",
+                Phase::CheckpointRebuildLeaves => "ckpt.rebuild_leaves",
+                Phase::CheckpointBuildInternal => "ckpt.build_internal",
+                Phase::LakeLoadFile => "lake.LOAD FILE TOTAL",
+                Phase::LakeOpenFile => "lake.open_file",
+                Phase::LakeOpenMiss => "lake.open_file MISS",
+                Phase::LakeDeleteSurvivors => "lake.delete_survivors",
+                Phase::LakeStoredFilter => "lake.stored_filter",
+                Phase::LakeDecodeColumns => "lake.decode_columns",
+                Phase::LakeReadPayload => "lake.  read_payload",
+                Phase::LakeDecodeRange => "lake.  decode_range",
+                Phase::LakeBuildBatch => "lake.build_batch",
+                Phase::LakeQueueBatch => "lake.queue_batch",
+                Phase::ExecLakeScanNext => "exec.lake_scan next",
+                Phase::ExecSeqScanNext => "exec.seq_scan next",
+                Phase::ExecHybridScanNext => "exec.hybrid_scan next",
+                Phase::ExecParallelScanNext => "exec.parallel_scan next",
+                Phase::ExecAggregateFold => "exec.aggregate_fold",
+                Phase::ExecLakeMaterialize => "exec.lake_materialize",
+                Phase::ExecLakeUniqueProbe => "exec.lake_unique_probe",
+                Phase::ExecLakeAppend => "exec.lake_append",
+                Phase::LakeWriteFile => "lake.write_file",
+                Phase::LakeStoredOrder => "lake.  stored_order",
+                Phase::LakeEncodeSegment => "lake.  encode_segment",
+                Phase::LakeWriteSegment => "lake.  write_segment",
+                Phase::LakeFinalizeFile => "lake.  finalize_file",
+                Phase::LakeIndexDeltas => "lake.index_deltas",
+                Phase::LakeVersionEncode => "lake.version_encode",
+                Phase::LakeVersionWrite => "lake.version_write",
+                Phase::LakePublish => "lake.publish",
+                Phase::LakeStatsPublish => "lake.stats_publish",
+                Phase::ExecWindowPartition => "exec.window_partition",
+                Phase::ExecWindowOrder => "exec.window_order",
+                Phase::ExecWindowArgs => "exec.window_args",
+                Phase::ExecWindowFold => "exec.window_fold",
+                Phase::ExecWindowScatter => "exec.window_scatter",
             }
         }
     }
@@ -337,6 +491,14 @@ mod imp {
 
     /// Zero-sized no-op span. Constructing and dropping it emits no code.
     pub struct Span;
+
+    /// The profiled span ends a phase when it drops, so a caller closes a
+    /// phase early with `drop(span)`. Dropping has to mean something in
+    /// this build too, or that call reads as a mistake
+    impl Drop for Span {
+        #[inline(always)]
+        fn drop(&mut self) {}
+    }
 
     #[inline(always)]
     pub fn scope(_phase: Phase) -> Span {

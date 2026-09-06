@@ -396,7 +396,7 @@ impl BloomFilter {
         })
     }
 
-    /// Returns the total serialized byte count: 20-byte header + bit array.
+    /// Total serialized byte count, the 25-byte header and the bit array
     pub fn on_disk_size(&self) -> usize {
         HEADER_SIZE + self.bits.len()
     }

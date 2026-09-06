@@ -1,5 +1,3 @@
-#![feature(portable_simd)]
-
 //! Storage engine for Zyron.
 //!
 //! This crate provides:

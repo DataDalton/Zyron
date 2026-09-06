@@ -11,12 +11,14 @@ pub mod parser;
 pub mod rewriter;
 pub mod simd_scan;
 pub mod token;
+pub mod unparse;
 
 pub use ast::*;
 pub use expr_sql::expr_to_sql;
 pub use lexer::Lexer;
 pub use parser::Parser;
 pub use token::{Keyword, Span, SpannedToken, Token};
+pub use unparse::{UnparseError, statement_to_sql};
 
 /// Parses a SQL string into a list of semicolon-separated statements.
 pub fn parse(sql: &str) -> zyron_common::Result<Vec<Statement>> {

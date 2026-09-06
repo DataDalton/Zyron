@@ -53,10 +53,17 @@
 //! - A load bounds loosely, because the lake is expected to lose. It writes
 //!   a data file and publishes a log version per statement.
 //!
-//! Range scan wide carries the thinnest margin of the set, and that is
-//! inherent rather than a defect. Reading most of a table is the shape
-//! where a row store is most competitive. If it trips, read it as a real
-//! narrowing and find out why, rather than widening the bound.
+//! The aggregate no file can answer carries the thinnest margin of the
+//! set, and that is inherent rather than a defect. It decodes one whole
+//! column on both formats and folds it, which is the shape where the two
+//! do the same work. If it trips, read it as a real narrowing and find out
+//! why, rather than widening the bound.
+//!
+//! A read-only statement ends the way a connection ends one, with no
+//! commit record and no flush wait. A durable commit on a statement that
+//! wrote nothing adds the device's flush latency to both formats alike,
+//! and a constant added to both sides of a ratio drags every ratio toward
+//! one, which had the point lookup reading four times slower than it is.
 //!
 //! A bound on a timing has to come from optimized runs. One invented from
 //! an unoptimized one is not a target, it is a number somebody made up that
@@ -377,6 +384,22 @@ async fn compare(
         }
     }
 
+    // Each format's phase breakdown for this shape, taken after the timed
+    // repetitions so a profiled pass never sits inside a measured window.
+    // Compiled in by --features profile, gated at runtime by ZYRON_PROFILE
+    if zyron_common::profile::is_enabled() {
+        zyron_common::profile::reset();
+        for _ in 0..reps() {
+            let _ = query_values(server, &heap_sql).await;
+        }
+        zyron_common::profile::dump(&format!("{metric}, heap"));
+        zyron_common::profile::reset();
+        for _ in 0..reps() {
+            let _ = query_values(server, &lake_sql).await;
+        }
+        zyron_common::profile::dump(&format!("{metric}, lake"));
+    }
+
     let heap_avg = record_metric_for(Format::Heap, test, metric, "us", heap_runs);
     let lake_avg = record_metric_for(Format::Lake, test, metric, "us", lake_runs);
     ratio_of(test, metric, heap_avg, lake_avg, bound);
@@ -579,8 +602,19 @@ async fn load_both(
 ) {
     HEAP.create(server, session, base).await;
     LAKE.create(server, session, base).await;
+    // Each format's load gets its own phase breakdown when the load is the
+    // measurement, so a statement's cost can be read as its pieces.
+    // Compiled in by --features profile, gated at runtime by ZYRON_PROFILE
+    zyron_common::profile::reset();
     let heap_us = HEAP.load(server, base, data, rows_per_statement).await;
+    if metric.is_some() {
+        zyron_common::profile::dump(&format!("{test}, heap"));
+    }
+    zyron_common::profile::reset();
     let lake_us = LAKE.load(server, base, data, rows_per_statement).await;
+    if metric.is_some() {
+        zyron_common::profile::dump(&format!("{test}, lake"));
+    }
     if let Some(metric) = metric {
         let heap_avg = record_metric_for(Format::Heap, test, metric, "us", vec![heap_us]);
         let lake_avg = record_metric_for(Format::Lake, test, metric, "us", vec![lake_us]);
@@ -738,9 +772,77 @@ async fn test_range_scan_across_formats() {
         |t| format!("SELECT COUNT(*) FROM {} WHERE amount >= 0", t),
     )
     .await;
+
+    // Per-phase wall-clock breakdown of the lake scan, as the aggregate test
+    // takes. Compiled in by --features profile, gated at runtime by
+    // ZYRON_PROFILE.
+    zyron_common::profile::dump("lake range scan");
 }
 
-/// One column out of four, which is columnar's best case
+/// Grouped aggregation, which is the shape an analytical query is usually
+/// written in and the one nothing here measured.
+///
+/// Two cardinalities, because they are bound by different things. Sixty
+/// four groups fit in cache and the cost is reading and folding the
+/// columns, while a group per hundred rows makes the hash table itself the
+/// work. A format that wins the first and loses the second is bound by its
+/// aggregate rather than by its scan
+#[tokio::test]
+async fn test_group_by_across_formats() {
+    let test = "group_by";
+    let _section = section("Group By");
+    let (server, _tmp, _data) = setup(test, "gb", None, None).await;
+
+    // One table per cardinality. The two shapes are bound by different
+    // things, so blending their phase counters into one report would hide
+    // which of them each number belongs to
+    zyron_common::profile::reset();
+    compare(
+        &server,
+        test,
+        "Group by, few groups",
+        "gb",
+        Some(RatioBound::AtMost(1.00)),
+        |t| {
+            format!(
+                "SELECT region, SUM(amount) FROM {} GROUP BY region ORDER BY region",
+                t
+            )
+        },
+    )
+    .await;
+    zyron_common::profile::dump("group by, few groups");
+
+    zyron_common::profile::reset();
+    compare(
+        &server,
+        test,
+        "Group by, many groups",
+        "gb",
+        Some(RatioBound::AtMost(1.00)),
+        |t| {
+            format!(
+                "SELECT id, SUM(amount) FROM {} GROUP BY id ORDER BY id LIMIT 100",
+                t
+            )
+        },
+    )
+    .await;
+    zyron_common::profile::dump("group by, many groups");
+}
+
+/// One column out of four, which is columnar's best case, measured twice
+/// because the two halves are different claims.
+///
+/// A sum is something a file can record about itself, so the lake settles
+/// the first from the per file statistics its manifest already holds and
+/// reads nothing at all. That is the format claim: an unfiltered aggregate
+/// costs the file count rather than the row count.
+///
+/// An average is not, so the second is decoded on both formats with no
+/// predicate and no pruning on either side. That is the throughput claim,
+/// and it is the one the first half stops measuring the moment the
+/// statistics can answer
 #[tokio::test]
 async fn test_aggregate_across_formats() {
     let test = "aggregate";
@@ -755,6 +857,22 @@ async fn test_aggregate_across_formats() {
         |t| format!("SELECT SUM(amount) FROM {}", t),
     )
     .await;
+
+    compare(
+        &server,
+        test,
+        "Aggregate no file can answer",
+        "ag",
+        Some(RatioBound::AtMost(1.00)),
+        |t| format!("SELECT AVG(amount) FROM {}", t),
+    )
+    .await;
+
+    // Per-phase wall-clock breakdown of the lake scan, which is what says
+    // whether the ratio above is bound by opening files, decoding columns or
+    // building batches. Compiled in by --features profile, gated at runtime by
+    // ZYRON_PROFILE.
+    zyron_common::profile::dump("lake aggregate over one column");
 }
 
 /// The same point lookup with and without a secondary index on the key,

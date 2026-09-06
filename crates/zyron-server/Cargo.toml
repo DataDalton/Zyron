@@ -30,6 +30,8 @@ zyron-types = { path = "../zyron-types" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-planner = { path = "../zyron-planner" }
 tokio.workspace = true
+# The driver asks every member of the group what it runs at the same time
+futures.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
@@ -43,6 +45,14 @@ crossbeam.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 base64.workspace = true
+# The format migration budget is measured against the node's memory and
+# the free space on the data volume
+sysinfo.workspace = true
+# Release manifests and binaries are signed by the vendor with Ed25519 and
+# checked against the key built into this binary. The signing half is what
+# zyron-ctl release sign uses, and keygen draws a new seed from the OS
+ed25519-dalek.workspace = true
+rand.workspace = true
 # The release feed is fetched over HTTPS. rustls only, no system TLS stack
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
@@ -60,7 +70,6 @@ profile = [
 
 [dev-dependencies]
 tempfile = "3"
-ed25519-dalek.workspace = true
 sha2.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }
 sysinfo.workspace = true

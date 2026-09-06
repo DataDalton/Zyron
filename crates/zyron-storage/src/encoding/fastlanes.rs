@@ -6,6 +6,7 @@
 //!
 //! Based on FastLanes (VLDB 2023), tuned for page-aligned columnar storage.
 
+use super::unpack::Packed;
 use crate::encoding::{Encoding, EncodingType, Predicate};
 use zyron_common::{Result, ZyronError};
 
@@ -219,854 +220,19 @@ impl Encoding for FastLanesEncoding {
         if value_size == 16 {
             return decode_range_wide(encoded, row_count, start, end);
         }
-        // The scale layout wraps another core blob, so it unwraps its own
-        // header here and recurses on the inner blob
-        if value_size == 0 || encoded.len() < 12 {
-            let decoded = self.decode(encoded, row_count, value_size)?;
-            return crate::encoding::slice_decoded(&decoded, row_count, value_size, start, end);
-        }
-        let flags = encoded[9];
-        let base_value = u64::from_le_bytes([
-            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
-            encoded[7],
-        ]);
-        let taken = end - start;
-
-        if flags & FLAG_SCALE != 0 {
-            if encoded.len() < 20 {
-                return Err(ZyronError::DecodingFailed(
-                    "FastLanes scale blob too short".to_string(),
-                ));
-            }
-            let scale = u64::from_le_bytes([
-                encoded[12],
-                encoded[13],
-                encoded[14],
-                encoded[15],
-                encoded[16],
-                encoded[17],
-                encoded[18],
-                encoded[19],
-            ]);
-            let quotients = self.decode_range(&encoded[20..], row_count, value_size, start, end)?;
-            // SAFETY: the loop below writes every one of the taken slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
-            for i in 0..taken {
-                let q = read_u64_le(&quotients, i * value_size, value_size);
-                write_le(
-                    &mut out,
-                    i,
-                    value_size,
-                    base_value.wrapping_add(q.wrapping_mul(scale)),
-                );
-            }
-            return Ok(out);
-        }
-
-        if flags & FLAG_CONST_STEP != 0 {
-            if encoded.len() < 20 {
-                return Err(ZyronError::DecodingFailed(
-                    "FastLanes constant-step blob too short".to_string(),
-                ));
-            }
-            let step = u64::from_le_bytes([
-                encoded[12],
-                encoded[13],
-                encoded[14],
-                encoded[15],
-                encoded[16],
-                encoded[17],
-                encoded[18],
-                encoded[19],
-            ]);
-            // SAFETY: the loop below writes every one of the taken slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
-            for i in 0..taken {
-                let row = start + i;
-                let v = base_value.wrapping_add((row as u64).wrapping_mul(step));
-                write_le(&mut out, i, value_size, v);
-            }
-            return Ok(out);
-        }
-
-        if flags & FLAG_MINIBLOCK != 0 {
-            return decode_range_miniblock(encoded, row_count, value_size, start, end, base_value);
-        }
-
-        let bit_width = encoded[8];
-        if bit_width == 0 || bit_width > 64 {
-            return Err(ZyronError::DecodingFailed(format!(
-                "invalid FastLanes bit width: {bit_width}"
-            )));
-        }
-        let mask: u64 = if bit_width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << bit_width) - 1
-        };
-
-        if flags & FLAG_PFOR != 0 {
-            let exc_count = u16::from_le_bytes([encoded[10], encoded[11]]) as usize;
-            let table_off = 12usize;
-            let table_bytes = exc_count * 12;
-            if encoded.len() < table_off + table_bytes {
-                return Err(ZyronError::DecodingFailed(
-                    "FastLanes PFOR blob malformed".to_string(),
-                ));
-            }
-            let packed = &encoded[table_off + table_bytes..];
-            // SAFETY: the loop below writes every one of the taken slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
-            let packed_ptr = packed.as_ptr();
-            let packed_len = packed.len();
-            for i in 0..taken {
-                let bit_offset = (start + i) as u64 * bit_width as u64;
-                let residual = unpack_inline(packed_ptr, packed_len, bit_offset, bit_width, mask);
-                write_le(&mut out, i, value_size, residual.wrapping_add(base_value));
-            }
-            // Exceptions carry their own row index, so the ones outside the
-            // range are stepped over rather than decoded
-            for e in 0..exc_count {
-                let o = table_off + e * 12;
-                let pos = u32::from_le_bytes([
-                    encoded[o],
-                    encoded[o + 1],
-                    encoded[o + 2],
-                    encoded[o + 3],
-                ]) as usize;
-                if pos < start || pos >= end {
-                    continue;
-                }
-                let resid = u64::from_le_bytes([
-                    encoded[o + 4],
-                    encoded[o + 5],
-                    encoded[o + 6],
-                    encoded[o + 7],
-                    encoded[o + 8],
-                    encoded[o + 9],
-                    encoded[o + 10],
-                    encoded[o + 11],
-                ]);
-                write_le(
-                    &mut out,
-                    pos - start,
-                    value_size,
-                    resid.wrapping_add(base_value),
-                );
-            }
-            return Ok(out);
-        }
-
-        let packed_off = narrow_packed_offset(encoded, flags, row_count);
-        if encoded.len() < packed_off {
-            return Err(ZyronError::DecodingFailed(
-                "FastLanes restart table truncated".to_string(),
-            ));
-        }
-        let restart = if flags & FLAG_RESTART != 0 {
-            Some((&encoded[12..packed_off], encoded[10] as u32))
-        } else {
-            None
-        };
-        let packed = &encoded[packed_off..];
-
-        if flags & FLAG_DELTA_OF_DELTA != 0 {
-            return Ok(decode_range_dod(
-                packed, bit_width, mask, base_value, value_size, row_count, restart, start, end,
-            ));
-        }
-        if flags & FLAG_DELTA != 0 {
-            return Ok(decode_range_delta(
-                packed, bit_width, mask, base_value, value_size, restart, start, end,
-            ));
-        }
-
-        // SAFETY: the loop below writes every one of the taken slots
-        // at value_size bytes each, which is the whole buffer, before
-        // anything reads it
-        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
-        let packed_ptr = packed.as_ptr();
-        let packed_len = packed.len();
-        for i in 0..taken {
-            let bit_offset = (start + i) as u64 * bit_width as u64;
-            let residual = unpack_inline(packed_ptr, packed_len, bit_offset, bit_width, mask);
-            write_le(&mut out, i, value_size, residual.wrapping_add(base_value));
-        }
-        Ok(out)
+        decode_narrow(encoded, row_count, value_size, start, end)
     }
 
+    /// A whole column is the range of every row, so the two share one
+    /// decode and the kernels behind it
     fn decode(&self, encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-
         if value_size == 16 {
             return decode_wide(encoded, row_count);
         }
-
-        if encoded.len() < 12 {
-            return Err(ZyronError::DecodingFailed(
-                "FastLanes header too short".to_string(),
-            ));
-        }
-
-        // Effective-resolution scale wrapper: [base:u64][_][FLAG_SCALE][_][scale:u64][inner].
-        if encoded[9] & FLAG_SCALE != 0 {
-            if encoded.len() < 20 {
-                return Err(ZyronError::DecodingFailed(
-                    "FastLanes scale blob too short".to_string(),
-                ));
-            }
-            let base = u64::from_le_bytes([
-                encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
-                encoded[7],
-            ]);
-            let scale = u64::from_le_bytes([
-                encoded[12],
-                encoded[13],
-                encoded[14],
-                encoded[15],
-                encoded[16],
-                encoded[17],
-                encoded[18],
-                encoded[19],
-            ]);
-            let q_raw = self.decode(&encoded[20..], row_count, value_size)?;
-            // SAFETY: the loop below writes every one of the row_count slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
-            for i in 0..row_count {
-                let q = read_u64_le(&q_raw, i * value_size, value_size);
-                let v = base.wrapping_add(q.wrapping_mul(scale));
-                write_le(&mut out, i, value_size, v);
-            }
-            return Ok(out);
-        }
-
-        let base_value = u64::from_le_bytes([
-            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
-            encoded[7],
-        ]);
-        let bit_width = encoded[8];
-        let flags = encoded[9];
-        let use_delta = flags & FLAG_DELTA != 0;
-        let use_dod = flags & FLAG_DELTA_OF_DELTA != 0;
-
-        // Constant-step closed form: [first_value:u64][.. step:u64]. No packed
-        // bit array, so this is handled before the bit-width check.
-        if flags & FLAG_CONST_STEP != 0 {
-            if encoded.len() < 20 {
-                return Err(ZyronError::DecodingFailed(
-                    "FastLanes constant-step blob too short".to_string(),
-                ));
-            }
-            let first = base_value;
-            let step = u64::from_le_bytes([
-                encoded[12],
-                encoded[13],
-                encoded[14],
-                encoded[15],
-                encoded[16],
-                encoded[17],
-                encoded[18],
-                encoded[19],
-            ]);
-            // The values are the linear sequence first + i*step. Storing through a
-            // typed pointer (instead of the byte-wise write_le) lets the loop
-            // vectorize into SIMD stores; value_size 4 and 8 are the hot column
-            // widths. Output is fully written, so it starts uninitialized to skip
-            // a redundant memset. write_unaligned is used because a Vec<u8> buffer
-            // is only byte-aligned; on x86_64 it compiles to the same store.
-            let out_len = row_count * value_size;
-            #[allow(clippy::uninit_vec)]
-            let mut out: Vec<u8> = {
-                let mut v = Vec::with_capacity(out_len);
-                unsafe { v.set_len(out_len) };
-                v
-            };
-            match value_size {
-                4 => {
-                    let p = out.as_mut_ptr() as *mut u32;
-                    for i in 0..row_count {
-                        let v = first.wrapping_add((i as u64).wrapping_mul(step)) as u32;
-                        unsafe { p.add(i).write_unaligned(v) };
-                    }
-                }
-                8 => {
-                    let p = out.as_mut_ptr() as *mut u64;
-                    for i in 0..row_count {
-                        let v = first.wrapping_add((i as u64).wrapping_mul(step));
-                        unsafe { p.add(i).write_unaligned(v) };
-                    }
-                }
-                _ => {
-                    for i in 0..row_count {
-                        write_le(
-                            &mut out,
-                            i,
-                            value_size,
-                            first.wrapping_add((i as u64).wrapping_mul(step)),
-                        );
-                    }
-                }
-            }
-            return Ok(out);
-        }
-
-        // Patched FoR: [hdr][exception table][packed low-width residuals].
-        if flags & FLAG_PFOR != 0 {
-            let exc_count = u16::from_le_bytes([encoded[10], encoded[11]]) as usize;
-            let table_off = 12usize;
-            let table_bytes = exc_count * 12;
-            if bit_width == 0 || bit_width > 64 || encoded.len() < table_off + table_bytes {
-                return Err(ZyronError::DecodingFailed(
-                    "FastLanes PFOR blob malformed".to_string(),
-                ));
-            }
-            let packed = &encoded[table_off + table_bytes..];
-            let mask: u64 = if bit_width >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << bit_width) - 1
-            };
-            let mut r = vec![0u64; row_count];
-            unpack_batch(packed, bit_width, mask, row_count, &mut r);
-            // SAFETY: the loop below writes every one of the row_count slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
-            write_residuals_add_base(&mut out, value_size, &r, base_value);
-            for e in 0..exc_count {
-                let o = table_off + e * 12;
-                let pos = u32::from_le_bytes([
-                    encoded[o],
-                    encoded[o + 1],
-                    encoded[o + 2],
-                    encoded[o + 3],
-                ]) as usize;
-                let resid = u64::from_le_bytes([
-                    encoded[o + 4],
-                    encoded[o + 5],
-                    encoded[o + 6],
-                    encoded[o + 7],
-                    encoded[o + 8],
-                    encoded[o + 9],
-                    encoded[o + 10],
-                    encoded[o + 11],
-                ]);
-                if pos < row_count {
-                    write_le(&mut out, pos, value_size, resid.wrapping_add(base_value));
-                }
-            }
-            return Ok(out);
-        }
-
-        // Per-mini-block bit width: [hdr][ (width:1)(byte-aligned packed) ]*.
-        if flags & FLAG_MINIBLOCK != 0 {
-            let nblocks = row_count.div_ceil(MINIBLOCK_SIZE);
-            let mut off = 12usize;
-            // SAFETY: the loop below writes every one of the row_count slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
-            for b in 0..nblocks {
-                if off >= encoded.len() {
-                    return Err(ZyronError::DecodingFailed(
-                        "FastLanes mini-block blob truncated".to_string(),
-                    ));
-                }
-                let bw = encoded[off];
-                off += 1;
-                if bw == 0 || bw > 64 {
-                    return Err(ZyronError::DecodingFailed(format!(
-                        "invalid FastLanes mini-block width: {bw}"
-                    )));
-                }
-                let start = b * MINIBLOCK_SIZE;
-                let end = (start + MINIBLOCK_SIZE).min(row_count);
-                let blen = end - start;
-                let block_bytes = (blen as u64 * bw as u64).div_ceil(8) as usize;
-                if off + block_bytes > encoded.len() {
-                    return Err(ZyronError::DecodingFailed(
-                        "FastLanes mini-block blob truncated".to_string(),
-                    ));
-                }
-                let packed = &encoded[off..off + block_bytes];
-                let mut block = vec![0u64; blen];
-                unpack_block_into(packed, bw, blen, &mut block);
-                write_residuals_add_base(
-                    &mut out[start * value_size..],
-                    value_size,
-                    &block,
-                    base_value,
-                );
-                off += block_bytes;
-            }
-            return Ok(out);
-        }
-
-        if bit_width == 0 || bit_width > 64 {
-            return Err(ZyronError::DecodingFailed(format!(
-                "invalid FastLanes bit width: {}",
-                bit_width
-            )));
-        }
-
-        let packed_off = narrow_packed_offset(encoded, flags, row_count);
-        if encoded.len() < packed_off {
-            return Err(ZyronError::DecodingFailed(
-                "FastLanes restart table truncated".to_string(),
-            ));
-        }
-        let packed = &encoded[packed_off..];
-
-        if use_dod {
-            // Reconstruct FoR residuals from the packed [r0, zz(d1), zz(dd2)..]
-            // stream via a double prefix sum, then re-add the FoR base.
-            let mask: u64 = if bit_width >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << bit_width) - 1
-            };
-            let mut r = vec![0u64; row_count];
-            unpack_batch(packed, bit_width, mask, row_count, &mut r);
-            // SAFETY: the loop below writes every one of the row_count slots
-            // at value_size bytes each, which is the whole buffer, before
-            // anything reads it
-            let mut out: Vec<u8> = unsafe { super::scratch::take_uninit(row_count * value_size) };
-            let mut residual: u64 = r[0];
-            write_le(&mut out, 0, value_size, residual.wrapping_add(base_value));
-            if row_count > 1 {
-                let mut delta = unzigzag_i64(r[1]) as u64;
-                residual = residual.wrapping_add(delta);
-                write_le(&mut out, 1, value_size, residual.wrapping_add(base_value));
-                for i in 2..row_count {
-                    let dd = unzigzag_i64(r[i]);
-                    delta = delta.wrapping_add(dd as u64);
-                    residual = residual.wrapping_add(delta);
-                    write_le(&mut out, i, value_size, residual.wrapping_add(base_value));
-                }
-            }
-            return Ok(out);
-        }
-        let out_len = row_count * value_size;
-        // SAFETY: the decode loop below writes every one of `out_len` bytes
-        // before any read. Zeroing first would memset the whole buffer just
-        // to overwrite it, halving decode throughput on the hot scan path.
-        #[allow(clippy::uninit_vec)]
-        let mut out: Vec<u8> = {
-            let mut v = Vec::with_capacity(out_len);
-            unsafe { v.set_len(out_len) };
-            v
-        };
-        let out_ptr = out.as_mut_ptr();
-        let mask: u64 = if bit_width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << bit_width) - 1
-        };
-        let bw = bit_width as u64;
-        let packed_ptr = packed.as_ptr();
-        let packed_len = packed.len();
-
-        if use_delta {
-            // Fused single-pass: unpack delta, prefix-sum, and write output
-            // in one loop. Eliminates the intermediate residuals Vec (800KB for
-            // 100K u64 values) and reduces 3 passes over data to 1.
-            let mut accumulator: u64 = 0;
-            match value_size {
-                4 if bit_width == 1 => {
-                    // bit_width=1 specialization: extract 8 deltas per packed byte.
-                    // Common for auto-increment PKs and sorted columns with unit step.
-                    // Eliminates per-element unpack_inline overhead (u64 read + shift + mask).
-                    let out32 = out_ptr as *mut u32;
-                    let base32 = base_value as u32;
-                    let fullBytes = row_count / 8;
-
-                    for b in 0..fullBytes {
-                        let byte = unsafe { *packed_ptr.add(b) };
-                        let idx = b * 8;
-
-                        // Unroll 8 bit extractions per byte. Each delta is 0 or 1.
-                        // Vec output is pointer-aligned and u32 writes at idx*4 are
-                        // always 4-byte aligned, so use aligned write.
-                        accumulator = accumulator.wrapping_add((byte & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 1) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 1)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 2) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 2)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 3) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 3)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 4) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 4)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 5) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 5)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 6) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 6)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 7) & 1) as u64);
-                        unsafe {
-                            out32
-                                .add(idx + 7)
-                                .write((accumulator as u32).wrapping_add(base32));
-                        }
-                    }
-                    for i in (fullBytes * 8)..row_count {
-                        let delta =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        accumulator = accumulator.wrapping_add(delta);
-                        unsafe {
-                            out32
-                                .add(i)
-                                .write(accumulator.wrapping_add(base_value) as u32);
-                        }
-                    }
-                }
-                4 => {
-                    // Batch-unpack 4 deltas at a time for instruction-level parallelism
-                    // on superscalar CPUs. The prefix-sum is sequential but the 4 unpacks
-                    // can overlap in the CPU pipeline.
-                    let chunks = row_count / 4;
-                    let out32 = out_ptr as *mut u32;
-
-                    for chunk in 0..chunks {
-                        let i0 = chunk * 4;
-                        let d0 =
-                            unpack_inline(packed_ptr, packed_len, i0 as u64 * bw, bit_width, mask);
-                        let d1 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 1) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let d2 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 2) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let d3 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 3) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-
-                        accumulator = accumulator.wrapping_add(d0);
-                        let v0 = accumulator.wrapping_add(base_value) as u32;
-                        accumulator = accumulator.wrapping_add(d1);
-                        let v1 = accumulator.wrapping_add(base_value) as u32;
-                        accumulator = accumulator.wrapping_add(d2);
-                        let v2 = accumulator.wrapping_add(base_value) as u32;
-                        accumulator = accumulator.wrapping_add(d3);
-                        let v3 = accumulator.wrapping_add(base_value) as u32;
-
-                        unsafe {
-                            out32.add(i0).write(v0);
-                            out32.add(i0 + 1).write(v1);
-                            out32.add(i0 + 2).write(v2);
-                            out32.add(i0 + 3).write(v3);
-                        }
-                    }
-                    for i in (chunks * 4)..row_count {
-                        let delta =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        accumulator = accumulator.wrapping_add(delta);
-                        unsafe {
-                            out32
-                                .add(i)
-                                .write(accumulator.wrapping_add(base_value) as u32);
-                        }
-                    }
-                }
-                8 if bit_width == 1 => {
-                    // bit_width=1 specialization for u64: extract 8 deltas per byte.
-                    let out64 = out_ptr as *mut u64;
-                    let fullBytes = row_count / 8;
-
-                    for b in 0..fullBytes {
-                        let byte = unsafe { *packed_ptr.add(b) };
-                        let idx = b * 8;
-
-                        accumulator = accumulator.wrapping_add((byte & 1) as u64);
-                        unsafe {
-                            out64.add(idx).write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 1) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 1)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 2) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 2)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 3) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 3)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 4) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 4)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 5) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 5)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 6) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 6)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(((byte >> 7) & 1) as u64);
-                        unsafe {
-                            out64
-                                .add(idx + 7)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                    }
-                    for i in (fullBytes * 8)..row_count {
-                        let delta =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        accumulator = accumulator.wrapping_add(delta);
-                        unsafe {
-                            out64.add(i).write(accumulator.wrapping_add(base_value));
-                        }
-                    }
-                }
-                8 => {
-                    let out64 = out_ptr as *mut u64;
-                    let chunks = row_count / 4;
-                    for chunk in 0..chunks {
-                        let i0 = chunk * 4;
-                        let d0 =
-                            unpack_inline(packed_ptr, packed_len, i0 as u64 * bw, bit_width, mask);
-                        let d1 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 1) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let d2 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 2) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let d3 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 3) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-
-                        accumulator = accumulator.wrapping_add(d0);
-                        unsafe {
-                            out64.add(i0).write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(d1);
-                        unsafe {
-                            out64
-                                .add(i0 + 1)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(d2);
-                        unsafe {
-                            out64
-                                .add(i0 + 2)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                        accumulator = accumulator.wrapping_add(d3);
-                        unsafe {
-                            out64
-                                .add(i0 + 3)
-                                .write(accumulator.wrapping_add(base_value));
-                        }
-                    }
-                    for i in (chunks * 4)..row_count {
-                        let delta =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        accumulator = accumulator.wrapping_add(delta);
-                        unsafe {
-                            out64.add(i).write(accumulator.wrapping_add(base_value));
-                        }
-                    }
-                }
-                _ => {
-                    for i in 0..row_count {
-                        let delta =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        accumulator = accumulator.wrapping_add(delta);
-                        let val = accumulator.wrapping_add(base_value).to_le_bytes();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                val.as_ptr(),
-                                out_ptr.add(i * value_size),
-                                value_size,
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            // No delta: unpack each value and write directly to output.
-            // Process 4 values at a time for instruction-level parallelism.
-            match value_size {
-                4 => {
-                    let out32 = out_ptr as *mut u32;
-                    let chunks = row_count / 4;
-                    for chunk in 0..chunks {
-                        let i0 = chunk * 4;
-                        let r0 =
-                            unpack_inline(packed_ptr, packed_len, i0 as u64 * bw, bit_width, mask);
-                        let r1 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 1) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let r2 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 2) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let r3 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 3) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        unsafe {
-                            out32.add(i0).write(r0.wrapping_add(base_value) as u32);
-                            out32.add(i0 + 1).write(r1.wrapping_add(base_value) as u32);
-                            out32.add(i0 + 2).write(r2.wrapping_add(base_value) as u32);
-                            out32.add(i0 + 3).write(r3.wrapping_add(base_value) as u32);
-                        }
-                    }
-                    for i in (chunks * 4)..row_count {
-                        let r =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        unsafe {
-                            out32.add(i).write(r.wrapping_add(base_value) as u32);
-                        }
-                    }
-                }
-                8 => {
-                    let out64 = out_ptr as *mut u64;
-                    let chunks = row_count / 4;
-                    for chunk in 0..chunks {
-                        let i0 = chunk * 4;
-                        let r0 =
-                            unpack_inline(packed_ptr, packed_len, i0 as u64 * bw, bit_width, mask);
-                        let r1 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 1) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let r2 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 2) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        let r3 = unpack_inline(
-                            packed_ptr,
-                            packed_len,
-                            (i0 + 3) as u64 * bw,
-                            bit_width,
-                            mask,
-                        );
-                        unsafe {
-                            out64.add(i0).write(r0.wrapping_add(base_value));
-                            out64.add(i0 + 1).write(r1.wrapping_add(base_value));
-                            out64.add(i0 + 2).write(r2.wrapping_add(base_value));
-                            out64.add(i0 + 3).write(r3.wrapping_add(base_value));
-                        }
-                    }
-                    for i in (chunks * 4)..row_count {
-                        let r =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        unsafe {
-                            out64.add(i).write(r.wrapping_add(base_value));
-                        }
-                    }
-                }
-                _ => {
-                    for i in 0..row_count {
-                        let r =
-                            unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        let val = r.wrapping_add(base_value).to_le_bytes();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                val.as_ptr(),
-                                out_ptr.add(i * value_size),
-                                value_size,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(out)
+        decode_narrow(encoded, row_count, value_size, 0, row_count)
     }
 
     fn eval_predicate(
@@ -1186,11 +352,6 @@ impl Encoding for FastLanesEncoding {
             ));
         }
         let packed = &encoded[packed_off..];
-        let mask: u64 = if bit_width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << bit_width) - 1
-        };
 
         // For non-delta FoR encoding, evaluate predicates directly on packed
         // residuals by transforming bounds into the FoR domain.
@@ -1241,7 +402,7 @@ impl Encoding for FastLanesEncoding {
                     // The residual is read straight out of the packed array,
                     // eight rows at a time, so a row that survives the zone
                     // maps is answered without materializing the column
-                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    let residuals = Packed::new(packed, bit_width);
                     return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
                         let residual = residuals.at(i);
                         residual >= loResidual && residual <= hiResidual
@@ -1253,7 +414,7 @@ impl Encoding for FastLanesEncoding {
                         return Ok(vec![0u8; row_count.div_ceil(8)]);
                     }
                     let targetResidual = targetVal - base_value;
-                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    let residuals = Packed::new(packed, bit_width);
                     return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
                         residuals.at(i) == targetResidual
                     }));
@@ -1273,7 +434,7 @@ impl Encoding for FastLanesEncoding {
                     if targetResiduals.is_empty() {
                         return Ok(vec![0u8; row_count.div_ceil(8)]);
                     }
-                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    let residuals = Packed::new(packed, bit_width);
                     return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
                         targetResiduals.contains(&residuals.at(i))
                     }));
@@ -1293,8 +454,9 @@ impl Encoding for FastLanesEncoding {
         if let Predicate::Range { low, high } = predicate
             && row_count >= 2
         {
-            let r0 = unpack_fast(packed, 0, bit_width, mask);
-            let step = unpack_fast(packed, bit_width as u64, bit_width, mask);
+            let stream = Packed::new(packed, bit_width);
+            let r0 = stream.at(0);
+            let step = stream.at(1);
 
             // Spot-check that all deltas from index 1 onward are identical
             let spots = [
@@ -1307,7 +469,7 @@ impl Encoding for FastLanesEncoding {
                 if idx < 1 || idx >= row_count {
                     return true;
                 }
-                unpack_fast(packed, idx as u64 * bit_width as u64, bit_width, mask) == step
+                stream.at(idx) == step
             });
 
             if isConstantStep && step > 0 {
@@ -1364,13 +526,19 @@ impl Encoding for FastLanesEncoding {
             }
         }
 
-        // Full unpack + prefix sum path for non-constant-delta data
+        // The running sum of the deltas is the FoR residual of every row,
+        // unpacked and summed in one pass
         let mut residuals = vec![0u64; row_count];
-        unpack_batch(packed, bit_width, mask, row_count, &mut residuals);
-
-        // Prefix sum to reverse delta encoding
-        for i in 1..row_count {
-            residuals[i] = residuals[i].wrapping_add(residuals[i - 1]);
+        // SAFETY: the buffer holds row_count eight byte slots
+        unsafe {
+            Packed::new(packed, bit_width).prefix_into(
+                0,
+                row_count,
+                0,
+                0,
+                residuals.as_mut_ptr() as *mut u8,
+                8,
+            );
         }
 
         // For Range predicates on sorted delta data, use binary search to find
@@ -1498,53 +666,241 @@ fn seed_narrow_restart<const W: usize>(
     Some((words, k << shift))
 }
 
+/// Rows `start..end` of a narrow layout as `value_size` byte little endian
+/// integers.
+///
+/// Every layout answers a range without materializing the rows outside it.
+/// A constant step is a closed form, row i is `first + i * step` from the
+/// header alone. Plain frame of reference, patched frame of reference and
+/// the mini-block form pack residuals to a known width, so row i is at a
+/// computable bit offset and only the exception entries landing inside the
+/// range are applied. Delta and delta-of-delta are cumulative, row i being
+/// defined against row i-1. They carry a table of periodic restart values,
+/// so a range seeds its running state at the boundary at or before `start`
+/// and sums at most one restart spacing instead of the whole prefix.
+///
+/// The scale layout wraps another core blob, so it unwraps its own header
+/// here and recurses on the inner blob
+fn decode_narrow(
+    encoded: &[u8],
+    row_count: usize,
+    value_size: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
+    if !(1..=8).contains(&value_size) {
+        return Err(ZyronError::DecodingFailed(format!(
+            "FastLanes decodes 1 to 8 or 16 byte values, not {value_size}"
+        )));
+    }
+    if encoded.len() < 12 {
+        return Err(ZyronError::DecodingFailed(
+            "FastLanes header too short".to_string(),
+        ));
+    }
+    let base_value = read_u64_le(encoded, 0, 8);
+    let bit_width = encoded[8];
+    let flags = encoded[9];
+    let taken = end - start;
+
+    if flags & FLAG_SCALE != 0 {
+        if encoded.len() < 20 {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes scale blob too short".to_string(),
+            ));
+        }
+        let scale = read_u64_le(encoded, 12, 8);
+        let quotients = decode_narrow(&encoded[20..], row_count, value_size, start, end)?;
+        // SAFETY: the loop below writes every one of the taken slots at
+        // value_size bytes each, which is the whole buffer, before anything
+        // reads it
+        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+        for i in 0..taken {
+            let q = read_u64_le(&quotients, i * value_size, value_size);
+            write_le(
+                &mut out,
+                i,
+                value_size,
+                base_value.wrapping_add(q.wrapping_mul(scale)),
+            );
+        }
+        return Ok(out);
+    }
+
+    if flags & FLAG_CONST_STEP != 0 {
+        if encoded.len() < 20 {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes constant-step blob too short".to_string(),
+            ));
+        }
+        let step = read_u64_le(encoded, 12, 8);
+        // SAFETY: store_linear writes every one of the taken slots at
+        // value_size bytes each, which is the whole buffer, before anything
+        // reads it
+        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+        store_linear(&mut out, value_size, start, taken, base_value, step);
+        return Ok(out);
+    }
+
+    if flags & FLAG_MINIBLOCK != 0 {
+        return decode_range_miniblock(encoded, row_count, value_size, start, end, base_value);
+    }
+
+    if bit_width == 0 || bit_width > 64 {
+        return Err(ZyronError::DecodingFailed(format!(
+            "invalid FastLanes bit width: {bit_width}"
+        )));
+    }
+
+    if flags & FLAG_PFOR != 0 {
+        let exc_count = u16::from_le_bytes([encoded[10], encoded[11]]) as usize;
+        let table_off = 12usize;
+        let table_bytes = exc_count * 12;
+        if encoded.len() < table_off + table_bytes {
+            return Err(ZyronError::DecodingFailed(
+                "FastLanes PFOR blob malformed".to_string(),
+            ));
+        }
+        let stream = Packed::new(&encoded[table_off + table_bytes..], bit_width);
+        // SAFETY: the kernel writes every one of the taken slots at
+        // value_size bytes each, which is the whole buffer, before anything
+        // reads it
+        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+        // SAFETY: out holds taken slots of value_size bytes
+        unsafe { stream.add_base_into(start, taken, base_value, out.as_mut_ptr(), value_size) };
+        // Exceptions carry their own row index, so the ones outside the
+        // range are stepped over rather than decoded
+        for e in 0..exc_count {
+            let o = table_off + e * 12;
+            let pos =
+                u32::from_le_bytes([encoded[o], encoded[o + 1], encoded[o + 2], encoded[o + 3]])
+                    as usize;
+            if pos < start || pos >= end {
+                continue;
+            }
+            let resid = read_u64_le(encoded, o + 4, 8);
+            write_le(
+                &mut out,
+                pos - start,
+                value_size,
+                resid.wrapping_add(base_value),
+            );
+        }
+        return Ok(out);
+    }
+
+    let packed_off = narrow_packed_offset(encoded, flags, row_count);
+    if encoded.len() < packed_off {
+        return Err(ZyronError::DecodingFailed(
+            "FastLanes restart table truncated".to_string(),
+        ));
+    }
+    let restart = if flags & FLAG_RESTART != 0 {
+        Some((&encoded[12..packed_off], encoded[10] as u32))
+    } else {
+        None
+    };
+    let stream = Packed::new(&encoded[packed_off..], bit_width);
+
+    if flags & FLAG_DELTA_OF_DELTA != 0 {
+        return Ok(decode_range_dod(
+            stream, base_value, value_size, row_count, restart, start, end,
+        ));
+    }
+    if flags & FLAG_DELTA != 0 {
+        return Ok(decode_range_delta(
+            stream, base_value, value_size, restart, start, end,
+        ));
+    }
+
+    // SAFETY: the kernel writes every one of the taken slots at value_size
+    // bytes each, which is the whole buffer, before anything reads it
+    let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+    // SAFETY: out holds taken slots of value_size bytes
+    unsafe { stream.add_base_into(start, taken, base_value, out.as_mut_ptr(), value_size) };
+    Ok(out)
+}
+
+/// Stores `first + row * step` for rows `start..start + count` as
+/// `value_size` byte little endian integers. The two hot widths go through
+/// typed pointers so the loop becomes vector stores
+fn store_linear(
+    out: &mut [u8],
+    value_size: usize,
+    start: usize,
+    count: usize,
+    first: u64,
+    step: u64,
+) {
+    assert!(
+        out.len() >= count * value_size,
+        "linear fill wider than its buffer"
+    );
+    // The value at the first row of the range, so the loop below counts
+    // from zero
+    let first = first.wrapping_add((start as u64).wrapping_mul(step));
+    match value_size {
+        8 => {
+            let p = out.as_mut_ptr() as *mut u64;
+            for i in 0..count {
+                let v = first.wrapping_add((i as u64).wrapping_mul(step));
+                // SAFETY: slot i is inside out, which holds count slots
+                unsafe { p.add(i).write_unaligned(v) };
+            }
+        }
+        4 => {
+            let p = out.as_mut_ptr() as *mut u32;
+            for i in 0..count {
+                let v = first.wrapping_add((i as u64).wrapping_mul(step)) as u32;
+                // SAFETY: slot i is inside out, which holds count slots
+                unsafe { p.add(i).write_unaligned(v) };
+            }
+        }
+        _ => {
+            for i in 0..count {
+                write_le(
+                    out,
+                    i,
+                    value_size,
+                    first.wrapping_add((i as u64).wrapping_mul(step)),
+                );
+            }
+        }
+    }
+}
+
 /// Range decode for the narrow delta layout. Seeds the running sum at the
-/// restart boundary at or before `start`, replays the rows between that
-/// boundary and `start` without writing, then emits the requested rows.
-#[allow(clippy::too_many_arguments)]
+/// restart boundary at or before `start`, sums the residuals between that
+/// boundary and `start` without writing them, then emits the requested rows
 fn decode_range_delta(
-    packed: &[u8],
-    bit_width: u8,
-    mask: u64,
+    stream: Packed<'_>,
     base_value: u64,
     value_size: usize,
     restart: Option<(&[u8], u32)>,
     start: usize,
     end: usize,
 ) -> Vec<u8> {
-    let bw = bit_width as u64;
-    let packed_ptr = packed.as_ptr();
-    let packed_len = packed.len();
-    let (mut accumulator, mut row) = match seed_narrow_restart::<1>(restart, start) {
+    let (mut accumulator, row) = match seed_narrow_restart::<1>(restart, start) {
         Some((words, at)) => (words[0], at),
         None => (0u64, 0usize),
     };
-    while row < start {
-        accumulator = accumulator.wrapping_add(unpack_inline(
-            packed_ptr,
-            packed_len,
-            row as u64 * bw,
-            bit_width,
-            mask,
-        ));
-        row += 1;
+    if row < start {
+        accumulator = accumulator.wrapping_add(stream.sum(row, start - row));
     }
-    let mut out = vec![0u8; (end - start) * value_size];
-    while row < end {
-        accumulator = accumulator.wrapping_add(unpack_inline(
-            packed_ptr,
-            packed_len,
-            row as u64 * bw,
-            bit_width,
-            mask,
-        ));
-        write_le(
-            &mut out,
-            row - start,
+    let taken = end - start;
+    // SAFETY: the kernel writes every one of the taken slots at value_size
+    // bytes each, which is the whole buffer, before anything reads it
+    let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+    // SAFETY: out holds taken slots of value_size bytes
+    unsafe {
+        stream.prefix_into(
+            start,
+            taken,
+            accumulator,
+            base_value,
+            out.as_mut_ptr(),
             value_size,
-            accumulator.wrapping_add(base_value),
         );
-        row += 1;
     }
     out
 }
@@ -1552,12 +908,11 @@ fn decode_range_delta(
 /// Range decode for the narrow delta-of-delta layout. A restart entry carries
 /// both running values the double prefix sum needs, the residual and the first
 /// difference. Without one the two head rows are replayed verbatim, which is
-/// what the layout stores them as.
-#[allow(clippy::too_many_arguments)]
+/// what the layout stores them as. The second differences from the seed row
+/// to the end of the range are unpacked in one pass, and the double prefix
+/// sum is then a walk over them
 fn decode_range_dod(
-    packed: &[u8],
-    bit_width: u8,
-    mask: u64,
+    stream: Packed<'_>,
     base_value: u64,
     value_size: usize,
     row_count: usize,
@@ -1565,13 +920,14 @@ fn decode_range_dod(
     start: usize,
     end: usize,
 ) -> Vec<u8> {
-    let bw = bit_width as u64;
-    let packed_ptr = packed.as_ptr();
-    let packed_len = packed.len();
-    let mut out = vec![0u8; (end - start) * value_size];
+    let taken = end - start;
+    // SAFETY: every row of start..end is written below at value_size bytes,
+    // the head rows by hand and the rest by the walk, before anything reads
+    // the buffer
+    let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
     let mut residual: u64;
     let mut delta: u64;
-    let mut row: usize;
+    let row: usize;
 
     match seed_narrow_restart::<2>(restart, start) {
         Some((words, at)) => {
@@ -1580,14 +936,13 @@ fn decode_range_dod(
             row = at;
         }
         None => {
-            residual = unpack_inline(packed_ptr, packed_len, 0, bit_width, mask);
+            residual = stream.at(0);
             delta = 0;
             if start == 0 {
                 write_le(&mut out, 0, value_size, residual.wrapping_add(base_value));
             }
             if row_count > 1 {
-                delta =
-                    unzigzag_i64(unpack_inline(packed_ptr, packed_len, bw, bit_width, mask)) as u64;
+                delta = unzigzag_i64(stream.at(1)) as u64;
                 residual = residual.wrapping_add(delta);
                 if start <= 1 && end > 1 {
                     write_le(
@@ -1602,42 +957,30 @@ fn decode_range_dod(
         }
     }
 
-    while row < start {
-        let dd = unzigzag_i64(unpack_inline(
-            packed_ptr,
-            packed_len,
-            row as u64 * bw,
-            bit_width,
-            mask,
-        ));
-        delta = delta.wrapping_add(dd as u64);
-        residual = residual.wrapping_add(delta);
-        row += 1;
-    }
-    while row < end {
-        let dd = unzigzag_i64(unpack_inline(
-            packed_ptr,
-            packed_len,
-            row as u64 * bw,
-            bit_width,
-            mask,
-        ));
-        delta = delta.wrapping_add(dd as u64);
-        residual = residual.wrapping_add(delta);
-        write_le(
-            &mut out,
-            row - start,
-            value_size,
-            residual.wrapping_add(base_value),
-        );
-        row += 1;
+    if row < end {
+        let second = stream.unpack_vec(row, end - row);
+        let replay = start.saturating_sub(row);
+        for &z in &second[..replay] {
+            delta = delta.wrapping_add(unzigzag_i64(z) as u64);
+            residual = residual.wrapping_add(delta);
+        }
+        for (i, &z) in second[replay..].iter().enumerate() {
+            delta = delta.wrapping_add(unzigzag_i64(z) as u64);
+            residual = residual.wrapping_add(delta);
+            write_le(
+                &mut out,
+                (row + replay + i) - start,
+                value_size,
+                residual.wrapping_add(base_value),
+            );
+        }
     }
     out
 }
 
 /// Range decode for the mini-block layout. Block widths are walked to reach the
 /// byte offset of the block holding `start`, which costs one byte read per
-/// skipped block, then only the blocks overlapping the range are unpacked.
+/// skipped block, then only the blocks overlapping the range are unpacked
 fn decode_range_miniblock(
     encoded: &[u8],
     row_count: usize,
@@ -1648,7 +991,11 @@ fn decode_range_miniblock(
 ) -> Result<Vec<u8>> {
     let first_block = start / MINIBLOCK_SIZE;
     let last_block = (end - 1) / MINIBLOCK_SIZE;
-    let mut out = vec![0u8; (end - start) * value_size];
+    // SAFETY: the blocks from first_block to last_block cover start..end
+    // without a gap, and each writes its rows at value_size bytes before
+    // anything reads the buffer. An error on the way out drops the buffer
+    // unread
+    let mut out = unsafe { super::scratch::take_uninit((end - start) * value_size) };
     let mut off = 12usize;
     for b in 0..=last_block {
         if off >= encoded.len() {
@@ -1674,21 +1021,16 @@ fn decode_range_miniblock(
         if b >= first_block {
             let lo = start.max(block_start);
             let hi = end.min(block_end);
-            let packed_ptr = encoded[off..off + block_bytes].as_ptr();
-            let mask: u64 = if bw >= 64 { u64::MAX } else { (1u64 << bw) - 1 };
-            for row in lo..hi {
-                let residual = unpack_inline(
-                    packed_ptr,
-                    block_bytes,
-                    (row - block_start) as u64 * bw as u64,
-                    bw,
-                    mask,
-                );
-                write_le(
-                    &mut out,
-                    row - start,
+            let block = Packed::new(&encoded[off..off + block_bytes], bw);
+            // SAFETY: rows lo..hi land in slots lo - start onward, which
+            // are inside out
+            unsafe {
+                block.add_base_into(
+                    lo - block_start,
+                    hi - lo,
+                    base_value,
+                    out.as_mut_ptr().add((lo - start) * value_size),
                     value_size,
-                    residual.wrapping_add(base_value),
                 );
             }
         }
@@ -1943,161 +1285,6 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     }
 }
 
-/// Unpacks a single value using unaligned u64 read instead of 9-byte memcpy.
-/// The unaligned read is faster on most modern CPUs where unaligned loads
-/// execute in a single cycle.
-#[inline(always)]
-fn unpack_fast(packed: &[u8], bit_offset: u64, bit_width: u8, mask: u64) -> u64 {
-    unpack_inline(packed.as_ptr(), packed.len(), bit_offset, bit_width, mask)
-}
-
-/// Random access into a packed residual array with the buffer's pointer,
-/// length and bit width held once rather than re-derived per read.
-///
-/// A predicate evaluated against the packed form reads one residual per row
-/// and never materializes the column, so the read is the whole loop body and
-/// the slice header work around it is the difference between reading the
-/// packed array and decoding it
-struct PackedResiduals<'a> {
-    packed: &'a [u8],
-    bit_width: u8,
-    bits: u64,
-    mask: u64,
-}
-
-impl<'a> PackedResiduals<'a> {
-    #[inline]
-    fn new(packed: &'a [u8], bit_width: u8, mask: u64) -> Self {
-        Self {
-            packed,
-            bit_width,
-            bits: bit_width as u64,
-            mask,
-        }
-    }
-
-    #[inline(always)]
-    fn at(&self, row: usize) -> u64 {
-        unpack_inline(
-            self.packed.as_ptr(),
-            self.packed.len(),
-            row as u64 * self.bits,
-            self.bit_width,
-            self.mask,
-        )
-    }
-}
-
-/// Raw pointer version of unpack_fast. Takes pre-computed pointer and length
-/// to avoid repeated slice header access in tight loops. The caller must
-/// guarantee packed_ptr points to a valid buffer of packed_len bytes.
-#[inline(always)]
-fn unpack_inline(
-    packed_ptr: *const u8,
-    packed_len: usize,
-    bit_offset: u64,
-    bit_width: u8,
-    mask: u64,
-) -> u64 {
-    let byte_idx = (bit_offset >> 3) as usize;
-    let bit_idx = (bit_offset & 7) as u32;
-
-    if byte_idx + 8 <= packed_len {
-        let raw = unsafe { (packed_ptr.add(byte_idx) as *const u64).read_unaligned() };
-        let val = (raw >> bit_idx) & mask;
-
-        if bit_idx + bit_width as u32 > 64 {
-            if byte_idx + 9 <= packed_len {
-                let hi = unsafe { *packed_ptr.add(byte_idx + 8) } as u64;
-                return (val | (hi << (64 - bit_idx))) & mask;
-            }
-            // 9th byte unavailable, fall through to safe fallback
-        } else {
-            return val;
-        }
-    }
-
-    // Fallback for the last few bytes
-    let mut buf = [0u8; 8];
-    let available = packed_len.saturating_sub(byte_idx).min(8);
-    unsafe {
-        std::ptr::copy_nonoverlapping(packed_ptr.add(byte_idx), buf.as_mut_ptr(), available);
-    }
-    let raw = u64::from_le_bytes(buf);
-    (raw >> bit_idx) & mask
-}
-
-/// Batch unpacks all values from the packed bit array into a u64 output buffer.
-/// Uses unaligned u64 reads for the inner loop.
-#[inline]
-fn unpack_batch(packed: &[u8], bit_width: u8, mask: u64, count: usize, out: &mut [u64]) {
-    let bw = bit_width as u64;
-    let packed_ptr = packed.as_ptr();
-    let packed_len = packed.len();
-
-    for (i, val) in out.iter_mut().enumerate().take(count) {
-        *val = unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-    }
-}
-
-/// Scalar reference unpack of one byte-aligned mini-block into `out[..len]`.
-/// This is the authoritative implementation. SIMD paths must match it exactly.
-#[inline]
-fn unpack_block_scalar(packed: &[u8], bw: u8, len: usize, out: &mut [u64]) {
-    let mask: u64 = if bw >= 64 { u64::MAX } else { (1u64 << bw) - 1 };
-    let pp = packed.as_ptr();
-    let pl = packed.len();
-    for (j, slot) in out.iter_mut().enumerate().take(len) {
-        *slot = unpack_inline(pp, pl, j as u64 * bw as u64, bw, mask);
-    }
-}
-
-/// AVX2 widening unpack for byte-multiple widths (8/16/32). For these widths
-/// the packed value is a whole little-endian integer, so unpacking is a pure
-/// zero-extend - provably identical to the scalar path, vectorized 4 lanes at
-/// a time. Caller guarantees avx2 is available.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn unpack_block_bytemul_avx2(packed: &[u8], bw: u8, len: usize, out: &mut [u64]) {
-    match bw {
-        8 => {
-            for (j, slot) in out.iter_mut().enumerate().take(len) {
-                *slot = packed[j] as u64;
-            }
-        }
-        16 => {
-            for (j, slot) in out.iter_mut().enumerate().take(len) {
-                *slot = u16::from_le_bytes([packed[2 * j], packed[2 * j + 1]]) as u64;
-            }
-        }
-        32 => {
-            for (j, slot) in out.iter_mut().enumerate().take(len) {
-                let o = 4 * j;
-                *slot = u32::from_le_bytes([packed[o], packed[o + 1], packed[o + 2], packed[o + 3]])
-                    as u64;
-            }
-        }
-        _ => unpack_block_scalar(packed, bw, len, out),
-    }
-}
-
-/// Unpacks one byte-aligned mini-block. Uses the AVX2 widening path for
-/// byte-multiple widths when the CPU supports it, otherwise the authoritative
-/// scalar path. Output is bit-for-bit identical regardless of path.
-#[inline]
-fn unpack_block_into(packed: &[u8], bw: u8, len: usize, out: &mut [u64]) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if matches!(bw, 8 | 16 | 32) && std::arch::is_x86_feature_detected!("avx2") {
-            // Safety: avx2 was just feature-detected; bw is a byte multiple so
-            // the byte-extent (len*bw/8) is within the block slice.
-            unsafe { unpack_block_bytemul_avx2(packed, bw, len, out) };
-            return;
-        }
-    }
-    unpack_block_scalar(packed, bw, len, out);
-}
-
 /// Sets bits [start, end) in a bitmask. Handles partial first/last bytes
 /// and fills full bytes with 0xFF in the middle.
 #[inline]
@@ -2147,38 +1334,16 @@ fn unzigzag_i128(z: u128) -> i128 {
 }
 
 /// Writes the low `value_size` little-endian bytes of `val` at row `idx`.
-#[inline]
+/// The two hot widths copy a fixed length, which is one store
+#[inline(always)]
 fn write_le(out: &mut [u8], idx: usize, value_size: usize, val: u64) {
     let bytes = val.to_le_bytes();
-    let start = idx * value_size;
-    out[start..start + value_size].copy_from_slice(&bytes[..value_size]);
-}
-
-/// Adds `base` to each residual and stores it as a value_size-byte little-endian
-/// integer through a typed pointer, so the loop vectorizes into SIMD stores
-/// instead of the byte-wise write_le. value_size 4 and 8 are the hot column
-/// widths; other widths fall back to write_le. write_unaligned is used because
-/// the output buffer is only byte-aligned (on x86_64 it is the same store). The
-/// caller guarantees out holds at least residuals.len()*value_size bytes.
-#[inline]
-fn write_residuals_add_base(out: &mut [u8], value_size: usize, residuals: &[u64], base: u64) {
     match value_size {
-        4 => {
-            let p = out.as_mut_ptr() as *mut u32;
-            for (i, &r) in residuals.iter().enumerate() {
-                unsafe { p.add(i).write_unaligned(r.wrapping_add(base) as u32) };
-            }
-        }
-        8 => {
-            let p = out.as_mut_ptr() as *mut u64;
-            for (i, &r) in residuals.iter().enumerate() {
-                unsafe { p.add(i).write_unaligned(r.wrapping_add(base)) };
-            }
-        }
+        8 => out[idx * 8..idx * 8 + 8].copy_from_slice(&bytes),
+        4 => out[idx * 4..idx * 4 + 4].copy_from_slice(&bytes[..4]),
         _ => {
-            for (i, &r) in residuals.iter().enumerate() {
-                write_le(out, i, value_size, r.wrapping_add(base));
-            }
+            let start = idx * value_size;
+            out[start..start + value_size].copy_from_slice(&bytes[..value_size]);
         }
     }
 }
@@ -3077,31 +2242,6 @@ mod tests {
             .unwrap();
         // All zeros (no matches)
         assert!(bitmask.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_simd_unpack_matches_scalar_differential_fuzz() {
-        // The scalar block unpack is authoritative. unpack_block_into may take
-        // an AVX2 path for byte-multiple widths; it must be bit-identical.
-        // Deterministic LCG, no external rng dependency.
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        for bw in 1u8..=40 {
-            for &len in &[1usize, 7, 8, 16, 31, 64, 1000, 3000] {
-                let block_bytes = (len as u64 * bw as u64).div_ceil(8) as usize + 8;
-                let packed: Vec<u8> = (0..block_bytes).map(|_| (next() & 0xFF) as u8).collect();
-                let mut a = vec![0u64; len];
-                let mut b = vec![0u64; len];
-                unpack_block_scalar(&packed, bw, len, &mut a);
-                unpack_block_into(&packed, bw, len, &mut b);
-                assert_eq!(a, b, "SIMD/scalar mismatch at bw={bw} len={len}");
-            }
-        }
     }
 
     #[test]

@@ -269,9 +269,20 @@ impl LogRecord {
     #[inline]
     pub fn version(&self) -> Result<RecordVersion> {
         let Some(tag) = RecordVersion::new(self.record_version) else {
+            // The escape is a future layout rather than damage, so it is
+            // named as one. The WAL header is a fixed 28 bytes with no room
+            // behind the tag, so the release that spends the escape defines
+            // where the wide version sits and this reader cannot guess
+            let reason = if RecordVersion::is_wide_escape(self.record_version) {
+                "record uses the wide version escape, which this binary has no reader for. \
+                 Upgrade through a release that reads it to replay this segment"
+                    .to_string()
+            } else {
+                "record carries no version tag".to_string()
+            };
             return Err(ZyronError::WalCorrupted {
                 lsn: self.lsn.0,
-                reason: "record carries no version tag".to_string(),
+                reason,
             });
         };
         if tag > crate::format::WAL_RECORD_VERSION {

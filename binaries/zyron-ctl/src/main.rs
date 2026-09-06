@@ -95,6 +95,9 @@ enum Subcommand {
     UpgradePause,
     UpgradeResume,
     UpgradeShowState,
+    UpgradeAcknowledge {
+        category: String,
+    },
 
     DeprecationReport,
     DeprecationGuide {
@@ -103,6 +106,31 @@ enum Subcommand {
 
     ReleaseVerify {
         today: Option<String>,
+    },
+    /// Puts a signed manifest and a release binary where an air-gapped
+    /// node's feed reads them
+    ReleaseStage {
+        manifest: PathBuf,
+        binary: PathBuf,
+        dataDir: PathBuf,
+        version: Option<String>,
+    },
+    /// Draws a release signing key and prints its public half
+    ReleaseKeygen {
+        out: PathBuf,
+    },
+    /// Signs a binary into a release manifest
+    ReleaseSign {
+        key: PathBuf,
+        binary: PathBuf,
+        version: String,
+        manifest: Option<PathBuf>,
+        channel: Option<String>,
+        artifactUrl: Option<String>,
+        notesUrl: Option<String>,
+        chain: Vec<String>,
+        formatBump: bool,
+        out: PathBuf,
     },
 }
 
@@ -147,11 +175,24 @@ Upgrade subcommands (connect to a server):
   upgrade pause                             Halt in-progress and queued upgrades
   upgrade resume                            Let upgrades proceed again
   upgrade show-state                        Show the current upgrade phase per node
+  upgrade acknowledge --category <ambiguous|unsafe>
+                                            Acknowledge the rewrites an upgrade waits on
   deprecation report                        List deprecation warnings in the trailing window
   deprecation guides <item>                 Print one item's migration guide
 
-Release subcommand (checks this binary):
+Release subcommands:
   release verify [--today <YYYY-MM-DD>]     Check every format bump, fixture, and retirement
+                                            in this binary
+  release stage --manifest <file> --binary <file> --data-dir <dir> [--version <X.Y.Z>]
+                                            Put a signed manifest and a release binary where an
+                                            air-gapped node's feed reads them
+  release keygen --out <file>               Draw a release signing key into a file and print
+                                            its public half
+  release sign --key <file> --binary <file> --version <X.Y.Z> --out <file>
+               [--manifest <file>] [--channel <name>] [--artifact-url <url>]
+               [--notes-url <url>] [--chain <a,b>] [--format-bump]
+                                            Sign a binary into a release manifest, adding to
+                                            an existing manifest or starting one
 
 Flags:
   --help                                    Print this help
@@ -581,10 +622,37 @@ fn parseUpgrade(args: &[String], i: &mut usize) -> Subcommand {
         "pause" => Subcommand::UpgradePause,
         "resume" => Subcommand::UpgradeResume,
         "show-state" => Subcommand::UpgradeShowState,
+        "acknowledge" => {
+            let mut category = None;
+            while *i < args.len() {
+                match args[*i].as_str() {
+                    "--category" => category = Some(flagValue(args, i, "--category")),
+                    other => {
+                        eprintln!("Unknown upgrade acknowledge flag: {other}");
+                        process::exit(1);
+                    }
+                }
+                *i += 1;
+            }
+            match category {
+                Some(category)
+                    if category.eq_ignore_ascii_case("ambiguous")
+                        || category.eq_ignore_ascii_case("unsafe") =>
+                {
+                    Subcommand::UpgradeAcknowledge {
+                        category: category.to_ascii_lowercase(),
+                    }
+                }
+                _ => {
+                    eprintln!("Usage: zyron-ctl upgrade acknowledge --category <ambiguous|unsafe>");
+                    process::exit(1);
+                }
+            }
+        }
         other => {
             eprintln!(
                 "Unknown upgrade subcommand: {other}. Use check, trigger, rollback, pause, \
-                 resume, or show-state."
+                 resume, show-state, or acknowledge."
             );
             process::exit(1);
         }
@@ -619,23 +687,150 @@ fn parseDeprecation(args: &[String], i: &mut usize) -> Subcommand {
 
 fn parseRelease(args: &[String], i: &mut usize) -> Subcommand {
     *i += 1;
-    if *i >= args.len() || args[*i] != "verify" {
-        eprintln!("Usage: zyron-ctl release verify [--today <YYYY-MM-DD>]");
+    if *i >= args.len() {
+        eprintln!("Usage: zyron-ctl release <verify|stage> ...");
         process::exit(1);
     }
+    let action = args[*i].clone();
     *i += 1;
-    let mut today = None;
-    while *i < args.len() {
-        match args[*i].as_str() {
-            "--today" => today = Some(flagValue(args, i, "--today")),
-            other => {
-                eprintln!("Unknown release verify flag: {other}");
-                process::exit(1);
+    match action.as_str() {
+        "verify" => {
+            let mut today = None;
+            while *i < args.len() {
+                match args[*i].as_str() {
+                    "--today" => today = Some(flagValue(args, i, "--today")),
+                    other => {
+                        eprintln!("Unknown release verify flag: {other}");
+                        process::exit(1);
+                    }
+                }
+                *i += 1;
+            }
+            Subcommand::ReleaseVerify { today }
+        }
+        "stage" => {
+            let mut manifest = None;
+            let mut binary = None;
+            let mut dataDir = None;
+            let mut version = None;
+            while *i < args.len() {
+                match args[*i].as_str() {
+                    "--manifest" => {
+                        manifest = Some(PathBuf::from(flagValue(args, i, "--manifest")))
+                    }
+                    "--binary" => binary = Some(PathBuf::from(flagValue(args, i, "--binary"))),
+                    "--data-dir" => dataDir = Some(PathBuf::from(flagValue(args, i, "--data-dir"))),
+                    "--version" => version = Some(flagValue(args, i, "--version")),
+                    other => {
+                        eprintln!("Unknown release stage flag: {other}");
+                        process::exit(1);
+                    }
+                }
+                *i += 1;
+            }
+            match (manifest, binary, dataDir) {
+                (Some(manifest), Some(binary), Some(dataDir)) => Subcommand::ReleaseStage {
+                    manifest,
+                    binary,
+                    dataDir,
+                    version,
+                },
+                _ => {
+                    eprintln!(
+                        "Usage: zyron-ctl release stage --manifest <file> --binary <file> \
+                         --data-dir <dir> [--version <X.Y.Z>]"
+                    );
+                    process::exit(1);
+                }
             }
         }
-        *i += 1;
+        "keygen" => {
+            let mut out = None;
+            while *i < args.len() {
+                match args[*i].as_str() {
+                    "--out" => out = Some(PathBuf::from(flagValue(args, i, "--out"))),
+                    other => {
+                        eprintln!("Unknown release keygen flag: {other}");
+                        process::exit(1);
+                    }
+                }
+                *i += 1;
+            }
+            match out {
+                Some(out) => Subcommand::ReleaseKeygen { out },
+                None => {
+                    eprintln!("Usage: zyron-ctl release keygen --out <file>");
+                    process::exit(1);
+                }
+            }
+        }
+        "sign" => {
+            let mut key = None;
+            let mut binary = None;
+            let mut version = None;
+            let mut manifest = None;
+            let mut channel = None;
+            let mut artifactUrl = None;
+            let mut notesUrl = None;
+            let mut chain = Vec::new();
+            let mut formatBump = false;
+            let mut out = None;
+            while *i < args.len() {
+                match args[*i].as_str() {
+                    "--key" => key = Some(PathBuf::from(flagValue(args, i, "--key"))),
+                    "--binary" => binary = Some(PathBuf::from(flagValue(args, i, "--binary"))),
+                    "--version" => version = Some(flagValue(args, i, "--version")),
+                    "--manifest" => {
+                        manifest = Some(PathBuf::from(flagValue(args, i, "--manifest")))
+                    }
+                    "--channel" => channel = Some(flagValue(args, i, "--channel")),
+                    "--artifact-url" => artifactUrl = Some(flagValue(args, i, "--artifact-url")),
+                    "--notes-url" => notesUrl = Some(flagValue(args, i, "--notes-url")),
+                    "--chain" => {
+                        chain = flagValue(args, i, "--chain")
+                            .split(',')
+                            .map(|part| part.trim().to_string())
+                            .filter(|part| !part.is_empty())
+                            .collect();
+                    }
+                    "--format-bump" => formatBump = true,
+                    "--out" => out = Some(PathBuf::from(flagValue(args, i, "--out"))),
+                    other => {
+                        eprintln!("Unknown release sign flag: {other}");
+                        process::exit(1);
+                    }
+                }
+                *i += 1;
+            }
+            match (key, binary, version, out) {
+                (Some(key), Some(binary), Some(version), Some(out)) => Subcommand::ReleaseSign {
+                    key,
+                    binary,
+                    version,
+                    manifest,
+                    channel,
+                    artifactUrl,
+                    notesUrl,
+                    chain,
+                    formatBump,
+                    out,
+                },
+                _ => {
+                    eprintln!(
+                        "Usage: zyron-ctl release sign --key <file> --binary <file> --version \
+                         <X.Y.Z> --out <file> [--manifest <file>] [--channel <name>] \
+                         [--artifact-url <url>] [--notes-url <url>] [--chain <a,b>] \
+                         [--format-bump]"
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("Unknown release subcommand: {other}. Use verify, stage, keygen, or sign.");
+            process::exit(1);
+        }
     }
-    Subcommand::ReleaseVerify { today }
 }
 
 fn executeRemote(flags: &GlobalFlags, sql: &str) -> Result<(), String> {
@@ -878,6 +1073,96 @@ fn handleUpgradeCheck(flags: &GlobalFlags, verbose: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// `release keygen` draws the key releases are signed with. The private
+/// half goes to the file and the public half is printed for the repo
+fn handleReleaseKeygen(out: &Path) -> Result<(), String> {
+    use zyron_server::upgrade::signing::ReleaseSigningSeed;
+
+    let seed = ReleaseSigningSeed::generate();
+    seed.write_to(out).map_err(|e| e.to_string())?;
+    println!("release signing key written to {}", out.display());
+    println!(
+        "Store its contents as the ZYRON_RELEASE_SIGNING_KEY secret of the release workflow and \
+         keep a copy where you keep secrets. The public half below goes in \
+         crates/zyron-server/release-signing.pub, or in upgrade.release_signing_key on every node \
+         when this key signs a feed of your own:"
+    );
+    println!("{}", seed.verifying_hex());
+    Ok(())
+}
+
+/// `release sign` signs one binary into a manifest, starting the manifest
+/// or adding to the one given
+#[allow(clippy::too_many_arguments)]
+fn handleReleaseSign(
+    key: &Path,
+    binary: &Path,
+    version: &str,
+    manifest: Option<&Path>,
+    channel: Option<&str>,
+    artifactUrl: Option<&str>,
+    notesUrl: Option<&str>,
+    chain: &[String],
+    formatBump: bool,
+    out: &Path,
+) -> Result<(), String> {
+    use zyron_server::upgrade::feed::{parse_manifest, write_manifest};
+    use zyron_server::upgrade::signing::{ReleaseSigningSeed, ReleaseToSign, sign_release};
+
+    let seed = ReleaseSigningSeed::read_from(key).map_err(|e| e.to_string())?;
+    let mut manifest: zyron_common::format::ReleaseManifest = match manifest {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("reading {}: {e}", path.display()))?;
+            parse_manifest(&text).map_err(|e| e.to_string())?.into()
+        }
+        None => zyron_common::format::ReleaseManifest {
+            channel: channel.unwrap_or("stable").to_string(),
+            generated_at_secs: 0,
+            releases: Vec::new(),
+            signature_scheme: String::new(),
+            signature: String::new(),
+        },
+    };
+    if let Some(channel) = channel {
+        if manifest.channel != channel {
+            return Err(format!(
+                "the manifest is for the {} channel, not {channel}",
+                manifest.channel
+            ));
+        }
+    }
+    let bytes = std::fs::read(binary).map_err(|e| format!("reading {}: {e}", binary.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = sign_release(
+        &seed,
+        &mut manifest,
+        ReleaseToSign {
+            version: version.to_string(),
+            artifact_url: artifactUrl.unwrap_or("").to_string(),
+            notes_url: notesUrl.unwrap_or("").to_string(),
+            upgrade_chain: chain.to_vec(),
+            carries_format_bump: formatBump,
+            binary: &bytes,
+        },
+        now,
+    )
+    .map_err(|e| e.to_string())?;
+    write_manifest(&manifest, out).map_err(|e| e.to_string())?;
+    println!(
+        "signed {} ({} bytes, sha256 {}) into the {} channel manifest at {}",
+        entry.version,
+        bytes.len(),
+        entry.sha256,
+        manifest.channel,
+        out.display()
+    );
+    Ok(())
+}
+
 fn handleReleaseVerify(today: &Option<String>) -> Result<(), String> {
     let substrate = zyron_common::format::substrate().map_err(|e| e.to_string())?;
     let today = match today {
@@ -965,6 +1250,9 @@ fn main() {
         Subcommand::UpgradePause => executeRemote(&flags, format_cmd::statements::PAUSE),
         Subcommand::UpgradeResume => executeRemote(&flags, format_cmd::statements::RESUME),
         Subcommand::UpgradeShowState => executeRemote(&flags, format_cmd::statements::SHOW_STATE),
+        Subcommand::UpgradeAcknowledge { ref category } => {
+            executeRemote(&flags, &format_cmd::statements::acknowledge(category))
+        }
 
         Subcommand::DeprecationReport => {
             executeRemote(&flags, format_cmd::statements::DEPRECATION_REPORT)
@@ -974,6 +1262,46 @@ fn main() {
         }
 
         Subcommand::ReleaseVerify { ref today } => handleReleaseVerify(today),
+        Subcommand::ReleaseStage {
+            ref manifest,
+            ref binary,
+            ref dataDir,
+            ref version,
+        } => {
+            format_cmd::stage_release(manifest, binary, dataDir, version.as_deref()).map(|staged| {
+                println!(
+                    "staged {} for the {} channel: manifest at {}, binary at {}",
+                    staged.version,
+                    staged.channel,
+                    staged.manifestPath.display(),
+                    staged.binaryPath.display()
+                );
+            })
+        }
+        Subcommand::ReleaseKeygen { ref out } => handleReleaseKeygen(out),
+        Subcommand::ReleaseSign {
+            ref key,
+            ref binary,
+            ref version,
+            ref manifest,
+            ref channel,
+            ref artifactUrl,
+            ref notesUrl,
+            ref chain,
+            formatBump,
+            ref out,
+        } => handleReleaseSign(
+            key,
+            binary,
+            version,
+            manifest.as_deref(),
+            channel.as_deref(),
+            artifactUrl.as_deref(),
+            notesUrl.as_deref(),
+            chain,
+            formatBump,
+            out,
+        ),
     };
 
     if let Err(e) = result {

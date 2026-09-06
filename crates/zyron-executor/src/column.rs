@@ -122,6 +122,19 @@ impl NullBitmap {
         self.len += 1;
     }
 
+    /// Appends `count` values that are all present.
+    ///
+    /// Every bit stays clear, so the words are grown in one step rather
+    /// than one bit at a time. Bits past `len` are always clear already,
+    /// which is what lets the tail word be left as it is
+    pub fn extend_valid(&mut self, count: usize) {
+        let needed = (self.len + count).div_ceil(64);
+        if needed > self.words.len() {
+            self.words.resize(needed, 0);
+        }
+        self.len += count;
+    }
+
     /// Returns true if any value is null.
     pub fn has_nulls(&self) -> bool {
         self.words.iter().any(|&w| w != 0)

@@ -1,0 +1,481 @@
+# suite:   executor
+# run:     2026-09-05_063827_65c7d22-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Aggregate Correctness Test ===
+  GROUP BY dept with COUNT/SUM/MIN/MAX: 3 groups [PASS]
+
+=== Aggregate Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Aggregate: 6,920,415,225 rows/sec (144.5µs)
+
+--- Run 2/5 ---
+  Aggregate: 12,886,597,938 rows/sec (77.6µs)
+
+--- Run 3/5 ---
+  Aggregate: 14,430,014,430 rows/sec (69.3µs)
+
+--- Run 4/5 ---
+  Aggregate: 14,619,883,041 rows/sec (68.4µs)
+
+--- Run 5/5 ---
+  Aggregate: 12,315,270,936 rows/sec (81.2µs)
+
+=== Aggregate Validation Results ===
+  Aggregate throughput (rows/sec) [PASS/OK]:
+    Runs: [6,920,415,225, 12,886,597,938, 14,430,014,430, 14,619,883,041, 12,315,270,936]
+    Average: 12,234,436,314 >= 150,000,000 (target)
+    Min/Max: 6,920,415,225 / 14,619,883,041, StdDev: 2,799,342,369
+
+=== Distinct Correctness Test ===
+  DISTINCT on 10 rows with 5 unique values: 5 rows [PASS]
+
+=== Distinct Throughput Test ===
+Rows: 1000000, distinct: 100000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Distinct: 77,528,395 rows/sec (12.8985ms)
+
+--- Run 2/5 ---
+  Distinct: 83,294,463 rows/sec (12.0056ms)
+
+--- Run 3/5 ---
+  Distinct: 82,597,527 rows/sec (12.1069ms)
+
+--- Run 4/5 ---
+  Distinct: 83,108,248 rows/sec (12.0325ms)
+
+--- Run 5/5 ---
+  Distinct: 80,142,975 rows/sec (12.4777ms)
+
+=== Distinct Validation Results ===
+  Distinct throughput (rows/sec) [PASS/OK]:
+    Runs: [77,528,395, 83,294,463, 82,597,527, 83,108,248, 80,142,975]
+    Average: 81,334,322 >= 45,000,000 (target)
+    Min/Max: 77,528,395 / 83,294,463, StdDev: 2,213,099
+
+=== Expression Evaluation Test ===
+  a + b: [15, 35, 55, 75, 95] [PASS]
+  a * 2: [20, 40, 60, 80, 100] [PASS]
+  a > b: all true [PASS]
+  IS NULL: row 2 is null [PASS]
+
+=== Filter Correctness Test ===
+  id < 10: 10 rows [PASS]
+  id >= 10 AND id < 20: 10 rows [PASS]
+
+=== Filter Throughput Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Filter: 475,465,957 rows/sec (2.1032ms), 250000 rows passed
+
+--- Run 2/5 ---
+  Filter: 492,319,811 rows/sec (2.0312ms), 250000 rows passed
+
+--- Run 3/5 ---
+  Filter: 519,723,507 rows/sec (1.9241ms), 250000 rows passed
+
+--- Run 4/5 ---
+  Filter: 497,438,193 rows/sec (2.0103ms), 250000 rows passed
+
+--- Run 5/5 ---
+  Filter: 492,150,204 rows/sec (2.0319ms), 250000 rows passed
+
+=== Filter Validation Results ===
+  Filter throughput (rows/sec) [PASS/OK]:
+    Runs: [475,465,957, 492,319,811, 519,723,507, 497,438,193, 492,150,204]
+    Average: 495,419,534 >= 60,000,000 (target)
+    Min/Max: 475,465,957 / 519,723,507, StdDev: 14,235,169
+
+=== Hash Build Many Groups Performance Test ===
+Rows: 1000000, groups: 100000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Hash Build (many groups): 68,306,944 rows/sec (14.6398ms), 100000 groups
+  Hash Build (many groups, COUNT only): 93,841,202 rows/sec (10.6563ms)
+
+--- Run 2/5 ---
+  Hash Build (many groups): 76,909,470 rows/sec (13.0023ms), 100000 groups
+  Hash Build (many groups, COUNT only): 95,716,679 rows/sec (10.4475ms)
+
+--- Run 3/5 ---
+  Hash Build (many groups): 76,309,665 rows/sec (13.1045ms), 100000 groups
+  Hash Build (many groups, COUNT only): 94,429,598 rows/sec (10.5899ms)
+
+--- Run 4/5 ---
+  Hash Build (many groups): 78,061,575 rows/sec (12.8104ms), 100000 groups
+  Hash Build (many groups, COUNT only): 94,919,888 rows/sec (10.5352ms)
+
+--- Run 5/5 ---
+  Hash Build (many groups): 77,449,735 rows/sec (12.9116ms), 100000 groups
+  Hash Build (many groups, COUNT only): 95,884,632 rows/sec (10.4292ms)
+
+=== Hash Build Many Groups Validation Results ===
+  Hash build throughput over many groups (rows/sec) [PASS/OK]:
+    Runs: [68,306,944, 76,909,470, 76,309,665, 78,061,575, 77,449,735]
+    Average: 75,407,478 >= 35,000,000 (target)
+    Min/Max: 68,306,944 / 78,061,575, StdDev: 3,597,292
+
+=== Hash Build Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Hash Build: 152,881,822 rows/sec (6.541ms), 1000 groups
+
+--- Run 2/5 ---
+  Hash Build: 151,618,528 rows/sec (6.5955ms), 1000 groups
+
+--- Run 3/5 ---
+  Hash Build: 154,466,396 rows/sec (6.4739ms), 1000 groups
+
+--- Run 4/5 ---
+  Hash Build: 137,705,008 rows/sec (7.2619ms), 1000 groups
+
+--- Run 5/5 ---
+  Hash Build: 143,110,653 rows/sec (6.9876ms), 1000 groups
+
+=== Hash Build Validation Results ===
+  Hash build throughput (rows/sec) [PASS/OK]:
+    Runs: [152,881,822, 151,618,528, 154,466,396, 137,705,008, 143,110,653]
+    Average: 147,956,481 >= 50,000,000 (target)
+    Min/Max: 137,705,008 / 154,466,396, StdDev: 6,459,463
+
+=== Hash Join Correctness Test ===
+  INNER JOIN: 3 rows [PASS]
+  LEFT JOIN: 5 rows [PASS]
+
+=== Hash Join Performance Test ===
+Left rows: 500000, Right rows: 50000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Join: 167,036,171 rows/sec (3.2927ms), 50000 output rows
+
+--- Run 2/5 ---
+  Join: 182,797,128 rows/sec (3.0088ms), 50000 output rows
+
+--- Run 3/5 ---
+  Join: 190,707,351 rows/sec (2.884ms), 50000 output rows
+
+--- Run 4/5 ---
+  Join: 190,939,073 rows/sec (2.8805ms), 50000 output rows
+
+--- Run 5/5 ---
+  Join: 193,873,594 rows/sec (2.8369ms), 50000 output rows
+
+=== Hash Join Validation Results ===
+  Join throughput (rows/sec) [PASS/OK]:
+    Runs: [167,036,171, 182,797,128, 190,707,351, 190,939,073, 193,873,594]
+    Average: 185,070,664 >= 100,000,000 (target)
+    Min/Max: 167,036,171 / 193,873,594, StdDev: 9,737,699
+
+=== IN-List Predicate Throughput Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  IN-list: 80,774,792 rows/sec
+
+--- Run 2/5 ---
+  IN-list: 75,257,569 rows/sec
+
+--- Run 3/5 ---
+  IN-list: 80,429,170 rows/sec
+
+--- Run 4/5 ---
+  IN-list: 80,137,837 rows/sec
+
+--- Run 5/5 ---
+  IN-list: 80,334,836 rows/sec
+
+=== IN-List Validation Results ===
+  IN-list predicate (rows/sec) [PASS/OK]:
+    Runs: [80,774,792, 75,257,569, 80,429,170, 80,137,837, 80,334,836]
+    Average: 79,386,841 >= 35,000,000 (target)
+    Min/Max: 75,257,569 / 80,774,792, StdDev: 2,074,918
+
+=== Limit/Offset Correctness Test ===
+  LIMIT 10: 10 rows [PASS]
+  LIMIT 10 OFFSET 100: 10 rows, first id=100 [PASS]
+  OFFSET beyond data: 0 rows [PASS]
+
+=== Limit Throughput Performance Test ===
+Rows: 1000000, Limit: 100
+Validation runs: 5
+
+--- Run 1/5 ---
+  Limit: 820,008,200,082 rows/sec (243.9µs for 200 samples)
+
+--- Run 2/5 ---
+  Limit: 866,175,833,694 rows/sec (230.9µs for 200 samples)
+
+--- Run 3/5 ---
+  Limit: 827,472,072,818 rows/sec (241.7µs for 200 samples)
+
+--- Run 4/5 ---
+  Limit: 793,650,793,651 rows/sec (252µs for 200 samples)
+
+--- Run 5/5 ---
+  Limit: 888,888,888,889 rows/sec (225µs for 200 samples)
+
+=== Limit Validation Results ===
+  Limit throughput (rows/sec) [PASS/OK]:
+    Runs: [820,008,200,082, 866,175,833,694, 827,472,072,818, 793,650,793,651, 888,888,888,889]
+    Average: 839,239,157,827 >= 200,000,000 (target)
+    Min/Max: 793,650,793,651 / 888,888,888,889, StdDev: 33,991,979,274
+
+=== Pipeline Integration Test (Filter -> Sort -> Limit) ===
+  Filter(id<500) -> Sort(val ASC) -> Limit(10): vals 500-509 [PASS]
+
+=== Projection Correctness Test ===
+  SELECT b, c FROM t: 2 columns, 3 rows [PASS]
+
+=== Residual-Condition Hash Join Throughput Test ===
+Left rows: 200000, Right rows: 20000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Residual join: 59,631,908 rows/sec (3.6893ms), 101811 output rows
+
+--- Run 2/5 ---
+  Residual join: 62,060,989 rows/sec (3.5449ms), 101811 output rows
+
+--- Run 3/5 ---
+  Residual join: 63,799,553 rows/sec (3.4483ms), 101811 output rows
+
+--- Run 4/5 ---
+  Residual join: 64,312,442 rows/sec (3.4208ms), 101811 output rows
+
+--- Run 5/5 ---
+  Residual join: 64,233,577 rows/sec (3.425ms), 101811 output rows
+
+=== Residual Join Validation Results ===
+  Residual-condition join throughput (rows/sec) [PASS/OK]:
+    Runs: [59,631,908, 62,060,989, 63,799,553, 64,312,442, 64,233,577]
+    Average: 62,807,694 >= 20,000,000 (target)
+    Min/Max: 59,631,908 / 64,312,442, StdDev: 1,784,622
+
+=== Scan Throughput Performance Test ===
+Rows: 1000000, Columns: 4
+Validation runs: 5
+
+--- Run 1/5 ---
+  Scan: 6,882,312,457 rows/sec (145.3µs)
+
+--- Run 2/5 ---
+  Scan: 8,058,017,728 rows/sec (124.1µs)
+
+--- Run 3/5 ---
+  Scan: 8,818,342,152 rows/sec (113.4µs)
+
+--- Run 4/5 ---
+  Scan: 8,833,922,261 rows/sec (113.2µs)
+
+--- Run 5/5 ---
+  Scan: 8,718,395,815 rows/sec (114.7µs)
+
+=== Scan Validation Results ===
+  Scan throughput (rows/sec) [PASS/OK]:
+    Runs: [6,882,312,457, 8,058,017,728, 8,818,342,152, 8,833,922,261, 8,718,395,815]
+    Average: 8,262,198,083 >= 75,000,000 (target)
+    Min/Max: 6,882,312,457 / 8,833,922,261, StdDev: 747,001,351
+
+=== Set Operations Correctness Test ===
+  UNION ALL: 10 rows [PASS]
+  UNION: 7 rows [PASS]
+  INTERSECT: 3 rows [PASS]
+  EXCEPT: 2 rows [PASS]
+
+=== Set Operation Throughput ===
+Rows per side: 200000, columns: 2
+  UNION ALL emitted 400000 rows
+  UNION ALL throughput (rows/sec) [PASS/OK]:
+    Runs: [9,950,248,756, 11,235,955,056, 11,173,184,358, 11,204,481,793, 11,049,723,757]
+    Average: 10,922,718,744 >= 2,000,000,000 (target)
+    Min/Max: 9,950,248,756 / 11,235,955,056, StdDev: 490,320,013
+  UNION emitted 300000 rows
+  UNION throughput (rows/sec) [PASS/OK]:
+    Runs: [38,935,503, 41,220,965, 40,830,075, 42,183,413, 45,006,020]
+    Average: 41,635,195 >= 24,000,000 (target)
+    Min/Max: 38,935,503 / 45,006,020, StdDev: 1,988,524
+  INTERSECT emitted 100000 rows
+  INTERSECT throughput (rows/sec) [PASS/OK]:
+    Runs: [59,946,647, 62,486,331, 65,406,501, 65,506,117, 61,785,604]
+    Average: 63,026,240 >= 38,000,000 (target)
+    Min/Max: 59,946,647 / 65,506,117, StdDev: 2,150,814
+  EXCEPT emitted 100000 rows
+  EXCEPT throughput (rows/sec) [PASS/OK]:
+    Runs: [56,125,384, 60,938,452, 58,361,785, 59,576,116, 57,675,116]
+    Average: 58,535,371 >= 28,000,000 (target)
+    Min/Max: 56,125,384 / 60,938,452, StdDev: 1,639,278
+
+=== Sort Correctness (Multi-Key) Test ===
+  Multi-key sort (ASC a, DESC b): verified [PASS]
+
+=== Sort Performance Test ===
+Rows: 500000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Sort: 412,847,824 rows/sec (1.2111ms)
+
+--- Run 2/5 ---
+  Sort: 630,199,143 rows/sec (793.4µs)
+
+--- Run 3/5 ---
+  Sort: 669,344,043 rows/sec (747µs)
+
+--- Run 4/5 ---
+  Sort: 679,809,653 rows/sec (735.5µs)
+
+--- Run 5/5 ---
+  Sort: 672,223,716 rows/sec (743.8µs)
+
+=== Sort Validation Results ===
+  Sort throughput (rows/sec) [PASS/OK]:
+    Runs: [412,847,824, 630,199,143, 669,344,043, 679,809,653, 672,223,716]
+    Average: 612,884,876 >= 100,000,000 (target)
+    Min/Max: 412,847,824 / 679,809,653, StdDev: 101,491,150
+
+=== TopN Sort Test ===
+  TopN(100) from 10K rows: correct smallest 100 [PASS]
+
+=== Top-N Sort Performance Test ===
+Rows: 1000000, limit: 100
+Validation runs: 5
+
+--- Run 1/5 ---
+  Top-N sort: 747,104,968 rows/sec (1.3385ms)
+
+--- Run 2/5 ---
+  Top-N sort: 1,336,898,396 rows/sec (748µs)
+
+--- Run 3/5 ---
+  Top-N sort: 1,499,250,375 rows/sec (667µs)
+
+--- Run 4/5 ---
+  Top-N sort: 1,451,378,810 rows/sec (689µs)
+
+--- Run 5/5 ---
+  Top-N sort: 1,463,914,507 rows/sec (683.1µs)
+
+=== Top-N Sort Validation Results ===
+  Top-N sort throughput (rows/sec) [PASS/OK]:
+    Runs: [747,104,968, 1,336,898,396, 1,499,250,375, 1,451,378,810, 1,463,914,507]
+    Average: 1,299,709,411 >= 450,000,000 (target)
+    Min/Max: 747,104,968 / 1,499,250,375, StdDev: 281,616,124
+
+=== String Predicate Throughput Test ===
+Rows: 500000
+Validation runs: 5
+
+--- Run 1/5 ---
+  eq 303,545,410 rows/sec, LIKE prefix 161,974,797 rows/sec, LIKE general 152,737,048 rows/sec, ILIKE 70,292,840 rows/sec
+  literal prefix 191,029,266 rows/sec, literal suffix 225,235,371 rows/sec, literal contains 82,082,937 rows/sec
+
+--- Run 2/5 ---
+  eq 306,504,015 rows/sec, LIKE prefix 172,384,072 rows/sec, LIKE general 152,378,630 rows/sec, ILIKE 71,792,663 rows/sec
+  literal prefix 188,721,975 rows/sec, literal suffix 233,394,016 rows/sec, literal contains 87,717,759 rows/sec
+
+--- Run 3/5 ---
+  eq 313,401,028 rows/sec, LIKE prefix 178,871,677 rows/sec, LIKE general 156,079,288 rows/sec, ILIKE 68,954,104 rows/sec
+  literal prefix 201,946,767 rows/sec, literal suffix 244,009,565 rows/sec, literal contains 75,101,011 rows/sec
+
+--- Run 4/5 ---
+  eq 322,081,938 rows/sec, LIKE prefix 186,212,804 rows/sec, LIKE general 159,928,352 rows/sec, ILIKE 71,348,050 rows/sec
+  literal prefix 199,624,706 rows/sec, literal suffix 227,117,874 rows/sec, literal contains 87,539,612 rows/sec
+
+--- Run 5/5 ---
+  eq 329,902,349 rows/sec, LIKE prefix 185,041,264 rows/sec, LIKE general 161,503,925 rows/sec, ILIKE 71,192,619 rows/sec
+  literal prefix 190,861,549 rows/sec, literal suffix 176,778,391 rows/sec, literal contains 74,364,924 rows/sec
+
+=== String Predicate Validation Results ===
+  String equality predicate (rows/sec) [PASS/OK]:
+    Runs: [303,545,410, 306,504,015, 313,401,028, 322,081,938, 329,902,349]
+    Average: 315,086,948 >= 80,000,000 (target)
+    Min/Max: 303,545,410 / 329,902,349, StdDev: 9,778,979
+  LIKE prefix predicate (rows/sec) [PASS/OK]:
+    Runs: [161,974,797, 172,384,072, 178,871,677, 186,212,804, 185,041,264]
+    Average: 176,896,923 >= 7,000,000 (target)
+    Min/Max: 161,974,797 / 186,212,804, StdDev: 8,944,845
+  LIKE underscore predicate (rows/sec) [PASS/OK]:
+    Runs: [152,737,048, 152,378,630, 156,079,288, 159,928,352, 161,503,925]
+    Average: 156,525,449 >= 5,000,000 (target)
+    Min/Max: 152,378,630 / 161,503,925, StdDev: 3,690,857
+  ILIKE contains predicate (rows/sec) [PASS/OK]:
+    Runs: [70,292,840, 71,792,663, 68,954,104, 71,348,050, 71,192,619]
+    Average: 70,716,055 >= 4,500,000 (target)
+    Min/Max: 68,954,104 / 71,792,663, StdDev: 1,006,896
+  LIKE literal prefix predicate (rows/sec) [PASS/OK]:
+    Runs: [191,029,266, 188,721,975, 201,946,767, 199,624,706, 190,861,549]
+    Average: 194,436,852 >= 100,000,000 (target)
+    Min/Max: 188,721,975 / 201,946,767, StdDev: 5,298,432
+  LIKE literal suffix predicate (rows/sec) [PASS/OK]:
+    Runs: [225,235,371, 233,394,016, 244,009,565, 227,117,874, 176,778,391]
+    Average: 221,307,043 >= 120,000,000 (target)
+    Min/Max: 176,778,391 / 244,009,565, StdDev: 23,209,902
+  LIKE literal contains predicate (rows/sec) [PASS/OK]:
+    Runs: [82,082,937, 87,717,759, 75,101,011, 87,539,612, 74,364,924]
+    Average: 81,361,248 >= 50,000,000 (target)
+    Min/Max: 74,364,924 / 87,717,759, StdDev: 5,783,379
+
+=== Window Explicit Frame Throughput Test ===
+Rows: 200000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Window frame: 41,638,907 rows/sec (4.8032ms)
+
+--- Run 2/5 ---
+  Window frame: 45,344,276 rows/sec (4.4107ms)
+
+--- Run 3/5 ---
+  Window frame: 45,685,047 rows/sec (4.3778ms)
+
+--- Run 4/5 ---
+  Window frame: 45,253,988 rows/sec (4.4195ms)
+
+--- Run 5/5 ---
+  Window frame: 44,880,282 rows/sec (4.4563ms)
+
+=== Window Frame Validation Results ===
+  Window explicit frame throughput (rows/sec) [PASS/OK]:
+    Runs: [41,638,907, 45,344,276, 45,685,047, 45,253,988, 44,880,282]
+    Average: 44,560,500 >= 9,000,000 (target)
+    Min/Max: 41,638,907 / 45,685,047, StdDev: 1,483,091
+
+=== Window Partitioned Running Sum Throughput Test ===
+Rows: 500000, partitions: 1000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Window partitioned: 19,104,751 rows/sec (26.1715ms)
+
+--- Run 2/5 ---
+  Window partitioned: 23,015,383 rows/sec (21.7246ms)
+
+--- Run 3/5 ---
+  Window partitioned: 24,812,418 rows/sec (20.1512ms)
+
+--- Run 4/5 ---
+  Window partitioned: 24,379,660 rows/sec (20.5089ms)
+
+--- Run 5/5 ---
+  Window partitioned: 23,562,233 rows/sec (21.2204ms)
+
+=== Window Partitioned Validation Results ===
+  Window partitioned running sum throughput (rows/sec) [PASS/OK]:
+    Runs: [19,104,751, 23,015,383, 24,812,418, 24,379,660, 23,562,233]
+    Average: 22,974,889 >= 12,000,000 (target)
+    Min/Max: 19,104,751 / 24,812,418, StdDev: 2,033,444

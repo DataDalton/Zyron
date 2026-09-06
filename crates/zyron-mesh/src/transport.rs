@@ -37,10 +37,12 @@ use tokio::net::TcpStream;
 
 use crate::rpc::{
     BeginDrainRequest, CancelProvisioningRequest, DrainStatus, DrainStatusRequest, HotSetChunk,
-    HotSetManifestRequest, MeshFuture, MeshRpc, MeshRpcError, NodeRef, PATH_BEGIN_DRAIN,
-    PATH_CANCEL_PROVISIONING, PATH_DRAIN_STATUS, PATH_HOT_SET_MANIFEST, PATH_PREFETCH,
-    PATH_RELOCATE_SESSION, PrefetchRequest, PrefetchStatus, RelocateSessionRequest,
-    RelocationOutcome,
+    HotSetManifestRequest, MeshFuture, MeshRpc, MeshRpcError, NodeAck, NodeRef, NodeStatus,
+    NodeStatusRequest, PATH_BEGIN_DRAIN, PATH_CANCEL_PROVISIONING, PATH_DRAIN_STATUS,
+    PATH_HOT_SET_MANIFEST, PATH_NODE_STATUS, PATH_PREFETCH, PATH_RELOCATE_SESSION,
+    PATH_RESTART_INTO_STAGED, PATH_ROLLBACK_TO_PREVIOUS, PATH_SET_CLUSTER_SETTING,
+    PATH_STAGE_RELEASE, PrefetchRequest, PrefetchStatus, RelocateSessionRequest, RelocationOutcome,
+    RestartRequest, RollbackRequest, SetClusterSettingRequest, StageReleaseRequest,
 };
 
 /// How long a call waits before giving up, when the request does not say.
@@ -415,6 +417,96 @@ impl MeshRpc for HttpMeshRpc {
                     what: "the node holding the ticket".into(),
                 }),
             }
+        })
+    }
+
+    fn node_status(&self, request: NodeStatusRequest) -> MeshFuture<'_, NodeStatus> {
+        Box::pin(async move {
+            if !request.valid() {
+                return Err(MeshRpcError::Malformed {
+                    field: "node_status.target".into(),
+                });
+            }
+            let target = request.target.clone();
+            self.call(
+                &target,
+                PATH_NODE_STATUS,
+                &request,
+                self.acknowledge_timeout(),
+            )
+            .await
+        })
+    }
+
+    fn stage_release(&self, request: StageReleaseRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            if !request.valid() {
+                return Err(MeshRpcError::Malformed {
+                    field: "stage_release.version".into(),
+                });
+            }
+            let target = request.target.clone();
+            self.call(
+                &target,
+                PATH_STAGE_RELEASE,
+                &request,
+                self.acknowledge_timeout(),
+            )
+            .await
+        })
+    }
+
+    fn set_cluster_setting(&self, request: SetClusterSettingRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            if !request.valid() {
+                return Err(MeshRpcError::Malformed {
+                    field: "set_cluster_setting.key".into(),
+                });
+            }
+            let target = request.target.clone();
+            self.call(
+                &target,
+                PATH_SET_CLUSTER_SETTING,
+                &request,
+                self.acknowledge_timeout(),
+            )
+            .await
+        })
+    }
+
+    fn restart_into_staged(&self, request: RestartRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            if !request.valid() {
+                return Err(MeshRpcError::Malformed {
+                    field: "restart_into_staged.version".into(),
+                });
+            }
+            let target = request.target.clone();
+            self.call(
+                &target,
+                PATH_RESTART_INTO_STAGED,
+                &request,
+                self.acknowledge_timeout(),
+            )
+            .await
+        })
+    }
+
+    fn rollback_to_previous(&self, request: RollbackRequest) -> MeshFuture<'_, NodeAck> {
+        Box::pin(async move {
+            if !request.valid() {
+                return Err(MeshRpcError::Malformed {
+                    field: "rollback_to_previous.target".into(),
+                });
+            }
+            let target = request.target.clone();
+            self.call(
+                &target,
+                PATH_ROLLBACK_TO_PREVIOUS,
+                &request,
+                self.acknowledge_timeout(),
+            )
+            .await
         })
     }
 }

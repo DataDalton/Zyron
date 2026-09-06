@@ -73,6 +73,10 @@ pub enum EnvelopeError {
     /// The declared header length does not fit the slice or is below the
     /// fixed minimum
     BadHeaderLength { declared: u32, have: usize },
+    /// A record's version tag is a reserved value rather than a version.
+    /// Zero means the slot was never written, 255 means the wide escape
+    /// reached a reader that has only the one byte to work with
+    BadRecordVersion { found: u8 },
     /// The header checksum does not match the header bytes
     HeaderChecksumMismatch { stored: u32, computed: u32 },
     /// The footer checksum does not match the body bytes
@@ -110,6 +114,19 @@ impl std::fmt::Display for EnvelopeError {
                 "format envelope declares a {declared} byte header, which does not fit \
                  the {have} bytes present"
             ),
+            EnvelopeError::BadRecordVersion { found } => match *found {
+                0 => write!(
+                    f,
+                    "record carries no version tag, the slot reads as never written"
+                ),
+                255 => write!(
+                    f,
+                    "record version 255 is the wide escape, so its version is carried in \
+                     two bytes this reader did not read. Upgrade through a release that \
+                     reads the wide tag to replay this record"
+                ),
+                other => write!(f, "record version {other} is not a usable tag"),
+            },
             EnvelopeError::HeaderChecksumMismatch { stored, computed } => write!(
                 f,
                 "format envelope header checksum mismatch, stored {stored:#010x} \

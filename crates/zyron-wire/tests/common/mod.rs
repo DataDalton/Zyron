@@ -222,6 +222,9 @@ async fn create_test_server_configured(
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
         password_encryption: "balloon-sha-256".into(),
+        admission: Arc::new(zyron_common::Admission::new()),
+        query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
+        upgrade_control: None,
     });
     (state, public_schema, security_manager, tmp)
 }
@@ -431,6 +434,26 @@ pub async fn exec_dml_result(
     outcome
 }
 
+/// Ends a statement's implicit transaction the way a connection does.
+///
+/// A transaction that appended a WAL record commits durably and then
+/// publishes the lake versions written under it. One that only read has
+/// nothing to make durable, so it releases its slot with no commit record
+/// and no flush wait, which keeps a read-only statement's time the engine's
+/// rather than the device's
+pub async fn end_statement(
+    server: &Arc<ServerState>,
+    txn: &mut zyron_storage::txn::Transaction,
+) -> Result<(), zyron_common::ZyronError> {
+    if !txn.wrote_data() {
+        return server.txn_manager.commit_read_only(txn);
+    }
+    server.txn_manager.commit(txn).await?;
+    let logs = zyron_lake::publish_txn(server.disk_manager.data_dir(), txn.txn_id)?;
+    zyron_wire::connection::refresh_lake_stats(server, &logs);
+    Ok(())
+}
+
 pub async fn query_rows(server: &Arc<ServerState>, sql: &str) -> usize {
     let stmt = zyron_parser::parse(sql)
         .expect("parse")
@@ -490,7 +513,7 @@ pub async fn query_rows(server: &Arc<ServerState>, sql: &str) -> usize {
     }
     let ctx = Arc::new(ctx);
     let batches = zyron_executor::execute(plan, &ctx).await.expect("execute");
-    server.txn_manager.commit(&mut txn).await.expect("commit");
+    end_statement(server, &mut txn).await.expect("commit");
     batches.iter().map(|b| b.num_rows).sum()
 }
 
@@ -548,7 +571,7 @@ pub async fn query_error(server: &Arc<ServerState>, sql: &str) -> String {
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
-    let _ = server.txn_manager.commit(&mut txn).await;
+    let _ = end_statement(server, &mut txn).await;
     match result {
         Ok(batches) => panic!(
             "expected {sql} to fail, got {} rows",
@@ -612,7 +635,7 @@ pub async fn query_result(
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
-    let _ = server.txn_manager.commit(&mut txn).await;
+    let _ = end_statement(server, &mut txn).await;
     match result {
         Ok(batches) => Ok(batches
             .iter()
@@ -632,20 +655,31 @@ pub async fn query_result(
 /// A row count matching is not the answers matching, and a timing taken
 /// against a different answer measures a cheaper wrong thing
 pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<ScalarValue>> {
-    let stmt = zyron_parser::parse(sql)
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("one statement");
-    let plan = zyron_planner::plan(
-        &server.catalog,
-        DatabaseId(1),
-        vec!["zyron_test".into()],
-        stmt,
-        None,
-    )
-    .await
-    .expect("plan");
+    // The statement phases a connection records, so a profiled run through
+    // the harness decomposes the same way one through the wire does.
+    // Compiled in by --features profile, gated at runtime by ZYRON_PROFILE
+    use zyron_common::profile::{Phase, scope};
+    let stmt = {
+        let _s = scope(Phase::WireRecvParse);
+        zyron_parser::parse(sql)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one statement")
+    };
+    let plan = {
+        let _s = scope(Phase::WirePlan);
+        zyron_planner::plan(
+            &server.catalog,
+            DatabaseId(1),
+            vec!["zyron_test".into()],
+            stmt,
+            None,
+        )
+        .await
+        .expect("plan")
+    };
+    let setup = scope(Phase::WireExecSetup);
     let mut txn = server
         .txn_manager
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
@@ -689,9 +723,17 @@ pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<Scala
         ctx.set_spatial_manager(Arc::clone(mgr));
     }
     let ctx = Arc::new(ctx);
-    let batches = zyron_executor::execute(plan, &ctx).await.expect("execute");
-    server.txn_manager.commit(&mut txn).await.expect("commit");
+    drop(setup);
+    let batches = {
+        let _s = scope(Phase::WireExecute);
+        zyron_executor::execute(plan, &ctx).await.expect("execute")
+    };
+    {
+        let _s = scope(Phase::WireAutoCommit);
+        end_statement(server, &mut txn).await.expect("commit");
+    }
 
+    let _s = scope(Phase::WireSend);
     let mut rows = Vec::new();
     for batch in &batches {
         for r in 0..batch.num_rows {
@@ -755,7 +797,7 @@ pub async fn try_query_values(
     let result = zyron_executor::execute(plan, &ctx).await;
     match result {
         Ok(batches) => {
-            server.txn_manager.commit(&mut txn).await.expect("commit");
+            end_statement(server, &mut txn).await.expect("commit");
             let mut rows = Vec::new();
             for batch in &batches {
                 for r in 0..batch.num_rows {
@@ -1066,7 +1108,7 @@ pub async fn analyze(
     let (_batches, metrics) = zyron_executor::execute_analyze(plan, &ctx)
         .await
         .expect("analyze");
-    server.txn_manager.commit(&mut txn).await.expect("commit");
+    end_statement(server, &mut txn).await.expect("commit");
 
     let metrics = metrics.expect("analyze mode produces metrics");
     let node_metrics = node_metrics_of(&metrics);

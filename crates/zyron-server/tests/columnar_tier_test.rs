@@ -1709,3 +1709,264 @@ async fn a_query_reading_a_promoted_path_names_it_in_the_plan_and_answers_from_t
         "the query answered with something other than what the documents hold"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rejecting a segment from its value bloom
+// ---------------------------------------------------------------------------
+
+/// A folded table a scan can be built against, with the catalog shared so
+/// an execution context can hold it
+struct SparseFold {
+    wal_dir: std::path::PathBuf,
+    catalog: Arc<Catalog>,
+    disk: Arc<DiskManager>,
+    table_id: zyron_catalog::TableId,
+}
+
+/// Folds rows of (k BIGINT, name TEXT, v BIGINT) whose keys step by three, so
+/// every value inside the column's own bounds that no row holds is a value
+/// only a membership answer can reject
+async fn fold_sparse_keys(tmp: &tempfile::TempDir, rows: i64) -> SparseFold {
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let columnar_dir = data_dir.join("columnar");
+
+    let disk = Arc::new(
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
+            .await
+            .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
+
+    let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+    storage.init_cache().await.unwrap();
+    let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
+    let cache = Arc::new(CatalogCache::new(1024, 256));
+    let catalog = Arc::new(
+        Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
+            .await
+            .unwrap(),
+    );
+    let db = catalog.create_database("db", "admin").await.unwrap();
+    let schema = catalog.create_schema(db, "app", "admin").await.unwrap();
+    let cols = vec![
+        col("k", DataType::BigInt),
+        col("name", DataType::Text),
+        col("v", DataType::BigInt),
+    ];
+    let table_id = catalog
+        .create_table(schema, "events", &cols, &[])
+        .await
+        .unwrap();
+    let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
+
+    let te = catalog.get_table_by_id(table_id).unwrap();
+    let heap = HeapFile::new(
+        Arc::clone(&disk),
+        Arc::clone(&pool),
+        HeapFileConfig {
+            heap_file_id: te.heap_file_id,
+            fsm_file_id: te.fsm_file_id,
+        },
+    )
+    .unwrap();
+    let mut tuples = Vec::new();
+    for i in 0..rows {
+        let k = i * 3;
+        tuples.push(Tuple::new(
+            encode_row(k, &format!("name-{:05}", k), i * 100),
+            1,
+        ));
+    }
+    heap.insert_batch(&tuples).await.unwrap();
+    heap.flush().await.unwrap();
+
+    let cfg = CompactionWorkerConfig {
+        min_rows: 4,
+        columnar_dir: columnar_dir.clone(),
+        ..CompactionWorkerConfig::default()
+    };
+    let (folded, segs) = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None, None,
+        )
+    });
+    assert_eq!(folded, rows as u64, "all rows folded");
+    assert!(segs >= 1, "at least one segment registered");
+
+    SparseFold {
+        wal_dir,
+        catalog,
+        disk,
+        table_id,
+    }
+}
+
+/// A value bloom is built for every high cardinality column a segment holds,
+/// and nothing read one back: the columnar scan pruned on header bounds and
+/// zone maps alone, and both only say a constant falls inside a range they
+/// cover. For a column whose values are spread across its range every zone
+/// covers every constant, so an equality no row satisfies still decoded the
+/// whole segment, and a text column had no pruning at all.
+///
+/// The keys step by three, so a constant between two of them is inside the
+/// bounds and inside a zone. Nothing but a membership answer can reject it,
+/// which is what makes a skip here evidence of the bloom rather than of the
+/// bounds check that was already there
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn columnar_scan_rejects_a_segment_its_value_bloom_denies() {
+    use zyron_parser::ast::{BinaryOperator, LiteralValue};
+    use zyron_planner::binder::{BoundExpr, ColumnRef};
+    use zyron_storage::txn::TxnStatusMap;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let f = fold_sparse_keys(&tmp, 400).await;
+    let catalog = Arc::clone(&f.catalog);
+    let te = f.catalog.get_table_by_id(f.table_id).unwrap();
+    let segments = te.columnar.segments.len();
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(f.wal_dir.clone())).unwrap());
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
+    let status = Arc::new(TxnStatusMap::new());
+
+    let column = |name: &str| -> LogicalColumn {
+        let c = te.columns.iter().find(|c| c.name == name).expect("column");
+        LogicalColumn {
+            table_idx: Some(0),
+            column_id: c.id,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+        }
+    };
+    let kcol = column("k");
+    let namecol = column("name");
+
+    let eq = |c: &LogicalColumn, lit: LiteralValue| BoundExpr::BinaryOp {
+        left: Box::new(BoundExpr::ColumnRef(ColumnRef {
+            table_idx: 0,
+            column_id: c.column_id,
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+        })),
+        op: BinaryOperator::Eq,
+        right: Box::new(BoundExpr::Literal {
+            value: lit,
+            type_id: c.type_id,
+        }),
+        type_id: zyron_common::types::TypeId::Boolean,
+    };
+
+    // Runs one scan and reports the k values it returned beside the segments
+    // its predicate rejected before decoding any column of them
+    async fn run(
+        f: &SparseFold,
+        catalog: &Arc<Catalog>,
+        wal: &Arc<WalWriter>,
+        pool: &Arc<BufferPool>,
+        status: &Arc<TxnStatusMap>,
+        projection: Vec<LogicalColumn>,
+        predicate: BoundExpr,
+    ) -> (Vec<i64>, usize) {
+        let snapshot = Snapshot::new(200, vec![], Arc::clone(status));
+        let ctx = Arc::new(ExecutionContext::new(
+            Arc::clone(catalog),
+            Arc::clone(wal),
+            Arc::clone(pool),
+            Arc::clone(&f.disk),
+            200,
+            snapshot,
+        ));
+        let mut op = ColumnScanOperator::new(ctx, f.table_id, projection, Some(predicate)).unwrap();
+        let mut got = Vec::new();
+        while let Some(eb) = op.next().await.unwrap() {
+            let b = eb.batch;
+            if let Some(c) = b.columns.first() {
+                for r in 0..b.num_rows {
+                    if let ScalarValue::Int64(v) = c.get_scalar(r) {
+                        got.push(v);
+                    }
+                }
+            }
+        }
+        got.sort();
+        (got, op.segments_skipped())
+    }
+
+    // A text value between two the segment holds, so its bytes sort inside
+    // the column's own bounds
+    let (rows, skipped) = run(
+        &f,
+        &catalog,
+        &wal,
+        &pool,
+        &status,
+        vec![kcol.clone(), namecol.clone()],
+        eq(&namecol, LiteralValue::String("name-00004".into())),
+    )
+    .await;
+    assert!(rows.is_empty(), "a name no row holds returned rows");
+    assert_eq!(
+        skipped, segments,
+        "the bloom did not reject a text value no segment holds"
+    );
+
+    // The same shape for a value that is there, which the bloom must admit
+    let (rows, skipped) = run(
+        &f,
+        &catalog,
+        &wal,
+        &pool,
+        &status,
+        vec![kcol.clone(), namecol.clone()],
+        eq(&namecol, LiteralValue::String("name-00135".into())),
+    )
+    .await;
+    assert_eq!(rows, vec![135], "the row holding the name was not returned");
+    assert!(
+        skipped < segments,
+        "every segment was skipped, including the one holding the name"
+    );
+
+    // An integer equality between two keys, inside the bounds and inside a
+    // zone, so the checks that were already there both admit it
+    let (rows, skipped) = run(
+        &f,
+        &catalog,
+        &wal,
+        &pool,
+        &status,
+        vec![kcol.clone()],
+        eq(&kcol, LiteralValue::Integer(4)),
+    )
+    .await;
+    assert!(rows.is_empty(), "a k no row holds returned rows");
+    assert_eq!(
+        skipped, segments,
+        "the bloom did not reject a k no segment holds"
+    );
+
+    let (rows, skipped) = run(
+        &f,
+        &catalog,
+        &wal,
+        &pool,
+        &status,
+        vec![kcol.clone()],
+        eq(&kcol, LiteralValue::Integer(135)),
+    )
+    .await;
+    assert_eq!(rows, vec![135], "the row holding k was not returned");
+    assert!(
+        skipped < segments,
+        "every segment was skipped, including the one holding k"
+    );
+}

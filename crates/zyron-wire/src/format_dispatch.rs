@@ -7,15 +7,15 @@
 //! guessing what happened
 
 use zyron_common::ZyronError;
-use zyron_common::format::rewrite::{ObjectKind, UserObjectRewritePolicy};
+use zyron_common::format::FormatKind;
+use zyron_common::format::rewrite::{ObjectKind, RewriteCategory, UserObjectRewritePolicy};
 use zyron_common::format::scheme::ArtifactKind;
 use zyron_common::format::upgrade::parse_duration_secs;
-use zyron_common::format::{FormatKind, UpgradePhase};
 use zyron_parser::ast::{
-    ExplainRewriteStatement, ListRegistryStatement, ListRegistryTarget,
-    RotateServicePrincipalKeyStatement, RotateSignatureSchemeStatement,
-    SetSignatureSchemeStatement, ShowUpgradeStatement, ShowUpgradeTarget, TriggerUpgradeAction,
-    TriggerUpgradeStatement,
+    AcknowledgeRewriteCategory, AcknowledgeUpgradeRewritesStatement, ExplainRewriteStatement,
+    ListRegistryStatement, ListRegistryTarget, RotateServicePrincipalKeyStatement,
+    RotateSignatureSchemeStatement, SetSignatureSchemeStatement, ShowUpgradeStatement,
+    ShowUpgradeTarget, TriggerUpgradeAction, TriggerUpgradeStatement,
 };
 
 use crate::ddl_dispatch::DdlResult;
@@ -23,29 +23,94 @@ use crate::messages::ProtocolError;
 use crate::types::{PG_INT8_OID, PG_TEXT_OID};
 
 /// The settings `ALTER SYSTEM SET` routes to the upgrade board rather than
-/// straight to the config file
-pub const UPGRADE_SETTING_KEYS: &[&str] = &[
-    "upgrade_channel",
-    "pinned_version",
-    "auto_upgrade_enabled",
-    "auto_upgrade_window",
-    "auto_upgrade_paused",
-    "user_object_rewrite_policy",
-    "release_feed_poll_interval",
-    "federation_coordination_timeout",
-    "pre_upgrade_backup_snapshot",
-    "rollback_on_health_fail",
-    "deprecation_warning_rate_limit_per_hour",
+/// straight to the config file, each paired with the config key it persists
+/// under so the next boot reads back what the statement set
+pub const UPGRADE_SETTING_KEYS: &[(&str, &str)] = &[
+    ("upgrade_channel", "upgrade.channel"),
+    ("pinned_version", "upgrade.pinned_version"),
+    ("auto_upgrade_enabled", "upgrade.auto_upgrade_enabled"),
+    ("auto_upgrade_window", "upgrade.window"),
+    ("auto_upgrade_paused", "upgrade.paused"),
+    (
+        "user_object_rewrite_policy",
+        "upgrade.user_object_rewrite_policy",
+    ),
+    (
+        "release_feed_poll_interval",
+        "upgrade.release_feed_poll_interval_secs",
+    ),
+    (
+        "federation_coordination_timeout",
+        "upgrade.federation_coordination_timeout_secs",
+    ),
+    (
+        "pre_upgrade_backup_snapshot",
+        "upgrade.pre_upgrade_backup_snapshot",
+    ),
+    ("rollback_on_health_fail", "upgrade.rollback_on_health_fail"),
+    (
+        "deprecation_warning_rate_limit_per_hour",
+        "upgrade.deprecation_warning_rate_limit_per_hour",
+    ),
 ];
 
 /// Whether a setting name is one the upgrade board owns
 pub fn owns_setting(name: &str) -> bool {
-    UPGRADE_SETTING_KEYS
-        .iter()
-        .any(|key| key.eq_ignore_ascii_case(name))
+    config_key(name).is_some()
 }
 
-fn now_secs() -> u64 {
+/// The config key an upgrade setting persists under, None for a name the
+/// board does not own
+pub fn config_key(name: &str) -> Option<&'static str> {
+    UPGRADE_SETTING_KEYS
+        .iter()
+        .find(|(setting, _)| setting.eq_ignore_ascii_case(name))
+        .map(|(_, key)| *key)
+}
+
+/// The setting name a config key under the upgrade section belongs to,
+/// None for a key the board does not own. This is what a node applies a
+/// replicated setting through, since the log carries the config key
+pub fn setting_for_config_key(key: &str) -> Option<&'static str> {
+    UPGRADE_SETTING_KEYS
+        .iter()
+        .find(|(_, config)| *config == key)
+        .map(|(setting, _)| *setting)
+}
+
+/// What the server's upgrade controller lets the DDL surface ask of it.
+///
+/// The controller lives above this crate, beside the journal, the release
+/// feed, and the cluster it drives. The statements here record an operator's
+/// intent and the controller carries it out on its next pass, so every method
+/// returns once the intent is written and never waits on the work
+pub trait UpgradeControl: Send + Sync {
+    /// Records a request to upgrade the cluster to one version
+    fn request_upgrade(&self, version: &str, actor: &str, now_secs: u64) -> Result<(), ZyronError>;
+
+    /// Records a request to roll the last upgrade back. Refuses when the
+    /// data on disk can no longer be read by the version it would return to
+    fn request_rollback(&self, actor: &str, now_secs: u64) -> Result<(), ZyronError>;
+
+    /// Acknowledges every rewrite of one category that waits on an operator
+    /// and applies what the acknowledgment unblocks. Returns how many records
+    /// moved
+    fn acknowledge_rewrites(
+        &self,
+        category: RewriteCategory,
+        actor: &str,
+        now_secs: u64,
+    ) -> Result<usize, ZyronError>;
+}
+
+fn without_controller() -> ProtocolError {
+    refused(
+        "this node runs without an upgrade controller, so there is nothing to carry the \
+         request out",
+    )
+}
+
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -216,9 +281,15 @@ pub fn handle_list_registry(stmt: &ListRegistryStatement) -> Result<DdlResult, P
 
 /// `TRIGGER MANUAL UPGRADE TO '<version>'` or `TRIGGER MANUAL ROLLBACK`
 ///
-/// Both record the operator's intent on the upgrade board. The orchestrator
-/// is what carries it out, and reads the board on its next pass
-pub fn handle_trigger_upgrade(stmt: &TriggerUpgradeStatement) -> Result<DdlResult, ProtocolError> {
+/// Both hand the operator's intent to the upgrade controller, which records
+/// it and carries it out on its next pass. The checks that need nothing but
+/// the board run here first, so a malformed request is refused before the
+/// controller is asked
+pub fn handle_trigger_upgrade(
+    stmt: &TriggerUpgradeStatement,
+    control: Option<&dyn UpgradeControl>,
+    actor: &str,
+) -> Result<DdlResult, ProtocolError> {
     let board = zyron_common::format::upgrade_board();
     let now = now_secs();
     match &stmt.action {
@@ -228,41 +299,51 @@ pub fn handle_trigger_upgrade(stmt: &TriggerUpgradeStatement) -> Result<DdlResul
                     "`{version}` is not a major.minor.patch version"
                 )));
             }
-            let settings = board.settings();
-            if settings.paused {
+            if board.settings().paused {
                 return Err(refused(
                     "auto_upgrade_paused is true. Set it false before triggering an upgrade",
                 ));
             }
-            board.set_node_state(zyron_common::format::NodeUpgradeState {
-                node_id: "this-node".to_string(),
-                from_version: env!("CARGO_PKG_VERSION").to_string(),
-                to_version: version.clone(),
-                phase: UpgradePhase::Detected,
-                started_at_secs: now,
-                updated_at_secs: now,
-                is_leader: false,
-                message: format!("manual upgrade to {version} requested"),
-            });
+            let control = control.ok_or_else(without_controller)?;
+            control
+                .request_upgrade(version, actor, now)
+                .map_err(database)?;
             Ok(DdlResult::Tag(format!("TRIGGER MANUAL UPGRADE {version}")))
         }
         TriggerUpgradeAction::Rollback => {
-            let states = board.node_states();
-            if states.is_empty() {
-                return Err(refused(
-                    "there is no upgrade to roll back. `SHOW UPGRADE STATE` reports what \
-                     this node is doing",
-                ));
-            }
-            for mut state in states {
-                state.phase = UpgradePhase::RollingBack;
-                state.updated_at_secs = now;
-                state.message = "manual rollback requested".to_string();
-                board.set_node_state(state);
-            }
+            let control = control.ok_or_else(without_controller)?;
+            control.request_rollback(actor, now).map_err(database)?;
             Ok(DdlResult::Tag("TRIGGER MANUAL ROLLBACK".to_string()))
         }
     }
+}
+
+/// `ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS` or `ACKNOWLEDGE UPGRADE REWRITES UNSAFE`
+///
+/// Answers with how many records the acknowledgment moved, so an operator
+/// who acknowledged a category with nothing waiting in it sees zero rather
+/// than a tag that looks like something happened
+pub fn handle_acknowledge_upgrade_rewrites(
+    stmt: &AcknowledgeUpgradeRewritesStatement,
+    control: Option<&dyn UpgradeControl>,
+    actor: &str,
+) -> Result<DdlResult, ProtocolError> {
+    let category = match stmt.category {
+        AcknowledgeRewriteCategory::Ambiguous => RewriteCategory::Ambiguous,
+        AcknowledgeRewriteCategory::Unsafe => RewriteCategory::Unsafe,
+    };
+    let control = control.ok_or_else(without_controller)?;
+    let moved = control
+        .acknowledge_rewrites(category, actor, now_secs())
+        .map_err(database)?;
+    Ok(DdlResult::Rows {
+        tag: "ACKNOWLEDGE UPGRADE REWRITES".to_string(),
+        columns: vec![
+            ("category".to_string(), PG_TEXT_OID),
+            ("acknowledged".to_string(), PG_INT8_OID),
+        ],
+        rows: vec![vec![category.label().to_string(), moved.to_string()]],
+    })
 }
 
 /// `SHOW UPGRADE STATE` and `SHOW FORMAT MIGRATIONS [FOR FORMAT <kind>]`
@@ -610,9 +691,9 @@ mod tests {
 
     #[test]
     fn test_owns_setting_covers_the_documented_keys() {
-        for key in UPGRADE_SETTING_KEYS {
-            assert!(owns_setting(key));
-            assert!(owns_setting(&key.to_uppercase()));
+        for (setting, _) in UPGRADE_SETTING_KEYS {
+            assert!(owns_setting(setting));
+            assert!(owns_setting(&setting.to_uppercase()));
         }
         assert!(!owns_setting("shared_buffers"));
     }
@@ -665,10 +746,132 @@ mod tests {
 
     #[test]
     fn test_a_manual_upgrade_to_a_bad_version_is_refused() {
-        let err = handle_trigger_upgrade(&TriggerUpgradeStatement {
-            action: TriggerUpgradeAction::UpgradeTo("latest".to_string()),
-        })
+        let err = handle_trigger_upgrade(
+            &TriggerUpgradeStatement {
+                action: TriggerUpgradeAction::UpgradeTo("latest".to_string()),
+            },
+            None,
+            "operator",
+        )
         .expect_err("refused");
         assert!(err.to_string().contains("major.minor.patch"), "{err}");
+    }
+
+    /// A controller that records what it was asked, so the statements can
+    /// be checked for what they hand over
+    struct Recording {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl UpgradeControl for Recording {
+        fn request_upgrade(
+            &self,
+            version: &str,
+            actor: &str,
+            _now_secs: u64,
+        ) -> Result<(), ZyronError> {
+            self.asked
+                .lock()
+                .expect("test lock")
+                .push(format!("upgrade {version} by {actor}"));
+            Ok(())
+        }
+        fn request_rollback(&self, actor: &str, _now_secs: u64) -> Result<(), ZyronError> {
+            self.asked
+                .lock()
+                .expect("test lock")
+                .push(format!("rollback by {actor}"));
+            Err(ZyronError::UpgradeRefused(
+                "there is no upgrade to roll back".into(),
+            ))
+        }
+        fn acknowledge_rewrites(
+            &self,
+            category: RewriteCategory,
+            actor: &str,
+            _now_secs: u64,
+        ) -> Result<usize, ZyronError> {
+            self.asked
+                .lock()
+                .expect("test lock")
+                .push(format!("acknowledge {category} by {actor}"));
+            Ok(2)
+        }
+    }
+
+    #[test]
+    fn test_manual_statements_reach_the_controller_with_the_operator_named() {
+        let control = Recording {
+            asked: std::sync::Mutex::new(Vec::new()),
+        };
+        let board = zyron_common::format::upgrade_board();
+        board.update_settings(|settings| settings.paused = false);
+        handle_trigger_upgrade(
+            &TriggerUpgradeStatement {
+                action: TriggerUpgradeAction::UpgradeTo("9.9.9".to_string()),
+            },
+            Some(&control),
+            "ana",
+        )
+        .expect("recorded");
+        let err = handle_trigger_upgrade(
+            &TriggerUpgradeStatement {
+                action: TriggerUpgradeAction::Rollback,
+            },
+            Some(&control),
+            "ana",
+        )
+        .expect_err("the controller refused");
+        assert!(err.to_string().contains("no upgrade to roll back"), "{err}");
+        match handle_acknowledge_upgrade_rewrites(
+            &AcknowledgeUpgradeRewritesStatement {
+                category: AcknowledgeRewriteCategory::Unsafe,
+            },
+            Some(&control),
+            "ana",
+        )
+        .expect("acknowledged")
+        {
+            DdlResult::Rows { rows, .. } => assert_eq!(rows, vec![vec!["unsafe", "2"]]),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        assert_eq!(
+            *control.asked.lock().expect("test lock"),
+            vec![
+                "upgrade 9.9.9 by ana",
+                "rollback by ana",
+                "acknowledge unsafe by ana"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_without_a_controller_a_manual_statement_is_refused_not_dropped() {
+        let err = handle_acknowledge_upgrade_rewrites(
+            &AcknowledgeUpgradeRewritesStatement {
+                category: AcknowledgeRewriteCategory::Ambiguous,
+            },
+            None,
+            "ana",
+        )
+        .expect_err("refused");
+        assert!(
+            err.to_string().contains("without an upgrade controller"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_every_upgrade_setting_persists_under_the_upgrade_section() {
+        for (setting, key) in UPGRADE_SETTING_KEYS {
+            assert!(owns_setting(setting));
+            assert_eq!(config_key(setting), Some(*key));
+            assert!(key.starts_with("upgrade."), "{key}");
+        }
+        assert_eq!(config_key("max_connections"), None);
+        for (setting, key) in UPGRADE_SETTING_KEYS {
+            assert_eq!(setting_for_config_key(key), Some(*setting));
+        }
+        assert_eq!(setting_for_config_key("server.port"), None);
     }
 }

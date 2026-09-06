@@ -1591,10 +1591,10 @@ impl BTreeIndex {
         Ok(self.range_scan_sync(None, None))
     }
 
-    /// Writes a compact V2 checkpoint of the current B+Tree to disk.
+    /// Writes a checkpoint of the current B+Tree to disk.
     ///
-    /// Extracts all leaf entries, LZ4-compresses them, writes to a single file.
-    /// Uses atomic rename (write to .tmp, rename to final) for crash safety.
+    /// Extracts every leaf entry into the columnar checkpoint body and writes
+    /// it through a temp file and an atomic rename for crash safety
     pub fn force_checkpoint(&self, current_lsn: u64) -> Result<()> {
         // Hold root_change_lock so the tree height and root_page_num
         // do not shift mid-checkpoint. Leaf-level splits below the root

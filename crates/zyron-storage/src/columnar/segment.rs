@@ -9,7 +9,7 @@ use crate::columnar::constants::*;
 use crate::columnar::sketch::DistinctSketch;
 use crate::encoding::{
     ColumnSampleStats, EncodingType, cardinality_cap, create_encoding, select_encoding_prepared,
-    select_encoding_varlen, varlen_pack,
+    select_encoding_varlen_prepared, varlen_pack,
 };
 use zyron_common::types::TypeId;
 use zyron_common::{Result, ZyronError};
@@ -808,7 +808,7 @@ impl ColumnSegment {
         }
 
         if valueSize == 0 {
-            return Self::build_varlen(columnId, typeId, values, options);
+            return Self::build_varlen(columnId, values, options);
         }
 
         // Pack the cells into the buffer the encoder reads.
@@ -1237,7 +1237,6 @@ impl ColumnSegment {
     /// distinct.
     fn build_varlen(
         columnId: u32,
-        typeId: TypeId,
         values: &[Option<&[u8]>],
         options: SegmentOptions,
     ) -> Result<Self> {
@@ -1248,10 +1247,16 @@ impl ColumnSegment {
 
         let mut nullCount = 0u64;
         let mut nullBitmap: Vec<u8> = Vec::new();
-        // Variable-length selection runs its own statistics over the packed
-        // buffer, so the only reader of this count is the bloom threshold
-        let mut distinct =
-            DistinctTracker::new(options.distinct_sketch, BLOOM_MIN_CARDINALITY as usize);
+        // Counted far enough for both readers of the count: the bloom
+        // threshold, and the dictionary decision that selection would
+        // otherwise walk the column a second time to make
+        let mut distinct = DistinctTracker::new(
+            options.distinct_sketch,
+            cardinality_cap(rowCount).max(BLOOM_MIN_CARDINALITY as usize),
+        );
+        // Adjacent non-null values that differ, plus one, which is what
+        // decides whether the column is one repeated value
+        let mut runCount = 1usize;
         let mut segmentMin: Option<(usize, &[u8])> = None;
         let mut segmentMax: Option<(usize, &[u8])> = None;
         let mut isSorted = true;
@@ -1301,11 +1306,13 @@ impl ColumnSegment {
                         zoneMax = Some((i, v));
                     }
 
-                    if isSorted
-                        && let Some(prev) = prevRaw
-                        && v.cmp(prev) == std::cmp::Ordering::Less
-                    {
-                        isSorted = false;
+                    if let Some(prev) = prevRaw {
+                        if v != prev {
+                            runCount += 1;
+                        }
+                        if isSorted && v.cmp(prev) == std::cmp::Ordering::Less {
+                            isSorted = false;
+                        }
                     }
                     prevRaw = Some(v);
                 }
@@ -1354,9 +1361,22 @@ impl ColumnSegment {
         let rawData = varlen_pack(values);
         let rawSize = rawData.len() as u64;
 
-        let encodingType = select_encoding_varlen(typeId, values);
-        let encoder = create_encoding(encodingType);
-        let encodedData = encoder.encode(&rawData, rowCount, 0)?;
+        // Selection reads the statistics the pass above gathered and, under
+        // exact selection, hands back the bytes its whole-column trial
+        // produced, so the column is walked once and encoded once
+        let allIdentical = nullCount as usize == rowCount || (nullCount == 0 && runCount == 1);
+        let stats = ColumnSampleStats {
+            cardinality: distinct.estimated(),
+            run_count: runCount,
+            all_identical: allIdentical,
+        };
+        let choice =
+            select_encoding_varlen_prepared(rowCount, stats, values, options.exact_encoding);
+        let encodingType = choice.encoding;
+        let encodedData = match choice.encoded {
+            Some(bytes) => bytes,
+            None => create_encoding(encodingType).encode(&rawData, rowCount, 0)?,
+        };
         let encodedSize = encodedData.len() as u64;
 
         let bloomFilter = if options.bloom.builds_bloom(cardinality, encodingType) {

@@ -30,13 +30,13 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use zyron_common::page::PAGE_SIZE;
 
-// Recycled page-buffer pool. A publish allocates a fresh 8KB buffer and the
+// Recycled page-buffer pool. A publish allocates a fresh page buffer and the
 // old buffer is retired; rather than round-tripping the allocator on every
 // write, retired buffers are pushed back here (after the epoch grace period,
 // so no reader still holds them) and reused. All buffers are PAGE_SIZE, so the
 // pool is shared process-wide across every index. Capacity bounds the recycled
 // memory; a push that overflows frees the buffer instead.
-const BUFFER_POOL_CAP: usize = 8192; // 8192 * 8KB = 64MB ceiling
+const BUFFER_POOL_CAP: usize = 8192; // 8192 * 16KB = 128MB ceiling
 
 // Raw page-buffer pointer made Send so it can cross into the epoch-deferred
 // recycle closure. The buffer is unreachable (already swapped out) and the
@@ -50,12 +50,30 @@ fn buffer_pool() -> &'static ArrayQueue<SendPtr> {
 }
 
 /// Takes a page buffer from the pool, or allocates one if the pool is empty.
-/// Contents are undefined, the caller fully overwrites before publishing.
+///
+/// Contents are undefined either way, and every caller writes all PAGE_SIZE
+/// bytes before the page is published. A pooled buffer already holds whatever
+/// the last page left in it, so zeroing a fresh allocation would only make the
+/// two cases differ in cost, not in what the caller may assume: it is a full
+/// pass over bytes the caller is about to overwrite.
+///
+/// Dereferencing the result is what carries the obligation, and that is
+/// already unsafe, so handing the pointer back is not.
 #[inline]
 fn take_buffer() -> *mut [u8; PAGE_SIZE] {
     match buffer_pool().pop() {
         Some(SendPtr(raw)) => raw,
-        None => Box::into_raw(Box::new([0u8; PAGE_SIZE])),
+        None => {
+            let layout = std::alloc::Layout::new::<[u8; PAGE_SIZE]>();
+            // SAFETY: the layout has non-zero size. The allocation goes
+            // straight to a caller contracted to fill it, and is reclaimed
+            // through Box under this same layout
+            let raw = unsafe { std::alloc::alloc(layout) } as *mut [u8; PAGE_SIZE];
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            raw
+        }
     }
 }
 
@@ -105,6 +123,31 @@ impl Chunk {
     unsafe fn dealloc(raw: *mut Chunk) {
         let layout = std::alloc::Layout::new::<Chunk>();
         unsafe { std::alloc::dealloc(raw as *mut u8, layout) }
+    }
+}
+
+/// One page buffer handed out by `bulk_install_uninit`, still to be filled.
+///
+/// A raw pointer rather than a reference because the bytes behind it are
+/// undefined until the holder writes them, and Send so one bulk fill can be
+/// split across threads. The store it came from is borrowed mutably for as
+/// long as any of these are outstanding.
+#[derive(Clone, Copy)]
+pub struct UninitPage(*mut u8);
+
+// SAFETY: the pages are disjoint allocations and the contract on
+// bulk_install_uninit gives each one to a single thread. Sync as well as Send
+// because a run is handed its pages as a shared slice, and a shared handle to
+// a pointer grants nothing that copying the pointer does not
+unsafe impl Send for UninitPage {}
+unsafe impl Sync for UninitPage {}
+
+impl UninitPage {
+    /// The page's first byte. All PAGE_SIZE bytes behind it are undefined
+    /// until written.
+    #[inline]
+    pub fn as_ptr(self) -> *mut u8 {
+        self.0
     }
 }
 
@@ -450,6 +493,45 @@ impl InMemoryPageStore {
         };
         // SAFETY: &mut self guarantees no other thread accesses this store.
         Some(unsafe { &mut *raw })
+    }
+
+    /// Installs a buffer for each of `count` consecutive pages starting at
+    /// `first` and hands back a pointer to each, in page order.
+    ///
+    /// Nothing is zeroed. `get_mut` installs a zeroed 8KB buffer per page,
+    /// which for a caller that rebuilds the whole page is a second pass over
+    /// every byte it is about to overwrite, and at a million keys that is
+    /// hundreds of megabytes of fill thrown away. Handing out pointers rather
+    /// than slices is what lets the fill run on several threads, since the
+    /// pages are disjoint allocations.
+    ///
+    /// # Safety
+    /// The caller must write every byte of every returned page before the
+    /// store is read, and must not hand one page to two threads. A byte left
+    /// unwritten holds whatever the buffer's previous owner left there, which
+    /// for a recycled buffer is another page's data.
+    pub unsafe fn bulk_install_uninit(&mut self, first: u32, count: usize) -> Vec<UninitPage> {
+        let guard = epoch::pin();
+        let mut pages = Vec::with_capacity(count);
+        for offset in 0..count {
+            let slot = self.slot(first + offset as u32);
+            let raw = take_buffer();
+            // SAFETY: raw came from the pool or the global allocator under the
+            // layout Owned uses for this type, so it is Owned's to reclaim
+            let owned = unsafe { Owned::from_raw(raw) };
+            // &mut self: no reader can be holding the buffer being replaced,
+            // so it is freed here rather than retired through an epoch
+            let old = slot.page.swap(owned, Ordering::AcqRel, &guard);
+            if !old.is_null() {
+                // SAFETY: exclusive access, and the pointer was installed by
+                // this store
+                unsafe { drop(old.into_owned()) };
+            }
+            let v = slot.version.load(Ordering::Relaxed);
+            slot.version.store((v & !1) + 2, Ordering::Release);
+            pages.push(UninitPage(raw as *mut u8));
+        }
+        pages
     }
 
     /// Single-threaded write helper used by initialization and checkpoint

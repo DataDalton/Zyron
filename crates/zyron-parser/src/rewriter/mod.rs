@@ -260,12 +260,24 @@ fn parse_one(object_name: &str, sql: &str) -> Result<Statement, RewriteError> {
     }
 }
 
-/// Renders a statement back to a comparable form.
+/// Renders a statement back to SQL.
 ///
-/// The debug rendering is the AST itself, which is what a diff has to
-/// compare: two statements that differ only in whitespace render the same,
-/// and two that differ in structure render differently
+/// This is the text a rewrite writes into the catalog and the text a diff
+/// compares, so two statements that differ only in whitespace render the
+/// same and two that differ in structure render differently. The rendering
+/// is parsed again before it is returned and has to read back as this very
+/// tree, so what goes into the catalog means what the rewriter produced. A
+/// statement the renderer has no faithful spelling for renders as its tree
+/// instead, which still diffs and which the catalog write-back refuses
+/// because it does not parse
 pub fn render(statement: &Statement) -> String {
+    if let Ok(sql) = crate::unparse::statement_to_sql(statement) {
+        if let Ok(parsed) = crate::parse(&sql) {
+            if parsed.len() == 1 && parsed[0] == *statement {
+                return sql;
+            }
+        }
+    }
     format!("{statement:?}")
 }
 

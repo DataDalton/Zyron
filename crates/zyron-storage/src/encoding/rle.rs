@@ -124,7 +124,14 @@ impl Encoding for RleEncoding {
         let runCount =
             u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
 
-        let mut out = Vec::with_capacity((end - start) * value_size);
+        let taken = end - start;
+        // SAFETY: the runs that overlap the range write every one of the
+        // taken slots before anything reads the buffer, and a range the runs
+        // do not cover is reported below rather than returned
+        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+        let outPtr = out.as_mut_ptr();
+        // Rows of the range written so far
+        let mut written = 0usize;
         let mut pos = 8usize;
         // First row of the run being examined
         let mut runStart = 0usize;
@@ -146,17 +153,24 @@ impl Encoding for RleEncoding {
             let take_from = runStart.max(start);
             let take_to = runEnd.min(end);
             if take_from < take_to {
-                for _ in take_from..take_to {
-                    out.extend_from_slice(value);
+                // SAFETY: rows take_from..take_to land in slots take_from -
+                // start onward, which are inside the taken slots
+                unsafe {
+                    fill_run(
+                        outPtr,
+                        take_from - start,
+                        take_to - take_from,
+                        value,
+                        value_size,
+                    );
                 }
+                written += take_to - take_from;
             }
             runStart = runEnd;
         }
-        if out.len() != (end - start) * value_size {
+        if written != taken {
             return Err(ZyronError::DecodingFailed(format!(
-                "RLE runs cover {} of the {} rows asked for",
-                out.len() / value_size.max(1),
-                end - start
+                "RLE runs cover {written} of the {taken} rows asked for"
             )));
         }
         Ok(out)
@@ -186,17 +200,12 @@ impl Encoding for RleEncoding {
         let runCount =
             u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
 
-        let totalBytes = row_count * value_size;
-        // SAFETY: the run-expansion loop below writes every byte of `out`
-        // before any read; zeroing first would memset the whole buffer only
-        // to overwrite it, regressing scan decode throughput.
-        #[allow(clippy::uninit_vec)]
-        let mut out: Vec<u8> = {
-            let mut v = Vec::with_capacity(totalBytes);
-            unsafe { v.set_len(totalBytes) };
-            v
-        };
+        // SAFETY: the runs write every one of the row_count slots before
+        // anything reads the buffer, and runs that fall short of the row
+        // count are reported below rather than returned
+        let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
         let outPtr = out.as_mut_ptr();
+        // Rows written so far
         let mut writePos = 0usize;
         let mut pos = 8;
 
@@ -210,42 +219,23 @@ impl Encoding for RleEncoding {
             let (runLen, bytesRead) = decode_varint(&encoded[pos..])?;
             pos += bytesRead;
 
-            let runBytes = runLen as usize * value_size;
-            if writePos + runBytes > totalBytes {
+            let runLen = runLen as usize;
+            if writePos + runLen > row_count {
                 return Err(ZyronError::DecodingFailed(format!(
                     "RLE row count mismatch: runs exceed expected {} rows",
                     row_count
                 )));
             }
-
-            // Write the first value, then use doubling memcpy to fill the rest.
-            // LLVM lowers large copy_nonoverlapping into SIMD stores or rep
-            // movsb, so the inner loop does a handful of wide memcpys instead
-            // of a per-element store loop.
-            unsafe {
-                std::ptr::copy_nonoverlapping(value.as_ptr(), outPtr.add(writePos), value_size);
-            }
-            let mut filled = value_size;
-            while filled < runBytes {
-                let chunk = filled.min(runBytes - filled);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        outPtr.add(writePos),
-                        outPtr.add(writePos + filled),
-                        chunk,
-                    );
-                }
-                filled += chunk;
-            }
-
-            writePos += runBytes;
+            // SAFETY: the run's rows land in slots writePos onward, which
+            // the check above keeps inside the row count
+            unsafe { fill_run(outPtr, writePos, runLen, value, value_size) };
+            writePos += runLen;
         }
 
-        if writePos != totalBytes {
+        if writePos != row_count {
             return Err(ZyronError::DecodingFailed(format!(
                 "RLE row count mismatch: runs sum to {}, expected {}",
-                writePos / value_size,
-                row_count
+                writePos, row_count
             )));
         }
 
@@ -341,6 +331,65 @@ impl Encoding for RleEncoding {
         }
 
         Ok(bitmask)
+    }
+}
+
+/// Writes `run` copies of `value` at slot `first`.
+///
+/// A fixed-width value is one integer, so the run is a splat store loop
+/// that the compiler turns into vector stores, the same shape a memset
+/// takes. A width that is not an integer's falls back to doubling copies
+/// of what has already been written.
+///
+/// # Safety
+/// Slots `first..first + run` at `value_size` bytes each are inside `out`
+#[inline(always)]
+unsafe fn fill_run(out: *mut u8, first: usize, run: usize, value: &[u8], value_size: usize) {
+    // SAFETY: the caller's contract on `out`, and `value` is value_size
+    // bytes long
+    unsafe {
+        match value_size {
+            8 => {
+                let v = u64::from_le_bytes(value[..8].try_into().unwrap_or([0; 8]));
+                let p = (out as *mut u64).add(first);
+                for i in 0..run {
+                    p.add(i).write_unaligned(v);
+                }
+            }
+            4 => {
+                let v = u32::from_le_bytes(value[..4].try_into().unwrap_or([0; 4]));
+                let p = (out as *mut u32).add(first);
+                for i in 0..run {
+                    p.add(i).write_unaligned(v);
+                }
+            }
+            2 => {
+                let v = u16::from_le_bytes(value[..2].try_into().unwrap_or([0; 2]));
+                let p = (out as *mut u16).add(first);
+                for i in 0..run {
+                    p.add(i).write_unaligned(v);
+                }
+            }
+            1 => std::ptr::write_bytes(out.add(first), value[0], run),
+            16 => {
+                let v = u128::from_le_bytes(value[..16].try_into().unwrap_or([0; 16]));
+                let p = (out as *mut u128).add(first);
+                for i in 0..run {
+                    p.add(i).write_unaligned(v);
+                }
+            }
+            _ => {
+                let base = out.add(first * value_size);
+                let runBytes = run * value_size;
+                std::ptr::copy_nonoverlapping(value.as_ptr(), base, value_size);
+                let mut filled = value_size;
+                while filled < runBytes {
+                    let chunk = filled.min(runBytes - filled);
+                    std::ptr::copy_nonoverlapping(base, base.add(filled), chunk);
+                    filled += chunk;
+                }
+            }
+        }
     }
 }
 

@@ -25,6 +25,10 @@ pub enum MetaAggKind {
     Min,
     /// MAX(col) from per-segment header max (fixed-width columns only).
     Max,
+    /// SUM(col) from per-file recorded totals. Answerable only where the
+    /// column's type adds exactly, so that folding per file and then across
+    /// files lands on the number a row by row fold would reach
+    Sum,
 }
 
 /// Specification of one metadata-pushdown aggregate output column.
@@ -191,6 +195,30 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// SUM/MIN/MAX/COUNT answered from the lake manifest, with no data file
+    /// opened at all.
+    ///
+    /// The manifest is already in memory and already records, per file and
+    /// per column, the bounds and null count that answer MIN, MAX and both
+    /// counts, and the exact total that answers SUM. So an ungrouped
+    /// aggregate over a whole table is a fold over statistics rather than a
+    /// read, and it costs the same whether the table holds a thousand rows
+    /// or a billion.
+    ///
+    /// Emitted only with no GROUP BY, no predicate and no DISTINCT. A file
+    /// carrying delete predicates, or missing the stat an aggregate needs,
+    /// is scanned instead of read off the manifest, so one delete costs one
+    /// file rather than the whole table
+    LakeMetadataAggregate {
+        table_id: TableId,
+        specs: Vec<MetaAggSpec>,
+        schema: Vec<LogicalColumn>,
+        /// The version the manifest is resolved at, so time travel reads
+        /// the statistics of the version it names
+        as_of: Option<super::logical::AsOfTarget>,
+        cost: PlanCost,
+    },
+
     /// Index-based scan for selective predicates.
     IndexScan {
         table_id: TableId,
@@ -309,7 +337,8 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
-    /// External sort (top-N uses a bounded heap when limit is present).
+    /// Sort. Under a limit the operator buffers about a batch beyond the
+    /// limit and orders only the rows it keeps.
     Sort {
         order_by: Vec<BoundOrderBy>,
         child: Box<PhysicalPlan>,
@@ -638,6 +667,7 @@ impl PhysicalPlan {
             | PhysicalPlan::LakeDelete { cost, .. }
             | PhysicalPlan::LakeUpdate { cost, .. }
             | PhysicalPlan::ColumnarMetadataAggregate { cost, .. }
+            | PhysicalPlan::LakeMetadataAggregate { cost, .. }
             | PhysicalPlan::IndexScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Project { cost, .. }
@@ -681,7 +711,8 @@ impl PhysicalPlan {
             | PhysicalPlan::ForeignScan { columns, .. }
             | PhysicalPlan::IndexScan { columns, .. }
             | PhysicalPlan::ParallelSeqScan { columns, .. } => columns.clone(),
-            PhysicalPlan::ColumnarMetadataAggregate { schema, .. } => schema.clone(),
+            PhysicalPlan::ColumnarMetadataAggregate { schema, .. }
+            | PhysicalPlan::LakeMetadataAggregate { schema, .. } => schema.clone(),
             PhysicalPlan::Filter { child, .. } => child.output_schema(),
             PhysicalPlan::Project {
                 expressions,
@@ -827,6 +858,7 @@ impl PhysicalPlan {
             | PhysicalPlan::ForeignScan { .. }
             | PhysicalPlan::LakeDelete { .. }
             | PhysicalPlan::ColumnarMetadataAggregate { .. }
+            | PhysicalPlan::LakeMetadataAggregate { .. }
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
             | PhysicalPlan::ParallelSeqScan { .. }

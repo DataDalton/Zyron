@@ -15,7 +15,8 @@ use zyron_common::format::stamp::{FORMAT_STAMP_LEN, FormatStamp, stamp_flags};
 use zyron_common::format::version::VersionWindow;
 use zyron_common::format::{
     ALL_FORMAT_KINDS, FormatKind, FormatRegistry, FormatVersion, Framing, MAGIC_ALLOCATIONS,
-    RecordVersion, WideRecordVersion, migration, text_envelope,
+    RECORD_VERSION_MAX_INLINE, RECORD_VERSION_WIDE_ESCAPE, RecordVersion, WideRecordVersion,
+    migration, text_envelope,
 };
 
 /// Item 1. Encode then decode preserves every field, for every format kind
@@ -134,7 +135,7 @@ fn magic_bytes_are_unique_and_total() {
         assert!(!row.doc.is_empty());
     }
     assert_eq!(MAGIC_ALLOCATIONS.len(), ALL_FORMAT_KINDS.len());
-    assert_eq!(ALL_FORMAT_KINDS.len(), 28);
+    assert_eq!(ALL_FORMAT_KINDS.len(), 29);
     for kind in ALL_FORMAT_KINDS {
         assert!(MAGIC_ALLOCATIONS.iter().any(|row| row.kind == *kind));
     }
@@ -259,15 +260,19 @@ fn the_text_framing_round_trips() {
     }
 }
 
-/// Record version tags refuse the reserved zero and order against each other
+/// Record version tags refuse both reserved values and order against each
+/// other. Zero marks an unwritten slot and 255 escapes to a wide tag, so the
+/// usable inline range is 1 through 254
 #[test]
-fn record_version_tags_reject_the_reserved_zero() {
+fn record_version_tags_reject_the_reserved_values() {
     assert!(RecordVersion::new(0).is_none());
     assert!(WideRecordVersion::new(0).is_none());
     assert!(RecordVersion::read(&[0]).is_err());
     assert!(RecordVersion::read(&[]).is_err());
-    for raw in 1u8..=255 {
-        let tag = RecordVersion::new(raw).expect("nonzero");
+    assert!(RecordVersion::new(RECORD_VERSION_WIDE_ESCAPE).is_none());
+    assert!(RecordVersion::read(&[RECORD_VERSION_WIDE_ESCAPE]).is_err());
+    for raw in 1u8..=RECORD_VERSION_MAX_INLINE {
+        let tag = RecordVersion::new(raw).expect("usable");
         assert_eq!(RecordVersion::read(&[raw]).expect("reads"), tag);
     }
     let wide = WideRecordVersion::new(1_000).expect("nonzero");

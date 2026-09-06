@@ -6,6 +6,7 @@
 
 pub mod background;
 pub mod backup;
+pub mod cluster_settings;
 pub mod columnar_recovery;
 pub mod columnar_wal_pin;
 pub mod config;
@@ -106,6 +107,20 @@ pub fn parse_cli_args() -> Option<CliOptions> {
                 println!("Zyron {} (zyron-server)", env!("CARGO_PKG_VERSION"));
                 return None;
             }
+            upgrade::capabilities::CAPABILITIES_FLAG => {
+                // What this binary reads and accepts, asked by an older
+                // binary deciding whether it can hand its data to this one
+                match zyron_common::format::substrate()
+                    .and_then(upgrade::capabilities::render_running)
+                {
+                    Ok(document) => println!("{document}"),
+                    Err(e) => {
+                        eprintln!("this binary cannot describe its capabilities: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return None;
+            }
             "--config" => {
                 i += 1;
                 if i >= args.len() {
@@ -178,10 +193,22 @@ Options:
   --log-level <level>   Log level: debug, info, warn, error
   --single-user         Single-connection mode for maintenance
   --skip-recovery       Skip WAL replay (emergency use only)
+  --capabilities        Print the formats and config keys this binary reads, as JSON, and exit
   --version, -v         Print version and exit
   --help, -h            Print this help and exit",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// How `Server::run` ended
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// A shutdown signal arrived and the server stopped
+    Exited,
+    /// The upgrade service armed a restart. The server stopped the way it
+    /// does for a signal and the process should start this binary with
+    /// these arguments in its place
+    Restart { binary: PathBuf, args: Vec<String> },
 }
 
 /// The Zyron server. Owns all subsystems and coordinates lifecycle.
@@ -190,6 +217,19 @@ pub struct Server {
     session_mgr: Arc<SessionManager>,
     health_state: Arc<HealthState>,
     shutdown: Arc<AtomicBool>,
+    /// Wakes the maintenance loops the moment the shutdown flag is set, so
+    /// none of them sleeps through its interval before it sees the flag
+    shutdown_wake: Arc<tokio::sync::Notify>,
+    /// Whether the node takes new work and what it has in flight, shared by
+    /// the wire listener, the readiness probe, the mesh, and the upgrade
+    /// service
+    admission: Arc<zyron_common::Admission>,
+    /// What every connection records, read by the metrics endpoint and the
+    /// upgrade service's health probe
+    query_metrics: Arc<zyron_common::QueryMetrics>,
+    /// Where the DDL surface and the mesh leave intents for the upgrade
+    /// service, and where the run loop waits for a restart
+    control: Arc<upgrade::control::NodeControl>,
     /// When true, skip WAL replay on startup. Set by --skip-recovery for
     /// emergency boots only.
     skip_recovery: bool,
@@ -268,7 +308,14 @@ impl Server {
 
         let session_mgr = Arc::new(SessionManager::new(config.server.connection_timeout_secs));
         let labeled_metrics = Arc::new(zyron_common::LabeledMetrics::new());
-        let metrics = Arc::new(MetricsRegistry::new(session_mgr.clone(), labeled_metrics));
+        let admission = Arc::new(zyron_common::Admission::new());
+        let query_metrics = Arc::new(zyron_common::QueryMetrics::new());
+        let control = upgrade::control::NodeControl::shared();
+        let metrics = Arc::new(MetricsRegistry::new(
+            session_mgr.clone(),
+            labeled_metrics,
+            Arc::clone(&query_metrics),
+        ));
         // Router and per-endpoint metrics created before the health state
         // so the HTTP listener and the endpoint registrar share them, a
         // route registered into any other router is never served
@@ -279,21 +326,28 @@ impl Server {
             &config.metrics.path,
             Arc::clone(&gateway_router),
             Arc::clone(&gateway_metrics),
+            Arc::clone(&admission),
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_wake = Arc::new(tokio::sync::Notify::new());
 
         Ok(Self {
             config,
             session_mgr,
             health_state,
             shutdown,
+            shutdown_wake,
+            admission,
+            query_metrics,
+            control,
             skip_recovery: opts.skip_recovery,
             single_user: opts.single_user,
         })
     }
 
-    /// Runs the server. This is the main entry point that blocks until shutdown.
-    pub async fn run(self) -> zyron_common::Result<()> {
+    /// Runs the server. This is the main entry point that blocks until
+    /// shutdown, or until the upgrade service asks for a restart
+    pub async fn run(self) -> zyron_common::Result<RunOutcome> {
         let start_time = Instant::now();
         info!("Zyron {} starting", env!("CARGO_PKG_VERSION"));
 
@@ -1250,6 +1304,7 @@ impl Server {
         let config_for_all = self.config.clone();
         let data_dir_for_alter = data_dir.clone();
         let config_for_alter = self.config.clone();
+        let control_for_alter = Arc::clone(&self.control);
 
         // Config-derived session and auth defaults exposed on ServerState. The
         // validator restricts the source strings, so parsing here maps a known
@@ -1309,7 +1364,14 @@ impl Server {
         // peers still gets a reason that names the mesh rather than leaving
         // an operator to infer it from a rung that never fires
         zyron_mesh::register();
-        let mesh_node = install_mesh(&self.config, &node_identity, &peers.read());
+        let mesh_node = install_mesh(
+            &self.config,
+            &node_identity,
+            &peers.read(),
+            Arc::clone(&self.admission),
+            Arc::clone(&self.query_metrics),
+            Arc::clone(&self.control),
+        );
         if let Some(mesh_node) = mesh_node.clone() {
             // The health listener is where the mesh paths are served, for the
             // same reason /pressure and the hot set are there: they are about
@@ -1424,6 +1486,48 @@ impl Server {
             Some(handle)
         } else {
             None
+        };
+
+        // The upgrade service, which the DDL surface reaches through the
+        // server state and the mesh through the node control. Booted here so
+        // its journal is read and the board seeded before the first
+        // connection can ask about the upgrade state
+        let upgrade_service = {
+            let node_name = if self.config.cluster.enabled {
+                self.config.cluster.node_name.clone()
+            } else {
+                node_identity.name.clone()
+            };
+            let mesh_peers: Vec<(String, zyron_mesh::NodeRef)> = peers
+                .read()
+                .peers()
+                .iter()
+                .map(|peer| {
+                    (
+                        peer.name.clone(),
+                        zyron_mesh::NodeRef::new(peer.node_id.unwrap_or(0), peer.name.clone()),
+                    )
+                })
+                .collect();
+            let checkpoint_lsn_stats = Arc::clone(&ckpt_stats);
+            upgrade::service::UpgradeService::boot(upgrade::service::ServiceParts {
+                config: self.config.clone(),
+                node_name,
+                catalog: Arc::clone(&catalog),
+                raft: cluster.as_ref().map(|c| Arc::clone(&c.node)),
+                admission: Arc::clone(&self.admission),
+                query_metrics: Arc::clone(&self.query_metrics),
+                control: Arc::clone(&self.control),
+                peers: mesh_peers,
+                checkpoint: ckpt_wake.clone(),
+                checkpoint_lsn: Arc::new(move || {
+                    checkpoint_lsn_stats
+                        .last_checkpoint_lsn
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                }),
+                shutdown: Arc::clone(&self.shutdown),
+            })
+            .await?
         };
 
         // Build ServerState for zyron-wire
@@ -1541,7 +1645,15 @@ impl Server {
                         .map_err(|e| e.to_string())?;
                     candidate.validate().map_err(|e| e.to_string())?;
                     crate::config::ZyronConfig::write_auto_conf(&data_dir_for_alter, key, value)
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| e.to_string())?;
+                    // An upgrade setting is policy for the whole group. It
+                    // took effect here already, and the upgrade service
+                    // carries it to the replicated log so every node, and
+                    // whichever node leads next, holds the same value
+                    if crate::cluster_settings::is_cluster_setting(key) {
+                        control_for_alter.request_cluster_setting(key, value);
+                    }
+                    Ok(())
                 },
             )),
             cdc_feed_stats: {
@@ -1681,6 +1793,10 @@ impl Server {
             balloon_params,
             default_auth_method,
             password_encryption: self.config.auth.password_encryption.clone(),
+            admission: Arc::clone(&self.admission),
+            query_metrics: Arc::clone(&self.query_metrics),
+            upgrade_control: Some(Arc::clone(&upgrade_service)
+                as Arc<dyn zyron_wire::format_dispatch::UpgradeControl>),
         });
 
         // The retention worker's age-tiering pass drives the wire
@@ -1786,12 +1902,14 @@ impl Server {
             let catalog_ret = Arc::clone(&catalog);
             let cdc_reg_ret = Some(Arc::clone(&cdc_registry_arc));
             let sh_ret = Arc::clone(&self.shutdown);
+            let wake_ret = Arc::clone(&self.shutdown_wake);
             let labeled_ret = Arc::clone(&labeled);
             spawned_workers.push(tokio::spawn(async move {
                 background::publication_retention::publication_retention_loop(
                     catalog_ret,
                     cdc_reg_ret,
                     sh_ret,
+                    wake_ret,
                     background::publication_retention::DEFAULT_INTERVAL_SECS,
                     Some(labeled_ret),
                 )
@@ -1800,12 +1918,14 @@ impl Server {
 
             let catalog_reap = Arc::clone(&catalog);
             let sh_reap = Arc::clone(&self.shutdown);
+            let wake_reap = Arc::clone(&self.shutdown_wake);
             let labeled_reap = Arc::clone(&labeled);
             spawned_workers.push(tokio::spawn(async move {
                 background::dead_subscriber_reaper::dead_subscriber_reaper_loop(
                     catalog_reap,
                     Some(Arc::clone(&cdc_registry_arc)),
                     sh_reap,
+                    wake_reap,
                     background::dead_subscriber_reaper::DEFAULT_INTERVAL_SECS,
                     Duration::from_secs(3600),
                     Some(labeled_reap),
@@ -1814,10 +1934,12 @@ impl Server {
             }));
 
             let sh_cred = Arc::clone(&self.shutdown);
+            let wake_cred = Arc::clone(&self.shutdown_wake);
             let sm_for_maintenance = Arc::clone(&security_manager_arc);
             spawned_workers.push(tokio::spawn(async move {
                 background::credential_refresh::credential_refresh_loop(
                     sh_cred,
+                    wake_cred,
                     background::credential_refresh::DEFAULT_INTERVAL_SECS,
                     Duration::from_secs(
                         background::credential_refresh::DEFAULT_REFRESH_WINDOW_SECS,
@@ -1843,10 +1965,12 @@ impl Server {
 
             let server_recycle = Arc::clone(&server_state);
             let sh_recycle = Arc::clone(&self.shutdown);
+            let wake_recycle = Arc::clone(&self.shutdown_wake);
             spawned_workers.push(tokio::spawn(async move {
                 background::recycle_reaper::recycle_reaper_loop(
                     server_recycle,
                     sh_recycle,
+                    wake_recycle,
                     background::recycle_reaper::DEFAULT_INTERVAL_SECS,
                 )
                 .await;
@@ -1854,10 +1978,12 @@ impl Server {
 
             let server_cdc_pump = Arc::clone(&server_state);
             let sh_cdc_pump = Arc::clone(&self.shutdown);
+            let wake_cdc_pump = Arc::clone(&self.shutdown_wake);
             spawned_workers.push(tokio::spawn(async move {
                 background::cdc_stream_pump::cdc_stream_pump_loop(
                     server_cdc_pump,
                     sh_cdc_pump,
+                    wake_cdc_pump,
                     background::cdc_stream_pump::DEFAULT_INTERVAL_SECS,
                 )
                 .await;
@@ -1870,12 +1996,14 @@ impl Server {
                 let pool_warm = Arc::clone(&buffer_pool);
                 let disk_warm = Arc::clone(&disk_manager);
                 let sh_warm = Arc::clone(&self.shutdown);
+                let wake_warm = Arc::clone(&self.shutdown_wake);
                 spawned_workers.push(tokio::spawn(async move {
                     background::mesh_prefetch::mesh_prefetch_loop(
                         mesh_node,
                         pool_warm,
                         disk_warm,
                         sh_warm,
+                        wake_warm,
                         background::mesh_prefetch::DEFAULT_INTERVAL_MS,
                     )
                     .await;
@@ -1883,10 +2011,12 @@ impl Server {
             }
 
             let sh_dlq = Arc::clone(&self.shutdown);
+            let wake_dlq = Arc::clone(&self.shutdown_wake);
             let dlq_registry_for_ttl = Arc::clone(&dlq_registry_arc);
             spawned_workers.push(tokio::spawn(async move {
                 background::dlq_ttl::dlq_ttl_loop(
                     sh_dlq,
+                    wake_dlq,
                     background::dlq_ttl::DEFAULT_INTERVAL_SECS,
                     30,
                     move |cutoff_secs| {
@@ -1966,12 +2096,36 @@ impl Server {
             }
         });
 
-        // 13. Wait for shutdown signal
-        let reason = signal::wait_for_shutdown().await;
-        info!("Shutdown signal received: {:?}", reason);
+        // The node serves now, so a restart the previous process journaled
+        // can be judged against real traffic. Then the service loops,
+        // carrying out what operators and other nodes ask for and, on the
+        // coordinator, polling the release feed. Its handle is kept apart
+        // from the workers because a task mid-restart parks until the
+        // process exits
+        upgrade_service.finish_restart().await;
+        let upgrade_handle = tokio::spawn(Arc::clone(&upgrade_service).run());
+
+        // 13. Wait for a shutdown signal, or for the upgrade service to arm
+        // a restart, which stops the server the same way
+        let control_for_restart = Arc::clone(&self.control);
+        tokio::select! {
+            reason = signal::wait_for_shutdown() => {
+                info!("Shutdown signal received: {:?}", reason);
+            }
+            _ = control_for_restart.wait_restart() => {
+                info!(
+                    "restart armed by the upgrade service, stopping to start {}",
+                    self.control
+                        .restart_intent()
+                        .map(|intent| intent.version().to_string())
+                        .unwrap_or_default()
+                );
+            }
+        }
 
         // Graceful shutdown sequence
         self.shutdown.store(true, Ordering::Release);
+        self.shutdown_wake.notify_waiters();
 
         // Wait briefly for active queries to complete
         let drain_start = Instant::now();
@@ -1991,6 +2145,7 @@ impl Server {
         // Active sessions already drained above, so aborting the listener task
         // closes the door on new connections and in-flight statements.
         wire_handle.abort();
+        upgrade_handle.abort();
 
         // Quiesce the detached worker loops. The shutdown flag is set above, so
         // each loop exits at its next interval. Awaiting them with a bounded
@@ -2169,7 +2324,21 @@ impl Server {
         }
 
         info!("Zyron shut down");
-        Ok(())
+        match self.control.restart_intent() {
+            Some(intent) => {
+                let binary = std::env::current_exe().map_err(|e| {
+                    zyron_common::ZyronError::Internal(format!(
+                        "the binary to restart into is not known, {e}"
+                    ))
+                })?;
+                info!("restarting {} for {}", binary.display(), intent.version());
+                Ok(RunOutcome::Restart {
+                    binary,
+                    args: std::env::args().skip(1).collect(),
+                })
+            }
+            None => Ok(RunOutcome::Exited),
+        }
     }
 }
 
@@ -2808,6 +2977,9 @@ fn install_mesh(
     config: &config::ZyronConfig,
     identity: &zyron_common::NodeIdentity,
     peers: &zyron_common::PeerRegistry,
+    admission: Arc<zyron_common::Admission>,
+    query_metrics: Arc<zyron_common::QueryMetrics>,
+    control: Arc<upgrade::control::NodeControl>,
 ) -> Option<std::sync::Arc<mesh_node::ServerMeshNode>> {
     use zyron_mesh::{HttpMeshRpc, MeshDirectory, MeshScheduler, NodeRef, WarmPool};
 
@@ -2870,8 +3042,9 @@ fn install_mesh(
 
     Some(std::sync::Arc::new(mesh_node::ServerMeshNode::new(
         local,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        std::sync::Arc::new(mesh_node::InFlight::default()),
+        admission,
+        query_metrics,
+        control,
         std::sync::Arc::new(parking_lot::RwLock::new(config.storage.data_dir.clone())),
     )))
 }

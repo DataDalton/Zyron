@@ -389,6 +389,18 @@ pub struct ServerState {
     pub config_all: Option<Arc<dyn Fn() -> Vec<(String, String, String)> + Send + Sync>>,
     /// Data directory path (for ALTER SYSTEM auto.conf writes).
     pub data_dir: std::path::PathBuf,
+    /// Whether this node takes new work and what it has in flight. The
+    /// accept loop, every connection, the mesh drain handler, the readiness
+    /// probe, and the upgrade driver all read this one instance
+    pub admission: Arc<zyron_common::Admission>,
+    /// Query count, latency, and error counters every connection records
+    /// into, read by the metrics endpoint and by the upgrade driver for the
+    /// health baseline it judges a restart against
+    pub query_metrics: Arc<zyron_common::QueryMetrics>,
+    /// The upgrade controller's operator surface. None in a harness
+    /// assembled without one, where TRIGGER MANUAL and ACKNOWLEDGE UPGRADE
+    /// REWRITES are refused rather than recorded for nothing to act on
+    pub upgrade_control: Option<Arc<dyn crate::format_dispatch::UpgradeControl>>,
     /// What the node measured about the machine it runs on, read back by
     /// zyron_sys.pressure.node_capabilities. None in a harness that assembled
     /// a server without probing, where the view reports no rows rather than
@@ -958,6 +970,15 @@ pub struct Connection<T: WireTransport> {
     authenticator: Box<dyn Authenticator>,
     /// Active explicit transaction (None = auto-commit mode).
     transaction: Option<Transaction>,
+    /// Holds this transaction's place in the node's in-flight count for
+    /// exactly as long as `transaction` is Some, so a drain waits on it
+    transaction_guard: Option<zyron_common::InFlightGuard>,
+    /// Holds this session's place in the node's in-flight count for the
+    /// life of the connection
+    _session_guard: zyron_common::InFlightGuard,
+    /// How many error responses this connection has buffered, read before
+    /// and after a query to tell whether it failed
+    error_responses: u64,
     /// What this transaction has done, as the group will be told it. Opened
     /// with the transaction and taken by whichever of commit or abort ends it
     changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
@@ -1134,6 +1155,8 @@ impl<T: WireTransport> Connection<T> {
     pub fn new(stream: T, server: Arc<ServerState>, peer_addr: Option<String>) -> Self {
         stream.configure_immediate();
         let pid = NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
+        server.query_metrics.connection_opened();
+        let session_guard = server.admission.open_session();
 
         Self {
             stream,
@@ -1144,6 +1167,9 @@ impl<T: WireTransport> Connection<T> {
             server,
             authenticator: Box::new(TrustAuthenticator),
             transaction: None,
+            transaction_guard: None,
+            _session_guard: session_guard,
+            error_responses: 0,
             changeset: None,
             lake_txn: None,
             statements: HashMap::new(),
@@ -1652,7 +1678,18 @@ impl<T: WireTransport> Connection<T> {
     // Simple query protocol
     // -----------------------------------------------------------------------
 
+    /// Runs one simple-protocol query while holding its place in the node's
+    /// in-flight count, and records what it cost once it is done
     async fn handle_simple_query(&mut self, sql: String) -> Result<(), ProtocolError> {
+        let _in_flight = self.server.admission.begin_query();
+        let started = std::time::Instant::now();
+        let errors_before = self.error_responses;
+        let outcome = self.run_simple_query(sql).await;
+        self.record_query(started, errors_before, outcome.is_err());
+        outcome
+    }
+
+    async fn run_simple_query(&mut self, sql: String) -> Result<(), ProtocolError> {
         debug!("Simple query: {}", sql);
 
         if sql.trim().is_empty() {
@@ -3504,7 +3541,22 @@ impl<T: WireTransport> Connection<T> {
         Ok(())
     }
 
+    /// Runs one extended-protocol Execute while holding its place in the
+    /// node's in-flight count, and records what it cost once it is done
     async fn handle_execute(
+        &mut self,
+        portal_name: String,
+        max_rows: i32,
+    ) -> Result<(), ProtocolError> {
+        let _in_flight = self.server.admission.begin_query();
+        let started = std::time::Instant::now();
+        let errors_before = self.error_responses;
+        let outcome = self.run_execute(portal_name, max_rows).await;
+        self.record_query(started, errors_before, outcome.is_err());
+        outcome
+    }
+
+    async fn run_execute(
         &mut self,
         portal_name: String,
         max_rows: i32,
@@ -3964,6 +4016,7 @@ impl<T: WireTransport> Connection<T> {
                 .replication
                 .as_ref()
                 .map(|r| r.changeset(txn.txn_id));
+            self.transaction_guard = Some(self.server.admission.open_transaction());
             self.transaction = Some(txn);
         }
         let txn = self.transaction.as_ref().unwrap();
@@ -4153,6 +4206,7 @@ impl<T: WireTransport> Connection<T> {
                             .replication
                             .as_ref()
                             .map(|r| r.changeset(txn.txn_id));
+                        self.transaction_guard = Some(self.server.admission.open_transaction());
                         self.transaction = Some(txn);
                         if begin.lake {
                             let now = std::time::SystemTime::now()
@@ -4172,6 +4226,7 @@ impl<T: WireTransport> Connection<T> {
                                 Ok(lake_txn) => self.lake_txn = Some(lake_txn),
                                 Err(e) => {
                                     self.transaction = None;
+                                    self.transaction_guard = None;
                                     self.changeset = None;
                                     return Some(Err(e));
                                 }
@@ -4202,6 +4257,7 @@ impl<T: WireTransport> Connection<T> {
                     Vec::new()
                 };
                 if let Some(mut txn) = self.transaction.take() {
+                    self.transaction_guard = None;
                     let txn_id = txn.txn_id;
                     // A transaction that wrote nothing commits without a
                     // commit record or flush wait. One that wrote goes through
@@ -4277,6 +4333,7 @@ impl<T: WireTransport> Connection<T> {
                 }
                 let had_txn = self.transaction.is_some();
                 let abort_result = if let Some(mut txn) = self.transaction.take() {
+                    self.transaction_guard = None;
                     let logs = self.abandon_lake_work(txn.txn_id);
                     refresh_lake_stats(&self.server, &logs);
                     self.abandon_changeset();
@@ -4698,10 +4755,13 @@ impl<T: WireTransport> Connection<T> {
             }
             zyron_parser::Statement::AlterSystemSet(s) => {
                 let mut val_str = expr_to_string(&s.value);
+                let mut key = s.name.clone();
                 // An upgrade setting takes effect on the board first, so the
                 // orchestrator sees it immediately, and the value persisted
-                // is the one that took effect rather than the one typed
-                if crate::format_dispatch::owns_setting(&s.name) {
+                // is the one that took effect rather than the one typed. It
+                // persists under the [upgrade] section's key, which is what
+                // the next boot seeds the board from
+                if let Some(config_key) = crate::format_dispatch::config_key(&s.name) {
                     match crate::format_dispatch::apply_upgrade_setting(&s.name, &val_str) {
                         Ok(stored) => val_str = stored,
                         Err(err) => {
@@ -4717,9 +4777,10 @@ impl<T: WireTransport> Connection<T> {
                             return Some(Ok(()));
                         }
                     }
+                    key = config_key.to_string();
                 }
                 if let Some(ref writer) = self.server.alter_system_set {
-                    match writer(&s.name, &val_str) {
+                    match writer(&key, &val_str) {
                         Ok(()) => Some(
                             self.feed(BackendMessage::CommandComplete {
                                 tag: "ALTER SYSTEM".into(),
@@ -5764,6 +5825,7 @@ impl<T: WireTransport> Connection<T> {
 
         if !in_explicit_txn {
             if let Some(mut txn) = self.transaction.take() {
+                self.transaction_guard = None;
                 let txn_id = txn.txn_id;
                 if self.session_ref().transaction_state() == TransactionState::Failed {
                     let logs = self.abandon_lake_work(txn_id);
@@ -6528,8 +6590,26 @@ impl<T: WireTransport> Connection<T> {
     /// Buffers a message into the write buffer without flushing.
     /// Call flush() after feeding all messages to send them in one syscall.
     async fn feed(&mut self, msg: BackendMessage) -> Result<(), ProtocolError> {
+        if let BackendMessage::ErrorResponse(fields) = &msg {
+            if is_server_fault(&fields.code) {
+                self.error_responses += 1;
+            }
+        }
         msg.encode(&mut self.write_buf);
         Ok(())
+    }
+
+    /// Records one finished query in the node's live metrics.
+    ///
+    /// A query failed when its handler returned an error or when it buffered
+    /// an error response for the client, which is how nearly every failure
+    /// leaves this crate
+    fn record_query(&self, started: std::time::Instant, errors_before: u64, handler_failed: bool) {
+        let failed = handler_failed || self.error_responses != errors_before;
+        let duration_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.server
+            .query_metrics
+            .record_query(epoch_seconds_now(), duration_us, failed);
     }
 
     /// Flushes the write buffer to the TCP stream.
@@ -6753,6 +6833,19 @@ async fn execute_admitted(
     let outcome = execute(plan, ctx).await;
     ticket.complete();
     outcome
+}
+
+/// Whether a SQLSTATE names a fault of the server rather than of the
+/// request, which is what the query metrics count as a failed statement.
+/// Connection exceptions, exhausted resources, system errors, and internal
+/// errors qualify. A shed query does not, the node declined it on purpose,
+/// and a request the client got wrong never does
+pub fn is_server_fault(code: &str) -> bool {
+    match code.get(..2) {
+        Some("08") | Some("58") | Some("XX") => true,
+        Some("53") => code != "53400",
+        _ => false,
+    }
 }
 
 /// Maps ZyronError to ErrorFields with appropriate SQLSTATE codes.

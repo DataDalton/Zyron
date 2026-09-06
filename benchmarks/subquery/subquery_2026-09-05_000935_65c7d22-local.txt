@@ -1,0 +1,72 @@
+# suite:   subquery
+# run:     2026-09-05_000935_65c7d22-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Correlated EXISTS ===
+  Outer rows: 2000
+  Inner rows: 19960
+  Correlated EXISTS, subquery form:
+    Runs: [1,290us, 1,214us, 1,197us]
+    Average: 1,233us (no target set)
+    Min/Max: 1,197us / 1,290us, StdDev: 40.4782us
+  Correlated EXISTS, join form:
+    Runs: [1,210us, 1,216us, 1,215us]
+    Average: 1,213us (no target set)
+    Min/Max: 1,210us / 1,216us, StdDev: 2.5573us
+  Correlated EXISTS: the subquery form costs 1.0x the join form (1,233 vs 1,213)
+
+=== Correlated EXISTS Growth ===
+  EXISTS growth, subquery at 1x outer rows:
+    Runs: [2,799us, 1,795us, 1,735us]
+    Average: 2,110us (no target set)
+    Min/Max: 1,735us / 2,799us, StdDev: 488.1549us
+  EXISTS growth, subquery at 2x outer rows:
+    Runs: [1,918us, 1,850us, 1,936us]
+    Average: 1,901us (no target set)
+    Min/Max: 1,850us / 1,936us, StdDev: 37.2852us
+  EXISTS growth, join at 1x outer rows:
+    Runs: [1,284us, 1,080us, 1,179us]
+    Average: 1,181us (no target set)
+    Min/Max: 1,080us / 1,284us, StdDev: 83.1743us
+  EXISTS growth, join at 2x outer rows:
+    Runs: [1,911us, 1,848us, 1,820us]
+    Average: 1,860us (no target set)
+    Min/Max: 1,820us / 1,911us, StdDev: 38.1390us
+  Outer rows 2000 to 4000 against one fixed inner table: subquery form grows 0.90x, join form grows 1.57x
+
+=== Correlated NOT EXISTS ===
+  Correlated NOT EXISTS, subquery form:
+    Runs: [1,250us, 1,186us, 1,246us]
+    Average: 1,227us (no target set)
+    Min/Max: 1,186us / 1,250us, StdDev: 29.4609us
+  Correlated NOT EXISTS, join form:
+    Runs: [912.1000us, 793.5000us, 819.9000us]
+    Average: 841.8333us (no target set)
+    Min/Max: 793.5000us / 912.1000us, StdDev: 50.8415us
+  Correlated NOT EXISTS: the subquery form costs 1.5x the join form (1,227 vs 841.8333)
+
+=== Correlated Scalar In Projection ===
+  Correlated scalar, subquery form:
+    Runs: [1,102us, 1,066us, 1,077us]
+    Average: 1,082us (no target set)
+    Min/Max: 1,066us / 1,102us, StdDev: 14.8585us
+  Correlated scalar, join form:
+    Runs: [740.5000us, 755.4000us, 749.6000us]
+    Average: 748.5000us (no target set)
+    Min/Max: 740.5000us / 755.4000us, StdDev: 6.1324us
+  Correlated scalar: the subquery form costs 1.4x the join form (1,082 vs 748.5000)
+
+=== Uncorrelated IN Subquery ===
+  Distinct values the subquery materializes: 1996
+  Uncorrelated IN, subquery form:
+    Runs: [3,225us, 2,848us, 2,644us]
+    Average: 2,906us (no target set)
+    Min/Max: 2,644us / 3,225us, StdDev: 240.5550us
+  Uncorrelated IN, join form:
+    Runs: [1,449us, 1,183us, 1,214us]
+    Average: 1,282us (no target set)
+    Min/Max: 1,183us / 1,449us, StdDev: 118.7794us
+  Uncorrelated IN: the subquery form costs 2.3x the join form (2,906 vs 1,282)

@@ -1,7 +1,7 @@
 //! Reader and writer for the .zyr columnar file format.
 //!
 //! File layout:
-//!   [0x0000] FILE HEADER (PAGE_SIZE = 16384 bytes)
+//!   [0x0000] FILE HEADER (FILE_HEADER_SIZE = 512 bytes)
 //!     [0..4]     magic: "ZCOL"
 //!     [4..8]     format_version: u16 major, u16 minor
 //!     [8..12]    header_length: u32 (128)
@@ -20,10 +20,11 @@
 //!     [80..88]   segment_index_offset: u64
 //!     [88..92]   segment_index_size: u32
 //!     [92..128]  reserved (zeroed)
-//!     [128..PAGE_SIZE] padding
+//!     [128..FILE_HEADER_SIZE] room to grow
 //!
-//!   [PAGE_SIZE+] COLUMN SEGMENTS (each page-aligned)
-//!     SegmentHeader (128 bytes) + bloom + zone_maps + encoded_data + padding
+//!   [FILE_HEADER_SIZE+] COLUMN SEGMENTS (each SEGMENT_ALIGNMENT-aligned)
+//!     SegmentHeader (128 bytes) + bloom + zone_maps + null bitmap +
+//!     encoded_data, padded to the next SEGMENT_ALIGNMENT boundary
 //!
 //!   FOOTER:
 //!     Segment index: column_count * 20 bytes
@@ -33,9 +34,11 @@
 //!     file_checksum: u32
 
 use super::bloom::BloomFilter;
+use super::cache::{CachedSegment, SegmentCache, SegmentCacheKey};
 use super::constants::{
-    FILE_HEADER_METADATA_SIZE, FILE_HEADER_SIZE, FOOTER_SIZE, SEGMENT_HEADER_SIZE,
-    SEGMENT_INDEX_ENTRY_SIZE, ZYR_FOOTER_SENTINEL, ZYR_FORMAT_VERSION,
+    FILE_HEADER_METADATA_SIZE, FILE_HEADER_SIZE, FOOTER_SIZE, SEGMENT_ALIGNMENT,
+    SEGMENT_HEADER_SIZE, SEGMENT_INDEX_ENTRY_SIZE, ZYR_FOOTER_SENTINEL, ZYR_FORMAT_VERSION,
+    ZYR_READER_WINDOW,
 };
 use super::segment::{SegmentHeader, ZoneMapEntry};
 use std::fs::{File, OpenOptions};
@@ -44,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::format::envelope::{self, ENVELOPE_HEADER_LEN};
 use zyron_common::format::{FormatKind, FormatVersion};
+#[cfg(test)]
 use zyron_common::page::PAGE_SIZE;
 use zyron_common::{Result, ZyronError};
 
@@ -81,7 +85,7 @@ impl SortOrder {
 // ZyrFileHeader
 // ---------------------------------------------------------------------------
 
-/// Metadata stored in the first PAGE_SIZE bytes of a .zyr file.
+/// Metadata stored in the first FILE_HEADER_SIZE bytes of a .zyr file.
 #[derive(Debug, Clone)]
 pub struct ZyrFileHeader {
     pub format_version: FormatVersion,
@@ -118,21 +122,21 @@ pub struct ZyrFileHeader {
 }
 
 impl ZyrFileHeader {
-    /// Serializes the header into a full PAGE_SIZE buffer.
+    /// Serializes the header into a full FILE_HEADER_SIZE buffer.
     ///
     /// Bytes [0..20) are the universal format envelope. Bytes
     /// [20..FILE_HEADER_METADATA_SIZE) are the file's own header extension,
     /// which the envelope's header checksum at [16..20) covers along with
     /// [0..16).
-    pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
-        let mut buf = [0u8; PAGE_SIZE];
+    pub fn to_bytes(&self) -> [u8; FILE_HEADER_SIZE] {
+        let mut buf = [0u8; FILE_HEADER_SIZE];
 
         let extension = self.extension_bytes();
         let header =
             envelope::encode_header(FormatKind::ZyrColumnar, self.format_version, 0, &extension);
         buf[0..ENVELOPE_HEADER_LEN].copy_from_slice(&header);
         buf[ENVELOPE_HEADER_LEN..FILE_HEADER_METADATA_SIZE].copy_from_slice(&extension);
-        // [128..PAGE_SIZE] padding, already zeroed
+        // [128..FILE_HEADER_SIZE] room to grow, already zeroed
         buf
     }
 
@@ -156,9 +160,9 @@ impl ZyrFileHeader {
         ext
     }
 
-    /// Deserializes a header from a PAGE_SIZE buffer. Validates the envelope,
-    /// the version, and the header checksum before returning.
-    pub fn from_bytes(buf: &[u8; PAGE_SIZE]) -> Result<Self> {
+    /// Deserializes a header from a FILE_HEADER_SIZE buffer. Validates the
+    /// envelope, the version, and the header checksum before returning.
+    pub fn from_bytes(buf: &[u8; FILE_HEADER_SIZE]) -> Result<Self> {
         let (header, extension) = envelope::decode_header(&buf[..FILE_HEADER_METADATA_SIZE])
             .map_err(|e| ZyronError::InvalidZyrFile(e.to_string()))?;
         if header.kind != FormatKind::ZyrColumnar {
@@ -173,11 +177,11 @@ impl ZyrFileHeader {
                 header.header_length, FILE_HEADER_METADATA_SIZE
             )));
         }
-        if header.version != ZYR_FORMAT_VERSION {
+        if !ZYR_READER_WINDOW.contains(header.version) {
             return Err(ZyronError::InvalidZyrFile(format!(
-                "columnar file is at format version {}, this binary writes and reads {}. \
+                "columnar file is at format version {}, this binary reads {} and writes {}. \
                  Upgrade through a release that still reads {} to move the file forward first",
-                header.version, ZYR_FORMAT_VERSION, header.version
+                header.version, ZYR_READER_WINDOW, ZYR_FORMAT_VERSION, header.version
             )));
         }
 
@@ -300,9 +304,9 @@ impl ZyrFileWriter {
     /// Writes a column segment. The segment consists of a 128-byte header,
     /// optional bloom filter bytes, zone map bytes, the null bitmap, and
     /// encoded column data, in that order. The combined output is padded to
-    /// the next PAGE_SIZE boundary. The null bitmap is empty when the column
-    /// has no nulls; readers derive its length from the header null_count and
-    /// the file row_count.
+    /// the next SEGMENT_ALIGNMENT boundary. The null bitmap is empty when the
+    /// column has no nulls; readers derive its length from the header
+    /// null_count and the file row_count.
     ///
     /// Returns the padded region this column occupies, which is what a
     /// reader pays to read the column and what a cost model comparing two
@@ -354,7 +358,7 @@ impl ZyrFileWriter {
             + zoneMapBytes.len()
             + nullBitmap.len()
             + encodedData.len();
-        let paddedLen = round_up_to_page(rawLen);
+        let paddedLen = round_up_to_alignment(rawLen);
         let padBytes = paddedLen - rawLen;
 
         if padBytes > 0 {
@@ -515,10 +519,10 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rounds `size` up to the next PAGE_SIZE multiple.
+/// Rounds `size` up to the next SEGMENT_ALIGNMENT multiple.
 #[inline]
-fn round_up_to_page(size: usize) -> usize {
-    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+pub(crate) fn round_up_to_alignment(size: usize) -> usize {
+    (size + SEGMENT_ALIGNMENT - 1) & !(SEGMENT_ALIGNMENT - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -568,46 +572,60 @@ pub struct ZyrFileReader {
     /// and zone reads too, so the two report bytes of column data the query
     /// had to touch rather than everything the file system was asked for
     dataBytes: AtomicU64,
-    /// Each segment's header, parsed on the first read of that column and
-    /// held for the rest of the reader's life.
-    ///
-    /// A segment header is fixed once the file is written, and every decode
-    /// needs it to locate the payload behind the bloom and the zone maps.
-    /// Reading it again per decode is a second positional read for bytes
-    /// that cannot have changed, and a scan reading several columns, or one
-    /// column in ranges, pays it every time. Filled lazily so opening a wide
-    /// file to read two of its columns does not read a hundred headers
     /// What has been read off each segment and does not have to be read
-    /// again, filled on the first column this reader decodes.
+    /// again, filled on the first column this reader touches.
     ///
     /// Built on first use rather than at open, because opening a file to
     /// prune it against its manifest never reads a segment at all, and a
     /// scan opens far more files than it decodes columns from
-    segmentCache: std::sync::OnceLock<Box<[SegmentCache]>>,
+    segmentParts: std::sync::OnceLock<Box<[SegmentParts]>>,
+    /// This reader's id in the column cache, taken from a process-wide
+    /// counter at open so no two readers ever share an entry
+    cacheId: u64,
     #[allow(dead_code)]
     fileSize: u64,
 }
 
-/// One segment's reusable parts.
+/// What has been read off one segment and does not have to be read again.
 ///
-/// The header is fixed once the file is written and every decode needs it to
-/// locate the payload behind the bloom and the zone maps. The tail is the
-/// null bitmap and encoded payload, held only when small: a well encoded
-/// column is a few dozen bytes, and a point probe decoding a range per key,
-/// or a predicate column that is also projected, would otherwise pay a
-/// system call each time for bytes that cannot have changed
+/// The header is fixed once the file is written and every decode needs it
+/// to locate the payload behind the bloom and the zone maps. Reading it
+/// again per decode is a second positional read for bytes that cannot have
+/// changed, and a scan reading several columns, or one column in ranges,
+/// pays it every time. The zone maps are sized by the row count rather
+/// than by the data, sixty four bytes per thousand rows, so they are held
+/// beside the header. The payload and the bloom are sized by the data and
+/// go through the process-wide column cache instead, where a byte budget
+/// decides what stays
 #[derive(Default)]
-struct SegmentCache {
+struct SegmentParts {
     header: std::sync::OnceLock<SegmentHeader>,
-    tail: std::sync::OnceLock<std::sync::Arc<Vec<u8>>>,
+    zones: std::sync::OnceLock<std::sync::Arc<[ZoneMapEntry]>>,
 }
 
-/// Largest segment tail held in memory after its first read.
+/// Bytes of segment payloads and value blooms held across every open file.
 ///
-/// Sized so a well compressed column is kept and a raw or lightly encoded
-/// one is not: past this the read is large enough that the system call is no
-/// longer the dominant cost, and holding it would grow with the file
-const CACHED_TAIL_MAX: usize = 8192;
+/// A scan reads every projected column of every surviving file, and a
+/// point read decodes a range of one column per key. Both read bytes that
+/// cannot have changed since the last query read them, and past this
+/// budget the clock sweep keeps the ones queries keep asking for. The
+/// operating system holds the file pages either way, what the budget buys
+/// back is the system call, the copy and the checksum each read repeats
+const COLUMN_CACHE_BUDGET: usize = 64 << 20;
+
+/// Largest single entry admitted, so one wide segment cannot push out the
+/// working set of every other file to hold bytes a single decode consumes
+const COLUMN_CACHE_ENTRY_MAX: usize = COLUMN_CACHE_BUDGET / 16;
+
+static COLUMN_CACHE: std::sync::OnceLock<SegmentCache> = std::sync::OnceLock::new();
+
+/// The process-wide column cache, shared by every reader
+fn column_cache() -> &'static SegmentCache {
+    COLUMN_CACHE.get_or_init(|| SegmentCache::new(COLUMN_CACHE_BUDGET))
+}
+
+/// Source of reader ids for cache keys, never reused within a process
+static NEXT_READER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Fills `buf` from `offset`, naming the region in any error so a failure
 /// says which part of which file could not be read
@@ -773,11 +791,11 @@ impl ZyrFileReader {
             ))
         })?;
 
-        // Read file header (first PAGE_SIZE bytes). It names where the
+        // Read file header (first FILE_HEADER_SIZE bytes). It names where the
         // segment index sits, which is what keeps this open to three system
         // calls: without it the file size has to be asked for and the
         // trailer read to find the index, and only then the index itself
-        let mut headerBuf = [0u8; PAGE_SIZE];
+        let mut headerBuf = [0u8; FILE_HEADER_SIZE];
         read_exact_at(&file, &mut headerBuf, 0, path, ReadPurpose::FileHeader)?;
         let header = ZyrFileHeader::from_bytes(&headerBuf)?;
 
@@ -893,9 +911,12 @@ impl ZyrFileReader {
             header,
             segmentIndex,
             segmentByColumn,
-            ioBytes: AtomicU64::new(PAGE_SIZE as u64 + indexRegionSize as u64 + FOOTER_SIZE as u64),
+            ioBytes: AtomicU64::new(
+                FILE_HEADER_SIZE as u64 + indexRegionSize as u64 + FOOTER_SIZE as u64,
+            ),
             dataBytes: AtomicU64::new(0),
-            segmentCache: std::sync::OnceLock::new(),
+            segmentParts: std::sync::OnceLock::new(),
+            cacheId: NEXT_READER_ID.fetch_add(1, Ordering::Relaxed),
             fileSize,
         })
     }
@@ -939,23 +960,23 @@ impl ZyrFileReader {
         self.segmentIndex.get(position).map(|e| (position, e))
     }
 
+    /// The per-segment memo, built the first time a segment is touched
+    fn segment_parts(&self) -> &[SegmentParts] {
+        self.segmentParts.get_or_init(|| {
+            (0..self.segmentIndex.len())
+                .map(|_| SegmentParts::default())
+                .collect()
+        })
+    }
+
     /// One segment's header, read off the file the first time it is asked
     /// for and answered from memory after that.
     ///
     /// The byte counter moves only on a read that happened, so the reported
     /// figure stays what the file system was actually asked for
-    /// The per-segment cache, built the first time a segment is read
-    fn segment_cache(&self) -> &[SegmentCache] {
-        self.segmentCache.get_or_init(|| {
-            (0..self.segmentIndex.len())
-                .map(|_| SegmentCache::default())
-                .collect()
-        })
-    }
-
     fn cached_segment_header(&self, position: usize, offset: u64) -> Result<&SegmentHeader> {
         let cell = self
-            .segment_cache()
+            .segment_parts()
             .get(position)
             .map(|c| &c.header)
             .ok_or_else(|| {
@@ -1004,9 +1025,9 @@ impl ZyrFileReader {
         self.segment_for(column_id).map(|e| e.size).unwrap_or(0)
     }
 
-    /// Reads the raw segment bytes for the given column_id. Returns the full
-    /// page-aligned segment data (header + bloom + zone maps + encoded data +
-    /// padding).
+    /// Reads the raw segment bytes for the given column_id. Returns the whole
+    /// segment, the header then bloom, zone maps, null bitmap and encoded data,
+    /// padded to the 64-byte alignment
     pub fn read_segment_raw(&self, columnId: u32) -> Result<Vec<u8>> {
         let entry = self.segment_for(columnId).ok_or_else(|| {
             ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", columnId))
@@ -1041,7 +1062,7 @@ impl ZyrFileReader {
         &self,
         column_id: u32,
         row_count: usize,
-    ) -> Result<(SegmentHeader, std::sync::Arc<Vec<u8>>, usize)> {
+    ) -> Result<(SegmentHeader, std::sync::Arc<CachedSegment>, usize)> {
         use super::constants::{ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE};
         let (position, entry) = self.segment_at(column_id).ok_or_else(|| {
             ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
@@ -1065,16 +1086,16 @@ impl ZyrFileReader {
                 null_start + tail_len
             )));
         }
-        // A tail already read off this file is handed back without a
-        // second system call. The checksum guards the transfer from disk, so
-        // it is verified when the bytes arrive rather than on every look at
-        // bytes that have not left memory since
-        if let Some(cell) = self.segment_cache().get(position).map(|c| &c.tail)
-            && let Some(tail) = cell.get()
+        // A tail a query already pulled off this file is handed back without
+        // a second system call. The checksum guards the transfer from disk,
+        // so it is verified when the bytes arrive rather than on every look
+        // at bytes that have not left memory since
+        let key = SegmentCacheKey::new(self.cacheId, column_id);
+        if let Some(tail) = column_cache().get(&key)
             && tail.len() == tail_len
         {
             self.count_data_read(tail_len);
-            return Ok((header, std::sync::Arc::clone(tail), null_len));
+            return Ok((header, tail, null_len));
         }
 
         let tail = read_vec_at(
@@ -1093,13 +1114,66 @@ impl ZyrFileReader {
                 column_id, header.data_checksum, crc
             )));
         }
-        let tail = std::sync::Arc::new(tail);
-        if tail_len <= CACHED_TAIL_MAX
-            && let Some(cell) = self.segment_cache().get(position).map(|c| &c.tail)
-        {
-            let _ = cell.set(std::sync::Arc::clone(&tail));
-        }
+        // Kept under the budget so the next query reads it from memory. A
+        // tail wider than the entry cap is handed back unshared, the read is
+        // then a small part of decoding it and holding it would push out the
+        // working set of every other file
+        let tail = if tail_len <= COLUMN_CACHE_ENTRY_MAX {
+            column_cache().insert(key, tail)
+        } else {
+            std::sync::Arc::new(CachedSegment::new(key, tail))
+        };
         Ok((header, tail, null_len))
+    }
+
+    /// Reads one column's null bitmap without its payload.
+    ///
+    /// None means the segment records no null at all, which its header says
+    /// on its own and no read can add to. Otherwise the bitmap is one bit
+    /// per row of the whole segment, set where the row is null.
+    ///
+    /// A payload already pulled off this file answers from its own bytes,
+    /// because the bitmap sits immediately ahead of the payload in the same
+    /// tail. Only a caller asking about nullness alone, which is what a
+    /// null-shaped predicate does, reaches the file, and it reads the
+    /// bitmap region rather than the payload behind it
+    pub fn read_segment_nulls(&self, column_id: u32, row_count: usize) -> Result<Option<Vec<u8>>> {
+        use super::constants::{ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE};
+        let (position, entry) = self.segment_at(column_id).ok_or_else(|| {
+            ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
+        })?;
+        let header = self.cached_segment_header(position, entry.offset)?.clone();
+        if header.null_count == 0 {
+            return Ok(None);
+        }
+        let null_len = row_count.div_ceil(8);
+        let tail_len = null_len + header.encoded_size as usize;
+        if let Some(tail) = column_cache().get(&SegmentCacheKey::new(self.cacheId, column_id))
+            && tail.len() == tail_len
+        {
+            self.count_data_read(null_len);
+            return Ok(Some(tail[..null_len].to_vec()));
+        }
+        let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
+        let null_start =
+            SEGMENT_HEADER_SIZE + header.bloom_filter_size as usize + zones * ZONE_MAP_ENTRY_SIZE;
+        if null_start as u64 + null_len as u64 > entry.size {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "null bitmap for column {} runs past its segment: needs {} bytes of {}",
+                column_id,
+                null_start + null_len,
+                entry.size
+            )));
+        }
+        let bitmap = read_vec_at(
+            &self.file,
+            null_len,
+            entry.offset + null_start as u64,
+            &self.path,
+            ReadPurpose::Segment(column_id),
+        )?;
+        self.count_data_read(null_len);
+        Ok(Some(bitmap))
     }
 
     /// Reads and fully decodes one column segment, returning the decoded
@@ -1141,15 +1215,21 @@ impl ZyrFileReader {
         start: usize,
         end: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
+        let (header, tail, null_len) = {
+            let _s = zyron_common::profile::scope(zyron_common::profile::Phase::LakeReadPayload);
+            self.read_segment_payload(column_id, row_count)?
+        };
         let (start, end) = crate::encoding::clamp_range(row_count, start, end);
-        let decoded = crate::encoding::create_encoding(header.encoding_type).decode_range(
-            &tail[null_len..],
-            row_count,
-            value_size,
-            start,
-            end,
-        )?;
+        let decoded = {
+            let _s = zyron_common::profile::scope(zyron_common::profile::Phase::LakeDecodeRange);
+            crate::encoding::create_encoding(header.encoding_type).decode_range(
+                &tail[null_len..],
+                row_count,
+                value_size,
+                start,
+                end,
+            )?
+        };
         Ok((decoded, tail[..null_len].to_vec()))
     }
 
@@ -1166,27 +1246,33 @@ impl ZyrFileReader {
     ///
     /// The two are returned together because the zone region's offset
     /// depends on the header's bloom size, so reading one already pays for
-    /// the other.
+    /// the other. Both are read off the file once per reader and answered
+    /// from memory after that, a filtered scan asks every file the same
+    /// question on every query
     pub fn read_segment_metadata(
         &self,
         column_id: u32,
         row_count: usize,
-    ) -> Result<(SegmentHeader, Vec<ZoneMapEntry>)> {
+    ) -> Result<(SegmentHeader, std::sync::Arc<[ZoneMapEntry]>)> {
         use super::constants::{ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE};
-        let entry = self.segment_for(column_id).ok_or_else(|| {
+        let (position, entry) = self.segment_at(column_id).ok_or_else(|| {
             ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
         })?;
-        let mut header_bytes = [0u8; SEGMENT_HEADER_SIZE];
-        read_exact_at(
-            &self.file,
-            &mut header_bytes,
-            entry.offset,
-            &self.path,
-            ReadPurpose::SegmentHeader,
-        )?;
-        let header = SegmentHeader::from_bytes(&header_bytes)?;
+        let header = self.cached_segment_header(position, entry.offset)?.clone();
+        let cell = self
+            .segment_parts()
+            .get(position)
+            .map(|p| &p.zones)
+            .ok_or_else(|| {
+                ZyronError::InvalidZyrFile(format!("no segment at index position {}", position))
+            })?;
 
         let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
+        if let Some(held) = cell.get()
+            && held.len() == zones
+        {
+            return Ok((header, std::sync::Arc::clone(held)));
+        }
         let region = zones * ZONE_MAP_ENTRY_SIZE;
         let start = (SEGMENT_HEADER_SIZE + header.bloom_filter_size as usize) as u64;
         if start + region as u64 > entry.size {
@@ -1206,6 +1292,7 @@ impl ZyrFileReader {
             &self.path,
             ReadPurpose::ZoneMaps(column_id),
         )?;
+        self.count_read(region);
         let mut out = Vec::with_capacity(zones);
         for z in 0..zones {
             let slice: [u8; ZONE_MAP_ENTRY_SIZE] = buf
@@ -1214,7 +1301,11 @@ impl ZyrFileReader {
                 .map_err(|_| ZyronError::InvalidZyrFile("failed to slice zone map entry".into()))?;
             out.push(ZoneMapEntry::from_bytes(&slice));
         }
-        Ok((header, out))
+        let held: std::sync::Arc<[ZoneMapEntry]> = out.into();
+        if held.len() == zones {
+            let _ = cell.set(std::sync::Arc::clone(&held));
+        }
+        Ok((header, held))
     }
 
     /// Evaluates a predicate against one column without decoding it,
@@ -1305,43 +1396,85 @@ impl ZyrFileReader {
     ///
     /// This is the metadata-only path an aggregate takes when MIN, MAX or
     /// COUNT is answerable from the header alone, so `SELECT MAX(c)` over
-    /// a clean segment costs one small read instead of decoding every row
+    /// a clean segment costs one small read the first time and no read
+    /// after that
     pub fn read_segment_header(&self, column_id: u32) -> Result<SegmentHeader> {
-        let bytes = self.read_segment_header_bytes(column_id)?;
-        SegmentHeader::from_bytes(&bytes)
+        let (position, entry) = self.segment_at(column_id).ok_or_else(|| {
+            ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
+        })?;
+        self.cached_segment_header(position, entry.offset).cloned()
     }
 
-    /// Reads a column's value bloom filter without touching its data.
+    /// One column's serialized value bloom, None when the segment carries
+    /// none, which is the answer for a low-cardinality or dictionary-encoded
+    /// column.
     ///
-    /// Returns None when the segment carries no bloom, which is the answer
-    /// for a low-cardinality or dictionary-encoded column. The bloom offset
-    /// in the header is segment relative, so the read lands at the segment's
-    /// file offset plus that value.
-    pub fn read_bloom(&self, columnId: u32) -> Result<Option<BloomFilter>> {
-        let entry = self.segment_for(columnId).ok_or_else(|| {
-            ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", columnId))
+    /// The bytes are shared through the column cache, so a point read that
+    /// asks every surviving file the same question pays the read once per
+    /// file rather than once per query. The bloom offset in the header is
+    /// segment relative, so the read lands at the segment's file offset
+    /// plus that value
+    fn bloom_bytes(&self, column_id: u32) -> Result<Option<std::sync::Arc<CachedSegment>>> {
+        let (position, entry) = self.segment_at(column_id).ok_or_else(|| {
+            ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
         })?;
-        let headerBytes = self.read_segment_header_bytes(columnId)?;
-        let header = super::segment::SegmentHeader::from_bytes(&headerBytes)?;
+        let header = self.cached_segment_header(position, entry.offset)?;
         if header.bloom_filter_size == 0 {
             return Ok(None);
+        }
+        let size = header.bloom_filter_size as usize;
+        let key = SegmentCacheKey::bloom(self.cacheId, column_id);
+        if let Some(bloom) = column_cache().get(&key)
+            && bloom.len() == size
+        {
+            return Ok(Some(bloom));
         }
         let end = header.bloom_filter_offset + header.bloom_filter_size as u64;
         if end > entry.size {
             return Err(ZyronError::InvalidZyrFile(format!(
                 "bloom filter for column {} runs past its segment: needs {} bytes of {}",
-                columnId, end, entry.size
+                column_id, end, entry.size
             )));
         }
-
         let buf = read_vec_at(
             &self.file,
-            header.bloom_filter_size as usize,
+            size,
             entry.offset + header.bloom_filter_offset,
             &self.path,
-            ReadPurpose::BloomFilter(columnId),
+            ReadPurpose::BloomFilter(column_id),
         )?;
-        BloomFilter::from_bytes(&buf).map(Some)
+        self.count_read(size);
+        Ok(Some(if size <= COLUMN_CACHE_ENTRY_MAX {
+            column_cache().insert(key, buf)
+        } else {
+            std::sync::Arc::new(CachedSegment::new(key, buf))
+        }))
+    }
+
+    /// Reads a column's value bloom filter without touching its data.
+    ///
+    /// Returns None when the segment carries no bloom, which is the answer
+    /// for a low-cardinality or dictionary-encoded column
+    pub fn read_bloom(&self, columnId: u32) -> Result<Option<BloomFilter>> {
+        match self.bloom_bytes(columnId)? {
+            Some(bytes) => BloomFilter::from_bytes(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a column's value bloom admits any of `values`.
+    ///
+    /// None when the segment carries no bloom. Some(false) says every value
+    /// is provably absent, which is the only answer a caller may act on.
+    /// Probed on the serialized bytes in place, so a hit in the column
+    /// cache costs no parse and no copy
+    pub fn bloom_admits_any(&self, column_id: u32, values: &[&[u8]]) -> Result<Option<bool>> {
+        let Some(bloom) = self.bloom_bytes(column_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(values.iter().any(|value| {
+            super::bloom::might_contain_serialized(&bloom, value)
+        })))
     }
 
     /// Reads several column segments with a single file open, invoking `f`
@@ -1541,7 +1674,11 @@ mod tests {
 
         // Read segment 0 and verify contents.
         let seg0 = reader.read_segment_raw(0).expect("read segment 0");
-        assert_eq!(seg0.len() % PAGE_SIZE, 0, "segment 0 not page-aligned");
+        assert_eq!(
+            seg0.len() % SEGMENT_ALIGNMENT,
+            0,
+            "segment 0 not on the segment alignment"
+        );
         // First 4 bytes = column_id.
         assert_eq!(u32::from_le_bytes([seg0[0], seg0[1], seg0[2], seg0[3]]), 0);
         // Zone map starts at offset 128 (after segment header, no bloom).
@@ -1554,7 +1691,11 @@ mod tests {
 
         // Read segment 1 and verify contents.
         let seg1 = reader.read_segment_raw(1).expect("read segment 1");
-        assert_eq!(seg1.len() % PAGE_SIZE, 0, "segment 1 not page-aligned");
+        assert_eq!(
+            seg1.len() % SEGMENT_ALIGNMENT,
+            0,
+            "segment 1 not on the segment alignment"
+        );
         assert_eq!(u32::from_le_bytes([seg1[0], seg1[1], seg1[2], seg1[3]]), 1);
         // Bloom starts at 128.
         assert_eq!(seg1[SEGMENT_HEADER_SIZE], 0xBB);
@@ -1736,13 +1877,75 @@ mod tests {
     }
 
     #[test]
-    fn test_round_up_to_page() {
-        assert_eq!(round_up_to_page(0), 0);
-        assert_eq!(round_up_to_page(1), PAGE_SIZE);
-        assert_eq!(round_up_to_page(PAGE_SIZE), PAGE_SIZE);
-        assert_eq!(round_up_to_page(PAGE_SIZE + 1), PAGE_SIZE * 2);
-        assert_eq!(round_up_to_page(PAGE_SIZE * 3), PAGE_SIZE * 3);
-        assert_eq!(round_up_to_page(PAGE_SIZE * 3 - 1), PAGE_SIZE * 3);
+    fn test_round_up_to_alignment() {
+        assert_eq!(round_up_to_alignment(0), 0);
+        assert_eq!(round_up_to_alignment(1), SEGMENT_ALIGNMENT);
+        assert_eq!(round_up_to_alignment(SEGMENT_ALIGNMENT), SEGMENT_ALIGNMENT);
+        assert_eq!(
+            round_up_to_alignment(SEGMENT_ALIGNMENT + 1),
+            SEGMENT_ALIGNMENT * 2
+        );
+        assert_eq!(
+            round_up_to_alignment(SEGMENT_ALIGNMENT * 3),
+            SEGMENT_ALIGNMENT * 3
+        );
+        assert_eq!(
+            round_up_to_alignment(SEGMENT_ALIGNMENT * 3 - 1),
+            SEGMENT_ALIGNMENT * 3
+        );
+    }
+
+    /// A segment's own bytes are what it occupies, past the boundary its
+    /// start is placed on. Padding it out to a page made a file of five
+    /// short columns eleven times the size of the data in it, and nothing
+    /// reads a segment as pages: the index names every column's offset and
+    /// size, and every read past the segment header lands at an offset a
+    /// bloom and a zone region already put off any boundary
+    #[test]
+    fn a_segment_occupies_its_own_bytes_rounded_to_the_alignment() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("compact.zyr");
+        let header = ZyrFileHeader {
+            format_version: ZYR_FORMAT_VERSION,
+            column_count: 1,
+            row_count: 1024,
+            table_id: 7,
+            xmin_range_lo: 0,
+            xmin_range_hi: 0,
+            xmax_range_lo: 0,
+            xmax_range_hi: u64::MAX,
+            primary_key_column_id: 0,
+            sort_order: SortOrder::None,
+            segment_index_offset: 0,
+            segment_index_size: 0,
+        };
+        let mut writer = ZyrFileWriter::create(&path, header).expect("create");
+        let headerBytes = make_segment_header(0);
+        let zones = vec![0xAAu8; 128];
+        let encoded = vec![0x11u8; 300];
+        let occupied = writer
+            .write_segment(0, &headerBytes, None, &zones, &[], &encoded)
+            .expect("write segment");
+        let raw = SEGMENT_HEADER_SIZE + zones.len() + encoded.len();
+        assert_eq!(occupied as usize, round_up_to_alignment(raw));
+        assert!(
+            occupied < PAGE_SIZE as u64,
+            "a segment of {} bytes took {} on disk",
+            raw,
+            occupied
+        );
+        let size = writer.finalize(false).expect("finalize");
+        assert!(
+            size < PAGE_SIZE as u64,
+            "a one column file of {} bytes of content took {} on disk",
+            raw,
+            size
+        );
+        // What it costs to read back is unchanged by where it sits
+        let reader = ZyrFileReader::open(&path).expect("open");
+        let seg = reader.read_segment_raw(0).expect("read segment");
+        assert_eq!(seg[SEGMENT_HEADER_SIZE], 0xAA);
+        assert_eq!(seg[SEGMENT_HEADER_SIZE + zones.len()], 0x11);
     }
 
     #[test]

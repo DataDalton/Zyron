@@ -9,6 +9,7 @@
 //! check runs against the tree and this runs against the binary that is
 //! actually about to open your data
 
+use zyron_common::format::wire_version::WireProtocol;
 use zyron_common::format::{FormatSubstrate, MAGIC_ALLOCATIONS};
 use zyron_common::{Result, ZyronError};
 
@@ -20,9 +21,15 @@ pub struct ValidationReport {
     pub schemes: usize,
     pub catalog_tables: usize,
     pub deprecations: usize,
+    /// Every registered protocol version row, across the three protocols
     pub wire_versions: usize,
     pub rewriters: usize,
+    /// The client protocol version new connections negotiate
     pub current_wire_version: u32,
+    /// The mesh protocol version in the path other nodes are called on
+    pub mesh_protocol_version: u32,
+    /// The consensus protocol version stamped into every frame
+    pub consensus_protocol_version: u32,
     pub channel: String,
     pub auto_upgrade_enabled: bool,
 }
@@ -33,15 +40,18 @@ impl std::fmt::Display for ValidationReport {
             f,
             "format substrate ready, {} formats ({} reserved), {} signature schemes, \
              {} catalog tables, {} deprecations, {} user-object rewriters, \
-             wire version {} of {}, upgrade channel {}, auto_upgrade_enabled {}",
+             {} protocol versions registered, client protocol {}, mesh protocol {}, \
+             consensus protocol {}, upgrade channel {}, auto_upgrade_enabled {}",
             self.formats,
             self.reserved_formats,
             self.schemes,
             self.catalog_tables,
             self.deprecations,
             self.rewriters,
-            self.current_wire_version,
             self.wire_versions,
+            self.current_wire_version,
+            self.mesh_protocol_version,
+            self.consensus_protocol_version,
             self.channel,
             self.auto_upgrade_enabled
         )
@@ -76,7 +86,13 @@ pub fn report(substrate: &FormatSubstrate) -> ValidationReport {
         deprecations: substrate.deprecations.records().len(),
         wire_versions: substrate.wire_versions.versions().len(),
         rewriters: zyron_parser::rewriter::registered().len(),
-        current_wire_version: substrate.wire_versions.current_version(),
+        current_wire_version: substrate
+            .wire_versions
+            .current_version(WireProtocol::Client),
+        mesh_protocol_version: substrate.wire_versions.current_version(WireProtocol::Mesh),
+        consensus_protocol_version: substrate
+            .wire_versions
+            .current_version(WireProtocol::Consensus),
         channel: settings.channel.label().to_string(),
         auto_upgrade_enabled: settings.auto_upgrade_enabled,
     }
@@ -147,6 +163,9 @@ mod tests {
         );
         assert!(report.catalog_tables > 0);
         assert_eq!(report.current_wire_version, 3);
+        assert_eq!(report.mesh_protocol_version, 1);
+        assert_eq!(report.consensus_protocol_version, 1);
+        assert_eq!(report.wire_versions, 3, "one row per protocol");
     }
 
     #[test]
@@ -155,6 +174,10 @@ mod tests {
         let text = report(substrate).to_string();
         assert!(text.contains("format substrate ready"), "{text}");
         assert!(text.contains("signature schemes"), "{text}");
+        assert!(
+            text.contains("client protocol 3, mesh protocol 1, consensus protocol 1"),
+            "{text}"
+        );
         assert!(text.contains("upgrade channel"), "{text}");
     }
 

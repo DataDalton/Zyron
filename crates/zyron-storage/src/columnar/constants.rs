@@ -1,7 +1,7 @@
 //! Byte-level constants for the .zyr columnar file format.
 
 use zyron_common::format::FormatVersion;
-use zyron_common::page::PAGE_SIZE;
+use zyron_common::format::version::VersionWindow;
 
 /// Sentinel repeated in the trailer of a .zyr file. Not the file's format
 /// identity, which the envelope in the header carries. This marks where the
@@ -9,10 +9,39 @@ use zyron_common::page::PAGE_SIZE;
 pub const ZYR_FOOTER_SENTINEL: [u8; 8] = *b"ZYRCOL\0\0";
 
 /// Current .zyr format version, registered in the format registry.
-pub const ZYR_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+///
+/// 1.1 keeps the file header in 512 bytes and starts every column segment
+/// on a 64-byte boundary. 1.0 padded the header and every segment to a
+/// 16KB page
+pub const ZYR_FORMAT_VERSION: FormatVersion = FormatVersion::new(1, 1);
 
-/// File header occupies one full page for alignment.
-pub const FILE_HEADER_SIZE: usize = PAGE_SIZE;
+/// The page-padded layout, which the reader still opens and the migration
+/// moves forward
+pub const ZYR_FORMAT_VERSION_1_0: FormatVersion = FormatVersion::V1;
+
+/// Versions this binary reads. Every offset a reader uses comes from the
+/// segment index, so one reader serves both layouts
+pub const ZYR_READER_WINDOW: VersionWindow =
+    VersionWindow::new(ZYR_FORMAT_VERSION_1_0, ZYR_FORMAT_VERSION);
+
+/// Bytes the file header occupies before the first column segment.
+///
+/// The header itself is FILE_HEADER_METADATA_SIZE bytes and the rest is
+/// room to grow. Nothing derives a segment's position from this, because
+/// the segment index records an explicit offset and size for every column,
+/// so the only thing it fixes is where the first segment can start
+pub const FILE_HEADER_SIZE: usize = 512;
+
+/// Byte boundary each column segment starts on.
+///
+/// A segment's header, bloom blocks and zone entries are all multiples of a
+/// cache line, so aligning the segment start keeps every one of them
+/// aligned within the file. Nothing reads a segment as pages: the header
+/// read lands at the segment offset and every other read lands at an
+/// offset past a bloom and a zone region whose sizes are the column's own,
+/// so padding a segment out to a page boundary bought alignment for one
+/// 128-byte read and spent up to a page per column to do it
+pub const SEGMENT_ALIGNMENT: usize = 64;
 
 /// Bytes of metadata in the file header before the padding region. The
 /// first 20 are the format envelope, the rest are the file's own header

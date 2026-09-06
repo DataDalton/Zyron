@@ -426,7 +426,59 @@ pub struct LogWriterHandle {
     /// waiter that checks the index after the writer has already moved past
     /// it must not park forever on a wakeup it missed
     persisted_tx: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Batch buffers the writer has emptied, for the log to stage into
+    /// next, so a flush neither copies the batch nor allocates for the one
+    /// after it
+    spare: Arc<parking_lot::Mutex<SparePool>>,
+    fsyncs: Arc<AtomicU64>,
+    /// The longest one fsync has taken, which is what a latency spike on a
+    /// quiet group is usually made of
+    fsync_max_us: Arc<AtomicU64>,
 }
+
+/// Emptied batch buffers, bounded in count and in the capacity they hold
+#[derive(Default)]
+struct SparePool {
+    buffers: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl SparePool {
+    fn take(&mut self) -> Vec<u8> {
+        match self.buffers.pop() {
+            Some(buffer) => {
+                self.bytes -= buffer.capacity();
+                buffer
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Keeps an emptied buffer while the pool has room for it, and lets it
+    /// go otherwise
+    fn give(&mut self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        if self.buffers.len() >= SPARE_BUFFERS || self.bytes + buffer.capacity() > SPARE_BYTES {
+            return;
+        }
+        self.bytes += buffer.capacity();
+        self.buffers.push(buffer);
+    }
+}
+
+/// Emptied batch buffers kept for reuse.
+///
+/// Sized to one writer cycle under load. Every proposal that lands while
+/// the writer is inside an fsync stages its own batch and takes a buffer,
+/// and the writer hands them all back once the cycle ends, so a pool
+/// smaller than a cycle's proposals leaves the rest staging into fresh
+/// allocations that grow by doubling
+const SPARE_BUFFERS: usize = 256;
+
+/// Capacity the pool holds at most. A follower's batch is a megabyte and
+/// its buffer keeps that capacity, so the pool is bounded in bytes as well
+/// as in count
+const SPARE_BYTES: usize = 4 * 1024 * 1024;
 
 impl Clone for LogWriterHandle {
     fn clone(&self) -> Self {
@@ -436,6 +488,9 @@ impl Clone for LogWriterHandle {
             failed: Arc::clone(&self.failed),
             error: Arc::clone(&self.error),
             persisted_tx: Arc::clone(&self.persisted_tx),
+            spare: Arc::clone(&self.spare),
+            fsyncs: Arc::clone(&self.fsyncs),
+            fsync_max_us: Arc::clone(&self.fsync_max_us),
         }
     }
 }
@@ -445,6 +500,21 @@ impl LogWriterHandle {
     #[inline]
     pub fn persisted_index(&self) -> u64 {
         self.persisted.load(Ordering::Acquire)
+    }
+
+    /// How many times the writer has flushed to stable storage
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// The longest one flush has taken, in microseconds
+    pub fn fsync_max_us(&self) -> u64 {
+        self.fsync_max_us.load(Ordering::Relaxed)
+    }
+
+    /// A buffer the writer has finished with, empty and with its capacity
+    fn take_spare(&self) -> Vec<u8> {
+        self.spare.lock().take()
     }
 
     /// A receiver that changes every time `persisted_index` advances
@@ -699,10 +769,86 @@ struct WriterPublish {
     failed: Arc<AtomicBool>,
     error: Arc<parking_lot::Mutex<Option<String>>>,
     persisted_tx: Arc<tokio::sync::watch::Sender<u64>>,
+    spare: Arc<parking_lot::Mutex<SparePool>>,
+    fsyncs: Arc<AtomicU64>,
+    fsync_max_us: Arc<AtomicU64>,
+}
+
+/// Consecutive append batches from one writer cycle, joined so they reach
+/// the file in one write.
+///
+/// Under load a cycle holds a hundred proposals that each staged their own
+/// batch, and a write per batch cost the writer a third of its cycle before
+/// the fsync began. A lone batch is written as it is, and a second one in
+/// the same cycle is what starts the join
+#[derive(Default)]
+struct AppendRun {
+    start_index: u64,
+    records: u64,
+    /// The first batch of the run, held rather than copied until a second
+    /// one joins it
+    lone: Option<(Vec<u8>, Vec<u32>)>,
+    bytes: Vec<u8>,
+    lengths: Vec<u32>,
+}
+
+impl AppendRun {
+    fn push(
+        &mut self,
+        store: &mut LogStore,
+        handle: &WriterPublish,
+        start_index: u64,
+        blob: Vec<u8>,
+        lengths: Vec<u32>,
+    ) -> Result<()> {
+        // A batch out of step with the run is written on its own, so the
+        // store's continuity check names it rather than the run
+        if self.records > 0 && start_index != self.start_index + self.records {
+            self.flush(store, handle)?;
+        }
+        if self.records == 0 {
+            self.start_index = start_index;
+        }
+        self.records += lengths.len() as u64;
+        match self.lone.take() {
+            None if self.bytes.is_empty() => {
+                self.lone = Some((blob, lengths));
+            }
+            None => self.join(handle, blob, lengths),
+            Some((first, first_lengths)) => {
+                self.join(handle, first, first_lengths);
+                self.join(handle, blob, lengths);
+            }
+        }
+        Ok(())
+    }
+
+    fn join(&mut self, handle: &WriterPublish, blob: Vec<u8>, lengths: Vec<u32>) {
+        self.bytes.extend_from_slice(&blob);
+        self.lengths.extend_from_slice(&lengths);
+        handle.spare.lock().give(blob);
+    }
+
+    fn flush(&mut self, store: &mut LogStore, handle: &WriterPublish) -> Result<()> {
+        if self.records == 0 {
+            return Ok(());
+        }
+        self.records = 0;
+        if let Some((blob, lengths)) = self.lone.take() {
+            let outcome = store.append(self.start_index, &blob, &lengths);
+            handle.spare.lock().give(blob);
+            return outcome;
+        }
+        let outcome = store.append(self.start_index, &self.bytes, &self.lengths);
+        self.bytes.clear();
+        self.lengths.clear();
+        outcome
+    }
 }
 
 fn writer_loop(mut store: LogStore, rx: Receiver<LogOp>, handle: WriterPublish) {
     let mut batch: Vec<LogOp> = Vec::with_capacity(64);
+    let mut run = AppendRun::default();
     'outer: loop {
         match rx.recv() {
             Ok(op) => batch.push(op),
@@ -723,15 +869,36 @@ fn writer_loop(mut store: LogStore, rx: Receiver<LogOp>, handle: WriterPublish) 
                 stopping = true;
                 break;
             }
-            if let Err(e) = store.apply(op) {
+            let outcome = match op {
+                LogOp::Append {
+                    start_index,
+                    blob,
+                    lengths,
+                } => run.push(&mut store, &handle, start_index, blob, lengths),
+                // The file has to hold the appends before it is cut or
+                // rewritten, so the run goes out ahead of anything else
+                other => run
+                    .flush(&mut store, &handle)
+                    .and_then(|_| store.apply(other)),
+            };
+            if let Err(e) = outcome {
                 failure = Some(e.to_string());
                 break;
             }
         }
         if failure.is_none() {
+            if let Err(e) = run.flush(&mut store, &handle) {
+                failure = Some(e.to_string());
+            }
+        }
+        if failure.is_none() {
+            let at = std::time::Instant::now();
             if let Err(e) = store.file.sync_data() {
                 failure = Some(format!("raft log fsync failed: {e}"));
             }
+            let took = at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            handle.fsyncs.fetch_add(1, Ordering::Relaxed);
+            handle.fsync_max_us.fetch_max(took, Ordering::Relaxed);
         }
         match failure {
             Some(err) => {
@@ -1156,12 +1323,18 @@ impl RaftLog {
             failed: Arc::new(AtomicBool::new(false)),
             error: Arc::new(parking_lot::Mutex::new(None)),
             persisted_tx: Arc::new(persisted_tx),
+            spare: Arc::new(parking_lot::Mutex::new(SparePool::default())),
+            fsyncs: Arc::new(AtomicU64::new(0)),
+            fsync_max_us: Arc::new(AtomicU64::new(0)),
         };
         let thread_handle = WriterPublish {
             persisted: Arc::clone(&handle.persisted),
             failed: Arc::clone(&handle.failed),
             error: Arc::clone(&handle.error),
             persisted_tx: Arc::clone(&handle.persisted_tx),
+            spare: Arc::clone(&handle.spare),
+            fsyncs: Arc::clone(&handle.fsyncs),
+            fsync_max_us: Arc::clone(&handle.fsync_max_us),
         };
         let writer = std::thread::Builder::new()
             .name("zyron-raft-log".into())
@@ -1336,6 +1509,13 @@ impl RaftLog {
 
     /// Appends one entry, staging its record for the writer
     pub fn append(&mut self, entry: RaftLogEntry) -> Result<u64> {
+        self.append_shared(Arc::new(entry))
+    }
+
+    /// Appends an entry another holder already shares, a follower's copy of
+    /// what the leader sent, without copying its command again. The slot
+    /// keeps the same allocation the message decoded into
+    pub fn append_shared(&mut self, entry: Arc<RaftLogEntry>) -> Result<u64> {
         let expected = self.last_index() + 1;
         if entry.index != expected {
             return Err(ZyronError::RaftLogCorrupted {
@@ -1369,7 +1549,7 @@ impl RaftLog {
             raw_offset: self.write_cursor,
             len,
             pinned,
-            entry: Some(Arc::new(entry)),
+            entry: Some(entry),
         });
         self.write_cursor += u64::from(len);
         self.resident_bytes += len as usize;
@@ -1379,21 +1559,19 @@ impl RaftLog {
     /// Hands everything staged to the writer thread.
     ///
     /// Called at the end of a proposal batch and at the end of handling one
-    /// AppendEntries, so a batch of either costs one fsync.
-    ///
-    /// The records are copied out at exactly their size and the staging
-    /// buffer is kept. Handing the buffer over instead and allocating a
-    /// replacement shipped its whole capacity with every flush, so a single
-    /// hundred and fifty byte entry travelled as a sixty four kilobyte
-    /// allocation, and a burst of concurrent proposals put hundreds of
-    /// megabytes through the allocator to move a few hundred kilobytes of log
+    /// AppendEntries, so a batch of either costs one fsync. The writer joins
+    /// the batches it finds queued and writes them once, so a proposal
+    /// staging on its own costs the file nothing more than one that shares
+    /// a batch
     pub fn flush_pending(&mut self) -> Result<()> {
         if self.stage_lengths.is_empty() {
             self.evict();
             return Ok(());
         }
-        let blob = self.stage.as_slice().to_vec();
-        self.stage.clear();
+        // The staged bytes go to the writer as they are, and a buffer the
+        // writer has emptied takes their place. Neither a copy of the batch
+        // nor an allocation for the next one, at any batch size
+        let blob = std::mem::replace(&mut self.stage, self.handle.take_spare());
         let lengths = std::mem::take(&mut self.stage_lengths);
         let sent = self.handle.send(LogOp::Append {
             start_index: self.stage_start,

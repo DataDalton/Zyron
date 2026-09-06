@@ -4,9 +4,6 @@
 //! INTERSECT and EXCEPT use a count-based HashMap with typed hashing and
 //! columnar storage for collision resolution.
 
-use std::collections::HashMap;
-
-use crate::compute::PreHashMap;
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::SetOpType;
 
@@ -127,10 +124,24 @@ enum SetOpState {
 }
 
 /// Columnar row store for set operations. Stores rows in column builders
-/// and uses typed hashing for deduplication/counting.
+/// and uses typed hashing for deduplication and counting.
+///
+/// Rows are addressed through a flat bucket table chained through an array,
+/// which is what the hash join builds its side with. A map from hash to a
+/// vector of row indices allocates one vector per distinct hash, so a
+/// distinct union over a million rows made a million short-lived
+/// allocations to hold one index each
 struct RowStore {
     columns: Vec<Column>,
-    hash_map: PreHashMap<u64, Vec<usize>>,
+    /// Bucket heads, chained backwards through `chain`
+    table: crate::compute::FlatHashTable,
+    /// Per stored row, the row that held its bucket before it
+    chain: Vec<u32>,
+    /// Per stored row, its hash. Kept so growing the table is a pass over
+    /// these rather than a rehash of every stored value
+    hashes: Vec<u64>,
+    /// Rows the table is sized for. Past it the table doubles and rebuilds
+    capacity_rows: usize,
     counts: Vec<usize>,
     num_rows: usize,
     /// Per-column declared type of the first batch seen, which is the left
@@ -139,14 +150,50 @@ struct RowStore {
     declared: Vec<(TypeId, Option<u8>)>,
 }
 
+/// Rows a fresh store is sized for, before any growth
+const ROW_STORE_INITIAL_ROWS: usize = 1024;
+
 impl RowStore {
     fn new() -> Self {
         Self {
             columns: Vec::new(),
-            hash_map: PreHashMap::default(),
+            table: crate::compute::FlatHashTable::with_capacity(ROW_STORE_INITIAL_ROWS),
+            chain: Vec::new(),
+            hashes: Vec::new(),
+            capacity_rows: ROW_STORE_INITIAL_ROWS,
             counts: Vec::new(),
             num_rows: 0,
             declared: Vec::new(),
+        }
+    }
+
+    /// The stored row equal to this one, or None.
+    ///
+    /// Walks the bucket chain rather than a vector of candidates, so a
+    /// lookup touches the table, the chain and whichever rows collided,
+    /// and nothing per distinct hash
+    fn find(&self, batch: &DataBatch, row: usize, hash: u64) -> Option<usize> {
+        let mut idx = self.table.get(hash);
+        while idx != u32::MAX {
+            let at = idx as usize;
+            if self.hashes[at] == hash && self.row_equals(batch, row, at) {
+                return Some(at);
+            }
+            idx = self.chain[at];
+        }
+        None
+    }
+
+    /// Doubles the bucket table when the rows outgrow it, rebuilding the
+    /// chains from the hashes already stored
+    fn grow_if_needed(&mut self) {
+        if self.num_rows < self.capacity_rows {
+            return;
+        }
+        self.capacity_rows = (self.capacity_rows * 2).max(ROW_STORE_INITIAL_ROWS);
+        self.table = crate::compute::FlatHashTable::with_capacity(self.capacity_rows);
+        for (row, hash) in self.hashes.iter().enumerate() {
+            self.chain[row] = self.table.insert(*hash, row as u32);
         }
     }
 
@@ -183,17 +230,14 @@ impl RowStore {
 
     /// Finds or inserts a row, returning (store_index, was_new).
     fn find_or_insert(&mut self, batch: &DataBatch, row: usize, hash: u64) -> (usize, bool) {
-        // First pass: check if row already exists (immutable borrow).
-        if let Some(candidates) = self.hash_map.get(&hash) {
-            for &idx in candidates {
-                if self.row_equals(batch, row, idx) {
-                    return (idx, false);
-                }
-            }
+        if let Some(idx) = self.find(batch, row, hash) {
+            return (idx, false);
         }
-        // Not found, insert.
+        self.grow_if_needed();
         let idx = self.num_rows;
-        self.hash_map.entry(hash).or_default().push(idx);
+        let prev = self.table.insert(hash, idx as u32);
+        self.chain.push(prev);
+        self.hashes.push(hash);
         for (ci, src) in batch.columns.iter().enumerate() {
             self.columns[ci].push_row_from(src, row);
         }
@@ -221,30 +265,26 @@ impl RowStore {
     }
 
     /// Builds a DataBatch from stored rows at the given indices.
+    ///
+    /// One typed gather per column over the indices, rather than one pass
+    /// per row over the columns. Which buffer a value belongs in and how to
+    /// copy it are the same answers for every row of a column, and settling
+    /// them per value is what a row-major copy out of a columnar store
+    /// spends its time on
     fn extract_rows(&self, indices: &[usize]) -> DataBatch {
         if indices.is_empty() || self.columns.is_empty() {
             return DataBatch::empty();
         }
-        let num_cols = self.columns.len();
-        let mut out_cols: Vec<Column> = self
-            .columns
-            .iter()
-            .map(|c| {
-                Column::new_ts(
-                    ColumnData::with_capacity(c.type_id, indices.len()),
-                    c.type_id,
-                    c.fractional_digits,
-                )
-            })
-            .collect();
+        let taken: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        DataBatch::new(self.columns.iter().map(|c| c.take(&taken)).collect())
+    }
 
-        for &idx in indices {
-            for ci in 0..num_cols {
-                out_cols[ci].push_row_from(&self.columns[ci], idx);
-            }
-        }
-
-        DataBatch::new(out_cols)
+    /// Every stored row in insertion order, handed over rather than copied.
+    ///
+    /// A distinct union's answer is the store itself, so gathering it into a
+    /// second set of columns copies the whole result to reproduce it
+    fn into_batch(self) -> DataBatch {
+        DataBatch::new(self.columns)
     }
 }
 
@@ -343,9 +383,7 @@ impl SetOpOperator {
         if store.num_rows == 0 {
             return Ok(None);
         }
-
-        let indices: Vec<usize> = (0..store.num_rows).collect();
-        Ok(Some(store.extract_rows(&indices)))
+        Ok(Some(store.into_batch()))
     }
 
     async fn materialize_intersect(&mut self) -> Result<Option<DataBatch>> {
@@ -385,20 +423,14 @@ impl SetOpOperator {
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
                         // Look up in store without inserting.
-                        let hash = hashes[row];
-                        if let Some(candidates) = store.hash_map.get(&hash) {
-                            for &idx in candidates {
-                                if store.row_equals(batch, row, idx) {
-                                    if store.counts[idx] > 0 {
-                                        result_indices.push(idx);
-                                        if self.all {
-                                            store.counts[idx] -= 1;
-                                        } else {
-                                            store.counts[idx] = 0;
-                                        }
-                                    }
-                                    break;
-                                }
+                        if let Some(idx) = store.find(batch, row, hashes[row])
+                            && store.counts[idx] > 0
+                        {
+                            result_indices.push(idx);
+                            if self.all {
+                                store.counts[idx] -= 1;
+                            } else {
+                                store.counts[idx] = 0;
                             }
                         }
                     }
@@ -450,17 +482,11 @@ impl SetOpOperator {
                     let col_refs: Vec<&Column> = batch.columns.iter().collect();
                     let hashes = compute::hash_column_batch(&col_refs, batch.num_rows);
                     for row in 0..batch.num_rows {
-                        let hash = hashes[row];
-                        if let Some(candidates) = store.hash_map.get(&hash) {
-                            for &idx in candidates {
-                                if store.row_equals(batch, row, idx) {
-                                    if self.all {
-                                        store.counts[idx] = store.counts[idx].saturating_sub(1);
-                                    } else {
-                                        store.counts[idx] = 0;
-                                    }
-                                    break;
-                                }
+                        if let Some(idx) = store.find(batch, row, hashes[row]) {
+                            if self.all {
+                                store.counts[idx] = store.counts[idx].saturating_sub(1);
+                            } else {
+                                store.counts[idx] = 0;
                             }
                         }
                     }
@@ -469,16 +495,16 @@ impl SetOpOperator {
             }
         }
 
-        // Emit remaining left rows in original order.
+        // Emit remaining left rows in original order. The tally is one slot
+        // per stored row rather than a map keyed by row index, since every
+        // key it could ever hold is a row the store already numbered
         let mut result_indices: Vec<usize> = Vec::new();
-        let mut emit_counts: HashMap<usize, usize> = HashMap::new();
+        let mut emitted = vec![0usize; store.num_rows];
 
         for &idx in &left_order {
-            let allowed = store.counts[idx];
-            let emitted = emit_counts.entry(idx).or_insert(0);
-            if *emitted < allowed {
+            if emitted[idx] < store.counts[idx] {
                 result_indices.push(idx);
-                *emitted += 1;
+                emitted[idx] += 1;
             }
         }
 

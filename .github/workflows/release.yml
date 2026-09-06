@@ -192,6 +192,15 @@ jobs:
           fi
           rm -rf "$stem"
           sha256sum "$stem".* > "$stem.sha256"
+
+          # The bare server binary is what a running node downloads when it
+          # upgrades itself, so it ships beside the archive under the name
+          # the release manifest points at
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "../$bindir/zyron-server.exe" "zyron-server-${{ needs.check.outputs.version }}-${{ matrix.target }}.exe"
+          else
+            cp "../$bindir/zyron-server" "zyron-server-${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          fi
           ls -la
           cat "$stem.sha256"
 
@@ -200,6 +209,18 @@ jobs:
         with:
           name: zyron-${{ needs.check.outputs.version }}-${{ matrix.target }}
           path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+      # The release job signs every platform's server binary with one
+      # zyron-ctl, the Linux one, because signing does not depend on the
+      # platform the binary runs on
+      - name: Upload the signing tool
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zyron-ctl-linux
+          path: target/${{ matrix.target }}/release/zyron-ctl
           retention-days: 14
           if-no-files-found: error
 
@@ -228,10 +249,46 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find staged -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          find staged -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'zyron-server-*' \) \
+            -not -path 'staged/zyron-ctl-linux/*' -exec cp {} dist/ \;
           find staged -type f -name '*.sha256' -exec cat {} + > dist/SHA256SUMS.txt
           ls -la dist
           cat dist/SHA256SUMS.txt
+
+      # Every running node checks a release against the public half of the
+      # release signing key built into its binary, so a release that is not
+      # signed with the private half is one nothing installs. The private
+      # half is the ZYRON_RELEASE_SIGNING_KEY secret, written by
+      # `zyron-ctl release keygen`. One manifest is signed per target,
+      # because a node downloads the binary for the platform it runs on, and
+      # the manifest names the asset URL this release will have
+      - name: Sign the server binaries into the release feed
+        env:
+          ZYRON_RELEASE_SIGNING_KEY: ${{ secrets.ZYRON_RELEASE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$ZYRON_RELEASE_SIGNING_KEY" ]; then
+            echo "ZYRON_RELEASE_SIGNING_KEY is not set. Run zyron-ctl release keygen and store the key file's contents as that repository secret."
+            exit 1
+          fi
+          version="${{ needs.check.outputs.version }}"
+          ctl=staged/zyron-ctl-linux/zyron-ctl
+          chmod +x "$ctl"
+          umask 077
+          printf '%s\n' "$ZYRON_RELEASE_SIGNING_KEY" > release-signing.key
+          for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            binary=$(ls dist/zyron-server-"$version"-"$target"*)
+            "$ctl" release sign \
+              --key release-signing.key \
+              --binary "$binary" \
+              --version "$version" \
+              --channel stable \
+              --artifact-url "https://github.com/${{ github.repository }}/releases/download/v$version/$(basename "$binary")" \
+              --notes-url "https://github.com/${{ github.repository }}/releases/tag/v$version" \
+              --out "dist/stable.$target.manifest"
+          done
+          rm -f release-signing.key
+          ls -la dist
 
       # Signed statement that these exact archives were produced by this
       # workflow at this commit. Verified with:
@@ -280,6 +337,13 @@ jobs:
           \`\`\`
           gh attestation verify <archive> --repo DataDalton/Zyron
           \`\`\`
+
+          The bare \`zyron-server-$version-<target>\` binaries and the
+          \`stable.<target>.manifest\` files are the release feed. A running
+          Zyron node reads the manifest for its platform from this
+          repository's latest release, checks it and the binary against the
+          release signing key built into every Zyron binary, and upgrades
+          itself. Nothing is installed that the key did not sign.
 
           ## Install and run
 

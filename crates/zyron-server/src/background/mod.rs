@@ -58,6 +58,28 @@ use self::schedule::{ScheduleWorker, ScheduleWorkerConfig};
 use self::stats::{StatsCollector, StatsCollectorConfig};
 use self::stream_monitor::{StreamMonitor, StreamMonitorConfig};
 use self::vacuum::{VacuumWorker, VacuumWorkerConfig};
+
+/// Waits for the next tick of a maintenance loop, returning false when
+/// shutdown was signalled first. The wake is armed before the flag is read,
+/// so a shutdown landing between the read and the wait is still seen
+pub async fn tick_until_shutdown(
+    ticker: &mut tokio::time::Interval,
+    shutdown: &std::sync::atomic::AtomicBool,
+    wake: &tokio::sync::Notify,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if shutdown.load(Ordering::Acquire) {
+        return false;
+    }
+    tokio::select! {
+        _ = ticker.tick() => !shutdown.load(Ordering::Acquire),
+        _ = &mut notified => false,
+    }
+}
 use self::wal_archiver::{WalArchiver, WalArchiverConfig};
 use crate::metrics::MetricsRegistry;
 

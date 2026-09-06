@@ -20,7 +20,9 @@ use zyron_storage::columnar::{
     BloomPolicy, ColumnSegment, SegmentOptions, SortOrder, ZyrFileHeader, ZyrFileWriter,
 };
 
-use crate::cells::{CellFamily, cell_family, cell_to_value, compare_cells};
+use crate::cells::{
+    CellFamily, cell_family, cell_to_i128, cell_to_value, compare_cells, sums_exactly,
+};
 use crate::curve::{normalize_component, ordering_key_into};
 use crate::manifest::ClusterStrategy;
 use crate::manifest::{ColumnStatsEntry, PartitionEntry};
@@ -398,7 +400,9 @@ pub fn write_data_file_at(
     req: &WriteRequest<'_>,
 ) -> Result<WrittenFile, ZyronError> {
     let row_count = validate_batch(schema, req.columns)?;
+    let order_span = zyron_common::profile::scope(zyron_common::profile::Phase::LakeStoredOrder);
     let order = stored_order(schema, req, row_count)?;
+    drop(order_span);
     // An unclustered write stores rows where they arrived, which is what
     // lets a fixed-width column go to the segment build as the buffer the
     // batch already holds rather than a copy of it
@@ -484,6 +488,8 @@ pub fn write_data_file_at(
         let mut gathered: Vec<u8> = Vec::new();
         let mut gathered_nulls: Vec<u8> = Vec::new();
         let mut views: Vec<Option<&[u8]>> = Vec::new();
+        let encode_span =
+            zyron_common::profile::scope(zyron_common::profile::Phase::LakeEncodeSegment);
         let (segment, cells) = match data.packed_at(value_size) {
             Some(values) if in_arrival_order => (
                 ColumnSegment::build_packed(
@@ -560,7 +566,10 @@ pub fn write_data_file_at(
                 )
             }
         };
+        drop(encode_span);
         let (zone_bytes, bloom_bytes) = segment_frame_bytes(&segment);
+        let write_span =
+            zyron_common::profile::scope(zyron_common::profile::Phase::LakeWriteSegment);
         let segment_bytes = writer.write_segment(
             col.id,
             &segment.header.to_bytes(),
@@ -569,6 +578,7 @@ pub fn write_data_file_at(
             &segment.null_bitmap,
             &segment.encoded_data,
         )?;
+        drop(write_span);
 
         // Only a declared column's filter is carried into the manifest. A
         // bloom is ten bits per value, so carrying every column's would make
@@ -588,7 +598,10 @@ pub fn write_data_file_at(
             segment_bytes,
         ));
     }
+    let finalize_span =
+        zyron_common::profile::scope(zyron_common::profile::Phase::LakeFinalizeFile);
     let size_bytes = writer.finalize(true)?;
+    drop(finalize_span);
 
     column_stats.sort_by_key(|s| s.column_id);
     Ok(WrittenFile {
@@ -802,7 +815,29 @@ pub fn column_stats_entry(
         bloom: bloom_for_manifest.map(std::sync::Arc::new),
         ndv: segment.ndv,
         size_bytes: Some(segment_bytes),
+        sum: column_sum(physical, cells),
     }
+}
+
+/// The column's exact total over its non-null cells, or None when the type
+/// does not add exactly or the total leaves 128 bits.
+///
+/// This is a walk of the column the write did not otherwise need, unlike
+/// the bounds above, and it is worth one because of what it removes on the
+/// read side: an ungrouped SUM over the file, or over any set of files a
+/// predicate keeps whole, stops reading the column at all. The walk is a
+/// strided load and an add over a buffer the encoder has just been through,
+/// so it runs warm
+fn column_sum(physical: TypeId, cells: StoredCells<'_>) -> Option<i128> {
+    if !sums_exactly(physical) {
+        return None;
+    }
+    let family = cell_family(physical);
+    let mut total: i128 = 0;
+    for cell in cells.present() {
+        total = total.checked_add(cell_to_i128(family, cell)?)?;
+    }
+    Some(total)
 }
 
 /// One column's cells in stored order, in whichever shape the write path

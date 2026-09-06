@@ -191,6 +191,9 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
         password_encryption: "balloon-sha-256".into(),
+        admission: Arc::new(zyron_common::Admission::new()),
+        query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
+        upgrade_control: None,
     });
 
     (state, tmp)

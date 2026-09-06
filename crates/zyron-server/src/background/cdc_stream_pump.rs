@@ -9,7 +9,7 @@
 // -----------------------------------------------------------------------------
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tracing::warn;
@@ -27,14 +27,11 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 1;
 pub async fn cdc_stream_pump_loop(
     server: Arc<ServerState>,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_secs: u64,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-    loop {
-        ticker.tick().await;
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         run_pump_once(&server).await;
     }
 }

@@ -5,11 +5,14 @@
 //! a rolling upgrade over a three-node cluster with a probe client, a health
 //! failure rolling one node back and pausing the sequence, the post-upgrade
 //! migrations, downgrade eligibility, the emergency pause, the maintenance
-//! window, notification, a chained upgrade, and the release check
+//! window, notification, a chained upgrade, the release check, and the
+//! cluster version gate a setting waits behind
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
+use parking_lot::Mutex;
 use zyron_auth::signature::VerifyingMaterial;
 use zyron_common::format::rewrite::{ObjectKind, RewriteCategory, UserObjectRewritePolicy};
 use zyron_common::format::scheme::{
@@ -17,20 +20,34 @@ use zyron_common::format::scheme::{
     SignatureSchemeRegistration,
 };
 use zyron_common::format::{
-    ALL_FORMAT_KINDS, FormatKind, FormatVersion, HealthBaseline, MaintenanceSchedule, ReleaseEntry,
-    ReleaseManifest, UpgradeBoard, UpgradeChannel, UpgradeOutcome, UpgradePhase, UpgradeSettings,
+    ALL_FORMAT_KINDS, BinaryVersion, FormatKind, FormatVersion, HealthBaseline,
+    MaintenanceSchedule, ReleaseEntry, ReleaseManifest, UpgradeBoard, UpgradeChannel,
+    UpgradeOutcome, UpgradePhase, UpgradeSettings,
 };
+use zyron_common::{Admission, QueryMetrics};
+use zyron_mesh::rpc::{MeshFuture, SetClusterSettingRequest};
+use zyron_mesh::{
+    BeginDrainRequest, CancelProvisioningRequest, DrainStatus, DrainStatusRequest, HotSetChunk,
+    HotSetManifestRequest, MeshRpc, MeshRpcError, MeshScheduler, NodeAck, NodeRef, NodeStatus,
+    NodeStatusRequest, PrefetchRequest, PrefetchStatus, RelocateSessionRequest, RelocationOutcome,
+    RestartRequest, RollbackRequest, StageReleaseRequest, WarmPool,
+};
+use zyron_server::cluster_settings::INTRODUCED_IN;
+use zyron_server::upgrade::cluster_driver::{ClusterDriver, DriverSettings};
 use zyron_server::upgrade::compat_gate::{
     AppCompat, GateInput, PeerState, TargetCapabilities, UserObject,
 };
+use zyron_server::upgrade::control::NodeControl;
 use zyron_server::upgrade::feed::{
     LocalFeedSource, ReleasePoller, ReleaseSigningKey, encode_hex, verify_manifest,
 };
+use zyron_server::upgrade::journal::Journal;
 use zyron_server::upgrade::migrations::CatalogTableStore;
 use zyron_server::upgrade::notification::{ContactChannel, Notifier, RecordingSink, UpgradeEvent};
 use zyron_server::upgrade::rolling::{
     NodePlan, RollingOutcome, RollingSettings, SimulatedCluster, capture_baseline,
 };
+use zyron_server::upgrade::version_gate::Floor;
 use zyron_server::upgrade::{
     PassContext, PassOutcome, UpgradeController, compat_gate, downgrade, migrations,
     running_capabilities,
@@ -186,6 +203,7 @@ fn healthy() -> HealthBaseline {
         throughput_per_sec: 10_000.0,
         error_rate: 0.0,
         active_connections: 20,
+        queries_in_window: 600_000,
     }
 }
 
@@ -504,6 +522,7 @@ async fn a_three_node_upgrade_completes_with_no_probe_failure() {
         TARGET,
         baseline,
         RollingSettings::default(),
+        None,
     )
     .await
     .expect("runs");
@@ -565,6 +584,7 @@ async fn a_health_regression_rolls_one_node_back_and_pauses() {
             health_poll_interval_secs: 5,
             ..RollingSettings::default()
         },
+        None,
     )
     .await
     .expect("runs");
@@ -608,6 +628,7 @@ async fn an_emergency_pause_halts_at_the_next_node() {
         TARGET,
         healthy(),
         RollingSettings::default(),
+        None,
     )
     .await
     .expect("runs");
@@ -960,6 +981,7 @@ async fn a_completed_upgrade_notifies_and_audits_every_step() {
                 target: &target,
                 running_version: RUNNING,
                 now_secs: 1_000,
+                manual_target: None,
             },
             Some(&feed),
         )
@@ -1069,6 +1091,239 @@ fn the_startup_gate_passes_and_reports_what_it_loaded() {
     assert!(report.schemes >= 6);
     assert!(report.catalog_tables >= 33);
     assert_eq!(report.current_wire_version, 3);
+    assert_eq!(report.mesh_protocol_version, 1);
+    assert_eq!(report.consensus_protocol_version, 1);
     let text = report.to_string();
     assert!(text.contains("format substrate ready"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Cluster version gate
+// ---------------------------------------------------------------------------
+
+/// A mesh whose nodes answer a status probe with a scripted version, or do
+/// not answer at all, and refuse every other call
+struct VersionedMesh {
+    versions: Mutex<HashMap<String, Option<String>>>,
+}
+
+impl VersionedMesh {
+    fn new(nodes: &[(&str, Option<&str>)]) -> Arc<Self> {
+        Arc::new(Self {
+            versions: Mutex::new(
+                nodes
+                    .iter()
+                    .map(|(name, version)| (name.to_string(), version.map(str::to_string)))
+                    .collect(),
+            ),
+        })
+    }
+
+    /// Scripts what a node answers next, None for a node that is not
+    /// listening
+    fn set(&self, name: &str, version: Option<&str>) {
+        self.versions
+            .lock()
+            .insert(name.to_string(), version.map(str::to_string));
+    }
+
+    fn refused<T: Send + 'static>(&self) -> MeshFuture<'_, T> {
+        Box::pin(async move {
+            Err(MeshRpcError::Refused {
+                reason: "this mesh answers status probes only".into(),
+            })
+        })
+    }
+}
+
+impl MeshRpc for VersionedMesh {
+    fn begin_drain(&self, _r: BeginDrainRequest) -> MeshFuture<'_, DrainStatus> {
+        self.refused()
+    }
+    fn drain_status(&self, _r: DrainStatusRequest) -> MeshFuture<'_, DrainStatus> {
+        self.refused()
+    }
+    fn hot_set_manifest(&self, _r: HotSetManifestRequest) -> MeshFuture<'_, HotSetChunk> {
+        self.refused()
+    }
+    fn prefetch(&self, _r: PrefetchRequest) -> MeshFuture<'_, PrefetchStatus> {
+        self.refused()
+    }
+    fn relocate_session(&self, _r: RelocateSessionRequest) -> MeshFuture<'_, RelocationOutcome> {
+        self.refused()
+    }
+    fn cancel_provisioning(&self, _r: CancelProvisioningRequest) -> MeshFuture<'_, ()> {
+        self.refused()
+    }
+    fn node_status(&self, r: NodeStatusRequest) -> MeshFuture<'_, NodeStatus> {
+        Box::pin(async move {
+            let scripted = self.versions.lock().get(&r.target.name).cloned();
+            match scripted {
+                Some(Some(version)) => Ok(NodeStatus {
+                    target: r.target,
+                    sequence: r.sequence,
+                    version,
+                    ..NodeStatus::default()
+                }),
+                Some(None) => Err(MeshRpcError::Unreachable {
+                    node: r.target.name,
+                    reason: "connection refused".into(),
+                }),
+                None => Err(MeshRpcError::Unknown {
+                    what: format!("node {}", r.target.name),
+                }),
+            }
+        })
+    }
+    fn stage_release(&self, _r: StageReleaseRequest) -> MeshFuture<'_, NodeAck> {
+        self.refused()
+    }
+    fn restart_into_staged(&self, _r: RestartRequest) -> MeshFuture<'_, NodeAck> {
+        self.refused()
+    }
+    fn rollback_to_previous(&self, _r: RollbackRequest) -> MeshFuture<'_, NodeAck> {
+        self.refused()
+    }
+    fn set_cluster_setting(&self, _r: SetClusterSettingRequest) -> MeshFuture<'_, NodeAck> {
+        self.refused()
+    }
+}
+
+/// A driver for one node over a mesh, with a mesh address for each peer
+fn driver_over(
+    mesh: Arc<VersionedMesh>,
+    self_name: &str,
+    peers: &[&str],
+    dir: &std::path::Path,
+) -> ClusterDriver {
+    let substrate = substrate();
+    let journal = Arc::new(
+        Journal::open(&substrate.formats, &substrate.catalog_schemas, dir).expect("journal"),
+    );
+    let scheduler = Arc::new(MeshScheduler::new(
+        NodeRef::new(1, self_name),
+        mesh,
+        Arc::new(WarmPool::new(0)),
+    ));
+    let peers = peers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.to_string(), NodeRef::new(i as u64 + 2, *name)))
+        .collect();
+    ClusterDriver::new(
+        self_name.to_string(),
+        substrate,
+        zyron_common::format::upgrade_board(),
+        Arc::new(Admission::new()),
+        Arc::new(QueryMetrics::new()),
+        NodeControl::shared(),
+        journal,
+        None,
+        Some(scheduler),
+        peers,
+        None,
+        DriverSettings {
+            probe_timeout_secs: 1,
+            ..DriverSettings::default()
+        },
+        dir.join("zyron-server"),
+    )
+}
+
+/// The leader puts a cluster setting in front of the group only once every
+/// member runs a release that applies it. The floor is the lowest version
+/// any member answers, this node answering for itself, a member that does
+/// not answer leaves the floor unknown whatever the others run, a burst of
+/// gated uses shares one reading, and the driver drops the reading when it
+/// knows a version changed
+#[tokio::test]
+async fn the_version_gate_holds_a_setting_until_every_member_applies_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mesh = VersionedMesh::new(&[("node-2", Some(RUNNING)), ("node-3", Some(TARGET))]);
+    let driver = driver_over(
+        Arc::clone(&mesh),
+        "node-1",
+        &["node-2", "node-3"],
+        dir.path(),
+    );
+    let members: Vec<String> = ["node-1", "node-2", "node-3"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+
+    let answers = driver.member_versions(&members).await;
+    assert_eq!(
+        answers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        ["node-1", "node-2", "node-3"],
+        "answers come back in member order"
+    );
+    assert_eq!(
+        answers[0].version,
+        Ok(BinaryVersion::parse(env!("CARGO_PKG_VERSION")).expect("this build's version parses")),
+        "this node answers for itself"
+    );
+    assert_eq!(answers[1].version, Ok(BinaryVersion::new(0, 11, 0)));
+
+    let floor = driver.version_floor(&members).await;
+    assert_eq!(
+        floor,
+        Floor::Known {
+            version: BinaryVersion::new(0, 11, 0),
+            member: "node-2".to_string(),
+        }
+    );
+    let refusal = driver
+        .cluster_allows(INTRODUCED_IN, &members)
+        .await
+        .expect_err("a member on 0.11.0 holds the setting back")
+        .to_string();
+    assert!(refusal.contains("node-2 runs 0.11.0"), "{refusal}");
+    assert!(
+        refusal.contains(&format!("{INTRODUCED_IN} or later")),
+        "{refusal}"
+    );
+
+    // The reading is shared across a burst, so the member's new version is
+    // seen once the driver drops it, which it does when it restarted or
+    // rolled the member back itself
+    mesh.set("node-2", Some(TARGET));
+    assert!(
+        driver
+            .cluster_allows(INTRODUCED_IN, &members)
+            .await
+            .is_err(),
+        "a fresh reading is not taken again"
+    );
+    driver.drop_version_reading();
+    driver
+        .cluster_allows(INTRODUCED_IN, &members)
+        .await
+        .expect("every member applies cluster settings");
+
+    mesh.set("node-3", None);
+    driver.drop_version_reading();
+    let floor = driver.version_floor(&members).await;
+    assert!(
+        matches!(&floor, Floor::Unknown { member, reason }
+            if member == "node-3" && reason.contains("did not answer a status probe")),
+        "{floor:?}"
+    );
+    let refusal = driver
+        .cluster_allows(INTRODUCED_IN, &members)
+        .await
+        .expect_err("a member that does not answer holds the setting back")
+        .to_string();
+    assert!(refusal.contains("node-3"), "{refusal}");
+
+    // A member with no mesh address on this node is named with the
+    // statement that gives it one
+    driver.drop_version_reading();
+    let floor = driver
+        .version_floor(&["node-1".to_string(), "node-9".to_string()])
+        .await;
+    assert!(
+        matches!(&floor, Floor::Unknown { member, reason }
+            if member == "node-9" && reason.contains("CREATE PEER node-9")),
+        "{floor:?}"
+    );
 }

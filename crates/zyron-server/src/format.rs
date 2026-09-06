@@ -16,9 +16,28 @@ use zyron_common::format::registry::{DeprecationStatus, FormatRegistration, Migr
 use zyron_common::format::version::{FormatVersion, VersionWindow};
 
 const GATE: &str = "0.11.0";
+const UPGRADE_JOURNAL_GATE: &str = "0.12.0";
 
 /// Version a backup manifest is written at
 pub const BACKUP_ARCHIVE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+/// Version the upgrade journal is written at
+pub const UPGRADE_JOURNAL_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+inventory::submit! {
+    FormatRegistration {
+        kind: FormatKind::UpgradeJournal,
+        writer_current_version: UPGRADE_JOURNAL_FORMAT_VERSION,
+        reader_supported_versions: VersionWindow::single(UPGRADE_JOURNAL_FORMAT_VERSION),
+        migration_policy: MigrationPolicy::Eager,
+        migration_reversible: true,
+        binary_version_gate: UPGRADE_JOURNAL_GATE,
+        deprecation_status: DeprecationStatus::Active,
+        retirement_date: None,
+        downgrade_write_supported: false,
+        notes: "the durable half of the upgrade board, rewritten whole on every change",
+    }
+}
 
 /// Version `zyron.toml` is written at
 pub const CONFIG_FORMAT_VERSION: FormatVersion = FormatVersion::V1;

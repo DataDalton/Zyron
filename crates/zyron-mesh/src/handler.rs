@@ -18,9 +18,12 @@
 
 use crate::rpc::{
     BeginDrainRequest, CancelProvisioningRequest, DrainStatus, DrainStatusRequest, HotSetChunk,
-    HotSetManifestRequest, MeshRpcError, PATH_BEGIN_DRAIN, PATH_CANCEL_PROVISIONING,
-    PATH_DRAIN_STATUS, PATH_HOT_SET_MANIFEST, PATH_PREFETCH, PATH_RELOCATE_SESSION,
-    PrefetchRequest, PrefetchStatus, RelocateSessionRequest, RelocationOutcome,
+    HotSetManifestRequest, MeshRpcError, NodeAck, NodeStatus, NodeStatusRequest, PATH_BEGIN_DRAIN,
+    PATH_CANCEL_PROVISIONING, PATH_DRAIN_STATUS, PATH_HOT_SET_MANIFEST, PATH_NODE_STATUS,
+    PATH_PREFETCH, PATH_RELOCATE_SESSION, PATH_RESTART_INTO_STAGED, PATH_ROLLBACK_TO_PREVIOUS,
+    PATH_SET_CLUSTER_SETTING, PATH_STAGE_RELEASE, PrefetchRequest, PrefetchStatus,
+    RelocateSessionRequest, RelocationOutcome, RestartRequest, RollbackRequest,
+    SetClusterSettingRequest, StageReleaseRequest,
 };
 
 /// What a node has to be able to answer to be part of a mesh.
@@ -54,6 +57,28 @@ pub trait MeshNode: Send + Sync {
 
     /// Abandons a provisioning request this node has in flight.
     fn cancel_provisioning(&self, request: &CancelProvisioningRequest) -> Result<(), MeshRpcError>;
+
+    /// What this node runs and how it is doing.
+    fn node_status(&self, request: &NodeStatusRequest) -> Result<NodeStatus, MeshRpcError>;
+
+    /// Takes a request to stage a release. The staging itself runs after
+    /// the answer
+    fn stage_release(&self, request: &StageReleaseRequest) -> Result<NodeAck, MeshRpcError>;
+
+    /// Takes a cluster setting for the replicated log. The append runs after
+    /// the answer, on the leader's next pass
+    fn set_cluster_setting(
+        &self,
+        request: &SetClusterSettingRequest,
+    ) -> Result<NodeAck, MeshRpcError>;
+
+    /// Takes a request to restart on the staged binary. The restart runs
+    /// after the answer
+    fn restart_into_staged(&self, request: &RestartRequest) -> Result<NodeAck, MeshRpcError>;
+
+    /// Takes a request to restart on the previous binary. The restart runs
+    /// after the answer
+    fn rollback_to_previous(&self, request: &RollbackRequest) -> Result<NodeAck, MeshRpcError>;
 }
 
 /// An HTTP status and a JSON body, ready for the listener to write.
@@ -119,6 +144,36 @@ pub fn dispatch(node: &dyn MeshNode, path: &str, body: &str) -> Option<MeshRespo
         PATH_CANCEL_PROVISIONING => run(body, |r: CancelProvisioningRequest| {
             require(r.valid(), "cancel_provisioning.ticket_id")?;
             node.cancel_provisioning(&r)
+        }),
+        PATH_NODE_STATUS => run(body, |r: NodeStatusRequest| {
+            require(r.valid(), "node_status.target")?;
+            let status = node.node_status(&r)?;
+            require(status.valid(), "node_status.version")?;
+            Ok(status)
+        }),
+        PATH_STAGE_RELEASE => run(body, |r: StageReleaseRequest| {
+            require(r.valid(), "stage_release.version")?;
+            let ack = node.stage_release(&r)?;
+            require(ack.valid(), "stage_release.detail")?;
+            Ok(ack)
+        }),
+        PATH_SET_CLUSTER_SETTING => run(body, |r: SetClusterSettingRequest| {
+            require(r.valid(), "set_cluster_setting.key")?;
+            let ack = node.set_cluster_setting(&r)?;
+            require(ack.valid(), "set_cluster_setting.detail")?;
+            Ok(ack)
+        }),
+        PATH_RESTART_INTO_STAGED => run(body, |r: RestartRequest| {
+            require(r.valid(), "restart_into_staged.version")?;
+            let ack = node.restart_into_staged(&r)?;
+            require(ack.valid(), "restart_into_staged.detail")?;
+            Ok(ack)
+        }),
+        PATH_ROLLBACK_TO_PREVIOUS => run(body, |r: RollbackRequest| {
+            require(r.valid(), "rollback_to_previous.target")?;
+            let ack = node.rollback_to_previous(&r)?;
+            require(ack.valid(), "rollback_to_previous.detail")?;
+            Ok(ack)
         }),
         _ => return None,
     };
@@ -218,6 +273,60 @@ mod tests {
         ) -> Result<(), MeshRpcError> {
             Err(MeshRpcError::Unknown {
                 what: "ticket".into(),
+            })
+        }
+        fn node_status(&self, request: &NodeStatusRequest) -> Result<NodeStatus, MeshRpcError> {
+            Ok(NodeStatus {
+                target: request.target.clone(),
+                sequence: request.sequence,
+                version: "0.12.0".into(),
+                staged_version: String::new(),
+                draining: false,
+                accepting: true,
+                queries_in_flight: if self.drained { 0 } else { 3 },
+                sessions_attached: 0,
+                transactions_open: 0,
+                p50_latency_us: 100,
+                p99_latency_us: 1_000,
+                throughput_milli_per_sec: 10_000,
+                error_rate_ppm: 0,
+                queries_in_window: 600,
+                uptime_secs: 60,
+            })
+        }
+        fn stage_release(&self, request: &StageReleaseRequest) -> Result<NodeAck, MeshRpcError> {
+            Ok(NodeAck {
+                target: request.target.clone(),
+                sequence: request.sequence,
+                accepted: true,
+                detail: format!("staging {}", request.version),
+            })
+        }
+        fn set_cluster_setting(
+            &self,
+            request: &SetClusterSettingRequest,
+        ) -> Result<NodeAck, MeshRpcError> {
+            Ok(NodeAck {
+                target: request.target.clone(),
+                sequence: request.sequence,
+                accepted: true,
+                detail: format!("{} = {} queued", request.key, request.value),
+            })
+        }
+        fn restart_into_staged(&self, request: &RestartRequest) -> Result<NodeAck, MeshRpcError> {
+            Ok(NodeAck {
+                target: request.target.clone(),
+                sequence: request.sequence,
+                accepted: false,
+                detail: format!("no release {} is staged here", request.version),
+            })
+        }
+        fn rollback_to_previous(&self, request: &RollbackRequest) -> Result<NodeAck, MeshRpcError> {
+            Ok(NodeAck {
+                target: request.target.clone(),
+                sequence: request.sequence,
+                accepted: true,
+                detail: "restarting on the previous binary".into(),
             })
         }
     }

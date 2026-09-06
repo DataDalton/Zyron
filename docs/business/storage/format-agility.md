@@ -35,7 +35,7 @@ Live progress is also available via WebSocket subscription at `/api/upgrade/form
 An admin can inspect and manage format state directly:
 
 - `zyron-ctl format inspect <file>`, reports the format kind, version, and integrity of any Zyron file.
-- `zyron-ctl format migrate --format <kind> --to <version> --path <dir>`, triggers a batch migration for a specific directory.
+- `zyron-ctl format migrate --format <kind> [--to <version>] --path <dir>`, moves every file of a kind under a directory to the version this binary writes, and refuses any other target.
 - `zyron-ctl format verify --path <dir>`, verifies every file in a directory matches its registered format expectations.
 
 ## Related

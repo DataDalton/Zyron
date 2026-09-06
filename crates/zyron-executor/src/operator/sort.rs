@@ -1,9 +1,16 @@
 //! Sort operator for ordering results.
 //!
-//! Materializes all child output, computes sort indices, reorders
+//! Materializes the child output, computes sort indices, reorders
 //! all data in a single take() pass, then emits the sorted batch as
 //! one output by move, no copy. Uses radix sort for integer key types.
-//! Supports top-N via optional limit parameter.
+//!
+//! ## Under a limit
+//!
+//! The buffer is bounded. Once it holds a batch or a limit's worth beyond
+//! the limit, a selection pass cuts it back to the limit, and the row at
+//! the limit becomes a bound that a later row has to beat to be buffered
+//! at all. The input is then read in one pass holding about a batch beyond
+//! the limit, and only the rows the limit keeps are ever sorted.
 //!
 //! ## When the input does not fit
 //!
@@ -23,6 +30,8 @@
 //!   written, no file is created, and the code below the threshold is the code
 //!   that ran before.
 
+use std::borrow::Cow;
+
 use zyron_common::{Result, RowLocator, ZyronError};
 use zyron_planner::binder::{BoundExpr, BoundOrderBy};
 use zyron_planner::logical::LogicalColumn;
@@ -30,8 +39,26 @@ use zyron_planner::logical::LogicalColumn;
 use crate::batch::DataBatch;
 use crate::column::{Column, ColumnData};
 use crate::compute;
-use crate::expr::{evaluate, resolve_column_index};
+use crate::expr::{evaluate, evaluate_borrowed, resolve_column_index};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
+
+/// Rows a bounded sort buffers before cutting back to its limit.
+///
+/// A cut is a selection pass over the buffer, so it waits until the buffer
+/// holds a batch or another limit's worth beyond the limit, whichever is
+/// more. Every cut then discards at least as many rows as it keeps, and the
+/// whole input costs at most two passes of selection
+fn top_n_trigger(keep: usize) -> usize {
+    keep.saturating_add(keep.max(crate::batch::BATCH_SIZE))
+}
+
+/// What a cut leaves: the rows the limit keeps, their locators when they
+/// are tracked, and the one-row key of the row at the limit
+struct CutBuffer {
+    batch: DataBatch,
+    locators: Option<Vec<RowLocator>>,
+    bound: Vec<Column>,
+}
 
 /// Sorts all input rows by the given order-by expressions.
 /// Materializes the entire input before producing output.
@@ -137,57 +164,123 @@ impl SortOperator {
     }
 
     async fn materialize(&mut self) -> Result<()> {
-        // Collect all input batches.
+        // A limit of nothing keeps nothing, and the input need not be read
+        // to say so
+        if self.limit == Some(0) {
+            self.finished = true;
+            return Ok(());
+        }
+
         let mut all_columns: Vec<Vec<Column>> = Vec::new();
         let mut all_locators: Vec<RowLocator> = Vec::new();
         let mut total_rows = 0usize;
 
-        // Bytes held in memory right now, which is what decides when a run
-        // is written. Distinct from the query budget: with somewhere to spill,
-        // the budget stops being a cap on the whole sort and becomes a cap on
-        // how much of it is resident at once
+        // Bytes held in memory right now. With somewhere to spill it decides
+        // when a run is written, distinct from the query budget: the budget
+        // then stops being a cap on the whole sort and becomes a cap on how
+        // much of it is resident at once. Under a limit it is what a cut
+        // hands back to the budget
         let mut resident_bytes = 0u64;
         let spilling = self.spill.is_some() && self.spill_threshold_bytes > 0;
 
-        loop {
-            match self.child.next().await? {
-                Some(eb) => {
-                    let batch_bytes = eb.batch.approx_bytes();
-                    if spilling {
-                        resident_bytes += batch_bytes;
-                    } else if let Some(budget) = &self.memory_budget {
-                        // No spill directory, so the budget is the hard limit
-                        // it always was and exceeding it is still a failure
-                        budget.reserve(batch_bytes)?;
-                    }
-                    total_rows += eb.batch.num_rows;
-                    if all_columns.is_empty() {
-                        all_columns.resize_with(eb.batch.num_columns(), Vec::new);
-                    }
-                    if self.track_locators {
-                        let locs = eb.locators.ok_or_else(|| {
-                            ZyronError::ExecutionError(
-                                "sort under row locking received a batch without row locators"
-                                    .to_string(),
-                            )
-                        })?;
-                        all_locators.extend(locs);
-                    }
-                    for (i, col) in eb.batch.columns.into_iter().enumerate() {
-                        all_columns[i].push(col);
-                    }
+        // A limit bounds the buffer. Past the trigger it is cut back to the
+        // limit, and the row at the limit becomes the bound a later row has
+        // to beat to be buffered at all
+        let keep = self.limit.map(|l| l as usize);
+        let trigger = keep.map(top_n_trigger);
+        let (ascending, nulls_first) = self.directions();
+        let mut bound: Option<Vec<Column>> = None;
 
-                    if spilling && resident_bytes >= self.spill_threshold_bytes {
-                        self.flush_run(
-                            std::mem::take(&mut all_columns),
-                            std::mem::take(&mut all_locators),
-                            total_rows,
-                        )?;
-                        total_rows = 0;
-                        resident_bytes = 0;
-                    }
+        loop {
+            let Some(mut eb) = self.child.next().await? else {
+                break;
+            };
+            if eb.batch.num_rows == 0 {
+                continue;
+            }
+
+            if let Some(bound) = bound.as_ref() {
+                let keys = self.batch_keys(&eb.batch)?;
+                let key_refs: Vec<&Column> = keys.iter().map(|c| c.as_ref()).collect();
+                let bound_refs: Vec<&Column> = bound.iter().collect();
+                let ahead = compute::rows_before_bound(
+                    &key_refs,
+                    &bound_refs,
+                    &ascending,
+                    &nulls_first,
+                    eb.batch.num_rows,
+                );
+                if ahead.is_empty() {
+                    continue;
                 }
-                None => break,
+                if ahead.len() < eb.batch.num_rows {
+                    let locators = eb
+                        .locators
+                        .map(|locs| ahead.iter().map(|&i| locs[i as usize]).collect());
+                    eb = ExecutionBatch {
+                        batch: eb.batch.take(&ahead),
+                        locators,
+                    };
+                }
+            }
+
+            let batch_bytes = eb.batch.approx_bytes();
+            if !spilling {
+                if let Some(budget) = &self.memory_budget {
+                    // No spill directory, so the budget is the hard limit
+                    // it always was and exceeding it is still a failure
+                    budget.reserve(batch_bytes)?;
+                }
+            }
+            resident_bytes += batch_bytes;
+            total_rows += eb.batch.num_rows;
+            if all_columns.is_empty() {
+                all_columns.resize_with(eb.batch.num_columns(), Vec::new);
+            }
+            if self.track_locators {
+                let locs = eb.locators.ok_or_else(|| {
+                    ZyronError::ExecutionError(
+                        "sort under row locking received a batch without row locators".to_string(),
+                    )
+                })?;
+                all_locators.extend(locs);
+            }
+            for (i, col) in eb.batch.columns.into_iter().enumerate() {
+                all_columns[i].push(col);
+            }
+
+            if let (Some(keep), Some(trigger)) = (keep, trigger) {
+                if total_rows >= trigger {
+                    let cut = self.cut_to_limit(
+                        std::mem::take(&mut all_columns),
+                        std::mem::take(&mut all_locators),
+                        total_rows,
+                        keep,
+                        &ascending,
+                        &nulls_first,
+                    )?;
+                    let kept_bytes = cut.batch.approx_bytes();
+                    if !spilling {
+                        if let Some(budget) = &self.memory_budget {
+                            budget.release(resident_bytes.saturating_sub(kept_bytes));
+                        }
+                    }
+                    resident_bytes = kept_bytes;
+                    total_rows = cut.batch.num_rows;
+                    all_columns = cut.batch.columns.into_iter().map(|c| vec![c]).collect();
+                    all_locators = cut.locators.unwrap_or_default();
+                    bound = Some(cut.bound);
+                }
+            }
+
+            if spilling && resident_bytes >= self.spill_threshold_bytes {
+                self.flush_run(
+                    std::mem::take(&mut all_columns),
+                    std::mem::take(&mut all_locators),
+                    total_rows,
+                )?;
+                total_rows = 0;
+                resident_bytes = 0;
             }
         }
 
@@ -418,6 +511,55 @@ impl SortOperator {
             None
         };
         Ok((merged.take(&indices), locators))
+    }
+
+    /// The direction and null placement of each key, in key order
+    fn directions(&self) -> (Vec<bool>, Vec<bool>) {
+        (
+            self.order_by.iter().map(|ob| ob.asc).collect(),
+            self.order_by.iter().map(|ob| ob.nulls_first).collect(),
+        )
+    }
+
+    /// The sort key of every row of a batch, borrowed wherever the key is
+    /// a column of the batch itself
+    fn batch_keys<'a>(&self, batch: &'a DataBatch) -> Result<Vec<Cow<'a, Column>>> {
+        self.order_by
+            .iter()
+            .map(|ob| evaluate_borrowed(&ob.expr, batch, &self.input_schema, &[]))
+            .collect()
+    }
+
+    /// Cuts the buffer back to the rows the limit keeps.
+    ///
+    /// One selection pass over the buffer finds them, and the row at the
+    /// limit comes back as the bound every later row is held against. The
+    /// kept rows are in no particular order, the final sort orders them
+    fn cut_to_limit(
+        &self,
+        all_columns: Vec<Vec<Column>>,
+        all_locators: Vec<RowLocator>,
+        total_rows: usize,
+        keep: usize,
+        ascending: &[bool],
+        nulls_first: &[bool],
+    ) -> Result<CutBuffer> {
+        let merged = DataBatch::new(all_columns.iter().map(|b| concat_columns(b)).collect());
+        let keys = self.batch_keys(&merged)?;
+        let key_refs: Vec<&Column> = keys.iter().map(|c| c.as_ref()).collect();
+        let indices =
+            compute::select_first_indices(&key_refs, ascending, nulls_first, total_rows, keep);
+        let kept = &indices[..keep];
+        let at_limit = [indices[keep - 1]];
+        let bound = key_refs.iter().map(|c| c.take(&at_limit)).collect();
+        let locators = self
+            .track_locators
+            .then(|| kept.iter().map(|&i| all_locators[i as usize]).collect());
+        Ok(CutBuffer {
+            batch: merged.take(kept),
+            locators,
+            bound,
+        })
     }
 
     /// Evaluates the sort key against a batch, owning every key column.
@@ -828,5 +970,267 @@ mod tests {
             ColumnData::Int64(v) => assert_eq!(v, &vec![1, 2, 3]),
             other => panic!("unexpected column {other:?}"),
         }
+    }
+
+    /// Twenty batches of a thousand, a permutation of the row numbers by a
+    /// stride, so every batch carries some of the first rows and a bounded
+    /// sort has to cut its buffer more than once
+    fn strided_batches() -> (Vec<DataBatch>, Vec<i64>) {
+        let total = 20_000i64;
+        let all: Vec<i64> = (0..total).map(|i| (i * 7_919) % total).collect();
+        let batches = all.chunks(1_000).map(|c| int_batch(c.to_vec())).collect();
+        (batches, all)
+    }
+
+    fn desc_order() -> Vec<BoundOrderBy> {
+        let mut order = order();
+        order[0].asc = false;
+        order
+    }
+
+    async fn drain(op: &mut SortOperator) -> Vec<Option<i64>> {
+        let mut out = Vec::new();
+        while let Some(eb) = op.next().await.unwrap() {
+            let column = &eb.batch.columns[0];
+            let ColumnData::Int64(values) = &column.data else {
+                panic!("unexpected column {:?}", column.data);
+            };
+            for (row, value) in values.iter().enumerate() {
+                out.push((!column.is_null(row)).then_some(*value));
+            }
+        }
+        out
+    }
+
+    fn present(values: &[i64]) -> Vec<Option<i64>> {
+        values.iter().map(|&v| Some(v)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_limit_keeps_the_first_rows_across_many_cuts() {
+        let (batches, mut all) = strided_batches();
+        let mut op =
+            SortOperator::new(Box::new(FeedOp { batches }), order(), int_schema(), Some(7));
+        let got = drain(&mut op).await;
+        all.sort_unstable();
+        assert_eq!(got, present(&all[..7]));
+    }
+
+    #[tokio::test]
+    async fn a_descending_limit_keeps_the_last_rows_first() {
+        let (batches, mut all) = strided_batches();
+        let mut op = SortOperator::new(
+            Box::new(FeedOp { batches }),
+            desc_order(),
+            int_schema(),
+            Some(5),
+        );
+        let got = drain(&mut op).await;
+        all.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(got, present(&all[..5]));
+    }
+
+    #[tokio::test]
+    async fn a_limit_past_the_rows_sorts_them_all() {
+        let (batches, mut all) = strided_batches();
+        let mut op = SortOperator::new(
+            Box::new(FeedOp { batches }),
+            order(),
+            int_schema(),
+            Some(50_000),
+        );
+        let got = drain(&mut op).await;
+        all.sort_unstable();
+        assert_eq!(got, present(&all));
+    }
+
+    // Twenty thousand rows are more bytes than this budget holds, and a
+    // sort under a limit never holds more than about a batch beyond the
+    // limit, so the same input sorts within it
+    #[tokio::test]
+    async fn a_limit_holds_the_buffer_within_a_budget_the_input_would_not_fit() {
+        let (batches, mut all) = strided_batches();
+        let budget_bytes = 32 * 1024;
+
+        let mut unbounded = SortOperator::new(
+            Box::new(FeedOp {
+                batches: batches.clone(),
+            }),
+            order(),
+            int_schema(),
+            None,
+        );
+        unbounded.set_memory_budget(Some(QueryMemoryBudget::new(budget_bytes)));
+        let err = match unbounded.next().await {
+            Err(e) => e,
+            Ok(_) => panic!("the whole input must not fit the budget"),
+        };
+        assert!(
+            err.to_string().contains("memory budget"),
+            "unexpected error: {err}"
+        );
+
+        let mut bounded =
+            SortOperator::new(Box::new(FeedOp { batches }), order(), int_schema(), Some(7));
+        let budget = QueryMemoryBudget::new(budget_bytes);
+        bounded.set_memory_budget(Some(budget.clone()));
+        let got = drain(&mut bounded).await;
+        all.sort_unstable();
+        assert_eq!(got, present(&all[..7]));
+        // What stays reserved is the buffer the sort kept, not the input
+        assert!(
+            budget.used() < budget_bytes,
+            "{} bytes still reserved",
+            budget.used()
+        );
+    }
+
+    fn int_batch_with_nulls(values: Vec<i64>, null_at: &[usize]) -> DataBatch {
+        let mut nulls = crate::column::NullBitmap::none(values.len());
+        for &row in null_at {
+            nulls.set_null(row);
+        }
+        DataBatch::new(vec![Column::with_nulls(
+            ColumnData::Int64(values),
+            nulls,
+            TypeId::Int64,
+        )])
+    }
+
+    // Nulls sort last here, so a limit inside the values sees none of them
+    // and a limit past the values ends in them, whichever batch they came in
+    #[tokio::test]
+    async fn null_keys_stay_out_of_a_limit_until_the_values_run_short() {
+        let batches: Vec<DataBatch> = (0..5)
+            .map(|b| {
+                let values: Vec<i64> = (0..1_000)
+                    .map(|i| ((b * 1_000 + i) * 7_919) % 5_000)
+                    .collect();
+                int_batch_with_nulls(values, &[0, 500])
+            })
+            .collect();
+        let hidden: std::collections::HashSet<i64> = (0..5)
+            .flat_map(|b| {
+                [
+                    (b * 1_000 * 7_919) % 5_000,
+                    ((b * 1_000 + 500) * 7_919) % 5_000,
+                ]
+            })
+            .collect();
+        let mut values: Vec<i64> = (0..5_000).filter(|v| !hidden.contains(v)).collect();
+        values.sort_unstable();
+
+        let mut inside = SortOperator::new(
+            Box::new(FeedOp {
+                batches: batches.clone(),
+            }),
+            order(),
+            int_schema(),
+            Some(7),
+        );
+        assert_eq!(drain(&mut inside).await, present(&values[..7]));
+
+        let mut past = SortOperator::new(
+            Box::new(FeedOp { batches }),
+            order(),
+            int_schema(),
+            Some(4_995),
+        );
+        let mut expected = present(&values);
+        expected.extend(std::iter::repeat_n(None, 5));
+        assert_eq!(drain(&mut past).await, expected);
+    }
+
+    // A key every row shares: once the sort holds its limit's worth, every
+    // later row ties with the bound and is dropped, which must still leave
+    // a full limit of rows
+    #[tokio::test]
+    async fn ties_at_the_bound_still_fill_the_limit() {
+        let batches = (0..5).map(|_| int_batch(vec![5; 1_000])).collect();
+        let mut op =
+            SortOperator::new(Box::new(FeedOp { batches }), order(), int_schema(), Some(3));
+        assert_eq!(drain(&mut op).await, present(&[5, 5, 5]));
+    }
+
+    /// Feeds batches whose row locators are the row values, so the kept
+    /// rows are known by their locators alone
+    struct LocatorFeed {
+        batches: Vec<DataBatch>,
+    }
+
+    impl Operator for LocatorFeed {
+        fn next(&mut self) -> crate::operator::OperatorResult<'_> {
+            Box::pin(async move {
+                Ok(self.batches.pop().map(|batch| {
+                    let ColumnData::Int64(values) = &batch.columns[0].data else {
+                        panic!("integer batches only");
+                    };
+                    let locators = values
+                        .iter()
+                        .map(|&v| RowLocator::Lake {
+                            file_id: 0,
+                            ordinal: v as u64,
+                        })
+                        .collect();
+                    ExecutionBatch::with_locators(batch, locators)
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_carries_the_kept_rows_locators() {
+        let (batches, mut all) = strided_batches();
+        let mut op = SortOperator::new(
+            Box::new(LocatorFeed { batches }),
+            order(),
+            int_schema(),
+            Some(7),
+        )
+        .with_locator_tracking();
+        let eb = op.next().await.unwrap().expect("the kept rows");
+        all.sort_unstable();
+        let expected: Vec<RowLocator> = all[..7]
+            .iter()
+            .map(|&v| RowLocator::Lake {
+                file_id: 0,
+                ordinal: v as u64,
+            })
+            .collect();
+        assert_eq!(eb.locators.expect("locators"), expected);
+        match &eb.batch.columns[0].data {
+            ColumnData::Int64(v) => assert_eq!(v, &all[..7]),
+            other => panic!("unexpected column {other:?}"),
+        }
+    }
+
+    /// Counts how often the sort asks for input
+    struct CountingFeed {
+        pulls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Operator for CountingFeed {
+        fn next(&mut self) -> crate::operator::OperatorResult<'_> {
+            Box::pin(async move {
+                self.pulls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_of_zero_reads_nothing() {
+        let pulls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut op = SortOperator::new(
+            Box::new(CountingFeed {
+                pulls: pulls.clone(),
+            }),
+            order(),
+            int_schema(),
+            Some(0),
+        );
+        assert!(op.next().await.unwrap().is_none());
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

@@ -88,6 +88,10 @@ pub struct RaftSnapshot {
 pub struct SnapshotStore {
     dir: PathBuf,
     current: Option<RaftSnapshot>,
+    /// The data file open for sending, with the path it was opened at. A
+    /// transfer reads a thousand chunks from a gigabyte, and opening the
+    /// file for each of them is a thousand opens for nothing
+    sender: Option<(PathBuf, File)>,
 }
 
 impl SnapshotStore {
@@ -104,6 +108,7 @@ impl SnapshotStore {
         let mut store = Self {
             dir: dir.to_path_buf(),
             current: None,
+            sender: None,
         };
         if meta_path.exists() {
             let bytes = std::fs::read(&meta_path)
@@ -183,6 +188,9 @@ impl SnapshotStore {
         self.write_meta(&meta)?;
         let snapshot = RaftSnapshot { meta, data };
         self.current = Some(snapshot.clone());
+        // The file held open for sending is the one the sweep removes, and
+        // an open file cannot be removed on every platform
+        self.sender = None;
         self.sweep_stale();
         Ok(snapshot)
     }
@@ -235,14 +243,23 @@ impl SnapshotStore {
     /// Opening per chunk rather than holding a handle keeps the sender
     /// stateless, so a transfer that is abandoned leaks nothing and a transfer
     /// that is restarted from a different offset needs no bookkeeping
-    pub fn read_chunk(&self, offset: u64, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+    pub fn read_chunk(&mut self, offset: u64, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
         let Some(snapshot) = self.current.as_ref() else {
             return Err(ZyronError::Internal(
                 "asked for a snapshot chunk with no snapshot on this node".into(),
             ));
         };
-        let mut file = File::open(&snapshot.data)
-            .map_err(|e| ZyronError::IoError(format!("open snapshot for send: {e}")))?;
+        let reopen = !matches!(&self.sender, Some((path, _)) if *path == snapshot.data);
+        if reopen {
+            let file = File::open(&snapshot.data)
+                .map_err(|e| ZyronError::IoError(format!("open snapshot for send: {e}")))?;
+            self.sender = Some((snapshot.data.clone(), file));
+        }
+        let Some((_, file)) = self.sender.as_mut() else {
+            return Err(ZyronError::Internal(
+                "the snapshot file did not stay open".into(),
+            ));
+        };
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| ZyronError::IoError(format!("seek snapshot: {e}")))?;
         let mut buf = vec![0u8; max_bytes];

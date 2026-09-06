@@ -1,4 +1,4 @@
-//! The wire protocol version registry.
+//! The client protocol's row in the wire version registry.
 //!
 //! A client names the protocol version it speaks in its startup message.
 //! The registry decides whether the server still speaks it: the current
@@ -7,7 +7,7 @@
 //! rather than carried as a shim, and the registry row records the release
 //! that removed it so the refusal names it
 
-use zyron_common::format::wire_version::{WireProtocolVersion, WireVersionStatus};
+use zyron_common::format::wire_version::{WireProtocol, WireProtocolVersion, WireVersionStatus};
 
 /// Protocol major 3, the version every client speaks today.
 ///
@@ -21,6 +21,7 @@ pub const WIRE_PROTOCOL_V3_PACKED: i32 = 196_608;
 
 inventory::submit! {
     WireProtocolVersion {
+        protocol: WireProtocol::Client,
         version: WIRE_PROTOCOL_V3,
         status: WireVersionStatus::Current,
         introduced_in_binary_version: "0.1.0",
@@ -39,14 +40,14 @@ pub fn negotiate_packed(packed: i32) -> Result<u32, String> {
     let substrate = zyron_common::format::substrate().map_err(|e| e.to_string())?;
     substrate
         .wire_versions
-        .negotiate(major)
+        .negotiate(WireProtocol::Client, major)
         .map_err(|e| e.to_string())
 }
 
 /// Every protocol major this server accepts right now
 pub fn accepted() -> Vec<u32> {
     zyron_common::format::substrate()
-        .map(|s| s.wire_versions.accepted())
+        .map(|s| s.wire_versions.accepted(WireProtocol::Client))
         .unwrap_or_default()
 }
 
@@ -58,7 +59,12 @@ mod tests {
     #[test]
     fn test_v3_is_the_current_version() {
         let substrate = zyron_common::format::substrate().expect("loads");
-        assert_eq!(substrate.wire_versions.current_version(), WIRE_PROTOCOL_V3);
+        assert_eq!(
+            substrate
+                .wire_versions
+                .current_version(WireProtocol::Client),
+            WIRE_PROTOCOL_V3
+        );
         assert_eq!(accepted(), vec![WIRE_PROTOCOL_V3]);
     }
 
@@ -84,6 +90,7 @@ mod tests {
     fn test_transition_then_cutover() {
         let transition = WireVersionRegistry::from_versions(vec![
             WireProtocolVersion {
+                protocol: WireProtocol::Client,
                 version: 3,
                 status: WireVersionStatus::Transitional,
                 introduced_in_binary_version: "0.1.0",
@@ -91,6 +98,7 @@ mod tests {
                 notes: "the previous version",
             },
             WireProtocolVersion {
+                protocol: WireProtocol::Client,
                 version: 4,
                 status: WireVersionStatus::Current,
                 introduced_in_binary_version: "0.12.0",
@@ -98,12 +106,13 @@ mod tests {
                 notes: "the current version",
             },
         ]);
-        assert_eq!(transition.accepted(), vec![3, 4]);
-        assert!(transition.negotiate(3).is_ok());
-        assert!(transition.negotiate(4).is_ok());
+        assert_eq!(transition.accepted(WireProtocol::Client), vec![3, 4]);
+        assert!(transition.negotiate(WireProtocol::Client, 3).is_ok());
+        assert!(transition.negotiate(WireProtocol::Client, 4).is_ok());
 
         let after_cutover = WireVersionRegistry::from_versions(vec![
             WireProtocolVersion {
+                protocol: WireProtocol::Client,
                 version: 3,
                 status: WireVersionStatus::Retired,
                 introduced_in_binary_version: "0.1.0",
@@ -111,6 +120,7 @@ mod tests {
                 notes: "retired at the cutover",
             },
             WireProtocolVersion {
+                protocol: WireProtocol::Client,
                 version: 4,
                 status: WireVersionStatus::Current,
                 introduced_in_binary_version: "0.12.0",
@@ -118,12 +128,12 @@ mod tests {
                 notes: "the current version",
             },
         ]);
-        assert_eq!(after_cutover.accepted(), vec![4]);
+        assert_eq!(after_cutover.accepted(WireProtocol::Client), vec![4]);
         let err = after_cutover
-            .negotiate(3)
+            .negotiate(WireProtocol::Client, 3)
             .expect_err("refuses v3")
             .to_string();
         assert!(err.contains("retired in Zyron 0.13.0"), "{err}");
-        assert!(err.contains("Update the driver"), "{err}");
+        assert!(err.contains("Update the peer"), "{err}");
     }
 }

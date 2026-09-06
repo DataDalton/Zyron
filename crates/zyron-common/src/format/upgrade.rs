@@ -12,7 +12,7 @@ use super::deprecation::BinaryVersion;
 use super::rewrite::UserObjectRewritePolicy;
 
 /// Which release stream a cluster follows
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum UpgradeChannel {
     /// Production-tested releases
     #[default]
@@ -78,7 +78,7 @@ impl fmt::Display for UpgradeChannel {
 }
 
 /// Where an upgrade has got to
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum UpgradePhase {
     /// No upgrade is pending
     #[default]
@@ -154,7 +154,7 @@ impl fmt::Display for UpgradePhase {
 }
 
 /// What one node reports about the upgrade it is part of
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodeUpgradeState {
     pub node_id: String,
     pub from_version: String,
@@ -170,7 +170,7 @@ pub struct NodeUpgradeState {
 }
 
 /// One finished upgrade, held for `zyron_sys.upgrade.history`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpgradeHistoryEntry {
     pub upgrade_id: u64,
     pub from_version: String,
@@ -189,7 +189,7 @@ pub struct UpgradeHistoryEntry {
 }
 
 /// How an upgrade ended
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UpgradeOutcome {
     Completed,
     RolledBack,
@@ -217,17 +217,21 @@ impl fmt::Display for UpgradeOutcome {
 }
 
 /// The metrics a node is judged against after it restarts
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HealthBaseline {
     pub p50_latency_us: u64,
     pub p99_latency_us: u64,
     pub throughput_per_sec: f64,
     pub error_rate: f64,
     pub active_connections: u64,
+    /// Queries the rate window held when the sample was taken, which is
+    /// what decides whether the rates and quantiles mean anything
+    #[serde(default)]
+    pub queries_in_window: u64,
 }
 
 /// How far a restarted node is allowed to drift from the baseline
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HealthThreshold {
     /// Multiple of baseline latency still counted as healthy
     pub latency_multiplier: f64,
@@ -283,13 +287,32 @@ impl HealthVerdict {
     }
 }
 
+/// Queries in the rate window below which a sample says nothing about
+/// latency or throughput. A quieter node is judged on its error rate
+/// alone, so a node nobody is querying is never read as starved and a
+/// handful of cold queries never read as slow. The count decides rather
+/// than the rate, because a burst of a few queries on a node that has just
+/// started reads as a high rate over the seconds it has been recording
+pub const HEALTH_SIGNAL_MIN_QUERIES: u64 = 30;
+
 impl HealthBaseline {
+    /// Whether enough queries went through for a rate or a quantile to
+    /// mean anything
+    pub fn carries_signal(&self) -> bool {
+        self.queries_in_window >= HEALTH_SIGNAL_MIN_QUERIES
+    }
+
     /// Judges an observation against this baseline.
     ///
     /// Latency and error rate are checked first because a node that answers
-    /// slowly or wrongly is unhealthy whatever its throughput says
+    /// slowly or wrongly is unhealthy whatever its throughput says. Latency
+    /// and throughput are compared only when the baseline carries signal,
+    /// and latency only when the observation does too, since a quantile
+    /// over a few queries is noise. The error rate is judged as it is,
+    /// because the wire counts only faults of the server, not of a request
     pub fn judge(&self, observed: &HealthBaseline, threshold: HealthThreshold) -> HealthVerdict {
-        if self.p99_latency_us > 0 {
+        let comparable = self.carries_signal();
+        if comparable && observed.carries_signal() && self.p99_latency_us > 0 {
             let ceiling = (self.p99_latency_us as f64 * threshold.latency_multiplier) as u64;
             if observed.p99_latency_us > ceiling {
                 return HealthVerdict::LatencyRegressed {
@@ -304,7 +327,7 @@ impl HealthBaseline {
                 observed_ppm: (observed.error_rate * 1_000_000.0) as u64,
             };
         }
-        if self.throughput_per_sec > 0.0 {
+        if comparable {
             let floor = self.throughput_per_sec * threshold.throughput_floor;
             if observed.throughput_per_sec < floor {
                 return HealthVerdict::ThroughputRegressed {
@@ -318,7 +341,7 @@ impl HealthBaseline {
 }
 
 /// One maintenance window, in UTC minutes from midnight
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaintenanceWindow {
     pub start_minute: u32,
     pub end_minute: u32,
@@ -437,7 +460,7 @@ pub fn parse_duration_secs(text: &str) -> Result<u64, String> {
 }
 
 /// A set of maintenance windows. Empty means any time
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaintenanceSchedule {
     pub windows: Vec<MaintenanceWindow>,
 }
@@ -602,7 +625,7 @@ impl ReleaseManifest {
 }
 
 /// The settings the upgrade substrate reads
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UpgradeSettings {
     pub auto_upgrade_enabled: bool,
     pub channel: UpgradeChannel,
@@ -647,7 +670,11 @@ impl Default for UpgradeSettings {
                 super::deprecation::DEFAULT_WARNING_RATE_LIMIT_PER_HOUR,
             release_feed_poll_interval_secs: 4 * 3_600,
             health_recovery_timeout_secs: 5 * 60,
-            release_feed_url: "https://releases.zyron.dev/feed".to_string(),
+            // The project's GitHub releases. The latest release's assets
+            // resolve under this path, so the newest manifest is always at
+            // one address and no feed server exists to run
+            release_feed_url: "https://github.com/DataDalton/Zyron/releases/latest/download"
+                .to_string(),
         }
     }
 }
@@ -691,7 +718,7 @@ impl UpgradeSettings {
 }
 
 /// One user-authored object an upgrade would rewrite
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RewriteRecord {
     pub object_name: String,
     pub object_kind: super::rewrite::ObjectKind,
@@ -721,6 +748,15 @@ pub struct UpgradeBoard {
     nodes: std::sync::Mutex<Vec<NodeUpgradeState>>,
     history: std::sync::Mutex<Vec<UpgradeHistoryEntry>>,
     rewrites: std::sync::Mutex<Vec<RewriteRecord>>,
+}
+
+/// The board's contents as one value, which the journal writes and reads
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct UpgradeBoardSnapshot {
+    pub settings: UpgradeSettings,
+    pub nodes: Vec<NodeUpgradeState>,
+    pub history: Vec<UpgradeHistoryEntry>,
+    pub rewrites: Vec<RewriteRecord>,
 }
 
 /// How many finished upgrades the board holds before the oldest fall off
@@ -855,6 +891,105 @@ impl UpgradeBoard {
         }
         moved
     }
+
+    /// Marks every blocked rewrite of one category accepted as broken, the
+    /// operator's explicit choice to upgrade with those objects failing.
+    /// Returns how many moved
+    pub fn accept_broken(
+        &self,
+        category: super::rewrite::RewriteCategory,
+        actor: &str,
+        now_secs: u64,
+    ) -> usize {
+        let Ok(mut records) = self.rewrites.lock() else {
+            return 0;
+        };
+        let mut moved = 0;
+        for record in records.iter_mut() {
+            if record.category == category
+                && record.status == super::rewrite::RewriteStatus::Blocked
+            {
+                record.status = super::rewrite::RewriteStatus::AcceptedBroken;
+                record.acknowledged_by = actor.to_string();
+                record.updated_at_secs = now_secs;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// Removes one node's row. The orchestrator does this when it takes over
+    /// a row the DDL surface wrote under a placeholder name. Returns whether
+    /// there was one
+    pub fn remove_node_state(&self, node_id: &str) -> bool {
+        let Ok(mut nodes) = self.nodes.lock() else {
+            return false;
+        };
+        let before = nodes.len();
+        nodes.retain(|state| state.node_id != node_id);
+        nodes.len() != before
+    }
+
+    /// Forgets every node's state, which the start of a new sequence does
+    pub fn clear_node_states(&self) {
+        if let Ok(mut nodes) = self.nodes.lock() {
+            nodes.clear();
+        }
+    }
+
+    /// Changes one finished upgrade in place. The stage that runs after a
+    /// restart uses it to record what it migrated. Returns whether the id
+    /// was found
+    pub fn amend_history(
+        &self,
+        upgrade_id: u64,
+        change: impl FnOnce(&mut UpgradeHistoryEntry),
+    ) -> bool {
+        let Ok(mut history) = self.history.lock() else {
+            return false;
+        };
+        match history
+            .iter_mut()
+            .find(|entry| entry.upgrade_id == upgrade_id)
+        {
+            Some(entry) => {
+                change(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Everything the board holds, for the journal
+    pub fn snapshot(&self) -> UpgradeBoardSnapshot {
+        UpgradeBoardSnapshot {
+            settings: self.settings(),
+            nodes: self.node_states(),
+            history: self.history.lock().map(|h| h.clone()).unwrap_or_default(),
+            rewrites: self.rewrites(),
+        }
+    }
+
+    /// Replaces everything the board holds with what the journal held
+    pub fn restore(&self, snapshot: UpgradeBoardSnapshot) {
+        if let Ok(mut slot) = self.settings.lock() {
+            *slot = snapshot.settings;
+        }
+        if let Ok(mut nodes) = self.nodes.lock() {
+            *nodes = snapshot.nodes;
+            nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        }
+        if let Ok(mut history) = self.history.lock() {
+            *history = snapshot.history;
+            let excess = history.len().saturating_sub(MAX_HISTORY_ENTRIES);
+            if excess > 0 {
+                history.drain(..excess);
+            }
+        }
+        if let Ok(mut rewrites) = self.rewrites.lock() {
+            *rewrites = snapshot.rewrites;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -980,6 +1115,7 @@ mod tests {
             throughput_per_sec: 10_000.0,
             error_rate: 0.0,
             active_connections: 50,
+            queries_in_window: 600_000,
         };
         let threshold = HealthThreshold::default();
         assert!(baseline.judge(&baseline, threshold).is_healthy());
@@ -1008,6 +1144,61 @@ mod tests {
         };
         assert!(matches!(
             baseline.judge(&starved, threshold),
+            HealthVerdict::ThroughputRegressed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_a_quiet_node_is_judged_on_errors_alone() {
+        // Six queries a minute is no rate to compare against, so a node
+        // that restarts into silence is healthy, and one whose few queries
+        // came back slow is healthy too
+        let quiet = HealthBaseline {
+            p50_latency_us: 100,
+            p99_latency_us: 1_000,
+            throughput_per_sec: 0.1,
+            error_rate: 0.0,
+            active_connections: 1,
+            queries_in_window: 6,
+        };
+        let threshold = HealthThreshold::default();
+        let silent = HealthBaseline::default();
+        assert!(quiet.judge(&silent, threshold).is_healthy());
+        let cold = HealthBaseline {
+            p99_latency_us: 50_000,
+            ..quiet
+        };
+        assert!(quiet.judge(&cold, threshold).is_healthy());
+
+        // Nine queries in the four seconds a node has been recording read
+        // as a rate of over two a second, and still say nothing
+        let burst = HealthBaseline {
+            throughput_per_sec: 2.25,
+            queries_in_window: 9,
+            ..quiet
+        };
+        assert!(burst.judge(&silent, threshold).is_healthy());
+
+        // The error rate still counts, which is what keeps a node that
+        // cannot be reached reading as unhealthy
+        let unreachable = HealthBaseline {
+            error_rate: 1.0,
+            ..silent
+        };
+        assert!(matches!(
+            quiet.judge(&unreachable, threshold),
+            HealthVerdict::ErrorRateRegressed { .. }
+        ));
+
+        // A busy baseline against a node that came back to no traffic is
+        // starved, which is what the recovery window is for
+        let busy = HealthBaseline {
+            throughput_per_sec: 10_000.0,
+            queries_in_window: 600_000,
+            ..quiet
+        };
+        assert!(matches!(
+            busy.judge(&silent, threshold),
             HealthVerdict::ThroughputRegressed { .. }
         ));
     }

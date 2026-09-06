@@ -247,6 +247,21 @@ pub struct LeaderState {
     /// Whether a snapshot transfer is running to each follower, so a second
     /// one is not started underneath it
     pub snapshot_in_flight: Vec<bool>,
+    /// Whether a batch for each follower is being read back from the log
+    /// file. Nothing else is built for the follower until that batch has
+    /// been handed to the transport, because a batch built after it would
+    /// otherwise reach the follower first and be refused
+    pub page_in_flight: Vec<bool>,
+    /// Whether each follower's position is unconfirmed, which it is after
+    /// an election, a refused batch, or a call that produced no answer. A
+    /// probing follower is sent entries one message at a time until it
+    /// confirms one, so a wrong guess costs one refusal rather than a
+    /// pipeline of them, and a follower that cannot be reached costs one
+    /// batch per retry rather than one per proposal
+    pub probing: Vec<bool>,
+    /// When a follower that could not be reached may be tried again, set by
+    /// a call that produced no answer and cleared by any reply
+    pub retry_at: Vec<Option<Instant>>,
     /// The highest read round each follower has echoed
     pub acked_round: Vec<u64>,
     /// The commit index last sent to each follower.
@@ -288,6 +303,9 @@ impl LeaderState {
             match_index: vec![0; n],
             inflight: vec![0; n],
             snapshot_in_flight: vec![false; n],
+            page_in_flight: vec![false; n],
+            probing: vec![true; n],
+            retry_at: vec![None; n],
             acked_round: vec![0; n],
             sent_commit: vec![0; n],
             last_contact: vec![now; n],
@@ -314,6 +332,9 @@ impl LeaderState {
         let mut match_index = Vec::with_capacity(peers.len());
         let mut inflight = Vec::with_capacity(peers.len());
         let mut snapshot_in_flight = Vec::with_capacity(peers.len());
+        let mut page_in_flight = Vec::with_capacity(peers.len());
+        let mut probing = Vec::with_capacity(peers.len());
+        let mut retry_at = Vec::with_capacity(peers.len());
         let mut acked_round = Vec::with_capacity(peers.len());
         let mut sent_commit = Vec::with_capacity(peers.len());
         let mut last_contact = Vec::with_capacity(peers.len());
@@ -325,6 +346,9 @@ impl LeaderState {
                     match_index.push(self.match_index[i]);
                     inflight.push(self.inflight[i]);
                     snapshot_in_flight.push(self.snapshot_in_flight[i]);
+                    page_in_flight.push(self.page_in_flight[i]);
+                    probing.push(self.probing[i]);
+                    retry_at.push(self.retry_at[i]);
                     acked_round.push(self.acked_round[i]);
                     sent_commit.push(self.sent_commit[i]);
                     last_contact.push(self.last_contact[i]);
@@ -335,6 +359,9 @@ impl LeaderState {
                     match_index.push(0);
                     inflight.push(0);
                     snapshot_in_flight.push(false);
+                    page_in_flight.push(false);
+                    probing.push(true);
+                    retry_at.push(None);
                     acked_round.push(0);
                     sent_commit.push(0);
                     last_contact.push(now);
@@ -347,6 +374,9 @@ impl LeaderState {
         self.match_index = match_index;
         self.inflight = inflight;
         self.snapshot_in_flight = snapshot_in_flight;
+        self.page_in_flight = page_in_flight;
+        self.probing = probing;
+        self.retry_at = retry_at;
         self.acked_round = acked_round;
         self.sent_commit = sent_commit;
         self.last_contact = last_contact;
@@ -361,10 +391,12 @@ impl LeaderState {
     }
 
     /// Forgets what was outstanding to a peer after a failed call, so the next
-    /// batch is rebuilt from what the peer actually confirmed
+    /// batch is rebuilt from what the peer actually confirmed, one message at
+    /// a time until it confirms again
     pub fn reset_progress(&mut self, i: usize) {
         self.next_index[i] = self.match_index[i] + 1;
         self.inflight[i] = 0;
+        self.probing[i] = true;
         // The message that would have carried the commit index did not land,
         // so the follower is owed it again
         self.sent_commit[i] = 0;

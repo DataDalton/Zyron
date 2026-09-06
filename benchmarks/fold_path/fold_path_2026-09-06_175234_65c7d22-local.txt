@@ -1,0 +1,35 @@
+# suite:   fold_path
+# run:     2026-09-06_175234_65c7d22-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Fold-path throughput (CompactionWorker::run_cycle) ===
+Rows per run: 100000, runs: 5
+  run 1: 801,455 rows/sec
+  run 2: 810,887 rows/sec
+  run 3: 780,513 rows/sec
+  run 4: 730,575 rows/sec
+  run 5: 781,080 rows/sec
+  Fold-path throughput (rows/sec) [FAIL/OK]:
+    Runs: [801,455, 810,887, 780,513, 730,575, 781,080]
+    Average: 780,902 >= 1,000,000 (target)
+    Min/Max: 730,575 / 810,887, StdDev: 27,765
+
+=== Shredded VARIANT read (folded segment) ===
+Rows: 200000, runs: 5
+  run 1: shredded 199 ns/row, document walk 387 ns/row
+  run 2: shredded 200 ns/row, document walk 401 ns/row
+  run 3: shredded 200 ns/row, document walk 393 ns/row
+  run 4: shredded 201 ns/row, document walk 389 ns/row
+  run 5: shredded 197 ns/row, document walk 390 ns/row
+  Promoted path read from its own column, per row [FAIL/REGR!]:
+    Runs: [198.6270ns, 199.7380ns, 199.7040ns, 200.5515ns, 196.9655ns]
+    Average: 199.1172ns <= 100ns (target)
+    Min/Max: 196.9655ns / 200.5515ns, StdDev: 1.2375ns
+  Same path read by walking the document, per row [PASS/OK]:
+    Runs: [386.8960ns, 401.0550ns, 393.3540ns, 389.1210ns, 389.9190ns]
+    Average: 392.0690ns <= 5,000ns (target)
+    Min/Max: 386.8960ns / 401.0550ns, StdDev: 4.9492ns
+  shredding is 2.0x the document walk on this machine

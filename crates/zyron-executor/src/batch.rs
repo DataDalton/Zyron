@@ -255,6 +255,221 @@ impl ColumnBuilder {
         self.data.push_scalar(&ScalarValue::Null);
     }
 
+    /// Appends one present fixed-width cell straight into the typed buffer.
+    ///
+    /// The per-cell counterpart of `extend_fixed`, for a decoder that walks
+    /// a row and meets one cell of each column at a time. Building a
+    /// scalar to push it costs a construction and two dispatches per cell,
+    /// this is one dispatch and a store. Returns false, having pushed
+    /// nothing, for a pairing this does not carry, and the caller pushes
+    /// the scalar instead. Every arm lands the value `decode_fixed_scalar`
+    /// would
+    #[inline]
+    pub fn push_fixed(&mut self, physical: TypeId, bytes: &[u8]) -> bool {
+        macro_rules! one {
+            ($buf:expr, $width:expr, $decode:expr) => {{
+                let Some(cell) = bytes.get(..$width) else {
+                    return false;
+                };
+                let decode: fn(&[u8]) -> _ = $decode;
+                $buf.push(decode(cell));
+                self.nulls.push(false);
+                true
+            }};
+        }
+
+        match (&mut self.data, physical) {
+            (ColumnData::Boolean(v), TypeId::Boolean) => one!(v, 1, |b| b[0] != 0),
+            (ColumnData::Int8(v), TypeId::Int8) => one!(v, 1, |b| i8::from_le_bytes([b[0]])),
+            (ColumnData::Int16(v), TypeId::Int16) => {
+                one!(v, 2, |b| i16::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::Int32(v), TypeId::Int32 | TypeId::Date) => {
+                one!(v, 4, |b| i32::from_le_bytes(b.try_into().unwrap()))
+            }
+            (
+                ColumnData::Int64(v),
+                TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz,
+            ) => {
+                one!(v, 8, |b| i64::from_le_bytes(b.try_into().unwrap()))
+            }
+            (
+                ColumnData::Int128(v),
+                TypeId::Int128 | TypeId::Decimal | TypeId::Hlc | TypeId::UInt128,
+            ) => {
+                one!(v, 16, |b| i128::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::UInt8(v), TypeId::UInt8) => one!(v, 1, |b| b[0]),
+            (ColumnData::UInt16(v), TypeId::UInt16) => {
+                one!(v, 2, |b| u16::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::UInt32(v), TypeId::UInt32) => {
+                one!(v, 4, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::UInt64(v), TypeId::UInt64) => {
+                one!(v, 8, |b| u64::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::Float32(v), TypeId::Float32) => {
+                one!(v, 4, |b| f32::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::Float64(v), TypeId::Float64) => {
+                one!(v, 8, |b| f64::from_le_bytes(b.try_into().unwrap()))
+            }
+            _ => false,
+        }
+    }
+
+    /// Appends a run of fixed-width cells straight into the typed buffer,
+    /// `None` meaning null.
+    ///
+    /// The per-value path decides two things at runtime for every single
+    /// value: which `ScalarValue` to build from the bytes, and which buffer
+    /// that scalar belongs in. Both answers are the same for every value in a
+    /// column, so this settles them once and leaves a load and a store in the
+    /// loop. Scanning a decoded column is where that difference is the whole
+    /// cost, since the bytes are already contiguous and typed.
+    ///
+    /// Returns false, having consumed nothing, when the buffer and the type
+    /// are a pairing this does not carry. The caller falls back to pushing
+    /// scalars, which is what makes an unlisted type slow rather than wrong.
+    ///
+    /// Every arm must land the same value the per-value path would:
+    /// `decode_fixed_scalar` for a present cell, and for an absent one the
+    /// buffer's own filler with the null flag set.
+    pub fn extend_fixed<'a>(
+        &mut self,
+        physical: TypeId,
+        cells: impl Iterator<Item = Option<&'a [u8]>>,
+    ) -> bool {
+        macro_rules! run {
+            ($buf:expr, $width:expr, $decode:expr, $filler:expr) => {{
+                let buf = $buf;
+                for cell in cells {
+                    match cell {
+                        Some(bytes) => {
+                            self.nulls.push(false);
+                            let decode: fn(&[u8]) -> _ = $decode;
+                            buf.push(decode(&bytes[..$width]));
+                        }
+                        None => {
+                            self.nulls.push(true);
+                            buf.push($filler);
+                        }
+                    }
+                }
+                true
+            }};
+        }
+
+        match (&mut self.data, physical) {
+            (ColumnData::Boolean(v), TypeId::Boolean) => run!(v, 1, |b| b[0] != 0, false),
+            (ColumnData::Int8(v), TypeId::Int8) => {
+                run!(v, 1, |b| i8::from_le_bytes([b[0]]), 0)
+            }
+            (ColumnData::Int16(v), TypeId::Int16) => {
+                run!(v, 2, |b| i16::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (ColumnData::Int32(v), TypeId::Int32 | TypeId::Date) => {
+                run!(v, 4, |b| i32::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (
+                ColumnData::Int64(v),
+                TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz,
+            ) => {
+                run!(v, 8, |b| i64::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (
+                ColumnData::Int128(v),
+                TypeId::Int128 | TypeId::Decimal | TypeId::Hlc | TypeId::UInt128,
+            ) => {
+                run!(v, 16, |b| i128::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (ColumnData::UInt8(v), TypeId::UInt8) => run!(v, 1, |b| b[0], 0),
+            (ColumnData::UInt16(v), TypeId::UInt16) => {
+                run!(v, 2, |b| u16::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (ColumnData::UInt32(v), TypeId::UInt32) => {
+                run!(v, 4, |b| u32::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (ColumnData::UInt64(v), TypeId::UInt64) => {
+                run!(v, 8, |b| u64::from_le_bytes(b.try_into().unwrap()), 0)
+            }
+            (ColumnData::Float32(v), TypeId::Float32) => {
+                run!(v, 4, |b| f32::from_le_bytes(b.try_into().unwrap()), 0.0)
+            }
+            (ColumnData::Float64(v), TypeId::Float64) => {
+                run!(v, 8, |b| f64::from_le_bytes(b.try_into().unwrap()), 0.0)
+            }
+            _ => false,
+        }
+    }
+
+    /// Appends `rows` cells laid out end to end, none of them null.
+    ///
+    /// The gather above asks two questions per value: whether the ordinal
+    /// falls inside the decoded range, and whether the cell is present. A
+    /// run has answered both for all of them before the loop starts, so
+    /// what is left is a decode over a slice and one bulk step for the
+    /// null bitmap. This is the shape every scan that filtered nothing
+    /// hands over, which is every full scan and every aggregate over one
+    pub fn extend_fixed_run(&mut self, physical: TypeId, data: &[u8], rows: usize) -> bool {
+        macro_rules! run {
+            ($buf:expr, $width:expr, $decode:expr) => {{
+                let buf = $buf;
+                if data.len() < rows * $width {
+                    return false;
+                }
+                buf.reserve(rows);
+                for cell in data.chunks_exact($width).take(rows) {
+                    let decode: fn(&[u8]) -> _ = $decode;
+                    buf.push(decode(cell));
+                }
+                self.nulls.extend_valid(rows);
+                true
+            }};
+        }
+
+        match (&mut self.data, physical) {
+            (ColumnData::Boolean(v), TypeId::Boolean) => run!(v, 1, |b| b[0] != 0),
+            (ColumnData::Int8(v), TypeId::Int8) => run!(v, 1, |b| i8::from_le_bytes([b[0]])),
+            (ColumnData::Int16(v), TypeId::Int16) => {
+                run!(v, 2, |b| i16::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::Int32(v), TypeId::Int32 | TypeId::Date) => {
+                run!(v, 4, |b| i32::from_le_bytes(b.try_into().unwrap()))
+            }
+            (
+                ColumnData::Int64(v),
+                TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz,
+            ) => {
+                run!(v, 8, |b| i64::from_le_bytes(b.try_into().unwrap()))
+            }
+            (
+                ColumnData::Int128(v),
+                TypeId::Int128 | TypeId::Decimal | TypeId::Hlc | TypeId::UInt128,
+            ) => {
+                run!(v, 16, |b| i128::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::UInt8(v), TypeId::UInt8) => run!(v, 1, |b| b[0]),
+            (ColumnData::UInt16(v), TypeId::UInt16) => {
+                run!(v, 2, |b| u16::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::UInt32(v), TypeId::UInt32) => {
+                run!(v, 4, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::UInt64(v), TypeId::UInt64) => {
+                run!(v, 8, |b| u64::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::Float32(v), TypeId::Float32) => {
+                run!(v, 4, |b| f32::from_le_bytes(b.try_into().unwrap()))
+            }
+            (ColumnData::Float64(v), TypeId::Float64) => {
+                run!(v, 8, |b| f64::from_le_bytes(b.try_into().unwrap()))
+            }
+            _ => false,
+        }
+    }
+
     pub fn finish(self) -> Column {
         Column::with_nulls_ts(self.data, self.nulls, self.type_id, self.fractional_digits)
     }
@@ -327,7 +542,7 @@ pub fn decode_tuple_into_builders(
 ) {
     debug_assert_eq!(column_to_builder.len(), columns.len());
     let num_cols = columns.len();
-    let null_bitmap_len = (num_cols + 7) / 8;
+    let null_bitmap_len = num_cols.div_ceil(8);
     let null_bitmap = &data[..null_bitmap_len];
     let mut offset = null_bitmap_len;
 
@@ -347,7 +562,11 @@ pub fn decode_tuple_into_builders(
                 offset += fixed_size;
             } else {
                 let value_bytes = &data[offset..offset + fixed_size];
-                if let Some(b) = builder_idx {
+                // Straight into the typed buffer, the scalar only for a
+                // pairing the typed push does not carry
+                if let Some(b) = builder_idx
+                    && !builders[b].push_fixed(phys_type, value_bytes)
+                {
                     let scalar = decode_fixed_scalar(phys_type, value_bytes);
                     builders[b].push_owned(scalar);
                 }
@@ -534,7 +753,7 @@ pub fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
 /// Encodes one row from a DataBatch into tuple data bytes (NSM format).
 pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) -> Vec<u8> {
     let num_cols = columns.len();
-    let null_bitmap_len = (num_cols + 7) / 8;
+    let null_bitmap_len = num_cols.div_ceil(8);
     let mut buf = Vec::with_capacity(null_bitmap_len + num_cols * 8);
     encode_row_into(&mut buf, batch, row_idx, columns);
     buf
@@ -554,7 +773,7 @@ pub fn encode_row_into(
     columns: &[ColumnEntry],
 ) {
     let num_cols = columns.len();
-    let null_bitmap_len = (num_cols + 7) / 8;
+    let null_bitmap_len = num_cols.div_ceil(8);
     let base = buf.len();
     buf.resize(base + null_bitmap_len, 0u8);
 
@@ -570,7 +789,7 @@ pub fn encode_row_into(
         let phys_type = col.physical_type_id();
         if let Some(fixed_size) = phys_type.fixed_size() {
             if is_null {
-                buf.extend(std::iter::repeat(0u8).take(fixed_size));
+                buf.extend(std::iter::repeat_n(0u8, fixed_size));
             } else {
                 encode_fixed_scalar(buf, phys_type, &column.data.get_scalar(row_idx));
             }
@@ -672,7 +891,7 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
         (TypeId::Interval, ScalarValue::Interval(i)) => buf.extend_from_slice(&i.to_le_bytes()),
         _ => {
             if let Some(size) = type_id.fixed_size() {
-                buf.extend(std::iter::repeat(0u8).take(size));
+                buf.extend(std::iter::repeat_n(0u8, size));
             }
         }
     }
@@ -839,5 +1058,126 @@ mod row_filter_tests {
         let mask = evaluate_row_filter(&output_columns, &table_columns, &predicate, &rows).unwrap();
         // Good row passes; the two malformed rows are dropped.
         assert_eq!(mask, vec![true, false, false]);
+    }
+}
+
+#[cfg(test)]
+mod extend_fixed_tests {
+    use super::*;
+
+    /// Every fixed-width physical type a lake column can decode to.
+    const FIXED_TYPES: &[TypeId] = &[
+        TypeId::Boolean,
+        TypeId::Int8,
+        TypeId::Int16,
+        TypeId::Int32,
+        TypeId::Date,
+        TypeId::Int64,
+        TypeId::Time,
+        TypeId::Timestamp,
+        TypeId::TimestampTz,
+        TypeId::Int128,
+        TypeId::Decimal,
+        TypeId::Hlc,
+        TypeId::UInt8,
+        TypeId::UInt16,
+        TypeId::UInt32,
+        TypeId::UInt64,
+        TypeId::UInt128,
+        TypeId::Float32,
+        TypeId::Float64,
+        TypeId::Uuid,
+        TypeId::Interval,
+    ];
+
+    /// The bulk append exists only to be faster, so it has to land exactly
+    /// what the per-value path lands, values and null flags alike. This runs
+    /// both over the same cells and compares the finished column.
+    ///
+    /// A type the bulk path declines is still covered: it reports false and
+    /// the comparison then holds trivially, which is the fallback the caller
+    /// depends on.
+    #[test]
+    fn extend_fixed_matches_the_per_value_path() {
+        for &physical in FIXED_TYPES {
+            let Some(width) = physical.fixed_size() else {
+                continue;
+            };
+            if width == 0 {
+                continue;
+            }
+
+            // A mix of bit patterns, including all-zero, all-ones and a
+            // high-bit-set value so sign handling shows up
+            let patterns: Vec<Option<Vec<u8>>> = (0..40u8)
+                .map(|i| {
+                    if i % 7 == 3 {
+                        None
+                    } else {
+                        Some(
+                            (0..width)
+                                .map(|b| i.wrapping_mul(31).wrapping_add(b as u8))
+                                .collect(),
+                        )
+                    }
+                })
+                .chain([
+                    Some(vec![0u8; width]),
+                    Some(vec![0xFFu8; width]),
+                    None,
+                    Some({
+                        let mut v = vec![0u8; width];
+                        v[width - 1] = 0x80;
+                        v
+                    }),
+                ])
+                .collect();
+
+            let mut bulk = ColumnBuilder::new(physical, patterns.len());
+            let took = bulk.extend_fixed(
+                physical,
+                patterns.iter().map(|p| p.as_ref().map(|v| v.as_slice())),
+            );
+
+            let mut per_value = ColumnBuilder::new(physical, patterns.len());
+            for p in &patterns {
+                let sv = match p {
+                    None => ScalarValue::Null,
+                    Some(bytes) => decode_fixed_scalar(physical, bytes),
+                };
+                per_value.push_owned(sv);
+            }
+
+            if !took {
+                // Declined, so the caller uses the per-value path and there
+                // is nothing to compare
+                continue;
+            }
+
+            let a = bulk.finish();
+            let b = per_value.finish();
+            assert_eq!(
+                format!("{:?}", a.data),
+                format!("{:?}", b.data),
+                "{physical:?} values differ between the bulk and per-value paths"
+            );
+            assert_eq!(
+                format!("{:?}", a.nulls),
+                format!("{:?}", b.nulls),
+                "{physical:?} null flags differ between the bulk and per-value paths"
+            );
+        }
+    }
+
+    /// The bulk path must not consume anything when it declines, or the
+    /// caller's fallback would start partway through the column.
+    #[test]
+    fn a_declined_type_consumes_no_cells() {
+        let cells = [Some([1u8, 2, 3, 4].as_slice()), None];
+        let mut builder = ColumnBuilder::new(TypeId::Int32, 2);
+        // Int32 buffer offered a type it does not carry
+        assert!(!builder.extend_fixed(TypeId::Float64, cells.iter().copied()));
+        let finished = builder.finish();
+        assert_eq!(finished.nulls.len(), 0, "declining still pushed nulls");
     }
 }

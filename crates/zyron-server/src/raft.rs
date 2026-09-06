@@ -116,14 +116,43 @@ impl ZyronStateMachine {
             RaftCommand::Noop => {
                 self.changesets.abandon_before_term(term);
             }
-            // The key-value shape exists for exercising consensus itself and
-            // has no meaning to a database node. Refusing is the only honest
-            // answer: applying it as nothing would let a group think this node
-            // holds state it does not
-            RaftCommand::Put { .. } | RaftCommand::Delete { .. } => {
+            // A key-value entry is a cluster setting, an upgrade setting that
+            // every node applies at the same point so a leadership change
+            // cannot lose it. Any other key has no meaning to a database
+            // node, and refusing is the only honest answer: applying it as
+            // nothing would let a group think this node holds state it does
+            // not
+            RaftCommand::Put { key, value } => {
+                let (key, value) = match (std::str::from_utf8(key), std::str::from_utf8(value)) {
+                    (Ok(key), Ok(value)) if crate::cluster_settings::is_cluster_setting(key) => {
+                        (key, value)
+                    }
+                    _ => {
+                        return Err(ZyronError::RaftLogCorrupted {
+                            index,
+                            reason: "a key-value command that is not a cluster setting reached a \
+                                     database node"
+                                .into(),
+                        });
+                    }
+                };
+                // A value this binary refuses, or a config file it cannot
+                // write, leaves this node behind on one setting. Stopping the
+                // apply loop over it would leave it behind on everything
+                if let Err(e) = crate::cluster_settings::apply(&self.engine.data_dir, key, value) {
+                    tracing::error!(
+                        index,
+                        key,
+                        value,
+                        error = %e,
+                        "a replicated setting was not applied on this node"
+                    );
+                }
+            }
+            RaftCommand::Delete { .. } => {
                 return Err(ZyronError::RaftLogCorrupted {
                     index,
-                    reason: "a key-value command reached a database node".into(),
+                    reason: "a key-value delete reached a database node".into(),
                 });
             }
             // Consensus state rather than user state. The node applies these

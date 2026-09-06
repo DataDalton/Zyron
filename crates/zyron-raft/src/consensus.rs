@@ -62,7 +62,9 @@ pub enum PeerWork {
     ///
     /// The plan is resolved into records by the replication task, off the
     /// consensus lock, because a page-in is a disk read and the lock it would
-    /// otherwise hold is the one the heartbeat needs
+    /// otherwise hold is the one the heartbeat needs. The follower is held
+    /// until [`RaftConsensus::finish_page_in`] says the batch has been handed
+    /// to the transport, so nothing built after it is placed ahead of it
     AppendPaged {
         request: AppendEntriesRequest,
         plan: Vec<SliceItem>,
@@ -107,6 +109,11 @@ pub struct ConsensusMetrics {
     pub elections_won: u64,
     pub step_downs: u64,
     pub appends_built: u64,
+    /// Messages built with no entries because the heartbeat interval passed
+    pub heartbeats_built: u64,
+    /// Messages built with no entries to carry a commit index a follower
+    /// with nothing in flight had not been told
+    pub commit_carriers_built: u64,
     pub appends_rejected: u64,
     pub entries_appended: u64,
     pub entries_replicated: u64,
@@ -258,6 +265,43 @@ impl RaftConsensus {
         self.membership.peers(self.id)
     }
 
+    /// The followers this leader replicates to, in the order its progress
+    /// arrays hold them. Empty on a node that does not lead
+    pub fn leader_peers(&self) -> &[NodeId] {
+        self.state
+            .leader
+            .as_ref()
+            .map(|leader| leader.peers.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Whether some follower can take entries now.
+    ///
+    /// A proposal wakes the replicator on this answer. Under load every
+    /// follower has its share in flight and the answer is no, and the reply
+    /// that frees a slot wakes the replicator instead, so the wake and the
+    /// pass through the lock it costs are not paid at the proposal rate. A
+    /// follower being probed has room for one message, and one that could
+    /// not be reached has none until its retry time
+    pub fn replication_has_room(&self, now: Instant) -> bool {
+        let Some(leader) = self.state.leader.as_ref() else {
+            return false;
+        };
+        let log_last = self.state.log().last_index();
+        (0..leader.peers.len()).any(|i| {
+            if leader.snapshot_in_flight[i] || leader.page_in_flight[i] {
+                return false;
+            }
+            if leader.probing[i]
+                && (leader.inflight[i] > 0 || leader.retry_at[i].is_some_and(|at| now < at))
+            {
+                return false;
+            }
+            let pending = entries_pending(leader.next_index[i], log_last);
+            pending > 0 && send_window_open(&self.config, leader.inflight[i], pending)
+        })
+    }
+
     pub fn election_deadline(&self) -> Instant {
         self.timer.deadline()
     }
@@ -306,7 +350,7 @@ impl RaftConsensus {
                     if self.config.pre_vote {
                         outcome.vote_requests = self.start_pre_vote(now);
                     } else {
-                        match self.become_candidate(now) {
+                        match self.become_candidate(now, false) {
                             Ok(requests) => outcome.vote_requests = requests,
                             Err(e) => {
                                 tracing::error!(node = self.id, error = %e, "could not start an election");
@@ -365,7 +409,7 @@ impl RaftConsensus {
 
         if self.membership.has_quorum(|id| id == self.id) {
             // A group whose only voter is this node has nobody to ask
-            match self.become_candidate(now) {
+            match self.become_candidate(now, false) {
                 Ok(requests) => return requests,
                 Err(e) => {
                     tracing::error!(node = self.id, error = %e, "could not start an election");
@@ -380,6 +424,7 @@ impl RaftConsensus {
             last_log_index: self.last_log_index(),
             last_log_term: self.last_log_term(),
             pre_vote: true,
+            transfer: false,
         };
         self.voting_peers()
             .into_iter()
@@ -387,8 +432,14 @@ impl RaftConsensus {
             .collect()
     }
 
-    /// Raises the term, votes for itself, and asks for the rest
-    fn become_candidate(&mut self, now: Instant) -> Result<Vec<(NodeId, RequestVoteRequest)>> {
+    /// Raises the term, votes for itself, and asks for the rest. `transfer`
+    /// marks an election the leader asked for, which voters grant even while
+    /// they still hear that leader
+    fn become_candidate(
+        &mut self,
+        now: Instant,
+        transfer: bool,
+    ) -> Result<Vec<(NodeId, RequestVoteRequest)>> {
         let term = self.term() + 1;
         self.state.persistent.start_term_voting_for(term, self.id)?;
         self.state.role = RaftRole::Candidate;
@@ -412,6 +463,7 @@ impl RaftConsensus {
             last_log_index: self.last_log_index(),
             last_log_term: self.last_log_term(),
             pre_vote: false,
+            transfer,
         };
         Ok(self
             .voting_peers()
@@ -483,6 +535,94 @@ impl RaftConsensus {
         Ok(true)
     }
 
+    /// The voter best placed to take the group, for a leadership transfer.
+    ///
+    /// The follower with the most confirmed log needs the least catching up,
+    /// so the handover is shortest through it. None when this node does not
+    /// lead or has no voting peer
+    pub fn transfer_target(&self) -> Option<NodeId> {
+        if self.state.role != RaftRole::Leader {
+            return None;
+        }
+        let leader = self.state.leader.as_ref()?;
+        let mut best: Option<(NodeId, u64)> = None;
+        for (i, peer) in leader.peers.iter().enumerate() {
+            if !self.membership.is_voter(*peer) {
+                continue;
+            }
+            let matched = leader.match_index[i];
+            match best {
+                Some((_, held)) if held >= matched => {}
+                _ => best = Some((*peer, matched)),
+            }
+        }
+        best.map(|(peer, _)| peer)
+    }
+
+    /// Whether a follower has confirmed everything this leader holds
+    pub fn peer_caught_up(&self, peer: NodeId) -> bool {
+        let Some(leader) = self.state.leader.as_ref() else {
+            return false;
+        };
+        match leader.pos(peer) {
+            Some(i) => leader.match_index[i] >= self.last_log_index(),
+            None => false,
+        }
+    }
+
+    /// What a peer has confirmed holding, None when this node does not lead
+    /// or does not replicate to that peer
+    pub fn peer_match_index(&self, peer: NodeId) -> Option<u64> {
+        let leader = self.state.leader.as_ref()?;
+        leader.pos(peer).map(|i| leader.match_index[i])
+    }
+
+    /// Takes a leader's request that this node campaign at once.
+    ///
+    /// The pre-vote is skipped. A leader asking to be replaced is the one
+    /// node whose permission the pre-vote would otherwise seek. Returns the
+    /// vote requests to fan out, none when the request was stale, this node
+    /// already leads, or it cannot vote
+    pub fn handle_timeout_now(
+        &mut self,
+        req: &crate::election::TimeoutNowRequest,
+        now: Instant,
+    ) -> Result<(
+        crate::election::TimeoutNowReply,
+        Vec<(NodeId, RequestVoteRequest)>,
+    )> {
+        let declined = |term: u64| {
+            (
+                crate::election::TimeoutNowReply {
+                    term,
+                    started: false,
+                },
+                Vec::new(),
+            )
+        };
+        if req.term < self.term()
+            || self.state.role == RaftRole::Leader
+            || !self.membership.is_voter(self.id)
+        {
+            return Ok(declined(self.term()));
+        }
+        self.observe_term(req.term, Some(req.leader_id), now)?;
+        let requests = self.become_candidate(now, true)?;
+        tracing::info!(
+            node = self.id,
+            from = req.leader_id,
+            term = self.term(),
+            "campaigning at the leader's request"
+        );
+        Ok((
+            crate::election::TimeoutNowReply {
+                term: self.term(),
+                started: true,
+            },
+            requests,
+        ))
+    }
+
     /// Answers a vote request, real or pre-vote.
     ///
     /// A granted real vote is on disk before this returns, because the reply
@@ -518,6 +658,24 @@ impl RaftConsensus {
             reply.vote_granted =
                 req.term > self.term() && up_to_date && !heard_recently && !leader_here;
             return Ok(reply);
+        }
+
+        // A real vote from a candidate the pre-vote never sanctioned, one
+        // that skipped it or won it while this node's leader was briefly
+        // quiet, gets the same answer while the leader can still be heard,
+        // and the term stays where it is so the candidate cannot depose a
+        // working leader from outside the group. A node dropped from the
+        // configuration that never learned it was dropped is the candidate
+        // this refuses. The leader's own hand-off is the one exception
+        if !req.transfer {
+            let follower_hears_leader = self.state.role != RaftRole::Leader
+                && self.state.leader_id.is_some()
+                && now.duration_since(self.last_leader_contact) < self.config.election_timeout_min;
+            let leader_with_quorum =
+                self.state.role == RaftRole::Leader && self.has_recent_quorum(now);
+            if follower_hears_leader || leader_with_quorum {
+                return Ok(reply);
+            }
         }
 
         if req.term < self.term() {
@@ -564,7 +722,7 @@ impl RaftConsensus {
                 .membership
                 .has_quorum(|id| self.pre_votes.contains(&id))
             {
-                return self.become_candidate(now);
+                return self.become_candidate(now, false);
             }
             return Ok(Vec::new());
         }
@@ -667,7 +825,9 @@ impl RaftConsensus {
             if entry.command.is_config_change() {
                 membership_dirty = true;
             }
-            self.state.log_mut().append((**entry).clone())?;
+            self.state
+                .log_mut()
+                .append_shared(std::sync::Arc::clone(entry))?;
             self.metrics.entries_appended += 1;
         }
         self.state.log_mut().flush_pending()?;
@@ -679,6 +839,15 @@ impl RaftConsensus {
         if req.leader_commit > self.state.volatile.commit_index {
             self.state.volatile.commit_index = req.leader_commit.min(last_new);
         }
+        tracing::trace!(
+            node = self.id,
+            from = req.leader_id,
+            prev = req.prev_log_index,
+            entries = req.entries.len(),
+            leader_commit = req.leader_commit,
+            commit = self.state.volatile.commit_index,
+            "append taken"
+        );
         reply.success = true;
         reply.match_index = last_new;
         Ok(reply)
@@ -714,10 +883,9 @@ impl RaftConsensus {
         if self.state.role != RaftRole::Leader {
             return Ok(PeerWork::Idle);
         }
-        let (max_entries, max_bytes, max_inflight, heartbeat) = (
+        let (max_entries, max_bytes, heartbeat) = (
             self.config.max_batch_entries,
             self.config.max_batch_bytes,
-            self.config.max_inflight_appends as u32,
             self.config.heartbeat_interval,
         );
         let log_prev = self.state.log().prev_index();
@@ -732,7 +900,7 @@ impl RaftConsensus {
         let Some(i) = leader.pos(peer) else {
             return Ok(PeerWork::Idle);
         };
-        if leader.snapshot_in_flight[i] {
+        if leader.snapshot_in_flight[i] || leader.page_in_flight[i] {
             return Ok(PeerWork::Idle);
         }
         let next = leader.next_index[i];
@@ -740,14 +908,31 @@ impl RaftConsensus {
             leader.snapshot_in_flight[i] = true;
             return Ok(PeerWork::Snapshot);
         }
+        // A follower that could not be reached is left alone until its retry
+        // time, heartbeats included, so a follower that is down costs one
+        // attempt per interval rather than one per proposal
+        if leader.probing[i] && leader.retry_at[i].is_some_and(|at| now < at) {
+            return Ok(PeerWork::Idle);
+        }
         let heartbeat_due = now >= leader.next_heartbeat[i];
-        let has_entries = next <= log_last;
-        // A commit that has moved past what this follower was last told is
-        // work even when there is nothing left to replicate. Only once the
-        // pipeline is empty, though: anything already in flight was built with
-        // a commit index at least this fresh and will carry it
-        let commit_due = commit > leader.sent_commit[i] && leader.inflight[i] == 0;
-        let can_send_entries = has_entries && leader.inflight[i] < max_inflight;
+        let pending = entries_pending(next, log_last);
+        // A commit index is due when the follower holds entries it has not
+        // been told are committed. What it can act on is bounded by what it
+        // has confirmed holding, because a message with no entries attaches
+        // at that point and the follower commits no further than it. So the
+        // comparison is against that bound, and a message still in flight
+        // does not cover an advance that landed after it was built. Entries
+        // waiting to go carry the commit index with them, so it costs a
+        // message of its own only when there are none
+        let actionable_commit = commit.min(leader.match_index[i]);
+        let commit_due = pending == 0 && actionable_commit > leader.sent_commit[i];
+        // Until the follower has confirmed a position, entries go one
+        // message at a time. Heartbeats still go on their timer, so a probe
+        // that is slow to be answered does not silence the leader
+        let probe_open = !leader.probing[i] || leader.inflight[i] == 0;
+        let can_send_entries = pending > 0
+            && probe_open
+            && send_window_open(&self.config, leader.inflight[i], pending);
         if !heartbeat_due && !commit_due && !can_send_entries {
             return Ok(PeerWork::Idle);
         }
@@ -766,7 +951,6 @@ impl RaftConsensus {
         };
         leader.inflight[i] += 1;
         leader.next_heartbeat[i] = now + heartbeat;
-        leader.sent_commit[i] = commit;
 
         let plan = if send_entries {
             let plan = self.state.log().plan_slice(next, max_entries, max_bytes);
@@ -777,6 +961,12 @@ impl RaftConsensus {
         } else {
             Vec::new()
         };
+        // What this message lets the follower commit, the leader's commit
+        // index capped at the last entry the message leaves it holding. A
+        // commit past that is still owed and a later message carries it
+        if let Some(leader) = self.state.leader.as_mut() {
+            leader.sent_commit[i] = commit.min(prev_log_index + plan.len() as u64);
+        }
         let Some(prev_log_term) = self.state.log().term_at(prev_log_index) else {
             // The entry the check needs was compacted between the two reads
             if let Some(leader) = self.state.leader.as_mut() {
@@ -789,6 +979,23 @@ impl RaftConsensus {
 
         self.metrics.appends_built += 1;
         self.metrics.entries_replicated += plan.len() as u64;
+        if !send_entries {
+            if commit_due {
+                self.metrics.commit_carriers_built += 1;
+            } else {
+                self.metrics.heartbeats_built += 1;
+            }
+        }
+        tracing::trace!(
+            node = id,
+            peer,
+            prev_log_index,
+            entries = plan.len(),
+            commit,
+            heartbeat_due,
+            commit_due,
+            "append built"
+        );
 
         // A batch entirely in memory becomes the request here. One that
         // crosses the residency boundary is handed out as a plan, so the reads
@@ -816,6 +1023,9 @@ impl RaftConsensus {
             .iter()
             .filter(|item| matches!(item, SliceItem::Paged(_)))
             .count() as u64;
+        if let Some(leader) = self.state.leader.as_mut() {
+            leader.page_in_flight[i] = true;
+        }
         Ok(PeerWork::AppendPaged {
             request: AppendEntriesRequest {
                 term,
@@ -867,8 +1077,12 @@ impl RaftConsensus {
         };
         leader.inflight[i] = leader.inflight[i].saturating_sub(1);
         leader.last_contact[i] = now;
+        // Any reply proves the follower can be reached
+        leader.retry_at[i] = None;
 
         if reply.success {
+            // A confirmed position is what opens the pipeline
+            leader.probing[i] = false;
             if reply.match_index > leader.match_index[i] {
                 leader.match_index[i] = reply.match_index;
             }
@@ -884,12 +1098,40 @@ impl RaftConsensus {
             leader.next_index[i] = next_index_after_reject(reply.hint_index, leader.match_index[i]);
             // Whatever else was in flight to this follower will be refused for
             // the same reason, so the guess is rebuilt from here rather than
-            // stepped once per stale reply
+            // stepped once per stale reply, and sent one message at a time
+            // until the follower confirms it
             leader.inflight[i] = 0;
+            leader.probing[i] = true;
             // A refused message delivered no commit index either
             leader.sent_commit[i] = 0;
         }
         Ok(())
+    }
+
+    /// Whether `peer` holds committed entries it has not been told are
+    /// committed.
+    ///
+    /// A message in flight is built with the commit index of the moment it
+    /// was built and attaches at what the follower had confirmed then, so an
+    /// advance that lands after it, or entries the follower confirms after
+    /// it, are not covered by it. A follower that has not been told cannot
+    /// apply, and no further message is due until the heartbeat timer, so a
+    /// linearizable read against it would wait out the heartbeat interval
+    /// for no reason. The answer is taken from what the follower has
+    /// confirmed holding rather than from the pipeline being empty, because
+    /// a message built while the pipeline was briefly empty and attached at
+    /// an older confirmation delivers less than the commit index it carries
+    pub fn peer_owes_commit(&self, peer: NodeId) -> bool {
+        if self.state.role != RaftRole::Leader {
+            return false;
+        }
+        let Some(leader) = self.state.leader.as_ref() else {
+            return false;
+        };
+        let Some(i) = leader.pos(peer) else {
+            return false;
+        };
+        self.commit_index().min(leader.match_index[i]) > leader.sent_commit[i]
     }
 
     /// Steps down if a peer's reply carried a later term.
@@ -912,17 +1154,44 @@ impl RaftConsensus {
     }
 
     /// Marks a call to a peer as having produced nothing, so the pipeline slot
-    /// is returned and the guess falls back to what the peer confirmed
-    pub fn handle_peer_unreachable(&mut self, peer: NodeId) {
+    /// is returned, the guess falls back to what the peer confirmed, and the
+    /// peer is left alone for a heartbeat interval before it is tried again
+    pub fn handle_peer_unreachable(&mut self, peer: NodeId, now: Instant) {
+        let heartbeat = self.config.heartbeat_interval;
         let Some(leader) = self.state.leader.as_mut() else {
             return;
         };
         if let Some(i) = leader.pos(peer) {
             leader.reset_progress(i);
+            leader.retry_at[i] = Some(now + heartbeat);
         }
     }
 
     /// Clears the snapshot flag once a transfer ends, either way
+    /// Records that a peer answered, whatever it answered. A follower taking
+    /// a snapshot chunk by chunk answers nothing else for the length of the
+    /// transfer, and without this it would read as unreachable to the quorum
+    /// check the moment it became a voter
+    pub fn note_peer_contact(&mut self, peer: NodeId, now: Instant) {
+        let Some(leader) = self.state.leader.as_mut() else {
+            return;
+        };
+        if let Some(i) = leader.pos(peer) {
+            leader.last_contact[i] = now;
+        }
+    }
+
+    /// Releases a follower held for a batch read back from the log file,
+    /// once that batch has been handed to the transport or given up on
+    pub fn finish_page_in(&mut self, peer: NodeId) {
+        let Some(leader) = self.state.leader.as_mut() else {
+            return;
+        };
+        if let Some(i) = leader.pos(peer) {
+            leader.page_in_flight[i] = false;
+        }
+    }
+
     pub fn finish_snapshot_transfer(&mut self, peer: NodeId, delivered_through: Option<u64>) {
         let Some(leader) = self.state.leader.as_mut() else {
             return;
@@ -938,6 +1207,9 @@ impl RaftConsensus {
             leader.next_index[i] = leader.match_index[i] + 1;
         }
         leader.inflight[i] = 0;
+        // The snapshot said nothing about the log past it, so the first
+        // append after it is a probe
+        leader.probing[i] = true;
     }
 
     /// Recomputes how far a majority has reached, and moves the commit index
@@ -1387,6 +1659,31 @@ impl RaftConsensus {
     }
 }
 
+/// How many entries a follower whose next index is `next` has yet to be sent
+#[inline]
+fn entries_pending(next: u64, log_last: u64) -> u64 {
+    if next <= log_last {
+        log_last + 1 - next
+    } else {
+        0
+    }
+}
+
+/// Whether a message carrying `pending` entries may go out to a follower
+/// with `inflight` messages unanswered.
+///
+/// A full batch goes out up to the pipeline depth, because what bounds it is
+/// bandwidth. A partial one goes out only inside the smaller window for
+/// partial batches. Past that window the entries wait for a reply to free a
+/// slot or for enough of them to fill a batch, so under load the pipeline
+/// carries batches rather than a message per proposal
+#[inline]
+fn send_window_open(config: &RaftConfig, inflight: u32, pending: u64) -> bool {
+    let depth = config.max_inflight_appends as u32;
+    let partial = (config.max_inflight_partial_appends as u32).min(depth);
+    inflight < depth && (inflight < partial || pending >= config.max_batch_entries as u64)
+}
+
 /// Folds one configuration entry into a membership
 fn apply_config_command(membership: &mut Membership, command: &RaftCommand) {
     match command {
@@ -1486,6 +1783,79 @@ mod tests {
     }
 
     #[test]
+    fn a_leader_hands_the_group_to_its_most_current_voter() {
+        let now = Instant::now();
+        let mut leader = node(1, &[1, 2, 3], now);
+        elect(&mut leader.core, &[2, 3], now);
+        wait_durable(&leader.core);
+        assert_eq!(leader.core.role(), RaftRole::Leader);
+        let term = leader.core.term();
+        let last = leader.core.last_log_index();
+
+        // Follower 3 has confirmed everything, follower 2 nothing yet
+        leader
+            .core
+            .handle_append_reply(
+                &AppendEntriesReply {
+                    term,
+                    success: true,
+                    match_index: last,
+                    hint_index: 0,
+                    read_round: 0,
+                    follower_id: 3,
+                },
+                now,
+            )
+            .expect("append reply");
+        assert_eq!(leader.core.transfer_target(), Some(3));
+        assert!(leader.core.peer_caught_up(3));
+        assert!(!leader.core.peer_caught_up(2));
+
+        // A follower told to campaign raises its term and asks for real votes
+        let mut follower = node(3, &[1, 2, 3], now);
+        let (reply, requests) = follower
+            .core
+            .handle_timeout_now(
+                &crate::election::TimeoutNowRequest { term, leader_id: 1 },
+                now,
+            )
+            .expect("timeout now");
+        assert!(reply.started);
+        assert_eq!(follower.core.role(), RaftRole::Candidate);
+        assert_eq!(follower.core.term(), term + 1);
+        assert_eq!(reply.term, term + 1);
+        assert_eq!(requests.len(), 2, "one real vote request per voting peer");
+        assert!(
+            requests
+                .iter()
+                .all(|(_, r)| !r.pre_vote && r.term == term + 1)
+        );
+
+        // A stale request is declined, and so is one at a leader
+        let (stale, none) = follower
+            .core
+            .handle_timeout_now(
+                &crate::election::TimeoutNowRequest {
+                    term: 0,
+                    leader_id: 1,
+                },
+                now,
+            )
+            .expect("stale timeout now");
+        assert!(!stale.started);
+        assert!(none.is_empty());
+        let (at_leader, _) = leader
+            .core
+            .handle_timeout_now(
+                &crate::election::TimeoutNowRequest { term, leader_id: 2 },
+                now,
+            )
+            .expect("timeout now at a leader");
+        assert!(!at_leader.started);
+        assert_eq!(leader.core.role(), RaftRole::Leader);
+    }
+
+    #[test]
     fn a_lone_voter_takes_the_group_without_asking() {
         let now = Instant::now();
         let mut n = node(1, &[1], now);
@@ -1559,6 +1929,7 @@ mod tests {
                     last_log_index: 0,
                     last_log_term: 0,
                     pre_vote: true,
+                    transfer: false,
                 },
                 now + Duration::from_millis(10),
             )
@@ -1566,6 +1937,51 @@ mod tests {
         assert!(!reply.vote_granted);
         // And the voter's term did not move for a pre-vote
         assert_eq!(n.core.term(), 5);
+    }
+
+    #[test]
+    fn a_voter_refuses_a_real_vote_while_it_can_hear_a_leader_unless_the_leader_asked() {
+        let now = Instant::now();
+        let mut n = node(2, &[1, 2, 3], now);
+        n.core
+            .handle_append_entries(
+                &AppendEntriesRequest {
+                    term: 5,
+                    leader_id: 1,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                    read_round: 1,
+                },
+                now,
+            )
+            .expect("heartbeat");
+        let mut req = RequestVoteRequest {
+            term: 6,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+            pre_vote: false,
+            transfer: false,
+        };
+        let reply = n
+            .core
+            .handle_request_vote(&req, now + Duration::from_millis(10))
+            .expect("vote");
+        assert!(!reply.vote_granted);
+        // The term did not move either, so a candidate outside the group
+        // cannot depose a leader this node still hears
+        assert_eq!(n.core.term(), 5);
+
+        // The leader's own hand-off is granted at once
+        req.transfer = true;
+        let reply = n
+            .core
+            .handle_request_vote(&req, now + Duration::from_millis(10))
+            .expect("vote");
+        assert!(reply.vote_granted);
+        assert_eq!(n.core.term(), 6);
     }
 
     #[test]
@@ -1595,6 +2011,7 @@ mod tests {
                     last_log_index: 0,
                     last_log_term: 0,
                     pre_vote: true,
+                    transfer: false,
                 },
                 now + Duration::from_millis(500),
             )
@@ -1634,6 +2051,7 @@ mod tests {
                     last_log_index: 2,
                     last_log_term: 4,
                     pre_vote: false,
+                    transfer: false,
                 },
                 now + Duration::from_millis(500),
             )
@@ -1653,6 +2071,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
             pre_vote: false,
+            transfer: false,
         };
         assert!(
             n.core
@@ -2083,6 +2502,85 @@ mod tests {
         assert_eq!(n.core.metrics.read_index_leases_used, 1);
     }
 
+    /// A commit index is owed the moment a follower has confirmed entries it
+    /// has not been told are committed, whatever is in flight to it. A
+    /// message attaches at what the follower had confirmed when it was
+    /// built, so one built before that confirmation lets the follower commit
+    /// no further than that and leaves the rest owed. Nothing else is due to
+    /// the follower until its heartbeat timer, so a linearizable read
+    /// against it would wait out the whole heartbeat interval otherwise
+    #[test]
+    fn a_follower_is_owed_the_commit_index_for_what_it_has_confirmed() {
+        let now = Instant::now();
+        let mut n = node(1, &[1, 2, 3], now);
+        elect(&mut n.core, &[2, 3], now);
+        wait_durable(&n.core);
+        let noop = n.core.last_log_index();
+        let reply = |core: &mut RaftConsensus, follower: NodeId, at: Instant| {
+            core.handle_append_reply(
+                &AppendEntriesReply {
+                    term: core.term(),
+                    success: true,
+                    match_index: noop,
+                    hint_index: 0,
+                    read_round: 0,
+                    follower_id: follower,
+                },
+                at,
+            )
+            .expect("reply");
+        };
+
+        // The no-op goes out to both followers, built while commit is still 0
+        let PeerWork::Append(first) = n.core.build_peer_work(2, now).expect("work") else {
+            panic!("expected an append carrying the no-op");
+        };
+        assert!(!first.entries.is_empty());
+        let PeerWork::Append(_) = n.core.build_peer_work(3, now).expect("work") else {
+            panic!("expected an append carrying the no-op");
+        };
+
+        // Follower 3 confirms first and the no-op commits. Follower 2 has
+        // confirmed nothing yet, so there is nothing it could act on, and a
+        // heartbeat built for it now attaches at index zero
+        reply(&mut n.core, 3, now);
+        assert_eq!(n.core.commit_index(), noop);
+        assert!(
+            !n.core.peer_owes_commit(2),
+            "nothing confirmed, nothing actionable"
+        );
+        let heartbeat_at = now + n.core.config.heartbeat_interval + Duration::from_millis(1);
+        let PeerWork::Append(early) = n.core.build_peer_work(2, heartbeat_at).expect("work") else {
+            panic!("expected a heartbeat");
+        };
+        assert!(early.entries.is_empty());
+        assert_eq!(early.prev_log_index, 0);
+        assert_eq!(early.leader_commit, noop);
+
+        // Follower 2 confirms the no-op. The heartbeat that went out let it
+        // commit nothing past index zero, so the commit index is owed now,
+        // with that heartbeat still unanswered
+        reply(&mut n.core, 2, heartbeat_at);
+        assert!(
+            n.core.peer_owes_commit(2),
+            "confirmed the entry, never told it committed"
+        );
+        let PeerWork::Append(carrier) = n.core.build_peer_work(2, heartbeat_at).expect("work")
+        else {
+            panic!("expected a commit carrier");
+        };
+        assert!(carrier.entries.is_empty());
+        assert_eq!(carrier.prev_log_index, noop);
+        assert_eq!(carrier.leader_commit, noop);
+
+        // The carrier settles the debt and nothing more is due
+        assert!(!n.core.peer_owes_commit(2));
+        assert!(matches!(
+            n.core.build_peer_work(2, heartbeat_at).expect("work"),
+            PeerWork::Idle
+        ));
+    }
+
     #[test]
     fn a_follower_answers_a_read_with_a_redirect() {
         let now = Instant::now();
@@ -2166,6 +2664,239 @@ mod tests {
         assert!(n.core.membership().contains(4));
     }
 
+    /// Under load a pipeline that sends every proposal the moment a slot is
+    /// free fills with messages of a few entries each. Past the window for
+    /// partial batches a follower is sent a full batch or nothing until a
+    /// reply frees a slot, and a commit index the follower is owed waits for
+    /// the entries that are about to carry it rather than costing a message
+    #[test]
+    fn partial_batches_stop_at_their_window_and_full_ones_do_not() {
+        let now = Instant::now();
+        let mut n = node(1, &[1, 2, 3], now);
+        n.core.config.max_batch_entries = 10;
+        n.core.config.max_inflight_appends = 16;
+        n.core.config.max_inflight_partial_appends = 2;
+        elect(&mut n.core, &[2, 3], now);
+        let noop = n.core.last_log_index();
+        let build = |core: &mut RaftConsensus, peer: NodeId| match core
+            .build_peer_work(peer, now)
+            .expect("work")
+        {
+            PeerWork::Append(request) => Some(request),
+            PeerWork::Idle => None,
+            PeerWork::AppendPaged { .. } => panic!("no page-in expected"),
+            PeerWork::Snapshot => panic!("no snapshot expected"),
+        };
+        let reply = |core: &mut RaftConsensus, follower: NodeId, match_index: u64| {
+            core.handle_append_reply(
+                &AppendEntriesReply {
+                    term: core.term(),
+                    success: true,
+                    match_index,
+                    hint_index: 0,
+                    read_round: 0,
+                    follower_id: follower,
+                },
+                now,
+            )
+            .expect("reply");
+        };
+
+        // The no-op is the first message, a probe that both followers
+        // answer, which opens the pipeline to them. Follower 3 is kept in
+        // step so the room check answers for 2
+        let first = build(&mut n.core, 2).expect("the no-op goes out");
+        assert_eq!(first.entries.len(), 1);
+        build(&mut n.core, 3).expect("the no-op goes to the other follower");
+        wait_durable(&n.core);
+        reply(&mut n.core, 2, noop);
+        reply(&mut n.core, 3, noop);
+        assert_eq!(n.core.commit_index(), noop);
+
+        // Two partial batches fill the window
+        for _ in 0..3 {
+            n.core.propose(RaftCommand::Noop).expect("propose");
+        }
+        let second = build(&mut n.core, 2).expect("a partial batch is inside the window");
+        assert_eq!(second.entries.len(), 3);
+        build(&mut n.core, 3).expect("the same batch goes to the other follower");
+        for _ in 0..3 {
+            n.core.propose(RaftCommand::Noop).expect("propose");
+        }
+        let third = build(&mut n.core, 2).expect("a second partial batch is inside the window");
+        assert_eq!(third.entries.len(), 3);
+        build(&mut n.core, 3).expect("and to the other follower");
+
+        // A third partial batch waits, and does not wake the replicator
+        for _ in 0..3 {
+            n.core.propose(RaftCommand::Noop).expect("propose");
+        }
+        assert!(build(&mut n.core, 2).is_none());
+        assert!(build(&mut n.core, 3).is_none());
+        assert!(!n.core.replication_has_room(now));
+
+        // A full batch goes out past the window
+        for _ in 0..7 {
+            n.core.propose(RaftCommand::Noop).expect("propose");
+        }
+        assert!(n.core.replication_has_room(now));
+        let full = build(&mut n.core, 2).expect("a full batch goes out");
+        assert_eq!(full.entries.len(), 10);
+        build(&mut n.core, 3).expect("and to the other follower");
+        assert!(!n.core.replication_has_room(now));
+
+        // Two more are pending behind three in flight. The commit index
+        // moves, follower 2 is owed it, and still nothing goes out on its
+        // own because the entries about to go carry it
+        for _ in 0..2 {
+            n.core.propose(RaftCommand::Noop).expect("propose");
+        }
+        wait_durable(&n.core);
+        reply(&mut n.core, 3, noop + 16);
+        reply(&mut n.core, 2, noop + 3);
+        assert_eq!(n.core.commit_index(), noop + 16);
+        assert!(n.core.peer_owes_commit(2));
+        assert!(build(&mut n.core, 2).is_none());
+        assert!(!n.core.replication_has_room(now));
+
+        // That reply left two in flight, which is still the window. The
+        // next one frees a slot, the replicator is worth waking, and the
+        // pending entries go out with the commit index
+        reply(&mut n.core, 2, noop + 6);
+        assert!(n.core.replication_has_room(now));
+        let after = build(&mut n.core, 2).expect("a freed slot sends what is pending");
+        assert_eq!(after.entries.len(), 2);
+        assert_eq!(after.leader_commit, noop + 16);
+        assert!(!n.core.peer_owes_commit(2));
+    }
+
+    /// A follower whose position is unconfirmed is sent entries one message
+    /// at a time. A wrong guess then costs one refusal, and a follower that
+    /// cannot be reached costs one batch per heartbeat interval rather than
+    /// one per proposal, which for a follower that is down and behind by a
+    /// gigabyte is the difference between a leader that carries on and one
+    /// that rebuilds a megabyte on every write
+    #[test]
+    fn an_unconfirmed_follower_is_probed_one_message_at_a_time() {
+        let now = Instant::now();
+        let mut n = node(1, &[1, 2, 3], now);
+        n.core.config.max_batch_entries = 2;
+        n.core.config.max_inflight_appends = 4;
+        n.core.config.max_inflight_partial_appends = 4;
+        elect(&mut n.core, &[2, 3], now);
+        let noop = n.core.last_log_index();
+        for _ in 0..11 {
+            n.core.propose(RaftCommand::Noop).expect("propose");
+        }
+        let build = |core: &mut RaftConsensus, at: Instant| match core
+            .build_peer_work(2, at)
+            .expect("work")
+        {
+            PeerWork::Append(request) => Some(request),
+            PeerWork::Idle => None,
+            PeerWork::AppendPaged { .. } => panic!("no page-in expected"),
+            PeerWork::Snapshot => panic!("no snapshot expected"),
+        };
+        let answer = |core: &mut RaftConsensus, success: bool, match_index: u64, hint: u64| {
+            core.handle_append_reply(
+                &AppendEntriesReply {
+                    term: core.term(),
+                    success,
+                    match_index,
+                    hint_index: hint,
+                    read_round: 0,
+                    follower_id: 2,
+                },
+                now,
+            )
+            .expect("reply");
+        };
+
+        // After the election one batch goes out and nothing follows it
+        // until the follower has answered. Follower 3 gets its probe too, so
+        // the room check answers for 2 alone
+        let probe = build(&mut n.core, now).expect("the probe goes out");
+        assert_eq!(probe.entries.len(), 2);
+        assert!(matches!(
+            n.core.build_peer_work(3, now).expect("work"),
+            PeerWork::Append(_)
+        ));
+        assert!(build(&mut n.core, now).is_none());
+        assert!(!n.core.replication_has_room(now));
+        answer(&mut n.core, true, noop + 1, 0);
+
+        // Confirmed, the pipeline fills to its depth
+        assert!(n.core.replication_has_room(now));
+        assert!(build(&mut n.core, now).is_some());
+        assert!(build(&mut n.core, now).is_some());
+        assert!(build(&mut n.core, now).is_some());
+        assert!(build(&mut n.core, now).is_some());
+        assert!(
+            build(&mut n.core, now).is_none(),
+            "the pipeline is four deep"
+        );
+
+        // A call that produced no answer puts the follower back to one
+        // message at a time, and not before a heartbeat interval has passed
+        n.core.handle_peer_unreachable(2, now);
+        assert!(build(&mut n.core, now).is_none());
+        assert!(!n.core.replication_has_room(now));
+        let retry = now + n.core.config.heartbeat_interval;
+        assert!(n.core.replication_has_room(retry));
+        let again = build(&mut n.core, retry).expect("one attempt at the retry time");
+        assert_eq!(
+            again.prev_log_index,
+            noop + 1,
+            "rebuilt from what was confirmed"
+        );
+        assert!(build(&mut n.core, retry).is_none());
+
+        // A refusal keeps the follower probing from the hint it gave
+        answer(&mut n.core, false, 0, noop + 1);
+        let from_hint = build(&mut n.core, retry).expect("one attempt from the hint");
+        assert_eq!(from_hint.prev_log_index, noop + 1);
+        assert!(build(&mut n.core, retry).is_none());
+
+        // And a confirmation opens the pipeline again
+        answer(&mut n.core, true, noop + 3, 0);
+        assert!(build(&mut n.core, retry).is_some());
+        assert!(build(&mut n.core, retry).is_some());
+    }
+
+    /// A group of two needs both members for a majority. The leader's own
+    /// durable index is one of two, and counting it as a majority would
+    /// commit entries no follower holds, which a leader failure then loses
+    #[test]
+    fn a_group_of_two_commits_on_both_members_and_not_on_the_leader_alone() {
+        let now = Instant::now();
+        let mut n = node(1, &[1, 2], now);
+        elect(&mut n.core, &[2], now);
+        assert!(n.core.is_leader());
+        wait_durable(&n.core);
+        let noop = n.core.last_log_index();
+        n.core.advance_commit();
+        assert_eq!(
+            n.core.commit_index(),
+            0,
+            "the leader alone is not a majority of two"
+        );
+
+        n.core
+            .handle_append_reply(
+                &AppendEntriesReply {
+                    term: n.core.term(),
+                    success: true,
+                    match_index: noop,
+                    hint_index: 0,
+                    read_round: 0,
+                    follower_id: 2,
+                },
+                now,
+            )
+            .expect("reply");
+        assert_eq!(n.core.commit_index(), noop);
+    }
+
     #[test]
     fn peer_work_pipelines_up_to_the_inflight_bound() {
         let now = Instant::now();
@@ -2173,9 +2904,28 @@ mod tests {
         n.core.config.max_batch_entries = 4;
         n.core.config.max_inflight_appends = 3;
         elect(&mut n.core, &[2, 3], now);
+        let noop = n.core.last_log_index();
         for _ in 0..100 {
             n.core.propose(RaftCommand::Noop).expect("propose");
         }
+        // The first batch is the probe, and its answer opens the pipeline
+        let PeerWork::Append(probe) = n.core.build_peer_work(2, now).expect("work") else {
+            panic!("expected the probe");
+        };
+        assert_eq!(probe.entries.len(), 4);
+        n.core
+            .handle_append_reply(
+                &AppendEntriesReply {
+                    term: n.core.term(),
+                    success: true,
+                    match_index: noop + 3,
+                    hint_index: 0,
+                    read_round: 0,
+                    follower_id: 2,
+                },
+                now,
+            )
+            .expect("reply");
         let mut built = 0;
         loop {
             match n.core.build_peer_work(2, now).expect("work") {
@@ -2191,7 +2941,7 @@ mod tests {
                 break;
             }
         }
-        // The first send is allowed by the heartbeat, the rest by the pipeline
+        // The pipeline fills to its bound and no further
         assert_eq!(built, 3);
     }
 

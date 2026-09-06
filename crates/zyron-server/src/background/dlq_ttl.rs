@@ -6,7 +6,7 @@
 // -----------------------------------------------------------------------------
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const DEFAULT_INTERVAL_SECS: u64 = 86400;
@@ -16,6 +16,7 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 86400;
 /// stays generic over the DLQ backend.
 pub async fn dlq_ttl_loop<F>(
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_secs: u64,
     ttl_days: u32,
     mut on_tick: F,
@@ -23,11 +24,7 @@ pub async fn dlq_ttl_loop<F>(
     F: FnMut(u64) + Send + 'static,
 {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(3600)));
-    loop {
-        ticker.tick().await;
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         let cutoff = current_secs().saturating_sub(ttl_days as u64 * 86400);
         on_tick(cutoff);
     }

@@ -4171,6 +4171,8 @@ fn append_lake_batches(
     // through a scratch buffer reused across every cell instead of one
     // allocation per cell
     let rows: usize = batches.iter().map(|b| b.num_rows).sum();
+    let materialize =
+        zyron_common::profile::scope(zyron_common::profile::Phase::ExecLakeMaterialize);
     let mut columns: Vec<zyron_lake::ColumnData> = table_entry
         .columns
         .iter()
@@ -4219,6 +4221,7 @@ fn append_lake_batches(
             None => columns.push(computed),
         }
     }
+    drop(materialize);
     let paths = zyron_lake::LakePaths::new(ctx.disk_manager.data_dir(), table_entry.id.0);
     // The branch this session writes, forked here if it has not touched
     // this table yet. Uniqueness reads the same head, so a key the branch
@@ -4226,7 +4229,10 @@ fn append_lake_batches(
     let head = crate::operator::lake_scan::effective_head(ctx, None);
     let log = crate::operator::lake_scan::open_lake_write_head(&paths, &table_entry.name, head)?;
     let root = log.registry_key();
+    let unique_probe =
+        zyron_common::profile::scope(zyron_common::profile::Phase::ExecLakeUniqueProbe);
     let probe = enforce_lake_unique(&log, table_entry, &columns, None)?;
+    drop(unique_probe);
     let timestamp_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -4248,7 +4254,9 @@ fn append_lake_batches(
         // statement timeout, which waits as before
         deadline: ctx.deadline(),
     };
+    let append = zyron_common::profile::scope(zyron_common::profile::Phase::ExecLakeAppend);
     let out = zyron_lake::append_rows(&log, attempt, table_entry.id.0 as u64, &columns)?;
+    drop(append);
     zyron_lake::register_txn_pending(
         ctx.disk_manager.data_dir(),
         ctx.lake_txn_id(),

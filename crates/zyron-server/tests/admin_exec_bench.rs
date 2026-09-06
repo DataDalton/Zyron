@@ -377,6 +377,7 @@ async fn start_admin_server(
     let metrics = Arc::new(MetricsRegistry::new(
         session_mgr,
         Arc::new(zyron_common::LabeledMetrics::new()),
+        Arc::new(zyron_common::QueryMetrics::new()),
     ));
     let health_state = Arc::new(HealthState::new(metrics, "/metrics"));
     let executor = Arc::new(AdminExecutor::new(

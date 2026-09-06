@@ -447,8 +447,9 @@ impl<'a> PhysicalPlanner<'a> {
         // offset skips still has to arrive, so the peer is asked for
         // both
         if let Some(rows) = limit {
-            let cap = (rows as usize).saturating_add(offset.unwrap_or(0) as usize);
-            push_limit_to_foreign_scan(&mut child_plan, cap);
+            let cap = rows.saturating_add(offset.unwrap_or(0));
+            push_limit_to_foreign_scan(&mut child_plan, cap as usize);
+            push_limit_to_sort(&mut child_plan, cap);
         }
         let rows = limit
             .map(|l| (l as f64).min(child_plan.cost().row_count))
@@ -1468,9 +1469,11 @@ impl<'a> PhysicalPlanner<'a> {
                 };
                 // Lower once here so the operator prunes with it instead of
                 // repeating the work, and EXPLAIN can say whether the filter
-                // skips files at all
+                // skips files at all. A conjunct with no lake form is
+                // dropped rather than refusing the whole predicate, which
+                // leaves the pruning the rest of it buys
                 let lowered = predicate.as_ref().and_then(|p| {
-                    crate::lake_predicate::lower_predicate(p, &te.columns, &te.cluster.derived)
+                    crate::lake_predicate::lower_scan_predicate(p, &te.columns, &te.cluster.derived)
                 });
                 let cluster_fit = lake_cluster_fit(&te, lowered.as_ref());
                 let bloom_redundant = lake_redundant_blooms(&te);
@@ -1920,13 +1923,23 @@ impl<'a> PhysicalPlanner<'a> {
     // -----------------------------------------------------------------------
 
     /// Maps a set of ungrouped aggregates to metadata-pushdown specs, or
-    /// None if any aggregate is not metadata-answerable. MIN/MAX require a
-    /// fixed-width column (a variable-length header stores only a truncated
-    /// byte prefix, which is not an exact extremum). DISTINCT disqualifies.
+    /// None if any aggregate is not metadata-answerable. DISTINCT
+    /// disqualifies.
+    ///
+    /// `exact_varlen_bounds` says whether the tier's recorded extremes are
+    /// whole values. A columnar segment header keeps a truncated byte
+    /// prefix, which is not an exact extremum, so MIN and MAX there are
+    /// restricted to fixed-width columns. The lake manifest keeps the cell
+    /// itself and has no such limit.
+    ///
+    /// `sums_recorded` says whether the tier records a per-file total.
+    /// The lake manifest does, a segment header does not
     fn try_meta_agg_specs(
         &self,
         table_id: zyron_catalog::TableId,
         aggregates: &[crate::logical::AggregateExpr],
+        exact_varlen_bounds: bool,
+        sums_recorded: bool,
     ) -> Option<Vec<crate::physical::MetaAggSpec>> {
         if aggregates.is_empty() {
             return None;
@@ -1949,15 +1962,26 @@ impl<'a> PhysicalPlanner<'a> {
                 "min" | "max" => {
                     let c = a.args.first().and_then(extract_column_id_from_expr)?;
                     let ce = te.columns.iter().find(|x| x.id == c)?;
-                    // Fixed-width only: a var-len header min/max is a
-                    // truncated prefix, not the exact value.
-                    ce.physical_type_id().fixed_size()?;
+                    if !exact_varlen_bounds {
+                        ce.physical_type_id().fixed_size()?;
+                    }
                     let k = if fname == "min" {
                         crate::physical::MetaAggKind::Min
                     } else {
                         crate::physical::MetaAggKind::Max
                     };
                     (k, Some(c))
+                }
+                "sum" if sums_recorded => {
+                    let c = a.args.first().and_then(extract_column_id_from_expr)?;
+                    let ce = te.columns.iter().find(|x| x.id == c)?;
+                    // Only a type whose values add exactly, so the fold
+                    // over per-file totals is the answer a fold over rows
+                    // would have reached
+                    if !zyron_lake::sums_exactly(ce.physical_type_id()) {
+                        return None;
+                    }
+                    (crate::physical::MetaAggKind::Sum, Some(c))
                 }
                 _ => return None,
             };
@@ -1971,6 +1995,25 @@ impl<'a> PhysicalPlanner<'a> {
         Some(specs)
     }
 
+    /// The output schema one aggregate row carries, named by the specs it
+    /// was built from
+    fn meta_agg_schema(
+        specs: &[crate::physical::MetaAggSpec],
+    ) -> Vec<crate::logical::LogicalColumn> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::logical::LogicalColumn {
+                table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
+                column_id: zyron_catalog::ColumnId(i as u16),
+                name: s.name.clone(),
+                type_id: s.return_type,
+                nullable: true,
+                fractional_digits: None,
+            })
+            .collect()
+    }
+
     fn plan_aggregate(
         &self,
         group_by: Vec<BoundExpr>,
@@ -1980,41 +2023,59 @@ impl<'a> PhysicalPlanner<'a> {
         let child_plan = self.plan(child)?;
         let child_cost = *child_plan.cost();
 
-        // Metadata aggregate pushdown: ungrouped MIN/MAX/COUNT over a table
-        // with columnar segments and no predicate can be answered from
-        // segment headers (with an MVCC patch guard at execution) instead of
-        // decoding the folded rows.
-        if group_by.is_empty()
-            && let PhysicalPlan::HybridScan {
-                table_id,
-                predicate: None,
-                ..
-            } = &child_plan
-        {
-            let tid = *table_id;
-            if let Some(specs) = self.try_meta_agg_specs(tid, &aggregates) {
-                let schema: Vec<crate::logical::LogicalColumn> = specs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| crate::logical::LogicalColumn {
-                        table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
-                        column_id: zyron_catalog::ColumnId(i as u16),
-                        name: s.name.clone(),
-                        type_id: s.return_type,
-                        nullable: true,
-                        fractional_digits: None,
-                    })
-                    .collect();
-                return Ok(PhysicalPlan::ColumnarMetadataAggregate {
-                    table_id: tid,
-                    specs,
-                    schema,
-                    cost: PlanCost {
-                        io_cost: 1.0,
-                        cpu_cost: 1.0,
-                        row_count: 1.0,
-                    },
-                });
+        // Metadata aggregate pushdown: an ungrouped aggregate over a table
+        // with no predicate is answered from the statistics the format
+        // already keeps, instead of decoding the rows. Both tiers guard at
+        // execution against the files their statistics do not describe, a
+        // patched segment on one and a file under a delete predicate on the
+        // other, so the pushdown is not a claim that the table is clean.
+        //
+        // The lake carries the wider set because its manifest records a per
+        // file total and whole extremes, so SUM joins MIN, MAX and the
+        // counts, and none of it opens a file
+        if group_by.is_empty() {
+            match &child_plan {
+                PhysicalPlan::LakeScan {
+                    table_id,
+                    predicate: None,
+                    as_of,
+                    ..
+                } => {
+                    let tid = *table_id;
+                    if let Some(specs) = self.try_meta_agg_specs(tid, &aggregates, true, true) {
+                        return Ok(PhysicalPlan::LakeMetadataAggregate {
+                            table_id: tid,
+                            schema: Self::meta_agg_schema(&specs),
+                            specs,
+                            as_of: as_of.clone(),
+                            cost: PlanCost {
+                                io_cost: 1.0,
+                                cpu_cost: 1.0,
+                                row_count: 1.0,
+                            },
+                        });
+                    }
+                }
+                PhysicalPlan::HybridScan {
+                    table_id,
+                    predicate: None,
+                    ..
+                } => {
+                    let tid = *table_id;
+                    if let Some(specs) = self.try_meta_agg_specs(tid, &aggregates, false, false) {
+                        return Ok(PhysicalPlan::ColumnarMetadataAggregate {
+                            table_id: tid,
+                            schema: Self::meta_agg_schema(&specs),
+                            specs,
+                            cost: PlanCost {
+                                io_cost: 1.0,
+                                cpu_cost: 1.0,
+                                row_count: 1.0,
+                            },
+                        });
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -2664,6 +2725,26 @@ fn push_limit_to_foreign_scan(plan: &mut PhysicalPlan, cap: usize) {
             }
         }
         PhysicalPlan::Project { child, .. } => push_limit_to_foreign_scan(child, cap),
+        _ => {}
+    }
+}
+
+/// Carries a LIMIT's row cap down to the sort beneath it, so the sort keeps
+/// only the rows the cap can use instead of ordering every row for the
+/// Limit above to discard most of them.
+///
+/// It descends through Project alone, for the reason the foreign scan
+/// pushdown does: anything between the cap and the sort that drops or
+/// reorders rows would leave the sort keeping the wrong ones. `cap` is
+/// offset plus limit, since the rows the offset skips are still the first
+/// the sort has to produce. The enclosing Limit applies unchanged either
+/// way, so this only ever removes work
+fn push_limit_to_sort(plan: &mut PhysicalPlan, cap: u64) {
+    match plan {
+        PhysicalPlan::Sort { limit, .. } => {
+            *limit = Some(limit.map_or(cap, |existing| existing.min(cap)));
+        }
+        PhysicalPlan::Project { child, .. } => push_limit_to_sort(child, cap),
         _ => {}
     }
 }

@@ -41,8 +41,8 @@ use zyron_pressure::provisioner::{
 
 use crate::pool::WarmPool;
 use crate::rpc::{
-    BeginDrainRequest, DrainStatusRequest, HotSetManifestRequest, MeshRpc, MeshRpcError, NodeRef,
-    PrefetchRequest,
+    BeginDrainRequest, DrainStatus, DrainStatusRequest, HotSetManifestRequest, MeshRpc,
+    MeshRpcError, NodeRef, PrefetchRequest,
 };
 
 /// How often a drain is polled while it finishes.
@@ -115,8 +115,84 @@ impl MeshScheduler {
         &self.pool
     }
 
+    /// The transport this scheduler speaks through, so the upgrade driver
+    /// reaches the same nodes through the same address book
+    pub fn rpc(&self) -> Arc<dyn MeshRpc> {
+        Arc::clone(&self.rpc)
+    }
+
+    /// A sequence for a call made on this scheduler's behalf
+    pub fn next_call_sequence(&self) -> u64 {
+        self.next_sequence()
+    }
+
     fn next_sequence(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Drains one node and hands its working set to the survivors, without
+    /// taking the node away.
+    ///
+    /// What a restart needs, and the first half of a scale-in. The deadline
+    /// covers the drain. Returns where the drain stood when it finished or
+    /// when the deadline ran out, and whether anything was handed over
+    pub async fn drain_for_restart(
+        &self,
+        node: &NodeRef,
+        survivors: &[NodeRef],
+        deadline: Duration,
+    ) -> Result<(DrainStatus, bool), MeshRpcError> {
+        self.stats.drains_started.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.next_sequence();
+
+        let mut status = self
+            .rpc
+            .begin_drain(BeginDrainRequest {
+                target: node.clone(),
+                sequence,
+                deadline_ms: deadline.as_millis().min(u32::MAX as u128) as u32,
+                relocate_sessions: !survivors.is_empty(),
+            })
+            .await?;
+        tracing::info!(
+            node = %node.name,
+            in_flight = status.queries_in_flight,
+            "node is draining"
+        );
+
+        // The handover runs while the node is still serving, so a survivor is
+        // reading those pages from storage at the same time the departing node
+        // is answering from memory
+        let handed_over = self.hand_over_hot_set(node, survivors).await?;
+
+        let started = std::time::Instant::now();
+        while !status.drained {
+            if started.elapsed() >= deadline {
+                tracing::warn!(
+                    node = %node.name,
+                    in_flight = status.queries_in_flight,
+                    "drain did not finish inside its deadline"
+                );
+                return Ok((status, handed_over));
+            }
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+            match self
+                .rpc
+                .drain_status(DrainStatusRequest {
+                    target: node.clone(),
+                    sequence,
+                })
+                .await
+            {
+                Ok(next) => status = next,
+                // A node that blinks mid-drain is still draining. Only a
+                // refusal ends the attempt, because a refusal will not change
+                Err(e) if e.transient() => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.stats.drains_completed.fetch_add(1, Ordering::Relaxed);
+        Ok((status, handed_over))
     }
 
     /// The driver this deployment's registration mode selects.
@@ -206,59 +282,13 @@ impl MeshScheduler {
         survivors: &[NodeRef],
         deadline: Duration,
     ) -> Result<DrainOutcome, MeshRpcError> {
-        self.stats.drains_started.fetch_add(1, Ordering::Relaxed);
-        let sequence = self.next_sequence();
-
-        let mut status = self
-            .rpc
-            .begin_drain(BeginDrainRequest {
-                target: node.clone(),
-                sequence,
-                deadline_ms: deadline.as_millis().min(u32::MAX as u128) as u32,
-                relocate_sessions: !survivors.is_empty(),
-            })
-            .await?;
-        tracing::info!(
-            node = %node.name,
-            in_flight = status.queries_in_flight,
-            "node is draining"
-        );
-
-        // The handover runs while the node is still serving, so a survivor is
-        // reading those pages from storage at the same time the departing node
-        // is answering from memory
-        let handed_over = self.hand_over_hot_set(&node, survivors).await?;
-
-        let started = std::time::Instant::now();
-        while !status.drained {
-            if started.elapsed() >= deadline {
-                tracing::warn!(
-                    node = %node.name,
-                    in_flight = status.queries_in_flight,
-                    "drain did not finish inside its deadline"
-                );
-                return Ok(DrainOutcome::StillBusy {
-                    node,
-                    in_flight: status.queries_in_flight,
-                });
-            }
-            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-            match self
-                .rpc
-                .drain_status(DrainStatusRequest {
-                    target: node.clone(),
-                    sequence,
-                })
-                .await
-            {
-                Ok(next) => status = next,
-                // A node that blinks mid-drain is still draining. Only a
-                // refusal ends the attempt, because a refusal will not change
-                Err(e) if e.transient() => continue,
-                Err(e) => return Err(e),
-            }
+        let (status, handed_over) = self.drain_for_restart(&node, survivors, deadline).await?;
+        if !status.drained {
+            return Ok(DrainOutcome::StillBusy {
+                node,
+                in_flight: status.queries_in_flight,
+            });
         }
-        self.stats.drains_completed.fetch_add(1, Ordering::Relaxed);
 
         let driver = self.driver();
         let request = ReclaimRequest {
@@ -389,8 +419,9 @@ impl MeshScheduler {
 mod tests {
     use super::*;
     use crate::rpc::{
-        CancelProvisioningRequest, DrainStatus, HotSetChunk, MeshFuture, PrefetchStatus,
-        RelocateSessionRequest, RelocationOutcome,
+        CancelProvisioningRequest, HotSetChunk, MeshFuture, NodeAck, NodeStatus, NodeStatusRequest,
+        PrefetchStatus, RelocateSessionRequest, RelocationOutcome, RestartRequest, RollbackRequest,
+        SetClusterSettingRequest, StageReleaseRequest,
     };
     use std::sync::Mutex;
 
@@ -463,6 +494,68 @@ mod tests {
         }
         fn cancel_provisioning(&self, _r: CancelProvisioningRequest) -> MeshFuture<'_, ()> {
             Box::pin(async move { Ok(()) })
+        }
+        fn node_status(&self, r: NodeStatusRequest) -> MeshFuture<'_, NodeStatus> {
+            Box::pin(async move {
+                let drain = self.next_drain();
+                Ok(NodeStatus {
+                    target: r.target,
+                    sequence: r.sequence,
+                    version: "0.12.0".into(),
+                    staged_version: String::new(),
+                    draining: !drain.drained,
+                    accepting: drain.drained,
+                    queries_in_flight: drain.queries_in_flight,
+                    sessions_attached: drain.sessions_attached,
+                    transactions_open: drain.transactions_open,
+                    p50_latency_us: 0,
+                    p99_latency_us: 0,
+                    throughput_milli_per_sec: 0,
+                    error_rate_ppm: 0,
+                    queries_in_window: 0,
+                    uptime_secs: 0,
+                })
+            })
+        }
+        fn stage_release(&self, r: StageReleaseRequest) -> MeshFuture<'_, NodeAck> {
+            Box::pin(async move {
+                Ok(NodeAck {
+                    target: r.target,
+                    sequence: r.sequence,
+                    accepted: true,
+                    detail: String::new(),
+                })
+            })
+        }
+        fn set_cluster_setting(&self, r: SetClusterSettingRequest) -> MeshFuture<'_, NodeAck> {
+            Box::pin(async move {
+                Ok(NodeAck {
+                    target: r.target,
+                    sequence: r.sequence,
+                    accepted: true,
+                    detail: String::new(),
+                })
+            })
+        }
+        fn restart_into_staged(&self, r: RestartRequest) -> MeshFuture<'_, NodeAck> {
+            Box::pin(async move {
+                Ok(NodeAck {
+                    target: r.target,
+                    sequence: r.sequence,
+                    accepted: true,
+                    detail: String::new(),
+                })
+            })
+        }
+        fn rollback_to_previous(&self, r: RollbackRequest) -> MeshFuture<'_, NodeAck> {
+            Box::pin(async move {
+                Ok(NodeAck {
+                    target: r.target,
+                    sequence: r.sequence,
+                    accepted: true,
+                    detail: String::new(),
+                })
+            })
         }
     }
 

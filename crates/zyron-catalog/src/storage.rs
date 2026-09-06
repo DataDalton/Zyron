@@ -133,6 +133,26 @@ pub trait CatalogStorage: Send + Sync {
         None
     }
 
+    /// Every row of one registered catalog table as its stored bytes, for
+    /// the schema migration runner. The table is named the way the catalog
+    /// schema registry names it. A storage that holds no rows for that
+    /// table answers with an error naming it rather than an empty table,
+    /// so a migration never records a table as moved when nothing was read
+    async fn raw_rows(&self, catalog_table: &str) -> Result<Vec<Vec<u8>>> {
+        Err(ZyronError::Internal(format!(
+            "this catalog storage holds no rows for {catalog_table}"
+        )))
+    }
+
+    /// Replaces every row of one registered catalog table with the given
+    /// bytes, which the schema migration runner does after moving them
+    async fn replace_raw_rows(&self, catalog_table: &str, rows: Vec<Vec<u8>>) -> Result<()> {
+        let _ = rows;
+        Err(ZyronError::Internal(format!(
+            "this catalog storage holds no rows for {catalog_table}"
+        )))
+    }
+
     // Database operations
     async fn load_databases(&self) -> Result<Vec<DatabaseEntry>>;
     async fn store_database(&self, entry: &DatabaseEntry) -> Result<TupleId>;
@@ -813,10 +833,86 @@ impl HeapCatalogStorage {
     }
 }
 
+impl HeapCatalogStorage {
+    /// The heap holding one registered catalog table's rows, by the
+    /// three-part name the catalog schema registry uses. None for a table
+    /// whose rows live outside these heaps
+    fn heap_for_table(&self, catalog_table: &str) -> Option<&HeapFile> {
+        let heap = match catalog_table.to_ascii_lowercase().as_str() {
+            "zyron_sys.core.databases" => &self.databases_heap,
+            "zyron_sys.core.schemas" => &self.schemas_heap,
+            "zyron_sys.core.tables" => &self.tables_heap,
+            "zyron_sys.core.columns" => &self.columns_heap,
+            "zyron_sys.storage.indexes" => &self.indexes_heap,
+            "zyron_sys.core.views" => &self.views_heap,
+            "zyron_sys.core.materialized_views" => &self.mviews_heap,
+            "zyron_sys.core.functions" => &self.functions_heap,
+            "zyron_sys.core.aggregates" => &self.aggregates_heap,
+            "zyron_sys.core.procedures" => &self.procedures_heap,
+            "zyron_sys.core.triggers" => &self.triggers_heap,
+            "zyron_sys.core.sequences" => &self.sequences_heap,
+            "zyron_sys.core.comments" => &self.comments_heap,
+            "zyron_sys.core.types" => &self.user_types_heap,
+            "zyron_sys.core.collations" => &self.collations_heap,
+            "zyron_sys.streaming.jobs" => &self.streaming_jobs_heap,
+            "zyron_sys.external_table.sources" => &self.external_sources_heap,
+            "zyron_sys.external_table.sinks" => &self.external_sinks_heap,
+            "zyron_sys.cdc.publications" => &self.publications_heap,
+            "zyron_sys.cdc.subscriptions" => &self.subscriptions_heap,
+            "zyron_sys.core.endpoints" => &self.endpoints_heap,
+            "zyron_sys.security.security_maps" => &self.security_maps_heap,
+            "zyron_sys.compliance.legal_holds" => &self.legal_holds_heap,
+            "zyron_sys.retention.policies" => &self.retention_policies_heap,
+            "zyron_sys.retention.jobs" => &self.retention_jobs_heap,
+            "zyron_sys.compliance.log" => &self.compliance_log_heap,
+            "zyron_sys.core.schedules" => &self.schedules_heap,
+            "zyron_sys.core.pipelines" => &self.pipelines_heap,
+            "zyron_sys.core.event_handlers" => &self.event_handlers_heap,
+            "zyron_sys.time_travel.version_tags" => &self.version_tags_heap,
+            "zyron_sys.search.analyzers" => &self.analyzers_heap,
+            "zyron_sys.search.synonym_dictionaries" => &self.synonym_dictionaries_heap,
+            "zyron_sys.core.resilience_policies" => &self.resilience_policies_heap,
+            _ => return None,
+        };
+        Some(heap)
+    }
+}
+
 #[async_trait]
 impl CatalogStorage for HeapCatalogStorage {
     fn data_dir(&self) -> Option<&std::path::Path> {
         Some(self.disk.data_dir())
+    }
+
+    async fn raw_rows(&self, catalog_table: &str) -> Result<Vec<Vec<u8>>> {
+        let heap = self.heap_for_table(catalog_table).ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "the catalog heaps hold no rows for {catalog_table}"
+            ))
+        })?;
+        let mut rows = Vec::new();
+        let guard = heap.scan()?;
+        guard.for_each(|_, view| rows.push(view.data.to_vec()));
+        Ok(rows)
+    }
+
+    async fn replace_raw_rows(&self, catalog_table: &str, rows: Vec<Vec<u8>>) -> Result<()> {
+        let heap = self.heap_for_table(catalog_table).ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "the catalog heaps hold no rows for {catalog_table}"
+            ))
+        })?;
+        let mut existing = Vec::new();
+        let guard = heap.scan()?;
+        guard.for_each(|tid, _| existing.push(tid));
+        drop(guard);
+        // The new rows land before the old ones go, so a crash in between
+        // leaves both sets rather than neither. The caller holds the old
+        // rows in its journal and puts them back on the next start
+        let tuples: Vec<Tuple> = rows.into_iter().map(|row| Tuple::new(row, 0)).collect();
+        heap.insert_batch(&tuples).await?;
+        heap.delete_batch(&existing).await?;
+        Ok(())
     }
 
     async fn init(&self) -> Result<()> {

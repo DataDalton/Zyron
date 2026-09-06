@@ -6,6 +6,7 @@
 //!
 //! Based on ALP (SIGMOD 2024), adapted for Zyron's columnar format.
 
+use super::unpack::Packed;
 use crate::encoding::{
     Encoding, EncodingType, Predicate, bitmask_from_rows, eval_predicate_on_raw,
 };
@@ -27,22 +28,22 @@ const FLAG_RESTART: u8 = 0x02;
 /// restart point lands on a zone boundary.
 const RESTART_MIN_SHIFT: u32 = 10;
 
-/// Encoded format:
-///   [0..8]    factor: f64 (multiply floats by this to get integers)
-///   [8..12]   exponent: i32 (power of 10 used for factor)
-///   [12..16]  exception_count: u32
-///   [16]      int_bit_width: u8 (bits per integer in main array)
-///   [17]      value_size_marker: u8 (4 = f32, 8 = f64)
-///   [18]      flags: u8 (FLAG_DELTA / FLAG_RESTART)
-///   [19]      restart shift when FLAG_RESTART is set
-///   [20..28]  base: i64 (FoR base for unsigned shift)
-///   [28..36]  delta seed: i64, present only when FLAG_DELTA is set. The
-///             running sum starts here, so every packed entry is a delta and
-///             none of them carries an absolute value that would widen the
-///             whole array
-///   after it  restart table when FLAG_RESTART is set, then the bit-packed
-///             integer array (delta+FoR if the delta flag is set)
-///   after it  exceptions: (row_index: u32 + original_value: value_size) per exception
+// Encoded format:
+//   [0..8]    factor: f64 (multiply floats by this to get integers)
+//   [8..12]   exponent: i32 (power of 10 used for factor)
+//   [12..16]  exception_count: u32
+//   [16]      int_bit_width: u8 (bits per integer in main array)
+//   [17]      value_size_marker: u8 (4 = f32, 8 = f64)
+//   [18]      flags: u8 (FLAG_DELTA / FLAG_RESTART)
+//   [19]      restart shift when FLAG_RESTART is set
+//   [20..28]  base: i64 (FoR base for unsigned shift)
+//   [28..36]  delta seed: i64, present only when FLAG_DELTA is set. The
+//             running sum starts here, so every packed entry is a delta and
+//             none of them carries an absolute value that would widen the
+//             whole array
+//   after it  restart table when FLAG_RESTART is set, then the bit-packed
+//             integer array (delta+FoR if the delta flag is set)
+//   after it  exceptions: (row_index: u32 + original_value: value_size) per exception
 
 /// Number of restart boundaries for a row count and spacing. Boundary k covers
 /// row `k << shift` counted from 1.
@@ -323,14 +324,14 @@ impl Encoding for AlpEncoding {
         Ok(out)
     }
 
-    /// Non-delta ALP addresses a row directly: the main array packs every
-    /// integer to the same width, so row i is at bit offset
+    /// Every layout answers a range without materializing the rows outside
+    /// it. Non-delta ALP addresses a row directly: the main array packs
+    /// every integer to the same width, so row i is at bit offset
     /// `i * int_bit_width`, and the exception list carries its own row
-    /// indices so only the ones inside the range are applied.
-    ///
-    /// Delta ALP is cumulative, row i being defined against row i-1, so it
-    /// seeds its running sum from the restart value at or before `start` and
-    /// replays at most one restart spacing rather than the whole prefix.
+    /// indices so only the ones inside the range are applied. Delta ALP is
+    /// cumulative, row i being defined against row i-1, so it seeds its
+    /// running sum from the restart value at or before `start` and sums at
+    /// most one restart spacing rather than the whole prefix
     fn decode_range(
         &self,
         encoded: &[u8],
@@ -343,447 +344,15 @@ impl Encoding for AlpEncoding {
         if start == end {
             return Ok(Vec::new());
         }
-        let take_default = |this: &Self| -> Result<Vec<u8>> {
-            let decoded = this.decode(encoded, row_count, value_size)?;
-            crate::encoding::slice_decoded(&decoded, row_count, value_size, start, end)
-        };
-        if encoded.len() < 28 {
-            return take_default(self);
-        }
-        let factor = f64::from_le_bytes([
-            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
-            encoded[7],
-        ]);
-        let int_bit_width = encoded[16];
-        let stored_value_size = encoded[17] as usize;
-        let flags = encoded[18];
-        // A raw fallback carries no packed array
-        if factor == 0.0 || stored_value_size != value_size {
-            return take_default(self);
-        }
-        if int_bit_width == 0 || int_bit_width > 64 {
-            return take_default(self);
-        }
-        let exception_count =
-            u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]]) as usize;
-        let base = i64::from_le_bytes([
-            encoded[20],
-            encoded[21],
-            encoded[22],
-            encoded[23],
-            encoded[24],
-            encoded[25],
-            encoded[26],
-            encoded[27],
-        ]);
-        let packed_start = packed_offset(encoded, row_count);
-        let packed_bytes = ((row_count as u64 * int_bit_width as u64) as usize).div_ceil(8);
-        let packed_end = packed_start + packed_bytes;
-        if encoded.len() < packed_end {
-            return take_default(self);
-        }
-        let packed = &encoded[packed_start..packed_end];
-        let mask: u64 = if int_bit_width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << int_bit_width) - 1
-        };
-        let inv_factor = 1.0 / factor;
-        let taken = end - start;
-        let mut out = vec![0u8; taken * value_size];
-        let write_value = |out: &mut [u8], slot: usize, int_val: i64| {
-            let value = int_val as f64 * inv_factor;
-            let at = &mut out[slot * value_size..(slot + 1) * value_size];
-            if value_size == 4 {
-                at.copy_from_slice(&(value as f32).to_le_bytes());
-            } else {
-                at.copy_from_slice(&value.to_le_bytes());
-            }
-        };
-
-        if flags & FLAG_DELTA != 0 {
-            // The running sum after row i is the undifferenced integer at row
-            // i, so a restart entry seeds it directly
-            let table = &encoded[restart_table_offset(encoded)..packed_start];
-            let shift = encoded[19] as u32;
-            let (mut running, mut row) = seed_restart(table, shift, start, delta_seed(encoded));
-            while row < start {
-                let raw =
-                    unpack_bits(packed, row as u64 * int_bit_width as u64, int_bit_width) & mask;
-                running = running.wrapping_add(raw as i64 + base);
-                row += 1;
-            }
-            while row < end {
-                let raw =
-                    unpack_bits(packed, row as u64 * int_bit_width as u64, int_bit_width) & mask;
-                running = running.wrapping_add(raw as i64 + base);
-                write_value(&mut out, row - start, running);
-                row += 1;
-            }
-            // Delta is only chosen when the column has no exceptions, so the
-            // range is complete once the stream is replayed
-            return Ok(out);
-        }
-
-        for i in 0..taken {
-            let row = start + i;
-            let raw = unpack_bits(packed, row as u64 * int_bit_width as u64, int_bit_width) & mask;
-            write_value(&mut out, i, (raw as i64).wrapping_add(base));
-        }
-
-        // Exceptions carry their own row index, so only the ones landing in
-        // the range are read back and the rest are stepped over
-        let exceptions = &encoded[packed_end..];
-        let entry_size = 4 + value_size;
-        for e in 0..exception_count {
-            let at = e * entry_size;
-            if at + entry_size > exceptions.len() {
-                return take_default(self);
-            }
-            let row = u32::from_le_bytes([
-                exceptions[at],
-                exceptions[at + 1],
-                exceptions[at + 2],
-                exceptions[at + 3],
-            ]) as usize;
-            if row < start || row >= end {
-                continue;
-            }
-            let payload = &exceptions[at + 4..at + 4 + value_size];
-            out[(row - start) * value_size..(row - start + 1) * value_size]
-                .copy_from_slice(payload);
-        }
-        Ok(out)
+        decode_alp(encoded, row_count, value_size, start, end)
     }
 
+    /// A whole column is the range of every row, so the two share one path
     fn decode(&self, encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-
-        if encoded.len() < 28 {
-            return Err(ZyronError::DecodingFailed(
-                "ALP header too short".to_string(),
-            ));
-        }
-
-        let factor = f64::from_le_bytes([
-            encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
-            encoded[7],
-        ]);
-
-        let exception_count =
-            u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]]) as usize;
-
-        let intBitWidth = encoded[16];
-        let storedValueSize = encoded[17] as usize;
-
-        if storedValueSize != value_size {
-            return Err(ZyronError::DecodingFailed(format!(
-                "ALP value_size mismatch: stored {}, expected {}",
-                storedValueSize, value_size
-            )));
-        }
-
-        // Check for raw fallback (factor == 0.0)
-        if factor == 0.0 {
-            return decode_raw_fallback(encoded, row_count, value_size);
-        }
-
-        let flags = encoded[18];
-        let useDelta = flags & FLAG_DELTA != 0;
-
-        let base = i64::from_le_bytes([
-            encoded[20],
-            encoded[21],
-            encoded[22],
-            encoded[23],
-            encoded[24],
-            encoded[25],
-            encoded[26],
-            encoded[27],
-        ]);
-
-        let packedStart = packed_offset(encoded, row_count);
-        let packedBits = row_count as u64 * intBitWidth as u64;
-        let packedBytes = (packedBits as usize).div_ceil(8);
-        let packedEnd = packedStart + packedBytes;
-
-        if encoded.len() < packedEnd {
-            return Err(ZyronError::DecodingFailed(
-                "ALP packed data truncated".to_string(),
-            ));
-        }
-
-        let packed = &encoded[packedStart..packedEnd];
-
-        // Reciprocal multiplication instead of division per value.
-        // f64 division: ~15-20 cycles. f64 multiplication: ~4-5 cycles.
-        let invFactor = 1.0 / factor;
-
-        // Single-pass decode: unpack, reverse delta in-place, convert to float,
-        // and write output directly. Eliminates intermediate Vec<i64> allocation.
-        let outLen = row_count * value_size;
-        // SAFETY: every byte of `out` is written by the decode below before
-        // any read; zeroing first would memset the whole buffer only to
-        // overwrite it, regressing decode throughput on the scan path.
-        #[allow(clippy::uninit_vec)]
-        let mut out: Vec<u8> = {
-            let mut v = Vec::with_capacity(outLen);
-            unsafe { v.set_len(outLen) };
-            v
-        };
-        let outPtr = out.as_mut_ptr();
-        let packedPtr = packed.as_ptr();
-        let packedLen = packed.len();
-
-        let mask: u64 = if intBitWidth >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << intBitWidth) - 1
-        };
-        let bw = intBitWidth as u64;
-        // Row zero is a delta against the seed like every other entry, so no
-        // path here special-cases it
-        let mut prevInt: i64 = delta_seed(encoded);
-
-        if value_size == 8 && useDelta && intBitWidth == 1 {
-            // bit_width=1 delta f64: extract 8 deltas per packed byte.
-            // Single-pass: prefix-sum + float convert + write.
-            // On modern out-of-order CPUs, the float conversion pipelines
-            // behind the integer add without stalling the prefix-sum chain.
-            let out64f = outPtr as *mut f64;
-
-            if row_count > 0 {
-                let byte0 = unsafe { *packedPtr.add(0) };
-                let firstByteTail = 8.min(row_count);
-                for bit in 0..firstByteTail {
-                    prevInt = prevInt.wrapping_add(((byte0 >> bit) & 1) as i64 + base);
-                    unsafe {
-                        out64f.add(bit).write(prevInt as f64 * invFactor);
-                    }
-                }
-            }
-
-            let fullBytes = row_count / 8;
-            for b in 1..fullBytes {
-                let byte = unsafe { *packedPtr.add(b) };
-                let idx = b * 8;
-
-                prevInt = prevInt.wrapping_add((byte & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 1) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 1).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 2) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 2).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 3) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 3).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 4) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 4).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 5) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 5).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 6) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 6).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(((byte >> 7) & 1) as i64 + base);
-                unsafe {
-                    out64f.add(idx + 7).write(prevInt as f64 * invFactor);
-                }
-            }
-            for i in (fullBytes * 8).max(8.min(row_count))..row_count {
-                let unsigned =
-                    unpack_alp_inline(packedPtr, packedLen, i as u64 * bw, intBitWidth, mask);
-                prevInt = prevInt.wrapping_add(unsigned as i64 + base);
-                unsafe {
-                    out64f.add(i).write(prevInt as f64 * invFactor);
-                }
-            }
-        } else if value_size == 8 && useDelta {
-            // Generic delta f64: unpack + prefix-sum + float convert in one pass.
-            let out64f = outPtr as *mut f64;
-
-            if row_count > 0 {
-                let u0 = unpack_alp_inline(packedPtr, packedLen, 0, intBitWidth, mask);
-                prevInt = prevInt.wrapping_add(u0 as i64 + base);
-                unsafe {
-                    out64f.add(0).write(prevInt as f64 * invFactor);
-                }
-            }
-
-            let remaining = row_count - 1;
-            let chunks = remaining / 4;
-            for chunk in 0..chunks {
-                let i0 = chunk * 4 + 1;
-                let u0 = unpack_alp_inline(packedPtr, packedLen, i0 as u64 * bw, intBitWidth, mask);
-                let u1 = unpack_alp_inline(
-                    packedPtr,
-                    packedLen,
-                    (i0 + 1) as u64 * bw,
-                    intBitWidth,
-                    mask,
-                );
-                let u2 = unpack_alp_inline(
-                    packedPtr,
-                    packedLen,
-                    (i0 + 2) as u64 * bw,
-                    intBitWidth,
-                    mask,
-                );
-                let u3 = unpack_alp_inline(
-                    packedPtr,
-                    packedLen,
-                    (i0 + 3) as u64 * bw,
-                    intBitWidth,
-                    mask,
-                );
-
-                prevInt = prevInt.wrapping_add(u0 as i64 + base);
-                unsafe {
-                    out64f.add(i0).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(u1 as i64 + base);
-                unsafe {
-                    out64f.add(i0 + 1).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(u2 as i64 + base);
-                unsafe {
-                    out64f.add(i0 + 2).write(prevInt as f64 * invFactor);
-                }
-                prevInt = prevInt.wrapping_add(u3 as i64 + base);
-                unsafe {
-                    out64f.add(i0 + 3).write(prevInt as f64 * invFactor);
-                }
-            }
-            for i in (chunks * 4 + 1)..row_count {
-                let unsigned =
-                    unpack_alp_inline(packedPtr, packedLen, i as u64 * bw, intBitWidth, mask);
-                prevInt = prevInt.wrapping_add(unsigned as i64 + base);
-                unsafe {
-                    out64f.add(i).write(prevInt as f64 * invFactor);
-                }
-            }
-        } else if value_size == 8 && !useDelta {
-            // Fast path for f64 without delta: batch unpack + convert.
-            // Process 4 values at a time to help instruction-level parallelism.
-            let chunks = row_count / 4;
-
-            for chunk in 0..chunks {
-                let i0 = chunk * 4;
-                let u0 = unpack_alp_inline(packedPtr, packedLen, i0 as u64 * bw, intBitWidth, mask);
-                let u1 = unpack_alp_inline(
-                    packedPtr,
-                    packedLen,
-                    (i0 + 1) as u64 * bw,
-                    intBitWidth,
-                    mask,
-                );
-                let u2 = unpack_alp_inline(
-                    packedPtr,
-                    packedLen,
-                    (i0 + 2) as u64 * bw,
-                    intBitWidth,
-                    mask,
-                );
-                let u3 = unpack_alp_inline(
-                    packedPtr,
-                    packedLen,
-                    (i0 + 3) as u64 * bw,
-                    intBitWidth,
-                    mask,
-                );
-
-                let f0 = (u0 as i64 + base) as f64 * invFactor;
-                let f1 = (u1 as i64 + base) as f64 * invFactor;
-                let f2 = (u2 as i64 + base) as f64 * invFactor;
-                let f3 = (u3 as i64 + base) as f64 * invFactor;
-
-                unsafe {
-                    (outPtr.add(i0 * 8) as *mut f64).write_unaligned(f0);
-                    (outPtr.add((i0 + 1) * 8) as *mut f64).write_unaligned(f1);
-                    (outPtr.add((i0 + 2) * 8) as *mut f64).write_unaligned(f2);
-                    (outPtr.add((i0 + 3) * 8) as *mut f64).write_unaligned(f3);
-                }
-            }
-
-            for i in (chunks * 4)..row_count {
-                let unsigned =
-                    unpack_alp_inline(packedPtr, packedLen, i as u64 * bw, intBitWidth, mask);
-                let floatVal = (unsigned as i64 + base) as f64 * invFactor;
-                unsafe {
-                    (outPtr.add(i * 8) as *mut f64).write_unaligned(floatVal);
-                }
-            }
-        } else {
-            for i in 0..row_count {
-                let unsigned =
-                    unpack_alp_inline(packedPtr, packedLen, i as u64 * bw, intBitWidth, mask);
-                let mut intVal = unsigned as i64 + base;
-
-                if useDelta {
-                    intVal = intVal.wrapping_add(prevInt);
-                    prevInt = intVal;
-                }
-
-                let floatVal = intVal as f64 * invFactor;
-
-                if value_size == 4 {
-                    unsafe {
-                        (outPtr.add(i * 4) as *mut f32).write_unaligned(floatVal as f32);
-                    }
-                } else {
-                    unsafe {
-                        (outPtr.add(i * 8) as *mut f64).write_unaligned(floatVal);
-                    }
-                }
-            }
-        }
-
-        // Apply exceptions (overwrite the placeholder values)
-        let exceptionEntrySize = 4 + value_size;
-        let exceptionsStart = packedEnd;
-
-        for e in 0..exception_count {
-            let offset = exceptionsStart + e * exceptionEntrySize;
-            if offset + exceptionEntrySize > encoded.len() {
-                return Err(ZyronError::DecodingFailed(
-                    "ALP exception data truncated".to_string(),
-                ));
-            }
-
-            let row_idx = u32::from_le_bytes([
-                encoded[offset],
-                encoded[offset + 1],
-                encoded[offset + 2],
-                encoded[offset + 3],
-            ]) as usize;
-
-            if row_idx >= row_count {
-                return Err(ZyronError::DecodingFailed(format!(
-                    "ALP exception row index {} out of range",
-                    row_idx
-                )));
-            }
-
-            let val_offset = offset + 4;
-            let out_offset = row_idx * value_size;
-            out[out_offset..out_offset + value_size]
-                .copy_from_slice(&encoded[val_offset..val_offset + value_size]);
-        }
-
-        Ok(out)
+        decode_alp(encoded, row_count, value_size, 0, row_count)
     }
 
     fn eval_predicate(
@@ -857,11 +426,9 @@ impl Encoding for AlpEncoding {
                         None => None,
                     };
 
-                    let packed = &encoded[packedStart..packedEnd];
+                    let stream = Packed::new(&encoded[packedStart..packedEnd], intBitWidth);
                     return Ok(bitmask_from_rows(row_count, |i| {
-                        let unsigned =
-                            unpack_bits(packed, i as u64 * intBitWidth as u64, intBitWidth);
-                        let intVal = unsigned as i64 + base;
+                        let intVal = (stream.at(i) as i64).wrapping_add(base);
                         loInt.is_none_or(|lo| intVal >= lo) && hiInt.is_none_or(|hi| intVal <= hi)
                     }));
                 }
@@ -873,6 +440,156 @@ impl Encoding for AlpEncoding {
         let decoded = self.decode(encoded, row_count, value_size)?;
         eval_predicate_on_raw(&decoded, row_count, value_size, predicate)
     }
+}
+
+/// Eight bytes at `at`
+#[inline]
+fn word_at(encoded: &[u8], at: usize) -> [u8; 8] {
+    [
+        encoded[at],
+        encoded[at + 1],
+        encoded[at + 2],
+        encoded[at + 3],
+        encoded[at + 4],
+        encoded[at + 5],
+        encoded[at + 6],
+        encoded[at + 7],
+    ]
+}
+
+/// Rows `start..end` as floats of `value_size` bytes
+fn decode_alp(
+    encoded: &[u8],
+    row_count: usize,
+    value_size: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
+    if encoded.len() < 28 {
+        return Err(ZyronError::DecodingFailed(
+            "ALP header too short".to_string(),
+        ));
+    }
+    let factor = f64::from_le_bytes(word_at(encoded, 0));
+    let exception_count =
+        u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]]) as usize;
+    let int_bit_width = encoded[16];
+    let stored_value_size = encoded[17] as usize;
+    if stored_value_size != value_size {
+        return Err(ZyronError::DecodingFailed(format!(
+            "ALP value_size mismatch: stored {stored_value_size}, expected {value_size}"
+        )));
+    }
+    if value_size != 4 && value_size != 8 {
+        return Err(ZyronError::DecodingFailed(format!(
+            "ALP decodes 4 or 8 byte floats, not {value_size}"
+        )));
+    }
+    // A raw fallback carries the floats as written
+    if factor == 0.0 {
+        let raw_start = 28 + start * value_size;
+        let raw_end = 28 + end * value_size;
+        if encoded.len() < raw_end {
+            return Err(ZyronError::DecodingFailed(
+                "ALP raw fallback data truncated".to_string(),
+            ));
+        }
+        return Ok(encoded[raw_start..raw_end].to_vec());
+    }
+    if int_bit_width == 0 || int_bit_width > 64 {
+        return Err(ZyronError::DecodingFailed(format!(
+            "invalid ALP bit width: {int_bit_width}"
+        )));
+    }
+    let base = i64::from_le_bytes(word_at(encoded, 20));
+    let packed_start = packed_offset(encoded, row_count);
+    let packed_bytes = (row_count as u64 * int_bit_width as u64).div_ceil(8) as usize;
+    let packed_end = packed_start + packed_bytes;
+    if encoded.len() < packed_end {
+        return Err(ZyronError::DecodingFailed(
+            "ALP packed data truncated".to_string(),
+        ));
+    }
+    let stream = Packed::new(&encoded[packed_start..packed_end], int_bit_width);
+    // Reciprocal multiplication instead of a division per value
+    let inv_factor = 1.0 / factor;
+    let taken = end - start;
+    // SAFETY: the kernel writes every slot of the range before anything
+    // reads the buffer, and an error on the way out drops it unread
+    let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
+
+    if encoded[18] & FLAG_DELTA != 0 {
+        // The running sum after row i is the undifferenced integer at row
+        // i, so a restart entry seeds it directly, and every packed entry
+        // is a delta plus the base
+        let table = &encoded[restart_table_offset(encoded)..packed_start];
+        let shift = encoded[19] as u32;
+        let (mut running, row) = seed_restart(table, shift, start, delta_seed(encoded));
+        if row < start {
+            let skipped = start - row;
+            running = running
+                .wrapping_add(stream.sum(row, skipped) as i64)
+                .wrapping_add((skipped as i64).wrapping_mul(base));
+        }
+        // SAFETY: out holds taken slots of value_size bytes
+        unsafe {
+            stream.floats_into(
+                start,
+                taken,
+                base as u64,
+                Some(running as u64),
+                inv_factor,
+                out.as_mut_ptr(),
+                value_size,
+            );
+        }
+        // Delta is only chosen when the column has no exceptions, so the
+        // range is complete once the stream is replayed
+        return Ok(out);
+    }
+
+    // SAFETY: out holds taken slots of value_size bytes
+    unsafe {
+        stream.floats_into(
+            start,
+            taken,
+            base as u64,
+            None,
+            inv_factor,
+            out.as_mut_ptr(),
+            value_size,
+        );
+    }
+
+    // Exceptions carry their own row index, so only the ones landing in
+    // the range are read back and the rest are stepped over
+    let exceptions = &encoded[packed_end..];
+    let entry_size = 4 + value_size;
+    for e in 0..exception_count {
+        let o = e * entry_size;
+        if o + entry_size > exceptions.len() {
+            return Err(ZyronError::DecodingFailed(
+                "ALP exception data truncated".to_string(),
+            ));
+        }
+        let row = u32::from_le_bytes([
+            exceptions[o],
+            exceptions[o + 1],
+            exceptions[o + 2],
+            exceptions[o + 3],
+        ]) as usize;
+        if row >= row_count {
+            return Err(ZyronError::DecodingFailed(format!(
+                "ALP exception row index {row} out of range"
+            )));
+        }
+        if row < start || row >= end {
+            continue;
+        }
+        let slot = (row - start) * value_size;
+        out[slot..slot + value_size].copy_from_slice(&exceptions[o + 4..o + 4 + value_size]);
+    }
+    Ok(out)
 }
 
 /// Reads a float value from a raw byte slice (not indexed by row).
@@ -973,50 +690,6 @@ fn encode_raw_fallback(data: &[u8], row_count: usize, value_size: usize) -> Resu
     Ok(out)
 }
 
-/// Decodes raw fallback data.
-fn decode_raw_fallback(encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
-    let raw_start = 28;
-    let raw_size = row_count * value_size;
-    if encoded.len() < raw_start + raw_size {
-        return Err(ZyronError::DecodingFailed(
-            "ALP raw fallback data truncated".to_string(),
-        ));
-    }
-    Ok(encoded[raw_start..raw_start + raw_size].to_vec())
-}
-
-/// Unpacks a single value from a bit-packed array using raw pointer reads.
-/// Equivalent to unpack_bits but takes pre-computed pointer and length.
-#[inline(always)]
-fn unpack_alp_inline(
-    packed_ptr: *const u8,
-    packed_len: usize,
-    bit_offset: u64,
-    bit_width: u8,
-    mask: u64,
-) -> u64 {
-    let byte_idx = (bit_offset >> 3) as usize;
-    let bit_idx = (bit_offset & 7) as u32;
-
-    if byte_idx + 8 <= packed_len {
-        let raw = unsafe { (packed_ptr.add(byte_idx) as *const u64).read_unaligned() };
-        let val = (raw >> bit_idx) & mask;
-        if bit_idx + bit_width as u32 > 64 {
-            let hi = unsafe { *packed_ptr.add(byte_idx + 8) } as u64;
-            return (val | (hi << (64 - bit_idx))) & mask;
-        }
-        return val;
-    }
-
-    let mut buf = [0u8; 8];
-    let available = packed_len.saturating_sub(byte_idx).min(8);
-    unsafe {
-        std::ptr::copy_nonoverlapping(packed_ptr.add(byte_idx), buf.as_mut_ptr(), available);
-    }
-    let raw = u64::from_le_bytes(buf);
-    (raw >> bit_idx) & mask
-}
-
 /// Packs a u64 value at the given bit offset.
 #[inline]
 fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
@@ -1037,33 +710,6 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
         if byte_idx + j < packed.len() {
             packed[byte_idx + j] |= shifted_bytes[j];
         }
-    }
-}
-
-/// Unpacks a u64 value from the given bit offset.
-#[inline]
-fn unpack_bits(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
-    let byte_idx = (bit_offset / 8) as usize;
-    let bit_idx = (bit_offset % 8) as u32;
-    let mut buf = [0u8; 9];
-    let available = packed.len().saturating_sub(byte_idx).min(9);
-    buf[..available].copy_from_slice(&packed[byte_idx..byte_idx + available]);
-
-    let lo = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let val = lo >> bit_idx;
-    let mask = if bit_width >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bit_width) - 1
-    };
-
-    if bit_idx + bit_width as u32 > 64 {
-        let hi = (buf[8] as u64) << (64 - bit_idx);
-        (val | hi) & mask
-    } else {
-        val & mask
     }
 }
 

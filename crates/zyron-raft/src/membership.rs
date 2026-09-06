@@ -418,11 +418,14 @@ fn config_quorum_index(config: &ClusterConfig, match_of: &impl Fn(NodeId) -> u64
     if count == 0 {
         return 0;
     }
-    // Descending, then the element at the midpoint is the highest index that
-    // at least half plus one of the voters have reached
+    // Descending, then the element at position quorum minus one is the
+    // highest index that a majority, half the voters plus one, has reached.
+    // For an even count the midpoint would be one position too high, an
+    // index only half the voters hold, which a group of two or four would
+    // commit on a minority
     let indexes = &mut indexes[..count];
     indexes.sort_unstable_by(|a, b| b.cmp(a));
-    indexes[(count - 1) / 2]
+    indexes[count / 2]
 }
 
 #[cfg(test)]
@@ -514,6 +517,56 @@ mod tests {
             }),
             7
         );
+    }
+
+    /// An even number of voters needs more than half of them. Two voters
+    /// need both, four need three, and the watermark is what the last of
+    /// those holds, never what the half ahead of it holds
+    #[test]
+    fn quorum_index_of_an_even_group_needs_more_than_half() {
+        let two = Membership::simple(ClusterConfig::of_voters([
+            (1, "a:1".to_string()),
+            (2, "b:1".to_string()),
+        ]));
+        assert_eq!(two.quorum_match_index(|id| if id == 1 { 50 } else { 3 }), 3);
+
+        let mut c = three();
+        c.nodes.push(NodeConfig::voter(4, "d:1"));
+        let four = Membership::simple(c);
+        assert_eq!(
+            four.quorum_match_index(|id| match id {
+                1 => 10,
+                2 => 10,
+                3 => 4,
+                4 => 1,
+                _ => 0,
+            }),
+            4
+        );
+        assert_eq!(
+            four.quorum_match_index(|id| match id {
+                1 => 10,
+                2 => 10,
+                3 => 10,
+                4 => 1,
+                _ => 0,
+            }),
+            10
+        );
+
+        for count in 1..=MAX_CLUSTER_NODES as u64 {
+            let m = Membership::simple(ClusterConfig::of_voters(
+                (1..=count).map(|id| (id, format!("n{id}:1"))),
+            ));
+            // Voter `id` holds index `id`, so the highest index a majority
+            // holds is the one at the quorum's lowest member
+            let quorum = count / 2 + 1;
+            assert_eq!(
+                m.quorum_match_index(|id| id),
+                count + 1 - quorum,
+                "{count} voters"
+            );
+        }
     }
 
     #[test]

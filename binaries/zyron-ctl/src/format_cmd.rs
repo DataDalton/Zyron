@@ -90,6 +90,14 @@ pub fn inspect(path: &Path) -> Result<Inspection, String> {
                 true,
                 "declared [format] section, the file is hand editable".to_string(),
             ),
+            Framing::OwnTrailer => match envelope::decode_header(&bytes) {
+                Ok(_) => (
+                    true,
+                    "header verified, the trailer's integrity belongs to the format's own reader"
+                        .to_string(),
+                ),
+                Err(e) => (false, e.to_string()),
+            },
         };
         return Ok(Inspection {
             path: path.to_path_buf(),
@@ -302,7 +310,7 @@ pub fn migrate(
             report.files_already_current += 1;
             continue;
         }
-        let rewritten = envelope::encode(kind, current, &opened.body);
+        let rewritten = opened.reencode();
         let tmp = path.with_extension("zymig.tmp");
         if let Err(e) = std::fs::write(&tmp, &rewritten) {
             report.failures.push(format!("{}, {e}", tmp.display()));
@@ -367,6 +375,14 @@ pub mod statements {
         format!("TRIGGER MANUAL UPGRADE TO '{version}'")
     }
 
+    /// `zyron-ctl upgrade acknowledge --category <ambiguous|unsafe>`
+    pub fn acknowledge(category: &str) -> String {
+        format!(
+            "ACKNOWLEDGE UPGRADE REWRITES {}",
+            category.to_ascii_uppercase()
+        )
+    }
+
     /// `zyron-ctl deprecation guides <item>`
     pub fn guide(item: &str) -> String {
         format!(
@@ -377,12 +393,130 @@ pub mod statements {
     }
 }
 
+/// What `release stage` put in place
+#[derive(Debug)]
+pub struct StagedForFeed {
+    pub version: String,
+    pub channel: String,
+    pub manifestPath: PathBuf,
+    pub binaryPath: PathBuf,
+}
+
+/// Puts a signed manifest and a release binary where a node's local feed
+/// reads them, the way an operator delivers a release to an air-gapped
+/// cluster.
+///
+/// The manifest goes under `releases/<channel>.manifest` in the data
+/// directory and the binary beside it as `zyron-server-<version>`. The
+/// binary is checked against the digest the manifest declares before it is
+/// copied, so a wrong file is refused here rather than by the node. The
+/// manifest's signature is the node's to check, with the release key it is
+/// configured with
+pub fn stage_release(
+    manifest: &Path,
+    binary: &Path,
+    data_dir: &Path,
+    version: Option<&str>,
+) -> Result<StagedForFeed, String> {
+    use zyron_server::upgrade::feed::{LocalFeedSource, parse_manifest, verify_sha256};
+    use zyron_server::upgrade::stager::LocalArtifactSource;
+
+    let body = std::fs::read_to_string(manifest)
+        .map_err(|e| format!("reading {}: {e}", manifest.display()))?;
+    let document = parse_manifest(&body).map_err(|e| e.to_string())?;
+    let manifest_value: zyron_common::format::ReleaseManifest = document.into();
+    if manifest_value.releases.is_empty() {
+        return Err("the manifest carries no releases".to_string());
+    }
+    let version = match version {
+        Some(version) => version.to_string(),
+        None if manifest_value.releases.len() == 1 => manifest_value.releases[0].version.clone(),
+        None => {
+            let versions: Vec<&str> = manifest_value
+                .releases
+                .iter()
+                .map(|r| r.version.as_str())
+                .collect();
+            return Err(format!(
+                "the manifest carries {} releases ({}), say which one the binary is with \
+                 --version",
+                versions.len(),
+                versions.join(", ")
+            ));
+        }
+    };
+    let release = manifest_value.release(&version).ok_or_else(|| {
+        format!(
+            "the manifest for the {} channel carries no release {version}",
+            manifest_value.channel
+        )
+    })?;
+    verify_sha256(binary, &release.sha256).map_err(|e| e.to_string())?;
+
+    let feed_dir = data_dir.join("releases");
+    let feed = LocalFeedSource::new(feed_dir.clone());
+    let manifest_path = feed.publish(&manifest_value).map_err(|e| e.to_string())?;
+    let artifacts = LocalArtifactSource::new(feed_dir);
+    let binary_path = artifacts.path_for(&version);
+    let partial = binary_path.with_extension("partial");
+    std::fs::copy(binary, &partial).map_err(|e| format!("copying the binary: {e}"))?;
+    std::fs::rename(&partial, &binary_path).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        format!("placing the binary: {e}")
+    })?;
+    Ok(StagedForFeed {
+        version,
+        channel: manifest_value.channel.clone(),
+        manifestPath: manifest_path,
+        binaryPath: binary_path,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use zyron_common::format::registry::{DeprecationStatus, FormatRegistration, MigrationPolicy};
     use zyron_common::format::version::VersionWindow;
     use zyron_common::format::{ALL_FORMAT_KINDS, FormatMigrator};
+
+    #[test]
+    fn test_stage_release_places_the_manifest_and_a_matching_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("zyron-server-next");
+        std::fs::write(&binary, b"a release binary").expect("writes");
+        let sha = zyron_server::upgrade::feed::sha256_hex(b"a release binary");
+        let manifest = dir.path().join("stable.json");
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{"channel":"stable","generated_at_secs":1,"releases":[{{"version":"9.9.9","artifact_url":"","sha256":"{sha}","signature_scheme":"Ed25519","signature":"","upgrade_chain":[],"carries_format_bump":false,"notes_url":""}}],"signature_scheme":"Ed25519","signature":""}}"#
+            ),
+        )
+        .expect("writes");
+        let data_dir = dir.path().join("data");
+
+        let staged = stage_release(&manifest, &binary, &data_dir, None).expect("stages");
+        assert_eq!(staged.version, "9.9.9");
+        assert_eq!(staged.channel, "stable");
+        assert_eq!(
+            staged.manifestPath,
+            data_dir.join("releases").join(format!(
+                "{}.manifest",
+                zyron_server::upgrade::feed::feed_name("stable")
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&staged.binaryPath).expect("copied"),
+            b"a release binary"
+        );
+
+        // A binary that is not the one the manifest describes is refused
+        std::fs::write(&binary, b"something else").expect("writes");
+        let err = stage_release(&manifest, &binary, &data_dir, Some("9.9.9")).expect_err("refused");
+        assert!(err.contains("the manifest declares"), "{err}");
+        let err = stage_release(&manifest, &binary, &data_dir, Some("1.0.0")).expect_err("refused");
+        assert!(err.contains("no release 1.0.0"), "{err}");
+    }
 
     fn append_marker(body: &[u8]) -> Result<Vec<u8>, String> {
         let mut out = body.to_vec();
@@ -604,6 +738,93 @@ mod tests {
         )
         .expect_err("refused");
         assert!(err.contains("writes statistics_file at 1.1"), "{err}");
+    }
+
+    fn append_whole_file(file: &[u8]) -> Result<Vec<u8>, String> {
+        let mut out = file.to_vec();
+        out.extend_from_slice(b"-trailer2");
+        Ok(out)
+    }
+
+    /// A registry where the columnar file, which owns its trailer, has two
+    /// versions so an own-trailer migration has something to move
+    fn own_trailer_registry() -> FormatRegistry {
+        let registrations: Vec<FormatRegistration> = ALL_FORMAT_KINDS
+            .iter()
+            .copied()
+            .map(|kind| {
+                let bumped = kind == FormatKind::ZyrColumnar;
+                FormatRegistration {
+                    kind,
+                    writer_current_version: if bumped {
+                        FormatVersion::new(1, 1)
+                    } else {
+                        FormatVersion::V1
+                    },
+                    reader_supported_versions: if bumped {
+                        VersionWindow::new(FormatVersion::V1, FormatVersion::new(1, 1))
+                    } else {
+                        VersionWindow::single(FormatVersion::V1)
+                    },
+                    migration_policy: MigrationPolicy::Eager,
+                    migration_reversible: false,
+                    binary_version_gate: "0.12.0",
+                    deprecation_status: DeprecationStatus::Active,
+                    retirement_date: if bumped { Some("2027-03-01") } else { None },
+                    downgrade_write_supported: false,
+                    notes: "test",
+                }
+            })
+            .collect();
+        let migrators = [FormatMigrator {
+            kind: FormatKind::ZyrColumnar,
+            from: FormatVersion::V1,
+            to: FormatVersion::new(1, 1),
+            reversible: false,
+            forward: append_whole_file,
+            backward: None,
+            no_body_change: false,
+            description: "appends a whole-file marker",
+        }];
+        let fixtures = [zyron_common::format::FormatFixture {
+            kind: FormatKind::ZyrColumnar,
+            version: FormatVersion::V1,
+            bytes: b"",
+            path: "fixtures/v1_0.bin",
+        }];
+        FormatRegistry::from_parts(&registrations, &migrators, &fixtures).expect("loads")
+    }
+
+    #[test]
+    fn test_migrate_rewrites_an_own_trailer_file_whole_not_re_enveloped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file that owns its trailer is handed to its migrator whole, and
+        // the migrated bytes are written back verbatim rather than wrapped in
+        // a second envelope
+        let original = envelope::encode(
+            FormatKind::ZyrColumnar,
+            FormatVersion::V1,
+            b"columnar-trailer",
+        );
+        let mut expected = original.clone();
+        expected.extend_from_slice(b"-trailer2");
+        std::fs::write(dir.path().join("data.zyr"), &original).expect("writes");
+
+        let registry = own_trailer_registry();
+        let report = migrate(
+            &registry,
+            FormatKind::ZyrColumnar,
+            Some(FormatVersion::new(1, 1)),
+            dir.path(),
+        )
+        .expect("migrates");
+        assert_eq!(report.files_migrated, 1);
+
+        let written = std::fs::read(dir.path().join("data.zyr")).expect("reads");
+        assert_eq!(
+            written, expected,
+            "an own-trailer file must be rewritten whole, the buggy path wrapped it in a fresh envelope"
+        );
     }
 
     #[test]

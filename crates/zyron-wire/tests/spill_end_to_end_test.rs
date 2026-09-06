@@ -83,12 +83,15 @@ async fn seeded_server(
 
 /// The query that used to fail.
 ///
-/// A limit, so the result is small and the sort is not. The memory budget
+/// An offset, so the result is small and the sort is not. The memory budget
 /// covers the whole query, and a result set genuinely is held in memory: a
 /// query returning twenty thousand rows exceeds a sixty-four kilobyte budget
 /// on the result alone, spill or no spill. What spilling fixes is the
-/// operator's own buffering, so that is what this measures.
-const SORTING_QUERY: &str = "SELECT id FROM zyron_test.wide ORDER BY id LIMIT 50";
+/// operator's own buffering, so that is what this measures. An offset
+/// rather than a limit because a limit bounds the sort's buffer to about a
+/// batch beyond it and the sort would then fit, whereas an offset alone
+/// caps nothing: every row past it is wanted, so the sort holds them all.
+const SORTING_QUERY: &str = "SELECT id FROM zyron_test.wide ORDER BY id OFFSET 19950";
 
 /// Rows the query asks for.
 const WANTED: usize = 50;
@@ -123,7 +126,7 @@ async fn a_sort_past_its_budget_spills_and_returns_rows() {
     // engine: a merge that is consistently wrong would agree with itself
     let mut expected = seeded_keys();
     expected.sort_unstable();
-    expected.truncate(WANTED);
+    let expected = expected.split_off(ROWS as usize - WANTED);
 
     let got: Vec<i64> = values
         .iter()

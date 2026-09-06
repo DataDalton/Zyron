@@ -7,6 +7,7 @@
 //! old binary or the new one and never a half-written file
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zyron_auth::signature::{VerifyingMaterial, verify_artifact};
 use zyron_common::format::ReleaseEntry;
@@ -120,6 +121,47 @@ impl ArtifactSource for LocalArtifactSource {
     }
 }
 
+/// A local artifact directory read ahead of a remote one.
+///
+/// The binary for a release delivered by hand sits in the node's feed
+/// directory and is read from there. A release the feed advertised with a
+/// URL is downloaded when the directory does not hold it
+pub struct LayeredArtifactSource {
+    local: LocalArtifactSource,
+    remote: Option<Arc<dyn ArtifactSource>>,
+}
+
+impl LayeredArtifactSource {
+    pub fn new(local: LocalArtifactSource, remote: Option<Arc<dyn ArtifactSource>>) -> Self {
+        Self { local, remote }
+    }
+}
+
+#[async_trait::async_trait]
+impl ArtifactSource for LayeredArtifactSource {
+    async fn fetch(&self, release: &ReleaseEntry) -> Result<Vec<u8>> {
+        if self.local.path_for(&release.version).is_file() {
+            return self.local.fetch(release).await;
+        }
+        match &self.remote {
+            Some(remote) if !release.artifact_url.trim().is_empty() => remote.fetch(release).await,
+            _ => Err(ZyronError::UpgradeRefused(format!(
+                "the {} binary is not at {} and the release names no URL to fetch it from. \
+                 Deliver it with zyron-ctl release stage",
+                release.version,
+                self.local.path_for(&release.version).display()
+            ))),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.remote {
+            Some(remote) => format!("{}, then {}", self.local.describe(), remote.describe()),
+            None => self.local.describe(),
+        }
+    }
+}
+
 /// Downloads, verifies, and stages one release
 pub async fn stage(
     source: &dyn ArtifactSource,
@@ -210,10 +252,17 @@ fn verify_signature(
     Ok(())
 }
 
+/// Where a rollback leaves the binary it moved out of the live path
+pub fn rolled_back_path(live_path: &Path) -> PathBuf {
+    live_path.with_extension("rolled-back")
+}
+
 /// Puts a staged binary in place, keeping the previous one beside it so a
-/// rollback is a rename rather than a download
+/// rollback is a rename rather than a download. A binary an earlier
+/// rollback left beside the live one is removed here, once nothing runs it
 pub fn activate(staged: &StagedRelease, live_path: &Path) -> Result<PathBuf> {
     let previous = live_path.with_extension("previous");
+    let _ = std::fs::remove_file(rolled_back_path(live_path));
     if live_path.exists() {
         std::fs::rename(live_path, &previous).map_err(ZyronError::Io)?;
     }
@@ -221,7 +270,9 @@ pub fn activate(staged: &StagedRelease, live_path: &Path) -> Result<PathBuf> {
     Ok(previous)
 }
 
-/// Puts the previous binary back
+/// Puts the previous binary back. The live binary is the image this process
+/// runs, which Windows lets a rename move but never replace, so it moves
+/// aside first and the previous one takes its place
 pub fn deactivate(live_path: &Path) -> Result<()> {
     let previous = live_path.with_extension("previous");
     if !previous.exists() {
@@ -230,7 +281,17 @@ pub fn deactivate(live_path: &Path) -> Result<()> {
             live_path.display()
         )));
     }
-    std::fs::rename(&previous, live_path).map_err(ZyronError::Io)
+    let rolled_back = rolled_back_path(live_path);
+    if live_path.exists() {
+        std::fs::rename(live_path, &rolled_back).map_err(ZyronError::Io)?;
+    }
+    if let Err(e) = std::fs::rename(&previous, live_path) {
+        // the live path keeps a binary either way, so a restart after a
+        // failed rename still starts what was running
+        let _ = std::fs::rename(&rolled_back, live_path);
+        return Err(ZyronError::Io(e));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,6 +372,15 @@ mod tests {
             std::fs::read(&live).expect("reads"),
             b"the old binary".to_vec()
         );
+        assert!(!previous.exists());
+        assert_eq!(
+            std::fs::read(rolled_back_path(&live)).expect("reads"),
+            bytes
+        );
+
+        activate(&staged, &live).expect("activates again");
+        assert!(!rolled_back_path(&live).exists());
+        assert_eq!(std::fs::read(&live).expect("reads"), bytes);
     }
 
     #[tokio::test]

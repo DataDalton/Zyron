@@ -14,6 +14,13 @@
 //! commonly appears. Scalar, EXISTS, and IN subqueries are supported. An
 //! uncorrelated subquery left inside the rewritten expression is folded by the
 //! existing materialize pass before per-row evaluation begins.
+//!
+//! A scalar aggregate is the exception, and it does not run per row. It asks
+//! one group of a grouped query, and a different group per outer row, so
+//! [`crate::decorrelate`] rewrites it into that grouped query and it is run
+//! once. Each row then reads its own group out of the result. An EXISTS
+//! whose correlation is a conjunction of equalities never reaches this
+//! module at all, because the same rewrite turns it into a hash semi join.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -322,6 +329,27 @@ struct CorrelatedSub {
     /// Membership compares raw i128s, so probe and list are moved onto one
     /// scale first
     probe_scale: Option<u8>,
+    /// A correlated scalar aggregate answered from one grouped run rather
+    /// than from `template` per row. Present only where the rewrite in
+    /// [`crate::decorrelate`] accepted the subquery
+    agg: Option<AggLookup>,
+}
+
+/// A correlated scalar aggregate's answers for every outer key at once.
+///
+/// `(SELECT MAX(x) FROM inner WHERE inner.k = outer.k)` asks a different
+/// group of the same grouped query per outer row, so the grouped query is
+/// run once and each row reads its own group out of the result
+struct AggLookup {
+    /// The grouped plan, run once before the first row
+    template: PhysicalPlan,
+    /// The outer expression each key column compares against
+    outer_keys: Vec<BoundExpr>,
+    /// What a key the grouped run did not produce means for this
+    /// aggregate: NULL, or zero for a count
+    empty: ScalarValue,
+    /// Key to aggregate value, filled before any row is evaluated
+    map: HashMap<Vec<ScalarValue>, ScalarValue>,
 }
 
 /// State threaded through expression rewriting: the enclosing query's table
@@ -515,6 +543,22 @@ fn extract(
         }
         _ => None,
     };
+    // A scalar aggregate asks one group of a grouped query per outer row,
+    // so where the rewrite accepts it the grouped query is planned here and
+    // run once instead of once per row
+    let agg = match &kind {
+        SubKind::Scalar => crate::decorrelate::lift_scalar_aggregate(&plan, prep.input_set)
+            .map(|lifted| {
+                crate::decorrelate::plan_lifted(lifted.select, prep.ctx).map(|template| AggLookup {
+                    template,
+                    outer_keys: lifted.outer_keys,
+                    empty: lifted.empty,
+                    map: HashMap::new(),
+                })
+            })
+            .transpose()?,
+        _ => None,
+    };
     let (template, outer_refs) =
         parameterize_subquery(plan, prep.input_set, prep.base_len, prep.ctx)?;
 
@@ -527,6 +571,7 @@ fn extract(
         outer_refs,
         output_scale,
         probe_scale,
+        agg,
     });
     if scalar_decimal {
         // The per-row value arrives as decimal text and the cast parses it
@@ -673,18 +718,52 @@ async fn eval_rows(
         .map(|e| ColumnBuilder::new(e.type_id(), n))
         .collect();
 
+    // Outer key columns for each subquery answered from a grouped run, so
+    // the per row work is one map probe rather than one plan execution
+    let mut sub_key_cols: Vec<Option<Vec<Column>>> = Vec::with_capacity(subs.len());
+    for s in subs {
+        let keys = match &s.agg {
+            Some(agg) => Some(
+                agg.outer_keys
+                    .iter()
+                    .map(|e| evaluate(e, batch, input_schema, base_params))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        sub_key_cols.push(keys);
+    }
+
     for row in 0..n {
         // Run each correlated subquery for this row and place its scalar result
         // in the slot region of the parameter set.
         let mut full_params = base_params.to_vec();
         for (i, s) in subs.iter().enumerate() {
-            let mut child_params = base_params.to_vec();
-            for col in &sub_outer_cols[i] {
-                child_params.push(bind_param_scalar(col, row));
-            }
-            let child = Arc::new(ctx.child_with_params(child_params));
-            let probe_val = sub_probe_cols[i].as_ref().map(|c| c.get_scalar(row));
-            let value = run_sub(s, probe_val, &child).await?;
+            let value = match (&s.agg, &sub_key_cols[i]) {
+                // A NULL key equals nothing, so its group is empty and the
+                // aggregate takes the value it has over no rows at all
+                (Some(agg), Some(cols)) => {
+                    if cols.iter().any(|c| c.is_null(row)) {
+                        agg.empty.clone()
+                    } else {
+                        let key: Vec<ScalarValue> =
+                            cols.iter().map(|c| c.get_scalar(row)).collect();
+                        agg.map
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| agg.empty.clone())
+                    }
+                }
+                _ => {
+                    let mut child_params = base_params.to_vec();
+                    for col in &sub_outer_cols[i] {
+                        child_params.push(bind_param_scalar(col, row));
+                    }
+                    let child = Arc::new(ctx.child_with_params(child_params));
+                    let probe_val = sub_probe_cols[i].as_ref().map(|c| c.get_scalar(row));
+                    run_sub(s, probe_val, &child).await?
+                }
+            };
             full_params.push(value);
         }
 
@@ -1007,10 +1086,12 @@ pub async fn build_correlated_filter(
     };
     let rewritten = rewrite_expr(predicate, &mut prep)?;
     let predicate = fold_uncorrelated(rewritten, ctx).await?;
+    let mut subs = prep.subs;
+    fill_agg_lookups(&mut subs, ctx).await?;
     Ok(CorrelatedFilterOperator {
         child,
         predicate,
-        subs: prep.subs,
+        subs,
         input_schema,
         base_params,
         ctx: Arc::clone(ctx),
@@ -1038,14 +1119,45 @@ pub async fn build_correlated_project(
         let r = rewrite_expr(e, &mut prep)?;
         rewritten.push(fold_uncorrelated(r, ctx).await?);
     }
+    let mut subs = prep.subs;
+    fill_agg_lookups(&mut subs, ctx).await?;
     Ok(CorrelatedProjectOperator {
         child,
         expressions: rewritten,
-        subs: prep.subs,
+        subs,
         input_schema,
         base_params,
         ctx: Arc::clone(ctx),
     })
+}
+
+/// Runs each lifted grouped query once and keeps its answers.
+///
+/// A group whose key holds a NULL is dropped rather than stored: an
+/// equality against NULL is never true, so no outer row could have asked
+/// for that group
+async fn fill_agg_lookups(subs: &mut [CorrelatedSub], ctx: &Arc<ExecutionContext>) -> Result<()> {
+    for sub in subs.iter_mut() {
+        let Some(agg) = &mut sub.agg else {
+            continue;
+        };
+        let batches = crate::executor::execute(agg.template.clone(), ctx).await?;
+        for batch in &batches {
+            // The grouped plan projects its keys first and the aggregate
+            // last, which is the order the lift laid them out in
+            let key_len = batch.columns.len().saturating_sub(1);
+            for row in 0..batch.num_rows {
+                if (0..key_len).any(|c| batch.columns[c].is_null(row)) {
+                    continue;
+                }
+                let key: Vec<ScalarValue> = (0..key_len)
+                    .map(|c| batch.columns[c].get_scalar(row))
+                    .collect();
+                agg.map.insert(key, batch.columns[key_len].get_scalar(row));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Value expressions containing correlated subqueries, prepared once and
@@ -1079,9 +1191,11 @@ pub async fn prepare_correlated_values(
         let r = rewrite_expr(e, &mut prep)?;
         rewritten.push(fold_uncorrelated(r, ctx).await?);
     }
+    let mut subs = prep.subs;
+    fill_agg_lookups(&mut subs, ctx).await?;
     Ok(CorrelatedValues {
         expressions: rewritten,
-        subs: prep.subs,
+        subs,
         input_schema,
         base_params,
     })
@@ -1145,9 +1259,11 @@ impl CorrelatedPredicate {
         };
         let rewritten = rewrite_expr(predicate, &mut prep)?;
         let predicate = fold_uncorrelated(rewritten, ctx).await?;
+        let mut subs = prep.subs;
+        fill_agg_lookups(&mut subs, ctx).await?;
         Ok(Self {
             predicate,
-            subs: prep.subs,
+            subs,
             input_schema,
             base_params,
         })

@@ -115,7 +115,7 @@ fn a_bump_without_a_migrator_is_refused() {
         Err(err @ RegistryError::MissingMigrator { .. }) => {
             let text = err.to_string();
             assert!(text.contains("heap_page"), "{text}");
-            assert!(text.contains("migrations/v0_to_v1.rs"), "{text}");
+            assert!(text.contains("migrations/v1_0_to_v1_1.rs"), "{text}");
             assert!(text.contains("no_body_change"), "{text}");
         }
         other => panic!("expected MissingMigrator, got {other:?}"),
@@ -152,7 +152,7 @@ fn a_bump_without_a_fixture_is_refused() {
         Err(err @ RegistryError::MissingFixture { .. }) => {
             let text = err.to_string();
             assert!(text.contains("heap_page"), "{text}");
-            assert!(text.contains("fixtures/v0.bin"), "{text}");
+            assert!(text.contains("fixtures/v1_0.bin"), "{text}");
         }
         other => panic!("expected MissingFixture, got {other:?}"),
     }

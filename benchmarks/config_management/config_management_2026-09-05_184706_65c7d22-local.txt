@@ -1,0 +1,103 @@
+# suite:   config_management
+# run:     2026-09-05_184706_65c7d22-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Validation: ALTER SYSTEM SET writes auto.conf ===
+  Wrote 4 ALTER SYSTEM SET overrides: PASS
+  zyron.auto.conf created: PASS
+  server.port = 9999: PASS
+  vacuum.enabled = false: PASS
+  query.default_isolation = serializable: PASS
+  compaction.max_concurrent = 8: PASS
+  Overwrite server.port = 7777: PASS
+
+=== Validation: SHOW ALL Returns Complete Config ===
+  Total config entries: 43
+  server_version present: PASS
+  All entries have key and description: PASS
+  server.port = 5432: PASS
+  query.default_isolation = snapshot: PASS
+
+=== Validation: Backup Manifest Checksum Integrity ===
+  Backup created with 1 files
+  Restore with valid checksums: PASS
+  Restore with corrupt checksum rejected: PASS
+
+=== Benchmark: Backup/Restore Throughput ===
+  Generating 72 MB of test data...
+  Backup throughput (MB/sec) [PASS/OK]:
+    Runs: [2,025, 2,057, 1,878, 2,053, 1,994]
+    Average: 2,001 >= 500 (target)
+    Min/Max: 1,878 / 2,057, StdDev: 65.6557
+  Restore throughput (MB/sec) [PASS/OK]:
+    Runs: [2,224, 2,261, 2,292, 2,451, 2,239]
+    Average: 2,293 >= 500 (target)
+    Min/Max: 2,224 / 2,451, StdDev: 82.0060
+
+=== Validation: Config Environment Variable Override ===
+  ZYRON_PORT=5555 override: PASS (port = 5555)
+
+=== Validation: Config Introspection (all keys) ===
+  24/24 config keys verified: PASS
+  Shorthand aliases (port, server_version): PASS
+  Unknown keys return None: PASS
+
+=== Validation: Config Invalid Value Rejection ===
+  Invalid sync_mode parsed but not yet validated: PASS
+  Invalid dead_tuple_threshold (-0.5) would be rejected by validate(): PASS
+  logging.output='file' without file_path would be rejected: PASS
+  Invalid default_isolation 'serializable' would be rejected: PASS
+
+=== Benchmark: Config Load (valid TOML with all sections) ===
+  Load latency (ms) [PASS/OK]:
+    Runs: [0.8680, 0.0680, 0.0430, 0.0400, 0.0370]
+    Average: 0.2112 <= 10 (target)
+    Min/Max: 0.0370 / 0.8680, StdDev: 0.3286
+
+=== Validation: Parser Admin Statements ===
+  ALTER SYSTEM SET parses: PASS
+  ANALYZE (no table) parses: PASS
+  ANALYZE my_table parses: PASS
+  SHOW ALL parses: PASS
+  SHOW server_version parses: PASS
+  CHECKPOINT parses: PASS
+  VACUUM parses: PASS
+  VACUUM users parses: PASS
+
+=== Benchmark: SET Command Latency ===
+  Set+Get latency (us/op) [PASS/OK]:
+    Runs: [0.0479, 0.0481, 0.0481, 0.0478, 0.0478]
+    Average: 0.0479 <= 20 (target)
+    Min/Max: 0.0478 / 0.0481, StdDev: 0.0001
+
+=== Benchmark: SHOW Command Latency ===
+  Lookup latency (us/op) [PASS/OK]:
+    Runs: [0.0097, 0.0099, 0.0096, 0.0096, 0.0095]
+    Average: 0.0097 <= 10 (target)
+    Min/Max: 0.0095 / 0.0099, StdDev: 0.0001
+  Correctness: all lookups return expected values: PASS
+
+=== Benchmark: Stat View Query Latency ===
+  View build latency (us/op) [PASS/OK]:
+    Runs: [0.0715, 0.0683, 0.0687, 0.0681, 0.0683]
+    Average: 0.0690 <= 200 (target)
+    Min/Max: 0.0681 / 0.0715, StdDev: 0.0013
+  Stat view name recognition: PASS
+
+=== Benchmark: Tab Completion Latency ===
+  Completion latency (ms/op) [PASS/OK]:
+    Runs: [0.0001, 0.0001, 0.0001, 0.0001, 0.0001]
+    Average: 0.0001 <= 20 (target)
+    Min/Max: 0.0001 / 0.0001, StdDev: 0.0000
+  'SEL' -> ["SELECT"]: PASS
+  '\d' -> ["\\dt", "\\d", "\\di", "\\du", "\\dp"]: PASS
+
+=== Validation: WAL Stats Counters ===
+  Initial counters at zero: PASS
+  After 1000 inserts:
+    wal_records_written = 1000
+    wal_bytes_written = 50000
+  WAL stats counters increment correctly: PASS

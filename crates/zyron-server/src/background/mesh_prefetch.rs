@@ -22,7 +22,7 @@
 //! before the traffic does, which is the only deadline this has.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use zyron_buffer::BufferPool;
@@ -40,11 +40,11 @@ pub async fn mesh_prefetch_loop(
     pool: Arc<BufferPool>,
     disk: Arc<DiskManager>,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_ms: u64,
 ) {
-    let interval = Duration::from_millis(interval_ms.max(1));
-    while !shutdown.load(Ordering::Relaxed) {
-        tokio::time::sleep(interval).await;
+    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         let queued = node.take_prefetch_queue();
         if queued.is_empty() {
             continue;

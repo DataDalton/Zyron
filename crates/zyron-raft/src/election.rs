@@ -102,6 +102,56 @@ impl ElectionTimer {
     }
 }
 
+/// A leader's request that a follower campaign at once.
+///
+/// Sent to hand the group over deliberately, which a node about to restart
+/// for an upgrade does. The follower skips the pre-vote, because the leader
+/// asking to be replaced is the one node whose permission it would otherwise
+/// need
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutNowRequest {
+    /// The leader's term, so a stale request from an earlier term is ignored
+    pub term: u64,
+    pub leader_id: NodeId,
+}
+
+impl TimeoutNowRequest {
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        put_u64(buf, self.term);
+        put_u64(buf, self.leader_id);
+    }
+
+    pub fn decode(c: &mut Cursor<'_>) -> Result<Self> {
+        Ok(Self {
+            term: c.u64()?,
+            leader_id: c.u64()?,
+        })
+    }
+}
+
+/// Whether the follower began campaigning
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutNowReply {
+    /// The follower's term after the request, one past the leader's when it
+    /// campaigned
+    pub term: u64,
+    pub started: bool,
+}
+
+impl TimeoutNowReply {
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        put_u64(buf, self.term);
+        put_bool(buf, self.started);
+    }
+
+    pub fn decode(c: &mut Cursor<'_>) -> Result<Self> {
+        Ok(Self {
+            term: c.u64()?,
+            started: c.bool()?,
+        })
+    }
+}
+
 /// Asks a peer for its vote, or asks whether it would give one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestVoteRequest {
@@ -113,6 +163,9 @@ pub struct RequestVoteRequest {
     pub last_log_term: u64,
     /// True while the candidate is only asking whether it could win
     pub pre_vote: bool,
+    /// True when the leader itself asked this candidate to take over, which
+    /// is the one election a voter that still hears its leader grants
+    pub transfer: bool,
 }
 
 impl RequestVoteRequest {
@@ -122,6 +175,7 @@ impl RequestVoteRequest {
         put_u64(buf, self.last_log_index);
         put_u64(buf, self.last_log_term);
         put_bool(buf, self.pre_vote);
+        put_bool(buf, self.transfer);
     }
 
     pub fn decode(c: &mut Cursor<'_>) -> Result<Self> {
@@ -131,6 +185,10 @@ impl RequestVoteRequest {
             last_log_index: c.u64()?,
             last_log_term: c.u64()?,
             pre_vote: c.bool()?,
+            // the flag trails the fixed fields so a build without it reads
+            // the request it knows and a build with it reads its absence as
+            // an ordinary election
+            transfer: if c.is_empty() { false } else { c.bool()? },
         })
     }
 }
@@ -259,6 +317,7 @@ mod tests {
             last_log_index: 40,
             last_log_term: 8,
             pre_vote: true,
+            transfer: true,
         };
         let mut buf = Vec::new();
         req.encode(&mut buf);

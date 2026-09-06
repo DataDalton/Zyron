@@ -1414,7 +1414,7 @@ async fn test_checkpoint_round_trip_1m() {
             0,
             checkpoint_dir.clone(),
             CheckpointConfig {
-                fsync: false,
+                fsync: true,
                 ..CheckpointConfig::default()
             },
         )
@@ -1555,7 +1555,7 @@ async fn test_checkpoint_corrupt_fallback() {
         0,
         checkpoint_dir.clone(),
         CheckpointConfig {
-            fsync: false,
+            fsync: true,
             ..CheckpointConfig::default()
         },
     )
@@ -1644,7 +1644,7 @@ async fn test_recovery_with_checkpoint() {
                 0,
                 checkpoint_dir.clone(),
                 CheckpointConfig {
-                    fsync: false,
+                    fsync: true,
                     ..CheckpointConfig::default()
                 },
             )
@@ -2036,7 +2036,7 @@ fn test_checkpoint_trigger_adaptive() {
         wal_bytes_threshold: 1024 * 1024, // 1 MB
         max_interval_secs: 60,
         min_interval_secs: 0, // Disable min interval for this sub-test
-        fsync: false,
+        fsync: true,
     };
     let mut trigger = CheckpointTrigger::new(config);
     let mut wal_bytes: u64 = 0;
@@ -2070,7 +2070,7 @@ fn test_checkpoint_trigger_adaptive() {
         wal_bytes_threshold: 0, // Would always trigger on bytes alone
         max_interval_secs: 3600,
         min_interval_secs: 999, // 999 seconds, will block
-        fsync: false,
+        fsync: true,
     };
     let trigger = CheckpointTrigger::new(config);
     assert!(
@@ -2085,7 +2085,7 @@ fn test_checkpoint_trigger_adaptive() {
         wal_bytes_threshold: u64::MAX,
         max_interval_secs: u64::MAX,
         min_interval_secs: 0,
-        fsync: false,
+        fsync: true,
     };
     let trigger = CheckpointTrigger::new(config);
 
@@ -2144,7 +2144,7 @@ async fn test_graceful_shutdown_checkpoint() {
                 0,
                 checkpoint_dir.clone(),
                 CheckpointConfig {
-                    fsync: false,
+                    fsync: true,
                     ..CheckpointConfig::default()
                 },
             )
@@ -2271,7 +2271,7 @@ async fn test_checkpoint_scale_10m() {
             0,
             checkpoint_dir.clone(),
             CheckpointConfig {
-                fsync: false,
+                fsync: true,
                 ..CheckpointConfig::default()
             },
         )
@@ -2441,6 +2441,12 @@ async fn test_checkpoint_scale_10m() {
         recovery_result.average,
         RECOVERY_SCALE_TARGET_MS
     );
+
+    // Per-phase wall-clock breakdown of the write and the load, which is what
+    // says whether a checkpoint is bound by the copy, the checksum or the
+    // device. Compiled in by --features profile, gated at runtime by
+    // ZYRON_PROFILE.
+    zyron_common::profile::dump("checkpoint 10M keys");
 }
 
 // =============================================================================

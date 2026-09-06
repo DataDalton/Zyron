@@ -125,9 +125,22 @@ pub fn try_handle_ddl_utility<'a>(
         Statement::ListRegistry(s) => {
             Box::pin(async move { Some(crate::format_dispatch::handle_list_registry(s)) })
         }
-        Statement::TriggerUpgrade(s) => {
-            Box::pin(async move { Some(crate::format_dispatch::handle_trigger_upgrade(s)) })
-        }
+        Statement::TriggerUpgrade(s) => Box::pin(async move {
+            let actor = session.as_ref().map(|s| s.user.clone()).unwrap_or_default();
+            Some(crate::format_dispatch::handle_trigger_upgrade(
+                s,
+                server.upgrade_control.as_deref(),
+                &actor,
+            ))
+        }),
+        Statement::AcknowledgeUpgradeRewrites(s) => Box::pin(async move {
+            let actor = session.as_ref().map(|s| s.user.clone()).unwrap_or_default();
+            Some(crate::format_dispatch::handle_acknowledge_upgrade_rewrites(
+                s,
+                server.upgrade_control.as_deref(),
+                &actor,
+            ))
+        }),
         Statement::ShowUpgrade(s) => {
             Box::pin(async move { Some(crate::format_dispatch::handle_show_upgrade(s)) })
         }

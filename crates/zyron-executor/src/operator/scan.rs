@@ -262,6 +262,7 @@ impl SeqScanOperator {
 impl Operator for SeqScanOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         Box::pin(async move {
+            let _scan = zyron_common::profile::scope(zyron_common::profile::Phase::ExecSeqScanNext);
             if self.finished {
                 return Ok(None);
             }
@@ -645,7 +646,7 @@ pub struct ParallelSeqScanOperator {
     /// returning Err through the channel) is detected as an error instead of
     /// being mistaken for clean end-of-stream, which would silently truncate
     /// the result set.
-    workers: Vec<tokio::task::JoinHandle<()>>,
+    workers: Vec<crate::parallel_pool::JoinHandle<()>>,
     /// Parallel work permits held for as long as the workers run. Dropping
     /// this hands the machine's capacity back to whatever query asks next
     _grant: crate::parallel_pool::DopGrant,
@@ -668,34 +669,31 @@ impl ParallelSeqScanOperator {
             stats.record_seq_scan();
         }
 
-        // The page count is the split the data supports. What the machine can
-        // currently afford is a different question, and the pool answers it:
-        // a scan planned while fifty others are running is handed fewer
-        // workers than the same scan on an idle node
-        let natural_workers = (num_pages as usize).max(1);
+        // The page count bounds the split the data supports, at a floor of
+        // work per worker below which the wake costs more than the work.
+        // What the machine can currently afford is a different question,
+        // and the pool answers it: a scan planned while fifty others are
+        // running is handed fewer workers than the same scan on an idle node
+        let natural_workers = parallel_workers_for_pages(num_pages);
         let grant = crate::parallel_pool::reserve(natural_workers);
         let num_workers = grant.workers().min(natural_workers).max(1);
-
-        let pages_per_worker = num_pages.div_ceil(num_workers as u64);
 
         // Channel capacity: 2 batches per worker to keep workers busy
         // without unbounded buffering.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<DataBatch>>(num_workers * 2);
 
+        // Every worker claims runs of pages from one cursor rather than
+        // owning a fixed slice, so the scan ends when the pages run out
+        // and not when the slowest worker finishes its share
+        let claims = Arc::new(PageClaims::new(0, num_pages));
         let mut workers = Vec::with_capacity(num_workers);
-        for worker_id in 0..num_workers {
-            let start_page = worker_id as u64 * pages_per_worker;
-            let end_page = ((worker_id as u64 + 1) * pages_per_worker).min(num_pages);
-
-            if start_page >= end_page {
-                continue;
-            }
-
+        for _ in 0..num_workers {
             let tx = tx.clone();
             let ctx = ctx.clone();
             let table_entry = table_entry.clone();
             let columns = columns.clone();
             let predicate = predicate.clone();
+            let claims = Arc::clone(&claims);
 
             // The shared pool, not the current runtime. On the serving path
             // the current runtime drives one connection, so spawning there
@@ -707,8 +705,7 @@ impl ParallelSeqScanOperator {
                     &table_entry,
                     &columns,
                     predicate.as_ref(),
-                    start_page,
-                    end_page,
+                    claims,
                     &tx,
                 )
                 .await;
@@ -729,25 +726,75 @@ impl ParallelSeqScanOperator {
     }
 }
 
-/// Scans a contiguous range of pages, decodes visible tuples, applies
-/// the predicate filter, and sends result batches through the channel.
+/// Pages of a heap file below which one more worker is not worth waking.
+///
+/// Waking a parked pool thread costs about ten microseconds on the
+/// spawner's side and the thread starts some tens of microseconds later,
+/// against a few microseconds of decode per page. Thirty two pages is a
+/// few hundred microseconds of work, enough that the wake is a small part
+/// of it
+pub(crate) const PARALLEL_SCAN_MIN_PAGES_PER_WORKER: u64 = 32;
+
+/// Pages a worker takes from the shared cursor at a time.
+///
+/// Small enough that the tail of the scan is spread evenly over the
+/// workers still running, large enough that the claim is a negligible
+/// share of the work it hands over
+pub(crate) const PARALLEL_SCAN_CLAIM_PAGES: u64 = 8;
+
+/// Workers a heap scan of `num_pages` pages naturally splits into
+pub(crate) fn parallel_workers_for_pages(num_pages: u64) -> usize {
+    (num_pages
+        .div_ceil(PARALLEL_SCAN_MIN_PAGES_PER_WORKER)
+        .max(1)) as usize
+}
+
+/// Pages the workers of one fan-out claim as they go.
+///
+/// A worker that owns a fixed slice of the table sets the scan's wall
+/// time when it is the slow one, and on a machine with two kinds of core
+/// one of them always is. Claiming runs from a shared cursor means a fast
+/// worker takes more of the table, a slow one less, and a worker whose
+/// thread started late finds less left rather than holding a share the
+/// others cannot touch
+pub(crate) struct PageClaims {
+    next: std::sync::atomic::AtomicU64,
+    end: u64,
+}
+
+impl PageClaims {
+    pub(crate) fn new(start: u64, end: u64) -> Self {
+        Self {
+            next: std::sync::atomic::AtomicU64::new(start),
+            end,
+        }
+    }
+
+    /// The next run of up to `chunk` pages, None once every page is taken
+    fn claim(&self, chunk: u64) -> Option<(u64, u64)> {
+        let start = self
+            .next
+            .fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+        if start >= self.end {
+            return None;
+        }
+        Some((start, start.saturating_add(chunk).min(self.end)))
+    }
+}
+
+/// Scans pages claimed from the shared cursor, decodes visible tuples,
+/// applies the predicate filter, and sends result batches through the
+/// channel.
 async fn scan_page_range(
     ctx: &ExecutionContext,
     table_entry: &TableEntry,
     output_columns: &[LogicalColumn],
     predicate: Option<&BoundExpr>,
-    start_page: u64,
-    end_page: u64,
+    claims: Arc<PageClaims>,
     tx: &tokio::sync::mpsc::Sender<Result<DataBatch>>,
 ) -> Result<()> {
-    let mut scanner = PageRangeScanner::new(
-        ctx,
-        table_entry,
-        output_columns,
-        predicate,
-        start_page,
-        end_page,
-    );
+    let mut scanner =
+        PageRangeScanner::claiming(ctx, table_entry, output_columns, predicate, claims);
     while let Some(batch) = scanner.next_batch().await? {
         if tx.send(Ok(batch)).await.is_err() {
             break;
@@ -756,9 +803,10 @@ async fn scan_page_range(
     Ok(())
 }
 
-/// Pull-based scanner over a contiguous page range. The single
-/// decode/visibility/count-only path shared by the parallel scan and the
-/// parallel aggregate, so both consume rows identically.
+/// Pull-based scanner over a page range, fixed or claimed run by run from
+/// a shared cursor. The single decode/visibility/count-only path shared by
+/// the parallel scan and the parallel aggregate, so both consume rows
+/// identically.
 ///
 /// Count-only mirrors SeqScanOperator. When no columns are projected and no
 /// predicate filters rows, COUNT(*) needs only the visible-row count, so the
@@ -773,6 +821,9 @@ pub(crate) struct PageRangeScanner<'a> {
     count_only: bool,
     page_cursor: u64,
     end_page: u64,
+    /// Where the next run of pages comes from once the current one is
+    /// spent. None for a scanner given one fixed range
+    claims: Option<Arc<PageClaims>>,
     // Resume position within the current page when a batch fills mid-page.
     // Without this, slots after the break would be skipped because page_cursor
     // already advanced.
@@ -807,8 +858,43 @@ impl<'a> PageRangeScanner<'a> {
             count_only,
             page_cursor: start_page,
             end_page,
+            claims: None,
             slot_cursor: 0,
             io_stats,
+        }
+    }
+
+    /// A scanner over runs of pages claimed from a cursor shared with the
+    /// other workers of one fan-out
+    pub(crate) fn claiming(
+        ctx: &'a ExecutionContext,
+        table_entry: &'a TableEntry,
+        output_columns: &'a [LogicalColumn],
+        predicate: Option<&'a BoundExpr>,
+        claims: Arc<PageClaims>,
+    ) -> Self {
+        let mut scanner = Self::new(ctx, table_entry, output_columns, predicate, 0, 0);
+        scanner.claims = Some(claims);
+        scanner
+    }
+
+    /// Whether a page remains to read, claiming the next run from the
+    /// shared cursor when the current one is spent
+    fn page_pending(&mut self) -> bool {
+        if self.page_cursor < self.end_page {
+            return true;
+        }
+        let Some(claims) = &self.claims else {
+            return false;
+        };
+        match claims.claim(PARALLEL_SCAN_CLAIM_PAGES) {
+            Some((start, end)) => {
+                self.page_cursor = start;
+                self.end_page = end;
+                self.slot_cursor = 0;
+                true
+            }
+            None => false,
         }
     }
 
@@ -816,7 +902,7 @@ impl<'a> PageRangeScanner<'a> {
     pub(crate) async fn next_batch(&mut self) -> Result<Option<DataBatch>> {
         let batch_size = self.ctx.batch_size;
 
-        while self.page_cursor < self.end_page {
+        while self.page_pending() {
             self.ctx.check_cancelled()?;
 
             let mut builders =
@@ -826,7 +912,7 @@ impl<'a> PageRangeScanner<'a> {
             // when the batch is done rather than once per page.
             let mut pages_read: u64 = 0;
 
-            while row_count < batch_size && self.page_cursor < self.end_page {
+            while row_count < batch_size && self.page_pending() {
                 let page_id = self.ctx.resolve_branch_page(
                     self.ctx.active_branch_id,
                     PageId::new(self.table_entry.heap_file_id, self.page_cursor),
@@ -930,6 +1016,8 @@ impl<'a> PageRangeScanner<'a> {
 impl Operator for ParallelSeqScanOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         Box::pin(async move {
+            let _scan =
+                zyron_common::profile::scope(zyron_common::profile::Phase::ExecParallelScanNext);
             if self.finished {
                 return Ok(None);
             }
@@ -1856,5 +1944,71 @@ impl IndexScanState {
         } else {
             Ok(Some(ExecutionBatch::new(batch)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every page is handed out exactly once, in runs of the chunk size
+    /// with the last one clipped to the end, and the cursor answers None
+    /// forever after
+    #[test]
+    fn page_claims_cover_the_range_once() {
+        let claims = PageClaims::new(3, 30);
+        let mut runs = Vec::new();
+        while let Some(run) = claims.claim(8) {
+            runs.push(run);
+        }
+        assert_eq!(runs, vec![(3, 11), (11, 19), (19, 27), (27, 30)]);
+        assert_eq!(claims.claim(8), None);
+        assert_eq!(claims.claim(1), None);
+    }
+
+    #[test]
+    fn an_empty_range_claims_nothing() {
+        let claims = PageClaims::new(5, 5);
+        assert_eq!(claims.claim(8), None);
+    }
+
+    /// Two claimers over one cursor split the pages between them without
+    /// either seeing a page the other took
+    #[test]
+    fn claims_from_several_workers_never_overlap() {
+        let claims = Arc::new(PageClaims::new(0, 1000));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let claims = Arc::clone(&claims);
+                std::thread::spawn(move || {
+                    let mut mine = Vec::new();
+                    while let Some((start, end)) = claims.claim(PARALLEL_SCAN_CLAIM_PAGES) {
+                        mine.extend(start..end);
+                    }
+                    mine
+                })
+            })
+            .collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("claimer"))
+            .collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..1000).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn worker_count_follows_the_work_floor() {
+        assert_eq!(parallel_workers_for_pages(0), 1);
+        assert_eq!(parallel_workers_for_pages(1), 1);
+        assert_eq!(
+            parallel_workers_for_pages(PARALLEL_SCAN_MIN_PAGES_PER_WORKER),
+            1
+        );
+        assert_eq!(
+            parallel_workers_for_pages(PARALLEL_SCAN_MIN_PAGES_PER_WORKER + 1),
+            2
+        );
+        assert_eq!(parallel_workers_for_pages(400), 13);
     }
 }

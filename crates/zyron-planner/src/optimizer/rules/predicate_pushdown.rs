@@ -424,7 +424,7 @@ fn collect_table_indices_recursive(plan: &LogicalPlan, out: &mut Vec<usize>) {
 }
 
 /// Collects all column references in an expression.
-pub(crate) fn collect_column_refs(expr: &BoundExpr) -> Vec<ColumnRef> {
+pub fn collect_column_refs(expr: &BoundExpr) -> Vec<ColumnRef> {
     let mut refs = Vec::new();
     collect_column_refs_recursive(expr, &mut refs);
     refs

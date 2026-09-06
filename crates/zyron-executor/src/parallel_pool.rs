@@ -19,19 +19,144 @@
 //! capped at what the machine has. A query that cannot get permits runs its
 //! operator serially rather than queueing, which keeps parallelism
 //! opportunistic and makes nesting deadlock-free.
+//!
+//! The threads are the pool's own rather than a multi-thread runtime's,
+//! because of how such a runtime starts a fan-out. It wakes one parked
+//! worker per notification and lets that worker wake the next once it has
+//! found work, so twenty four tasks spawned at once start one at a time,
+//! about twenty microseconds apart, and the last begins four hundred
+//! microseconds after the first. A scan whose workers each hold a hundred
+//! microseconds of work spent most of its wall time on that ladder. Here
+//! every spawn wakes one distinct sleeping thread, so a fan-out of N wakes
+//! N threads at once and they all start together.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 
 use zyron_pressure::pressure::ParallelCapacity;
 
+/// One unit of work queued for a pool thread, a future that has already
+/// wrapped its own result delivery
+type Job = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// What the worker threads share, the queue they take jobs from and the
+/// signal that a job arrived
+struct Shared {
+    queue: parking_lot::Mutex<VecDeque<Job>>,
+    /// Signalled once per spawn and again by each worker that takes a job
+    /// while more are queued. A condition variable wakes one distinct
+    /// waiter per signal, so the wake spreads as a tree rather than one
+    /// thread at a time from the spawner
+    available: parking_lot::Condvar,
+    /// Jobs pushed and not yet taken, read without the lock to decide
+    /// whether a wake is worth issuing
+    queued: AtomicUsize,
+    /// Threads waiting on the condition variable. A signal with nobody
+    /// parked is a system call that wakes no one, so it is skipped
+    parked: AtomicUsize,
+    /// Set when the pool is dropped, so a test pool's threads leave once the
+    /// queue is empty rather than waiting forever
+    shutdown: AtomicBool,
+}
+
+impl Shared {
+    /// Wakes one parked thread, when there is one to wake
+    fn wake_one(&self) {
+        if self.parked.load(Ordering::Acquire) > 0 {
+            self.available.notify_one();
+        }
+    }
+
+    /// Takes the next job, parking until one arrives. None once the pool
+    /// is shutting down and nothing is queued.
+    ///
+    /// A worker that finds more work still queued wakes two more parked
+    /// threads on its way out. Waking a parked thread costs the caller
+    /// several microseconds, so a fan-out woken from the spawner alone
+    /// starts its last worker hundreds of microseconds after its first,
+    /// and each woken worker waking two more brings that down to a few
+    /// levels of the tree
+    fn take(&self) -> Option<Job> {
+        let mut queue = self.queue.lock();
+        let job = loop {
+            if let Some(job) = queue.pop_front() {
+                break job;
+            }
+            if self.shutdown.load(Ordering::Acquire) {
+                return None;
+            }
+            self.parked.fetch_add(1, Ordering::AcqRel);
+            self.available.wait(&mut queue);
+            self.parked.fetch_sub(1, Ordering::AcqRel);
+        };
+        drop(queue);
+        if self.queued.fetch_sub(1, Ordering::AcqRel) > 1 {
+            self.wake_one();
+            self.wake_one();
+        }
+        Some(job)
+    }
+}
+
 /// Shared parallel work pool. One per process.
 pub struct ParallelPool {
-    runtime: tokio::runtime::Runtime,
+    shared: Arc<Shared>,
     /// Where the budget is accounted. Owned by zyron-common so the planner,
     /// which sits below this crate, reads the same number the executor spends
     capacity: &'static ParallelCapacity,
     tasks_spawned: AtomicU64,
+}
+
+/// The result of one spawned job, ready when the job has finished.
+///
+/// Resolves to an error only when the job panicked, which drops its result
+/// channel without a value. A job that ran to completion always delivers
+pub struct JoinHandle<T> {
+    result: tokio::sync::oneshot::Receiver<T>,
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.result)
+            .poll(cx)
+            .map(|received| received.map_err(|_| JoinError))
+    }
+}
+
+/// A spawned job ended without delivering a result, which happens only
+/// when it panicked
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinError;
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("parallel worker panicked")
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+/// Body of one pool thread. Takes jobs off the queue and runs each on this
+/// thread's own single-threaded runtime, so a job may await the page reads
+/// and channel sends it needs to. A panic inside a job ends that job alone,
+/// its result channel drops and the join reports it, and the thread goes
+/// back for the next
+fn run_worker(shared: Arc<Shared>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("parallel worker runtime");
+    while let Some(job) = shared.take() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(job);
+        }));
+    }
 }
 
 static POOL: OnceLock<ParallelPool> = OnceLock::new();
@@ -80,22 +205,26 @@ impl ParallelPool {
     fn build(config: ParallelPoolConfig, capacity: &'static ParallelCapacity) -> Self {
         let worker_threads = config.worker_threads.max(1);
         let permits = config.permits.max(1);
+        let shared = Arc::new(Shared {
+            queue: parking_lot::Mutex::new(VecDeque::new()),
+            available: parking_lot::Condvar::new(),
+            queued: AtomicUsize::new(0),
+            parked: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        });
         // Numbered rather than a fixed name: the names are how a profile and
         // the parallelism tests tell one pool thread from another, and a
         // shared name makes every thread look like the same thread
-        let next_thread = std::sync::atomic::AtomicUsize::new(0);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name_fn(move || {
-                let id = next_thread.fetch_add(1, Ordering::Relaxed);
-                format!("zyron-parallel-{id}")
-            })
-            .enable_all()
-            .build()
-            .expect("parallel work pool runtime");
+        for id in 0..worker_threads {
+            let shared = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name(format!("zyron-parallel-{id}"))
+                .spawn(move || run_worker(shared))
+                .expect("parallel work pool thread");
+        }
         capacity.set_total(permits as u32);
         Self {
-            runtime,
+            shared,
             capacity,
             tasks_spawned: AtomicU64::new(0),
         }
@@ -117,11 +246,6 @@ impl ParallelPool {
                 ParallelCapacity::global(),
             )
         })
-    }
-
-    /// Handle for spawning onto the pool's threads.
-    pub fn handle(&self) -> &tokio::runtime::Handle {
-        self.runtime.handle()
     }
 
     /// The shared account this pool spends against.
@@ -200,13 +324,30 @@ impl ParallelPool {
     /// The distinction from `tokio::spawn` is the whole point: spawn resolves
     /// to whatever runtime is current, and on the serving path that is a
     /// single-threaded one, so the work would interleave on one core.
-    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    ///
+    /// Each spawn signals the queue once, which wakes one sleeping thread
+    /// that no earlier signal already claimed, and the woken threads wake
+    /// more while jobs remain queued
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
-        F: std::future::Future + Send + 'static,
+        F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         self.tasks_spawned.fetch_add(1, Ordering::Relaxed);
-        self.runtime.spawn(future)
+        let (deliver, result) = tokio::sync::oneshot::channel();
+        let job: Job = Box::pin(async move {
+            let output = future.await;
+            let _ = deliver.send(output);
+        });
+        {
+            // Counted under the lock, so a worker that pops this job has
+            // seen the count rise before it lowers it
+            let mut queue = self.shared.queue.lock();
+            queue.push_back(job);
+            self.shared.queued.fetch_add(1, Ordering::AcqRel);
+        }
+        self.shared.wake_one();
+        JoinHandle { result }
     }
 
     pub fn tasks_spawned(&self) -> u64 {
@@ -223,6 +364,15 @@ impl ParallelPool {
 
     pub fn requests_trimmed(&self) -> u64 {
         self.capacity.trimmed_total()
+    }
+}
+
+impl Drop for ParallelPool {
+    /// Lets the threads leave once the queue drains. The process pool lives
+    /// as long as the process, this is for a pool a test built
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.available.notify_all();
     }
 }
 
@@ -288,9 +438,9 @@ pub fn reserve(natural: usize) -> DopGrant {
 }
 
 /// Spawns one parallel worker onto the shared pool.
-pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
-    F: std::future::Future + Send + 'static,
+    F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     ParallelPool::global().spawn(future)

@@ -268,6 +268,22 @@ fn push_as_of(details: &mut Vec<(String, String)>, as_of: &Option<crate::logical
     }
 }
 
+/// The aggregates a metadata pushdown answers, in the order they are
+/// returned, so a plan says which ones the statistics settled
+fn meta_agg_names(specs: &[crate::physical::MetaAggSpec]) -> String {
+    specs
+        .iter()
+        .map(|s| match s.kind {
+            crate::physical::MetaAggKind::CountStar => "count(*)",
+            crate::physical::MetaAggKind::CountCol => "count(col)",
+            crate::physical::MetaAggKind::Min => "min(col)",
+            crate::physical::MetaAggKind::Max => "max(col)",
+            crate::physical::MetaAggKind::Sum => "sum(col)",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl ExplainNode {
     /// Builds an ExplainNode tree from a PhysicalPlan.
     pub fn from_physical_plan(plan: &PhysicalPlan) -> Self {
@@ -473,24 +489,33 @@ impl ExplainNode {
                 specs,
                 cost,
                 ..
+            } => Self {
+                operator_name: "ColumnarMetadataAggregate".to_string(),
+                details: vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("aggs".to_string(), meta_agg_names(specs)),
+                    ("source".to_string(), "segment-headers+heap".to_string()),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: Vec::new(),
+            },
+            PhysicalPlan::LakeMetadataAggregate {
+                table_id,
+                specs,
+                as_of,
+                cost,
+                ..
             } => {
-                let aggs = specs
-                    .iter()
-                    .map(|s| match s.kind {
-                        crate::physical::MetaAggKind::CountStar => "count(*)".to_string(),
-                        crate::physical::MetaAggKind::CountCol => "count(col)".to_string(),
-                        crate::physical::MetaAggKind::Min => "min(col)".to_string(),
-                        crate::physical::MetaAggKind::Max => "max(col)".to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let mut details = vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("aggs".to_string(), meta_agg_names(specs)),
+                    ("source".to_string(), "manifest-statistics".to_string()),
+                ];
+                push_as_of(&mut details, as_of);
                 Self {
-                    operator_name: "ColumnarMetadataAggregate".to_string(),
-                    details: vec![
-                        ("table_id".to_string(), format!("{}", table_id.0)),
-                        ("aggs".to_string(), aggs),
-                        ("source".to_string(), "segment-headers+heap".to_string()),
-                    ],
+                    operator_name: "LakeMetadataAggregate".to_string(),
+                    details,
                     estimated_cost: Some(*cost),
                     actual_metrics: None,
                     children: Vec::new(),

@@ -2,6 +2,7 @@
 //!
 //! This crate provides shared definitions used across all Zyron components.
 
+pub mod admission;
 pub mod array_value;
 pub mod checksum;
 pub mod cluster;
@@ -15,6 +16,7 @@ pub mod foreign;
 pub mod format;
 pub mod interval;
 pub mod io_stats;
+pub mod live_metrics;
 pub mod nested_value;
 pub mod node;
 pub mod obs_metrics;
@@ -26,6 +28,7 @@ pub mod storage_tier;
 pub mod types;
 pub mod zerocopy;
 
+pub use admission::{Admission, InFlightCounts, InFlightGuard};
 pub use array_value::ArrayView;
 pub use checksum::{
     ALGORITHM_VERSION, FX_K, HASH_GOLDEN, Hasher, HotHasher, IdentityBuildHasher, IdentityHasher,
@@ -57,6 +60,7 @@ pub use interval::{
     parse_timestamp_micros, ymd_from_days,
 };
 pub use io_stats::{IndexIOStats, IndexIOStatsRegistry, TableIOStats, TableIOStatsRegistry};
+pub use live_metrics::{LatencyHistogram, QueryMetrics};
 pub use nested_value::{MapView, StructView};
 pub use node::{
     IDENTITY_FILE, NodeIdentity, PEERS_FILE, PeerEntry, PeerRegistry, peer_timestamp_us,

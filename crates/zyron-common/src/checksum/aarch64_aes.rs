@@ -52,7 +52,7 @@ unsafe fn v_to_u128(v: uint8x16_t) -> u128 {
 
 /// AES round matching x86's `_mm_aesenc_si128(state, key)` semantics:
 /// `MixColumns(ShiftRows(SubBytes(state))) XOR key`.
-#[inline(always)]
+#[inline]
 #[target_feature(enable = "aes,neon")]
 unsafe fn aes_round(state: uint8x16_t, key: uint8x16_t) -> uint8x16_t {
     let zero = u128_to_v(0);

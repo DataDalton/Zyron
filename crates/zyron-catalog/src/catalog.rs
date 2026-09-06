@@ -311,6 +311,12 @@ struct SystemCatalogIds {
 }
 
 impl Catalog {
+    /// The storage the catalog persists through, for the schema migration
+    /// runner that moves stored rows between versions
+    pub fn storage(&self) -> &Arc<dyn CatalogStorage> {
+        &self.storage
+    }
+
     /// Creates a new catalog. Bootstraps system tables on first init.
     pub async fn new(
         storage: Arc<dyn CatalogStorage>,

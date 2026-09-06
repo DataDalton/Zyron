@@ -1,19 +1,24 @@
 //! Hash-based distinct operator for duplicate elimination.
 //!
 //! Uses typed hashing and columnar storage for seen rows instead of
-//! HashSet<Vec<ScalarValue>>. Rows are hashed using compute::hash_row
-//! and stored in column builders for collision resolution via typed equality.
+//! HashSet<Vec<ScalarValue>>. Rows are hashed in batches and stored in
+//! column builders for collision resolution via typed equality, and found
+//! again through the flat chained index the aggregate keeps its groups in.
 
 use crate::column::Column;
-use crate::compute::{self, PreHashMap};
+use crate::compute;
+use crate::operator::aggregate::GroupIndex;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
+
+/// Rows ahead of the one being checked whose bucket is prefetched
+const SEEN_PREFETCH_DISTANCE: usize = 16;
 
 /// Eliminates duplicate rows using typed hash-based deduplication.
 /// Stores seen rows in columnar format for collision resolution.
 pub struct HashDistinctOperator {
     child: Box<dyn Operator>,
-    /// Maps hash -> list of row indices in the seen_columns store.
-    seen_map: PreHashMap<u64, Vec<usize>>,
+    /// Where a seen row is found from its hash
+    index: GroupIndex,
     /// Columnar storage of all distinct rows seen so far.
     seen_columns: Vec<Column>,
     seen_count: usize,
@@ -24,7 +29,7 @@ impl HashDistinctOperator {
     pub fn new(child: Box<dyn Operator>) -> Self {
         Self {
             child,
-            seen_map: PreHashMap::default(),
+            index: GroupIndex::new(),
             seen_columns: Vec::new(),
             seen_count: 0,
             initialized: false,
@@ -67,44 +72,26 @@ impl Operator for HashDistinctOperator {
                 let mut mask = Vec::with_capacity(num_rows);
 
                 for row in 0..num_rows {
-                    let hash = hashes[row];
-                    let candidates = self.seen_map.entry(hash).or_default();
-
-                    let mut found = false;
-                    for &seen_idx in candidates.iter() {
-                        // Compare batch row vs seen_columns[seen_idx].
-                        let mut eq = true;
-                        for ci in 0..num_cols {
-                            let a_null = batch.columns[ci].is_null(row);
-                            let b_null = self.seen_columns[ci].is_null(seen_idx);
-                            if a_null != b_null {
-                                eq = false;
-                                break;
-                            }
-                            if a_null {
-                                continue;
-                            }
-                            if !column_values_equal_cross(
-                                &batch.columns[ci].data,
-                                row,
-                                &self.seen_columns[ci].data,
-                                seen_idx,
-                            ) {
-                                eq = false;
-                                break;
-                            }
-                        }
-                        if eq {
-                            found = true;
-                            break;
-                        }
+                    // The hashes are all in hand, so the bucket a later row
+                    // needs is fetched while this one is compared
+                    let ahead = row + SEEN_PREFETCH_DISTANCE;
+                    if ahead < num_rows {
+                        self.index.prefetch(hashes[ahead]);
                     }
+                    let hash = hashes[row];
+                    let seen_columns = &self.seen_columns;
+                    let found = self
+                        .index
+                        .find(hash, |seen_idx| {
+                            seen_row_equals(batch, row, seen_columns, seen_idx, num_cols)
+                        })
+                        .is_some();
 
                     if found {
                         mask.push(false);
                     } else {
                         // Add to seen store.
-                        candidates.push(self.seen_count);
+                        self.index.insert(hash);
                         for ci in 0..num_cols {
                             self.seen_columns[ci].push_row_from(&batch.columns[ci], row);
                         }
@@ -122,6 +109,37 @@ impl Operator for HashDistinctOperator {
             }
         })
     }
+}
+
+/// Whether a batch row equals a stored row, two NULLs counting as equal
+/// the way DISTINCT reads them
+#[inline]
+fn seen_row_equals(
+    batch: &crate::batch::DataBatch,
+    row: usize,
+    seen_columns: &[Column],
+    seen_idx: usize,
+    num_cols: usize,
+) -> bool {
+    for ci in 0..num_cols {
+        let a_null = batch.columns[ci].is_null(row);
+        let b_null = seen_columns[ci].is_null(seen_idx);
+        if a_null != b_null {
+            return false;
+        }
+        if a_null {
+            continue;
+        }
+        if !column_values_equal_cross(
+            &batch.columns[ci].data,
+            row,
+            &seen_columns[ci].data,
+            seen_idx,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Compares values at different indices across two ColumnData instances of the same type.

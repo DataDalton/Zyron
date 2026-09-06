@@ -21,7 +21,7 @@ pub mod encoding_pushdown;
 mod index_advisor;
 mod join_reorder;
 pub mod parallel_plan;
-mod predicate_pushdown;
+pub mod predicate_pushdown;
 mod projection_pushdown;
 
 pub use constant_folding::ConstantFolding;

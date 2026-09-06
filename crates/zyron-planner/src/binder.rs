@@ -1671,7 +1671,13 @@ fn for_each_ref_in_from(item: &BoundFromItem, f: &mut dyn FnMut(&ColumnRef)) {
     }
 }
 
-fn for_each_ref_in_bound_expr(expr: &BoundExpr, f: &mut dyn FnMut(&ColumnRef)) {
+/// Every column reference in one expression, including those inside any
+/// subquery it holds.
+///
+/// Public because deciding which side of a correlation an expression sits
+/// on is the same question, and answering it with a second walker would be
+/// a second chance to miss a variant
+pub fn for_each_ref_in_bound_expr(expr: &BoundExpr, f: &mut dyn FnMut(&ColumnRef)) {
     match expr {
         BoundExpr::ColumnRef(cr) => f(cr),
         BoundExpr::Literal { .. } | BoundExpr::Parameter { .. } => {}

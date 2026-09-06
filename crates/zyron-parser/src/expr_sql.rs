@@ -172,7 +172,7 @@ pub fn expr_to_sql(e: &Expr) -> String {
 /// a persisted default or CHECK constraint round-trips. The match is exhaustive:
 /// adding a DataType variant is a compile error here rather than a silent
 /// debug-form rendering that fails to re-parse.
-fn data_type_to_sql(dt: &crate::ast::DataType) -> String {
+pub(crate) fn data_type_to_sql(dt: &crate::ast::DataType) -> String {
     use crate::ast::DataType as D;
     match dt {
         D::Boolean => "BOOLEAN".to_string(),

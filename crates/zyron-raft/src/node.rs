@@ -24,12 +24,13 @@
 //! on the disk, an AppendEntries reply and a proposal, wait on a published
 //! watermark rather than on the lock.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use zyron_common::error::{Result, ZyronError};
 
@@ -93,6 +94,10 @@ pub struct RaftMetrics {
     pub snapshot_bytes_sent: u64,
     pub snapshot_bytes_received: u64,
     pub proposals: u64,
+    /// Flushes the log writer has made to stable storage
+    pub log_fsyncs: u64,
+    /// The longest one of them took, in microseconds
+    pub log_fsync_max_us: u64,
 }
 
 struct RaftInner {
@@ -117,6 +122,13 @@ struct RaftInner {
     applied_tx: watch::Sender<u64>,
     round_tx: watch::Sender<u64>,
     role_tx: watch::Sender<(RaftRole, u64, Option<NodeId>)>,
+    /// Proposals waiting for the commit index to reach their entry.
+    ///
+    /// Taken after the consensus lock, never before it, wherever both are
+    /// held. A registration takes it alone
+    commit_waiters: parking_lot::Mutex<IndexWaiters>,
+    /// Reads waiting for the applied index to reach their read index
+    applied_waiters: parking_lot::Mutex<IndexWaiters>,
 
     shutdown: Arc<tokio::sync::Notify>,
     running: AtomicBool,
@@ -128,6 +140,126 @@ struct RaftInner {
     snapshot_bytes_received: AtomicU64,
     proposals: AtomicU64,
     directory_version: AtomicU64,
+}
+
+/// Tasks waiting for a watermark, the commit index or the applied index, to
+/// reach an index of theirs.
+///
+/// Keyed by index, so an advance wakes the waiters it satisfies and nobody
+/// else. A shared watch wakes every waiter on every advance, and under
+/// hundreds of outstanding proposals that is a herd of tasks re-arming
+/// timers and taking the consensus lock to learn that nothing changed for
+/// them.
+///
+/// Waiters are taken out under a lock and answered after it is released.
+/// Answering one schedules a task, and a commit advance under load answers
+/// a hundred of them, which is longer than the consensus lock may be held
+#[derive(Default)]
+struct IndexWaiters {
+    by_index: BTreeMap<u64, Vec<IndexWaiter>>,
+    next_ticket: u64,
+}
+
+struct IndexWaiter {
+    /// Tells a waiter that gave up apart from the others at its index
+    ticket: u64,
+    /// The term the waiter's entry was proposed under, zero when the entry's
+    /// identity does not matter to it
+    term: u64,
+    tx: oneshot::Sender<Result<()>>,
+}
+
+/// A waiter taken out of the registry with the verdict it is owed
+type Answer = (oneshot::Sender<Result<()>>, Result<()>);
+
+/// Delivers verdicts, after every lock they were decided under is released
+fn answer(answers: Vec<Answer>) {
+    for (tx, verdict) in answers {
+        let _ = tx.send(verdict);
+    }
+}
+
+impl IndexWaiters {
+    fn register(&mut self, index: u64, term: u64) -> (u64, oneshot::Receiver<Result<()>>) {
+        let (tx, rx) = oneshot::channel();
+        self.next_ticket += 1;
+        let ticket = self.next_ticket;
+        self.by_index
+            .entry(index)
+            .or_default()
+            .push(IndexWaiter { ticket, term, tx });
+        (ticket, rx)
+    }
+
+    /// Drops a waiter that stopped waiting, so a proposal that timed out
+    /// does not sit here until its index commits
+    fn forget(&mut self, index: u64, ticket: u64) {
+        if let Some(waiters) = self.by_index.get_mut(&index) {
+            waiters.retain(|waiter| waiter.ticket != ticket);
+            if waiters.is_empty() {
+                self.by_index.remove(&index);
+            }
+        }
+    }
+
+    fn first_index(&self) -> Option<u64> {
+        self.by_index.keys().next().copied()
+    }
+
+    /// Takes every waiter at or below the mark out, with the verdict for its
+    /// index and the term it proposed under
+    fn take_up_to(&mut self, mark: u64, verdict: impl Fn(u64, u64) -> Result<()>) -> Vec<Answer> {
+        match self.first_index() {
+            Some(first) if first <= mark => {}
+            _ => return Vec::new(),
+        }
+        let later = self.by_index.split_off(&(mark + 1));
+        let ready = std::mem::replace(&mut self.by_index, later);
+        let mut answers = Vec::new();
+        for (index, waiters) in ready {
+            for waiter in waiters {
+                answers.push((waiter.tx, verdict(index, waiter.term)));
+            }
+        }
+        answers
+    }
+
+    /// Keeps the waiters the predicate still stands behind and takes the
+    /// rest out with the failure
+    fn take_where(
+        &mut self,
+        lose: impl Fn(u64, u64) -> bool,
+        err: impl Fn() -> ZyronError,
+    ) -> Vec<Answer> {
+        let mut answers = Vec::new();
+        let mut drained = Vec::new();
+        for (index, waiters) in self.by_index.iter_mut() {
+            let mut kept = Vec::with_capacity(waiters.len());
+            for waiter in waiters.drain(..) {
+                if lose(*index, waiter.term) {
+                    answers.push((waiter.tx, Err(err())));
+                } else {
+                    kept.push(waiter);
+                }
+            }
+            *waiters = kept;
+            if waiters.is_empty() {
+                drained.push(*index);
+            }
+        }
+        for index in drained {
+            self.by_index.remove(&index);
+        }
+        answers
+    }
+
+    fn fail_all(&mut self, err: impl Fn() -> ZyronError) {
+        for (_, waiters) in std::mem::take(&mut self.by_index) {
+            for waiter in waiters {
+                let _ = waiter.tx.send(Err(err()));
+            }
+        }
+    }
 }
 
 /// A running consensus node.
@@ -220,6 +352,8 @@ impl RaftNode {
             applied_tx,
             round_tx,
             role_tx,
+            commit_waiters: parking_lot::Mutex::new(IndexWaiters::default()),
+            applied_waiters: parking_lot::Mutex::new(IndexWaiters::default()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             running: AtomicBool::new(true),
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -257,6 +391,9 @@ impl RaftNode {
             return;
         }
         self.inner.shutdown.notify_waiters();
+        let stopped = || ZyronError::Internal("the node stopped".into());
+        self.inner.commit_waiters.lock().fail_all(stopped);
+        self.inner.applied_waiters.lock().fail_all(stopped);
         let tasks = std::mem::take(&mut *self.inner.tasks.lock());
         for task in tasks {
             task.abort();
@@ -379,6 +516,8 @@ impl RaftNode {
             snapshot_bytes_sent: self.inner.snapshot_bytes_sent.load(Ordering::Relaxed),
             snapshot_bytes_received: self.inner.snapshot_bytes_received.load(Ordering::Relaxed),
             proposals: self.inner.proposals.load(Ordering::Relaxed),
+            log_fsyncs: self.inner.log_writer.fsyncs(),
+            log_fsync_max_us: self.inner.log_writer.fsync_max_us(),
         }
     }
 
@@ -407,6 +546,73 @@ impl RaftNode {
         }
     }
 
+    /// Hands the group to the best placed follower and waits for it to lead.
+    ///
+    /// The follower with the most confirmed log is let catch up, then told to
+    /// campaign at once. This node steps down when it sees the higher term.
+    /// Returns the new leader, or None when this node does not lead or has
+    /// no voting peer to hand the group to
+    pub async fn transfer_leadership(&self, timeout: Duration) -> Result<Option<NodeId>> {
+        let target = {
+            let core = self.inner.core.lock();
+            if !core.is_leader() {
+                return Ok(None);
+            }
+            core.transfer_target()
+        };
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let deadline = Instant::now() + timeout;
+
+        // The target campaigns in a term that must hold everything this
+        // leader holds, so it is brought level before it is asked
+        wake_replicator(&self.inner);
+        while !self.inner.core.lock().peer_caught_up(target) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(self.inner.config.tick_interval).await;
+        }
+
+        let request = {
+            let core = self.inner.core.lock();
+            crate::election::TimeoutNowRequest {
+                term: core.term(),
+                leader_id: self.inner.id,
+            }
+        };
+        let reply = self
+            .inner
+            .transport
+            .send_timeout_now(target, request)
+            .await
+            .map_err(ZyronError::from)?;
+        if !reply.started {
+            return Err(ZyronError::Internal(format!(
+                "node {target} declined to take the group at term {}",
+                reply.term
+            )));
+        }
+
+        let mut rx = self.inner.role_tx.subscribe();
+        loop {
+            if !self.is_leader() {
+                if let Some(leader) = self.leader_id() {
+                    return Ok(Some(leader));
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ZyronError::ElectionTimeout {
+                    term: self.term(),
+                    elapsed_ms: timeout.as_millis() as u64,
+                });
+            }
+            let _ = tokio::time::timeout(left.min(Duration::from_millis(20)), rx.changed()).await;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Writes
     // -----------------------------------------------------------------------
@@ -430,12 +636,7 @@ impl RaftNode {
             ));
         }
         let count = commands.len() as u64;
-        let (last, _term) = {
-            let mut core = self.inner.core.lock();
-            core.propose_many(commands)?
-        };
-        self.inner.proposals.fetch_add(count, Ordering::Relaxed);
-        wake_replicator(&self.inner);
+        let (last, _term) = self.append_proposal(commands)?;
         Ok(last + 1 - count)
     }
 
@@ -447,15 +648,42 @@ impl RaftNode {
         if commands.is_empty() {
             return Ok(self.commit_index());
         }
-        let count = commands.len() as u64;
-        let (index, term) = {
-            let mut core = self.inner.core.lock();
-            core.propose_many(commands)?
-        };
-        self.inner.proposals.fetch_add(count, Ordering::Relaxed);
-        wake_replicator(&self.inner);
+        let (index, term) = self.append_proposal(commands)?;
         self.wait_committed(index, term).await?;
         Ok(index)
+    }
+
+    /// Appends a proposal to the log and wakes whoever it gives work to.
+    ///
+    /// The replicator is woken only when a follower can take the entries
+    /// now. Under load every follower has its share in flight, and a wake
+    /// per proposal then costs the replicator a pass through the consensus
+    /// lock to find that out, at the rate proposals arrive. The reply that
+    /// frees a slot wakes it instead
+    fn append_proposal(&self, commands: Vec<RaftCommand>) -> Result<(u64, u64)> {
+        let count = commands.len() as u64;
+        let (index, term, committed, room) = {
+            let mut core = self.inner.core.lock();
+            let before = core.commit_index();
+            let (index, term) = core.propose_many(commands)?;
+            (
+                index,
+                term,
+                core.commit_index() > before,
+                core.replication_has_room(Instant::now()),
+            )
+        };
+        self.inner.proposals.fetch_add(count, Ordering::Relaxed);
+        if committed {
+            // The append found this node's own fsync ahead of the durability
+            // watcher and moved the commit index, so the proposals it reached
+            // are answered here rather than left to the watcher's next pass
+            publish_commit(&self.inner);
+        }
+        if room {
+            wake_replicator(&self.inner);
+        }
+        Ok((index, term))
     }
 
     /// Waits for a specific entry to commit, or for the log to prove it never
@@ -478,48 +706,31 @@ impl RaftNode {
     /// caller told its write committed when a different entry now sits there
     /// would be told a falsehood
     async fn wait_committed(&self, index: u64, term: u64) -> Result<()> {
-        let mut rx = self.inner.commit_tx.subscribe();
-        let deadline = Instant::now() + self.inner.config.propose_timeout;
-        loop {
-            if *rx.borrow_and_update() >= index {
-                let core = self.inner.core.lock();
-                if core.commit_index() >= index {
-                    return match core.state.log().term_at(index) {
-                        // Compacted, which only happens after it applied
-                        None => Ok(()),
-                        Some(t) if t == term => Ok(()),
-                        Some(_) => Err(ZyronError::NotLeader {
-                            leader: core.leader_id(),
-                        }),
-                    };
-                }
-            }
-            if let Some(err) = self.inner.log_writer.failure() {
-                return Err(ZyronError::WalWriteFailed(err));
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(ZyronError::ConsensusTimeout {
+        if let Some(err) = self.inner.log_writer.failure() {
+            return Err(ZyronError::WalWriteFailed(err));
+        }
+        let (ticket, rx) = self.inner.commit_waiters.lock().register(index, term);
+        // A commit that landed between the append and the registration is
+        // answered here, the same way a later advance answers it. The
+        // published watermark says whether one did, and it is read instead
+        // of the consensus lock because every proposal passes through here
+        // and that lock is the one the replies are waiting for. An entry a
+        // truncation replaces is answered from the truncation, and a log
+        // writer that fails answers everyone from the durability watcher
+        if *self.inner.commit_tx.borrow() >= index {
+            resolve_commit_waiters(&self.inner);
+        }
+        match tokio::time::timeout(self.inner.config.propose_timeout, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(ZyronError::Internal(
+                "the node stopped before the entry committed".into(),
+            )),
+            Err(_) => {
+                self.inner.commit_waiters.lock().forget(index, ticket);
+                Err(ZyronError::ConsensusTimeout {
                     operation: format!("commit of index {index}"),
                     elapsed_ms: self.inner.config.propose_timeout.as_millis() as u64,
-                });
-            }
-            // A commit advance ends the wait early. The bound is what makes
-            // the overwrite check happen at all, and it is deliberately not on
-            // the wakeup path: a proposal being overwritten means this node
-            // lost the group, which is rare enough to notice on a timer
-            if tokio::time::timeout(left.min(Duration::from_millis(20)), rx.changed())
-                .await
-                .is_err()
-            {
-                let core = self.inner.core.lock();
-                if let Some(t) = core.state.log().term_at(index) {
-                    if t != term {
-                        return Err(ZyronError::NotLeader {
-                            leader: core.leader_id(),
-                        });
-                    }
-                }
+                })
             }
         }
     }
@@ -589,20 +800,23 @@ impl RaftNode {
 
     /// Blocks until the state machine has applied everything up to `index`
     pub async fn wait_applied(&self, index: u64) -> Result<()> {
-        let mut rx = self.inner.applied_tx.subscribe();
-        let deadline = Instant::now() + self.inner.config.propose_timeout;
-        loop {
-            if self.last_applied() >= index {
-                return Ok(());
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(ZyronError::ConsensusTimeout {
+        if *self.inner.applied_tx.borrow() >= index {
+            return Ok(());
+        }
+        let (ticket, rx) = self.inner.applied_waiters.lock().register(index, 0);
+        resolve_applied_waiters(&self.inner);
+        match tokio::time::timeout(self.inner.config.propose_timeout, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(ZyronError::Internal(
+                "the node stopped before the entry applied".into(),
+            )),
+            Err(_) => {
+                self.inner.applied_waiters.lock().forget(index, ticket);
+                Err(ZyronError::ConsensusTimeout {
                     operation: format!("apply of index {index}"),
                     elapsed_ms: self.inner.config.propose_timeout.as_millis() as u64,
-                });
+                })
             }
-            let _ = tokio::time::timeout(left.min(Duration::from_millis(20)), rx.changed()).await;
         }
     }
 
@@ -694,8 +908,31 @@ impl RaftNode {
             let core = self.inner.core.lock();
             core.leave_joint_command()?
         };
-        self.propose(final_config).await?;
+        let index = self.propose(final_config).await?;
+        // The entry commits on the old voters' say so, and the new voter
+        // learns it is one only when it holds that entry. Returning before
+        // then hands the caller a membership the node itself does not report
+        self.wait_peer_holds(node_id, index).await;
         Ok(())
+    }
+
+    /// Waits, inside the rpc timeout, for a peer to confirm it holds an
+    /// entry. A peer that does not answer in time is left to catch up on its
+    /// own, the entry is committed either way
+    async fn wait_peer_holds(&self, peer: NodeId, index: u64) {
+        let deadline = Instant::now() + self.inner.config.rpc_timeout;
+        loop {
+            let held = self
+                .inner
+                .core
+                .lock()
+                .peer_match_index(peer)
+                .unwrap_or(u64::MAX);
+            if held >= index || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(self.inner.config.tick_interval).await;
+        }
     }
 
     /// Takes a node out.
@@ -751,7 +988,13 @@ impl RaftNode {
     }
 
     async fn create_snapshot_inner(&self) -> Result<SnapshotMeta> {
-        let mut source = self.inner.machine.begin_checkpoint()?;
+        // Capturing the state is the machine's own copy or lock of whatever
+        // it holds, and for a large machine that is real work, so it runs
+        // beside the runtime rather than on a worker the ticker needs
+        let machine = Arc::clone(&self.inner.machine);
+        let mut source = tokio::task::spawn_blocking(move || machine.begin_checkpoint())
+            .await
+            .map_err(|e| ZyronError::Internal(format!("checkpoint capture task failed: {e}")))??;
         let applied = source.last_applied();
         // A transaction that spans entries has to be replayable from its
         // first one after a restart, so the machine's floor caps compaction
@@ -857,6 +1100,12 @@ impl RaftNode {
 async fn ticker(inner: Arc<RaftInner>) {
     let mut interval = tokio::time::interval(inner.config.tick_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A tick that lands long after the one before means the runtime held
+    // this task up, and replies that arrived meanwhile are still queued.
+    // The gap is logged because a leader judges its quorum on this loop and
+    // a held-up loop is the one way a reachable quorum reads as absent
+    let held_up_after = inner.config.election_timeout_min / 3;
+    let mut last_tick = Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -867,6 +1116,15 @@ async fn ticker(inner: Arc<RaftInner>) {
             break;
         }
         let now = Instant::now();
+        let gap = now.duration_since(last_tick);
+        last_tick = now;
+        if gap > held_up_after {
+            tracing::info!(
+                node = inner.id,
+                gap_ms = gap.as_millis() as u64,
+                "the tick loop was held up"
+            );
+        }
         let (outcome, version, role) = {
             let mut core = inner.core.lock();
             let outcome = core.tick(now);
@@ -921,21 +1179,109 @@ fn wake_replicator(inner: &RaftInner) {
         .send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
-fn publish_commit(inner: &Arc<RaftInner>) {
-    let commit = inner.core.lock().commit_index();
-    if *inner.commit_tx.borrow() != commit {
-        inner.commit_tx.send_replace(commit);
+/// Publishes a commit index read under the consensus lock.
+///
+/// Monotone, so a value that was read before another and published after
+/// it never rolls the advance back. The applier waits on this, and on a
+/// follower it is published before the entries are on this node's own disk:
+/// what the leader says is committed holds on a majority already, and
+/// waiting for the local flush would put one more fsync in front of every
+/// follower's apply
+fn publish_commit_at(inner: &RaftInner, commit: u64) {
+    let advanced = inner.commit_tx.send_if_modified(|current| {
+        if commit > *current {
+            *current = commit;
+            true
+        } else {
+            false
+        }
+    });
+    if advanced {
         // A follower learns what is committed only from the leader, so an
         // advance here is a message owed to every one of them
         wake_replicator(inner);
     }
 }
 
-fn publish_round(inner: &Arc<RaftInner>) {
-    let round = inner.core.lock().quorum_round();
-    if *inner.round_tx.borrow() != round {
-        inner.round_tx.send_replace(round);
+/// Publishes the commit index and answers the proposals it reached, for a
+/// caller that does not hold the consensus lock
+fn publish_commit(inner: &Arc<RaftInner>) {
+    let (commit, answers) = {
+        let core = inner.core.lock();
+        (core.commit_index(), take_committed_waiters(inner, &core))
+    };
+    publish_commit_at(inner, commit);
+    answer(answers);
+}
+
+/// Answers the proposals whose entries the commit index has reached
+fn resolve_commit_waiters(inner: &RaftInner) {
+    let answers = {
+        let core = inner.core.lock();
+        take_committed_waiters(inner, &core)
+    };
+    answer(answers);
+}
+
+/// Takes out the proposals the commit index has reached, with their
+/// verdicts.
+///
+/// Runs under the consensus lock because a verdict is the term at the
+/// index, which is the one thing the watermark cannot say. An entry this
+/// node proposed can be replaced by a new leader's, and a caller told its
+/// write committed when a different entry now sits there would be told a
+/// falsehood
+fn take_committed_waiters(inner: &RaftInner, core: &RaftConsensus) -> Vec<Answer> {
+    let mut waiters = inner.commit_waiters.lock();
+    let commit = core.commit_index();
+    match waiters.first_index() {
+        Some(first) if first <= commit => {}
+        _ => return Vec::new(),
     }
+    let leader = core.leader_id();
+    let log = core.state.log();
+    waiters.take_up_to(commit, |index, term| match log.term_at(index) {
+        // Compacted, which only happens after it applied
+        None => Ok(()),
+        Some(t) if t == term => Ok(()),
+        Some(_) => Err(ZyronError::NotLeader { leader }),
+    })
+}
+
+/// Takes out the proposals whose entries a truncation replaced or removed,
+/// with the failure they are owed
+fn take_overwritten_waiters(inner: &RaftInner, core: &RaftConsensus) -> Vec<Answer> {
+    let mut waiters = inner.commit_waiters.lock();
+    if waiters.first_index().is_none() {
+        return Vec::new();
+    }
+    let leader = core.leader_id();
+    let log = core.state.log();
+    waiters.take_where(
+        |index, term| !matches!(log.term_at(index), Some(t) if t == term),
+        || ZyronError::NotLeader { leader },
+    )
+}
+
+/// Answers the reads whose index the applier has reached
+fn resolve_applied_waiters(inner: &RaftInner) {
+    let answers = {
+        let mut waiters = inner.applied_waiters.lock();
+        let applied = *inner.applied_tx.borrow();
+        waiters.take_up_to(applied, |_, _| Ok(()))
+    };
+    answer(answers);
+}
+
+fn publish_round_at(inner: &RaftInner, round: u64) {
+    inner.round_tx.send_if_modified(|current| {
+        if round > *current {
+            *current = round;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Asks one peer for its vote and records the answer.
@@ -997,14 +1343,7 @@ async fn replicator(inner: Arc<RaftInner>) {
         // Marked seen before the pass, so a bump that arrives during it is
         // still waiting when the pass ends
         work.borrow_and_update();
-        let peers = {
-            let core = inner.core.lock();
-            if core.is_leader() {
-                core.peers()
-            } else {
-                Vec::new()
-            }
-        };
+        let peers = inner.core.lock().leader_peers().to_vec();
         for peer in peers {
             loop {
                 let work = {
@@ -1013,12 +1352,7 @@ async fn replicator(inner: Arc<RaftInner>) {
                 };
                 match work {
                     Ok(PeerWork::Idle) => break,
-                    Ok(PeerWork::Append(request)) => {
-                        let inner = Arc::clone(&inner);
-                        tokio::spawn(async move {
-                            send_append(inner, peer, request).await;
-                        });
-                    }
+                    Ok(PeerWork::Append(request)) => dispatch_append(&inner, peer, request),
                     Ok(PeerWork::AppendPaged {
                         request,
                         plan,
@@ -1062,9 +1396,10 @@ async fn replicator(inner: Arc<RaftInner>) {
 /// The reads run on a blocking thread because they are file reads, and the
 /// batch is abandoned rather than sent short if any of them fails: a follower
 /// that received a gap would take it as the leader's log and truncate its own.
-/// Abandoning leaves `next_index` optimistically advanced, which the next
-/// refused append rewinds, and a follower that keeps missing this way ends up
-/// taking a snapshot instead
+/// Abandoning rewinds the guess to what the follower confirmed, and a
+/// follower that keeps missing this way ends up taking a snapshot instead.
+/// The follower is held for the length of the read, so nothing built after
+/// this batch is placed ahead of it
 async fn send_paged_append(
     inner: Arc<RaftInner>,
     peer: NodeId,
@@ -1092,43 +1427,93 @@ async fn send_paged_append(
     .await;
 
     let entries = match read {
-        Ok(Ok(entries)) => entries,
+        Ok(Ok(entries)) => Some(entries),
         Ok(Err(e)) => {
             tracing::warn!(node = inner.id, peer, error = %e, "could not read log entries back for replication");
-            let mut core = inner.core.lock();
-            core.handle_peer_unreachable(peer);
-            return;
+            None
         }
         Err(e) => {
             tracing::warn!(node = inner.id, peer, error = %e, "the log read back task did not finish");
-            let mut core = inner.core.lock();
-            core.handle_peer_unreachable(peer);
-            return;
+            None
         }
     };
-    request.entries = entries;
-    send_append(inner, peer, request).await;
+    match entries {
+        Some(entries) => {
+            request.entries = entries;
+            dispatch_append(&inner, peer, request);
+        }
+        None => inner
+            .core
+            .lock()
+            .handle_peer_unreachable(peer, Instant::now()),
+    }
+    inner.core.lock().finish_page_in(peer);
+    wake_replicator(&inner);
 }
 
-async fn send_append(inner: Arc<RaftInner>, peer: NodeId, request: AppendEntriesRequest) {
+/// Hands one append to the transport in the order it was built, and settles
+/// its reply on a task of its own.
+///
+/// The hand-off runs on the replicator because the transport places a call's
+/// frame at call time and the follower reads frames in the order they were
+/// placed. A task per message that made the call itself would run in
+/// whatever order the runtime chose, and a batch reaching the follower ahead
+/// of the one before it is refused, which resets the pipeline and sends
+/// everything after it again
+fn dispatch_append(inner: &Arc<RaftInner>, peer: NodeId, request: AppendEntriesRequest) {
     let had_entries = !request.entries.is_empty();
-    match inner.transport.send_append_entries(peer, request).await {
+    let call = inner.transport.send_append_entries(peer, request);
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        let outcome = call.await;
+        settle_append(&inner, peer, had_entries, outcome);
+    });
+}
+
+/// Takes one append's answer into the leader's view
+fn settle_append(
+    inner: &Arc<RaftInner>,
+    peer: NodeId,
+    had_entries: bool,
+    outcome: std::result::Result<AppendEntriesReply, RaftRpcError>,
+) {
+    match outcome {
         Ok(reply) => {
-            {
+            tracing::trace!(
+                node = inner.id,
+                peer,
+                success = reply.success,
+                match_index = reply.match_index,
+                "append answered"
+            );
+            // Everything the reply changes is read under the one lock that
+            // recorded it, and everything that has to be told is told after
+            // the lock is released. Under load this runs for every message
+            // to every follower, so a second acquisition here is one the
+            // proposals queue behind
+            let (owes_commit, commit, round, role, answers) = {
                 let mut core = inner.core.lock();
                 if let Err(e) = core.handle_append_reply(&reply, Instant::now()) {
                     tracing::warn!(node = inner.id, peer, error = %e, "could not record an append reply");
                 }
-            }
-            publish_commit(&inner);
-            publish_round(&inner);
-            let role = {
-                let core = inner.core.lock();
-                (core.role(), core.term(), core.leader_id())
+                (
+                    core.peer_owes_commit(peer),
+                    core.commit_index(),
+                    core.quorum_round(),
+                    (core.role(), core.term(), core.leader_id()),
+                    take_committed_waiters(&inner, &core),
+                )
             };
+            publish_commit_at(&inner, commit);
+            publish_round_at(&inner, round);
             publish_role(&inner, role);
-            if had_entries || !reply.success {
-                wake_replicator(&inner);
+            answer(answers);
+            // A reply carrying no entries still owes a wake when it drained the
+            // last message to a follower the commit index has moved past.
+            // The commit publish wakes only on the advance itself, which
+            // happened while this message was still in flight
+            if had_entries || !reply.success || owes_commit {
+                wake_replicator(inner);
             }
         }
         Err(e) => {
@@ -1136,7 +1521,7 @@ async fn send_append(inner: Arc<RaftInner>, peer: NodeId, request: AppendEntries
                 tracing::debug!(node = inner.id, peer, error = %e, "append produced no answer");
             }
             let mut core = inner.core.lock();
-            core.handle_peer_unreachable(peer);
+            core.handle_peer_unreachable(peer, Instant::now());
         }
     }
 }
@@ -1181,10 +1566,16 @@ async fn stream_snapshot(
     let chunk_bytes = inner.config.snapshot_chunk_bytes;
     let mut offset = 0u64;
     loop {
-        let (data, done) = {
-            let store = inner.snapshots.lock();
-            store.read_chunk(offset, chunk_bytes)?
-        };
+        // A chunk is a file read, so it runs beside the runtime. A worker
+        // held for a megabyte read a thousand times over is a worker the
+        // ticker and the reply handlers do not have
+        let reader = Arc::clone(inner);
+        let (data, done) = tokio::task::spawn_blocking(move || {
+            let mut store = reader.snapshots.lock();
+            store.read_chunk(offset, chunk_bytes)
+        })
+        .await
+        .map_err(|e| ZyronError::Internal(format!("snapshot read task failed: {e}")))??;
         let sent = data.len() as u64;
         let request = InstallSnapshotRequest {
             term,
@@ -1212,6 +1603,7 @@ async fn stream_snapshot(
                 "node {peer} refused a snapshot chunk at offset {offset}"
             )));
         }
+        inner.core.lock().note_peer_contact(peer, Instant::now());
         offset = reply.bytes_received;
         if done {
             *delivered = Some(meta.last_included_index);
@@ -1338,6 +1730,7 @@ async fn apply_ready(inner: &Arc<RaftInner>) -> bool {
     }
     if *inner.applied_tx.borrow() != last {
         inner.applied_tx.send_replace(last);
+        resolve_applied_waiters(inner);
     }
     true
 }
@@ -1414,22 +1807,24 @@ fn maybe_snapshot(inner: &Arc<RaftInner>) {
 /// commit index between heartbeats
 async fn durability_watcher(inner: Arc<RaftInner>) {
     let mut rx = inner.log_writer.subscribe();
-    let mut published = 0u64;
     loop {
-        let commit = {
+        let (commit, answers) = {
             let mut core = inner.core.lock();
             core.advance_commit();
-            core.commit_index()
+            (core.commit_index(), take_committed_waiters(&inner, &core))
         };
-        publish_commit(&inner);
         // A commit this node's own fsync produced is one no follower has been
-        // told about: nothing was replied to and nothing was sent. Waiting for
-        // the next heartbeat to carry it leaves every follower up to a
-        // heartbeat behind on a group that has just gone quiet, which is
-        // exactly when a read is most likely to arrive
-        if commit > published {
-            published = commit;
-            wake_replicator(&inner);
+        // told about: nothing was replied to and nothing was sent. The
+        // publish wakes the replicator on the advance, so it goes out now
+        // rather than on the next heartbeat, which would leave every follower
+        // up to a heartbeat behind on a group that has just gone quiet
+        publish_commit_at(&inner, commit);
+        answer(answers);
+        if let Some(err) = inner.log_writer.failure() {
+            inner
+                .commit_waiters
+                .lock()
+                .fail_all(|| ZyronError::WalWriteFailed(err.clone()));
         }
         tokio::select! {
             biased;
@@ -1475,21 +1870,35 @@ impl RaftRequestHandler for RaftNode {
         let inner = Arc::clone(&self.inner);
         // The entries are taken into the log here, in the order the frames
         // arrived. Only the wait for the fsync is deferred into the future
-        let outcome = {
+        let (outcome, commit, role, overwritten, committed) = {
             let mut core = inner.core.lock();
-            core.handle_append_entries(&req, Instant::now())
+            let before = core.metrics.log_truncations;
+            let outcome = core.handle_append_entries(&req, Instant::now());
+            let overwritten = if core.metrics.log_truncations != before {
+                take_overwritten_waiters(&inner, &core)
+            } else {
+                Vec::new()
+            };
+            (
+                outcome,
+                core.commit_index(),
+                (core.role(), core.term(), core.leader_id()),
+                overwritten,
+                take_committed_waiters(&inner, &core),
+            )
         };
+        // The commit index the leader sent is published now, ahead of this
+        // node's own flush of the entries, so the applier is not held behind
+        // the disk for entries a majority already holds
+        publish_commit_at(&inner, commit);
+        publish_role(&inner, role);
+        answer(overwritten);
+        answer(committed);
         Box::pin(async move {
             let reply = outcome?;
             if reply.success {
                 wait_persisted(&inner, reply.match_index).await?;
             }
-            publish_commit(&inner);
-            let role = {
-                let core = inner.core.lock();
-                (core.role(), core.term(), core.leader_id())
-            };
-            publish_role(&inner, role);
             Ok(reply)
         })
     }
@@ -1511,15 +1920,41 @@ impl RaftRequestHandler for RaftNode {
         Box::pin(async move { install_snapshot(inner, req, decision?).await })
     }
 
-    fn on_read_index(&self, req: ReadIndexRequest) -> RaftHandlerFuture<'_, ReadIndexReply> {
+    fn on_timeout_now(
+        &self,
+        req: crate::election::TimeoutNowRequest,
+    ) -> RaftHandlerFuture<'_, crate::election::TimeoutNowReply> {
         let inner = Arc::clone(&self.inner);
         let outcome = {
             let mut core = inner.core.lock();
-            core.handle_read_index(&req, Instant::now())
+            core.handle_timeout_now(&req, Instant::now())
+        };
+        Box::pin(async move {
+            let (reply, requests) = outcome?;
+            for (peer, request) in requests {
+                tokio::spawn(send_vote(Arc::clone(&inner), peer, request));
+            }
+            let role = {
+                let core = inner.core.lock();
+                (core.role(), core.term(), core.leader_id())
+            };
+            publish_role(&inner, role);
+            Ok(reply)
+        })
+    }
+
+    fn on_read_index(&self, req: ReadIndexRequest) -> RaftHandlerFuture<'_, ReadIndexReply> {
+        let inner = Arc::clone(&self.inner);
+        // Both reads under one lock, so the index the answer promises and what
+        // the asking follower has been told are the same instant
+        let (result, owes_commit) = {
+            let mut core = inner.core.lock();
+            let result = core.handle_read_index(&req, Instant::now());
+            (result, core.peer_owes_commit(req.from))
         };
         let timeout = inner.config.propose_timeout;
         Box::pin(async move {
-            let (outcome, reply) = outcome?;
+            let (outcome, reply) = result?;
             if let ReadIndexOutcome::Pending { round, .. } = outcome {
                 // The index is only safe to hand out once a majority has
                 // echoed the round, so the answer waits rather than being sent
@@ -1529,6 +1964,12 @@ impl RaftRequestHandler for RaftNode {
                     inner: Arc::clone(&inner),
                 };
                 node.wait_round(round, Instant::now() + timeout).await?;
+            } else if owes_commit {
+                // The follower asked because it is about to read locally, and
+                // the commit index has moved past what it was last told. Only
+                // a new message carries that advance, so send one now instead
+                // of leaving the read to wait on the heartbeat timer
+                wake_replicator(&inner);
             }
             Ok(reply)
         })
@@ -1554,7 +1995,7 @@ async fn wait_persisted(inner: &Arc<RaftInner>, index: u64) -> Result<()> {
 
 async fn install_snapshot(
     inner: Arc<RaftInner>,
-    req: InstallSnapshotRequest,
+    mut req: InstallSnapshotRequest,
     decision: SnapshotDecision,
 ) -> Result<InstallSnapshotReply> {
     let term = inner.core.lock().term();
@@ -1578,20 +2019,23 @@ async fn install_snapshot(
         SnapshotDecision::Accept => {}
     }
 
-    let written = {
-        let store = inner.snapshots.lock();
-        store.write_chunk(
-            req.last_included_index,
-            req.offset,
-            &req.data,
-            // The file only has to survive a crash once it is about to become
-            // this node's snapshot
-            req.done,
-        )?
-    };
+    // A chunk is a file write, so it runs beside the runtime rather than on
+    // a worker the election timer and the appends from the leader need
+    let received = req.data.len() as u64;
+    let data = std::mem::take(&mut req.data);
+    let writer = Arc::clone(&inner);
+    let (index, offset, done) = (req.last_included_index, req.offset, req.done);
+    let written = tokio::task::spawn_blocking(move || {
+        let store = writer.snapshots.lock();
+        // The file only has to survive a crash once it is about to become
+        // this node's snapshot
+        store.write_chunk(index, offset, &data, done)
+    })
+    .await
+    .map_err(|e| ZyronError::Internal(format!("snapshot write task failed: {e}")))??;
     inner
         .snapshot_bytes_received
-        .fetch_add(req.data.len() as u64, Ordering::Relaxed);
+        .fetch_add(received, Ordering::Relaxed);
     reply.success = true;
     reply.bytes_received = written;
 
@@ -1618,17 +2062,27 @@ async fn install_snapshot(
         .await
         .map_err(|e| ZyronError::Internal(format!("snapshot restore task failed: {e}")))??;
 
-    {
+    let (commit, committed, overwritten) = {
         let mut core = inner.core.lock();
         core.adopt_snapshot(
             meta.last_included_index,
             meta.last_included_term,
             meta.config.clone(),
         )?;
-    }
-    publish_commit(&inner);
+        (
+            core.commit_index(),
+            take_committed_waiters(&inner, &core),
+            // The log restarts past the snapshot, so a proposal waiting on
+            // an entry beyond it has nothing left to wait for
+            take_overwritten_waiters(&inner, &core),
+        )
+    };
+    publish_commit_at(&inner, commit);
+    answer(committed);
+    answer(overwritten);
     if *inner.applied_tx.borrow() < index {
         inner.applied_tx.send_replace(index);
+        resolve_applied_waiters(&inner);
     }
     tracing::info!(
         node = inner.id,

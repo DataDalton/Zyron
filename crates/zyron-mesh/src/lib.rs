@@ -7,10 +7,14 @@
 //!
 //! ## The shape of it
 //!
-//! - [`rpc`] is what one node asks another, and where. Six calls under
-//!   `/internal/mesh/v1/`, with payloads bounded so they can be framed by a
-//!   binary protocol later without anyone having to pick a limit under
-//!   pressure in the wire code.
+//! - [`rpc`] is what one node asks another, and where. Eleven calls under
+//!   `/internal/mesh/v1/`, six for growing and shrinking the mesh and five
+//!   the upgrade driver uses to read, stage, restart, roll back, and carry a
+//!   cluster setting from a node, with payloads bounded so they can be framed
+//!   by a binary protocol later without anyone having to pick a limit under
+//!   pressure in the wire code. Every body decodes with any field absent,
+//!   which is the rule that lets one release add a field the release beside
+//!   it in a rolling upgrade does not know.
 //! - [`transport`] carries those calls over the HTTP the node already serves.
 //!   It is behind [`rpc::MeshRpc`] so the scheduler is written against the
 //!   calls and not against what carries them: when the binary protocol lands,
@@ -47,9 +51,11 @@ pub use handler::{MeshNode, MeshResponse, dispatch};
 pub use pool::WarmPool;
 pub use rpc::{
     BeginDrainRequest, CancelProvisioningRequest, DrainStatus, DrainStatusRequest, HotSetChunk,
-    HotSetManifestRequest, MAX_CHUNK_PAGES, MAX_NAME_BYTES, MESH_PATH_PREFIX, MeshRpc,
-    MeshRpcError, NodeRef, PrefetchRequest, PrefetchStatus, RelocateSessionRequest,
-    RelocationOutcome, is_mesh_path,
+    HotSetManifestRequest, MAX_CHUNK_PAGES, MAX_DETAIL_BYTES, MAX_NAME_BYTES, MESH_PATH_PREFIX,
+    MESH_PROTOCOL_VERSION, MeshRpc, MeshRpcError, NodeAck, NodeRef, NodeStatus, NodeStatusRequest,
+    PATH_NODE_STATUS, PATH_RESTART_INTO_STAGED, PATH_ROLLBACK_TO_PREVIOUS, PATH_STAGE_RELEASE,
+    PrefetchRequest, PrefetchStatus, RelocateSessionRequest, RelocationOutcome, RestartRequest,
+    RollbackRequest, StageReleaseRequest, is_mesh_path,
 };
 pub use scheduler::{DrainOutcome, MeshScheduler, SchedulerStats};
 pub use transport::{HttpMeshRpc, MeshDirectory, TransportStats};

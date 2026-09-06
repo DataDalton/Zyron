@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use zyron_common::profile::{self, Phase};
 use zyron_common::{Result, ZyronError};
 use zyron_lake::{
     AllCommitted, LakeFileReader, LakePaths, ManifestFile, PruneDecision, TimeTravelSpec,
@@ -31,7 +32,11 @@ use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
 use crate::context::ExecutionContext;
 use crate::expr::evaluate;
-use crate::operator::{ExecutionBatch, Operator, OperatorResult, apply_column_security};
+use crate::operator::{
+    ExecutionBatch, MetaAcc, Operator, OperatorResult, apply_column_security, expose_column_value,
+    fold_rows_into_meta_accs,
+};
+use zyron_planner::physical::{MetaAggKind, MetaAggSpec};
 
 /// Which head of a lake table a statement addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +135,203 @@ pub(crate) fn open_lake_write_head(
         }
         Err(e) => Err(branch_error(table_name, name, e)),
     }
+}
+
+/// Materializes one batch from the decoded columns, taking the rows
+/// `ordinals` names in that order.
+///
+/// Column at a time. A fixed-width column whose buffer carries its type goes
+/// through the bulk append, which resolves the decode and the destination once
+/// for the whole run. Everything else, text and binary included, falls back to
+/// the scalar per value, so an unlisted type stays correct and only stays
+/// slow.
+fn build_batch(
+    output_columns: &[zyron_planner::logical::LogicalColumn],
+    decoded: &[(zyron_common::TypeId, usize, zyron_lake::DecodedColumn)],
+    ordinals: &[u32],
+) -> DataBatch {
+    let mut builders = create_builders(output_columns, ordinals.len());
+    // Rows in order and with no gaps, which is what a scan that filtered
+    // nothing produces. The gather is then the identity, and the cells can
+    // be taken as one run instead of addressed one ordinal at a time
+    let run_start = match (ordinals.first(), ordinals.last()) {
+        (Some(&first), Some(&last)) if last as usize - first as usize + 1 == ordinals.len() => {
+            Some(first)
+        }
+        _ => None,
+    };
+    for (ci, (type_id, value_size, col)) in decoded.iter().enumerate() {
+        // Two concrete iterators rather than one boxed one. The whole point is
+        // to take work out of a per-value loop, and a dynamic call per value
+        // would put more back than the hoisting removes
+        let took = if *value_size == 0 {
+            false
+        } else if let Some(flat) = col.flat_cells() {
+            match run_start.and_then(|start| flat.run(start, ordinals.len())) {
+                Some(bytes) => builders[ci].extend_fixed_run(*type_id, bytes, ordinals.len()),
+                None => builders[ci].extend_fixed(*type_id, flat.cells(ordinals)),
+            }
+        } else {
+            builders[ci].extend_fixed(*type_id, ordinals.iter().map(|&o| col.cell(o as usize)))
+        };
+        if took {
+            continue;
+        }
+        for &o in ordinals {
+            // push_owned moves a decoded text or binary allocation into
+            // the column instead of copying it a second time
+            let sv = match col.cell(o as usize) {
+                None => ScalarValue::Null,
+                Some(cell) if *value_size == 0 => decode_varlen_scalar(*type_id, cell),
+                Some(cell) => decode_fixed_scalar(*type_id, cell),
+            };
+            builders[ci].push_owned(sv);
+        }
+    }
+    finalize_builders(builders)
+}
+
+/// The part of a row filter the stored filter does not answer itself.
+///
+/// A conjunct whose lowering is exact is applied to the keep mask before
+/// any projected column is decoded, so evaluating it again over decoded
+/// values can only agree with what is already decided. What is left is what
+/// the row filter still has to run, and one inexact conjunct beside it no
+/// longer makes the whole predicate its own work.
+///
+/// Exactness is asked of the schema the manifest holds, which is the schema
+/// the mask was built from, so this cannot claim a conjunct the mask did
+/// not actually answer. The plan narrows the projection on the same
+/// question against the catalog's schema, and where the two disagree the
+/// scan decodes the predicate's own columns rather than going without them
+fn scan_residual(
+    predicate: &BoundExpr,
+    table_entry: &zyron_catalog::TableEntry,
+    schema: &zyron_lake::LakeSchema,
+) -> Option<BoundExpr> {
+    let mut kept: Vec<BoundExpr> = Vec::new();
+    for conjunct in split_conjuncts(predicate) {
+        let answered = zyron_planner::lake_predicate::lower_predicate(
+            &conjunct,
+            &table_entry.columns,
+            &table_entry.cluster.derived,
+        )
+        .and_then(|lowered| zyron_lake::StoredFilter::lower(&lowered, schema))
+        .is_some_and(|filter| filter.is_exact());
+        if !answered {
+            kept.push(conjunct);
+        }
+    }
+    match kept.len() {
+        0 => None,
+        1 => kept.pop(),
+        _ => {
+            let mut combined = kept.remove(0);
+            for conjunct in kept {
+                combined = BoundExpr::BinaryOp {
+                    left: Box::new(combined),
+                    op: zyron_parser::ast::BinaryOperator::And,
+                    right: Box::new(conjunct),
+                    type_id: zyron_common::TypeId::Boolean,
+                };
+            }
+            Some(combined)
+        }
+    }
+}
+
+/// The top level conjuncts of a predicate
+fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
+    match expr {
+        BoundExpr::Nested(inner) => split_conjuncts(inner),
+        BoundExpr::BinaryOp {
+            left,
+            op: zyron_parser::ast::BinaryOperator::And,
+            right,
+            ..
+        } => {
+            let mut out = split_conjuncts(left);
+            out.extend(split_conjuncts(right));
+            out
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Decodes rows `start..end` of each of `columns` out of one data file.
+///
+/// Cells decode by the physical type, which is what sizes them. A
+/// TIMESTAMP(p>6) column stores 16 byte i128 picoseconds, and decoding it
+/// as its logical type would read half the cell and hand the i128 builder
+/// a variant it zeroes. Every other type's physical form is its logical one
+fn decode_range_columns(
+    reader: &LakeFileReader,
+    schema: &zyron_lake::LakeSchema,
+    columns: &[LogicalColumn],
+    start: usize,
+    end: usize,
+) -> Result<Vec<(zyron_common::TypeId, usize, zyron_lake::DecodedColumn)>> {
+    let mut decoded = Vec::with_capacity(columns.len());
+    for col in columns {
+        let lake_col = schema.column_by_id(col.column_id.0 as u32).ok_or_else(|| {
+            ZyronError::ExecutionError(format!(
+                "lake scan: column \"{}\" missing from the manifest schema",
+                col.name
+            ))
+        })?;
+        let physical = lake_col.physical_type_id();
+        decoded.push((
+            physical,
+            physical.fixed_size().unwrap_or(0),
+            reader.read_column_range(lake_col, start, end)?,
+        ));
+    }
+    Ok(decoded)
+}
+
+/// The columns a row filter reads, when the projection does not carry all
+/// of them.
+///
+/// Returns empty whenever every column the predicate references is
+/// projected, which is what the filter is then evaluated against. A plan
+/// that withheld a column, because the scan was expected to answer the
+/// predicate on stored bytes, leaves the full set here so the filter has
+/// something to read if that expectation does not hold for a file
+fn filter_columns_outside(
+    predicate: &Option<BoundExpr>,
+    projected: &[LogicalColumn],
+    schema: &zyron_lake::LakeSchema,
+) -> Vec<LogicalColumn> {
+    let Some(predicate) = predicate else {
+        return Vec::new();
+    };
+    let mut refs = zyron_planner::collect_column_refs(predicate);
+    refs.sort_unstable_by_key(|r| (r.table_idx, r.column_id.0));
+    refs.dedup_by_key(|r| (r.table_idx, r.column_id.0));
+    let covered = |r: &zyron_planner::binder::ColumnRef| {
+        projected
+            .iter()
+            .any(|c| c.table_idx == Some(r.table_idx) && c.column_id == r.column_id)
+    };
+    if refs.iter().all(covered) {
+        return Vec::new();
+    }
+    // Typed from the reference the binder resolved rather than from the
+    // schema, so a column this manifest does not name is still described
+    // and the decode is what reports it missing
+    refs.iter()
+        .map(|r| LogicalColumn {
+            table_idx: Some(r.table_idx),
+            column_id: r.column_id,
+            name: schema
+                .column_by_id(r.column_id.0 as u32)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("column {}", r.column_id.0)),
+            type_id: r.type_id,
+            nullable: r.nullable,
+            fractional_digits: r.fractional_digits,
+        })
+        .collect()
 }
 
 /// The ordinal range a keep mask still admits, as the first and one past
@@ -419,6 +621,10 @@ pub struct LakeScanOperator {
     /// caller can see how much IO the predicate saved.
     files_pruned: usize,
     file_idx: usize,
+    /// A cursor over `files` shared with the other scans of one fan-out,
+    /// each taking the next file nobody has claimed. None for a scan that
+    /// reads its list alone
+    shared_cursor: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// When set, emit RowLocator::Lake per surviving row for DML addressing.
     emit_locators: bool,
     pending: VecDeque<ExecutionBatch>,
@@ -439,6 +645,26 @@ pub struct LakeScanOperator {
     /// The predicate lowered onto stored bytes, applied per file before
     /// any projected column is decoded. None when nothing lowered
     stored_filter: Option<zyron_lake::StoredFilter>,
+    /// Whether the lowered predicate is equivalent to the bound one rather
+    /// than merely implied by it.
+    ///
+    /// A scan lowering keeps the conjuncts with a lake form and drops the
+    /// rest, which is what buys pruning for a predicate one LIKE would
+    /// otherwise make unprunable. The stored filter's exactness is about
+    /// what it was lowered from, so it says nothing about the predicate
+    /// unless nothing was dropped
+    lowering_is_complete: bool,
+    /// Columns the row filter reads, kept only when the projection does not
+    /// carry all of them.
+    ///
+    /// The plan withholds a column that exists only to feed a predicate the
+    /// scan was expected to answer on encoded bytes. A file whose lowering
+    /// turns out short of exact still has to evaluate that predicate, and it
+    /// does so against a batch built from these rather than from the
+    /// projection, which no longer holds what it reads. Empty in every case
+    /// where the projection already covers the predicate, which is the case
+    /// the plan intends
+    filter_columns: Vec<LogicalColumn>,
     /// Files whose zone maps or encoded bytes left no surviving row, and
     /// what they would have cost to decode. Counted here rather than at
     /// build time because they are only known once the file is opened
@@ -601,6 +827,31 @@ impl LakeScanOperator {
         let stored_filter = lowered
             .as_ref()
             .and_then(|p| zyron_lake::StoredFilter::lower(p, &manifest.schema));
+        // A scan lowering keeps the conjuncts that have a lake form and
+        // drops the rest, so it is implied by the predicate rather than
+        // equivalent to it. The stored filter is exact for what it was
+        // lowered from, which is the predicate itself only when nothing was
+        // dropped, and skipping the row filter on anything less would
+        // return the rows a dropped conjunct excludes
+        let lowering_is_complete = predicate.as_ref().is_none_or(|p| {
+            zyron_planner::lake_predicate::lower_predicate(
+                p,
+                &table_entry.columns,
+                &table_entry.cluster.derived,
+            )
+            .is_some()
+        });
+        // The conjuncts the stored filter answers exactly are already in the
+        // keep mask, so what is left of the predicate is all the row filter
+        // has to run. Only when the filter actually runs: an index path
+        // resolves rows without it and answers no term at all
+        let predicate = match (&stored_filter, index_rows.is_none()) {
+            (Some(_), true) => predicate
+                .as_ref()
+                .and_then(|p| scan_residual(p, &table_entry, &manifest.schema)),
+            _ => predicate,
+        };
+        let filter_columns = filter_columns_outside(&predicate, &columns, &manifest.schema);
         let io_stats = ctx.table_io_stats_for(table_entry.id.0);
         if let Some(stats) = &io_stats {
             stats.record_seq_scan();
@@ -615,6 +866,7 @@ impl LakeScanOperator {
             files,
             files_pruned,
             file_idx: 0,
+            shared_cursor: None,
             emit_locators: false,
             pending: VecDeque::new(),
             finished: false,
@@ -624,6 +876,8 @@ impl LakeScanOperator {
             bytes_considered,
             bytes_skipped,
             stored_filter,
+            lowering_is_complete,
+            filter_columns,
             files_skipped_on_read: 0,
             bytes_skipped_on_read: 0,
             index_rows,
@@ -632,6 +886,67 @@ impl LakeScanOperator {
             metrics: None,
             io_stats,
         })
+    }
+
+    /// The data files this scan will read, after pruning.
+    ///
+    /// A parallel aggregate splits the work by file, and splitting the
+    /// pruned set rather than the manifest's whole list is what keeps the
+    /// workers even when a predicate has already removed most of it
+    pub fn files(&self) -> &[u64] {
+        &self.files
+    }
+
+    /// The manifest version this scan resolved to, for a caller deciding
+    /// how to run it from the statistics the version carries
+    pub fn manifest(&self) -> &ManifestFile {
+        &self.manifest
+    }
+
+    /// Narrows a built scan to the files named, dropping the rest.
+    ///
+    /// The metadata aggregate reads its answer off the manifest for every
+    /// file whose statistics settle it, and needs a scan of only what is
+    /// left over. The byte counters follow the narrowing, so what the scan
+    /// reports considering is what it opened
+    pub fn restrict_to_files(&mut self, keep: &std::collections::HashSet<u64>) {
+        self.files.retain(|id| keep.contains(id));
+        let considered: u64 = self
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| keep.contains(&e.partition_id))
+            .map(|e| e.size_bytes)
+            .sum();
+        self.files_pruned = self.manifest.entries.len() - self.files.len();
+        self.bytes_skipped += self.bytes_considered.saturating_sub(considered);
+        self.bytes_considered = considered;
+    }
+
+    /// Hands this scan the file list of a fan-out and the cursor its
+    /// workers claim from, so each file is read by exactly one of them and
+    /// a slow worker takes fewer files than a fast one.
+    ///
+    /// The list replaces the scan's own so every worker indexes the same
+    /// order, and the counters follow it as a narrowing does
+    pub fn share_files(&mut self, files: &[u64], cursor: Arc<std::sync::atomic::AtomicUsize>) {
+        let keep: std::collections::HashSet<u64> = files.iter().copied().collect();
+        self.restrict_to_files(&keep);
+        self.files = files.to_vec();
+        self.shared_cursor = Some(cursor);
+    }
+
+    /// The position of the next file to read, claimed from the shared
+    /// cursor when there is one
+    fn next_file_position(&mut self) -> usize {
+        match &self.shared_cursor {
+            Some(cursor) => cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            None => {
+                let at = self.file_idx;
+                self.file_idx += 1;
+                at
+            }
+        }
     }
 
     /// Publishes the pruning counters where EXPLAIN ANALYZE reads them.
@@ -727,18 +1042,30 @@ impl LakeScanOperator {
     }
 
     fn load_file(&mut self, partition_id: u64) -> Result<()> {
+        let _total = profile::scope(Phase::LakeLoadFile);
         let entry = self.manifest.entry_for(partition_id).ok_or_else(|| {
             ZyronError::ExecutionError(format!(
                 "lake scan: partition {:#x} vanished from its manifest",
                 partition_id
             ))
         })?;
-        let reader = LakeFileReader::open(&self.paths, partition_id)?;
+        let reader = {
+            let _s = profile::scope(Phase::LakeOpenFile);
+            LakeFileReader::open_shared(&self.paths, partition_id)?
+        };
+        // The reader is shared with whatever scanned this file before, so its
+        // counter is a running total. What this scan read is the difference
+        // across its own reads
+        let bytes_before = reader.bytes_read();
+        let bytes_read = || reader.bytes_read().saturating_sub(bytes_before);
         let row_count = reader.row_count();
         if row_count == 0 {
             return Ok(());
         }
-        let mut keep = reader.delete_survivors(&self.manifest.schema, &self.manifest, entry)?;
+        let mut keep = {
+            let _s = profile::scope(Phase::LakeDeleteSurvivors);
+            reader.delete_survivors(&self.manifest.schema, &self.manifest, entry)?
+        };
 
         // An index resolved this file to specific rows, so everything it
         // did not name is cleared before any projected column is decoded.
@@ -768,10 +1095,26 @@ impl LakeScanOperator {
         // whole column segment, which is the cost the index exists to
         // avoid, and the exact row filter still runs on what survives so
         // the terms the index did not consume are applied either way
-        if self.index_rows.is_none()
-            && let Some(filter) = &self.stored_filter
-            && let Some(mask) = reader.rows_matching(filter)?
-        {
+        // Whether what the stored filter left standing is the matching rows
+        // themselves rather than a superset of them. An exact lowering
+        // answers the predicate on encoded bytes, so evaluating it a second
+        // time over decoded values can only agree with what is already
+        // decided. An index path does not run the filter at all, so it
+        // decides nothing here
+        let answered = self.index_rows.is_none()
+            && self.lowering_is_complete
+            && self
+                .stored_filter
+                .as_ref()
+                .is_some_and(|filter| filter.is_exact());
+        let stored_mask = {
+            let _s = profile::scope(Phase::LakeStoredFilter);
+            match (self.index_rows.is_none(), &self.stored_filter) {
+                (true, Some(filter)) => reader.rows_matching(filter)?,
+                _ => None,
+            }
+        };
+        if let Some(mask) = stored_mask {
             for (k, m) in keep.iter_mut().zip(mask.iter()) {
                 *k &= *m;
             }
@@ -782,7 +1125,7 @@ impl LakeScanOperator {
                 // No projected column was decoded, but the terms answered on
                 // encoded bytes read their own segments, and that is what
                 // rejecting the file cost
-                self.record_file_io(0, reader.bytes_read());
+                self.record_file_io(0, bytes_read());
                 return Ok(());
             }
         }
@@ -790,8 +1133,10 @@ impl LakeScanOperator {
         // COUNT(*) projects nothing. A batch built from zero column builders
         // reports zero rows, so counting one would answer zero for a file
         // full of rows, which is a wrong answer rather than a slow one. The
-        // heap scan carries the same fast path
-        if self.output_columns.is_empty() && self.predicate.is_none() {
+        // heap scan carries the same fast path.
+        // A predicate the stored filter answered exactly is already applied
+        // to the keep mask, so the count is over what stands
+        if self.output_columns.is_empty() && (self.predicate.is_none() || answered) {
             let mut kept = 0usize;
             let mut locators: Vec<zyron_common::RowLocator> = Vec::new();
             for r in 0..row_count {
@@ -807,9 +1152,9 @@ impl LakeScanOperator {
                 }
             }
             if kept > 0 {
-                self.queue_batch(DataBatch::with_row_count(kept), locators)?;
+                self.queue_batch(DataBatch::with_row_count(kept), locators, true, None)?;
             }
-            self.record_file_io(kept as u64, reader.bytes_read());
+            self.record_file_io(kept as u64, bytes_read());
             return Ok(());
         }
 
@@ -819,80 +1164,89 @@ impl LakeScanOperator {
         // read stops paying for the whole column
         let (span_start, span_end) = surviving_span(&keep, row_count);
         if span_start == span_end {
-            self.record_file_io(0, reader.bytes_read());
+            self.record_file_io(0, bytes_read());
             return Ok(());
         }
 
         // One decoded column per projected column, schema-evolved columns
         // absent from the file come back as all NULL
-        let mut decoded = Vec::with_capacity(self.output_columns.len());
-        for col in &self.output_columns {
-            let lake_col = self
-                .manifest
-                .schema
-                .column_by_id(col.column_id.0 as u32)
-                .ok_or_else(|| {
-                    ZyronError::ExecutionError(format!(
-                        "lake scan: column \"{}\" missing from the manifest schema",
-                        col.name
-                    ))
-                })?;
-            // Cells decode by the physical type, which is what sizes them.
-            // A TIMESTAMP(p>6) column stores 16 byte i128 picoseconds, and
-            // decoding it as its logical type would read half the cell and
-            // hand the i128 builder a variant it zeroes. Every other type's
-            // physical form is its logical one
-            let physical = lake_col.physical_type_id();
-            decoded.push((
-                physical,
-                physical.fixed_size().unwrap_or(0),
-                reader.read_column_range(lake_col, span_start, span_end)?,
-            ));
-        }
+        let decode = profile::scope(Phase::LakeDecodeColumns);
+        let decoded = decode_range_columns(
+            &reader,
+            &self.manifest.schema,
+            &self.output_columns,
+            span_start,
+            span_end,
+        )?;
+        // The row filter's own columns, decoded only when the projection
+        // does not carry them and the stored filter did not settle the
+        // predicate for this file
+        let residual = if answered || self.filter_columns.is_empty() {
+            Vec::new()
+        } else {
+            decode_range_columns(
+                &reader,
+                &self.manifest.schema,
+                &self.filter_columns,
+                span_start,
+                span_end,
+            )?
+        };
 
-        let mut builders = create_builders(&self.output_columns, row_count.min(BATCH_SIZE));
-        let mut locators: Vec<zyron_common::RowLocator> = Vec::new();
-        let mut in_batch = 0usize;
+        // A batch's ordinals first, then one pass per column over them, rather
+        // than one pass per row over the columns. Which scalar to build from a
+        // cell and which buffer it belongs in are the same answers for every
+        // value in a column, and settling them per value is what a decoded
+        // column scan spends its time on. Gathering the ordinals costs four
+        // bytes per row of a batch and takes that decision out of the loop
+        drop(decode);
+        let mut ordinals: Vec<u32> = Vec::with_capacity(BATCH_SIZE.min(row_count));
         // Rows this file yielded, counted before the exact row filter runs so
         // the number means rows the scan read rather than rows it returned
         let mut rows_yielded: u64 = 0;
-        for r in 0..row_count {
-            if keep[r / 8] & (1 << (r % 8)) == 0 {
-                continue;
+        let mut r = span_start;
+        loop {
+            while r < span_end && ordinals.len() < BATCH_SIZE {
+                if keep[r / 8] & (1 << (r % 8)) != 0 {
+                    ordinals.push(r as u32);
+                }
+                r += 1;
             }
-            for (ci, (type_id, value_size, col)) in decoded.iter().enumerate() {
-                // push_owned moves a decoded text or binary allocation into
-                // the column instead of copying it a second time
-                let sv = match col.cell(r) {
-                    None => ScalarValue::Null,
-                    Some(cell) if *value_size == 0 => decode_varlen_scalar(*type_id, cell),
-                    Some(cell) => decode_fixed_scalar(*type_id, cell),
+            if ordinals.is_empty() {
+                break;
+            }
+            let (batch, filter_batch) = {
+                let _s = profile::scope(Phase::LakeBuildBatch);
+                // A projection of nothing is a row count, which is what a
+                // COUNT(*) whose filter columns were withheld asks for
+                let batch = if self.output_columns.is_empty() {
+                    DataBatch::with_row_count(ordinals.len())
+                } else {
+                    build_batch(&self.output_columns, &decoded, &ordinals)
                 };
-                builders[ci].push_owned(sv);
-            }
-            if self.emit_locators {
-                locators.push(zyron_common::RowLocator::Lake {
-                    file_id: partition_id,
-                    ordinal: r as u64,
-                });
-            }
-            in_batch += 1;
-            rows_yielded += 1;
-            if in_batch == BATCH_SIZE {
-                let batch = finalize_builders(std::mem::replace(
-                    &mut builders,
-                    create_builders(&self.output_columns, BATCH_SIZE),
-                ));
-                let locs = std::mem::take(&mut locators);
-                self.queue_batch(batch, locs)?;
-                in_batch = 0;
+                let filter_batch = (!residual.is_empty())
+                    .then(|| build_batch(&self.filter_columns, &residual, &ordinals));
+                (batch, filter_batch)
+            };
+            let locators: Vec<zyron_common::RowLocator> = if self.emit_locators {
+                ordinals
+                    .iter()
+                    .map(|&o| zyron_common::RowLocator::Lake {
+                        file_id: partition_id,
+                        ordinal: o as u64,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            rows_yielded += ordinals.len() as u64;
+            self.queue_batch(batch, locators, answered, filter_batch)?;
+            ordinals.clear();
+            if r >= span_end {
+                break;
             }
         }
-        if in_batch > 0 {
-            let batch = finalize_builders(builders);
-            self.queue_batch(batch, locators)?;
-        }
-        self.record_file_io(rows_yielded, reader.bytes_read());
+        self.record_file_io(rows_yielded, bytes_read());
         Ok(())
     }
 
@@ -905,26 +1259,62 @@ impl LakeScanOperator {
         }
     }
 
+    /// Adds one batch to the output queue, applying the row filter unless
+    /// the scan has already answered it.
+    ///
+    /// `answered` says the keep mask this batch was gathered from is the
+    /// matching rows and not a superset, which is what an exactly lowered
+    /// stored filter produces. The predicate then has no row left to
+    /// remove, so evaluating it would rebuild an all-keep mask and
+    /// `filter` would copy every column of the batch to reproduce it.
+    ///
+    /// `filter_batch` carries the predicate's own columns for the case
+    /// where the projection no longer holds them, gathered over the same
+    /// ordinals so its mask addresses the same rows
     fn queue_batch(
         &mut self,
         batch: DataBatch,
         locators: Vec<zyron_common::RowLocator>,
+        answered: bool,
+        filter_batch: Option<DataBatch>,
     ) -> Result<()> {
+        let _s = profile::scope(Phase::LakeQueueBatch);
         self.rows_scanned += batch.num_rows as u64;
-        let (filtered, kept_locs) = if let Some(ref predicate) = self.predicate {
-            let mask_col = evaluate(predicate, &batch, &self.output_columns, &self.ctx.params)?;
-            let mask = column_to_mask(&mask_col);
-            let kept = if self.emit_locators {
-                mask.iter()
-                    .zip(locators.iter())
-                    .filter_map(|(&k, l)| if k { Some(l.clone()) } else { None })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            (batch.filter(&mask), kept)
-        } else {
-            (batch, locators)
+        let (filtered, kept_locs) = match &self.predicate {
+            Some(predicate) if !answered => {
+                let mask = {
+                    let (eval_batch, eval_schema) = match &filter_batch {
+                        Some(fb) => (fb, self.filter_columns.as_slice()),
+                        None => (&batch, self.output_columns.as_slice()),
+                    };
+                    let mask_col = evaluate(predicate, eval_batch, eval_schema, &self.ctx.params)?;
+                    column_to_mask(&mask_col)
+                };
+                // A predicate that removed nothing still describes every row
+                // of the batch, and rebuilding it column by column to say so
+                // copies as much as a filter that removed most of them
+                if mask.iter().all(|k| *k) {
+                    (batch, locators)
+                } else {
+                    let kept = if self.emit_locators {
+                        mask.iter()
+                            .zip(locators.iter())
+                            .filter_map(|(&k, l)| if k { Some(*l) } else { None })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    // A batch of no columns is a row count, and selecting
+                    // rows out of one is counting the rows that stand
+                    let filtered = if batch.num_columns() == 0 {
+                        DataBatch::with_row_count(mask.iter().filter(|k| **k).count())
+                    } else {
+                        batch.filter(&mask)
+                    };
+                    (filtered, kept)
+                }
+            }
+            _ => (batch, locators),
         };
         self.rows_matched += filtered.num_rows as u64;
         if filtered.num_rows == 0 {
@@ -945,11 +1335,17 @@ impl LakeScanOperator {
 impl Operator for LakeScanOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         Box::pin(async move {
+            let _scan = profile::scope(Phase::ExecLakeScanNext);
             loop {
                 if let Some(b) = self.pending.pop_front() {
                     return Ok(Some(b));
                 }
-                if self.finished || self.file_idx >= self.files.len() {
+                let position = if self.finished {
+                    self.files.len()
+                } else {
+                    self.next_file_position()
+                };
+                if position >= self.files.len() {
                     // One report per finished scan, never per row
                     if !self.finished {
                         if let Some(lowered) = &self.lowered {
@@ -976,8 +1372,7 @@ impl Operator for LakeScanOperator {
                     self.finished = true;
                     return Ok(None);
                 }
-                let partition_id = self.files[self.file_idx];
-                self.file_idx += 1;
+                let partition_id = self.files[position];
                 self.load_file(partition_id)?;
             }
         })
@@ -1564,6 +1959,296 @@ impl Operator for LakeDeleteOperator {
             Ok(Some(ExecutionBatch::new(
                 crate::operator::modify::count_batch(outcome.rows_matched as i64),
             )))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lake metadata aggregate
+// ---------------------------------------------------------------------------
+
+/// Answers an ungrouped SUM, MIN, MAX or COUNT from the lake manifest,
+/// opening no data file.
+///
+/// The manifest is already resident and already records, per file and per
+/// column, the bounds and null count that settle MIN, MAX and both counts,
+/// and the exact total that settles SUM. A whole table aggregate is
+/// therefore a fold over statistics, and it costs the file count rather
+/// than the row count.
+///
+/// A file the statistics do not describe is scanned instead: one carrying
+/// delete predicates, whose live rows are not the rows the statistics were
+/// taken over, and one missing the stat an aggregate needs, which is what
+/// a column added after the file was written looks like. That is decided
+/// per file, so a delete against one file leaves the rest on the fast path
+pub struct LakeMetadataAggregateOperator {
+    ctx: Arc<ExecutionContext>,
+    table_id: zyron_catalog::TableId,
+    specs: Vec<MetaAggSpec>,
+    schema: Vec<LogicalColumn>,
+    as_of: Option<AsOfTarget>,
+    done: bool,
+}
+
+/// What one file contributes to one aggregate, out of its statistics alone
+enum StatAnswer {
+    /// The file holds no non-null value in this column, so it moves
+    /// nothing. Distinct from carrying no statistics at all
+    Empty,
+    Count(i64),
+    Value(ScalarValue),
+    Sum(i128),
+}
+
+impl LakeMetadataAggregateOperator {
+    pub fn new(
+        ctx: Arc<ExecutionContext>,
+        table_id: zyron_catalog::TableId,
+        specs: Vec<MetaAggSpec>,
+        schema: Vec<LogicalColumn>,
+        as_of: Option<AsOfTarget>,
+    ) -> Self {
+        Self {
+            ctx,
+            table_id,
+            specs,
+            schema,
+            as_of,
+            done: false,
+        }
+    }
+
+    /// What one file's statistics say about one aggregate, or None when
+    /// they say nothing and the file has to be read.
+    ///
+    /// A column with no stats entry is one the file predates, which reads
+    /// as all NULL, but nothing here separates that from a writer that
+    /// recorded none, so it is answered by a scan
+    fn answer_from_stats(
+        spec: &MetaAggSpec,
+        entry: &zyron_lake::PartitionEntry,
+        schema: &zyron_lake::LakeSchema,
+    ) -> Option<StatAnswer> {
+        if spec.kind == MetaAggKind::CountStar {
+            return Some(StatAnswer::Count(entry.row_count as i64));
+        }
+        let column_id = spec.column_id?.0 as u32;
+        let stats = entry.stats_for(column_id)?;
+        let live = stats
+            .bounds
+            .row_count
+            .saturating_sub(stats.bounds.null_count);
+        match spec.kind {
+            MetaAggKind::CountStar => None,
+            MetaAggKind::CountCol => Some(StatAnswer::Count(live as i64)),
+            MetaAggKind::Min | MetaAggKind::Max => {
+                if live == 0 {
+                    return Some(StatAnswer::Empty);
+                }
+                let bound = if spec.kind == MetaAggKind::Max {
+                    stats.bounds.max.as_ref()
+                } else {
+                    stats.bounds.min.as_ref()
+                }?;
+                let physical = schema.column_by_id(column_id)?.physical_type_id();
+                stat_to_scalar(physical, bound).map(StatAnswer::Value)
+            }
+            MetaAggKind::Sum => {
+                if live == 0 {
+                    return Some(StatAnswer::Empty);
+                }
+                stats.sum.map(StatAnswer::Sum)
+            }
+        }
+    }
+
+    /// Folds one file's statistics answers into the accumulators. Every
+    /// aggregate has an answer by the time this runs, so a file is never
+    /// counted half from statistics and half from rows
+    fn fold_answers(
+        answers: Vec<StatAnswer>,
+        accs: &mut [MetaAcc],
+        specs: &[MetaAggSpec],
+    ) -> Result<()> {
+        for (si, answer) in answers.into_iter().enumerate() {
+            match (answer, &mut accs[si]) {
+                (StatAnswer::Empty, _) => {}
+                (StatAnswer::Count(n), MetaAcc::Count(c)) => *c += n,
+                (StatAnswer::Value(v), MetaAcc::MinMax(m)) => {
+                    MetaAcc::fold_minmax(m, v, specs[si].kind == MetaAggKind::Max);
+                }
+                (StatAnswer::Sum(v), MetaAcc::Sum { total, any }) => {
+                    *total = total.checked_add(v).ok_or_else(|| {
+                        ZyronError::ExecutionError(
+                            "SUM overflowed its 128-bit accumulator".to_string(),
+                        )
+                    })?;
+                    *any = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The columns a fallback scan has to project, and where each
+    /// aggregate reads its target in the batch that comes back.
+    ///
+    /// COUNT(*) needs no column of its own, so a request holding only that
+    /// one drives the scan off the first column in the table
+    fn fallback_projection(
+        &self,
+        table_entry: &zyron_catalog::TableEntry,
+    ) -> Result<(Vec<LogicalColumn>, Vec<Option<usize>>)> {
+        let as_projected = |ce: &zyron_catalog::ColumnEntry| LogicalColumn {
+            table_idx: Some(0),
+            column_id: ce.id,
+            name: ce.name.clone(),
+            type_id: ce.type_id,
+            nullable: ce.nullable,
+            fractional_digits: ce.fractional_digits,
+        };
+        let mut proj: Vec<LogicalColumn> = Vec::new();
+        let mut col_to_proj: std::collections::HashMap<u16, usize> =
+            std::collections::HashMap::new();
+        for s in &self.specs {
+            if let Some(cid) = s.column_id
+                && !col_to_proj.contains_key(&cid.0)
+            {
+                let ce = table_entry
+                    .columns
+                    .iter()
+                    .find(|c| c.id == cid)
+                    .ok_or_else(|| {
+                        ZyronError::ExecutionError(
+                            "lake metadata aggregate: column not found".into(),
+                        )
+                    })?;
+                col_to_proj.insert(cid.0, proj.len());
+                proj.push(as_projected(ce));
+            }
+        }
+        if proj.is_empty()
+            && let Some(ce) = table_entry.columns.first()
+        {
+            proj.push(as_projected(ce));
+        }
+        let proj_idx = self
+            .specs
+            .iter()
+            .map(|s| s.column_id.and_then(|c| col_to_proj.get(&c.0).copied()))
+            .collect();
+        Ok((proj, proj_idx))
+    }
+}
+
+/// One manifest statistic as the scalar a scan of the same value would
+/// have produced, so an aggregate answered from statistics and one
+/// answered from rows agree on the variant as well as the number
+fn stat_to_scalar(
+    physical: zyron_common::TypeId,
+    value: &zyron_lake::LakeValue,
+) -> Option<ScalarValue> {
+    use zyron_lake::LakeValue;
+    let mut cell = [0u8; 16];
+    match value {
+        LakeValue::Null => return Some(ScalarValue::Null),
+        LakeValue::Str(s) => return Some(decode_varlen_scalar(physical, s.as_bytes())),
+        LakeValue::Bytes(b) => return Some(decode_varlen_scalar(physical, b)),
+        LakeValue::Bool(b) => cell[0] = u8::from(*b),
+        // A signed value's low bytes are the narrower width's own two's
+        // complement bytes, so one 16-byte little endian buffer serves
+        // every width the column can be
+        LakeValue::Int(v) => cell = (*v as i128).to_le_bytes(),
+        LakeValue::Int128(v) => cell = v.to_le_bytes(),
+        LakeValue::UInt(v) => cell = (*v as u128).to_le_bytes(),
+        LakeValue::UInt128(v) => cell = v.to_le_bytes(),
+        LakeValue::Float(f) => {
+            if physical.fixed_size()? == 4 {
+                cell[..4].copy_from_slice(&(*f as f32).to_le_bytes());
+            } else {
+                cell[..8].copy_from_slice(&f.to_le_bytes());
+            }
+        }
+    }
+    let width = physical.fixed_size()?;
+    if width > cell.len() {
+        return None;
+    }
+    Some(decode_fixed_scalar(physical, &cell[..width]))
+}
+
+impl Operator for LakeMetadataAggregateOperator {
+    fn next(&mut self) -> OperatorResult<'_> {
+        Box::pin(async move {
+            if self.done {
+                return Ok(None);
+            }
+            self.done = true;
+
+            let table_entry = self.ctx.get_table_entry(self.table_id)?;
+            let paths = LakePaths::new(self.ctx.disk_manager.data_dir(), table_entry.id.0);
+            let head = effective_head(&self.ctx, self.as_of.as_ref());
+            let log = open_lake_head(&paths, &table_entry.name, head)?;
+            let version = match &self.as_of {
+                None | Some(AsOfTarget::Branch(_)) => log.latest_version(),
+                Some(AsOfTarget::Version(v)) => resolve_version(&log, TimeTravelSpec::Version(*v))?,
+                Some(AsOfTarget::Timestamp(us)) => {
+                    resolve_version(&log, TimeTravelSpec::Timestamp(*us))?
+                }
+            };
+            let manifest = log.manifest_at(version)?;
+
+            let mut accs = MetaAcc::for_specs(&self.specs);
+            let mut scan_files: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for entry in manifest.entries.iter() {
+                // A file under a delete predicate still holds the rows its
+                // statistics counted, so nothing it recorded describes what
+                // is live in it
+                let answers: Option<Vec<StatAnswer>> = if entry.delete_predicate_ids.is_empty() {
+                    self.specs
+                        .iter()
+                        .map(|s| Self::answer_from_stats(s, entry, &manifest.schema))
+                        .collect()
+                } else {
+                    None
+                };
+                match answers {
+                    Some(answers) => Self::fold_answers(answers, &mut accs, &self.specs)?,
+                    None => {
+                        scan_files.insert(entry.partition_id);
+                    }
+                }
+            }
+
+            if !scan_files.is_empty() {
+                let (proj, proj_idx) = self.fallback_projection(&table_entry)?;
+                let mut scan = LakeScanOperator::new(
+                    self.ctx.clone(),
+                    self.table_id,
+                    proj,
+                    None,
+                    None,
+                    self.as_of.clone(),
+                )?;
+                scan.restrict_to_files(&scan_files);
+                fold_rows_into_meta_accs(Box::new(scan), &self.specs, &proj_idx, &mut accs).await?;
+            }
+
+            // MIN, MAX and SUM all hand back something derived from actual
+            // cell values, so they answer to the same column level policy a
+            // row scan enforces. COUNT exposes no value
+            let table_id = self.table_id.0;
+            let mut builders = create_builders(&self.schema, 1);
+            for (si, acc) in accs.into_iter().enumerate() {
+                let exposes_value = !matches!(acc, MetaAcc::Count(_));
+                let mut sv = acc.finish(self.specs[si].return_type)?;
+                if exposes_value {
+                    sv = expose_column_value(&self.ctx, table_id, self.specs[si].column_id, sv);
+                }
+                builders[si].push(&sv);
+            }
+            Ok(Some(ExecutionBatch::new(finalize_builders(builders))))
         })
     }
 }

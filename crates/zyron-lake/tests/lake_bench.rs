@@ -41,7 +41,7 @@ use zyron_lake::predicate::ColumnBounds;
 use zyron_lake::{
     AllCommitted, ClusterKey, ClusterPassOptions, ClusterStrategy, ColumnData, CommitAttempt,
     CompareOp, Decision, GateConfig, LakeColumn, LakePaths, LakePredicate, LakeSchema, LakeValue,
-    LogEntry, ManifestFile, OperationKind, PredicateClass, PruneDecision, PruneIndex,
+    LogEntry, ManifestFile, OperationKind, PredicateClass, PruneDecision, PruneIndex, StoredFilter,
     TransactionLog, WriteRequest, skip_rate, with_sweep,
 };
 
@@ -139,6 +139,7 @@ fn int_stats(column_id: u32, min: i64, max: i64, rows: u64) -> ColumnStatsEntry 
         bloom: None,
         ndv: Some(rows),
         size_bytes: None,
+        sum: None,
     }
 }
 
@@ -1705,6 +1706,105 @@ fn test_encode_cost_per_row_stays_flat_as_a_column_grows() {
         ratio,
         per_row
     );
+}
+
+/// One column's segment build, for each shape a table's columns take.
+///
+/// A statement's encode phase is the sum over its columns, and the columns
+/// are not alike: a key ascends, a category repeats, a measure is noise,
+/// and a label is text. Timed one shape at a time so the phase can be read
+/// as the column that costs it rather than as one figure over four
+/// unrelated encoders, at a bulk statement's row count and at a trickle
+/// statement's
+#[test]
+fn test_encode_cost_by_column_shape() {
+    let _section = section("Encode By Column Shape");
+    let sizes: &[usize] = if measuring() {
+        &[10_000, 100]
+    } else {
+        &[500, 50]
+    };
+    let options = zyron_storage::columnar::SegmentOptions {
+        bloom: zyron_storage::columnar::BloomPolicy::Auto,
+        exact_encoding: true,
+        distinct_sketch: true,
+    };
+    let mut noise = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        noise ^= noise << 13;
+        noise ^= noise >> 7;
+        noise ^= noise << 17;
+        noise
+    };
+    for &rows in sizes {
+        tprintln!("  Rows per column: {}", rows);
+        let ints: [(&str, Vec<i64>); 3] = [
+            ("ascending key", (0..rows as i64).collect()),
+            (
+                "category of 64",
+                (0..rows).map(|_| (next() % 64) as i64).collect(),
+            ),
+            (
+                "noise measure",
+                (0..rows)
+                    .map(|_| ((next() >> 20) % 100_000) as i64)
+                    .collect(),
+            ),
+        ];
+        for (name, values) in &ints {
+            let mut packed = Vec::with_capacity(rows * 8);
+            for v in values {
+                packed.extend_from_slice(&v.to_le_bytes());
+            }
+            let mut us = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let (_, took) = micros(|| {
+                    zyron_storage::columnar::ColumnSegment::build_packed(
+                        0,
+                        TypeId::Int64,
+                        8,
+                        &packed,
+                        &[],
+                        rows,
+                        options,
+                    )
+                    .expect("encode")
+                });
+                us.push(took);
+            }
+            record_metric(
+                "lake_targets",
+                &format!("Encode {} rows, {}", rows, name),
+                "us",
+                us,
+            );
+        }
+
+        let labels: Vec<Vec<u8>> = (0..rows)
+            .map(|i| format!("row-{:08}", i).into_bytes())
+            .collect();
+        let views: Vec<Option<&[u8]>> = labels.iter().map(|l| Some(l.as_slice())).collect();
+        let mut us = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let (_, took) = micros(|| {
+                zyron_storage::columnar::ColumnSegment::build_with_options(
+                    0,
+                    TypeId::Text,
+                    0,
+                    &views,
+                    options,
+                )
+                .expect("encode")
+            });
+            us.push(took);
+        }
+        record_metric(
+            "lake_targets",
+            &format!("Encode {} rows, text label", rows),
+            "us",
+            us,
+        );
+    }
 }
 
 /// Where the time in one insert actually goes.
@@ -3428,5 +3528,183 @@ fn test_manifest_and_concurrency_targets() {
         gate("Commit throughput (commits/sec)", per_sec, 10.0, true),
         "the log took {:.1} commits a second, under the 10/sec floor",
         per_sec
+    );
+}
+
+// =============================================================================
+// What the value bloom is worth
+// =============================================================================
+
+/// Every side of the value bloom, so the question of whether it should
+/// exist is answered from the same run.
+///
+/// A filter is ten bits per row written into the segment of every high
+/// cardinality column, so it is paid in bytes on disk and in the write that
+/// puts them there, and it is earned on an equality it can deny before the
+/// payload is read. An equality it admits pays for the read twice.
+///
+/// Every number here moves when the filter stops being built, which is what
+/// makes the pair a verdict rather than a description: with it suppressed
+/// the files shrink, the write speeds up, the denied equality has to read
+/// and evaluate the payload, and the admitted one stops paying for a filter
+/// that told it nothing
+#[test]
+fn test_what_the_value_bloom_is_worth() {
+    let _section = section("Value Bloom");
+    let files = if measuring() { 32usize } else { 8 };
+    let rows = ROWS_PER_FILE;
+    let schema = two_column_schema();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 907);
+
+    // Every key distinct and spread across the whole i64 range, which is
+    // what a bloom is for: an identifier, a hash, a key from somewhere
+    // else. A filter is ten bits a row whatever the values are, so the
+    // question of whether it earns its bytes is decided by how wide they
+    // are, and the narrow high cardinality column that packs to fourteen
+    // bits a row is its worst case rather than its case.
+    //
+    // Keys are odd, so any even constant is one no row holds while sitting
+    // inside the bounds, where nothing but a membership answer rejects it
+    let keys: Vec<i64> = {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        (0..rows)
+            .map(|_| {
+                // A 64-bit mix, so the deltas carry no order for FastLanes
+                // to fold and the column stores its values at full width
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 1) as i64) | 1
+            })
+            .collect()
+    };
+    let key_min = *keys.iter().min().expect("rows");
+    let key_max = *keys.iter().max().expect("rows");
+    let batch = {
+        let mut ids = ColumnData::with_capacity(0, 8, rows);
+        let mut bucket = ColumnData::with_capacity(1, 8, rows);
+        for (i, key) in keys.iter().enumerate() {
+            ids.push(Some(&key.to_le_bytes()));
+            bucket.push(Some(&(((i as i64) * 7919) % 1024).to_le_bytes()));
+        }
+        vec![ids, bucket]
+    };
+
+    let partitions: Vec<u64> = (0..files).map(|f| 0xE000 + f as u64).collect();
+    let mut write_us = Vec::with_capacity(partitions.len());
+    for partition in &partitions {
+        let (_, us) = micros(|| {
+            zyron_lake::write_data_file(
+                &paths,
+                &schema,
+                &WriteRequest {
+                    partition_id: *partition,
+                    columns: &batch,
+                    sort_keys: &[],
+                    sort_strategies: &[],
+                    cluster_spec_id: 0,
+                    table_id: 907,
+                    bloom_columns: &[],
+                    index_id: None,
+                },
+            )
+            .expect("write a file for the bloom measurement")
+        });
+        write_us.push(us);
+    }
+
+    // What the filter costs on disk, beside the payload it would replace
+    let readers: Vec<zyron_lake::LakeFileReader> = partitions
+        .iter()
+        .map(|p| zyron_lake::LakeFileReader::open(&paths, *p).expect("open"))
+        .collect();
+    let header = readers[0].segment_header(0).expect("header");
+    let file_bytes = std::fs::metadata(paths.data_file(partitions[0]))
+        .expect("stat")
+        .len();
+    tprintln!(
+        "  key column: {} encoded bytes, {} filter bytes, file {} bytes",
+        header.encoded_size,
+        header.bloom_filter_size,
+        file_bytes
+    );
+    record_metric(
+        "lake_targets",
+        "Data file size with the value bloom",
+        " bytes",
+        vec![file_bytes as f64],
+    );
+    record_metric(
+        "lake_targets",
+        "Write one data file",
+        "us",
+        write_us.clone(),
+    );
+
+    let equality = |value: i64| {
+        StoredFilter::lower(
+            &LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::Eq,
+                value: LakeValue::Int(value),
+            },
+            &schema,
+        )
+        .expect("an equality lowers")
+    };
+    // Even, so no row holds it, and halfway between the bounds, so the
+    // header and the zone maps both admit it and nothing but a membership
+    // answer can reject it
+    let absent_key = ((key_min / 2) + (key_max / 2)) & !1i64;
+    assert!(
+        !keys.contains(&absent_key) && absent_key > key_min && absent_key < key_max,
+        "the absent key has to be inside the bounds and held by no row"
+    );
+    let absent = equality(absent_key);
+    // The key of the first row, which every file holds
+    let present = equality(keys[0]);
+
+    let mut absent_us = Vec::with_capacity(5);
+    let mut present_us = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let (kept, us) = micros(|| {
+            readers
+                .iter()
+                .filter(|r| {
+                    r.rows_matching(&absent)
+                        .expect("eval")
+                        .is_none_or(|m| m.iter().any(|b| *b != 0))
+                })
+                .count()
+        });
+        assert_eq!(kept, 0, "a key no row holds admitted a file");
+        absent_us.push(us);
+
+        let (kept, us) = micros(|| {
+            readers
+                .iter()
+                .filter(|r| {
+                    r.rows_matching(&present)
+                        .expect("eval")
+                        .is_none_or(|m| m.iter().any(|b| *b != 0))
+                })
+                .count()
+        });
+        assert_eq!(kept, files, "a key every file holds was denied");
+        present_us.push(us);
+    }
+
+    record_metric(
+        "lake_targets",
+        &format!("Equality no row holds, across {} files", files),
+        "us",
+        absent_us,
+    );
+    record_metric(
+        "lake_targets",
+        &format!("Equality every file holds, across {} files", files),
+        "us",
+        present_us,
     );
 }

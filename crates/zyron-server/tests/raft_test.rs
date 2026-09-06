@@ -142,7 +142,7 @@ impl RaftTransport for PartitionedTransport {
         &self,
         to: NodeId,
         req: RequestVoteRequest,
-    ) -> RaftFuture<'_, RequestVoteReply> {
+    ) -> RaftFuture<RequestVoteReply> {
         if self.is_blocked(to) {
             return Box::pin(async move { Err(Self::cut(to)) });
         }
@@ -153,7 +153,7 @@ impl RaftTransport for PartitionedTransport {
         &self,
         to: NodeId,
         req: AppendEntriesRequest,
-    ) -> RaftFuture<'_, AppendEntriesReply> {
+    ) -> RaftFuture<AppendEntriesReply> {
         if self.is_blocked(to) {
             return Box::pin(async move { Err(Self::cut(to)) });
         }
@@ -164,18 +164,29 @@ impl RaftTransport for PartitionedTransport {
         &self,
         to: NodeId,
         req: InstallSnapshotRequest,
-    ) -> RaftFuture<'_, InstallSnapshotReply> {
+    ) -> RaftFuture<InstallSnapshotReply> {
         if self.is_blocked(to) {
             return Box::pin(async move { Err(Self::cut(to)) });
         }
         self.inner.send_install_snapshot(to, req)
     }
 
-    fn send_read_index(&self, to: NodeId, req: ReadIndexRequest) -> RaftFuture<'_, ReadIndexReply> {
+    fn send_read_index(&self, to: NodeId, req: ReadIndexRequest) -> RaftFuture<ReadIndexReply> {
         if self.is_blocked(to) {
             return Box::pin(async move { Err(Self::cut(to)) });
         }
         self.inner.send_read_index(to, req)
+    }
+
+    fn send_timeout_now(
+        &self,
+        to: NodeId,
+        req: zyron_raft::TimeoutNowRequest,
+    ) -> RaftFuture<zyron_raft::TimeoutNowReply> {
+        if self.is_blocked(to) {
+            return Box::pin(async move { Err(Self::cut(to)) });
+        }
+        self.inner.send_timeout_now(to, req)
     }
 
     fn set_address(&self, node: NodeId, address: &str) {
@@ -461,6 +472,64 @@ async fn start_member(
         server_stop,
         alive: Arc::new(AtomicBool::new(true)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Leadership transfer, the handover an upgrading leader performs
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_raft_leadership_transfer() {
+    zyron_bench_harness::init("raft");
+    tprintln!("\n=== Leadership Transfer ===");
+
+    let mut cluster = Cluster::start(3, RaftConfig::default()).await;
+    let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+    for i in 0..200u64 {
+        cluster
+            .node(leader)
+            .propose(put(&format!("k{i}"), "v"))
+            .await
+            .expect("write before the transfer");
+    }
+
+    let at = Instant::now();
+    let handed_to = cluster
+        .node(leader)
+        .transfer_leadership(Duration::from_secs(5))
+        .await
+        .expect("transfer")
+        .expect("a three node group has a follower to hand to");
+    let took = at.elapsed();
+    assert_ne!(handed_to, leader, "the leader handed the group to itself");
+    assert!(
+        !cluster.node(leader).is_leader(),
+        "the old leader still leads after the handover"
+    );
+
+    // The group agrees on the node it was handed to, and keeps writing
+    let settled = cluster.wait_leader(Duration::from_secs(5)).await;
+    assert_eq!(
+        settled, handed_to,
+        "the group settled on a different leader"
+    );
+    cluster
+        .node(handed_to)
+        .propose(put("after", "transfer"))
+        .await
+        .expect("write after the transfer");
+    tprintln!("  leadership moved from {leader} to {handed_to} in {took:.2?}");
+
+    // A follower cannot hand over what it does not hold
+    assert_eq!(
+        cluster
+            .node(leader)
+            .transfer_leadership(Duration::from_secs(1))
+            .await
+            .expect("a follower answers rather than failing"),
+        None
+    );
+    cluster.shutdown().await;
 }
 
 fn put(key: &str, value: &str) -> RaftCommand {
@@ -1028,6 +1097,108 @@ async fn test_raft_apply_pages_back_evicted_entries() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 5c: the replicator reads evicted entries back for a follower behind
+// ---------------------------------------------------------------------------
+
+/// A follower that fell behind by more than the leader keeps in memory is
+/// caught up from the leader's log file, not from a snapshot, and in order.
+/// A batch read back from disk is placed after the read, so the follower is
+/// held while it is read and nothing built after it can arrive first
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_raft_replication_pages_back_evicted_entries() {
+    zyron_bench_harness::init("raft");
+    tprintln!("\n=== Replication Pages Back Evicted Entries ===");
+
+    let mut config = RaftConfig::default();
+    // The smallest cap the log accepts, and no snapshots, so the follower
+    // can only be caught up from entries the leader has already evicted
+    config.resident_log_bytes = 64 * 1024;
+    config.snapshot_threshold = 0;
+    config.snapshot_threshold_bytes = 0;
+    let cluster = Cluster::start(3, config).await;
+    let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+    let behind = cluster
+        .live()
+        .into_iter()
+        .find(|id| *id != leader)
+        .expect("a follower");
+    let rest: Vec<NodeId> = cluster
+        .live()
+        .into_iter()
+        .filter(|id| *id != behind)
+        .collect();
+
+    // The follower is cut off while the leader and the other follower commit
+    // half a megabyte, eight times the leader's residency cap
+    cluster.partition(&[&[behind], &rest]);
+    let payload = vec![9u8; 4096];
+    for chunk in 0..8 {
+        let commands: Vec<RaftCommand> = (0..16)
+            .map(|i| RaftCommand::Put {
+                key: format!("page{chunk}-{i}").into_bytes(),
+                value: payload.clone(),
+            })
+            .collect();
+        cluster
+            .node(leader)
+            .propose_batch(commands)
+            .await
+            .expect("bulk write with a majority");
+    }
+    let last_index = cluster.node(leader).last_log_index();
+    let held_back = last_index - cluster.node(behind).last_log_index();
+    assert!(
+        held_back >= 100,
+        "the follower only fell {held_back} behind"
+    );
+
+    // Healed, the follower is brought level from the file
+    cluster.heal();
+    cluster
+        .wait_applied(&[behind], last_index, Duration::from_secs(30))
+        .await;
+
+    let paged = cluster.node(leader).metrics().consensus.entries_paged_in;
+    let follower = cluster.node(behind).metrics();
+    tprintln!(
+        "  the follower was {held_back} entries behind, the leader read {paged} of them back from its log file, the follower refused {} appends and installed {} snapshots",
+        follower.consensus.appends_rejected,
+        follower.consensus.snapshots_installed
+    );
+    assert!(
+        paged > 0,
+        "nothing was paged in, so the follower never met the leader's eviction"
+    );
+    // While the follower was cut off the leader probed it once per heartbeat
+    // interval, reading back whatever was pending each time. A leader that
+    // rebuilt the batch on every proposal would read the backlog back dozens
+    // of times over
+    assert!(
+        paged <= held_back * 16,
+        "the leader read {paged} entries back for a follower {held_back} behind"
+    );
+    assert_eq!(
+        follower.consensus.snapshots_installed, 0,
+        "the follower was caught up by a snapshot rather than the log"
+    );
+    assert_eq!(
+        follower.consensus.appends_rejected, 0,
+        "the follower refused appends, a paged batch was placed out of order"
+    );
+    assert_eq!(
+        cluster.node(behind).log_signature(1, last_index),
+        cluster.node(leader).log_signature(1, last_index),
+        "the follower holds different entries"
+    );
+    assert_eq!(
+        cluster.machine(behind).digest(),
+        cluster.machine(leader).digest(),
+        "the follower state differs"
+    );
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // Test 6: Membership change
 // ---------------------------------------------------------------------------
 
@@ -1195,6 +1366,10 @@ async fn test_raft_pre_vote() {
         .expect("a follower");
     let term_before = cluster.node(isolated).term();
     let leader_term_before = cluster.node(leader).term();
+    // The count is cumulative from the node's start, and a follower may have
+    // campaigned and lost while the group first formed, so only elections
+    // started after the isolation count
+    let elections_before = cluster.node(isolated).metrics().consensus.elections_started;
     tprintln!("  isolating follower {isolated} at term {term_before}");
 
     let rest: Vec<NodeId> = cluster
@@ -1209,7 +1384,7 @@ async fn test_raft_pre_vote() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let term_after = cluster.node(isolated).term();
-    let elections = cluster.node(isolated).metrics().consensus.elections_started;
+    let elections = cluster.node(isolated).metrics().consensus.elections_started - elections_before;
     let pre_votes = cluster.node(isolated).metrics().consensus.pre_votes_started;
     tprintln!(
         "  isolated node is still at term {term_after} after {pre_votes} pre-vote rounds and {elections} elections"
@@ -1443,16 +1618,21 @@ async fn test_raft_write_throughput() {
         )
         .await;
         latencies.sort();
+        // The shape of the tail says whether a p99 is a few stalls or a
+        // shifted distribution
         tprintln!(
-            "  {} writes at {} outstanding: p50 {:.2?}, p99 {:.2?}",
+            "  {} writes at {} outstanding: p50 {:.2?}, p90 {:.2?}, p99 {:.2?}, max {:.2?}",
             format_with_commas(LATENCY_WRITES as f64),
             LATENCY_CONCURRENCY,
             percentile(&latencies, 0.50),
+            percentile(&latencies, 0.90),
             percentile(&latencies, 0.99),
+            latencies.last().copied().unwrap_or_default(),
         );
         p99s.push(millis(percentile(&latencies, 0.99)));
 
         // What the group commits per second, driven to saturation
+        let before = cluster.node(leader).metrics().consensus;
         let at = Instant::now();
         let mut saturated =
             drive_writes(cluster.node(leader), "p", 0, TOTAL, THROUGHPUT_CONCURRENCY).await;
@@ -1468,8 +1648,53 @@ async fn test_raft_write_throughput() {
             percentile(&saturated, 0.50),
             percentile(&saturated, 0.99),
         );
+        // How the entries were carried says whether the pipeline moved
+        // batches or a message per proposal, and what the followers took
+        // against what was sent says whether anything was sent twice
+        let after = cluster.node(leader).metrics().consensus;
+        let heartbeats = after.heartbeats_built - before.heartbeats_built;
+        let carriers = after.commit_carriers_built - before.commit_carriers_built;
+        let carrying = after.appends_built - before.appends_built - heartbeats - carriers;
+        let entries = after.entries_replicated - before.entries_replicated;
+        tprintln!(
+            "  the leader sent {} messages with entries, {:.1} entries each, {} heartbeats and {} commit carriers",
+            format_with_commas(carrying as f64),
+            entries as f64 / carrying.max(1) as f64,
+            heartbeats,
+            carriers
+        );
+        for id in cluster.live().into_iter().filter(|id| *id != leader) {
+            let m = cluster.node(id).metrics().consensus;
+            tprintln!(
+                "  follower {id} appended {} entries, refused {} appends, truncated {} times",
+                format_with_commas(m.entries_appended as f64),
+                m.appends_rejected,
+                m.log_truncations
+            );
+            // A healthy group refuses nothing. A refusal here means a batch
+            // reached the follower ahead of the one before it, which is the
+            // ordering the transport and the replicator together promise
+            assert_eq!(
+                m.appends_rejected, 0,
+                "follower {id} refused appends, the pipeline delivered a batch out of order"
+            );
+            assert_eq!(
+                m.log_truncations, 0,
+                "follower {id} truncated its log under a leader that never changed"
+            );
+        }
         throughputs.push(throughput);
         saturated_p99s.push(millis(percentile(&saturated, 0.99)));
+        // The slowest flush on each node says whether a latency spike was
+        // the disk's
+        for id in cluster.live() {
+            let m = cluster.node(id).metrics();
+            tprintln!(
+                "  node {id}: {} log fsyncs, the slowest {:.2?}",
+                m.log_fsyncs,
+                Duration::from_micros(m.log_fsync_max_us)
+            );
+        }
         assert_eq!(
             cluster.machine(leader).len(),
             (TOTAL + LATENCY_WRITES) as usize
@@ -1585,23 +1810,67 @@ async fn test_raft_replication_lag() {
 
         // Warm the connections and the log so the measurement is steady state
         drive_writes(cluster.node(leader), "warm", 0, 500, 32).await;
+        let leader_commit = cluster.node(leader).commit_index();
+        let behind = leader_commit.saturating_sub(cluster.node(follower).last_applied());
+        let catch_up = Instant::now();
+        while cluster.node(follower).last_applied() < leader_commit {
+            tokio::task::yield_now().await;
+        }
+        tprintln!(
+            "  after the warm-up the follower was {behind} entries behind and caught up in {:.2?}",
+            catch_up.elapsed()
+        );
 
         let mut lags = Vec::with_capacity(WRITES as usize);
         for i in 0..WRITES {
+            let before = cluster.node(leader).metrics().consensus;
+            let follower_before = cluster.node(follower).metrics();
+            let follower_fsync_before = follower_before.log_fsync_max_us;
+            let follower_before = follower_before.consensus;
             let index = cluster
                 .node(leader)
                 .propose(put(&format!("lag{i}"), "v"))
                 .await
                 .expect("write");
             let at = Instant::now();
+            let follower_log_at_commit = cluster.node(follower).metrics().last_log_index;
+            let mut commit_seen: Option<Duration> = None;
             while cluster.node(follower).last_applied() < index {
+                if commit_seen.is_none() && cluster.node(follower).commit_index() >= index {
+                    commit_seen = Some(at.elapsed());
+                }
                 tokio::task::yield_now().await;
                 assert!(
                     at.elapsed() < Duration::from_secs(10),
                     "the follower never applied index {index}"
                 );
             }
-            lags.push(at.elapsed());
+            let lag = at.elapsed();
+            // A stall is rare and short, and where it lands says whether the
+            // leader was slow to say the entry committed or the follower was
+            // slow to apply what it knew. A follower that held the log short
+            // of the entry at the commit was still flushing it, and its
+            // slowest fsync moving past the stall names the disk
+            if lag > Duration::from_millis(5) {
+                let after = cluster.node(leader).metrics().consensus;
+                let follower_after = cluster.node(follower).metrics();
+                let follower_fsync_after = follower_after.log_fsync_max_us;
+                let follower_after = follower_after.consensus;
+                tprintln!(
+                    "  write {i} at index {index}: the follower learned the commit after {:.2?} and applied it after {:.2?}, the leader built {} appends, {} heartbeats, {} commit carriers meanwhile, the follower held log {} at the commit, appended {} entries, rejected {} appends, and its slowest fsync went from {:.2?} to {:.2?}",
+                    commit_seen.unwrap_or(lag),
+                    lag,
+                    after.appends_built - before.appends_built,
+                    after.heartbeats_built - before.heartbeats_built,
+                    after.commit_carriers_built - before.commit_carriers_built,
+                    follower_log_at_commit,
+                    follower_after.entries_appended - follower_before.entries_appended,
+                    follower_after.appends_rejected - follower_before.appends_rejected,
+                    Duration::from_micros(follower_fsync_before),
+                    Duration::from_micros(follower_fsync_after)
+                );
+            }
+            lags.push(lag);
         }
         lags.sort();
         tprintln!(
@@ -1814,6 +2083,12 @@ async fn test_raft_membership_change_latency() {
 async fn test_raft_snapshot_one_gigabyte() {
     zyron_bench_harness::init("raft");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // A leader that steps down mid-run says why at info level, and this is
+    // the one test where that has happened, so its output carries the log
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
     tprintln!("\n=== Snapshot Create and Transfer, One Gigabyte ===");
 
     if zyron_bench_harness::skip_expensive("Snapshot 1GB", "a gigabyte of state through consensus")

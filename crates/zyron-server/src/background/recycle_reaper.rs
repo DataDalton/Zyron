@@ -31,14 +31,11 @@ impl Drop for ReaperPassGuard {
 pub async fn recycle_reaper_loop(
     server: Arc<ServerState>,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_secs: u64,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(10)));
-    loop {
-        ticker.tick().await;
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         run_reaper_once(&server).await;
     }
 }

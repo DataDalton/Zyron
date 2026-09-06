@@ -244,6 +244,7 @@ mod tests {
                 },
                 bloom: None,
                 size_bytes: None,
+                sum: None,
             })
             .collect();
         column_stats.sort_by_key(|s| s.column_id);

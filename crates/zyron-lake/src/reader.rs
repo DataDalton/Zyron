@@ -18,7 +18,7 @@ use zyron_storage::columnar::{
 use zyron_storage::encoding::Predicate;
 
 use crate::cells::{CellFamily, cell_family, compare_cell_to_value, compare_cells};
-use crate::encoded_filter::{ColumnEvidence, StoredFilter, rows_matching};
+use crate::encoded_filter::{ColumnEvidence, StoredFilter, Validity, rows_matching};
 use crate::manifest::{ManifestFile, PartitionEntry};
 use crate::paths::LakePaths;
 use crate::predicate::{CompareOp, LakePredicate, LakeValue};
@@ -39,14 +39,54 @@ impl ColumnEvidence for FileEvidence<'_> {
         self.reader.row_count
     }
 
-    fn zone_maps(&self, column_id: u32) -> Result<Vec<ZoneMapEntry>, ZyronError> {
+    fn zone_maps(&self, column_id: u32) -> Result<std::sync::Arc<[ZoneMapEntry]>, ZyronError> {
         if !self.reader.reader.has_segment(column_id) {
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         self.reader
             .reader
             .read_segment_metadata(column_id, self.reader.row_count)
             .map(|(_, zones)| zones)
+    }
+
+    fn validity(&self, column_id: u32) -> Result<Validity, ZyronError> {
+        if !self.reader.reader.has_segment(column_id) {
+            return Ok(Validity::AllNull);
+        }
+        Ok(
+            match self
+                .reader
+                .reader
+                .read_segment_nulls(column_id, self.reader.row_count)?
+            {
+                None => Validity::AllValid,
+                Some(bitmap) => Validity::Nulls(bitmap),
+            },
+        )
+    }
+
+    fn bloom_denies(&self, column_id: u32, values: &[Vec<u8>]) -> Result<bool, ZyronError> {
+        if values.is_empty() || !self.reader.reader.has_segment(column_id) {
+            return Ok(false);
+        }
+        // What a rejection here avoids is reading this one column's payload
+        // and evaluating the term over it, so a filter as wide as that
+        // payload is not a saving whatever it answers. The columnar scan
+        // measures the same question against the decoded size, because a
+        // rejection there skips a whole segment rather than one term. The
+        // header carries both sizes and is the read a bloom read follows
+        // anyway
+        let header = self.reader.reader.read_segment_header(column_id)?;
+        if header.bloom_filter_size == 0
+            || u64::from(header.bloom_filter_size) >= header.encoded_size
+        {
+            return Ok(false);
+        }
+        let cells: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
+        Ok(matches!(
+            self.reader.reader.bloom_admits_any(column_id, &cells)?,
+            Some(false)
+        ))
     }
 
     fn eval(
@@ -108,6 +148,50 @@ pub struct DecodedColumn {
     all_null: bool,
 }
 
+/// A decoded column whose cells are fixed width with no NULLs among them,
+/// which is the shape a scan reads without asking anything per row.
+#[derive(Clone, Copy, Debug)]
+pub struct FlatCells<'a> {
+    data: &'a [u8],
+    base: usize,
+    row_count: usize,
+    width: usize,
+}
+
+impl<'a> FlatCells<'a> {
+    /// Cells for `rows`, in the order given, None for an ordinal outside the
+    /// decoded range. Same answers `cell` gives for the same column.
+    #[inline]
+    pub fn cells(self, rows: &'a [u32]) -> impl Iterator<Item = Option<&'a [u8]>> + 'a {
+        rows.iter().map(move |&r| {
+            let local = (r as usize).wrapping_sub(self.base);
+            if local < self.row_count {
+                let start = local * self.width;
+                Some(&self.data[start..start + self.width])
+            } else {
+                None
+            }
+        })
+    }
+
+    /// A contiguous run of `len` cells starting at ordinal `start`, as one
+    /// slice, None when the run leaves the decoded range.
+    ///
+    /// A scan that filtered nothing asks for its rows in order and with no
+    /// gaps, so addressing each of them through its ordinal answers a
+    /// question whose answer is already known. Handing the run over whole
+    /// lets a caller walk it without asking anything per value
+    #[inline]
+    pub fn run(self, start: u32, len: usize) -> Option<&'a [u8]> {
+        let local = (start as usize).checked_sub(self.base)?;
+        let end = local.checked_add(len)?;
+        if end > self.row_count {
+            return None;
+        }
+        Some(&self.data[local * self.width..end * self.width])
+    }
+}
+
 impl Drop for DecodedColumn {
     /// Offers the decode buffer back for the next decode on this thread.
     ///
@@ -157,6 +241,29 @@ impl DecodedColumn {
             let blob_base = 4 + (self.row_count + 1) * 4;
             Some(&self.data[blob_base + start..blob_base + end])
         }
+    }
+
+    /// The decoded range as a flat run of fixed-width cells, when every row in
+    /// it holds a value.
+    ///
+    /// `cell` re-reads whether the column is all NULL, whether it carries a
+    /// bitmap, where the decoded range starts, how long it is and how wide a
+    /// cell is, for every single row. Those five answers are the same for the
+    /// whole column, and a scan filling a typed buffer asks for hundreds of
+    /// thousands of cells in a row. This settles them once.
+    ///
+    /// None for a column carrying NULLs or variable-length values, where the
+    /// caller goes back to asking per row.
+    pub fn flat_cells(&self) -> Option<FlatCells<'_>> {
+        if self.all_null || !self.null_bitmap.is_empty() || self.value_size == 0 {
+            return None;
+        }
+        Some(FlatCells {
+            data: &self.data,
+            base: self.base,
+            row_count: self.row_count,
+            width: self.value_size,
+        })
     }
 
     fn is_null(&self, row: usize) -> bool {
@@ -247,10 +354,102 @@ pub struct LakeFileReader {
     row_count: usize,
 }
 
+/// Readers already open, keyed by the data file each one reads.
+///
+/// A lake data file never changes once the manifest names it, and a partition
+/// id is never reused, so a reader's file handle and parsed segment index stay
+/// correct for as long as the file exists. Opening one costs far more than
+/// reading a column out of it, and a scan opens every surviving file on every
+/// query, so the open is what a repeated scan spends its time on rather than
+/// the scan. Follows the transaction log registry's precedent.
+static OPEN_READERS: std::sync::OnceLock<
+    scc::HashMap<std::path::PathBuf, std::sync::Arc<LakeFileReader>>,
+> = std::sync::OnceLock::new();
+
+fn open_readers() -> &'static scc::HashMap<std::path::PathBuf, std::sync::Arc<LakeFileReader>> {
+    OPEN_READERS.get_or_init(scc::HashMap::new)
+}
+
+/// Readers the registry holds before it drops the ones no caller still has.
+///
+/// Each entry is a file handle and a segment index, so the cost of a stale one
+/// is an open descriptor rather than the file's bytes.
+const OPEN_READER_CACHE_MAX: usize = 512;
+
+/// Drops every registry entry no other caller is holding.
+///
+/// A reader is shared, so a caller that is mid-scan keeps its own reference and
+/// is unaffected by losing the registry's. Entries the registry alone holds are
+/// exactly the ones no scan would notice going away.
+fn evict_open_readers() {
+    let readers = open_readers();
+    if readers.len() <= OPEN_READER_CACHE_MAX {
+        return;
+    }
+    let mut idle = Vec::new();
+    readers.iter_sync(|path, reader| {
+        if std::sync::Arc::strong_count(reader) == 1 {
+            idle.push(path.clone());
+        }
+        true
+    });
+    for path in &idle {
+        let _ = readers.remove_sync(path);
+    }
+}
+
 impl LakeFileReader {
     /// Opens the data file for one partition id
     pub fn open(paths: &LakePaths, partition_id: u64) -> Result<Self, ZyronError> {
         Self::open_path(&paths.data_file(partition_id))
+    }
+
+    /// Opens the data file for one partition id through the process-global
+    /// registry, so a file a query opens is still open for the next one.
+    ///
+    /// The reader it hands back is shared, and the byte counters on it count
+    /// every read any caller has made through it. A caller reporting what one
+    /// scan read has to take the difference across its own reads rather than
+    /// the running total, which is what [`LakeFileReader::bytes_read`] returns.
+    pub fn open_shared(
+        paths: &LakePaths,
+        partition_id: u64,
+    ) -> Result<std::sync::Arc<Self>, ZyronError> {
+        let path = paths.data_file(partition_id);
+        if let Some(hit) =
+            open_readers().read_sync(&path, |_, reader| std::sync::Arc::clone(reader))
+        {
+            return Ok(hit);
+        }
+        let _miss = zyron_common::profile::scope(zyron_common::profile::Phase::LakeOpenMiss);
+        let reader = std::sync::Arc::new(Self::open_path(&path)?);
+        // A concurrent opener may have won the race, and either reader reads
+        // the same immutable file, so whichever landed first is the one to keep
+        match open_readers().insert_sync(path, std::sync::Arc::clone(&reader)) {
+            Ok(()) => {
+                evict_open_readers();
+                Ok(reader)
+            }
+            Err((path, _)) => Ok(open_readers()
+                .read_sync(&path, |_, existing| std::sync::Arc::clone(existing))
+                .unwrap_or(reader)),
+        }
+    }
+
+    /// Drops every cached reader nothing else is holding, so the files they
+    /// keep open can be removed.
+    pub fn release_cached_readers() {
+        let readers = open_readers();
+        let mut idle = Vec::new();
+        readers.iter_sync(|path, reader| {
+            if std::sync::Arc::strong_count(reader) == 1 {
+                idle.push(path.clone());
+            }
+            true
+        });
+        for path in &idle {
+            let _ = readers.remove_sync(path);
+        }
     }
 
     /// Opens a data file by path. A clustering pass reads back the
@@ -317,10 +516,9 @@ impl LakeFileReader {
     /// at different speeds, and a throughput number that does not say which
     /// one it read cannot be compared with another that read the other
     pub fn segment_header(&self, column_id: u32) -> Result<SegmentHeader, ZyronError> {
-        self.reader
-            .read_segment_metadata(column_id, self.row_count)
-            .map(|(header, _)| header)
+        self.reader.read_segment_header(column_id)
     }
+
     /// The rows that can hold any of `cells`, decided from one column's
     /// zone maps with no payload read.
     ///
@@ -943,6 +1141,370 @@ mod tests {
             },
         )
         .expect("write")
+    }
+
+    /// A scan opens every surviving file on every query, and opening one costs
+    /// far more than reading a column out of it, so the shared open has to hand
+    /// back the reader it already has rather than building another. Comparing
+    /// the pointers is what says it did, since two readers of one file answer
+    /// every question identically and would hide a miss.
+    #[test]
+    fn open_shared_returns_the_same_reader_for_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = LakePaths::new(dir.path(), 7);
+        std::fs::create_dir_all(paths.data_dir()).expect("data dir");
+        let entry = write_sample(&paths, 0xA1);
+
+        let first = LakeFileReader::open_shared(&paths, entry.partition_id).expect("first open");
+        let second = LakeFileReader::open_shared(&paths, entry.partition_id).expect("second open");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the second open built a new reader instead of reusing the registered one"
+        );
+
+        // A reader nothing else holds is what the registry is free to drop, so
+        // releasing has to leave the next open building a fresh one
+        drop(first);
+        drop(second);
+        LakeFileReader::release_cached_readers();
+        let third = LakeFileReader::open_shared(&paths, entry.partition_id).expect("third open");
+        let fourth = LakeFileReader::open_shared(&paths, entry.partition_id).expect("fourth open");
+        assert!(
+            std::sync::Arc::ptr_eq(&third, &fourth),
+            "the registry did not take the reader back after it was released"
+        );
+    }
+
+    /// A schema whose fixed-width column admits nulls, which the shared one
+    /// does not
+    fn nullable_schema() -> LakeSchema {
+        LakeSchema::new(
+            1,
+            vec![
+                LakeColumn {
+                    id: 0,
+                    name: "id".into(),
+                    type_id: TypeId::Int64,
+                    nullable: true,
+                    fractional_digits: None,
+                    tz_offset_secs: None,
+                    max_length: None,
+                    default_expr: None,
+                },
+                LakeColumn {
+                    id: 1,
+                    name: "name".into(),
+                    type_id: TypeId::Varchar,
+                    nullable: true,
+                    fractional_digits: None,
+                    tz_offset_secs: None,
+                    max_length: None,
+                    default_expr: None,
+                },
+            ],
+        )
+        .expect("schema")
+    }
+
+    /// The id values a keep mask stands for, so an assertion reads the same
+    /// whatever order the writer laid the rows down in
+    fn kept_ids(reader: &LakeFileReader, s: &LakeSchema, mask: &[u8]) -> Vec<Option<i64>> {
+        let col = reader.read_column(&s.columns[0]).expect("id");
+        (0..reader.row_count())
+            .filter(|r| mask[r / 8] & (1 << (r % 8)) != 0)
+            .map(|r| {
+                col.cell(r).map(|c| {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&c[..8]);
+                    i64::from_le_bytes(b)
+                })
+            })
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<Option<i64>>) -> Vec<Option<i64>> {
+        v.sort();
+        v
+    }
+
+    /// A null cell is stored as zero bytes, so a comparison answered on the
+    /// encoded payload sees the value zero where the row holds nothing at
+    /// all. SQL says no comparison is true of a null on either side of a
+    /// negation, and the bitmap that says which rows those are comes off the
+    /// same read as the payload, so the filter answers the rows rather than
+    /// bounding them.
+    #[test]
+    fn a_null_cell_satisfies_no_comparison_the_encoded_filter_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = LakePaths::new(dir.path(), 7);
+        let s = nullable_schema();
+        let ids: Vec<Option<i64>> = vec![Some(5), None, Some(-3), Some(0), None, Some(7)];
+        let names: Vec<Option<&str>> = vec![Some("a"), Some("b"), Some("c"), None, Some("e"), None];
+        let columns = vec![
+            ColumnData::from_cells(0, int_cells(&ids)),
+            ColumnData::from_cells(1, str_cells(&names)),
+        ];
+        write_data_file(
+            &paths,
+            &s,
+            &WriteRequest {
+                partition_id: 0x51,
+                columns: &columns,
+                sort_keys: &[],
+                sort_strategies: &[],
+                cluster_spec_id: 0,
+                table_id: 7,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write");
+        let reader = LakeFileReader::open(&paths, 0x51).expect("open");
+
+        // A range whose zero-filled null cells would otherwise pass it
+        let ge_zero = StoredFilter::lower(
+            &LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::GtEq,
+                value: LakeValue::Int(0),
+            },
+            &s,
+        )
+        .expect("lowers");
+        assert!(ge_zero.is_exact());
+        let mask = reader.rows_matching(&ge_zero).expect("eval").expect("mask");
+        assert_eq!(
+            sorted(kept_ids(&reader, &s, &mask)),
+            vec![Some(0), Some(5), Some(7)]
+        );
+
+        // An inverted term keeps what the constant does not pin, and a null
+        // is not one of the rows it keeps
+        let not_five = StoredFilter::lower(
+            &LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::NotEq,
+                value: LakeValue::Int(5),
+            },
+            &s,
+        )
+        .expect("lowers");
+        assert!(not_five.is_exact());
+        let mask = reader
+            .rows_matching(&not_five)
+            .expect("eval")
+            .expect("mask");
+        assert_eq!(
+            sorted(kept_ids(&reader, &s, &mask)),
+            vec![Some(-3), Some(0), Some(7)]
+        );
+
+        // The null-shaped terms read the bitmap and nothing else
+        let is_null =
+            StoredFilter::lower(&LakePredicate::IsNull { column_id: 0 }, &s).expect("lowers");
+        let mask = reader.rows_matching(&is_null).expect("eval").expect("mask");
+        assert_eq!(kept_ids(&reader, &s, &mask), vec![None, None]);
+
+        let not_null =
+            StoredFilter::lower(&LakePredicate::IsNotNull { column_id: 0 }, &s).expect("lowers");
+        let mask = reader
+            .rows_matching(&not_null)
+            .expect("eval")
+            .expect("mask");
+        assert_eq!(
+            sorted(kept_ids(&reader, &s, &mask)),
+            vec![Some(-3), Some(0), Some(5), Some(7)]
+        );
+
+        // A variable-length column answers the same way
+        let named =
+            StoredFilter::lower(&LakePredicate::IsNotNull { column_id: 1 }, &s).expect("lowers");
+        let mask = reader.rows_matching(&named).expect("eval").expect("mask");
+        assert_eq!(
+            sorted(kept_ids(&reader, &s, &mask)),
+            vec![None, None, Some(-3), Some(5)],
+            "the rows holding a name, whose own ids include two nulls"
+        );
+    }
+
+    /// Zone bounds only say a constant falls inside a range they cover, and
+    /// a column whose values are spread across its range has a zone
+    /// covering every constant, so an equality no row satisfies read the
+    /// whole payload to find that out. The value bloom answers membership,
+    /// and it is built for exactly those columns.
+    ///
+    /// The mechanism is asserted, not just the answer: the byte counter
+    /// counts payload reads and nothing else, so a rejection that leaves it
+    /// untouched is a rejection that never opened the payload
+    #[test]
+    fn an_equality_stops_at_the_value_bloom_before_reading_the_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = LakePaths::new(dir.path(), 7);
+        let s = nullable_schema();
+        // Keys spread across the whole i64 range, which is the shape a
+        // bloom is for and the shape that keeps the payload wider than the
+        // filter that would replace it. A narrower column packs below the
+        // filter, and the probe is not tried there at all.
+        //
+        // Every key is odd, so any even constant is one no row holds
+        let keys: Vec<i64> = {
+            let mut state = 0x243f_6a88_85a3_08d3u64;
+            (0..1000)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 1) as i64) | 1
+                })
+                .collect()
+        };
+        let key_min = *keys.iter().min().expect("keys");
+        let key_max = *keys.iter().max().expect("keys");
+        let ids: Vec<Option<i64>> = keys.iter().map(|k| Some(*k)).collect();
+        let names: Vec<Option<&str>> = (0..1000).map(|_| Some("x")).collect();
+        let columns = vec![
+            ColumnData::from_cells(0, int_cells(&ids)),
+            ColumnData::from_cells(1, str_cells(&names)),
+        ];
+        write_data_file(
+            &paths,
+            &s,
+            &WriteRequest {
+                partition_id: 0x61,
+                columns: &columns,
+                sort_keys: &[],
+                sort_strategies: &[],
+                cluster_spec_id: 0,
+                table_id: 7,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write");
+        let reader = LakeFileReader::open(&paths, 0x61).expect("open");
+        let header = reader.segment_header(0).expect("header");
+        assert!(
+            header.bloom_filter_size > 0
+                && u64::from(header.bloom_filter_size) < header.encoded_size,
+            "the probe is only tried when the filter is narrower than the payload it \
+             replaces, and here it is {} against {}, so this proves nothing",
+            header.bloom_filter_size,
+            header.encoded_size
+        );
+
+        // Even, so no row holds it, and between the bounds, so the header
+        // and the zone maps both admit it
+        let absent_key = ((key_min / 2) + (key_max / 2)) & !1i64;
+        assert!(
+            !keys.contains(&absent_key) && absent_key > key_min && absent_key < key_max,
+            "the absent key has to be inside the bounds and held by no row"
+        );
+        let absent = StoredFilter::lower(
+            &LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::Eq,
+                value: LakeValue::Int(absent_key),
+            },
+            &s,
+        )
+        .expect("lowers");
+        let before = reader.bytes_read();
+        let mask = reader.rows_matching(&absent).expect("eval").expect("mask");
+        assert!(
+            mask.iter().all(|b| *b == 0),
+            "a key no row holds admitted rows"
+        );
+        assert_eq!(
+            reader.bytes_read(),
+            before,
+            "the payload was read to answer what the bloom had already denied"
+        );
+
+        // The same shape for a key that is there, which the bloom admits
+        // and the payload then decides
+        let present = StoredFilter::lower(
+            &LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::Eq,
+                value: LakeValue::Int(keys[0]),
+            },
+            &s,
+        )
+        .expect("lowers");
+        let mask = reader.rows_matching(&present).expect("eval").expect("mask");
+        assert_eq!(kept_ids(&reader, &s, &mask), vec![Some(keys[0])]);
+        assert!(
+            reader.bytes_read() > before,
+            "a key the bloom admits still has to be decided on the payload"
+        );
+    }
+
+    /// The flat view exists only to skip per-row work, so it has to answer
+    /// exactly what asking per row answers. A column carrying NULLs or
+    /// variable-length values has to decline it, or a scan would read past
+    /// the offsets array as though it were cells.
+    #[test]
+    fn flat_cells_answers_what_cell_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = LakePaths::new(dir.path(), 7);
+
+        // No NULLs in the id column, one in the name column
+        let ids: Vec<Option<i64>> = (0..500).map(|i| Some(i * 7 - 100)).collect();
+        let names: Vec<Option<&str>> = (0..500)
+            .map(|i| if i % 97 == 3 { None } else { Some("value") })
+            .collect();
+        let columns = vec![
+            ColumnData::from_cells(0, int_cells(&ids)),
+            ColumnData::from_cells(1, str_cells(&names)),
+        ];
+        write_data_file(
+            &paths,
+            &schema(),
+            &WriteRequest {
+                partition_id: 0x9,
+                columns: &columns,
+                sort_keys: &[0],
+                sort_strategies: &[],
+                cluster_spec_id: 0,
+                table_id: 7,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write");
+
+        let reader = LakeFileReader::open(&paths, 0x9).expect("open");
+        let s = schema();
+        let id_col = reader.read_column(&s.columns[0]).expect("id");
+
+        let flat = id_col
+            .flat_cells()
+            .expect("a fixed width column with no nulls is flat");
+        // Ordinals out of order and including one past the end, which is what
+        // a filtered scan hands over
+        let rows: Vec<u32> = (0..500u32)
+            .rev()
+            .step_by(3)
+            .chain(std::iter::once(9_999))
+            .collect();
+        let via_flat: Vec<Option<&[u8]>> = flat.cells(&rows).collect();
+        let via_cell: Vec<Option<&[u8]>> = rows.iter().map(|&r| id_col.cell(r as usize)).collect();
+        assert_eq!(
+            via_flat, via_cell,
+            "flat view disagreed with the per-row read"
+        );
+        assert_eq!(
+            via_flat[via_flat.len() - 1],
+            None,
+            "past the end is not a cell"
+        );
+
+        // A variable-length column declines, and so does one with NULLs
+        let name_col = reader.read_column(&s.columns[1]).expect("name");
+        assert!(
+            name_col.flat_cells().is_none(),
+            "a variable-length column has no flat run of cells"
+        );
     }
 
     #[test]

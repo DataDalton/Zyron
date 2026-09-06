@@ -136,6 +136,8 @@ pub fn append_rows(
                 // the spec asked rather than always ascending
                 let sort_strategies: Vec<ClusterStrategy> =
                     base.cluster_spec.keys.iter().map(|k| k.strategy).collect();
+                let _write =
+                    zyron_common::profile::scope(zyron_common::profile::Phase::LakeWriteFile);
                 let written = write_data_file_ordered(
                     log.paths(),
                     &base.schema,
@@ -167,6 +169,7 @@ pub fn append_rows(
         // index does not name them
         let mut used: Vec<u64> = vec![placed.partition_id];
         let mut entries = vec![LogEntry::AddFile(placed.entry.clone())];
+        let _deltas = zyron_common::profile::scope(zyron_common::profile::Phase::LakeIndexDeltas);
         let deltas = index::delta_entries_for_written_file(
             log.paths(),
             base,

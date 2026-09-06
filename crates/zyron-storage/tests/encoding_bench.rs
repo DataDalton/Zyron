@@ -33,6 +33,20 @@ const DICTIONARY_LOOKUP_TARGET_NS: f64 = 3.0;
 const RLE_DECODE_TARGET_VAL_SEC: f64 = 60_000_000_000.0;
 const COMPRESSED_EVAL_SPEEDUP_TARGET: f64 = 3.0;
 const ENCODING_SELECT_TARGET_US: f64 = 500.0;
+// Bit-packed residuals are what a lake column actually decodes: the
+// sequential shape above is a closed form that never touches the packed
+// array, so it measures the store bandwidth of the machine and nothing
+// about the unpack kernel. The 100k value column writes 800KB, which is
+// the memory write speed of whichever core the run lands on, so the
+// targets sit under the slower cores of the baseline machine
+const FASTLANES_PACKED_DECODE_TARGET_VAL_SEC: f64 = 4_500_000_000.0;
+const FASTLANES_DELTA_DECODE_TARGET_VAL_SEC: f64 = 3_500_000_000.0;
+const FASTLANES_ZONE_DECODE_TARGET_VAL_SEC: f64 = 2_800_000_000.0;
+// Decimals in no order are the float column a lake holds, which ALP packs
+// as scaled integers under a frame of reference with no delta, where the
+// sequential shape above is a unit step delta stream
+const ALP_PACKED_DECODE_TARGET_FLOAT_SEC: f64 = 3_500_000_000.0;
+const ALP_ZONE_DECODE_TARGET_FLOAT_SEC: f64 = 2_500_000_000.0;
 
 static BENCHMARK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -417,6 +431,252 @@ fn test_encoding_round_trip_correctness() {
     let utilAfter = take_util_snapshot();
     record_test_util("Encoding Round-Trip", utilBefore, utilAfter);
     tprintln!("\n  Round-trip correctness: ALL PASS");
+}
+
+// =============================================================================
+// Test 1b: Bit-packed decode throughput
+// =============================================================================
+
+/// A fixed-seed generator so every run decodes the same bytes
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 11
+    }
+}
+
+fn i64_bytes(values: &[i64]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(values.len() * 8);
+    for v in values {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    raw
+}
+
+/// Times a full decode `VALIDATION_RUNS` times and reports values per second
+fn time_decode(
+    encoder: &dyn zyron_storage::encoding::Encoding,
+    encoded: &[u8],
+    rows: usize,
+    valueSize: usize,
+) -> Vec<f64> {
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        std::hint::black_box(encoder.decode(encoded, rows, valueSize).unwrap());
+        results.push(rows as f64 / start.elapsed().as_secs_f64());
+    }
+    results
+}
+
+/// Decodes every 1024-row zone of the column on its own, which is the
+/// shape a pruned lake scan asks for, and reports rows per second over
+/// all of them together
+fn time_zone_decode(
+    encoder: &dyn zyron_storage::encoding::Encoding,
+    encoded: &[u8],
+    rows: usize,
+    valueSize: usize,
+) -> Vec<f64> {
+    const ZONE: usize = 1024;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let mut zoneStart = 0;
+        while zoneStart < rows {
+            let zoneEnd = (zoneStart + ZONE).min(rows);
+            std::hint::black_box(
+                encoder
+                    .decode_range(encoded, rows, valueSize, zoneStart, zoneEnd)
+                    .unwrap(),
+            );
+            zoneStart = zoneEnd;
+        }
+        results.push(rows as f64 / start.elapsed().as_secs_f64());
+    }
+    results
+}
+
+#[test]
+fn test_fastlanes_packed_decode_throughput() {
+    zyron_bench_harness::init("encoding");
+    let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 100_000;
+
+    tprintln!("\n=== FastLanes Bit-Packed Decode ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    let utilBefore = take_util_snapshot();
+    let encoder = create_encoding(EncodingType::FastLanes);
+
+    // Residuals spread over twenty bits with no order, so the encoder packs
+    // them at that width under a frame of reference and nothing narrower
+    // applies
+    {
+        let mut rng = Lcg(7);
+        let values: Vec<i64> = (0..ROW_COUNT)
+            .map(|_| 5_000_000_000 + (rng.next() & 0xF_FFFF) as i64)
+            .collect();
+        let raw = i64_bytes(&values);
+        let encoded = encoder.encode(&raw, ROW_COUNT, 8).expect("encode failed");
+        tprintln!(
+            "\n  Frame of reference, 20-bit residuals: {:.2}x, {} bytes",
+            raw.len() as f64 / encoded.len() as f64,
+            encoded.len()
+        );
+        assert_eq!(
+            encoder
+                .decode(&encoded, ROW_COUNT, 8)
+                .expect("decode failed"),
+            raw,
+            "FastLanes packed round-trip mismatch"
+        );
+        for zoneStart in [0, 1024, 50_000, ROW_COUNT - 1024] {
+            let ranged = encoder
+                .decode_range(&encoded, ROW_COUNT, 8, zoneStart, zoneStart + 1024)
+                .expect("decode_range failed");
+            assert_eq!(
+                ranged,
+                &raw[zoneStart * 8..(zoneStart + 1024) * 8],
+                "FastLanes packed zone mismatch at {zoneStart}"
+            );
+        }
+        validate_metric(
+            "FastLanes Packed Decode",
+            "FastLanes 20-bit decode (val/sec)",
+            time_decode(encoder.as_ref(), &encoded, ROW_COUNT, 8),
+            FASTLANES_PACKED_DECODE_TARGET_VAL_SEC,
+            true,
+        );
+        validate_metric(
+            "FastLanes Packed Decode",
+            "FastLanes 20-bit zone decode (val/sec)",
+            time_zone_decode(encoder.as_ref(), &encoded, ROW_COUNT, 8),
+            FASTLANES_ZONE_DECODE_TARGET_VAL_SEC,
+            true,
+        );
+    }
+
+    // An ascending column with gaps under sixty-four, which delta packs at
+    // six bits behind a restart table
+    {
+        let mut rng = Lcg(11);
+        let mut next = 1_000_000_000i64;
+        let values: Vec<i64> = (0..ROW_COUNT)
+            .map(|_| {
+                next += (rng.next() & 63) as i64;
+                next
+            })
+            .collect();
+        let raw = i64_bytes(&values);
+        let encoded = encoder.encode(&raw, ROW_COUNT, 8).expect("encode failed");
+        tprintln!(
+            "\n  Delta, gaps under 64: {:.2}x, {} bytes",
+            raw.len() as f64 / encoded.len() as f64,
+            encoded.len()
+        );
+        assert_eq!(
+            encoder
+                .decode(&encoded, ROW_COUNT, 8)
+                .expect("decode failed"),
+            raw,
+            "FastLanes delta round-trip mismatch"
+        );
+        for zoneStart in [0, 1024, 50_000, ROW_COUNT - 1024] {
+            let ranged = encoder
+                .decode_range(&encoded, ROW_COUNT, 8, zoneStart, zoneStart + 1024)
+                .expect("decode_range failed");
+            assert_eq!(
+                ranged,
+                &raw[zoneStart * 8..(zoneStart + 1024) * 8],
+                "FastLanes delta zone mismatch at {zoneStart}"
+            );
+        }
+        validate_metric(
+            "FastLanes Packed Decode",
+            "FastLanes delta decode (val/sec)",
+            time_decode(encoder.as_ref(), &encoded, ROW_COUNT, 8),
+            FASTLANES_DELTA_DECODE_TARGET_VAL_SEC,
+            true,
+        );
+        validate_metric(
+            "FastLanes Packed Decode",
+            "FastLanes delta zone decode (val/sec)",
+            time_zone_decode(encoder.as_ref(), &encoded, ROW_COUNT, 8),
+            FASTLANES_ZONE_DECODE_TARGET_VAL_SEC,
+            true,
+        );
+    }
+
+    let utilAfter = take_util_snapshot();
+    record_test_util("FastLanes Packed Decode", utilBefore, utilAfter);
+}
+
+#[test]
+fn test_alp_packed_decode_throughput() {
+    zyron_bench_harness::init("encoding");
+    let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 100_000;
+
+    tprintln!("\n=== ALP Bit-Packed Decode ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    let utilBefore = take_util_snapshot();
+    let encoder = create_encoding(EncodingType::Alp);
+
+    // Two place decimals spread over ten thousand, in no order, so the
+    // integers pack at twenty bits with no delta and no exception
+    let mut rng = Lcg(19);
+    let values: Vec<f64> = (0..ROW_COUNT)
+        .map(|_| 100.0 + (rng.next() % 1_000_000) as f64 / 100.0)
+        .collect();
+    let mut raw = Vec::with_capacity(ROW_COUNT * 8);
+    for v in &values {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    let encoded = encoder.encode(&raw, ROW_COUNT, 8).expect("encode failed");
+    tprintln!(
+        "\n  Decimals, no order: {:.2}x, {} bytes",
+        raw.len() as f64 / encoded.len() as f64,
+        encoded.len()
+    );
+    let decoded = encoder
+        .decode(&encoded, ROW_COUNT, 8)
+        .expect("decode failed");
+    for (i, v) in values.iter().enumerate() {
+        let got = f64::from_le_bytes(decoded[i * 8..(i + 1) * 8].try_into().unwrap());
+        assert!((got - v).abs() < 1e-9, "ALP mismatch at {i}: {got} vs {v}");
+    }
+    for zoneStart in [0, 1024, 50_000, ROW_COUNT - 1024] {
+        let ranged = encoder
+            .decode_range(&encoded, ROW_COUNT, 8, zoneStart, zoneStart + 1024)
+            .expect("decode_range failed");
+        assert_eq!(
+            ranged,
+            &decoded[zoneStart * 8..(zoneStart + 1024) * 8],
+            "ALP zone mismatch at {zoneStart}"
+        );
+    }
+    validate_metric(
+        "ALP Packed Decode",
+        "ALP decimals decode (float/sec)",
+        time_decode(encoder.as_ref(), &encoded, ROW_COUNT, 8),
+        ALP_PACKED_DECODE_TARGET_FLOAT_SEC,
+        true,
+    );
+    validate_metric(
+        "ALP Packed Decode",
+        "ALP decimals zone decode (float/sec)",
+        time_zone_decode(encoder.as_ref(), &encoded, ROW_COUNT, 8),
+        ALP_ZONE_DECODE_TARGET_FLOAT_SEC,
+        true,
+    );
+
+    let utilAfter = take_util_snapshot();
+    record_test_util("ALP Packed Decode", utilBefore, utilAfter);
 }
 
 // =============================================================================

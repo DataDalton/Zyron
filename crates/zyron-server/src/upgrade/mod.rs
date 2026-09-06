@@ -11,20 +11,30 @@
 //! read, so there is one answer to "what is this cluster doing" rather than
 //! four
 
+pub mod capabilities;
+pub mod catalog_store;
+pub mod cluster_driver;
 pub mod compat_gate;
+pub mod control;
 pub mod downgrade;
 pub mod feed;
+pub mod journal;
 pub mod migrations;
 pub mod notification;
+pub mod objects;
+pub mod release_key;
 pub mod rolling;
+pub mod service;
+pub mod signing;
 pub mod stager;
+pub mod version_gate;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use zyron_common::format::{
-    FormatSubstrate, ReleaseManifest, UpgradeBoard, UpgradeHistoryEntry, UpgradeOutcome,
-    UpgradePhase, UpgradeSettings,
+    FormatSubstrate, NodeUpgradeState, ReleaseManifest, UpgradeBoard, UpgradeHistoryEntry,
+    UpgradeOutcome, UpgradePhase, UpgradeSettings,
 };
 use zyron_common::{Result, ZyronError};
 
@@ -68,6 +78,10 @@ pub struct PassContext<'a> {
     pub target: &'a TargetCapabilities,
     pub running_version: &'a str,
     pub now_secs: u64,
+    /// A version an operator asked for by hand. A manual request goes ahead
+    /// with auto-upgrade off and outside the window, and still stops for a
+    /// pause
+    pub manual_target: Option<&'a str>,
 }
 
 /// The auto-upgrade controller
@@ -128,17 +142,34 @@ impl UpgradeController {
         manifest: Option<&ReleaseManifest>,
     ) -> Result<PassOutcome> {
         let settings = context.board.settings();
-        if let Err(reason) = settings.may_start(context.now_secs) {
-            return Ok(PassOutcome::Held { reason });
-        }
-
-        let Some(target_version) =
-            self.target_version(&settings, manifest, context.running_version)
-        else {
+        let target_version = match context.manual_target {
+            Some(version) => {
+                if settings.paused {
+                    return Ok(PassOutcome::Held {
+                        reason: "auto_upgrade_paused is true".to_string(),
+                    });
+                }
+                version.to_string()
+            }
+            None => {
+                if let Err(reason) = settings.may_start(context.now_secs) {
+                    return Ok(PassOutcome::Held { reason });
+                }
+                let Some(version) =
+                    self.target_version(&settings, manifest, context.running_version)
+                else {
+                    return Ok(PassOutcome::UpToDate {
+                        version: context.running_version.to_string(),
+                    });
+                };
+                version
+            }
+        };
+        if target_version == context.running_version {
             return Ok(PassOutcome::UpToDate {
                 version: context.running_version.to_string(),
             });
-        };
+        }
 
         let report = self.gate(
             &context,
@@ -199,7 +230,49 @@ impl UpgradeController {
             )
             .await;
 
+        // Every node holds the verified release before any of them restarts,
+        // so a fetch that fails on the last node fails before the first one
+        // moved. A pass with no manifest has nothing to stage from, which is
+        // the simulated case
+        if let Some(release) = manifest.and_then(|m| m.release(&target_version)) {
+            for node in context.nodes {
+                context.board.set_node_state(NodeUpgradeState {
+                    node_id: node.node_id.clone(),
+                    from_version: context.running_version.to_string(),
+                    to_version: target_version.clone(),
+                    phase: UpgradePhase::Staging,
+                    started_at_secs: context.now_secs,
+                    updated_at_secs: context.driver.now_secs(),
+                    is_leader: node.is_leader,
+                    message: "fetching and verifying the release".to_string(),
+                });
+                context.driver.stage(&node.node_id, release).await?;
+            }
+        } else if let Some(manifest) = manifest {
+            let reason = format!(
+                "no release {target_version} is on the {} channel, so there is nothing to stage",
+                manifest.channel
+            );
+            self.publish_phase(&context, &target_version, UpgradePhase::Blocked, &reason);
+            return Ok(PassOutcome::Held { reason });
+        }
+
         let baseline = rolling::capture_baseline(context.driver, context.nodes).await?;
+        let plan = rolling::SequencePlan {
+            format_migrations: report.format_migrations.clone(),
+            reversible: self.reversible(&context, &report),
+            actor: String::new(),
+        };
+        context
+            .driver
+            .begin_sequence(
+                context.running_version,
+                &target_version,
+                &baseline,
+                context.nodes,
+                &plan,
+            )
+            .await?;
         let outcome = rolling::run(
             context.driver,
             context.board,
@@ -208,6 +281,7 @@ impl UpgradeController {
             &target_version,
             baseline,
             self.rolling,
+            Some(context.notifier),
         )
         .await?;
 
@@ -220,7 +294,7 @@ impl UpgradeController {
     }
 
     /// The version this pass would move to, or None when nothing is newer
-    fn target_version(
+    pub fn target_version(
         &self,
         settings: &UpgradeSettings,
         manifest: Option<&ReleaseManifest>,
@@ -332,16 +406,21 @@ impl UpgradeController {
             format_migrations_run: report.format_migrations.len() as u32,
             catalog_migrations_run: 0,
             rewrites_applied: report.classification.safe as u32,
-            reversible: report.format_migrations.iter().all(|(kind, from, _)| {
-                context
-                    .substrate
-                    .formats
-                    .get(*kind)
-                    .map(|entry| entry.reversible_from(*from))
-                    .unwrap_or(false)
-            }),
+            reversible: self.reversible(context, report),
             detail,
         });
+    }
+
+    /// Whether every format migration the gate planned can be undone
+    fn reversible(&self, context: &PassContext<'_>, report: &GateReport) -> bool {
+        report.format_migrations.iter().all(|(kind, from, _)| {
+            context
+                .substrate
+                .formats
+                .get(*kind)
+                .map(|entry| entry.reversible_from(*from))
+                .unwrap_or(false)
+        })
     }
 
     /// Publishes one phase for this node
@@ -357,18 +436,16 @@ impl UpgradeController {
             .first()
             .map(|node| node.node_id.clone())
             .unwrap_or_else(|| "this-node".to_string());
-        context
-            .board
-            .set_node_state(zyron_common::format::NodeUpgradeState {
-                node_id,
-                from_version: context.running_version.to_string(),
-                to_version: target_version.to_string(),
-                phase,
-                started_at_secs: context.now_secs,
-                updated_at_secs: context.now_secs,
-                is_leader: context.nodes.first().map(|n| n.is_leader).unwrap_or(false),
-                message: message.to_string(),
-            });
+        context.board.set_node_state(NodeUpgradeState {
+            node_id,
+            from_version: context.running_version.to_string(),
+            to_version: target_version.to_string(),
+            phase,
+            started_at_secs: context.now_secs,
+            updated_at_secs: context.now_secs,
+            is_leader: context.nodes.first().map(|n| n.is_leader).unwrap_or(false),
+            message: message.to_string(),
+        });
     }
 }
 
@@ -378,13 +455,11 @@ pub fn running_capabilities(substrate: &FormatSubstrate, version: &str) -> Targe
     TargetCapabilities::of_running(&substrate.formats, version)
 }
 
-/// The settings this node runs under, seeded from the config
+/// The settings this node runs under, seeded from the `[upgrade]` section
+/// of the config. The feed defaults to the releases directory under the
+/// data directory, so an air-gapped node needs no extra configuration
 pub fn settings_from_config(config: &crate::config::ZyronConfig) -> UpgradeSettings {
-    let mut settings = UpgradeSettings::default();
-    // The storage data directory is where staged binaries and uploaded
-    // manifests live, so an air-gapped node needs no extra configuration
-    settings.release_feed_url = format!("{}/{}", config.storage.data_dir.display(), "releases");
-    settings
+    config.upgrade.to_settings(&config.storage.data_dir)
 }
 
 /// Refuses an upgrade that the board says cannot start, with the reason
@@ -557,7 +632,64 @@ mod tests {
             target: &fixture.target,
             running_version: "0.11.0",
             now_secs: 1_000,
+            manual_target: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_manual_target_goes_ahead_outside_the_window_but_not_through_a_pause() {
+        let fixture = fixture();
+        fixture.board.update_settings(|settings| {
+            settings.auto_upgrade_enabled = false;
+            settings.window = MaintenanceSchedule::parse("02:00-04:00 UTC").expect("parses");
+        });
+        let manifest = manifest("0.12.0");
+        let controller = UpgradeController::new(std::env::temp_dir());
+        let mut ctx = context(&fixture, &[], &[]);
+        ctx.now_secs = 15 * 3_600;
+        ctx.manual_target = Some("0.12.0");
+        let outcome = controller
+            .run_pass(ctx, Some(&manifest))
+            .await
+            .expect("runs");
+        assert!(matches!(outcome, PassOutcome::Ran { .. }), "{outcome:?}");
+        // Every node was handed the release before any of them restarted
+        let staged = fixture.driver.staged.lock().clone();
+        assert_eq!(staged.len(), 2);
+        assert!(staged.iter().all(|(_, version)| version == "0.12.0"));
+        assert_eq!(fixture.driver.sequences.lock().len(), 1);
+
+        fixture
+            .board
+            .update_settings(|settings| settings.paused = true);
+        let mut ctx = context(&fixture, &[], &[]);
+        ctx.manual_target = Some("0.12.0");
+        let outcome = controller
+            .run_pass(ctx, Some(&manifest))
+            .await
+            .expect("runs");
+        assert!(matches!(outcome, PassOutcome::Held { .. }), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_version_the_channel_does_not_carry_is_blocked_before_staging() {
+        let fixture = fixture();
+        let manifest = manifest("0.12.0");
+        let controller = UpgradeController::new(std::env::temp_dir());
+        let mut ctx = context(&fixture, &[], &[]);
+        ctx.manual_target = Some("0.12.5");
+        let outcome = controller
+            .run_pass(ctx, Some(&manifest))
+            .await
+            .expect("runs");
+        match outcome {
+            PassOutcome::Blocked { blockers, .. } => {
+                assert!(blockers.contains("no upgrade chain"), "{blockers}")
+            }
+            other => panic!("expected the gate to block, got {other:?}"),
+        }
+        assert!(fixture.driver.staged.lock().is_empty());
+        assert!(fixture.driver.restarted.lock().is_empty());
     }
 
     #[tokio::test]
@@ -759,6 +891,7 @@ mod tests {
             throughput_per_sec: 10_000.0,
             error_rate: 0.0,
             active_connections: 10,
+            queries_in_window: 600_000,
         };
         let slow = HealthBaseline {
             p99_latency_us: 90_000,

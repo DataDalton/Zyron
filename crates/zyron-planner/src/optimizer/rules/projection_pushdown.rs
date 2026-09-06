@@ -17,14 +17,44 @@ impl OptimizationRule for ProjectionPushdown {
         "projection_pushdown"
     }
 
-    fn apply(&self, plan: &LogicalPlan, _catalog: &Catalog) -> Option<LogicalPlan> {
+    fn apply(&self, plan: &LogicalPlan, catalog: &Catalog) -> Option<LogicalPlan> {
         // Quick check: no Project nodes means nothing to push.
         if !has_project(plan) {
             return None;
         }
-        let pushed = push_projections(plan, None);
+        let pushed = push_projections(plan, None, catalog);
         if pushed != *plan { Some(pushed) } else { None }
     }
+}
+
+/// The conjuncts of a filter the scan below it does not answer, which are
+/// the only ones anything above the scan still reads columns for.
+///
+/// Only a lake scan answers any of them, and only the ones that lower onto
+/// stored bytes with nothing left over. A time-travel read is excluded: it
+/// reads a manifest whose schema predates the catalog's, so what the
+/// current columns prove about the lowering is not what that file will be
+/// asked. Everything else returns the whole predicate, which projects
+/// exactly what it did before
+fn filter_residual(
+    child: &LogicalPlan,
+    predicate: &BoundExpr,
+    catalog: &Catalog,
+) -> Vec<BoundExpr> {
+    let whole = || vec![predicate.clone()];
+    let LogicalPlan::Scan {
+        table_id, as_of, ..
+    } = child
+    else {
+        return whole();
+    };
+    if as_of.is_some() {
+        return whole();
+    }
+    let Ok(te) = catalog.get_table_by_id(*table_id) else {
+        return whole();
+    };
+    crate::lake_predicate::split_scan_answered(predicate, &te).1
 }
 
 /// Returns true if the plan tree contains any Project node.
@@ -39,6 +69,7 @@ fn has_project(plan: &LogicalPlan) -> bool {
 fn push_projections(
     plan: &LogicalPlan,
     needed: Option<&HashSet<(usize, ColumnId)>>,
+    catalog: &Catalog,
 ) -> LogicalPlan {
     match plan {
         LogicalPlan::Scan {
@@ -90,16 +121,21 @@ fn push_projections(
             LogicalPlan::Project {
                 expressions: expressions.clone(),
                 aliases: aliases.clone(),
-                child: Arc::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed), catalog)),
                 output_table_idx: *output_table_idx,
             }
         }
         LogicalPlan::Filter { predicate, child } => {
             let mut child_needed = needed.cloned().unwrap_or_default();
-            collect_needed_columns(predicate, &mut child_needed);
+            // A conjunct the scan answers itself reads its columns off the
+            // scan's own encoded bytes, so projecting them would decode a
+            // column whose only reader is a term with nothing left to do
+            for conjunct in filter_residual(child, predicate, catalog) {
+                collect_needed_columns(&conjunct, &mut child_needed);
+            }
             LogicalPlan::Filter {
                 predicate: predicate.clone(),
-                child: Arc::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed), catalog)),
             }
         }
         LogicalPlan::Join {
@@ -138,6 +174,7 @@ fn push_projections(
                     } else {
                         Some(&left_needed)
                     },
+                    catalog,
                 )),
                 right: Arc::new(push_projections(
                     right,
@@ -146,6 +183,7 @@ fn push_projections(
                     } else {
                         Some(&right_needed)
                     },
+                    catalog,
                 )),
                 join_type: *join_type,
                 condition: condition.clone(),
@@ -168,7 +206,7 @@ fn push_projections(
             LogicalPlan::Aggregate {
                 group_by: group_by.clone(),
                 aggregates: aggregates.clone(),
-                child: Arc::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed), catalog)),
             }
         }
         LogicalPlan::Sort { order_by, child } => {
@@ -178,7 +216,7 @@ fn push_projections(
             }
             LogicalPlan::Sort {
                 order_by: order_by.clone(),
-                child: Arc::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed), catalog)),
             }
         }
         // Pass through for other node types
@@ -189,10 +227,10 @@ fn push_projections(
         } => LogicalPlan::Limit {
             limit: *limit,
             offset: *offset,
-            child: Arc::new(push_projections(child, needed)),
+            child: Arc::new(push_projections(child, needed, catalog)),
         },
         LogicalPlan::Distinct { child } => LogicalPlan::Distinct {
-            child: Arc::new(push_projections(child, needed)),
+            child: Arc::new(push_projections(child, needed, catalog)),
         },
         LogicalPlan::SetOp {
             op,
@@ -202,8 +240,8 @@ fn push_projections(
         } => LogicalPlan::SetOp {
             op: *op,
             all: *all,
-            left: Arc::new(push_projections(left, needed)),
-            right: Arc::new(push_projections(right, needed)),
+            left: Arc::new(push_projections(left, needed, catalog)),
+            right: Arc::new(push_projections(right, needed, catalog)),
         },
         other => other.clone(),
     }

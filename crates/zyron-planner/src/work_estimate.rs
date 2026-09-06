@@ -46,7 +46,8 @@ pub fn operator_kind_of(plan: &PhysicalPlan) -> Option<OperatorKind> {
         | PhysicalPlan::ColumnarMetadataAggregate { .. } => Some(OperatorKind::SeqScan),
         PhysicalPlan::LakeScan { .. }
         | PhysicalPlan::LakeDelete { .. }
-        | PhysicalPlan::LakeUpdate { .. } => Some(OperatorKind::LakeScan),
+        | PhysicalPlan::LakeUpdate { .. }
+        | PhysicalPlan::LakeMetadataAggregate { .. } => Some(OperatorKind::LakeScan),
         PhysicalPlan::IndexScan { .. }
         | PhysicalPlan::FulltextScan { .. }
         | PhysicalPlan::VectorScan { .. }
@@ -101,6 +102,7 @@ fn relation_of(plan: &PhysicalPlan) -> Option<TableId> {
         | PhysicalPlan::LakeScan { table_id, .. }
         | PhysicalPlan::LakeDelete { table_id, .. }
         | PhysicalPlan::LakeUpdate { table_id, .. }
+        | PhysicalPlan::LakeMetadataAggregate { table_id, .. }
         | PhysicalPlan::ForeignScan { table_id, .. }
         | PhysicalPlan::IndexScan { table_id, .. }
         | PhysicalPlan::FulltextScan { table_id, .. }

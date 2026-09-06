@@ -78,6 +78,40 @@ fn float_from_cell(cell: &[u8]) -> Option<f64> {
     })
 }
 
+/// One cell as an exact 128-bit integer, for a column sum a file records
+/// alongside its bounds.
+///
+/// Covers the signed and unsigned integer families, which is where the
+/// temporal types and the fixed-point decimals live as well. Both fold
+/// exactly, so a sum taken per file and added across files is the same
+/// number as a sum taken row by row.
+///
+/// Floats are excluded because that is not true of them: the two folds
+/// associate differently and can round to different answers. Unsigned
+/// 128-bit is excluded because the row path has no widening for it and
+/// leaves those values out of a sum entirely, and a file stat that counted
+/// them would disagree with the scan it stands in for
+pub(crate) fn cell_to_i128(family: CellFamily, cell: &[u8]) -> Option<i128> {
+    match family {
+        CellFamily::SignedInt => signed_from_cell(cell),
+        CellFamily::UnsignedInt if cell.len() <= 8 => unsigned_from_cell(cell).map(|v| v as i128),
+        _ => None,
+    }
+}
+
+/// Whether a column of this type can carry a file sum at all, answered
+/// without a cell in hand so a caller can skip the walk.
+///
+/// Public because the planner asks the same question before it pushes a
+/// SUM down to the manifest, and the two answers have to be the one rule
+pub fn sums_exactly(physical: TypeId) -> bool {
+    match cell_family(physical) {
+        CellFamily::SignedInt => true,
+        CellFamily::UnsignedInt => physical.fixed_size().is_some_and(|w| w <= 8),
+        _ => false,
+    }
+}
+
 /// Interprets one cell into a typed value for statistics bounds. None for
 /// unordered types and malformed widths, those columns keep no bounds
 pub(crate) fn cell_to_value(physical: TypeId, cell: &[u8]) -> Option<LakeValue> {

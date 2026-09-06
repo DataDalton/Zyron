@@ -31,8 +31,10 @@ use crate::metrics::MetricsRegistry;
 pub struct HealthState {
     /// Set to true once server initialization is complete.
     pub startup_complete: AtomicBool,
-    /// Set to true once the server is accepting client connections.
-    pub accepting_connections: AtomicBool,
+    /// Whether the node takes new connections, shared with the accept loop
+    /// and the upgrade driver so the readiness probe reports a drain the
+    /// moment it starts
+    pub admission: Arc<zyron_common::Admission>,
     /// Metrics registry for the exposition endpoint.
     pub metrics: Arc<MetricsRegistry>,
     /// Route the Prometheus exposition answers on, from metrics.path.
@@ -109,17 +111,21 @@ impl HealthState {
             metrics_path,
             Arc::new(GatewayRouter::new()),
             Arc::new(GatewayMetrics::new()),
+            Arc::new(zyron_common::Admission::new()),
         )
     }
 
     /// Creates a health state serving the given gateway router and metric
     /// set. The endpoint registrar must share these same instances, a
-    /// route registered into any other router is never served.
+    /// route registered into any other router is never served. The
+    /// admission is the one the wire listener reads, so readiness and the
+    /// accept loop agree
     pub fn with_gateway(
         metrics: Arc<MetricsRegistry>,
         metrics_path: &str,
         gateway_router: Arc<GatewayRouter>,
         gateway_metrics: Arc<GatewayMetrics>,
+        admission: Arc<zyron_common::Admission>,
     ) -> Self {
         let metrics_path = if metrics_path.starts_with('/') {
             metrics_path.to_string()
@@ -128,7 +134,7 @@ impl HealthState {
         };
         Self {
             startup_complete: AtomicBool::new(false),
-            accepting_connections: AtomicBool::new(false),
+            admission,
             metrics,
             metrics_path,
             gateway_router,
@@ -178,7 +184,7 @@ impl HealthState {
 
     /// Marks the server as accepting connections.
     pub fn mark_accepting(&self) {
-        self.accepting_connections.store(true, Ordering::Release);
+        self.admission.mark_accepting();
     }
 
     /// Returns true if startup is complete.
@@ -186,9 +192,10 @@ impl HealthState {
         self.startup_complete.load(Ordering::Acquire)
     }
 
-    /// Returns true if the server is accepting connections.
+    /// Returns true if the server is accepting connections, which it is not
+    /// while it drains for a restart
     pub fn is_accepting(&self) -> bool {
-        self.accepting_connections.load(Ordering::Acquire)
+        self.admission.is_accepting()
     }
 }
 
@@ -830,21 +837,22 @@ pub(crate) fn bind_dual_stack_listener(
             trimmed
         };
 
-    let addr_str = format!("{}:{}", host_clean, port);
-    let addr: SocketAddr = if let Ok(parsed) = addr_str.parse() {
-        parsed
-    } else if host_clean.parse::<IpAddr>().is_ok() {
-        format!("{}:{}", host_clean, port)
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
-    } else {
-        // hostname form, resolve via DNS
-        addr_str.to_socket_addrs()?.next().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!("no addresses for {}", host_clean),
-            )
-        })?
+    // An IPv6 address joins its port only in bracketed form, so the address
+    // is built from the parsed parts rather than from pasted text
+    let addr: SocketAddr = match host_clean.parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port),
+        Err(_) => {
+            // hostname form, resolve via DNS
+            format!("{}:{}", host_clean, port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        format!("no addresses for {}", host_clean),
+                    )
+                })?
+        }
     };
 
     let domain = if addr.is_ipv6() {
@@ -874,7 +882,11 @@ mod tests {
     fn test_state() -> Arc<HealthState> {
         let session_mgr = Arc::new(SessionManager::new(0));
         let labeled = Arc::new(zyron_common::LabeledMetrics::new());
-        let metrics = Arc::new(MetricsRegistry::new(session_mgr, labeled));
+        let metrics = Arc::new(MetricsRegistry::new(
+            session_mgr,
+            labeled,
+            Arc::new(zyron_common::QueryMetrics::new()),
+        ));
         Arc::new(HealthState::new(metrics, "/metrics"))
     }
 
@@ -942,5 +954,16 @@ mod tests {
         );
         assert_eq!(extract_path("POST /metrics HTTP/1.1\r\n"), "/metrics");
         assert_eq!(extract_path(""), "/");
+    }
+
+    #[tokio::test]
+    async fn test_the_bracketed_ipv6_wildcard_binds() {
+        let listener = bind_dual_stack_listener("[::]", 0, false).expect("binds");
+        let addr = listener.local_addr().expect("has an address");
+        assert!(addr.is_ipv6());
+        assert_ne!(addr.port(), 0);
+
+        let v4 = bind_dual_stack_listener("127.0.0.1", 0, false).expect("binds");
+        assert!(v4.local_addr().expect("has an address").is_ipv4());
     }
 }

@@ -34,6 +34,10 @@ use crate::predicate::{
 };
 use crate::schema::LakeSchema;
 
+/// The steps that move an older checkpoint forward, one file each beside
+/// the fixtures they read
+mod migrations;
+
 /// Sentinel repeated at the very end of a manifest. Not the file's format
 /// identity, which the envelope in the header carries. It marks a complete
 /// trailer so a truncated write is told apart from a healthy file.
@@ -62,7 +66,8 @@ const STAT_MAX: u8 = 1 << 1;
 const STAT_BLOOM: u8 = 1 << 2;
 const STAT_NDV: u8 = 1 << 3;
 const STAT_SIZE: u8 = 1 << 4;
-const STAT_KNOWN_MASK: u8 = STAT_MIN | STAT_MAX | STAT_BLOOM | STAT_NDV | STAT_SIZE;
+const STAT_SUM: u8 = 1 << 5;
+const STAT_KNOWN_MASK: u8 = STAT_MIN | STAT_MAX | STAT_BLOOM | STAT_NDV | STAT_SIZE | STAT_SUM;
 
 // The strategy encoding is persisted here and in the catalog, so one
 // definition lives in zyron-common and this crate names it
@@ -148,8 +153,8 @@ pub struct ColumnStatsEntry {
     /// the estimate existed, which reads as evidence the clustering
     /// planner does not have rather than as zero distinct values
     pub ndv: Option<u64>,
-    /// Bytes this column's segment occupies in the file, padded to the
-    /// page boundary the reader seeks to.
+    /// Bytes this column's segment occupies in the file, rounded to the
+    /// alignment the reader seeks to.
     ///
     /// This is what reading the column costs, and columns of one file
     /// differ by more than an order of magnitude, so a per file average is
@@ -158,6 +163,19 @@ pub struct ColumnStatsEntry {
     /// writer did not record it, which reads as evidence a cost model does
     /// not have rather than as a free column
     pub size_bytes: Option<u64>,
+    /// Exact sum of this file's non-null values in this column.
+    ///
+    /// This is what lets an ungrouped SUM over a whole table be answered
+    /// from the manifest with no file opened and nothing decoded. Bounds
+    /// already answer MIN and MAX, and `row_count` less `null_count`
+    /// already answers both counts, so a sum completes the set of
+    /// aggregates a file can settle about itself.
+    ///
+    /// None means the writer had no exact sum to record, because the
+    /// column's type does not fold exactly or because the total left 128
+    /// bits. That reads as a file whose sum has to be scanned out, not as
+    /// a file summing to zero
+    pub sum: Option<i128>,
 }
 
 /// One live data file. The spec calls this a partition entry, it is a
@@ -710,13 +728,16 @@ impl ManifestFile {
                 ),
             ));
         }
-        if header.version != MANIFEST_FORMAT_VERSION {
+        if !crate::format::LAKE_MANIFEST_READER_WINDOW.contains(header.version) {
             return Err(corrupt(
                 ctx,
                 format!(
-                    "manifest is at format version {}, this binary writes and reads {}. \
+                    "manifest is at format version {}, this binary reads {} and writes {}. \
                      Upgrade through a release that still reads {} to move it forward first",
-                    header.version, MANIFEST_FORMAT_VERSION, header.version
+                    header.version,
+                    crate::format::LAKE_MANIFEST_READER_WINDOW,
+                    MANIFEST_FORMAT_VERSION,
+                    header.version
                 ),
             ));
         }
@@ -958,6 +979,9 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
         if stat.size_bytes.is_some() {
             flags |= STAT_SIZE;
         }
+        if stat.sum.is_some() {
+            flags |= STAT_SUM;
+        }
         buf.push(flags);
         buf.extend_from_slice(&stat.bounds.null_count.to_le_bytes());
         if let Some(min) = &stat.bounds.min {
@@ -975,6 +999,9 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
         }
         if let Some(size) = stat.size_bytes {
             buf.extend_from_slice(&size.to_le_bytes());
+        }
+        if let Some(sum) = stat.sum {
+            buf.extend_from_slice(&sum.to_le_bytes());
         }
     }
     // u32 length: a small-delete workload can attach tens of thousands of
@@ -1032,6 +1059,15 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
         } else {
             None
         };
+        let sum = if flags & STAT_SUM != 0 {
+            let raw: [u8; 16] = fr
+                .take(16)?
+                .try_into()
+                .map_err(|_| fr.corrupt(format!("column {} has a truncated sum", column_id)))?;
+            Some(i128::from_le_bytes(raw))
+        } else {
+            None
+        };
         column_stats.push(ColumnStatsEntry {
             ndv,
             column_id,
@@ -1043,6 +1079,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
             },
             bloom,
             size_bytes,
+            sum,
         });
     }
     let ref_count = fr.u32()? as usize;
@@ -1451,6 +1488,7 @@ mod tests {
             },
             bloom: None,
             size_bytes: Some(16_384),
+            sum: Some(min as i128 + max as i128),
         }
     }
 
@@ -1497,6 +1535,7 @@ mod tests {
                             },
                             bloom: Some(std::sync::Arc::new(vec![0xDE, 0xAD, 0xBE, 0xEF])),
                             size_bytes: Some(49_152),
+                            sum: None,
                         },
                     ]),
                     delete_predicate_ids: vec![9],
@@ -1551,6 +1590,7 @@ mod tests {
                         bloom: Some(std::sync::Arc::new(vec![0x01, 0x02])),
                         ndv: Some(5),
                         size_bytes: Some(16_384),
+                        sum: None,
                     }]),
                     delete_predicate_ids: Vec::new(),
                 },

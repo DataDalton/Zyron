@@ -8,12 +8,16 @@
 //!
 //! The registry load already refuses a set that is internally inconsistent,
 //! so what is left here is the things a load cannot see: whether today is
-//! past a retirement date, whether a deprecation has a rewriter, and whether
-//! a scheme's test vectors still pass
+//! past a retirement date, whether a deprecation has a rewriter, whether a
+//! scheme's test vectors still pass, and whether each of the three wire
+//! protocols has exactly one current version
 
 use zyron_common::format::registry::is_iso_date;
 use zyron_common::format::scheme::SchemeStatus;
-use zyron_common::format::{ALL_FORMAT_KINDS, FormatKind, FormatSubstrate, MAGIC_ALLOCATIONS};
+use zyron_common::format::wire_version::{WireProtocol, WireVersionRegistry, WireVersionStatus};
+use zyron_common::format::{
+    ALL_FORMAT_KINDS, BinaryVersion, FormatKind, FormatSubstrate, MAGIC_ALLOCATIONS,
+};
 
 /// One thing the check found wrong
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +43,8 @@ pub struct ReleaseReport {
     pub schemes_checked: usize,
     pub deprecations_checked: usize,
     pub rewriters_checked: usize,
+    /// The wire protocols whose version rows were checked
+    pub protocols_checked: usize,
 }
 
 impl ReleaseReport {
@@ -50,13 +56,14 @@ impl ReleaseReport {
     pub fn summary(&self) -> String {
         format!(
             "{} formats, {} migrators, {} fixtures, {} signature schemes, \
-             {} deprecations, {} rewriters checked, {} finding(s)",
+             {} deprecations, {} rewriters, {} wire protocols checked, {} finding(s)",
             self.formats_checked,
             self.migrators_checked,
             self.fixtures_checked,
             self.schemes_checked,
             self.deprecations_checked,
             self.rewriters_checked,
+            self.protocols_checked,
             self.findings.len()
         )
     }
@@ -85,6 +92,7 @@ pub fn run(substrate: &FormatSubstrate, today: &str) -> ReleaseReport {
     check_retirement(substrate, today, now_secs, &mut report);
     check_schemes(substrate, &mut report);
     check_deprecations(substrate, &mut report);
+    check_protocols(&substrate.wire_versions, &mut report);
     report
 }
 
@@ -217,23 +225,30 @@ fn check_migrators_and_fixtures(substrate: &FormatSubstrate, report: &mut Releas
             if fixture.bytes.is_empty() {
                 continue;
             }
-            match zyron_common::format::envelope::decode(fixture.bytes) {
-                Ok(parsed) => {
-                    if parsed.header.kind != registration.kind {
+            // A format that owns its trailer is verified by its own reader,
+            // so only the header is asked for its kind and version here
+            let header = if registration.kind.framing().migrates_whole_file() {
+                zyron_common::format::envelope::decode_header(fixture.bytes).map(|(h, _)| h)
+            } else {
+                zyron_common::format::envelope::decode(fixture.bytes).map(|parsed| parsed.header)
+            };
+            match header {
+                Ok(header) => {
+                    if header.kind != registration.kind {
                         report.note(
                             "fixture",
                             format!(
                                 "fixture {} is a {} file, not a {}",
-                                fixture.path, parsed.header.kind, registration.kind
+                                fixture.path, header.kind, registration.kind
                             ),
                         );
                     }
-                    if parsed.header.version != fixture.version {
+                    if header.version != fixture.version {
                         report.note(
                             "fixture",
                             format!(
                                 "fixture {} declares version {} but holds {}",
-                                fixture.path, fixture.version, parsed.header.version
+                                fixture.path, fixture.version, header.version
                             ),
                         );
                     }
@@ -416,6 +431,74 @@ fn check_deprecations(substrate: &FormatSubstrate, report: &mut ReleaseReport) {
     }
 }
 
+/// Every wire protocol has exactly one current version, no two rows of a
+/// protocol share a number, every row names the release that introduced it
+/// as `major.minor.patch`, and a retired row names the release that removed
+/// it. A binary speaks one current version of each protocol, so a protocol
+/// with none or with two is a build that cannot say what it speaks
+fn check_protocols(registry: &WireVersionRegistry, report: &mut ReleaseReport) {
+    report.protocols_checked = WireProtocol::ALL.len();
+    for protocol in WireProtocol::ALL {
+        let rows: Vec<_> = registry.of(protocol).collect();
+        let current = rows
+            .iter()
+            .filter(|row| row.status == WireVersionStatus::Current)
+            .count();
+        if current != 1 {
+            report.note(
+                "protocol",
+                format!(
+                    "the {protocol} protocol registers {current} current versions, and a binary \
+                     speaks exactly one"
+                ),
+            );
+        }
+        for (index, row) in rows.iter().enumerate() {
+            if rows[..index]
+                .iter()
+                .any(|earlier| earlier.version == row.version)
+            {
+                report.note(
+                    "protocol",
+                    format!(
+                        "the {protocol} protocol registers version {} twice",
+                        row.version
+                    ),
+                );
+            }
+            if BinaryVersion::parse(row.introduced_in_binary_version).is_none() {
+                report.note(
+                    "protocol",
+                    format!(
+                        "the {protocol} protocol's version {} names `{}` as the release that \
+                         introduced it, which is not major.minor.patch",
+                        row.version, row.introduced_in_binary_version
+                    ),
+                );
+            }
+            match row.retired_in_binary_version {
+                Some(retired) if BinaryVersion::parse(retired).is_none() => report.note(
+                    "protocol",
+                    format!(
+                        "the {protocol} protocol's version {} names `{retired}` as the release \
+                         that retired it, which is not major.minor.patch",
+                        row.version
+                    ),
+                ),
+                None if row.status == WireVersionStatus::Retired => report.note(
+                    "protocol",
+                    format!(
+                        "the {protocol} protocol's version {} is retired and names no release \
+                         that removed it",
+                        row.version
+                    ),
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Format kinds this binary registers but has no live writer for, which the
 /// report prints so a reserved magic is never mistaken for a gap
 pub fn reserved_kinds() -> &'static [FormatKind] {
@@ -446,6 +529,7 @@ mod tests {
         );
         assert_eq!(report.formats_checked, ALL_FORMAT_KINDS.len());
         assert!(report.schemes_checked >= 3);
+        assert_eq!(report.protocols_checked, WireProtocol::ALL.len());
     }
 
     #[test]
@@ -453,7 +537,106 @@ mod tests {
         let substrate = zyron_common::format::substrate().expect("loads");
         let text = run(substrate, TODAY).summary();
         assert!(text.contains("formats"), "{text}");
+        assert!(text.contains("3 wire protocols checked"), "{text}");
         assert!(text.contains("0 finding(s)"), "{text}");
+    }
+
+    /// The server links all three protocol crates, so each registers its one
+    /// current version
+    #[test]
+    fn test_every_protocol_registers_one_current_version_in_this_binary() {
+        let substrate = zyron_common::format::substrate().expect("loads");
+        for protocol in WireProtocol::ALL {
+            assert_eq!(
+                substrate.wire_versions.accepted(protocol).len(),
+                1,
+                "{protocol} accepts one version"
+            );
+        }
+        assert_eq!(
+            substrate.wire_versions.current_version(WireProtocol::Mesh),
+            zyron_mesh::MESH_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            substrate
+                .wire_versions
+                .current_version(WireProtocol::Consensus),
+            u32::from(zyron_raft::CONSENSUS_PROTOCOL_VERSION)
+        );
+    }
+
+    /// A protocol with no current version, one registered twice, a retired
+    /// row naming no release, and a release that is not a version are each
+    /// a finding naming the protocol
+    #[test]
+    fn test_a_protocol_registry_that_cannot_say_what_it_speaks_is_a_finding() {
+        use zyron_common::format::wire_version::WireProtocolVersion;
+        let registry = WireVersionRegistry::from_versions(vec![
+            WireProtocolVersion {
+                protocol: WireProtocol::Client,
+                version: 3,
+                status: WireVersionStatus::Current,
+                introduced_in_binary_version: "0.1.0",
+                retired_in_binary_version: None,
+                notes: "",
+            },
+            WireProtocolVersion {
+                protocol: WireProtocol::Client,
+                version: 3,
+                status: WireVersionStatus::Current,
+                introduced_in_binary_version: "0.1.0",
+                retired_in_binary_version: None,
+                notes: "",
+            },
+            WireProtocolVersion {
+                protocol: WireProtocol::Mesh,
+                version: 1,
+                status: WireVersionStatus::Retired,
+                introduced_in_binary_version: "next",
+                retired_in_binary_version: None,
+                notes: "",
+            },
+        ]);
+        let mut report = ReleaseReport::default();
+        check_protocols(&registry, &mut report);
+        let details: Vec<&str> = report.findings.iter().map(|f| f.detail.as_str()).collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("client protocol registers 2 current versions")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("client protocol registers version 3 twice")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("mesh protocol registers 0 current versions")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("`next` as the release that introduced it")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("retired and names no release")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("consensus protocol registers 0 current versions")),
+            "{details:?}"
+        );
+        assert!(report.findings.iter().all(|f| f.check == "protocol"));
     }
 
     #[test]

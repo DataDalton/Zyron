@@ -1,44 +1,91 @@
-//! Segment cache for decoded column data.
+//! Byte cache for the parts of column segments a query reads more than
+//! once.
 //!
-//! Separate from the buffer pool (which manages fixed 16KB pages).
-//! Column segments are variable-size, immutable once cached, and
-//! shared via Arc. Uses clock-sweep eviction with a byte-level
-//! capacity limit.
+//! Separate from the buffer pool, which manages fixed pages. A segment part
+//! is variable in size, immutable for as long as the file it came from
+//! exists, and shared through an Arc, so a hit hands back the bytes an
+//! earlier read verified rather than a copy of them. Eviction is a clock
+//! sweep under a byte capacity
 
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// Cache key identifying a decoded column segment.
+/// Which part of a segment an entry holds
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SegmentPart {
+    /// The null bitmap and encoded payload, the bytes a decode consumes
+    Payload,
+    /// The serialized value bloom
+    Bloom,
+}
+
+/// Identifies one part of one column segment of one open file.
+///
+/// The file id is assigned per reader and never reused within a process,
+/// so an entry left behind by a reader that has gone is never answered to
+/// a later reader of the same path
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SegmentCacheKey {
-    /// File identifier (hash of file path or monotonic counter).
     pub file_id: u64,
-    /// Column identifier within the file.
     pub column_id: u32,
+    pub part: SegmentPart,
 }
 
 impl SegmentCacheKey {
+    /// The payload part of one column segment
     pub fn new(file_id: u64, column_id: u32) -> Self {
-        Self { file_id, column_id }
+        Self {
+            file_id,
+            column_id,
+            part: SegmentPart::Payload,
+        }
+    }
+
+    /// The bloom part of one column segment
+    pub fn bloom(file_id: u64, column_id: u32) -> Self {
+        Self {
+            file_id,
+            column_id,
+            part: SegmentPart::Bloom,
+        }
     }
 }
 
-/// A cached decoded column segment.
+/// One cached segment part
 pub struct CachedSegment {
     pub key: SegmentCacheKey,
-    /// Decoded column data.
     pub data: Vec<u8>,
-    /// Reference bit for clock eviction.
+    /// Reference bit for the clock sweep
     reference_bit: AtomicBool,
 }
 
 impl CachedSegment {
+    /// Bytes under a key, shared the way a cached entry is but held by
+    /// nothing else. What a read too large to admit hands back, so a caller
+    /// sees one type whether the bytes were kept or not
+    pub fn new(key: SegmentCacheKey, data: Vec<u8>) -> Self {
+        Self {
+            key,
+            data,
+            reference_bit: AtomicBool::new(false),
+        }
+    }
+
     fn size_bytes(&self) -> usize {
         self.data.len()
     }
 }
 
-/// Cache utilization statistics.
+impl Deref for CachedSegment {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// Cache utilization statistics
 #[derive(Debug, Clone)]
 pub struct SegmentCacheStats {
     pub max_bytes: usize,
@@ -48,20 +95,20 @@ pub struct SegmentCacheStats {
     pub miss_count: u64,
 }
 
-/// Clock-sweep cache for decoded column segments.
+/// Clock-sweep cache of segment parts under a byte capacity
 pub struct SegmentCache {
     max_bytes: usize,
     current_bytes: AtomicU64,
-    entries: scc::HashMap<u64, Arc<CachedSegment>>,
-    /// Ordered list of cache keys for clock sweep.
-    clock_keys: parking_lot::RwLock<Vec<u64>>,
+    entries: scc::HashMap<SegmentCacheKey, Arc<CachedSegment>>,
+    /// Keys in insertion order, the ring the clock hand walks
+    clock_keys: parking_lot::RwLock<Vec<SegmentCacheKey>>,
     clock_hand: AtomicUsize,
     hit_count: AtomicU64,
     miss_count: AtomicU64,
 }
 
 impl SegmentCache {
-    /// Creates a segment cache with the given byte capacity.
+    /// Creates a cache with the given byte capacity
     pub fn new(max_bytes: usize) -> Self {
         Self {
             max_bytes,
@@ -74,10 +121,9 @@ impl SegmentCache {
         }
     }
 
-    /// Looks up a cached segment. Sets reference bit on hit.
+    /// Looks up a cached part, setting its reference bit on a hit
     pub fn get(&self, key: &SegmentCacheKey) -> Option<Arc<CachedSegment>> {
-        let packedKey = pack_key(key);
-        if let Some(segment) = self.entries.read_sync(&packedKey, |_, v| {
+        if let Some(segment) = self.entries.read_sync(key, |_, v| {
             v.reference_bit.store(true, Ordering::Relaxed);
             Arc::clone(v)
         }) {
@@ -89,16 +135,17 @@ impl SegmentCache {
         }
     }
 
-    /// Inserts a decoded segment into the cache. Evicts entries if needed.
+    /// Inserts a part, evicting until it fits, and hands back the shared
+    /// entry so the caller reads the same bytes a later hit will
     pub fn insert(&self, key: SegmentCacheKey, data: Vec<u8>) -> Arc<CachedSegment> {
         let dataSize = data.len() as u64;
-        let packedKey = pack_key(&key);
 
-        // Evict until there is room. Accounts for the size of an existing entry
-        // under this key being displaced so the post-insert net stays bounded.
+        // Evict until there is room. Accounts for the size of an existing
+        // entry under this key being displaced so the post-insert net stays
+        // bounded
         let displacedSize = self
             .entries
-            .read_sync(&packedKey, |_, v| v.size_bytes() as u64)
+            .read_sync(&key, |_, v| v.size_bytes() as u64)
             .unwrap_or(0);
         let netNeeded = dataSize.saturating_sub(displacedSize) as usize;
         self.evict_until(netNeeded);
@@ -111,13 +158,13 @@ impl SegmentCache {
 
         let result = Arc::clone(&segment);
 
-        // Replace the stored segment under this key. On an existing key, subtract
-        // the displaced entry's size before adding the new size and skip pushing
-        // a duplicate clock_keys entry so accounting and the clock ring stay
-        // consistent.
+        // Replace the stored entry under this key. On an existing key,
+        // subtract the displaced entry's size before adding the new size and
+        // skip pushing a duplicate ring entry so accounting and the ring
+        // stay consistent
         let mut displaced: u64 = 0;
         let mut wasPresent = false;
-        match self.entries.entry_sync(packedKey) {
+        match self.entries.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut entry) => {
                 displaced = entry.get().size_bytes() as u64;
                 *entry.get_mut() = segment;
@@ -135,25 +182,24 @@ impl SegmentCache {
 
         if !wasPresent {
             let mut keys = self.clock_keys.write();
-            keys.push(packedKey);
+            keys.push(key);
         }
 
         result
     }
 
-    /// Removes a specific entry from the cache.
+    /// Removes one entry
     pub fn invalidate(&self, key: &SegmentCacheKey) {
-        let packedKey = pack_key(key);
-        if let Some((_, removed)) = self.entries.remove_sync(&packedKey) {
+        if let Some((_, removed)) = self.entries.remove_sync(key) {
             let size = removed.size_bytes() as u64;
             self.current_bytes.fetch_sub(size, Ordering::Relaxed);
         }
 
         let mut keys = self.clock_keys.write();
-        keys.retain(|k| *k != packedKey);
+        keys.retain(|k| k != key);
     }
 
-    /// Clears the entire cache.
+    /// Removes every entry
     pub fn clear(&self) {
         self.entries.retain_sync(|_, _| false);
         self.current_bytes.store(0, Ordering::Relaxed);
@@ -161,7 +207,7 @@ impl SegmentCache {
         keys.clear();
     }
 
-    /// Returns cache utilization statistics.
+    /// Cache utilization statistics
     pub fn stats(&self) -> SegmentCacheStats {
         let entryCount = self.entries.len();
         SegmentCacheStats {
@@ -173,7 +219,7 @@ impl SegmentCache {
         }
     }
 
-    /// Clock-sweep eviction until at least `needed_bytes` are free.
+    /// Clock-sweep eviction until at least `needed_bytes` are free
     fn evict_until(&self, needed_bytes: usize) {
         let maxSweeps = 2;
         for _ in 0..maxSweeps {
@@ -192,19 +238,18 @@ impl SegmentCache {
 
             // One full rotation
             for _ in 0..keyCount {
-                let packedKey = keys[hand];
+                let key = keys[hand];
                 hand = (hand + 1) % keyCount;
 
-                if let Some(entry) = self.entries.get_sync(&packedKey) {
+                if let Some(entry) = self.entries.get_sync(&key) {
                     let segment = entry.get();
                     if segment.reference_bit.load(Ordering::Relaxed) {
-                        // Clear reference bit, give second chance
+                        // Clear the reference bit, give a second chance
                         segment.reference_bit.store(false, Ordering::Relaxed);
                     } else {
-                        // Evict this entry
                         let size = segment.size_bytes() as u64;
                         drop(entry);
-                        if let Some((_, _)) = self.entries.remove_sync(&packedKey) {
+                        if let Some((_, _)) = self.entries.remove_sync(&key) {
                             self.current_bytes.fetch_sub(size, Ordering::Relaxed);
                         }
 
@@ -212,7 +257,7 @@ impl SegmentCache {
                         if currentUsed + needed_bytes <= self.max_bytes {
                             self.clock_hand.store(hand, Ordering::Relaxed);
                             drop(keys);
-                            // Clean up evicted keys from the ring
+                            // Drop evicted keys from the ring
                             let mut wrKeys = self.clock_keys.write();
                             wrKeys.retain(|k| self.entries.contains_sync(k));
                             return;
@@ -224,17 +269,17 @@ impl SegmentCache {
             self.clock_hand.store(hand, Ordering::Relaxed);
         }
 
-        // Final sweep, the second-chance passes above may clear reference bits
-        // without freeing enough for a large item. Force-evict ignoring the
+        // Final sweep, the second-chance passes above may clear reference
+        // bits without freeing enough for a large item. Evict ignoring the
         // reference bit so insert never pushes current_bytes above max_bytes
-        // while entries remain to reclaim.
+        // while entries remain to reclaim
         loop {
             let currentUsed = self.current_bytes.load(Ordering::Relaxed) as usize;
             if currentUsed + needed_bytes <= self.max_bytes {
                 break;
             }
 
-            let packedKey = {
+            let key = {
                 let keys = self.clock_keys.read();
                 if keys.is_empty() {
                     break;
@@ -246,14 +291,14 @@ impl SegmentCache {
                 keys[hand]
             };
 
-            if let Some((_, removed)) = self.entries.remove_sync(&packedKey) {
+            if let Some((_, removed)) = self.entries.remove_sync(&key) {
                 let size = removed.size_bytes() as u64;
                 self.current_bytes.fetch_sub(size, Ordering::Relaxed);
                 let mut wrKeys = self.clock_keys.write();
-                wrKeys.retain(|k| *k != packedKey);
+                wrKeys.retain(|k| *k != key);
             } else {
-                // Stale ring entry already gone from the map, drop it so the
-                // loop makes progress instead of spinning on a dead key
+                // A stale ring entry already gone from the map, dropped so
+                // the loop makes progress instead of spinning on a dead key
                 let mut wrKeys = self.clock_keys.write();
                 wrKeys.retain(|k| self.entries.contains_sync(k));
                 if wrKeys.is_empty() {
@@ -262,11 +307,6 @@ impl SegmentCache {
             }
         }
     }
-}
-
-/// Packs a SegmentCacheKey into a u64 for hash map lookup.
-fn pack_key(key: &SegmentCacheKey) -> u64 {
-    key.file_id ^ ((key.column_id as u64) << 48)
 }
 
 #[cfg(test)]
@@ -296,6 +336,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parts_of_one_column_are_distinct_entries() {
+        let cache = SegmentCache::new(1024 * 1024);
+        cache.insert(SegmentCacheKey::new(7, 3), vec![1u8; 10]);
+        cache.insert(SegmentCacheKey::bloom(7, 3), vec![2u8; 20]);
+
+        let payload = cache.get(&SegmentCacheKey::new(7, 3)).expect("payload");
+        let bloom = cache.get(&SegmentCacheKey::bloom(7, 3)).expect("bloom");
+        assert_eq!(&payload[..], &[1u8; 10]);
+        assert_eq!(&bloom[..], &[2u8; 20]);
+        assert_eq!(cache.stats().entry_count, 2);
+    }
+
+    #[test]
     fn test_invalidate() {
         let cache = SegmentCache::new(1024 * 1024);
         let key = SegmentCacheKey::new(1, 0);
@@ -311,7 +364,7 @@ mod tests {
         // Cache with 200 bytes capacity
         let cache = SegmentCache::new(200);
 
-        // Insert 3 segments of 100 bytes each. Third should trigger eviction.
+        // Insert 3 segments of 100 bytes each. Third should trigger eviction
         let key1 = SegmentCacheKey::new(1, 0);
         let key2 = SegmentCacheKey::new(2, 0);
         let key3 = SegmentCacheKey::new(3, 0);
@@ -323,8 +376,8 @@ mod tests {
 
         cache.insert(key2, vec![2u8; 100]);
 
-        // Don't access key2 (no reference bit set after insert resets)
-        // key2's reference bit is true from insert, so it needs one more sweep
+        // key2's reference bit is true from insert, so it needs one more
+        // sweep
 
         cache.insert(key3, vec![3u8; 100]);
 

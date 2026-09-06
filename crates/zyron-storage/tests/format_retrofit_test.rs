@@ -300,7 +300,8 @@ fn the_index_checkpoint_declares_its_version() {
 }
 
 /// The four page formats are the ones that carry a stamp rather than an
-/// envelope, and the file formats are the ones that carry an envelope
+/// envelope, the columnar file carries the envelope header and a trailer
+/// of its own, and the other file formats carry the whole envelope
 #[test]
 fn the_framings_are_what_each_format_declares() {
     for (kind, owner) in STORAGE_FORMATS {
@@ -312,6 +313,9 @@ fn the_framings_are_what_each_format_declares() {
             | FormatKind::Fsm
             | FormatKind::BloomFilter => {
                 assert_eq!(framing, Framing::Stamp, "{kind} from {owner}");
+            }
+            FormatKind::ZyrColumnar => {
+                assert_eq!(framing, Framing::OwnTrailer, "{kind} from {owner}");
             }
             _ => assert_eq!(framing, Framing::Envelope, "{kind} from {owner}"),
         }

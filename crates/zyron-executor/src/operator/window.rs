@@ -1,11 +1,19 @@
 //! Window function operator.
 //!
-//! Drains all input, sorts by (partition_by, order_by), iterates partition
-//! boundaries, and applies each window function per-partition. Appends one
+//! Drains all input into one batch, and for each window expression lays
+//! the rows out by partition and ORDER BY key, applies the function per
+//! partition, and scatters the result back to input order. Appends one
 //! result column per window expression to the output batch.
 //!
-//! Currently supports the unbounded full-partition frame (default for
-//! analytical functions without explicit ROWS/RANGE BETWEEN).
+//! The layout groups partitions by hash rather than sorting by the
+//! partition key, since the output goes back to input order and only the
+//! grouping matters, orders the rows by the ORDER BY keys once, and gathers
+//! only the columns the function reads. The running aggregates over one
+//! numeric argument fold in typed loops that write their output column
+//! directly, and every other shape folds through the aggregate operator's
+//! accumulators so the two never disagree.
+
+use std::borrow::Cow;
 
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::{WindowFrame, WindowFrameBound, WindowFrameDirection, WindowFrameMode};
@@ -14,9 +22,10 @@ use zyron_planner::logical::LogicalColumn;
 
 use crate::batch::DataBatch;
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
-use crate::expr::evaluate;
+use crate::compute;
+use crate::expr::evaluate_borrowed;
 use crate::operator::aggregate::{
-    Accumulator, build_accumulator, coerce_aggregate_scalar, is_supported_aggregate,
+    Accumulator, GroupIndex, build_accumulator, coerce_aggregate_scalar, is_supported_aggregate,
 };
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -83,14 +92,11 @@ impl WindowOperator {
             return Ok(());
         }
 
-        // Concatenate all column pieces.
-        let mut input_columns: Vec<Column> =
-            combined_columns.into_iter().map(concat_columns).collect();
-
-        // Determine sort key from the first window expression's partition_by + order_by.
-        // All window functions currently share the same implicit frame; we process
-        // each independently so they can have different partition/order keys.
-        let mut output_columns = input_columns.clone();
+        // The whole input as one batch, which every window expression
+        // reads in place. Each has its own partition and order keys, so
+        // each lays the rows out for itself
+        let input = DataBatch::new(combined_columns.into_iter().map(concat_columns).collect());
+        let mut window_columns: Vec<Column> = Vec::with_capacity(self.window_exprs.len());
 
         for window_expr in &self.window_exprs {
             let (function, partition_by, order_by, frame) = match window_expr {
@@ -108,45 +114,486 @@ impl WindowOperator {
                 }
             };
 
-            // Build a sort key: partition keys (ascending) then order keys.
-            let sort_indices = compute_sort_indices(
-                &input_columns,
-                &self.input_schema,
-                partition_by,
-                order_by,
-                total_rows,
-            )?;
-
-            // Evaluate the window function in sorted order, then unsort back.
-            let sorted_input = reorder_batch(&input_columns, &sort_indices);
-
-            // Identify partition boundaries.
-            let partition_boundaries = find_partition_boundaries(
-                &sorted_input,
-                &self.input_schema,
-                partition_by,
-                total_rows,
-            )?;
-
-            // Compute window function output per partition.
+            let layout =
+                PartitionLayout::build(&input, &self.input_schema, partition_by, order_by)?;
             let window_output = evaluate_window_function(
                 function,
-                &sorted_input,
+                &input,
                 &self.input_schema,
-                &partition_boundaries,
+                &layout,
                 order_by,
                 frame,
                 window_expr.type_id(),
             )?;
-
-            // Unsort: scatter the window values back to their original row positions.
-            let unsorted = unsort_column(&window_output, &sort_indices);
-            output_columns.push(unsorted);
+            // Scatter the window values back to their input positions
+            let _scatter =
+                zyron_common::profile::scope(zyron_common::profile::Phase::ExecWindowScatter);
+            window_columns.push(unsort_column(&window_output, &layout.sorted));
         }
 
+        let mut output_columns = input.columns;
+        output_columns.extend(window_columns);
         self.result = Some(DataBatch::new(output_columns));
         Ok(())
     }
+}
+
+/// The rows of the input arranged for one window: grouped by partition,
+/// each partition in ORDER BY order, with the partition boundaries in that
+/// arrangement and the ORDER BY keys gathered into it
+struct PartitionLayout {
+    /// Input row of each sorted position
+    sorted: Vec<u32>,
+    /// Partition starts in sorted positions, ending with the row count
+    boundaries: Vec<usize>,
+    /// The ORDER BY key columns in sorted order, evaluated once
+    order_cols: Vec<Column>,
+}
+
+impl PartitionLayout {
+    fn build(
+        input: &DataBatch,
+        schema: &[LogicalColumn],
+        partition_by: &[BoundExpr],
+        order_by: &[BoundOrderBy],
+    ) -> Result<Self> {
+        let total = input.num_rows;
+        let partition =
+            zyron_common::profile::scope(zyron_common::profile::Phase::ExecWindowPartition);
+        let (ids, partitions) = partition_ids(input, schema, partition_by)?;
+        drop(partition);
+        let _order = zyron_common::profile::scope(zyron_common::profile::Phase::ExecWindowOrder);
+
+        let keys: Vec<Cow<'_, Column>> = order_by
+            .iter()
+            .map(|ob| evaluate_borrowed(&ob.expr, input, schema, &[]))
+            .collect::<Result<Vec<_>>>()?;
+        let ordered: Vec<u32> = if keys.is_empty() {
+            (0..total as u32).collect()
+        } else {
+            let refs: Vec<&Column> = keys.iter().map(|c| c.as_ref()).collect();
+            let ascending: Vec<bool> = order_by.iter().map(|ob| ob.asc).collect();
+            let nulls_first: Vec<bool> = order_by.iter().map(|ob| ob.nulls_first).collect();
+            compute::sort_indices_stable(&refs, &ascending, &nulls_first, total)
+        };
+
+        // A counting sort by partition id over the ordered rows. It is
+        // stable, so it groups the partitions and keeps each one's order,
+        // and its offsets are the partition boundaries
+        let mut boundaries = vec![0usize; partitions + 1];
+        for &row in &ordered {
+            boundaries[ids[row as usize] as usize + 1] += 1;
+        }
+        for p in 0..partitions {
+            boundaries[p + 1] += boundaries[p];
+        }
+        let mut next: Vec<usize> = boundaries[..partitions].to_vec();
+        let mut sorted = vec![0u32; total];
+        for &row in &ordered {
+            let p = ids[row as usize] as usize;
+            sorted[next[p]] = row;
+            next[p] += 1;
+        }
+
+        let order_cols: Vec<Column> = keys.iter().map(|k| k.take(&sorted)).collect();
+        Ok(Self {
+            sorted,
+            boundaries,
+            order_cols,
+        })
+    }
+}
+
+/// Rows ahead of the one being placed whose bucket is prefetched
+const PARTITION_PREFETCH_DISTANCE: usize = 16;
+
+/// A dense partition id per input row, in order of first appearance, and
+/// how many partitions there are. Rows with equal keys share an id, two
+/// NULL keys counting as equal, which is how GROUP BY groups them
+fn partition_ids(
+    input: &DataBatch,
+    schema: &[LogicalColumn],
+    partition_by: &[BoundExpr],
+) -> Result<(Vec<u32>, usize)> {
+    let total = input.num_rows;
+    if partition_by.is_empty() {
+        return Ok((vec![0; total], 1));
+    }
+    let keys: Vec<Cow<'_, Column>> = partition_by
+        .iter()
+        .map(|expr| evaluate_borrowed(expr, input, schema, &[]))
+        .collect::<Result<Vec<_>>>()?;
+    let refs: Vec<&Column> = keys.iter().map(|c| c.as_ref()).collect();
+    let hashes = compute::hash_column_batch(&refs, total);
+
+    let mut index = GroupIndex::new();
+    // The first row seen of each partition, which is what a later row's
+    // key is compared against
+    let mut representatives: Vec<u32> = Vec::new();
+    let mut ids: Vec<u32> = Vec::with_capacity(total);
+    for row in 0..total {
+        let ahead = row + PARTITION_PREFETCH_DISTANCE;
+        if ahead < total {
+            index.prefetch(hashes[ahead]);
+        }
+        let id = match index.find(hashes[row], |p| {
+            compute::rows_equal_typed(&refs, row, representatives[p] as usize)
+        }) {
+            Some(p) => p,
+            None => {
+                index.insert(hashes[row]);
+                representatives.push(row as u32);
+                representatives.len() - 1
+            }
+        };
+        ids.push(id as u32);
+    }
+    Ok((ids, representatives.len()))
+}
+
+/// How two adjacent sorted rows are compared for a tie on the ORDER BY
+/// keys, resolved once per fold rather than per row: whether a column has
+/// nulls is a scan of its bitmap, which asked per pair is a pass over the
+/// column for every row. One integer key with no nulls, the common case,
+/// compares the values directly
+enum PeerKey<'a> {
+    Int64(&'a [i64]),
+    General(&'a [Column]),
+}
+
+impl<'a> PeerKey<'a> {
+    fn of(order_cols: &'a [Column]) -> Self {
+        if let [col] = order_cols
+            && let ColumnData::Int64(v) = &col.data
+            && !col.nulls.has_nulls()
+        {
+            return PeerKey::Int64(v);
+        }
+        PeerKey::General(order_cols)
+    }
+
+    #[inline]
+    fn tie(&self, a: usize, b: usize) -> bool {
+        match self {
+            PeerKey::Int64(v) => v[a] == v[b],
+            PeerKey::General(cols) => cols
+                .iter()
+                .all(|c| compare_col_rows(c, a, b) == std::cmp::Ordering::Equal),
+        }
+    }
+}
+
+/// How the rows of a partition accumulate into each output row
+#[derive(Clone, Copy)]
+enum RunningShape {
+    /// Every row of the partition folds into every output row
+    Whole,
+    /// Rows fold in one at a time, each output row seeing the rows up to
+    /// and including itself
+    Rows,
+    /// Rows fold in a peer group at a time, rows tied on the ORDER BY keys
+    /// sharing one output value
+    Peers,
+}
+
+/// The running shape a frame describes, or None for a frame the
+/// accumulator fold has to resolve row by row. A RANGE frame with no ORDER
+/// BY is left to that fold as well, which is where it is refused
+fn running_shape(order_cols: &[Column], frame: Option<&WindowFrame>) -> Option<RunningShape> {
+    match frame {
+        None if order_cols.is_empty() => Some(RunningShape::Whole),
+        None => Some(RunningShape::Peers),
+        Some(f) => {
+            if !matches!(
+                f.start,
+                WindowFrameBound::Unbounded(WindowFrameDirection::Preceding)
+            ) {
+                return None;
+            }
+            match (f.mode, f.end) {
+                (WindowFrameMode::Rows, None | Some(WindowFrameBound::CurrentRow)) => {
+                    Some(RunningShape::Rows)
+                }
+                (WindowFrameMode::Range, None | Some(WindowFrameBound::CurrentRow))
+                    if !order_cols.is_empty() =>
+                {
+                    Some(RunningShape::Peers)
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Folds each partition's rows into its output rows under a running shape,
+/// `step` absorbing one row and `emit` reading the state, rows that share a
+/// peer group taking one value. None from `emit` is a NULL output
+#[allow(clippy::too_many_arguments)]
+fn fold_running<S, T: Copy>(
+    boundaries: &[usize],
+    order_cols: &[Column],
+    shape: RunningShape,
+    mut fresh: impl FnMut() -> S,
+    mut step: impl FnMut(&mut S, usize),
+    mut emit: impl FnMut(&S) -> Result<Option<T>>,
+    out: &mut [T],
+    nulls: &mut NullBitmap,
+) -> Result<()> {
+    let mut write = |row: usize, value: Option<T>| match value {
+        Some(v) => out[row] = v,
+        None => nulls.set_null(row),
+    };
+    let peers = PeerKey::of(order_cols);
+    for window in boundaries.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        if end <= start {
+            continue;
+        }
+        let mut state = fresh();
+        match shape {
+            RunningShape::Whole => {
+                for row in start..end {
+                    step(&mut state, row);
+                }
+                let value = emit(&state)?;
+                for row in start..end {
+                    write(row, value);
+                }
+            }
+            RunningShape::Rows => {
+                for row in start..end {
+                    step(&mut state, row);
+                    write(row, emit(&state)?);
+                }
+            }
+            RunningShape::Peers => {
+                let mut pos = start;
+                while pos < end {
+                    let mut peer_end = pos + 1;
+                    while peer_end < end && peers.tie(peer_end - 1, peer_end) {
+                        peer_end += 1;
+                    }
+                    for row in pos..peer_end {
+                        step(&mut state, row);
+                    }
+                    let value = emit(&state)?;
+                    for row in pos..peer_end {
+                        write(row, value);
+                    }
+                    pos = peer_end;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The running aggregates whose state is one number, folded in a typed
+/// loop that writes the output column directly. None hands the shape to
+/// the accumulator fold, which covers every aggregate and every frame
+#[allow(clippy::too_many_arguments)]
+fn running_typed(
+    name: &str,
+    args_len: usize,
+    arg_col: Option<&Column>,
+    boundaries: &[usize],
+    order_cols: &[Column],
+    frame: Option<&WindowFrame>,
+    total_rows: usize,
+    out_type: TypeId,
+) -> Result<Option<Column>> {
+    let Some(shape) = running_shape(order_cols, frame) else {
+        return Ok(None);
+    };
+    let mut nulls = NullBitmap::none(total_rows);
+    let column = match (name, arg_col, out_type) {
+        ("count", None, TypeId::Int64) if args_len == 0 => {
+            let mut out = vec![0i64; total_rows];
+            fold_running(
+                boundaries,
+                order_cols,
+                shape,
+                || 0i64,
+                |n, _| *n += 1,
+                |n| Ok(Some(*n)),
+                &mut out,
+                &mut nulls,
+            )?;
+            Column::with_nulls(ColumnData::Int64(out), nulls, out_type)
+        }
+        ("count", Some(col), TypeId::Int64) => {
+            let mut out = vec![0i64; total_rows];
+            fold_running(
+                boundaries,
+                order_cols,
+                shape,
+                || 0i64,
+                |n, row| {
+                    if !col.is_null(row) {
+                        *n += 1;
+                    }
+                },
+                |n| Ok(Some(*n)),
+                &mut out,
+                &mut nulls,
+            )?;
+            Column::with_nulls(ColumnData::Int64(out), nulls, out_type)
+        }
+        ("sum", Some(col), TypeId::Int64) => {
+            let ColumnData::Int64(v) = &col.data else {
+                return Ok(None);
+            };
+            let mut out = vec![0i64; total_rows];
+            fold_running(
+                boundaries,
+                order_cols,
+                shape,
+                || (0i128, false),
+                |(sum, seen), row| {
+                    if !col.is_null(row) {
+                        *sum += v[row] as i128;
+                        *seen = true;
+                    }
+                },
+                |(sum, seen)| {
+                    if !*seen {
+                        return Ok(None);
+                    }
+                    i64::try_from(*sum).map(Some).map_err(|_| {
+                        ZyronError::ExecutionError(format!(
+                            "aggregate result of type {:?} does not fit output type {out_type:?}",
+                            TypeId::Int128
+                        ))
+                    })
+                },
+                &mut out,
+                &mut nulls,
+            )?;
+            Column::with_nulls(ColumnData::Int64(out), nulls, out_type)
+        }
+        ("sum", Some(col), TypeId::Float64) => {
+            let ColumnData::Float64(v) = &col.data else {
+                return Ok(None);
+            };
+            let mut out = vec![0f64; total_rows];
+            fold_running(
+                boundaries,
+                order_cols,
+                shape,
+                || (0f64, false),
+                |(sum, seen), row| {
+                    if !col.is_null(row) {
+                        *sum += v[row];
+                        *seen = true;
+                    }
+                },
+                |(sum, seen)| Ok(seen.then_some(*sum)),
+                &mut out,
+                &mut nulls,
+            )?;
+            Column::with_nulls(ColumnData::Float64(out), nulls, out_type)
+        }
+        ("avg", Some(col), TypeId::Float64) => {
+            let mut out = vec![0f64; total_rows];
+            let emit = |(sum, count): &(f64, i64)| Ok((*count > 0).then(|| *sum / *count as f64));
+            match &col.data {
+                ColumnData::Int64(v) => fold_running(
+                    boundaries,
+                    order_cols,
+                    shape,
+                    || (0f64, 0i64),
+                    |(sum, count), row| {
+                        if !col.is_null(row) {
+                            *sum += v[row] as f64;
+                            *count += 1;
+                        }
+                    },
+                    emit,
+                    &mut out,
+                    &mut nulls,
+                )?,
+                ColumnData::Float64(v) => fold_running(
+                    boundaries,
+                    order_cols,
+                    shape,
+                    || (0f64, 0i64),
+                    |(sum, count), row| {
+                        if !col.is_null(row) {
+                            *sum += v[row];
+                            *count += 1;
+                        }
+                    },
+                    emit,
+                    &mut out,
+                    &mut nulls,
+                )?,
+                _ => return Ok(None),
+            }
+            Column::with_nulls(ColumnData::Float64(out), nulls, out_type)
+        }
+        ("min" | "max", Some(col), TypeId::Int64) => {
+            let ColumnData::Int64(v) = &col.data else {
+                return Ok(None);
+            };
+            let is_max = name == "max";
+            let mut out = vec![0i64; total_rows];
+            fold_running(
+                boundaries,
+                order_cols,
+                shape,
+                || None::<i64>,
+                |extreme, row| {
+                    if !col.is_null(row) {
+                        let x = v[row];
+                        *extreme = Some(match *extreme {
+                            None => x,
+                            Some(cur) if is_max => cur.max(x),
+                            Some(cur) => cur.min(x),
+                        });
+                    }
+                },
+                |extreme| Ok(*extreme),
+                &mut out,
+                &mut nulls,
+            )?;
+            Column::with_nulls(ColumnData::Int64(out), nulls, out_type)
+        }
+        ("min" | "max", Some(col), TypeId::Float64) => {
+            let ColumnData::Float64(v) = &col.data else {
+                return Ok(None);
+            };
+            // The float total order, NaN above every number and equal to
+            // itself, so the running extreme does not depend on arrival
+            let wanted = if name == "max" {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+            let mut out = vec![0f64; total_rows];
+            fold_running(
+                boundaries,
+                order_cols,
+                shape,
+                || None::<f64>,
+                |extreme, row| {
+                    if !col.is_null(row) {
+                        let x = v[row];
+                        *extreme = Some(match *extreme {
+                            None => x,
+                            Some(cur) if compute::cmp_f64_total(x, cur) == wanted => x,
+                            Some(cur) => cur,
+                        });
+                    }
+                },
+                |extreme| Ok(*extreme),
+                &mut out,
+                &mut nulls,
+            )?;
+            Column::with_nulls(ColumnData::Float64(out), nulls, out_type)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(column))
 }
 
 impl Operator for WindowOperator {
@@ -216,73 +663,6 @@ fn slice_batch(batch: &DataBatch, offset: usize, len: usize) -> DataBatch {
 
 /// Computes sort indices that group partitions together and order rows within
 /// each partition. Uses a stable sort by (partition_keys..., order_keys...).
-fn compute_sort_indices(
-    columns: &[Column],
-    schema: &[LogicalColumn],
-    partition_by: &[BoundExpr],
-    order_by: &[BoundOrderBy],
-    total_rows: usize,
-) -> Result<Vec<u32>> {
-    let mut indices: Vec<u32> = (0..total_rows as u32).collect();
-
-    // Materialize evaluation of partition keys and order keys.
-    let batch = DataBatch::new(columns.to_vec());
-    let mut partition_cols: Vec<Column> = Vec::with_capacity(partition_by.len());
-    for expr in partition_by {
-        partition_cols.push(evaluate(expr, &batch, schema, &[])?);
-    }
-    let mut order_cols: Vec<Column> = Vec::with_capacity(order_by.len());
-    for ob in order_by {
-        order_cols.push(evaluate(&ob.expr, &batch, schema, &[])?);
-    }
-
-    indices.sort_by(|&a, &b| {
-        // Compare partition keys first (ascending).
-        for col in &partition_cols {
-            let ord = compare_col_rows(col, a as usize, b as usize);
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        // Then order keys respecting direction and null placement. Null
-        // placement is what the ORDER BY clause declared and is decided
-        // before the direction reversal, the same rule the Sort operator
-        // applies, so a window's frame sees rows in the order the query
-        // said rather than nulls-first regardless
-        for (i, col) in order_cols.iter().enumerate() {
-            let (ai, bi) = (a as usize, b as usize);
-            let a_null = col.is_null(ai);
-            let b_null = col.is_null(bi);
-            match (a_null, b_null) {
-                (true, true) => continue,
-                (true, false) => {
-                    return if order_by[i].nulls_first {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    };
-                }
-                (false, true) => {
-                    return if order_by[i].nulls_first {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Less
-                    };
-                }
-                (false, false) => {}
-            }
-            let ord = compare_col_values(&col.data, ai, bi);
-            let ord = if order_by[i].asc { ord } else { ord.reverse() };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-
-    Ok(indices)
-}
-
 fn compare_col_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
     let a_null = col.nulls.is_null(a);
     let b_null = col.nulls.is_null(b);
@@ -315,10 +695,6 @@ fn compare_col_values(data: &ColumnData, a: usize, b: usize) -> std::cmp::Orderi
     }
 }
 
-fn reorder_batch(columns: &[Column], indices: &[u32]) -> Vec<Column> {
-    columns.iter().map(|c| reorder_column(c, indices)).collect()
-}
-
 fn reorder_column(col: &Column, indices: &[u32]) -> Column {
     let new_data = col.data.take(indices);
     let new_nulls = col.nulls.take(indices);
@@ -335,43 +711,6 @@ fn unsort_column(sorted: &Column, indices: &[u32]) -> Column {
         inverse[orig_pos as usize] = sorted_pos as u32;
     }
     reorder_column(sorted, &inverse)
-}
-
-/// Returns partition start offsets in sorted order. Always includes 0 and total_rows as endpoints.
-/// Partitions are ranges [starts[i], starts[i+1]).
-fn find_partition_boundaries(
-    sorted_columns: &[Column],
-    schema: &[LogicalColumn],
-    partition_by: &[BoundExpr],
-    total_rows: usize,
-) -> Result<Vec<usize>> {
-    let mut boundaries = vec![0usize];
-
-    if partition_by.is_empty() || total_rows == 0 {
-        boundaries.push(total_rows);
-        return Ok(boundaries);
-    }
-
-    let batch = DataBatch::new(sorted_columns.to_vec());
-    let mut partition_cols: Vec<Column> = Vec::with_capacity(partition_by.len());
-    for expr in partition_by {
-        partition_cols.push(evaluate(expr, &batch, schema, &[])?);
-    }
-
-    for row in 1..total_rows {
-        let mut same = true;
-        for col in &partition_cols {
-            if compare_col_rows(col, row - 1, row) != std::cmp::Ordering::Equal {
-                same = false;
-                break;
-            }
-        }
-        if !same {
-            boundaries.push(row);
-        }
-    }
-    boundaries.push(total_rows);
-    Ok(boundaries)
 }
 
 /// Identifies which output column type a window function produces.
@@ -401,12 +740,24 @@ fn compute_window_aggregate(
     arg_col: Option<&Column>,
     partition_boundaries: &[usize],
     order_by: &[BoundOrderBy],
+    order_cols: &[Column],
     frame: Option<&WindowFrame>,
-    batch: &DataBatch,
-    schema: &[LogicalColumn],
     total_rows: usize,
     out_type: TypeId,
 ) -> Result<Column> {
+    if let Some(column) = running_typed(
+        name,
+        args_len,
+        arg_col,
+        partition_boundaries,
+        order_cols,
+        frame,
+        total_rows,
+        out_type,
+    )? {
+        return Ok(column);
+    }
+
     let mut data = ColumnData::with_capacity(out_type, total_rows);
     let mut nulls = NullBitmap::empty();
 
@@ -424,18 +775,7 @@ fn compute_window_aggregate(
         coerce_aggregate_scalar(acc.finalize(), out_type)
     };
 
-    // ORDER BY key columns (evaluated once over the whole sorted batch) drive
-    // peer detection for the running default frame and RANGE frame bounds.
-    let order_cols: Vec<Column> = if order_by.is_empty() {
-        Vec::new()
-    } else {
-        order_by
-            .iter()
-            .map(|ob| evaluate(&ob.expr, batch, schema, &[]))
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    let mut push = |val: ScalarValue, data: &mut ColumnData, nulls: &mut NullBitmap| {
+    let push = |val: ScalarValue, data: &mut ColumnData, nulls: &mut NullBitmap| {
         nulls.push(val.is_null());
         data.push_scalar(&val);
     };
@@ -539,18 +879,12 @@ fn compute_window_aggregate(
             // accumulator across the partition, grouping peers so equal order
             // keys share the cumulative value.
             let mut acc = build_accumulator(name, args_len);
+            let peers = PeerKey::of(order_cols);
             let mut pos = start;
             while pos < end {
                 let mut peer_end = pos + 1;
-                while peer_end < end {
-                    let tied = order_cols.iter().all(|c| {
-                        compare_col_rows(c, peer_end - 1, peer_end) == std::cmp::Ordering::Equal
-                    });
-                    if tied {
-                        peer_end += 1;
-                    } else {
-                        break;
-                    }
+                while peer_end < end && peers.tie(peer_end - 1, peer_end) {
+                    peer_end += 1;
                 }
                 if args_len == 0 {
                     acc.add_count(peer_end - pos);
@@ -614,9 +948,9 @@ fn window_function_kind(name: &str) -> Result<WindowOutputKind> {
 #[allow(clippy::too_many_arguments)]
 fn evaluate_window_function(
     function: &BoundExpr,
-    sorted_columns: &[Column],
+    input: &DataBatch,
     schema: &[LogicalColumn],
-    partition_boundaries: &[usize],
+    layout: &PartitionLayout,
     order_by: &[BoundOrderBy],
     frame: Option<&WindowFrame>,
     result_type: TypeId,
@@ -631,14 +965,19 @@ fn evaluate_window_function(
         }
     };
 
-    let total_rows = sorted_columns.first().map(|c| c.data.len()).unwrap_or(0);
+    let total_rows = input.num_rows;
 
-    // Evaluate argument columns in sorted order.
-    let batch = DataBatch::new(sorted_columns.to_vec());
+    // Argument columns, evaluated on the input as it arrived and gathered
+    // into the window's order, so only what the function reads is moved
+    let gather = zyron_common::profile::scope(zyron_common::profile::Phase::ExecWindowArgs);
     let mut arg_cols: Vec<Column> = Vec::with_capacity(args.len());
     for a in args {
-        arg_cols.push(evaluate(a, &batch, schema, &[])?);
+        arg_cols.push(evaluate_borrowed(a, input, schema, &[])?.take(&layout.sorted));
     }
+    drop(gather);
+    let _fold = zyron_common::profile::scope(zyron_common::profile::Phase::ExecWindowFold);
+    let partition_boundaries = layout.boundaries.as_slice();
+    let order_cols = layout.order_cols.as_slice();
 
     // A built-in aggregate used as a window function (SUM/COUNT/AVG/MIN/MAX OVER)
     // folds the aggregate over each partition's frame. result_type is the
@@ -650,21 +989,16 @@ fn evaluate_window_function(
             arg_cols.first(),
             partition_boundaries,
             order_by,
+            order_cols,
             frame,
-            &batch,
-            schema,
             total_rows,
             result_type,
         );
     }
 
-    // Evaluate the ORDER BY expression (used as the time axis for rate/derivative
-    // and as the ranking key for rank/dense_rank).
-    let time_col: Option<Column> = if let Some(ob) = order_by.first() {
-        Some(evaluate(&ob.expr, &batch, schema, &[])?)
-    } else {
-        None
-    };
+    // The leading ORDER BY key, the time axis for rate and derivative and
+    // the ranking key for rank and dense_rank
+    let time_col: Option<&Column> = order_cols.first();
 
     let kind = window_function_kind(&name)?;
 
@@ -685,18 +1019,10 @@ fn evaluate_window_function(
                         }
                     }
                     "rank" => {
-                        compute_rank(
-                            &mut result_data,
-                            start,
-                            end,
-                            order_by,
-                            &batch,
-                            schema,
-                            false,
-                        )?;
+                        compute_rank(&mut result_data, start, end, order_cols, false);
                     }
                     "dense_rank" => {
-                        compute_rank(&mut result_data, start, end, order_by, &batch, schema, true)?;
+                        compute_rank(&mut result_data, start, end, order_cols, true);
                     }
                     "ntile" => {
                         let n = extract_i64_scalar(&arg_cols.first(), start)?
@@ -858,7 +1184,7 @@ fn evaluate_window_function(
                             continue;
                         }
                         let mut ranks = vec![0i64; total_rows];
-                        compute_rank(&mut ranks, start, end, order_by, &batch, schema, false)?;
+                        compute_rank(&mut ranks, start, end, order_cols, false);
                         let denom = (partition_len - 1) as f64;
                         for i in start..end {
                             result_data[i] = (ranks[i] - 1) as f64 / denom;
@@ -869,7 +1195,7 @@ fn evaluate_window_function(
                         // Using rank to determine peer count.
                         let partition_len = end - start;
                         let mut ranks = vec![0i64; total_rows];
-                        compute_rank(&mut ranks, start, end, order_by, &batch, schema, false)?;
+                        compute_rank(&mut ranks, start, end, order_cols, false);
                         // count how many rows have rank <= current row's rank
                         for i in start..end {
                             let r = ranks[i];
@@ -991,43 +1317,24 @@ fn evaluate_window_function(
 }
 
 /// Computes dense or sparse ranks within a single partition range [start, end).
-fn compute_rank(
-    out: &mut [i64],
-    start: usize,
-    end: usize,
-    order_by: &[BoundOrderBy],
-    batch: &DataBatch,
-    schema: &[LogicalColumn],
-    dense: bool,
-) -> Result<()> {
+fn compute_rank(out: &mut [i64], start: usize, end: usize, order_cols: &[Column], dense: bool) {
     if end == start {
-        return Ok(());
+        return;
     }
-    if order_by.is_empty() {
+    if order_cols.is_empty() {
         // Without ORDER BY, all rows tie at rank 1.
         for i in start..end {
             out[i] = 1;
         }
-        return Ok(());
+        return;
     }
 
-    let order_cols: Vec<Column> = order_by
-        .iter()
-        .map(|ob| evaluate(&ob.expr, batch, schema, &[]))
-        .collect::<Result<Vec<_>>>()?;
-
+    let peers = PeerKey::of(order_cols);
     let mut current_rank: i64 = 1;
     out[start] = 1;
     let mut tie_base: i64 = 1;
     for i in (start + 1)..end {
-        let mut tied = true;
-        for col in &order_cols {
-            if compare_col_rows(col, i - 1, i) != std::cmp::Ordering::Equal {
-                tied = false;
-                break;
-            }
-        }
-        if tied {
+        if peers.tie(i - 1, i) {
             out[i] = tie_base;
         } else {
             if dense {
@@ -1039,7 +1346,6 @@ fn compute_rank(
             tie_base = current_rank;
         }
     }
-    Ok(())
 }
 
 /// Resolves a row-frame (WindowFrameMode::Rows) to (lower_inclusive, upper_exclusive)

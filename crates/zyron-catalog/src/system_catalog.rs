@@ -351,7 +351,8 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
         schema: "wire",
         object: "protocol_versions",
         kind: SystemObjectKind::View,
-        doc: "Wire protocol versions, which are accepted now, and when each was introduced",
+        doc: "The client, mesh, and consensus protocol versions, which are accepted now, and \
+              when each was introduced",
     },
     // -----------------------------------------------------------------------
     // stat

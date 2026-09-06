@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::envelope::{self, EnvelopeError};
-use super::kind::FormatKind;
+use super::kind::{FormatKind, Framing};
 use super::registry::{FormatEntry, FormatMigrator, FormatRegistry, MigrationPolicy};
 use super::version::FormatVersion;
 
@@ -55,7 +55,8 @@ impl ReaderPath {
 /// What a migration produced and whether it has to be written back
 #[derive(Debug, Clone)]
 pub struct MigratedBody {
-    /// The body at the current writer version
+    /// The body at the current writer version, or the whole file for a
+    /// format that owns its trailer
     pub body: Vec<u8>,
     pub from: FormatVersion,
     pub to: FormatVersion,
@@ -73,9 +74,13 @@ pub struct OpenedFile<'a> {
     /// The version the current writer emits
     pub current_version: FormatVersion,
     pub path: ReaderPath,
-    /// The body at the current version, borrowed when no migration ran
+    /// The body at the current version, borrowed when no migration ran.
+    /// The whole file for a format that owns its trailer
     pub body: Cow<'a, [u8]>,
     pub policy: MigrationPolicy,
+    /// How the kind is framed, which decides what `body` holds and how it
+    /// is written back
+    pub framing: Framing,
 }
 
 impl OpenedFile<'_> {
@@ -95,9 +100,16 @@ impl OpenedFile<'_> {
         }
     }
 
-    /// Re-wraps the current body in an envelope at the current version
+    /// The bytes to write back at the current version.
+    ///
+    /// An envelope framed file is re-wrapped around the current body. A
+    /// file that owns its trailer is the body itself, which its migrators
+    /// returned whole with the format's own checksums in place
     pub fn reencode(&self) -> Vec<u8> {
-        envelope::encode(self.kind, self.current_version, &self.body)
+        match self.framing {
+            Framing::OwnTrailer => self.body.to_vec(),
+            _ => envelope::encode(self.kind, self.current_version, &self.body),
+        }
     }
 }
 
@@ -304,30 +316,42 @@ pub fn reader_path(
     })
 }
 
-/// Opens a complete envelope, dispatching by version and migrating the body
-/// forward when the version is behind
+/// Opens a file, dispatching by version and migrating it forward when the
+/// version is behind. The kind comes off the file's own header
 pub fn open<'a>(
     registry: &FormatRegistry,
     bytes: &'a [u8],
 ) -> Result<OpenedFile<'a>, MigrationError> {
-    let parsed = envelope::decode(bytes)?;
-    let kind = parsed.header.kind;
-    let entry = registry
-        .get(kind)
-        .ok_or(MigrationError::Unregistered { kind })?;
-    open_parsed(entry, kind, parsed.header.version, parsed.body)
+    let (kind, _) = envelope::peek(bytes)?;
+    open_as(registry, bytes, kind)
 }
 
-/// Opens a complete envelope and refuses one of a different kind
+/// Opens a file and refuses one of a different kind.
+///
+/// An envelope framed file has both its checksums verified and its body
+/// carved out here. A format that owns its trailer has only its header
+/// read, because its trailer is its own to verify, and the whole file is
+/// what its migrators take and return
 pub fn open_as<'a>(
     registry: &FormatRegistry,
     bytes: &'a [u8],
     expected: FormatKind,
 ) -> Result<OpenedFile<'a>, MigrationError> {
-    let parsed = envelope::decode_as(bytes, expected)?;
     let entry = registry
         .get(expected)
         .ok_or(MigrationError::Unregistered { kind: expected })?;
+    if expected.framing().migrates_whole_file() {
+        let (header, _) = envelope::decode_header(bytes)?;
+        if header.kind != expected {
+            return Err(EnvelopeError::MagicMismatch {
+                expected,
+                found: header.kind.magic(),
+            }
+            .into());
+        }
+        return open_parsed(entry, expected, header.version, bytes);
+    }
+    let parsed = envelope::decode_as(bytes, expected)?;
     open_parsed(entry, expected, parsed.header.version, parsed.body)
 }
 
@@ -354,6 +378,7 @@ fn open_parsed<'a>(
         path,
         body,
         policy: entry.registration.migration_policy,
+        framing: kind.framing(),
     })
 }
 

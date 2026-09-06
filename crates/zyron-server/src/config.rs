@@ -10,6 +10,56 @@ use zyron_common::format::FormatKind;
 use zyron_common::format::text_envelope;
 use zyron_common::{Result, ZyronError};
 
+/// Serializes every rewrite of zyron.auto.conf in this process
+static AUTO_CONF_WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Writes a file through a sibling and a rename. The sibling is synced
+/// before the rename and the directory after it, so once this returns the
+/// new contents are on disk under the final name, and a crash before that
+/// leaves the previous file untouched
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let sibling = path.with_file_name(format!("{file_name}.tmp"));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&sibling)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&sibling);
+        return Err(ZyronError::Internal(format!(
+            "{} could not be written, {e}",
+            sibling.display()
+        )));
+    }
+    if let Err(e) = std::fs::rename(&sibling, path) {
+        let _ = std::fs::remove_file(&sibling);
+        return Err(ZyronError::Internal(format!(
+            "{} could not replace {}, {e}",
+            sibling.display(),
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if let Some(directory) = path.parent() {
+        std::fs::File::open(directory)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                ZyronError::Internal(format!(
+                    "{} could not be synced after writing {}, {e}",
+                    directory.display(),
+                    path.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 /// Top-level server configuration loaded from zyron.toml.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -35,6 +85,296 @@ pub struct ZyronConfig {
     /// External media tooling: paths to the binaries media operations
     /// invoke when configured
     pub media: MediaSection,
+    /// How this node finds, checks, and installs releases. The upgrade board
+    /// is seeded from here at boot and `ALTER SYSTEM SET` writes back here,
+    /// so the settings an operator sees are the ones the next boot reads
+    pub upgrade: UpgradeSection,
+}
+
+/// [upgrade] section of the config file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct UpgradeSection {
+    pub auto_upgrade_enabled: bool,
+    /// stable, beta, canary, or pinned
+    pub channel: String,
+    /// The version a pinned channel holds at
+    pub pinned_version: Option<String>,
+    /// Comma separated `HH:MM-HH:MM UTC` windows, empty for any time
+    pub window: String,
+    /// Set by an operator or by a failed health check, and cleared only by
+    /// an operator
+    pub paused: bool,
+    /// auto_safe, notify_all, or manual_only
+    pub user_object_rewrite_policy: String,
+    pub format_migration_budget_memory_fraction: f64,
+    pub format_migration_budget_time_secs: u64,
+    pub format_migration_budget_disk_multiple: f64,
+    pub rollback_on_health_fail: bool,
+    pub federation_coordination_timeout_secs: u64,
+    pub pre_upgrade_backup_snapshot: bool,
+    pub deprecation_warning_rate_limit_per_hour: u32,
+    pub release_feed_poll_interval_secs: u64,
+    /// Seconds a restarted node has to reach the health baseline
+    pub health_recovery_timeout_secs: u64,
+    /// Seconds between health observations while a node recovers
+    pub health_poll_interval_secs: u64,
+    /// Multiple of the baseline p99 still counted as healthy
+    pub health_latency_multiplier: f64,
+    /// Fraction of the baseline throughput still counted as healthy
+    pub health_throughput_floor: f64,
+    /// Absolute error rate ceiling
+    pub health_error_rate_ceiling: f64,
+    /// Seconds a node has to finish its in-flight work before a restart
+    pub drain_timeout_secs: u64,
+    /// Seconds a node has to stage a release once asked
+    pub stage_timeout_secs: u64,
+    /// Where the signed release feed lives. Empty is the vendor's feed, an
+    /// `http://` or `https://` URL is another feed, and a directory is a
+    /// feed an operator publishes into by hand with no remote at all. The
+    /// `releases` directory under the data directory is read ahead of a
+    /// remote feed either way
+    pub release_feed_url: String,
+    /// The public half of the key releases are signed with, as hex. Empty
+    /// uses the vendor's key built into this binary. Set it to verify
+    /// releases signed with a key of your own
+    pub release_signing_key: String,
+    /// The signature scheme a configured release key belongs to
+    pub release_signing_scheme: String,
+    /// Where upgrade notifications are posted, empty for none
+    pub notify_webhook_url: String,
+    /// A Slack incoming webhook that receives upgrade notifications, empty
+    /// for none
+    pub notify_slack_webhook_url: String,
+}
+
+impl Default for UpgradeSection {
+    fn default() -> Self {
+        let settings = zyron_common::format::UpgradeSettings::default();
+        Self {
+            auto_upgrade_enabled: settings.auto_upgrade_enabled,
+            channel: settings.channel.label().to_string(),
+            pinned_version: None,
+            window: String::new(),
+            paused: false,
+            user_object_rewrite_policy: settings.user_object_rewrite_policy.label().to_string(),
+            format_migration_budget_memory_fraction: settings
+                .format_migration_budget_memory_fraction,
+            format_migration_budget_time_secs: settings.format_migration_budget_time_secs,
+            format_migration_budget_disk_multiple: settings.format_migration_budget_disk_multiple,
+            rollback_on_health_fail: settings.rollback_on_health_fail,
+            federation_coordination_timeout_secs: settings.federation_coordination_timeout_secs,
+            pre_upgrade_backup_snapshot: settings.pre_upgrade_backup_snapshot,
+            deprecation_warning_rate_limit_per_hour: settings
+                .deprecation_warning_rate_limit_per_hour,
+            release_feed_poll_interval_secs: settings.release_feed_poll_interval_secs,
+            health_recovery_timeout_secs: settings.health_recovery_timeout_secs,
+            health_poll_interval_secs: 5,
+            health_latency_multiplier: 2.0,
+            health_throughput_floor: 0.5,
+            health_error_rate_ceiling: 0.01,
+            drain_timeout_secs: 300,
+            stage_timeout_secs: 600,
+            release_feed_url: String::new(),
+            release_signing_key: String::new(),
+            release_signing_scheme: "Ed25519".to_string(),
+            notify_webhook_url: String::new(),
+            notify_slack_webhook_url: String::new(),
+        }
+    }
+}
+
+impl UpgradeSection {
+    /// Refuses a section the board could not be seeded from
+    pub fn validate(&self) -> Result<()> {
+        use zyron_common::format::rewrite::UserObjectRewritePolicy;
+        use zyron_common::format::{BinaryVersion, MaintenanceSchedule, UpgradeChannel};
+
+        if UpgradeChannel::parse(&self.channel).is_none() {
+            return Err(ZyronError::ConfigError(format!(
+                "upgrade.channel \"{}\" is not a channel, use stable, beta, canary, or pinned",
+                self.channel
+            )));
+        }
+        if let Some(pinned) = &self.pinned_version {
+            if BinaryVersion::parse(pinned).is_none() {
+                return Err(ZyronError::ConfigError(format!(
+                    "upgrade.pinned_version \"{pinned}\" is not a major.minor.patch version"
+                )));
+            }
+        }
+        if self.channel.eq_ignore_ascii_case("pinned") && self.pinned_version.is_none() {
+            return Err(ZyronError::ConfigError(
+                "upgrade.channel is pinned but upgrade.pinned_version names no version".into(),
+            ));
+        }
+        MaintenanceSchedule::parse(&self.window)
+            .map_err(|e| ZyronError::ConfigError(format!("upgrade.window, {e}")))?;
+        if UserObjectRewritePolicy::parse(&self.user_object_rewrite_policy).is_none() {
+            return Err(ZyronError::ConfigError(format!(
+                "upgrade.user_object_rewrite_policy \"{}\" is not a policy, use auto_safe, \
+                 notify_all, or manual_only",
+                self.user_object_rewrite_policy
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.format_migration_budget_memory_fraction) {
+            return Err(ZyronError::ConfigError(
+                "upgrade.format_migration_budget_memory_fraction must be between 0 and 1".into(),
+            ));
+        }
+        if self.format_migration_budget_disk_multiple < 1.0 {
+            return Err(ZyronError::ConfigError(
+                "upgrade.format_migration_budget_disk_multiple must be at least 1".into(),
+            ));
+        }
+        if self.health_latency_multiplier < 1.0 {
+            return Err(ZyronError::ConfigError(
+                "upgrade.health_latency_multiplier must be at least 1".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.health_throughput_floor) {
+            return Err(ZyronError::ConfigError(
+                "upgrade.health_throughput_floor must be between 0 and 1".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.health_error_rate_ceiling) {
+            return Err(ZyronError::ConfigError(
+                "upgrade.health_error_rate_ceiling must be between 0 and 1".into(),
+            ));
+        }
+        if self.health_poll_interval_secs == 0 {
+            return Err(ZyronError::ConfigError(
+                "upgrade.health_poll_interval_secs must be at least 1".into(),
+            ));
+        }
+        if !self.release_signing_key.is_empty() {
+            self.release_key_material()?;
+        }
+        Ok(())
+    }
+
+    /// The release signing key as verifying material: the configured key
+    /// when one is set, otherwise the vendor's key built into this binary
+    pub fn release_key_material(&self) -> Result<zyron_auth::signature::VerifyingMaterial> {
+        use zyron_auth::signature::VerifyingMaterial;
+
+        if self.release_signing_key.trim().is_empty() {
+            return crate::upgrade::release_key::built_in();
+        }
+        let bytes =
+            crate::upgrade::feed::decode_hex(self.release_signing_key.trim()).ok_or_else(|| {
+                ZyronError::ConfigError(
+                    "upgrade.release_signing_key must be the verifying key as hex".into(),
+                )
+            })?;
+        let scheme = self.release_signing_scheme.trim();
+        let material = match scheme.to_ascii_uppercase().as_str() {
+            "ED25519" => {
+                let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    ZyronError::ConfigError(
+                        "upgrade.release_signing_key must be the 32 byte Ed25519 verifying \
+                         key as 64 hex characters"
+                            .into(),
+                    )
+                })?;
+                VerifyingMaterial::Ed25519(key)
+            }
+            "ES256" => VerifyingMaterial::Es256(bytes),
+            "RS256" => VerifyingMaterial::Rs256(bytes),
+            other => {
+                return Err(ZyronError::ConfigError(format!(
+                    "upgrade.release_signing_scheme \"{other}\" is not a scheme a release key \
+                     belongs to, use Ed25519, ES256, or RS256"
+                )));
+            }
+        };
+        Ok(material)
+    }
+
+    /// The board settings this section describes
+    pub fn to_settings(&self, data_dir: &Path) -> zyron_common::format::UpgradeSettings {
+        use zyron_common::format::rewrite::UserObjectRewritePolicy;
+        use zyron_common::format::{MaintenanceSchedule, UpgradeChannel};
+
+        let channel = match UpgradeChannel::parse(&self.channel) {
+            Some(UpgradeChannel::Pinned(_)) => {
+                UpgradeChannel::Pinned(self.pinned_version.clone().unwrap_or_default())
+            }
+            Some(channel) => channel,
+            None => UpgradeChannel::Stable,
+        };
+        zyron_common::format::UpgradeSettings {
+            auto_upgrade_enabled: self.auto_upgrade_enabled,
+            channel,
+            pinned_version: self.pinned_version.clone(),
+            window: MaintenanceSchedule::parse(&self.window).unwrap_or_default(),
+            paused: self.paused,
+            user_object_rewrite_policy: UserObjectRewritePolicy::parse(
+                &self.user_object_rewrite_policy,
+            )
+            .unwrap_or_default(),
+            format_migration_budget_memory_fraction: self.format_migration_budget_memory_fraction,
+            format_migration_budget_time_secs: self.format_migration_budget_time_secs,
+            format_migration_budget_disk_multiple: self.format_migration_budget_disk_multiple,
+            rollback_on_health_fail: self.rollback_on_health_fail,
+            federation_coordination_timeout_secs: self.federation_coordination_timeout_secs,
+            pre_upgrade_backup_snapshot: self.pre_upgrade_backup_snapshot,
+            deprecation_warning_rate_limit_per_hour: self.deprecation_warning_rate_limit_per_hour,
+            release_feed_poll_interval_secs: self.release_feed_poll_interval_secs,
+            health_recovery_timeout_secs: self.health_recovery_timeout_secs,
+            release_feed_url: self.release_feed_url(data_dir),
+        }
+    }
+
+    /// The scheme the effective release key belongs to
+    pub fn release_signing_scheme_name(&self) -> String {
+        if self.release_signing_key.trim().is_empty() {
+            crate::upgrade::release_key::BUILT_IN_SCHEME.to_string()
+        } else {
+            self.release_signing_scheme.trim().to_string()
+        }
+    }
+
+    /// The directory an operator delivers releases into with `zyron-ctl
+    /// release stage`. It is read ahead of any remote feed, so a release
+    /// placed by hand is the one the node sees. The setting names it when
+    /// it holds a directory, otherwise it is `releases` under the data
+    /// directory
+    pub fn local_feed_dir(&self, data_dir: &Path) -> PathBuf {
+        let url = self.release_feed_url.trim();
+        if url.is_empty() || self.feed_is_remote() {
+            data_dir.join("releases")
+        } else {
+            PathBuf::from(url)
+        }
+    }
+
+    /// The remote feed, when there is one: the vendor's feed by default,
+    /// the configured URL when the setting holds one, and none when the
+    /// setting names a directory, which is what an air-gapped node sets
+    pub fn remote_feed_url(&self) -> Option<String> {
+        let url = self.release_feed_url.trim();
+        if url.is_empty() {
+            Some(zyron_common::format::UpgradeSettings::default().release_feed_url)
+        } else if self.feed_is_remote() {
+            Some(url.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// The feed the settings report, the remote one when there is one and
+    /// the local directory otherwise
+    pub fn release_feed_url(&self, data_dir: &Path) -> String {
+        self.remote_feed_url()
+            .unwrap_or_else(|| self.local_feed_dir(data_dir).display().to_string())
+    }
+
+    /// Whether the setting holds a URL rather than a directory
+    pub fn feed_is_remote(&self) -> bool {
+        let url = self.release_feed_url.trim().to_ascii_lowercase();
+        url.starts_with("http://") || url.starts_with("https://")
+    }
 }
 
 /// External tool paths for media operations. An unset path makes the
@@ -62,6 +402,7 @@ impl Default for ZyronConfig {
             mesh: zyron_pressure::provisioner::MeshSection::default(),
             cluster: ClusterSection::default(),
             media: MediaSection::default(),
+            upgrade: UpgradeSection::default(),
         }
     }
 }
@@ -568,6 +909,81 @@ impl ZyronConfig {
                 "hot_set_queries" => self.mesh.hot_set_queries = parsed(section, key, value)?,
                 _ => return unknown_key(section, key),
             },
+            "upgrade" => match key {
+                "auto_upgrade_enabled" => {
+                    self.upgrade.auto_upgrade_enabled = parsed(section, key, value)?;
+                }
+                "channel" => self.upgrade.channel = value.into(),
+                "pinned_version" => {
+                    self.upgrade.pinned_version = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value.into())
+                    };
+                }
+                "window" => self.upgrade.window = value.into(),
+                "paused" => self.upgrade.paused = parsed(section, key, value)?,
+                "user_object_rewrite_policy" => {
+                    self.upgrade.user_object_rewrite_policy = value.into();
+                }
+                "format_migration_budget_memory_fraction" => {
+                    self.upgrade.format_migration_budget_memory_fraction =
+                        parsed(section, key, value)?;
+                }
+                "format_migration_budget_time_secs" => {
+                    self.upgrade.format_migration_budget_time_secs = parsed(section, key, value)?;
+                }
+                "format_migration_budget_disk_multiple" => {
+                    self.upgrade.format_migration_budget_disk_multiple =
+                        parsed(section, key, value)?;
+                }
+                "rollback_on_health_fail" => {
+                    self.upgrade.rollback_on_health_fail = parsed(section, key, value)?;
+                }
+                "federation_coordination_timeout_secs" => {
+                    self.upgrade.federation_coordination_timeout_secs =
+                        parsed(section, key, value)?;
+                }
+                "pre_upgrade_backup_snapshot" => {
+                    self.upgrade.pre_upgrade_backup_snapshot = parsed(section, key, value)?;
+                }
+                "deprecation_warning_rate_limit_per_hour" => {
+                    self.upgrade.deprecation_warning_rate_limit_per_hour =
+                        parsed(section, key, value)?;
+                }
+                "release_feed_poll_interval_secs" => {
+                    self.upgrade.release_feed_poll_interval_secs = parsed(section, key, value)?;
+                }
+                "health_recovery_timeout_secs" => {
+                    self.upgrade.health_recovery_timeout_secs = parsed(section, key, value)?;
+                }
+                "health_poll_interval_secs" => {
+                    self.upgrade.health_poll_interval_secs = parsed(section, key, value)?;
+                }
+                "health_latency_multiplier" => {
+                    self.upgrade.health_latency_multiplier = parsed(section, key, value)?;
+                }
+                "health_throughput_floor" => {
+                    self.upgrade.health_throughput_floor = parsed(section, key, value)?;
+                }
+                "health_error_rate_ceiling" => {
+                    self.upgrade.health_error_rate_ceiling = parsed(section, key, value)?;
+                }
+                "drain_timeout_secs" => {
+                    self.upgrade.drain_timeout_secs = parsed(section, key, value)?;
+                }
+                "stage_timeout_secs" => {
+                    self.upgrade.stage_timeout_secs = parsed(section, key, value)?;
+                }
+                "release_feed_url" => self.upgrade.release_feed_url = value.into(),
+                "release_signing_key" => self.upgrade.release_signing_key = value.into(),
+                "release_signing_scheme" => self.upgrade.release_signing_scheme = value.into(),
+                "notify_webhook_url" => self.upgrade.notify_webhook_url = value.into(),
+                "notify_slack_webhook_url" => {
+                    self.upgrade.notify_slack_webhook_url = value.into();
+                }
+                _ => return unknown_key(section, key),
+            },
             _ => {
                 return Err(ZyronError::Internal(format!(
                     "unknown config section '{}'",
@@ -580,12 +996,27 @@ impl ZyronConfig {
 
     /// Writes a single key-value override to zyron.auto.conf.
     /// The key should be in "section.field" format (e.g. "server.port").
+    ///
+    /// The whole file is read, changed, and written back under one
+    /// process-wide lock, because `ALTER SYSTEM SET`, a replicated setting
+    /// being applied, and the upgrade service's pause each call this from
+    /// their own thread and two at once would lose one key. The write goes
+    /// through a sibling file and a rename, so a crash at any point leaves
+    /// the previous file or the new one and never a partial one the next
+    /// boot refuses
     pub fn write_auto_conf(data_dir: &Path, key: &str, value: &str) -> Result<()> {
+        let _writing = AUTO_CONF_WRITE.lock();
         let auto_path = data_dir.join("zyron.auto.conf");
         let mut table: toml::Table = if auto_path.exists() {
-            let contents = std::fs::read_to_string(&auto_path)
-                .map_err(|e| ZyronError::Internal(format!("Failed to read auto.conf: {}", e)))?;
-            toml::from_str(&contents).unwrap_or_default()
+            let contents = std::fs::read_to_string(&auto_path).map_err(|e| {
+                ZyronError::Internal(format!("{} is not readable, {e}", auto_path.display()))
+            })?;
+            toml::from_str(&contents).map_err(|e| {
+                ZyronError::Internal(format!(
+                    "{} is not readable TOML, {e}. Fix or remove the file before setting {key}",
+                    auto_path.display()
+                ))
+            })?
         } else {
             toml::Table::new()
         };
@@ -621,9 +1052,7 @@ impl ZyronConfig {
         let serialized = toml::to_string_pretty(&table)
             .map_err(|e| ZyronError::Internal(format!("Failed to serialize auto.conf: {}", e)))?;
         let stamped = Self::stamp_format(&serialized);
-        std::fs::write(&auto_path, stamped)
-            .map_err(|e| ZyronError::Internal(format!("Failed to write auto.conf: {}", e)))?;
-        Ok(())
+        write_replacing(&auto_path, stamped.as_bytes())
     }
 
     /// Applies environment variable overrides to the config.
@@ -734,6 +1163,7 @@ impl ZyronConfig {
             return Err(ZyronError::Internal(REMOVED_MAX_CONNECTIONS.into()));
         }
         self.mesh.validate()?;
+        self.upgrade.validate()?;
         if !matches!(
             self.auth.password_encryption.as_str(),
             "balloon-sha-256" | "scram-sha-256" | "md5"
@@ -990,6 +1420,77 @@ impl ZyronConfig {
             "mesh.provision_latency_secs" => Some(self.mesh.provision_latency_secs.to_string()),
             "mesh.hot_set_pages" => Some(self.mesh.hot_set_pages.to_string()),
             "mesh.hot_set_queries" => Some(self.mesh.hot_set_queries.to_string()),
+            "upgrade.auto_upgrade_enabled" => Some(self.upgrade.auto_upgrade_enabled.to_string()),
+            "upgrade.channel" => Some(self.upgrade.channel.clone()),
+            "upgrade.pinned_version" => {
+                Some(self.upgrade.pinned_version.clone().unwrap_or_default())
+            }
+            "upgrade.window" => Some(self.upgrade.window.clone()),
+            "upgrade.paused" => Some(self.upgrade.paused.to_string()),
+            "upgrade.user_object_rewrite_policy" => {
+                Some(self.upgrade.user_object_rewrite_policy.clone())
+            }
+            "upgrade.format_migration_budget_memory_fraction" => Some(
+                self.upgrade
+                    .format_migration_budget_memory_fraction
+                    .to_string(),
+            ),
+            "upgrade.format_migration_budget_time_secs" => {
+                Some(self.upgrade.format_migration_budget_time_secs.to_string())
+            }
+            "upgrade.format_migration_budget_disk_multiple" => Some(
+                self.upgrade
+                    .format_migration_budget_disk_multiple
+                    .to_string(),
+            ),
+            "upgrade.rollback_on_health_fail" => {
+                Some(self.upgrade.rollback_on_health_fail.to_string())
+            }
+            "upgrade.federation_coordination_timeout_secs" => Some(
+                self.upgrade
+                    .federation_coordination_timeout_secs
+                    .to_string(),
+            ),
+            "upgrade.pre_upgrade_backup_snapshot" => {
+                Some(self.upgrade.pre_upgrade_backup_snapshot.to_string())
+            }
+            "upgrade.deprecation_warning_rate_limit_per_hour" => Some(
+                self.upgrade
+                    .deprecation_warning_rate_limit_per_hour
+                    .to_string(),
+            ),
+            "upgrade.release_feed_poll_interval_secs" => {
+                Some(self.upgrade.release_feed_poll_interval_secs.to_string())
+            }
+            "upgrade.health_recovery_timeout_secs" => {
+                Some(self.upgrade.health_recovery_timeout_secs.to_string())
+            }
+            "upgrade.health_poll_interval_secs" => {
+                Some(self.upgrade.health_poll_interval_secs.to_string())
+            }
+            "upgrade.health_latency_multiplier" => {
+                Some(self.upgrade.health_latency_multiplier.to_string())
+            }
+            "upgrade.health_throughput_floor" => {
+                Some(self.upgrade.health_throughput_floor.to_string())
+            }
+            "upgrade.health_error_rate_ceiling" => {
+                Some(self.upgrade.health_error_rate_ceiling.to_string())
+            }
+            "upgrade.drain_timeout_secs" => Some(self.upgrade.drain_timeout_secs.to_string()),
+            "upgrade.stage_timeout_secs" => Some(self.upgrade.stage_timeout_secs.to_string()),
+            "upgrade.release_feed_url" => {
+                Some(self.upgrade.release_feed_url(&self.storage.data_dir))
+            }
+            // The key is a secret's public half, but a config value that
+            // prints in full is one an operator can compare against the
+            // release page, which is the point of publishing it
+            "upgrade.release_signing_key" => Some(self.upgrade.release_signing_key.clone()),
+            "upgrade.release_signing_scheme" => Some(self.upgrade.release_signing_scheme.clone()),
+            "upgrade.notify_webhook_url" => Some(self.upgrade.notify_webhook_url.clone()),
+            "upgrade.notify_slack_webhook_url" => {
+                Some(self.upgrade.notify_slack_webhook_url.clone())
+            }
             // Also support shorthand aliases
             "server_version" => Some(env!("CARGO_PKG_VERSION").to_string()),
             "port" => Some(self.server.port.to_string()),
@@ -1217,6 +1718,153 @@ impl ZyronConfig {
                 "mesh.hot_set_queries".into(),
                 self.mesh.hot_set_queries.to_string(),
                 "Query shapes a draining node hands to its survivors".into(),
+            ),
+            (
+                "upgrade.auto_upgrade_enabled".into(),
+                self.upgrade.auto_upgrade_enabled.to_string(),
+                "Whether this cluster installs releases from its channel on its own".into(),
+            ),
+            (
+                "upgrade.channel".into(),
+                self.upgrade.channel.clone(),
+                "Release channel: stable, beta, canary, or pinned".into(),
+            ),
+            (
+                "upgrade.pinned_version".into(),
+                self.upgrade.pinned_version.clone().unwrap_or_default(),
+                "The version a pinned channel holds at".into(),
+            ),
+            (
+                "upgrade.window".into(),
+                self.upgrade.window.clone(),
+                "Maintenance windows as HH:MM-HH:MM UTC, comma separated, empty for any time"
+                    .into(),
+            ),
+            (
+                "upgrade.paused".into(),
+                self.upgrade.paused.to_string(),
+                "Whether upgrades are halted, set by an operator or by a failed health check"
+                    .into(),
+            ),
+            (
+                "upgrade.user_object_rewrite_policy".into(),
+                self.upgrade.user_object_rewrite_policy.clone(),
+                "What happens to user objects an upgrade rewrites: auto_safe, notify_all, or \
+                 manual_only"
+                    .into(),
+            ),
+            (
+                "upgrade.format_migration_budget_memory_fraction".into(),
+                self.upgrade
+                    .format_migration_budget_memory_fraction
+                    .to_string(),
+                "Fraction of node memory an eager format sweep may use".into(),
+            ),
+            (
+                "upgrade.format_migration_budget_time_secs".into(),
+                self.upgrade.format_migration_budget_time_secs.to_string(),
+                "Seconds one format's sweep may run for".into(),
+            ),
+            (
+                "upgrade.format_migration_budget_disk_multiple".into(),
+                self.upgrade
+                    .format_migration_budget_disk_multiple
+                    .to_string(),
+                "Multiple of a file's size a sweep may occupy on disk while it works".into(),
+            ),
+            (
+                "upgrade.rollback_on_health_fail".into(),
+                self.upgrade.rollback_on_health_fail.to_string(),
+                "Whether a node that fails its health check is put back on the previous binary"
+                    .into(),
+            ),
+            (
+                "upgrade.federation_coordination_timeout_secs".into(),
+                self.upgrade
+                    .federation_coordination_timeout_secs
+                    .to_string(),
+                "Seconds a federated peer has to answer the compatibility gate".into(),
+            ),
+            (
+                "upgrade.pre_upgrade_backup_snapshot".into(),
+                self.upgrade.pre_upgrade_backup_snapshot.to_string(),
+                "Whether a physical backup is taken before a major version upgrade".into(),
+            ),
+            (
+                "upgrade.deprecation_warning_rate_limit_per_hour".into(),
+                self.upgrade
+                    .deprecation_warning_rate_limit_per_hour
+                    .to_string(),
+                "Deprecation warnings emitted per item per hour".into(),
+            ),
+            (
+                "upgrade.release_feed_poll_interval_secs".into(),
+                self.upgrade.release_feed_poll_interval_secs.to_string(),
+                "Seconds between polls of the release feed".into(),
+            ),
+            (
+                "upgrade.health_recovery_timeout_secs".into(),
+                self.upgrade.health_recovery_timeout_secs.to_string(),
+                "Seconds a restarted node has to reach the health baseline".into(),
+            ),
+            (
+                "upgrade.health_poll_interval_secs".into(),
+                self.upgrade.health_poll_interval_secs.to_string(),
+                "Seconds between health observations while a node recovers".into(),
+            ),
+            (
+                "upgrade.health_latency_multiplier".into(),
+                self.upgrade.health_latency_multiplier.to_string(),
+                "Multiple of the baseline p99 still counted as healthy".into(),
+            ),
+            (
+                "upgrade.health_throughput_floor".into(),
+                self.upgrade.health_throughput_floor.to_string(),
+                "Fraction of the baseline throughput still counted as healthy".into(),
+            ),
+            (
+                "upgrade.health_error_rate_ceiling".into(),
+                self.upgrade.health_error_rate_ceiling.to_string(),
+                "Error rate above which a restarted node is unhealthy".into(),
+            ),
+            (
+                "upgrade.drain_timeout_secs".into(),
+                self.upgrade.drain_timeout_secs.to_string(),
+                "Seconds a node has to finish in-flight work before it restarts".into(),
+            ),
+            (
+                "upgrade.stage_timeout_secs".into(),
+                self.upgrade.stage_timeout_secs.to_string(),
+                "Seconds a node has to fetch and verify a release once asked".into(),
+            ),
+            (
+                "upgrade.release_feed_url".into(),
+                self.upgrade.release_feed_url(&self.storage.data_dir),
+                "The signed release feed: the vendor's by default, another URL, or a directory \
+                 releases are delivered into by hand"
+                    .into(),
+            ),
+            (
+                "upgrade.release_signing_key".into(),
+                self.upgrade.release_signing_key.clone(),
+                "The public half of the key releases are checked against as hex, empty uses the \
+                 key built into this binary"
+                    .into(),
+            ),
+            (
+                "upgrade.release_signing_scheme".into(),
+                self.upgrade.release_signing_scheme.clone(),
+                "The signature scheme a configured release signing key belongs to".into(),
+            ),
+            (
+                "upgrade.notify_webhook_url".into(),
+                self.upgrade.notify_webhook_url.clone(),
+                "Webhook that receives upgrade notifications, empty for none".into(),
+            ),
+            (
+                "upgrade.notify_slack_webhook_url".into(),
+                self.upgrade.notify_slack_webhook_url.clone(),
+                "Slack incoming webhook that receives upgrade notifications, empty for none".into(),
             ),
         ]
     }
@@ -2167,6 +2815,60 @@ sync_mode = "fdatasync"
 
         // Clean up
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The rewrite goes through a sibling and a rename, so nothing but the
+    // file itself is left behind, and a file that is not TOML is refused
+    // with its name rather than silently replaced
+    #[test]
+    fn test_auto_conf_rewrite_leaves_only_the_file_and_refuses_a_corrupt_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        ZyronConfig::write_auto_conf(dir, "server.port", "9999").unwrap();
+        ZyronConfig::write_auto_conf(dir, "vacuum.enabled", "false").unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["zyron.auto.conf".to_string()], "{names:?}");
+
+        std::fs::write(dir.join("zyron.auto.conf"), "[server\nport = ").unwrap();
+        let err = ZyronConfig::write_auto_conf(dir, "server.port", "1")
+            .expect_err("a corrupt file is not overwritten")
+            .to_string();
+        assert!(err.contains("zyron.auto.conf"), "{err}");
+        assert!(err.contains("server.port"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("zyron.auto.conf")).unwrap(),
+            "[server\nport = ",
+            "the corrupt file is left for the operator"
+        );
+    }
+
+    // Every writer rewrites the whole file, so writers from several threads
+    // at once keep every key only because the rewrite is serialized
+    #[test]
+    fn test_auto_conf_concurrent_writers_lose_no_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let keys: Vec<String> = (0..16).map(|i| format!("section_{i}.field")).collect();
+        std::thread::scope(|scope| {
+            for key in &keys {
+                scope.spawn(move || {
+                    ZyronConfig::write_auto_conf(dir, key, "1").unwrap();
+                });
+            }
+        });
+        let contents = std::fs::read_to_string(dir.join("zyron.auto.conf")).unwrap();
+        let table: toml::Table = toml::from_str(&contents).unwrap();
+        for key in &keys {
+            let (section, field) = key.split_once('.').unwrap();
+            let value = table
+                .get(section)
+                .and_then(|s| s.get(field))
+                .and_then(|v| v.as_integer());
+            assert_eq!(value, Some(1), "{key} was lost, file holds {contents}");
+        }
     }
 
     #[test]

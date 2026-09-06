@@ -18,6 +18,147 @@ use zyron_parser::ast::{BinaryOperator, LiteralValue, UnaryOperator};
 
 use crate::binder::{BoundExpr, ColumnRef};
 
+/// The lake schema a table's catalog columns describe.
+///
+/// A lake table's schema is written from its catalog columns one for one,
+/// so this reproduces what a manifest holds without opening the log. It is
+/// what lets a plan reason about the answer a scan will reach before
+/// anything is read
+pub fn lake_schema_of(te: &zyron_catalog::TableEntry) -> Option<zyron_lake::LakeSchema> {
+    let columns: Vec<zyron_lake::LakeColumn> = te
+        .columns
+        .iter()
+        .map(|c| zyron_lake::LakeColumn {
+            id: c.id.0 as u32,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            fractional_digits: c.fractional_digits,
+            tz_offset_secs: c.tz_offset_secs,
+            max_length: c.max_length.map(|n| n as u32),
+            default_expr: c.default_expr.clone(),
+        })
+        .collect();
+    zyron_lake::LakeSchema::new(1, columns).ok()
+}
+
+/// Whether a lake scan of this table answers the predicate on stored bytes
+/// alone, leaving no row for a filter over decoded values to remove.
+///
+/// A predicate that lowers exactly is applied to the keep mask before a
+/// projected column is decoded, so the columns it reads are the scan's own
+/// business. A caller that only needs those columns to evaluate the
+/// predicate does not need them at all, and a `COUNT(*)` over a filtered
+/// lake table then decodes nothing.
+///
+/// The scan re-derives this against the schema the manifest holds and
+/// falls back to reading those columns itself when the two disagree, so a
+/// wrong answer here costs the saving and never the result
+pub fn scan_answers_predicate(expr: &BoundExpr, te: &zyron_catalog::TableEntry) -> bool {
+    // A foreign table has no lake files here at all, and its access path is
+    // chosen ahead of the lake gate
+    if !te.lake.is_lake() || te.foreign.is_foreign() {
+        return false;
+    }
+    let Some(lowered) = lower_predicate(expr, &te.columns, &te.cluster.derived) else {
+        return false;
+    };
+    let Some(schema) = lake_schema_of(te) else {
+        return false;
+    };
+    zyron_lake::StoredFilter::lower(&lowered, &schema).is_some_and(|f| f.is_exact())
+}
+
+/// Lowers what it can of a scan predicate, one top level conjunct at a
+/// time.
+///
+/// A scan's lowering only has to be implied by the predicate, never
+/// equivalent to it: it drops files that provably hold no matching row and
+/// prunes rows on stored bytes, and the row filter still decides what is
+/// returned. Refusing the whole predicate because one conjunct has no lake
+/// form throws away the pruning every other conjunct would have bought,
+/// and an equality on a clustered column beside a LIKE is exactly that
+/// shape.
+///
+/// A DML lowering is a different question and stays all or nothing:
+/// [`lower_predicate`] records what a delete removes rather than what a
+/// scan may skip, and a weaker predicate there would remove the wrong rows.
+///
+/// Only top level conjuncts split. An arm of a disjunction that does not
+/// lower makes the whole disjunction admit everything, which
+/// [`lower_predicate`] already reports by refusing it
+pub fn lower_scan_predicate(
+    expr: &BoundExpr,
+    columns: &[ColumnEntry],
+    derived: &[DerivedColumnEntry],
+) -> Option<LakePredicate> {
+    let mut kept: Vec<LakePredicate> = Vec::new();
+    let mut conjuncts = Vec::new();
+    split_conjuncts_into(expr, &mut conjuncts);
+    for conjunct in conjuncts {
+        if let Some(lowered) = lower_predicate(conjunct, columns, derived) {
+            kept.push(lowered);
+        }
+    }
+    match kept.len() {
+        0 => None,
+        1 => kept.pop(),
+        _ => Some(LakePredicate::And(kept)),
+    }
+}
+
+/// The top level conjuncts a lake scan answers on stored bytes, and the
+/// ones left over for a row filter.
+///
+/// A conjunct the scan answers exactly is applied to the keep mask before
+/// any projected column is decoded, so evaluating it again over decoded
+/// values can only agree with what is already decided, and the columns it
+/// reads are the scan's own business. What is left over decides both what
+/// the row filter still has to run and which columns the projection has to
+/// carry.
+///
+/// One inexact conjunct used to make the whole predicate unanswered, so an
+/// equality on a clustered column beside a float range paid for both
+/// columns and re-ran both terms.
+///
+/// The projection rule and the scan build call this, so the columns one
+/// withholds are the columns the other leaves unevaluated. A disagreement
+/// is still safe, because the scan decodes the predicate's own columns when
+/// its projection does not carry them, but it costs the saving
+pub fn split_scan_answered(
+    expr: &BoundExpr,
+    te: &zyron_catalog::TableEntry,
+) -> (Vec<BoundExpr>, Vec<BoundExpr>) {
+    let mut conjuncts = Vec::new();
+    split_conjuncts_into(expr, &mut conjuncts);
+    let mut answered = Vec::new();
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        if scan_answers_predicate(conjunct, te) {
+            answered.push(conjunct.clone());
+        } else {
+            residual.push(conjunct.clone());
+        }
+    }
+    (answered, residual)
+}
+
+fn split_conjuncts_into<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match expr {
+        BoundExpr::Nested(inner) => split_conjuncts_into(inner, out),
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
+            split_conjuncts_into(left, out);
+            split_conjuncts_into(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
 /// Lowers a bound predicate over one table. Returns None when the
 /// expression has no exact lake equivalent
 pub fn lower_predicate(
@@ -425,6 +566,109 @@ mod tests {
             right: Box::new(right),
             type_id: TypeId::Boolean,
         }
+    }
+
+    /// A lake table over `cols`, which is all `split_scan_answered` reads
+    fn lake_table(cols: Vec<ColumnEntry>) -> zyron_catalog::TableEntry {
+        zyron_catalog::TableEntry {
+            id: TableId(1),
+            schema_id: zyron_catalog::SchemaId(1),
+            name: "t".to_string(),
+            heap_file_id: 200,
+            fsm_file_id: 201,
+            columns: cols,
+            constraints: vec![],
+            created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: zyron_catalog::schema::LakeConfig::lake(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+        }
+    }
+
+    /// One conjunct the scan cannot answer used to make the whole predicate
+    /// its own work, so an equality the scan settles on stored bytes still
+    /// paid for its column and ran again over the decoded values.
+    ///
+    /// The float range is the case that survives every widening: a
+    /// `Predicate::Range` is defined over unsigned byte order and ALP
+    /// answers one in float order, so nothing is pushed and the term only
+    /// prunes zones
+    #[test]
+    fn a_scan_keeps_the_conjuncts_it_answers_and_hands_back_the_rest() {
+        let te = lake_table(vec![
+            column(0, "id", TypeId::Int64),
+            column(1, "price", TypeId::Float64),
+            column(2, "name", TypeId::Text),
+        ]);
+        let exact = cmp(col_ref(0, TypeId::Int64), BinaryOperator::Eq, int_lit(7));
+        let float_range = cmp(
+            col_ref(1, TypeId::Float64),
+            BinaryOperator::Gt,
+            BoundExpr::Literal {
+                value: LiteralValue::Float(9.99),
+                type_id: TypeId::Float64,
+            },
+        );
+
+        let (answered, residual) = split_scan_answered(
+            &cmp(exact.clone(), BinaryOperator::And, float_range.clone()),
+            &te,
+        );
+        assert_eq!(
+            answered.len(),
+            1,
+            "the equality is answered on stored bytes"
+        );
+        assert_eq!(
+            residual.len(),
+            1,
+            "the float range is left to the row filter"
+        );
+
+        // Both answered leaves nothing for a row filter to do
+        let second = cmp(col_ref(0, TypeId::Int64), BinaryOperator::Lt, int_lit(90));
+        let (answered, residual) =
+            split_scan_answered(&cmp(exact.clone(), BinaryOperator::And, second), &te);
+        assert_eq!(answered.len(), 2);
+        assert!(residual.is_empty());
+
+        // A term with no lake form at all is residual, and does not stop
+        // the equality beside it from being answered. A comparison between
+        // two columns is that shape: the lowering is defined over a column
+        // against a constant and there is no constant here
+        let unlowerable = cmp(
+            col_ref(0, TypeId::Int64),
+            BinaryOperator::Gt,
+            col_ref(1, TypeId::Float64),
+        );
+        let (answered, residual) =
+            split_scan_answered(&cmp(exact.clone(), BinaryOperator::And, unlowerable), &te);
+        assert_eq!(answered.len(), 1, "the equality is still answered");
+        assert_eq!(residual.len(), 1, "a term with no lake form is residual");
+
+        // A heap table answers none of it
+        let heap = lake_table_as_heap(&te);
+        let (answered, residual) =
+            split_scan_answered(&cmp(exact, BinaryOperator::And, float_range), &heap);
+        assert!(answered.is_empty());
+        assert_eq!(residual.len(), 2);
+    }
+
+    fn lake_table_as_heap(te: &zyron_catalog::TableEntry) -> zyron_catalog::TableEntry {
+        let mut heap = te.clone();
+        heap.lake = Default::default();
+        heap
     }
 
     struct OneColumn {

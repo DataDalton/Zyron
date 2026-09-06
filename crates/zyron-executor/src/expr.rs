@@ -1057,6 +1057,136 @@ fn evaluate_is_null(
 // IN list
 // ---------------------------------------------------------------------------
 
+/// List length at which membership is answered from a set rather than one
+/// comparison pass per item.
+///
+/// Below this the passes win: a compare kernel runs over a whole batch at
+/// a time, so a handful of them costs less than hashing every probe value.
+/// Above it the passes are what the query spends its time on, and a list
+/// that long is machine written, either a subquery folded to a constant
+/// list or a generated statement
+const IN_LIST_HASH_THRESHOLD: usize = 16;
+
+/// The values of an IN list held for membership testing.
+///
+/// Integers are widened to 128 bits, which compares exactly across every
+/// signed and unsigned width the probe column can be, the same answer the
+/// per item path reaches by coercing both sides to a common type
+enum InSet {
+    Ints(std::collections::HashSet<i128>),
+    Strings(std::collections::HashSet<String>),
+}
+
+/// Whether a probe column's type is one the set path answers exactly.
+///
+/// Plain integers and text only. A decimal stores a scaled integer whose
+/// scale the per item path aligns, a temporal type carries a unit, and a
+/// float has values that are equal without being interchangeable, so all
+/// three keep the comparison passes that already handle them
+fn set_probeable(type_id: TypeId, fractional_digits: Option<u8>) -> bool {
+    fractional_digits.is_none()
+        && matches!(
+            type_id,
+            TypeId::Int8
+                | TypeId::Int16
+                | TypeId::Int32
+                | TypeId::Int64
+                | TypeId::UInt8
+                | TypeId::UInt16
+                | TypeId::UInt32
+                | TypeId::UInt64
+                | TypeId::Char
+                | TypeId::Varchar
+                | TypeId::Text
+        )
+}
+
+impl InSet {
+    /// Collects a list into a set, or None when it is not uniformly one
+    /// family the probe column can be tested against. A NULL item is
+    /// recorded separately because it makes a miss unknown rather than
+    /// false, and is not a member of anything
+    fn build(
+        list: &[BoundExpr],
+        probe: &Column,
+        params: &[ScalarValue],
+    ) -> Result<Option<(InSet, bool)>> {
+        if !set_probeable(probe.type_id, probe.fractional_digits) {
+            return Ok(None);
+        }
+        let wants_text = matches!(probe.data, ColumnData::Utf8(_));
+        let mut ints: std::collections::HashSet<i128> = std::collections::HashSet::new();
+        let mut strings: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut has_null = false;
+        for item in list {
+            if !is_scalar_expr(item) {
+                return Ok(None);
+            }
+            let value = evaluate_scalar_operand(item, params)?.get_scalar(0);
+            match value {
+                ScalarValue::Null => has_null = true,
+                ScalarValue::Utf8(s) if wants_text => {
+                    strings.insert(s);
+                }
+                other if !wants_text => match other.to_i128() {
+                    Some(v) => {
+                        ints.insert(v);
+                    }
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            }
+        }
+        let set = if wants_text {
+            InSet::Strings(strings)
+        } else {
+            InSet::Ints(ints)
+        };
+        Ok(Some((set, has_null)))
+    }
+
+    /// Tests every row against the set under SQL's three-valued IN.
+    ///
+    /// A NULL probe is unknown. A hit is true. A miss beside a NULL in the
+    /// list is unknown, because the value could have been the one that was
+    /// not known. Negation flips the two decided answers and leaves the
+    /// unknown alone, which is why NOT IN over a list holding NULL returns
+    /// no rows
+    fn probe(&self, col: &Column, has_null: bool, negated: bool) -> Column {
+        let n = col.len();
+        let mut out = Vec::with_capacity(n);
+        let mut nulls = NullBitmap::none(n);
+        let text = match &col.data {
+            ColumnData::Utf8(v) => Some(v),
+            _ => None,
+        };
+        for row in 0..n {
+            if col.is_null(row) {
+                nulls.set_null(row);
+                out.push(false);
+                continue;
+            }
+            let found = match (self, text) {
+                (InSet::Strings(set), Some(v)) => set.contains(v[row].as_str()),
+                (InSet::Ints(set), None) => col
+                    .get_scalar(row)
+                    .to_i128()
+                    .is_some_and(|v| set.contains(&v)),
+                _ => false,
+            };
+            if found {
+                out.push(!negated);
+            } else if has_null {
+                nulls.set_null(row);
+                out.push(false);
+            } else {
+                out.push(negated);
+            }
+        }
+        Column::with_nulls(ColumnData::Boolean(out), nulls, TypeId::Boolean)
+    }
+}
+
 fn evaluate_in_list(
     expr: &BoundExpr,
     list: &[BoundExpr],
@@ -1074,6 +1204,14 @@ fn evaluate_in_list(
             ColumnData::Boolean(vec![val; num_rows]),
             TypeId::Boolean,
         ));
+    }
+
+    // A long list is answered by membership. The per item passes below stay
+    // for everything else, and remain the faster answer for a short one
+    if list.len() >= IN_LIST_HASH_THRESHOLD
+        && let Some((set, has_null)) = InSet::build(list, expr_col.as_ref(), params)?
+    {
+        return Ok(set.probe(expr_col.as_ref(), has_null, negated));
     }
 
     // Each list item pairs with the probe column independently. A literal or

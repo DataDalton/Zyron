@@ -62,9 +62,13 @@ pub fn manifest_stats(
             } else {
                 nulls as f64 / rows_with_stats as f64
             },
-            // The manifest carries exact bounds and null counts but no
-            // distinct count, so nothing is claimed here rather than a
-            // guess the selectivity estimator would treat as measured
+            // The manifest carries a distinct estimate per file, but their
+            // sum counts a value appearing in two files twice and their
+            // maximum counts it once too few. The selectivity estimator
+            // reads this field as measured, so neither bound is claimed
+            // here. A caller that wants one of them reads the manifest and
+            // says which direction it needs, as the parallel aggregate's
+            // split does
             distinct_count: 0,
             avg_width: column
                 .type_id
@@ -90,6 +94,7 @@ pub fn manifest_stats(
 /// an earlier version left. Memory only, the manifest on disk is the durable
 /// copy, so a restart reloads them from the recovered log.
 pub fn publish_manifest_stats(catalog: &Catalog, table: &TableEntry, manifest: &ManifestFile) {
+    let _publish = zyron_common::profile::scope(zyron_common::profile::Phase::LakeStatsPublish);
     let (table_stats, column_stats) = manifest_stats(table, manifest);
     catalog.put_stats(table.id, table_stats, column_stats);
 }

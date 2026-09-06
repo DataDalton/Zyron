@@ -13,9 +13,12 @@
 use std::sync::Arc;
 
 use zyron_common::format::{
-    HealthBaseline, HealthThreshold, HealthVerdict, NodeUpgradeState, UpgradeBoard, UpgradePhase,
+    FormatKind, FormatVersion, HealthBaseline, HealthThreshold, HealthVerdict, NodeUpgradeState,
+    ReleaseEntry, UpgradeBoard, UpgradePhase,
 };
 use zyron_common::{Result, ZyronError};
+
+use super::notification::{Notifier, UpgradeEvent};
 
 /// What a node in the sequence needs
 #[derive(Debug, Clone)]
@@ -24,11 +27,41 @@ pub struct NodePlan {
     pub is_leader: bool,
 }
 
+/// What the gate learned about a sequence, carried by the node that
+/// restarts last across its own restart
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequencePlan {
+    /// Formats the gate expects the post-upgrade sweep to move
+    pub format_migrations: Vec<(FormatKind, FormatVersion, FormatVersion)>,
+    /// Whether every planned migration can be undone
+    pub reversible: bool,
+    /// Who asked for the sequence, empty for the controller
+    pub actor: String,
+}
+
 /// What the coordinator does to a node. Implemented by the server for a
 /// real cluster and by a test for a simulated one, so the sequencing logic
 /// is exercised without a cluster
 #[async_trait::async_trait]
 pub trait NodeDriver: Send + Sync {
+    /// Fetches, verifies, and stages one release on a node, returning once
+    /// the node reports it staged. A node that already holds it answers at
+    /// once
+    async fn stage(&self, node_id: &str, release: &ReleaseEntry) -> Result<()>;
+
+    /// Tells the driver a sequence is about to walk these nodes, with the
+    /// baseline every restarted node is judged against and what the gate
+    /// learned. What a node needs to carry across its own restart is taken
+    /// from here
+    async fn begin_sequence(
+        &self,
+        from_version: &str,
+        to_version: &str,
+        baseline: &HealthBaseline,
+        nodes: &[NodePlan],
+        plan: &SequencePlan,
+    ) -> Result<()>;
+
     /// Stops accepting new work and lets in-flight work finish
     async fn drain(&self, node_id: &str) -> Result<()>;
 
@@ -104,7 +137,11 @@ impl Default for RollingSettings {
     }
 }
 
-/// Runs the sequence
+/// Runs the sequence.
+///
+/// Every node completing is announced through the notifier when one is
+/// given, with how many nodes are still to go
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     driver: &dyn NodeDriver,
     board: &UpgradeBoard,
@@ -113,6 +150,7 @@ pub async fn run(
     to_version: &str,
     baseline: HealthBaseline,
     settings: RollingSettings,
+    notifier: Option<&Notifier>,
 ) -> Result<RollingOutcome> {
     if nodes.is_empty() {
         return Err(ZyronError::UpgradeRefused(
@@ -127,6 +165,7 @@ pub async fn run(
 
     let started = driver.now_secs();
     let mut upgraded = 0u32;
+    let total = nodes.len() as u32;
 
     for node in ordered {
         if board.settings().paused {
@@ -196,6 +235,18 @@ pub async fn run(
                     started,
                     "healthy on the new binary",
                 );
+                if let Some(notifier) = notifier {
+                    notifier
+                        .emit(
+                            &UpgradeEvent::NodeCompleted {
+                                node_id: node.node_id.clone(),
+                                to_version: to_version.to_string(),
+                                nodes_remaining: total.saturating_sub(upgraded),
+                            },
+                            driver.now_secs(),
+                        )
+                        .await;
+                }
             }
             verdict => {
                 let reason = verdict.reason();
@@ -299,15 +350,20 @@ pub async fn capture_baseline(
     let mut throughput = 0.0f64;
     let mut error_rate = 0.0f64;
     let mut connections = 0u64;
+    let mut queries: Option<u64> = None;
     for node in nodes {
         let observed = driver.observe(&node.node_id).await?;
         // The baseline takes the worst latency and the total throughput, so
-        // a node that was already the slow one is not asked to beat itself
+        // a node that was already the slow one is not asked to beat itself.
+        // The quietest node decides whether the rates carry signal at all
         p50 = p50.max(observed.p50_latency_us);
         p99 = p99.max(observed.p99_latency_us);
         throughput += observed.throughput_per_sec;
         error_rate = error_rate.max(observed.error_rate);
         connections += observed.active_connections;
+        queries = Some(queries.map_or(observed.queries_in_window, |fewest| {
+            fewest.min(observed.queries_in_window)
+        }));
     }
     Ok(HealthBaseline {
         p50_latency_us: p50,
@@ -315,6 +371,7 @@ pub async fn capture_baseline(
         throughput_per_sec: throughput / nodes.len() as f64,
         error_rate,
         active_connections: connections,
+        queries_in_window: queries.unwrap_or(0),
     })
 }
 
@@ -324,6 +381,10 @@ pub async fn capture_baseline(
 pub struct SimulatedCluster {
     /// Health each node reports, in the order it is asked
     pub observations: parking_lot::Mutex<Vec<(String, HealthBaseline)>>,
+    /// Nodes asked to stage, with the version each was given
+    pub staged: parking_lot::Mutex<Vec<(String, String)>>,
+    /// The baseline and node count each sequence began with
+    pub sequences: parking_lot::Mutex<Vec<(HealthBaseline, usize)>>,
     pub drained: parking_lot::Mutex<Vec<String>>,
     pub restarted: parking_lot::Mutex<Vec<String>>,
     pub rolled_back: parking_lot::Mutex<Vec<String>>,
@@ -335,6 +396,8 @@ impl SimulatedCluster {
     pub fn new(observations: Vec<(String, HealthBaseline)>) -> Arc<Self> {
         Arc::new(Self {
             observations: parking_lot::Mutex::new(observations),
+            staged: parking_lot::Mutex::new(Vec::new()),
+            sequences: parking_lot::Mutex::new(Vec::new()),
             drained: parking_lot::Mutex::new(Vec::new()),
             restarted: parking_lot::Mutex::new(Vec::new()),
             rolled_back: parking_lot::Mutex::new(Vec::new()),
@@ -346,6 +409,25 @@ impl SimulatedCluster {
 
 #[async_trait::async_trait]
 impl NodeDriver for SimulatedCluster {
+    async fn stage(&self, node_id: &str, release: &ReleaseEntry) -> Result<()> {
+        self.staged
+            .lock()
+            .push((node_id.to_string(), release.version.clone()));
+        Ok(())
+    }
+
+    async fn begin_sequence(
+        &self,
+        _from_version: &str,
+        _to_version: &str,
+        baseline: &HealthBaseline,
+        nodes: &[NodePlan],
+        _plan: &SequencePlan,
+    ) -> Result<()> {
+        self.sequences.lock().push((*baseline, nodes.len()));
+        Ok(())
+    }
+
     async fn drain(&self, node_id: &str) -> Result<()> {
         self.drained.lock().push(node_id.to_string());
         Ok(())
@@ -366,6 +448,7 @@ impl NodeDriver for SimulatedCluster {
                 throughput_per_sec: 10_000.0,
                 error_rate: 0.0,
                 active_connections: 10,
+                queries_in_window: 600_000,
             }),
         }
     }
@@ -401,6 +484,7 @@ mod tests {
             throughput_per_sec: 10_000.0,
             error_rate: 0.0,
             active_connections: 10,
+            queries_in_window: 600_000,
         }
     }
 
@@ -433,6 +517,7 @@ mod tests {
             "0.12.0",
             healthy(),
             RollingSettings::default(),
+            None,
         )
         .await
         .expect("runs");
@@ -487,6 +572,7 @@ mod tests {
             "0.12.0",
             healthy(),
             settings,
+            None,
         )
         .await
         .expect("runs");
@@ -528,6 +614,7 @@ mod tests {
             "0.12.0",
             healthy(),
             RollingSettings::default(),
+            None,
         )
         .await
         .expect("runs");
@@ -550,6 +637,7 @@ mod tests {
             "0.12.0",
             healthy(),
             RollingSettings::default(),
+            None,
         )
         .await
         .expect_err("refused");
@@ -609,6 +697,7 @@ mod tests {
             "0.12.0",
             healthy(),
             settings,
+            None,
         )
         .await
         .expect("runs");

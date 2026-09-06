@@ -129,6 +129,193 @@ pub(crate) fn apply_column_security(
     DataBatch::new(cols).with_resolved(resolved)
 }
 
+/// A value an aggregate hands back out of a column's cells, NULLed when
+/// the session is not cleared for that column or a masking policy covers
+/// it.
+///
+/// MIN, MAX and SUM all expose something derived from actual values, so
+/// they answer to the same column level policy a row scan enforces. COUNT
+/// exposes no value and does not come through here
+pub(crate) fn expose_column_value(
+    ctx: &ExecutionContext,
+    table_id: u32,
+    column_id: Option<zyron_catalog::ColumnId>,
+    value: ScalarValue,
+) -> ScalarValue {
+    let Some(cid) = column_id else {
+        return value;
+    };
+    let Some((sc, sm)) = ctx
+        .security_context
+        .as_ref()
+        .zip(ctx.security_manager.as_ref())
+    else {
+        return value;
+    };
+    let cleared = sm
+        .classification_store
+        .check_clearance(sc.clearance, table_id, cid.0);
+    let mut probe = String::new();
+    let has_mask =
+        sm.masking_policy_store
+            .apply_masking(table_id, cid.0, "", &sc.effective_roles, &mut probe);
+    if cleared && !has_mask {
+        value
+    } else {
+        ScalarValue::Null
+    }
+}
+
+/// One running answer for a metadata pushdown aggregate.
+///
+/// Shared by the two tiers that answer aggregates from statistics, because
+/// both fold the same four kinds and both fall back to folding rows for
+/// the files their statistics do not describe. Two copies of this would be
+/// two chances for a statistics answer and a scan answer to disagree
+pub(crate) enum MetaAcc {
+    Count(i64),
+    MinMax(Option<ScalarValue>),
+    /// Running total and whether any non-null value reached it, because a
+    /// SUM over no rows is NULL rather than zero
+    Sum {
+        total: i128,
+        any: bool,
+    },
+}
+
+impl MetaAcc {
+    /// A fresh accumulator per aggregate, in spec order
+    pub(crate) fn for_specs(specs: &[zyron_planner::physical::MetaAggSpec]) -> Vec<MetaAcc> {
+        use zyron_planner::physical::MetaAggKind;
+        specs
+            .iter()
+            .map(|s| match s.kind {
+                MetaAggKind::CountStar | MetaAggKind::CountCol => MetaAcc::Count(0),
+                MetaAggKind::Min | MetaAggKind::Max => MetaAcc::MinMax(None),
+                MetaAggKind::Sum => MetaAcc::Sum {
+                    total: 0,
+                    any: false,
+                },
+            })
+            .collect()
+    }
+
+    /// Keeps the smaller or larger of what is held and what arrives.
+    /// A NULL is not a candidate, MIN and MAX both ignore them
+    pub(crate) fn fold_minmax(cur: &mut Option<ScalarValue>, v: ScalarValue, want_max: bool) {
+        if matches!(v, ScalarValue::Null) {
+            return;
+        }
+        match cur {
+            None => *cur = Some(v),
+            Some(c) => {
+                if let Some(ord) = v.partial_cmp(c) {
+                    let take = if want_max {
+                        ord == std::cmp::Ordering::Greater
+                    } else {
+                        ord == std::cmp::Ordering::Less
+                    };
+                    if take {
+                        *cur = Some(v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The scalar this accumulator answers with, on the aggregate's
+    /// declared type and before column policy.
+    ///
+    /// A sum accumulates at 128 bits whatever the column's width, exactly
+    /// as the row path's does, so the same narrowing the row path applies
+    /// on the way out is applied here. Skipping it lands a 128-bit value
+    /// in a builder typed for the declared width, which silently stores
+    /// nothing
+    pub(crate) fn finish(self, target: zyron_common::TypeId) -> Result<ScalarValue> {
+        let raw = match self {
+            MetaAcc::Count(c) => ScalarValue::Int64(c),
+            MetaAcc::MinMax(m) => m.unwrap_or(ScalarValue::Null),
+            MetaAcc::Sum { total, any } => {
+                if any {
+                    ScalarValue::Int128(total)
+                } else {
+                    ScalarValue::Null
+                }
+            }
+        };
+        crate::operator::aggregate::coerce_aggregate_scalar(raw, target)
+    }
+}
+
+/// Folds every row an operator produces into metadata aggregate
+/// accumulators, for the files whose statistics could not answer.
+///
+/// `proj_idx` maps each spec to the column of the batch holding its
+/// target, or None for COUNT(*), which needs no column
+pub(crate) async fn fold_rows_into_meta_accs(
+    mut op: Box<dyn Operator>,
+    specs: &[zyron_planner::physical::MetaAggSpec],
+    proj_idx: &[Option<usize>],
+    accs: &mut [MetaAcc],
+) -> Result<()> {
+    use zyron_planner::physical::MetaAggKind;
+    while let Some(eb) = op.next().await? {
+        let b = &eb.batch;
+        for (si, spec) in specs.iter().enumerate() {
+            match (&spec.kind, &mut accs[si]) {
+                (MetaAggKind::CountStar, MetaAcc::Count(c)) => {
+                    *c += b.num_rows as i64;
+                }
+                (MetaAggKind::CountCol, MetaAcc::Count(c)) => {
+                    if let Some(ci) = proj_idx[si] {
+                        let col = &b.columns[ci];
+                        for r in 0..b.num_rows {
+                            if !col.is_null(r) {
+                                *c += 1;
+                            }
+                        }
+                    }
+                }
+                (MetaAggKind::Min, MetaAcc::MinMax(m)) | (MetaAggKind::Max, MetaAcc::MinMax(m)) => {
+                    if let Some(ci) = proj_idx[si] {
+                        let want_max = spec.kind == MetaAggKind::Max;
+                        let col = &b.columns[ci];
+                        for r in 0..b.num_rows {
+                            if !col.is_null(r) {
+                                MetaAcc::fold_minmax(m, col.get_scalar(r), want_max);
+                            }
+                        }
+                    }
+                }
+                (MetaAggKind::Sum, MetaAcc::Sum { total, any }) => {
+                    if let Some(ci) = proj_idx[si] {
+                        let col = &b.columns[ci];
+                        for r in 0..b.num_rows {
+                            if col.is_null(r) {
+                                continue;
+                            }
+                            let v = col.get_scalar(r).to_i128().ok_or_else(|| {
+                                zyron_common::ZyronError::ExecutionError(
+                                    "metadata aggregate: SUM over a column that does not add exactly"
+                                        .into(),
+                                )
+                            })?;
+                            *total = total.checked_add(v).ok_or_else(|| {
+                                zyron_common::ZyronError::ExecutionError(
+                                    "SUM overflowed its 128-bit accumulator".to_string(),
+                                )
+                            })?;
+                            *any = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Boxed future returned by Operator::next().
 pub type OperatorResult<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ExecutionBatch>>> + Send + 'a>>;

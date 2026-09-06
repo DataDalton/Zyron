@@ -95,6 +95,27 @@ impl From<&ReleaseManifest> for ManifestDocument {
     }
 }
 
+/// The target this binary was built for, which names the manifest it
+/// reads: a Linux node and a Windows node download different binaries
+pub const RELEASE_TARGET: &str = env!("ZYRON_TARGET");
+
+/// The name of a channel's manifest for this binary's target, without the
+/// `.manifest` suffix
+pub fn feed_name(channel: &str) -> String {
+    format!("{channel}.{RELEASE_TARGET}")
+}
+
+/// Writes a manifest as the JSON document a feed serves
+pub fn write_manifest(manifest: &ReleaseManifest, path: &Path) -> Result<()> {
+    let document = ManifestDocument::from(manifest);
+    let body = serde_json::to_vec_pretty(&document)
+        .map_err(|e| ZyronError::Internal(format!("release manifest encode, {e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(ZyronError::Io)?;
+    }
+    std::fs::write(path, body).map_err(ZyronError::Io)
+}
+
 /// Where a manifest comes from
 #[async_trait::async_trait]
 pub trait ReleaseFeedSource: Send + Sync {
@@ -126,7 +147,11 @@ impl HttpFeedSource {
     }
 
     fn url_for(&self, channel: &str) -> String {
-        format!("{}/{channel}.manifest", self.base_url.trim_end_matches('/'))
+        format!(
+            "{}/{}.manifest",
+            self.base_url.trim_end_matches('/'),
+            feed_name(channel)
+        )
     }
 }
 
@@ -141,6 +166,13 @@ impl ReleaseFeedSource for HttpFeedSource {
             .await
             .map_err(|e| ZyronError::Internal(format!("release feed {url}, {e}")))?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(None);
+        }
+        // A feed with no manifest for this channel and target has nothing
+        // to offer, which is not a fault. It is what every node sees until
+        // the first release that carries a manifest is published
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            tracing::debug!(url, "the release feed has no manifest for this channel yet");
             return Ok(None);
         }
         if !response.status().is_success() {
@@ -176,17 +208,14 @@ impl LocalFeedSource {
 
     /// Where one channel's manifest is expected
     pub fn path_for(&self, channel: &str) -> PathBuf {
-        self.directory.join(format!("{channel}.manifest"))
+        self.directory
+            .join(format!("{}.manifest", feed_name(channel)))
     }
 
     /// Writes a manifest into the directory, which is what an upload does
     pub fn publish(&self, manifest: &ReleaseManifest) -> Result<PathBuf> {
-        std::fs::create_dir_all(&self.directory).map_err(ZyronError::Io)?;
-        let document = ManifestDocument::from(manifest);
-        let body = serde_json::to_vec_pretty(&document)
-            .map_err(|e| ZyronError::Internal(format!("release manifest encode, {e}")))?;
         let path = self.path_for(&manifest.channel);
-        std::fs::write(&path, body).map_err(ZyronError::Io)?;
+        write_manifest(manifest, &path)?;
         Ok(path)
     }
 }
@@ -204,6 +233,45 @@ impl ReleaseFeedSource for LocalFeedSource {
 
     fn describe(&self) -> String {
         format!("local feed at {}", self.directory.display())
+    }
+}
+
+/// A local feed directory read ahead of a remote feed.
+///
+/// A manifest an operator delivered into the node's own feed directory is
+/// what an air-gapped node reads, and it wins over the remote feed on a
+/// node that has both, so a release placed by hand is the one the node
+/// sees whatever the feed says. With no manifest in the directory the
+/// remote feed answers, and a node with no remote feed configured answers
+/// that nothing is new
+pub struct LayeredFeedSource {
+    local: LocalFeedSource,
+    remote: Option<Arc<dyn ReleaseFeedSource>>,
+}
+
+impl LayeredFeedSource {
+    pub fn new(local: LocalFeedSource, remote: Option<Arc<dyn ReleaseFeedSource>>) -> Self {
+        Self { local, remote }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReleaseFeedSource for LayeredFeedSource {
+    async fn fetch(&self, channel: &str) -> Result<Option<ManifestDocument>> {
+        if let Some(document) = self.local.fetch(channel).await? {
+            return Ok(Some(document));
+        }
+        match &self.remote {
+            Some(remote) => remote.fetch(channel).await,
+            None => Ok(None),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.remote {
+            Some(remote) => format!("{}, then {}", self.local.describe(), remote.describe()),
+            None => self.local.describe(),
+        }
     }
 }
 
@@ -352,16 +420,21 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     verify_sha256_bytes(&bytes, expected_hex, &path.display().to_string())
 }
 
+/// The SHA-256 of bytes as lower-case hex, the form a manifest declares
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    encode_hex(&hasher.finalize())
+}
+
 /// Checks bytes already in memory against a declared digest.
 ///
 /// The staging path holds the artifact in memory already, so hashing it
 /// there avoids reading a freshly written binary back off disk. `label`
 /// names the artifact in the refusal
 pub fn verify_sha256_bytes(bytes: &[u8], expected_hex: &str, label: &str) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let actual = encode_hex(&hasher.finalize());
+    let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(expected_hex) {
         return Err(ZyronError::UpgradeRefused(format!(
             "the staged binary at {label} hashes to {actual}, the manifest declares \

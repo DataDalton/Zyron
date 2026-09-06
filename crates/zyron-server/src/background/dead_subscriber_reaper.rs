@@ -37,16 +37,13 @@ pub async fn dead_subscriber_reaper_loop(
     catalog: Arc<Catalog>,
     cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_secs: u64,
     idle_threshold: Duration,
     metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(60)));
-    loop {
-        ticker.tick().await;
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         let _ = run_reaper_once(
             catalog.as_ref(),
             cdc_registry.as_deref(),
@@ -318,6 +315,7 @@ mod tests {
                 cat,
                 None,
                 sd,
+                Arc::new(tokio::sync::Notify::new()),
                 60,
                 std::time::Duration::from_millis(0),
                 None,

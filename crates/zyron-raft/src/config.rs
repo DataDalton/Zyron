@@ -40,6 +40,17 @@ pub struct RaftConfig {
     /// How many AppendEntries may be outstanding to one follower at once.
     /// This is what makes replication a pipeline rather than a ping pong
     pub max_inflight_appends: usize,
+    /// How many of those may carry less than a full batch.
+    ///
+    /// With this many in flight to a follower, further entries wait for a
+    /// reply to free a slot or for a full batch to form, and the wait is at
+    /// most one round trip divided by this. A leader that sent every
+    /// proposal the moment a slot was free filled the pipeline with
+    /// messages of a few entries each under load, and the cost of a message,
+    /// at both ends, outweighed the entries it carried. A full batch is
+    /// bandwidth bound rather than message bound and goes out up to the
+    /// pipeline depth
+    pub max_inflight_partial_appends: usize,
     /// How many entries past the snapshot the log may grow before another
     /// snapshot is taken
     pub snapshot_threshold: u64,
@@ -84,6 +95,7 @@ impl Default for RaftConfig {
             max_batch_entries: 1024,
             max_batch_bytes: 1024 * 1024,
             max_inflight_appends: 16,
+            max_inflight_partial_appends: 4,
             snapshot_threshold: 10_000,
             snapshot_threshold_bytes: 512 * 1024 * 1024,
             resident_log_bytes: 64 * 1024 * 1024,
@@ -102,8 +114,10 @@ impl RaftConfig {
     ///
     /// A cross-region round trip is tens of milliseconds, so a 150ms election
     /// timeout would have followers campaigning against a leader that is
-    /// simply far away. Everything that waits on the network is stretched;
-    /// nothing that waits on the local disk is
+    /// simply far away. Everything that waits on the network is stretched,
+    /// the pipeline included, because a link that long holds more messages
+    /// between the two ends and a proposal waiting for a slot on it waits
+    /// a share of that round trip. Nothing that waits on the local disk is
     pub fn multi_region() -> Self {
         let election_timeout_min = Duration::from_millis(500);
         Self {
@@ -112,6 +126,8 @@ impl RaftConfig {
             heartbeat_interval: Duration::from_millis(150),
             tick_interval: Duration::from_millis(20),
             rpc_timeout: Duration::from_millis(5000),
+            max_inflight_appends: 64,
+            max_inflight_partial_appends: 16,
             leader_lease: election_timeout_min / 2,
             ..Self::default()
         }
@@ -155,6 +171,14 @@ impl RaftConfig {
             return Err(ZyronError::Internal(
                 "raft max_inflight_appends must be at least one".into(),
             ));
+        }
+        if self.max_inflight_partial_appends == 0
+            || self.max_inflight_partial_appends > self.max_inflight_appends
+        {
+            return Err(ZyronError::Internal(format!(
+                "raft max_inflight_partial_appends {} must be between one and max_inflight_appends {}",
+                self.max_inflight_partial_appends, self.max_inflight_appends
+            )));
         }
         if self.snapshot_chunk_bytes == 0 {
             return Err(ZyronError::Internal(

@@ -1,9 +1,11 @@
 //! Zyron server entry point.
 
+use zyron_server::RunOutcome;
+
 fn main() {
     let opts = match zyron_server::parse_cli_args() {
         Some(opts) => opts,
-        None => return, // --help or --version was printed
+        None => return, // --help, --version, or --capabilities was printed
     };
 
     let config =
@@ -30,7 +32,7 @@ fn main() {
         }
     };
 
-    runtime.block_on(async move {
+    let outcome = runtime.block_on(async move {
         let server = match zyron_server::Server::init(config, &opts).await {
             Ok(s) => s,
             Err(e) => {
@@ -39,9 +41,51 @@ fn main() {
             }
         };
 
-        if let Err(e) = server.run().await {
-            eprintln!("Server error: {}", e);
-            std::process::exit(1);
+        match server.run().await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!("Server error: {}", e);
+                std::process::exit(1);
+            }
         }
     });
+
+    // The runtime is gone before the process is replaced, so no worker
+    // thread is left holding a file the new process opens
+    drop(runtime);
+    if let RunOutcome::Restart { binary, args } = outcome {
+        restart(&binary, &args);
+    }
+}
+
+/// Starts the binary at the live path in this process's place.
+///
+/// On Unix the process image is replaced, so the service manager keeps the
+/// same PID and the new binary inherits the descriptors. On Windows a
+/// process cannot replace itself, so the new one is started detached and
+/// this one exits once it has
+#[cfg(unix)]
+fn restart(binary: &std::path::Path, args: &[String]) {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(binary).args(args).exec();
+    eprintln!("could not start {} in place: {err}", binary.display());
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn restart(binary: &std::path::Path, args: &[String]) {
+    match std::process::Command::new(binary).args(args).spawn() {
+        Ok(child) => {
+            eprintln!(
+                "started {} as process {}, this process exits",
+                binary.display(),
+                child.id()
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("could not start {}: {e}", binary.display());
+            std::process::exit(1);
+        }
+    }
 }

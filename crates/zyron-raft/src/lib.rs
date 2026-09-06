@@ -95,7 +95,10 @@ pub use config::RaftConfig;
 pub use consensus::{
     ConsensusMetrics, PeerWork, RaftConsensus, ReadIndexOutcome, SnapshotDecision, TickOutcome,
 };
-pub use election::{ElectionTimer, RequestVoteReply, RequestVoteRequest, log_is_up_to_date};
+pub use election::{
+    ElectionTimer, RequestVoteReply, RequestVoteRequest, TimeoutNowReply, TimeoutNowRequest,
+    log_is_up_to_date,
+};
 pub use log::{LogWriterHandle, RaftCommand, RaftLog, RaftLogEntry};
 pub use machine::{ApplyFuture, CheckpointSource, MemoryStateMachine, StateMachine};
 pub use membership::{ClusterConfig, MAX_CLUSTER_NODES, Membership, NodeConfig};
@@ -109,6 +112,6 @@ pub use snapshot::{
 };
 pub use state::{LeaderState, PersistentState, RaftRole, RaftState, VolatileState};
 pub use transport::{
-    RaftFuture, RaftHandlerFuture, RaftRequestHandler, RaftRpcError, RaftServer, RaftTransport,
-    TcpTransport, TransportConfig, TransportStats,
+    CONSENSUS_PROTOCOL_VERSION, RaftFuture, RaftHandlerFuture, RaftRequestHandler, RaftRpcError,
+    RaftServer, RaftTransport, TcpTransport, TransportConfig, TransportStats,
 };

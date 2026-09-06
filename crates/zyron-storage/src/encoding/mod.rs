@@ -15,6 +15,7 @@ mod fastlanes;
 mod fsst;
 mod rle;
 mod unencoded;
+mod unpack;
 
 pub use alp::AlpEncoding;
 pub use bitpack::BitPackEncoding;
@@ -644,7 +645,10 @@ mod scratch {
             None => {
                 let mut buf = Vec::with_capacity(len);
                 // SAFETY: as above, over the capacity just reserved
-                unsafe { buf.set_len(len) };
+                #[allow(clippy::uninit_vec)]
+                unsafe {
+                    buf.set_len(len)
+                };
                 buf
             }
         }
@@ -840,7 +844,7 @@ fn select_encoding_inner(
     // The caller's buffer already holds exactly what the trial would build,
     // values at `i * valueSize` and null slots zeroed, so a prefix of it is
     // the trial input. Only a caller that supplied none pays to build one
-    let mut ownedRaw: Vec<u8> = Vec::new();
+    let mut ownedRaw: Vec<u8>;
     let rawData: &[u8] = match packed {
         Some((buffer, _)) if buffer.len() >= sampleCount * valueSize => {
             &buffer[..sampleCount * valueSize]
@@ -897,29 +901,50 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
         return EncodingType::Unencoded;
     }
     let stats = compute_sample_stats(sample);
+    select_encoding_varlen_prepared(sample.len(), stats, sample, false).encoding
+}
+
+/// Chooses a variable-length column's encoding from statistics the caller
+/// already gathered, and hands back the bytes the trial produced when the
+/// trial covered every row.
+///
+/// The cardinality and run decisions read the statistics. The trial that
+/// compares a candidate against storing the column raw encodes either a
+/// bounded prefix or, under `exact`, the whole column, and a whole-column
+/// trial is the encode the caller was about to do, so its output comes
+/// back rather than being thrown away and produced again. Unencoded is the
+/// always-correct floor, so a candidate is chosen only when it is strictly
+/// smaller. RLE is not a candidate: it is a fixed-width encoder and cannot
+/// round-trip the canonical variable-length buffer, and a run-heavy or
+/// low-cardinality column is already captured densely by Dictionary
+pub fn select_encoding_varlen_prepared(
+    row_count: usize,
+    stats: ColumnSampleStats,
+    values: &[Option<&[u8]>],
+    exact: bool,
+) -> EncodingChoice {
+    let plain = |encoding| EncodingChoice {
+        encoding,
+        encoded: None,
+    };
+    if row_count == 0 {
+        return plain(EncodingType::Unencoded);
+    }
     if stats.all_identical {
-        return EncodingType::Constant;
+        return plain(EncodingType::Constant);
     }
 
-    // Pick the encoding from a bounded prefix probe instead of fully encoding
-    // the whole column twice (Dictionary and FSST) just to choose. The
-    // cardinality/run decision uses the full-sample stats above (cheap: a
-    // HashSet pass, no encoding); only the expensive trial compression runs
-    // on a bounded prefix. The chosen encoder still encodes the full column
-    // in build_varlen, so this changes the selection cost, not the encoded
-    // output. Unencoded is the always-correct floor, so a candidate is only
-    // chosen when it is strictly smaller on the probe. RLE is intentionally
-    // not a candidate here: it is a fixed-width encoder and cannot round-trip
-    // the canonical variable-length buffer; run-heavy / low-cardinality
-    // variable-length columns are already captured densely by the Dictionary
-    // candidate (whole-value dedup + bit-packed codes).
-    const PROBE_ROWS: usize = 8192;
-    let row_count = sample.len();
-    let probe = &sample[..row_count.min(PROBE_ROWS)];
+    let probe = if exact {
+        values
+    } else {
+        &values[..row_count.min(TRIAL_ENCODE_ROWS)]
+    };
+    let whole_column = probe.len() == row_count;
     let raw = varlen_pack(probe);
     let probe_rows = probe.len();
     let mut best = EncodingType::Unencoded;
     let mut best_size = raw.len();
+    let mut best_bytes: Option<Vec<u8>> = None;
 
     if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
         let dict = create_encoding(EncodingType::Dictionary);
@@ -928,6 +953,7 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
         {
             best = EncodingType::Dictionary;
             best_size = enc.len();
+            best_bytes = Some(enc);
         }
     }
 
@@ -936,9 +962,15 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
         && enc.len() < best_size
     {
         best = EncodingType::Fsst;
+        best_bytes = Some(enc);
     }
 
-    best
+    EncodingChoice {
+        encoding: best,
+        // A prefix's output describes a prefix and would truncate the
+        // column if a caller wrote it out
+        encoded: if whole_column { best_bytes } else { None },
+    }
 }
 
 /// Creates an Encoding trait object for the given encoding type.

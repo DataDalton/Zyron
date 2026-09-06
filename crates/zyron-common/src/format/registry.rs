@@ -109,9 +109,12 @@ inventory::collect!(FormatRegistration);
 
 /// A transformation from one format version to the next.
 ///
-/// Both directions take and return whole envelope bodies. The substrate
-/// re-wraps the result, so a migrator never touches magic, version, or
-/// checksums
+/// For an envelope framed format both directions take and return the
+/// envelope body. The substrate re-wraps the result, so a migrator never
+/// touches magic, version, or checksums. For a format that owns its
+/// trailer they take and return the whole file, header and trailer
+/// included, because the format's own checksums cover the header and only
+/// its writer can stamp them
 pub type MigrateFn = fn(&[u8]) -> Result<Vec<u8>, String>;
 
 #[derive(Debug, Clone, Copy)]
@@ -207,6 +210,13 @@ pub enum RegistryError {
         from: FormatVersion,
         to: FormatVersion,
     },
+    /// A step marked as changing nothing in the body, on a format whose
+    /// checksums the substrate cannot restamp
+    RestampOnOwnTrailer {
+        kind: FormatKind,
+        from: FormatVersion,
+        to: FormatVersion,
+    },
     /// A supported version behind the current one has no fixture
     MissingFixture {
         kind: FormatKind,
@@ -251,9 +261,10 @@ impl fmt::Display for RegistryError {
             RegistryError::MissingMigrator { kind, from, to } => write!(
                 f,
                 "format `{kind}` has no migrator for {from} to {to}. Add \
-                 migrations/v{}_to_v{}.rs and submit a FormatMigrator, or mark the step \
-                 no_body_change when the bump changes nothing on disk",
-                from.minor, to.minor
+                 migrations/v{}_{}_to_v{}_{}.rs beside the format and submit a \
+                 FormatMigrator, or mark the step no_body_change when the bump changes \
+                 nothing on disk",
+                from.major, from.minor, to.major, to.minor
             ),
             RegistryError::DuplicateMigrator { kind, from, to } => {
                 write!(f, "format `{kind}` has two migrators for {from} to {to}")
@@ -268,11 +279,19 @@ impl fmt::Display for RegistryError {
                 "format `{kind}` migrator steps {from} to {to}, which are not adjacent \
                  versions. Migrators move one version at a time and the substrate chains them"
             ),
+            RegistryError::RestampOnOwnTrailer { kind, from, to } => write!(
+                f,
+                "format `{kind}` migrator {from} to {to} is marked no_body_change, but a \
+                 {kind} file owns its trailer and its checksums cover the header the \
+                 substrate would restamp. Give the step a forward function that rewrites \
+                 the file whole"
+            ),
             RegistryError::MissingFixture { kind, version } => write!(
                 f,
                 "format `{kind}` supports reading version {version} but ships no fixture \
-                 for it. Add fixtures/v{}.bin and submit a FormatFixture",
-                version.minor
+                 for it. Add fixtures/v{}_{}.bin beside the format, written by the release \
+                 that wrote that version, and submit a FormatFixture",
+                version.major, version.minor
             ),
             RegistryError::MissingRetirementDate { kind } => write!(
                 f,
@@ -546,6 +565,16 @@ fn validate_entry(entry: &FormatEntry) -> Result<(), RegistryError> {
                 to: registration.writer_current_version,
             },
         )?;
+        // A format that owns its trailer cannot be restamped by the
+        // substrate, its checksums cover the header, so a step for it has
+        // to rewrite the file
+        if step.no_body_change && registration.kind.framing().migrates_whole_file() {
+            return Err(RegistryError::RestampOnOwnTrailer {
+                kind: registration.kind,
+                from: step.from,
+                to: step.to,
+            });
+        }
         cursor = step.to;
     }
 

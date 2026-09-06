@@ -26,13 +26,15 @@ inventory::submit! {
         kind: FormatKind::WalSegment,
         writer_current_version: WAL_SEGMENT_FORMAT_VERSION,
         reader_supported_versions: VersionWindow::single(WAL_SEGMENT_FORMAT_VERSION),
-        migration_policy: MigrationPolicy::Eager,
+        migration_policy: MigrationPolicy::Lazy,
         migration_reversible: true,
         binary_version_gate: "0.11.0",
         deprecation_status: DeprecationStatus::Active,
         retirement_date: None,
         downgrade_write_supported: false,
-        notes: "envelope header plus a per-record version tag, eager on segment rotation",
+        notes: "envelope header plus a per-record version tag, a new segment is written at the \
+                current version and older segments are replayed then retired by checkpoint, \
+                never rewritten in place",
     }
 }
 

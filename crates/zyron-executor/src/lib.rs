@@ -4,6 +4,7 @@ pub mod column;
 pub mod compute;
 pub mod context;
 pub mod correlated;
+pub mod decorrelate;
 pub mod derived_columns;
 pub mod executor;
 pub mod expectation_results;

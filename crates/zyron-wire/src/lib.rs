@@ -231,6 +231,14 @@ pub async fn start_server(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, peer_addr) = result?;
+                // A draining node is about to restart or leave, so a client
+                // that connects now would only be cut off. Refusing sends it
+                // to another node, or back after the restart
+                if server_state.admission.is_draining() {
+                    debug!("refusing connection from {}: this node is draining", peer_addr);
+                    drop(stream);
+                    continue;
+                }
                 let Some(slot) = ConnectionSlot::acquire() else {
                     warn!(
                         "refusing connection from {}: node memory affords no further connections",
@@ -272,6 +280,10 @@ pub async fn start_server(
                     None => std::future::pending().await,
                 }
             } => {
+                if server_state.admission.is_draining() {
+                    debug!("refusing QUIC connection from {}: this node is draining", peer_addr);
+                    continue;
+                }
                 let Some(slot) = ConnectionSlot::acquire() else {
                     warn!(
                         "refusing QUIC connection from {}: node memory affords no further connections",

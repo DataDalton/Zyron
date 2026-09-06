@@ -1259,6 +1259,7 @@ pub fn publish_txn(
     else {
         return Ok(Vec::new());
     };
+    let _publish = zyron_common::profile::scope(zyron_common::profile::Phase::LakePublish);
     list.sort_by_key(|(_, version)| *version);
     let mut published: Vec<Arc<TransactionLog>> = Vec::new();
     for (root, version) in list {
@@ -1924,6 +1925,8 @@ impl TransactionLog {
                 }
             }
             let version = base_version + 1;
+            let encode_span =
+                zyron_common::profile::scope(zyron_common::profile::Phase::LakeVersionEncode);
             let mut state = Some((*base).clone());
             apply_entries(&mut state, version, attempt.timestamp_us, &entries)?;
             let manifest = match state {
@@ -1935,6 +1938,9 @@ impl TransactionLog {
                 }
             };
             let bytes = encode_version_file(version, base_version, &attempt, &entries, &base)?;
+            drop(encode_span);
+            let _write_span =
+                zyron_common::profile::scope(zyron_common::profile::Phase::LakeVersionWrite);
             let path = self.version_path(version);
             match fs::OpenOptions::new()
                 .write(true)
@@ -2616,6 +2622,7 @@ mod tests {
                 },
                 bloom: None,
                 size_bytes: None,
+                sum: None,
             }]),
             delete_predicate_ids: vec![],
         }

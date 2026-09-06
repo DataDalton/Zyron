@@ -303,6 +303,8 @@ pub enum Statement {
     ListRegistry(Box<ListRegistryStatement>),
     /// TRIGGER MANUAL UPGRADE TO '2.3.1', TRIGGER MANUAL ROLLBACK
     TriggerUpgrade(Box<TriggerUpgradeStatement>),
+    /// ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS, ACKNOWLEDGE UPGRADE REWRITES UNSAFE
+    AcknowledgeUpgradeRewrites(Box<AcknowledgeUpgradeRewritesStatement>),
     /// SHOW UPGRADE STATE, SHOW FORMAT MIGRATIONS [FOR FORMAT <kind>]
     ShowUpgrade(Box<ShowUpgradeStatement>),
     /// EXPLAIN REWRITE FOR OBJECT <name>
@@ -374,6 +376,23 @@ pub enum TriggerUpgradeAction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TriggerUpgradeStatement {
     pub action: TriggerUpgradeAction,
+}
+
+/// Which class of user object rewrites an `ACKNOWLEDGE` covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcknowledgeRewriteCategory {
+    /// ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS, applies the rewrites that
+    /// waited for a person to read them
+    Ambiguous,
+    /// ACKNOWLEDGE UPGRADE REWRITES UNSAFE, lets the upgrade proceed with
+    /// those objects broken
+    Unsafe,
+}
+
+/// `ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS` or `ACKNOWLEDGE UPGRADE REWRITES UNSAFE`
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcknowledgeUpgradeRewritesStatement {
+    pub category: AcknowledgeRewriteCategory,
 }
 
 /// What a `SHOW` statement of the substrate asks for.

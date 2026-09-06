@@ -7,11 +7,18 @@
 //! coexist and new entries are written at the current version.
 //!
 //! The snapshot pointer is rewritten whole every time a snapshot is taken,
-//! so it migrates eagerly with the next one
+//! so it migrates eagerly with the next one.
+//!
+//! The consensus protocol, the frames between members of a group, registers
+//! here as well, so the release check and the protocol versions view report
+//! it beside the client and mesh protocols
 
 use zyron_common::format::registry::{DeprecationStatus, FormatRegistration, MigrationPolicy};
 use zyron_common::format::version::{FormatVersion, VersionWindow};
+use zyron_common::format::wire_version::{WireProtocol, WireProtocolVersion, WireVersionStatus};
 use zyron_common::format::{FormatKind, RecordVersion};
+
+use crate::transport::CONSENSUS_PROTOCOL_VERSION;
 
 const GATE: &str = "0.11.0";
 
@@ -54,6 +61,18 @@ inventory::submit! {
     }
 }
 
+inventory::submit! {
+    WireProtocolVersion {
+        protocol: WireProtocol::Consensus,
+        version: CONSENSUS_PROTOCOL_VERSION as u32,
+        status: WireVersionStatus::Current,
+        introduced_in_binary_version: "0.8.0",
+        retired_in_binary_version: None,
+        notes: "twenty byte frame header naming the version, five message kinds, a field is \
+                added by appending it and an absent trailing field reads as its default",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +86,16 @@ mod tests {
                 .count();
             assert_eq!(count, 1, "{kind} submitted {count} registrations");
         }
+    }
+
+    #[test]
+    fn test_the_consensus_protocol_registers_its_frame_version_once() {
+        let rows: Vec<_> = inventory::iter::<WireProtocolVersion>
+            .into_iter()
+            .filter(|v| v.protocol == WireProtocol::Consensus)
+            .collect();
+        assert_eq!(rows.len(), 1, "the consensus protocol registers once");
+        assert_eq!(rows[0].version, u32::from(CONSENSUS_PROTOCOL_VERSION));
+        assert_eq!(rows[0].status, WireVersionStatus::Current);
     }
 }

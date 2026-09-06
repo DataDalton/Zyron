@@ -277,17 +277,17 @@ What a client sees from a running server over the wire protocol, from cold start
 
 | Lifecycle / workload | Result |
 |----------------------|--------|
-| Cold boot to accepting queries | 45 ms |
-| First `ReadyForQuery` | 0.58 ms |
-| Schema DDL bootstrap | 8.4 ms |
-| Seed insert | 250K rows/sec |
-| OLTP, 1 client | 11.6K tps, p99 282 us |
-| OLTP, 4 clients | 32.9K tps, p99 372 us |
-| OLTP, 16 clients | 61.7K tps, p99 529 us |
-| OLTP, 64 clients | 57.9K tps, p99 1871 us |
-| OLTP, 256 clients | 51.5K tps, p99 8922 us |
-| Analytical query (median) | 1.16 ms |
-| Graceful shutdown | 66 ms |
+| Cold boot to accepting queries | 34 ms |
+| First `ReadyForQuery` | 0.54 ms |
+| Schema DDL bootstrap | 7.7 ms |
+| Seed insert | 238K rows/sec |
+| OLTP, 1 client | 13.4K tps, p99 240 us |
+| OLTP, 4 clients | 38.4K tps, p99 293 us |
+| OLTP, 16 clients | 66.4K tps, p99 480 us |
+| OLTP, 64 clients | 62.3K tps, p99 1731 us |
+| OLTP, 256 clients | 56.6K tps, p99 8094 us |
+| Analytical query (median) | 0.59 ms |
+| Graceful shutdown | 62 ms |
 
 ![OLTP throughput vs. concurrent clients (thousand tps, higher is better)](benchmarks/charts/oltp_throughput.svg)
 
@@ -318,32 +318,32 @@ A few more numbers not shown in the charts above:
 | Subsystem | Metric | Result |
 |-----------|--------|--------|
 | MVCC | GC sweep | ~1.8B tuples/sec |
-| Columnar | .zyr scan throughput | ~10.4 GB/sec |
-| Columnar | Compaction pipeline | ~11.8M rows/sec |
-| Columnar | HybridScan overhead vs heap-only | ~0.6% |
-| Columnar | Metadata-aggregate pruning speedup | ~35.1x |
+| Columnar | .zyr scan throughput | ~12.4 GB/sec |
+| Columnar | Compaction pipeline | ~12.3M rows/sec |
+| Columnar | HybridScan overhead vs heap-only | ~1.4% |
+| Columnar | Metadata-aggregate pruning speedup | ~50.1x |
 | Temporal | Picosecond timestamp decode | ~966M rows/sec |
 | Versioning | Time-travel scan overhead | ~24% |
 | Wire | QUIC PostgreSQL handshake | ~5 us |
 | Transactions | Durable commit floor (device write) | ~66.4 us |
-| Lake | Commit rate (insert) | ~2738 commits/sec |
-| Lake | Commit latency (insert) | ~2.74 ms |
-| Lake | Commit rate (delete predicate) | ~7531 commits/sec |
+| Lake | Commit rate (insert) | ~2389 commits/sec |
+| Lake | Commit latency (insert) | ~2.39 ms |
+| Lake | Commit rate (delete predicate) | ~2043 commits/sec |
 | Lake | Derived clustering expression files pruned | ~93% |
-| Lake | Load with clustering expression | ~779K rows/sec |
-| Consensus | Leader election after a kill | ~234 ms |
-| Consensus | Single log append | ~0.15 us |
-| Consensus | Snapshot 1GB, create | ~0.85 s |
-| Consensus | Snapshot 1GB, transfer | ~2.47 s |
+| Lake | Load with clustering expression | ~752K rows/sec |
+| Consensus | Leader election after a kill | ~218 ms |
+| Consensus | Single log append | ~0.21 us |
+| Consensus | Snapshot 1GB, create | ~0.82 s |
+| Consensus | Snapshot 1GB, transfer | ~2.57 s |
 | Replication | Follower keep-up vs leader | ~99.7% |
 | Replication | Worst follower lag | ~162 entries |
 | Transactions | Durable group-commit peak | ~741K txn/sec |
 | Transactions | Group-commit amplification (c=1 to c=512) | ~78.0x |
-| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~1.2x (heap wins indexed points) |
-| Cross-format | Bulk load to queryable, lake vs heap | ~9.6x (heap wins large batches) |
-| Cross-format | Trickle load to queryable, lake vs heap | ~22.9x (heap wins tiny commits) |
+| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~0.8x (heap wins indexed points) |
+| Cross-format | Bulk load to queryable, lake vs heap | ~1.4x (heap wins large batches) |
+| Cross-format | Trickle load to queryable, lake vs heap | ~10.0x (heap wins tiny commits) |
 
-39 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+40 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started

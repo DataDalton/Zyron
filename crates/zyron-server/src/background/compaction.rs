@@ -373,7 +373,7 @@ impl CompactionWorker {
             // OLTP-aware backoff: do not compete with the foreground write
             // path when query latency is already elevated.
             if let Some(m) = metrics {
-                let p99 = m.query_duration.p99_estimate_us();
+                let p99 = m.query.latency.p99_estimate_us();
                 if p99 > config.oltp_p99_threshold_us {
                     stats.cycles_backpressured.fetch_add(1, Ordering::Relaxed);
                     debug!(

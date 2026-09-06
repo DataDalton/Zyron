@@ -315,6 +315,9 @@ async fn create_test_state(
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
         password_encryption: "balloon-sha-256".into(),
+        admission: Arc::new(zyron_common::Admission::new()),
+        query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
+        upgrade_control: None,
     });
 
     (state, wal, pool, disk, bg_writer, catalog)
@@ -1194,16 +1197,20 @@ fn test_10_metrics() {
     let registry = Arc::new(MetricsRegistry::new(
         session_mgr.clone(),
         Arc::new(zyron_common::LabeledMetrics::new()),
+        Arc::new(zyron_common::QueryMetrics::new()),
     ));
 
     // Increment counters
     registry
+        .query
         .connections_total
         .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
     registry
+        .query
         .queries_total
         .fetch_add(50, std::sync::atomic::Ordering::Relaxed);
     registry
+        .query
         .errors_total
         .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
     registry
@@ -1214,9 +1221,9 @@ fn test_10_metrics() {
         .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
 
     // Record latencies
-    registry.query_duration.record(500); // 0.5ms
-    registry.query_duration.record(2000); // 2ms
-    registry.query_duration.record(50_000); // 50ms
+    registry.query.latency.record(500); // 0.5ms
+    registry.query.latency.record(2000); // 2ms
+    registry.query.latency.record(50_000); // 50ms
 
     // Register some sessions for gauge
     session_mgr.register(1, "u1".into(), "db".into()).unwrap();
@@ -1298,6 +1305,7 @@ fn test_11_health_checks() {
     let metrics = Arc::new(MetricsRegistry::new(
         session_mgr,
         Arc::new(zyron_common::LabeledMetrics::new()),
+        Arc::new(zyron_common::QueryMetrics::new()),
     ));
     let health = Arc::new(HealthState::new(metrics, "/metrics"));
 

@@ -33,6 +33,14 @@ pub struct MigrationBudget {
     pub disk_multiple: f64,
     /// Fraction of node memory the sweep may hold
     pub memory_fraction: f64,
+    /// Bytes free on the volume the sweep writes to, zero when unmeasured.
+    /// A file whose size times the disk multiple exceeds this stops the
+    /// sweep
+    pub disk_free_bytes: u64,
+    /// Bytes of memory on the node, zero when unmeasured. A file larger
+    /// than the memory fraction of this stops the sweep, because a migration
+    /// holds the whole file
+    pub node_memory_bytes: u64,
 }
 
 impl Default for MigrationBudget {
@@ -41,7 +49,36 @@ impl Default for MigrationBudget {
             time_secs: 6 * 3_600,
             disk_multiple: 2.0,
             memory_fraction: 0.25,
+            disk_free_bytes: 0,
+            node_memory_bytes: 0,
         }
+    }
+}
+
+impl MigrationBudget {
+    /// Whether one file of this size fits the disk and memory budgets
+    pub fn affords(&self, file_bytes: u64) -> std::result::Result<(), String> {
+        if self.disk_free_bytes > 0 {
+            let needed = (file_bytes as f64 * self.disk_multiple) as u64;
+            if needed > self.disk_free_bytes {
+                return Err(format!(
+                    "a {file_bytes} byte file needs {needed} bytes free at {} times its size \
+                     and the volume has {}",
+                    self.disk_multiple, self.disk_free_bytes
+                ));
+            }
+        }
+        if self.node_memory_bytes > 0 {
+            let ceiling = (self.node_memory_bytes as f64 * self.memory_fraction) as u64;
+            if file_bytes > ceiling {
+                return Err(format!(
+                    "a {file_bytes} byte file exceeds the {ceiling} bytes the sweep may hold, \
+                     {} of node memory",
+                    self.memory_fraction
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -87,7 +124,7 @@ pub fn sweep_format(
     }
 
     // Sizes came from the directory read, so the totals cost no syscalls
-    let files = collect_files(directory, kind);
+    let files = collect_files(directory);
     let total_bytes: u64 = files.iter().map(|(_, size)| *size).sum();
     let progress = board.start(MigrationProgress::new(
         kind,
@@ -111,7 +148,16 @@ pub fn sweep_format(
             result.budget_exhausted = true;
             break;
         }
-        match migrate_file(registry, kind, &path, current, size) {
+        if let Err(reason) = budget.affords(size) {
+            tracing::warn!(
+                path = %path.display(),
+                reason = %reason,
+                "format migration stopped at this file, the budget does not cover it"
+            );
+            result.budget_exhausted = true;
+            break;
+        }
+        match migrate_file(registry, kind, current, &path, size) {
             // Another format's file was never a candidate, so it counts
             // neither as scanned nor as skipped
             Ok(FileOutcome::NotThisFormat) => {}
@@ -154,8 +200,8 @@ enum FileOutcome {
 fn migrate_file(
     registry: &FormatRegistry,
     kind: FormatKind,
-    path: &Path,
     current: FormatVersion,
+    path: &Path,
     size_hint: u64,
 ) -> Result<FileOutcome> {
     use std::io::Read;
@@ -169,8 +215,16 @@ fn migrate_file(
     if file.read_exact(&mut head).is_err() {
         return Ok(FileOutcome::NotThisFormat);
     }
-    if !matches!(envelope::peek(&head), Ok((found, _)) if found == kind) {
-        return Ok(FileOutcome::NotThisFormat);
+    let version = match envelope::peek(&head) {
+        Ok((found, version)) if found == kind => version,
+        _ => return Ok(FileOutcome::NotThisFormat),
+    };
+    // A file already at the writer's version has nothing to move, and its
+    // body stays unread. Reading it would verify a checksum a file still
+    // being written cannot carry, and would make every sweep a full read of
+    // the data directory
+    if version == current {
+        return Ok(FileOutcome::Skipped);
     }
     let mut bytes = Vec::with_capacity(size_hint.max(head.len() as u64) as usize);
     bytes.extend_from_slice(&head);
@@ -181,7 +235,10 @@ fn migrate_file(
     if !opened.path.needs_migration() {
         return Ok(FileOutcome::Skipped);
     }
-    let rewritten = envelope::encode(kind, current, &opened.body);
+    // The bytes at the current version, re-wrapped for an envelope framed
+    // format and returned whole by the migration for one that owns its
+    // trailer
+    let rewritten = opened.reencode();
     let written = rewritten.len() as u64;
     let tmp = path.with_extension("zymig.tmp");
     std::fs::write(&tmp, &rewritten).map_err(ZyronError::Io)?;
@@ -191,8 +248,9 @@ fn migrate_file(
     Ok(FileOutcome::Migrated(written))
 }
 
-/// Every file in a directory tree whose first bytes name this format
-fn collect_files(directory: &Path, kind: FormatKind) -> Vec<(PathBuf, u64)> {
+/// Every file in a directory tree, with its size. Which ones are this
+/// format is decided in the visit, which has each file open anyway
+fn collect_files(directory: &Path) -> Vec<(PathBuf, u64)> {
     let mut out = Vec::new();
     let mut stack = vec![directory.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -590,6 +648,96 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(runs[0].is_finished());
         assert_eq!(runs[0].files_done(), 6);
+    }
+
+    #[test]
+    fn test_a_current_file_is_skipped_without_its_body_being_read() {
+        // A file still being written, the open WAL segment for one, carries
+        // a checksum that does not hold yet. At the current version it is
+        // not a candidate, so the sweep decides from the header alone
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = envelope::encode(
+            FormatKind::StatisticsFile,
+            FormatVersion::new(1, 1),
+            b"a body whose checksum is stale",
+        );
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(dir.path().join("live.zysts"), &bytes).expect("writes");
+        assert!(
+            migration::open_as(
+                &registry(MigrationPolicy::Eager),
+                &bytes,
+                FormatKind::StatisticsFile
+            )
+            .is_err()
+        );
+
+        let registry = registry(MigrationPolicy::Eager);
+        let board = MigrationBoard::new();
+        let result = sweep_format(
+            &registry,
+            &board,
+            FormatKind::StatisticsFile,
+            dir.path(),
+            MigrationBudget::default(),
+            0,
+        )
+        .expect("sweeps");
+        assert_eq!(result.files_scanned, 1);
+        assert_eq!(result.files_skipped, 1);
+        assert_eq!(result.failures, 0);
+        assert_eq!(
+            std::fs::read(dir.path().join("live.zysts")).expect("reads"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn test_a_sweep_stops_at_a_file_the_disk_or_memory_budget_does_not_cover() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..3 {
+            let bytes = envelope::encode(
+                FormatKind::StatisticsFile,
+                FormatVersion::V1,
+                format!("body {i}").as_bytes(),
+            );
+            std::fs::write(dir.path().join(format!("{i}.zysts")), bytes).expect("writes");
+        }
+        let registry = registry(MigrationPolicy::Eager);
+        let board = MigrationBoard::new();
+        // Every file is a few dozen bytes, and the volume reports eight free
+        let result = sweep_format(
+            &registry,
+            &board,
+            FormatKind::StatisticsFile,
+            dir.path(),
+            MigrationBudget {
+                disk_free_bytes: 8,
+                ..MigrationBudget::default()
+            },
+            0,
+        )
+        .expect("sweeps");
+        assert!(result.budget_exhausted);
+        assert_eq!(result.files_migrated, 0);
+        let untouched = std::fs::read(dir.path().join("0.zysts")).expect("reads");
+        let opened =
+            migration::open_as(&registry, &untouched, FormatKind::StatisticsFile).expect("opens");
+        assert_eq!(opened.version, FormatVersion::V1, "nothing moved");
+
+        let budget = MigrationBudget {
+            node_memory_bytes: 1_000,
+            memory_fraction: 0.25,
+            ..MigrationBudget::default()
+        };
+        assert!(budget.affords(250).is_ok());
+        let err = budget.affords(251).expect_err("over the fraction");
+        assert!(err.contains("250 bytes"), "{err}");
+        assert!(
+            MigrationBudget::default().affords(u64::MAX).is_ok(),
+            "unmeasured is unbounded"
+        );
     }
 
     #[test]

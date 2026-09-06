@@ -6,10 +6,11 @@
 //! version the next time it is written, which costs nothing on a read and
 //! nothing on a page that is never touched again.
 //!
-//! The file formats carry the full envelope. The columnar file and the index
-//! checkpoint are rewritten wholesale when they change, so they migrate on
-//! the next compaction and the next checkpoint respectively. The commit log
-//! is rewritten on every persist, so it migrates lazily with the next one
+//! The index checkpoint and the commit log carry the full envelope. The
+//! checkpoint is rewritten wholesale on the next checkpoint and the commit
+//! log on every persist, so each migrates with the next one. The columnar
+//! file carries the envelope header and a trailer of its own, and an old
+//! one is repacked by the upgrade sweep, whole, through its migration
 
 use zyron_common::format::FormatKind;
 use zyron_common::format::registry::{DeprecationStatus, FormatRegistration, MigrationPolicy};
@@ -18,10 +19,18 @@ use zyron_common::page::{
     BTREE_PAGE_FORMAT_VERSION, FSM_PAGE_FORMAT_VERSION, HEAP_PAGE_FORMAT_VERSION,
 };
 
-use crate::columnar::constants::ZYR_FORMAT_VERSION;
+use crate::columnar::constants::{ZYR_FORMAT_VERSION, ZYR_READER_WINDOW};
 
 /// The Zyron version these formats were last bumped in
 const GATE: &str = "0.11.0";
+
+/// The Zyron version the columnar file moved to 1.1 in
+const ZYR_GATE: &str = "0.12.0";
+
+/// The day the 1.0 columnar reader and its migration leave the tree. The
+/// eager sweep has moved every file long before, this is the date the
+/// release check holds the code to
+const ZYR_1_0_RETIREMENT: &str = "2027-03-01";
 
 /// Version the B+tree index checkpoint is written at
 pub const CHECKPOINT_FORMAT_VERSION: FormatVersion = FormatVersion::new(11, 0);
@@ -96,14 +105,14 @@ inventory::submit! {
     FormatRegistration {
         kind: FormatKind::ZyrColumnar,
         writer_current_version: ZYR_FORMAT_VERSION,
-        reader_supported_versions: VersionWindow::single(ZYR_FORMAT_VERSION),
-        migration_policy: MigrationPolicy::Lazy,
-        migration_reversible: true,
-        binary_version_gate: GATE,
+        reader_supported_versions: ZYR_READER_WINDOW,
+        migration_policy: MigrationPolicy::Eager,
+        migration_reversible: false,
+        binary_version_gate: ZYR_GATE,
         deprecation_status: DeprecationStatus::Active,
-        retirement_date: None,
+        retirement_date: Some(ZYR_1_0_RETIREMENT),
         downgrade_write_supported: false,
-        notes: "encoded column segments, lazy on next compaction",
+        notes: "segments aligned to 64 bytes behind a 512-byte header, the page-padded 1.0 is repacked by the eager sweep",
     }
 }
 
@@ -118,7 +127,7 @@ inventory::submit! {
         deprecation_status: DeprecationStatus::Active,
         retirement_date: None,
         downgrade_write_supported: false,
-        notes: "index arena pages and free lists, eager on the next checkpoint",
+        notes: "prefix-compressed keys and a locator column, eager on the next checkpoint",
     }
 }
 

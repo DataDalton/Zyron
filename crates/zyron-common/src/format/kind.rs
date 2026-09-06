@@ -70,6 +70,8 @@ pub enum FormatKind {
     StreamingCdcCheckpoint,
     /// App image bundle
     AppImageBundle,
+    /// Upgrade journal, the durable half of the upgrade board
+    UpgradeJournal,
 }
 
 /// One row of the magic byte allocation registry
@@ -141,7 +143,7 @@ pub const MAGIC_ALLOCATIONS: &[MagicAllocation] = &[
         kind: FormatKind::Checkpoint,
         magic: *b"ZCPT",
         owner: "zyron-storage",
-        doc: "B+tree index checkpoint holding arena pages and free lists",
+        doc: "B+tree index checkpoint holding a prefix-compressed key column and a locator column",
     },
     MagicAllocation {
         kind: FormatKind::BloomFilter,
@@ -257,6 +259,12 @@ pub const MAGIC_ALLOCATIONS: &[MagicAllocation] = &[
         owner: "zyron-server",
         doc: "App image bundle holding layers and its signed attestation",
     },
+    MagicAllocation {
+        kind: FormatKind::UpgradeJournal,
+        magic: *b"ZUPJ",
+        owner: "zyron-server",
+        doc: "Upgrade journal holding the settings, history, rewrite queue and any restart in progress",
+    },
 ];
 
 /// Every format kind, in allocation order
@@ -289,6 +297,7 @@ pub const ALL_FORMAT_KINDS: &[FormatKind] = &[
     FormatKind::WorkflowDefinitionOnDisk,
     FormatKind::StreamingCdcCheckpoint,
     FormatKind::AppImageBundle,
+    FormatKind::UpgradeJournal,
 ];
 
 impl FormatKind {
@@ -375,6 +384,7 @@ impl FormatKind {
             FormatKind::WorkflowDefinitionOnDisk => "workflow_definition_on_disk",
             FormatKind::StreamingCdcCheckpoint => "streaming_cdc_checkpoint",
             FormatKind::AppImageBundle => "app_image_bundle",
+            FormatKind::UpgradeJournal => "upgrade_journal",
         }
     }
 
@@ -421,6 +431,10 @@ impl FormatKind {
             | FormatKind::ReplicationApplyLog
             | FormatKind::DeletePredicate
             | FormatKind::LakeTransactionLog => Framing::RecordTag,
+            // An envelope header on a file whose trailer and checksums are
+            // the format's own, so the substrate reads the header and moves
+            // the file forward whole
+            FormatKind::ZyrColumnar | FormatKind::LakeManifest => Framing::OwnTrailer,
             _ => Framing::Envelope,
         }
     }
@@ -431,6 +445,9 @@ impl FormatKind {
 pub enum Framing {
     /// A 20-byte header and a 4-byte body checksum, in a file of its own
     Envelope,
+    /// A 20-byte envelope header on a file that ends in a trailer of its
+    /// own, checksummed by the format rather than by the envelope
+    OwnTrailer,
     /// A 9-byte stamp inside a container that checksums it
     Stamp,
     /// A `[format]` section in a hand-editable text file
@@ -443,6 +460,7 @@ impl Framing {
     pub const fn label(self) -> &'static str {
         match self {
             Framing::Envelope => "envelope",
+            Framing::OwnTrailer => "own_trailer",
             Framing::Stamp => "stamp",
             Framing::Text => "text",
             Framing::RecordTag => "record_tag",
@@ -452,11 +470,22 @@ impl Framing {
     /// Bytes the framing costs at the head of what it wraps
     pub const fn header_bytes(self) -> u32 {
         match self {
-            Framing::Envelope => super::envelope::ENVELOPE_HEADER_LEN as u32,
+            Framing::Envelope | Framing::OwnTrailer => super::envelope::ENVELOPE_HEADER_LEN as u32,
             Framing::Stamp => super::stamp::FORMAT_STAMP_LEN as u32,
             Framing::Text => 0,
             Framing::RecordTag => 1,
         }
+    }
+
+    /// Whether a migrator for this framing takes and returns the whole
+    /// file.
+    ///
+    /// The envelope framing hands a migrator the body alone and re-wraps
+    /// the result, which a format with a trailer of its own cannot allow,
+    /// because its checksums cover the header the envelope path would
+    /// restamp
+    pub const fn migrates_whole_file(self) -> bool {
+        matches!(self, Framing::OwnTrailer)
     }
 
     /// Bytes the framing costs at the tail
@@ -475,12 +504,20 @@ impl Framing {
                  [16..20) header_checksum, [20..header_length) extension, body, \
                  [len-4..len) body checksum"
             }
+            Framing::OwnTrailer => {
+                "[0..4) magic, [4..8) version, [8..12) header_length, [12..16) flags, \
+                 [16..20) header_checksum, [20..header_length) extension, body and a \
+                 trailer the format checksums itself"
+            }
             Framing::Stamp => {
                 "[0..4) magic, [4..6) major, [6..8) minor, [8] flags, body follows, \
                  integrity from the container"
             }
             Framing::Text => "[format] section with kind and version keys, body is TOML",
-            Framing::RecordTag => "per-record version tag, the record lives inside its container",
+            Framing::RecordTag => {
+                "[0] version tag, 1 through 254, the record lives inside its container. \
+                 0 marks an unwritten slot and 255 escapes to a two byte version"
+            }
         }
     }
 }

@@ -47,6 +47,7 @@ pub use branch::{
     BranchInfo, MergeOutcome, branch_info, create_branch, drop_branch, list_branches, merge_branch,
     open_branch, open_branch_shared,
 };
+pub use cells::sums_exactly;
 pub use changefeed::{
     ChangeDescriptor, ChangeKind, change_row_counts, changed_ordinals, changes_between,
 };

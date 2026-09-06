@@ -568,6 +568,7 @@ fn build_deprecation_warnings(substrate: &FormatSubstrate) -> ViewRows {
 
 fn build_protocol_versions(substrate: &FormatSubstrate) -> ViewRows {
     let fields = vec![
+        make_field("protocol", PG_TEXT_OID, -1),
         make_field("version", PG_INT4_OID, 4),
         make_field("status", PG_TEXT_OID, -1),
         make_field("accepted", PG_BOOL_OID, 1),
@@ -581,6 +582,7 @@ fn build_protocol_versions(substrate: &FormatSubstrate) -> ViewRows {
         .iter()
         .map(|version| {
             vec![
+                text(version.protocol.label()),
                 number(version.version),
                 text(version.status.label()),
                 boolean(version.status.is_accepted()),

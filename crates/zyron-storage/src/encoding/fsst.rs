@@ -24,8 +24,10 @@ const SYMBOL_TABLE_SIZE: usize = 256;
 /// Escape byte: the next byte in compressed output is a literal, not a symbol code.
 const ESCAPE_BYTE: u8 = 0xFF;
 
-/// Number of iterative refinement rounds for symbol table building.
-const REFINEMENT_ROUNDS: usize = 5;
+/// Refinement rounds a symbol table is trained for. A symbol grows by one
+/// neighbour a round, so eight rounds reach the longest symbol from single
+/// bytes with rounds to spare for the table to settle
+const REFINEMENT_ROUNDS: usize = 8;
 
 /// Encoded format:
 ///   [0..4]     row_count: u32
@@ -53,35 +55,23 @@ impl Encoding for FsstEncoding {
             return Ok(out);
         }
 
-        // Extract individual strings from the data
         let strings = extract_strings(data, row_count, value_size)?;
-
-        // Build symbol table with iterative refinement on a larger sample
-        let sampleSize = strings.len().min(1024);
-        let symbolTable = build_symbol_table_iterative(&strings[..sampleSize]);
+        let table = train_symbol_table(&training_sample(&strings));
 
         // Serialize symbol table
-        let mut tableBytes = Vec::new();
-        let mut symbolCount = 0u32;
-        for sym in &symbolTable {
-            if sym.is_empty() {
-                break;
-            }
-            tableBytes.push(sym.len() as u8);
-            tableBytes.extend_from_slice(sym);
-            symbolCount += 1;
+        let mut tableBytes = Vec::with_capacity(table.len() * (MAX_SYMBOL_LEN + 1));
+        for sym in &table {
+            tableBytes.push(sym.len);
+            tableBytes.extend_from_slice(&sym.bytes()[..sym.len as usize]);
         }
+        let symbolCount = table.len() as u32;
 
-        // Build hash index once, then compress all strings using it
-        let symbolIndex = build_symbol_index(&symbolTable, symbolCount as usize);
-        let maxSymLen = max_symbol_length(&symbolTable, symbolCount as usize);
-
-        let mut compressedData = Vec::new();
+        let matcher = Matcher::new(&table);
+        let mut compressedData = Vec::with_capacity(data.len());
         let mut rowLengths = Vec::with_capacity(row_count);
-
         for s in &strings {
             let startLen = compressedData.len();
-            compress_string_with_index(s, &symbolIndex, maxSymLen, &mut compressedData);
+            matcher.compress(s, &mut compressedData);
             rowLengths.push((compressedData.len() - startLen) as u32);
         }
 
@@ -381,10 +371,12 @@ impl Encoding for FsstEncoding {
                 pos += len;
             }
 
-            if tableOk {
+            // A table the matcher cannot hold is a table the decoder will
+            // refuse too, so the comparison falls through to the decode
+            if tableOk && let Some(matcher) = Matcher::from_table_bytes(&symbolTable) {
                 // Compress the search term with the same symbol table
                 let mut compressedTarget = Vec::new();
-                compress_string(target, &symbolTable, symbolCount, &mut compressedTarget);
+                matcher.compress(target, &mut compressedTarget);
 
                 // Read bit-packed offsets
                 let totalOffsetBits = row_count as u64 * offsetBitWidth as u64;
@@ -548,247 +540,302 @@ fn decode_fsst_varlen_range(
     Ok(varlen_pack(&refs))
 }
 
-/// Builds a symbol table using iterative refinement.
-/// Each round compresses the sample with the current table, then rebuilds
-/// the table from the compressed output's escape sequences, capturing
-/// multi-byte patterns that span previous symbols.
-fn build_symbol_table_iterative(sample: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut table = build_symbol_table_from_raw(sample);
-
-    for _ in 0..REFINEMENT_ROUNDS {
-        // Compress the sample with the current table
-        let symbolCount = table
-            .iter()
-            .position(|s| s.is_empty())
-            .unwrap_or(table.len());
-        let mut escapedSegments: Vec<Vec<u8>> = Vec::new();
-
-        for s in sample {
-            let mut compressed = Vec::new();
-            compress_string(s, &table, symbolCount, &mut compressed);
-
-            // Collect runs of escaped (literal) bytes as candidates for new symbols
-            let mut segment = Vec::new();
-            let mut i = 0;
-            while i < compressed.len() {
-                if compressed[i] == ESCAPE_BYTE && i + 1 < compressed.len() {
-                    segment.push(compressed[i + 1]);
-                    i += 2;
-                } else {
-                    if segment.len() >= 2 {
-                        escapedSegments.push(segment.clone());
-                    }
-                    segment.clear();
-                    i += 1;
-                }
-            }
-            if segment.len() >= 2 {
-                escapedSegments.push(segment);
-            }
-        }
-
-        // Build new candidate table from raw sample plus escape patterns
-        let newTable = build_symbol_table_from_raw(sample);
-
-        // Merge: keep symbols from both tables, ranked by frequency
-        let mut merged = merge_symbol_tables(&table, &newTable, sample);
-
-        // Add multi-byte escape patterns as new symbols
-        let mut escapeFreq: hashbrown::HashMap<Vec<u8>, usize> = hashbrown::HashMap::new();
-        for seg in &escapedSegments {
-            for len in 2..=MAX_SYMBOL_LEN.min(seg.len()) {
-                for start in 0..=seg.len() - len {
-                    let substr = seg[start..start + len].to_vec();
-                    if !substr.contains(&ESCAPE_BYTE) {
-                        *escapeFreq.entry(substr).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-
-        let mut escapeCandidates: Vec<(Vec<u8>, usize)> = escapeFreq.into_iter().collect();
-        escapeCandidates.sort_by(|a, b| {
-            let ba = a.1 * (a.0.len() - 1);
-            let bb = b.1 * (b.0.len() - 1);
-            bb.cmp(&ba)
-        });
-
-        for (sym, _) in escapeCandidates {
-            if merged.len() >= SYMBOL_TABLE_SIZE - 1 {
-                break;
-            }
-            if !merged.contains(&sym) {
-                merged.push(sym);
-            }
-        }
-
-        table = merged;
-    }
-
-    table
+/// A symbol as the trainer and the matcher hold it: its bytes packed little
+/// endian into one word, zero padded, and its length. Two symbols are equal
+/// exactly when their bytes are, so a word and a length key a map directly
+/// and a candidate matches the input by one masked compare
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Symbol {
+    word: u64,
+    len: u8,
 }
 
-/// Builds a symbol table from raw input strings using frequency analysis.
-fn build_symbol_table_from_raw(sample: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut freq: hashbrown::HashMap<Vec<u8>, usize> = hashbrown::HashMap::new();
+/// Mask of the low `len` bytes of a word, indexed by length
+const WORD_MASKS: [u64; MAX_SYMBOL_LEN + 1] = [
+    0,
+    0xFF,
+    0xFFFF,
+    0xFF_FFFF,
+    0xFFFF_FFFF,
+    0xFF_FFFF_FFFF,
+    0xFFFF_FFFF_FFFF,
+    0xFF_FFFF_FFFF_FFFF,
+    u64::MAX,
+];
 
-    // Count substring frequencies for lengths 1..=MAX_SYMBOL_LEN
-    for s in sample {
-        for len in 1..=MAX_SYMBOL_LEN.min(s.len()) {
-            for start in 0..=s.len() - len {
-                let substr = &s[start..start + len];
-                *freq.entry(substr.to_vec()).or_insert(0) += 1;
-            }
+/// Symbols a table holds at most, one code short of the byte range so the
+/// escape keeps its value
+const MAX_SYMBOLS: usize = SYMBOL_TABLE_SIZE - 1;
+
+/// Bytes the training sample is held to.
+///
+/// Training is several passes over the sample, so its size is the cost of
+/// building the table, and a table learned from this much of a column
+/// compresses the rest of it about as well as one learned from all of it
+const SAMPLE_BYTES_MAX: usize = 32 << 10;
+
+/// Strings the training sample draws from at most
+const SAMPLE_STRINGS_MAX: usize = 1024;
+
+/// Bytes a string contributes to the sample at least, however many strings
+/// share the budget, so a long string still shows training a run of it
+const SAMPLE_WINDOW_MIN: usize = 64;
+
+/// Bytes of the sample the first table is seeded from.
+///
+/// The seed counts every run of one to eight bytes, which is eight
+/// candidates per byte and the one pass that costs more than the sample is
+/// long. A few kilobytes of it are enough to put every alignment of a
+/// repeated run in the first table, which is what the seed is for: a table
+/// grown from pairs alone holds only the alignments the greedy match
+/// happened to produce, and a variable run ahead of a constant one leaves
+/// those misaligned for good
+const SEED_BYTES_MAX: usize = 4 << 10;
+
+impl Symbol {
+    /// The symbol for a run of one to eight bytes
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let len = bytes.len().min(MAX_SYMBOL_LEN);
+        let mut packed = [0u8; 8];
+        packed[..len].copy_from_slice(&bytes[..len]);
+        Self {
+            word: u64::from_le_bytes(packed),
+            len: len as u8,
         }
     }
 
-    // Sort by benefit: frequency * (length - 1) gives bytes saved
-    let mut candidates: Vec<(Vec<u8>, usize)> = freq
-        .into_iter()
-        .filter(|(sym, count)| {
-            let benefit = *count * (sym.len().saturating_sub(1));
-            benefit > 0 && !sym.contains(&ESCAPE_BYTE)
+    fn bytes(&self) -> [u8; 8] {
+        self.word.to_le_bytes()
+    }
+
+    /// This symbol followed by another, when the two fit one symbol
+    fn followed_by(self, next: Symbol) -> Option<Symbol> {
+        let len = self.len as usize + next.len as usize;
+        if len > MAX_SYMBOL_LEN {
+            return None;
+        }
+        Some(Symbol {
+            word: self.word | (next.word << (8 * self.len as u32)),
+            len: len as u8,
         })
-        .collect();
-
-    candidates.sort_by(|a, b| {
-        let benefitA = a.1 * (a.0.len() - 1);
-        let benefitB = b.1 * (b.0.len() - 1);
-        benefitB.cmp(&benefitA)
-    });
-
-    // Take top symbols (max 254 to reserve 0xFF as escape)
-    let maxSymbols = SYMBOL_TABLE_SIZE - 1;
-    let mut table: Vec<Vec<u8>> = Vec::with_capacity(maxSymbols);
-
-    for (sym, _) in candidates.into_iter().take(maxSymbols) {
-        table.push(sym);
     }
 
-    table
+    /// Whether any byte of the symbol is the escape byte, which a symbol
+    /// never holds so a code and an escaped literal stay apart
+    fn contains_escape(&self) -> bool {
+        self.bytes()[..self.len as usize].contains(&ESCAPE_BYTE)
+    }
 }
 
-/// Merges two symbol tables, keeping the best symbols by benefit on the sample.
-fn merge_symbol_tables(a: &[Vec<u8>], b: &[Vec<u8>], sample: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut freq: hashbrown::HashMap<Vec<u8>, usize> = hashbrown::HashMap::new();
+/// Greedy longest match over a symbol table.
+///
+/// Candidates are kept per first byte, longest first, so a position reads
+/// one word of input, walks the few symbols that start with its byte and
+/// takes the first whose masked word matches. No hashing, no allocation,
+/// and no work per position for the symbols that cannot start there
+struct Matcher {
+    /// Per first byte, the word, length and code of every symbol starting
+    /// with it, longest first
+    buckets: Vec<Vec<(u64, u8, u8)>>,
+}
 
-    // Count actual occurrences in sample for all candidate symbols
-    let mut allSymbols: Vec<&Vec<u8>> = Vec::new();
-    for s in a {
-        if !s.is_empty() {
-            allSymbols.push(s);
+impl Matcher {
+    fn new(table: &[Symbol]) -> Self {
+        let mut buckets: Vec<Vec<(u64, u8, u8)>> = vec![Vec::new(); 256];
+        for (code, sym) in table.iter().enumerate().take(MAX_SYMBOLS) {
+            buckets[(sym.word & 0xFF) as usize].push((sym.word, sym.len, code as u8));
         }
-    }
-    for s in b {
-        if !s.is_empty() && !a.contains(s) {
-            allSymbols.push(s);
+        for bucket in &mut buckets {
+            bucket.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
         }
+        Self { buckets }
     }
 
-    for sym in &allSymbols {
-        let mut count = 0;
-        for s in sample {
-            let mut pos = 0;
-            while pos + sym.len() <= s.len() {
-                if &s[pos..pos + sym.len()] == sym.as_slice() {
-                    count += 1;
-                    pos += sym.len();
-                } else {
-                    pos += 1;
+    /// A matcher over a table read back from a segment, or None when an
+    /// entry is not a symbol the format allows
+    fn from_table_bytes(table: &[Vec<u8>]) -> Option<Self> {
+        if table.len() > MAX_SYMBOLS
+            || table
+                .iter()
+                .any(|s| s.is_empty() || s.len() > MAX_SYMBOL_LEN)
+        {
+            return None;
+        }
+        let symbols: Vec<Symbol> = table.iter().map(|s| Symbol::from_bytes(s)).collect();
+        Some(Self::new(&symbols))
+    }
+
+    /// The longest symbol matching the input at `at`, as its length and code
+    #[inline]
+    fn longest_at(&self, input: &[u8], at: usize) -> Option<(u8, u8)> {
+        let remaining = input.len() - at;
+        let word = word_at(input, at);
+        self.buckets[(word & 0xFF) as usize]
+            .iter()
+            .find(|&&(sym_word, len, _)| {
+                len as usize <= remaining && (word & WORD_MASKS[len as usize]) == sym_word
+            })
+            .map(|&(_, len, code)| (len, code))
+    }
+
+    /// Compresses one string, appending codes and escaped literals
+    fn compress(&self, input: &[u8], out: &mut Vec<u8>) {
+        let mut at = 0;
+        while at < input.len() {
+            match self.longest_at(input, at) {
+                Some((len, code)) => {
+                    out.push(code);
+                    at += len as usize;
+                }
+                None => {
+                    out.push(ESCAPE_BYTE);
+                    out.push(input[at]);
+                    at += 1;
                 }
             }
         }
-        if count > 0 {
-            freq.insert((*sym).clone(), count);
-        }
     }
 
-    let mut ranked: Vec<(Vec<u8>, usize)> = freq.into_iter().collect();
-    ranked.sort_by(|a, b| {
-        let ba = a.1 * (a.0.len() - 1);
-        let bb = b.1 * (b.0.len() - 1);
-        bb.cmp(&ba)
-    });
+    /// Splits one string into the symbols compression would emit, a
+    /// literal byte standing as a symbol of its own, and returns the bytes
+    /// the compressed form takes
+    fn tokenize(&self, input: &[u8], tokens: &mut Vec<Symbol>) -> usize {
+        let mut at = 0;
+        let mut bytes = 0;
+        while at < input.len() {
+            match self.longest_at(input, at) {
+                Some((len, _)) => {
+                    tokens.push(Symbol::from_bytes(&input[at..at + len as usize]));
+                    at += len as usize;
+                    bytes += 1;
+                }
+                None => {
+                    tokens.push(Symbol::from_bytes(&input[at..at + 1]));
+                    at += 1;
+                    bytes += 2;
+                }
+            }
+        }
+        bytes
+    }
+}
 
-    let maxSymbols = SYMBOL_TABLE_SIZE - 1;
+/// The word of input at `at`, zero padded past the end
+#[inline]
+fn word_at(input: &[u8], at: usize) -> u64 {
+    let mut packed = [0u8; 8];
+    let take = (input.len() - at).min(8);
+    packed[..take].copy_from_slice(&input[at..at + take]);
+    u64::from_le_bytes(packed)
+}
+
+/// The table ranked out of a gain per candidate: the top of the ranking by
+/// gain, ties shorter then smaller, so the table is a function of the
+/// counts alone
+fn rank_table(gains: &hashbrown::HashMap<Symbol, u64>) -> Vec<Symbol> {
+    let mut ranked: Vec<(Symbol, u64)> = gains
+        .iter()
+        .filter(|(sym, _)| !sym.contains_escape())
+        .map(|(sym, gain)| (*sym, *gain))
+        .collect();
+    ranked.sort_unstable_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(a.0.len.cmp(&b.0.len))
+            .then(a.0.word.cmp(&b.0.word))
+    });
     ranked
         .into_iter()
-        .take(maxSymbols)
-        .map(|(s, _)| s)
+        .take(MAX_SYMBOLS)
+        .map(|(sym, _)| sym)
         .collect()
 }
 
-/// Builds a hash-based lookup index from the symbol table for O(1) substring matching.
-/// Returns a HashMap keyed by (length, bytes) for each symbol, mapping to its code index.
-fn build_symbol_index(
-    symbolTable: &[Vec<u8>],
-    symbolCount: usize,
-) -> hashbrown::HashMap<Vec<u8>, u8> {
-    let mut index = hashbrown::HashMap::with_capacity(symbolCount);
-    for (code, sym) in symbolTable.iter().enumerate().take(symbolCount) {
-        if !sym.is_empty() {
-            index.insert(sym.clone(), code as u8);
+/// The first table: every run of one to eight bytes in the head of the
+/// sample, ranked by the bytes it covers
+fn seeded_table(sample: &[&[u8]], gains: &mut hashbrown::HashMap<Symbol, u64>) -> Vec<Symbol> {
+    gains.clear();
+    let mut budget = SEED_BYTES_MAX;
+    for s in sample {
+        if budget == 0 {
+            break;
         }
-    }
-    index
-}
-
-/// Computes the maximum symbol length in the table.
-fn max_symbol_length(symbolTable: &[Vec<u8>], symbolCount: usize) -> usize {
-    symbolTable
-        .iter()
-        .take(symbolCount)
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(0)
-}
-
-/// Compresses a single string using the symbol table.
-/// Uses greedy longest-match with hash-based lookup: at each position,
-/// try substrings from longest to shortest until a symbol match is found.
-/// If no symbol matches, emit ESCAPE_BYTE + literal byte.
-fn compress_string(
-    input: &[u8],
-    symbol_table: &[Vec<u8>],
-    symbol_count: usize,
-    output: &mut Vec<u8>,
-) {
-    let index = build_symbol_index(symbol_table, symbol_count);
-    let maxLen = max_symbol_length(symbol_table, symbol_count);
-    compress_string_with_index(input, &index, maxLen, output);
-}
-
-/// Inner compression using a pre-built hash index. Avoids rebuilding the
-/// index when compressing multiple strings with the same symbol table.
-fn compress_string_with_index(
-    input: &[u8],
-    index: &hashbrown::HashMap<Vec<u8>, u8>,
-    maxSymLen: usize,
-    output: &mut Vec<u8>,
-) {
-    let mut i = 0;
-    while i < input.len() {
-        let mut matched = false;
-        let remaining = input.len() - i;
-        let tryLen = remaining.min(maxSymLen);
-
-        // Try longest substrings first for greedy longest-match
-        for len in (1..=tryLen).rev() {
-            let substr = &input[i..i + len];
-            if let Some(&code) = index.get(substr) {
-                output.push(code);
-                i += len;
-                matched = true;
-                break;
+        let take = s.len().min(budget);
+        budget -= take;
+        let s = &s[..take];
+        for start in 0..s.len() {
+            let word = word_at(s, start);
+            for len in 1..=MAX_SYMBOL_LEN.min(s.len() - start) {
+                let sym = Symbol {
+                    word: word & WORD_MASKS[len],
+                    len: len as u8,
+                };
+                *gains.entry(sym).or_insert(0) += len as u64;
             }
         }
+    }
+    rank_table(gains)
+}
 
-        if !matched {
-            output.push(ESCAPE_BYTE);
-            output.push(input[i]);
-            i += 1;
+/// The strings training reads: up to the string cap, spread over the
+/// column rather than taken from its head, each contributing a window of
+/// itself sized so the whole sample stays within the byte budget. The
+/// window slides along the column so the sample sees the strings' tails as
+/// well as their heads
+fn training_sample<'a>(strings: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    let step = strings.len().div_ceil(SAMPLE_STRINGS_MAX).max(1);
+    let picked = strings.len().div_ceil(step);
+    let window = (SAMPLE_BYTES_MAX / picked.max(1)).max(SAMPLE_WINDOW_MIN);
+    let mut sample = Vec::with_capacity(picked);
+    for (k, s) in strings.iter().step_by(step).enumerate() {
+        if s.len() <= window {
+            sample.push(*s);
+        } else {
+            let offset = (k * 61) % (s.len() - window + 1);
+            sample.push(&s[offset..offset + window]);
         }
     }
+    sample
+}
+
+/// The symbol table the sample settles on.
+///
+/// The first table is seeded from the runs in the sample. Each round then
+/// compresses the sample with the table in hand and counts what came out:
+/// every symbol by the bytes it covered, and every adjacent pair by the
+/// bytes the two would cover as one. The next table is the top of that
+/// ranking, so a symbol that is used keeps its place, one that is not
+/// falls out, and a pair that is used grows into one symbol. The table
+/// kept is the one that compressed the sample smallest
+fn train_symbol_table(sample: &[&[u8]]) -> Vec<Symbol> {
+    let mut gains: hashbrown::HashMap<Symbol, u64> = hashbrown::HashMap::new();
+    let mut table = seeded_table(sample, &mut gains);
+    let mut best: Option<(usize, Vec<Symbol>)> = None;
+    let mut tokens: Vec<Symbol> = Vec::new();
+    for round in 0..=REFINEMENT_ROUNDS {
+        let matcher = Matcher::new(&table);
+        gains.clear();
+        let mut compressed = 0usize;
+        for s in sample {
+            tokens.clear();
+            compressed += matcher.tokenize(s, &mut tokens);
+            let mut prev: Option<Symbol> = None;
+            for &token in &tokens {
+                *gains.entry(token).or_insert(0) += token.len as u64;
+                if let Some(joined) = prev.and_then(|p| p.followed_by(token)) {
+                    *gains.entry(joined).or_insert(0) += joined.len as u64;
+                }
+                prev = Some(token);
+            }
+        }
+        if best.as_ref().is_none_or(|(size, _)| compressed < *size) {
+            best = Some((compressed, table.clone()));
+        }
+        if round == REFINEMENT_ROUNDS {
+            break;
+        }
+        table = rank_table(&gains);
+    }
+    best.map(|(_, table)| table).unwrap_or_default()
 }
 
 /// Packs a u64 value at the given bit offset.
@@ -960,5 +1007,104 @@ mod tests {
 
         let decoded = enc.decode(&encoded, n, 32).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// The symbol table read back from an encoded segment
+    fn symbols_of(encoded: &[u8]) -> Vec<Vec<u8>> {
+        let count = u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
+        let mut pos = 14;
+        let mut table = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = encoded[pos] as usize;
+            table.push(encoded[pos + 1..pos + 1 + len].to_vec());
+            pos += 1 + len;
+        }
+        table
+    }
+
+    // A label column, the shape a lake table's text column takes, encodes
+    // smaller than raw, decodes to what went in, and encodes to the same
+    // bytes every time
+    #[test]
+    fn test_label_column_roundtrips_and_is_deterministic() {
+        let labels: Vec<Vec<u8>> = (0..10_000)
+            .map(|i| format!("row-{:08}", i).into_bytes())
+            .collect();
+        let vals: Vec<Option<&[u8]>> = labels.iter().map(|l| Some(l.as_slice())).collect();
+        let raw = crate::encoding::varlen_pack(&vals);
+        let enc = FsstEncoding;
+        let encoded = enc.encode(&raw, vals.len(), 0).expect("encode");
+        assert!(
+            encoded.len() * 2 < raw.len(),
+            "{} encoded bytes for {} raw",
+            encoded.len(),
+            raw.len()
+        );
+        assert_eq!(enc.decode(&encoded, vals.len(), 0).expect("decode"), raw);
+        assert_eq!(enc.encode(&raw, vals.len(), 0).expect("encode"), encoded);
+        assert!(
+            symbols_of(&encoded)
+                .iter()
+                .all(|s| s.len() <= MAX_SYMBOL_LEN)
+        );
+    }
+
+    // Strings far longer than the sample budget train on a bounded sample
+    // and still round-trip
+    #[test]
+    fn test_long_strings_train_on_a_bounded_sample() {
+        let rows: Vec<Vec<u8>> = (0..200)
+            .map(|i| format!("{i:04}-").repeat(300).into_bytes())
+            .collect();
+        let vals: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(r.as_slice())).collect();
+        let raw = crate::encoding::varlen_pack(&vals);
+        let enc = FsstEncoding;
+        let encoded = enc.encode(&raw, vals.len(), 0).expect("encode");
+        assert!(encoded.len() < raw.len());
+        assert_eq!(enc.decode(&encoded, vals.len(), 0).expect("decode"), raw);
+    }
+
+    // The escape byte never lands inside a symbol, so a run of it is
+    // carried as literals and comes back intact
+    #[test]
+    fn test_symbols_never_hold_the_escape_byte() {
+        let rows: Vec<Vec<u8>> = (0..500)
+            .map(|i| {
+                let mut r = vec![ESCAPE_BYTE, ESCAPE_BYTE, b'a', ESCAPE_BYTE, b'b'];
+                r.extend_from_slice(format!("{}", i % 7).as_bytes());
+                r
+            })
+            .collect();
+        let vals: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(r.as_slice())).collect();
+        let raw = crate::encoding::varlen_pack(&vals);
+        let enc = FsstEncoding;
+        let encoded = enc.encode(&raw, vals.len(), 0).expect("encode");
+        assert!(
+            symbols_of(&encoded)
+                .iter()
+                .all(|s| !s.contains(&ESCAPE_BYTE))
+        );
+        assert_eq!(enc.decode(&encoded, vals.len(), 0).expect("decode"), raw);
+    }
+
+    // The equality fast path compresses the search term with the stored
+    // table and compares compressed rows, which must agree with a decode
+    #[test]
+    fn test_equality_predicate_matches_through_the_symbol_table() {
+        let rows: Vec<Vec<u8>> = (0..300)
+            .map(|i| format!("item-{:03}-{}", i % 50, i % 3).into_bytes())
+            .collect();
+        let vals: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(r.as_slice())).collect();
+        let raw = crate::encoding::varlen_pack(&vals);
+        let enc = FsstEncoding;
+        let encoded = enc.encode(&raw, vals.len(), 0).expect("encode");
+        let target = b"item-007-1".to_vec();
+        let mask = enc
+            .eval_predicate(&encoded, vals.len(), 0, &Predicate::Equality(&target))
+            .expect("predicate");
+        for (row, value) in rows.iter().enumerate() {
+            let set = mask[row / 8] & (1 << (row % 8)) != 0;
+            assert_eq!(set, *value == target, "row {row}");
+        }
     }
 }

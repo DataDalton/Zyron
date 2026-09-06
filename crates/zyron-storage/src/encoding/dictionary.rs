@@ -4,7 +4,13 @@
 //! so 10 distinct values use 4-bit codes instead of 32-bit codes.
 //! Predicate evaluation resolves the search term to a code via binary search
 //! on the dictionary, then scans the code array without decoding.
+//!
+//! The code array is the same sequential bit packing FastLanes uses, so a
+//! decode unpacks a range of codes through that kernel in one pass and then
+//! gathers each row's entry, and a predicate tests unpacked codes a block at
+//! a time.
 
+use super::unpack::Packed;
 use crate::encoding::{
     Encoding, EncodingType, Predicate, bitmask_from_rows, range_admits, slice_rows,
 };
@@ -120,69 +126,17 @@ impl Encoding for DictionaryEncoding {
         Ok(out)
     }
 
+    /// A whole column is the range of every row, so the two share one path
     fn decode(&self, encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-
         if encoded.len() < 8 {
             return Err(ZyronError::DecodingFailed(
                 "dictionary header too short".to_string(),
             ));
         }
-
-        if value_size == 0 {
-            return decode_varlen(encoded, row_count);
-        }
-
-        let storedValueSize =
-            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
-        if storedValueSize != value_size {
-            return Err(ZyronError::DecodingFailed(format!(
-                "dictionary value_size mismatch: stored {}, expected {}",
-                storedValueSize, value_size
-            )));
-        }
-
-        let dictCount =
-            u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
-
-        let dictStart = 8;
-        let dictEnd = dictStart + dictCount * value_size;
-
-        // Bit width for codes
-        let codeBitWidth = if dictCount <= 1 {
-            1u8
-        } else {
-            (32 - (dictCount as u32 - 1).leading_zeros()) as u8
-        };
-
-        let packedStart = dictEnd;
-
-        if encoded.len() < packedStart {
-            return Err(ZyronError::DecodingFailed(
-                "dictionary data truncated".to_string(),
-            ));
-        }
-
-        let packed = &encoded[packedStart..];
-        let mut out = Vec::with_capacity(row_count * value_size);
-
-        for i in 0..row_count {
-            let code = unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as usize;
-
-            if code >= dictCount {
-                return Err(ZyronError::DecodingFailed(format!(
-                    "dictionary code {} out of range (dict_count={})",
-                    code, dictCount
-                )));
-            }
-
-            let valOffset = dictStart + code * value_size;
-            out.extend_from_slice(&encoded[valOffset..valOffset + value_size]);
-        }
-
-        Ok(out)
+        self.decode_range(encoded, row_count, value_size, 0, row_count)
     }
 
     /// Codes are fixed width, so row i's code sits at bit offset
@@ -232,20 +186,14 @@ impl Encoding for DictionaryEncoding {
                 "dictionary data truncated".to_string(),
             ));
         }
-        let packed = &encoded[dictEnd..];
-        let mut out = Vec::with_capacity((end - start) * value_size);
-        for i in start..end {
-            let code = unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as usize;
-            if code >= dictCount {
-                return Err(ZyronError::DecodingFailed(format!(
-                    "dictionary code {} out of range (dict_count={})",
-                    code, dictCount
-                )));
-            }
-            let valOffset = dictStart + code * value_size;
-            out.extend_from_slice(&encoded[valOffset..valOffset + value_size]);
-        }
-        Ok(out)
+        gather(
+            &encoded[dictStart..dictEnd],
+            value_size,
+            &encoded[dictEnd..],
+            codeBitWidth,
+            start,
+            end,
+        )
     }
 
     fn eval_predicate(
@@ -323,22 +271,13 @@ impl Encoding for DictionaryEncoding {
             return Ok(vec![0u8; bitmaskLen]);
         }
 
-        // Scan code array, checking membership. An equality resolves to one
-        // code, and comparing against it directly is what a point lookup on
-        // a dictionary column runs per row
-        matchingCodes.sort_unstable();
-        let packed = &encoded[packedStart..];
-        let code_at =
-            |i: usize| unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as u32;
-        Ok(match matchingCodes.as_slice() {
-            [only] => {
-                let only = *only;
-                bitmask_from_rows(row_count, |i| code_at(i) == only)
-            }
-            _ => bitmask_from_rows(row_count, |i| {
-                matchingCodes.binary_search(&code_at(i)).is_ok()
-            }),
-        })
+        Ok(bitmask_from_codes(
+            &encoded[packedStart..],
+            codeBitWidth,
+            dictCount,
+            row_count,
+            &matchingCodes,
+        ))
     }
 }
 
@@ -444,9 +383,12 @@ fn encode_varlen(data: &[u8], row_count: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Reads the variable-length dictionary container header. Returns
-/// (dict_count, dict offsets, blob slice, packed code slice).
-fn read_varlen_container(encoded: &[u8]) -> Result<(usize, Vec<u32>, &[u8], &[u8])> {
+/// The parts of a variable-length dictionary container: entry count, entry
+/// offsets, the entry blob and the packed code array
+type VarlenContainer<'a> = (usize, Vec<u32>, &'a [u8], &'a [u8]);
+
+/// Reads the variable-length dictionary container header
+fn read_varlen_container(encoded: &[u8]) -> Result<VarlenContainer<'_>> {
     if encoded.len() < 12 {
         return Err(ZyronError::DecodingFailed(
             "varlen dictionary header too short".to_string(),
@@ -489,23 +431,16 @@ fn varlen_dict_entry<'a>(blob: &'a [u8], offsets: &[u32], i: usize) -> &'a [u8] 
     &blob[offsets[i] as usize..offsets[i + 1] as usize]
 }
 
-/// Decodes a variable-length dictionary directly into the canonical buffer in
-/// a single allocation. The prior path built Vec<&[u8]> then Vec<Option<..>>
-/// then varlen_pack (three allocations + an extra pass) for a 1M-row column;
-/// here the codes are unpacked once to size the output, then again to fill it,
-/// writing the header, offset array, and blob in place.
-fn decode_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
-    decode_varlen_range(encoded, row_count, 0, row_count)
-}
-
-/// Rebuilds the canonical varlen buffer for one row range.
+/// Rebuilds the canonical varlen buffer for one row range in a single
+/// allocation, header, offset array and blob written in place.
 ///
 /// The output offsets are relative to the buffer being built, so a range
 /// has to write its own offset array whatever it reads. That is repacking
 /// the range, not reading the segment: the codes are fixed width, so row i
 /// sits at bit offset `i * code_bits` and the range unpacks only its own,
 /// and the dictionary entries stay where they are, so only the range's
-/// values are copied.
+/// values are copied. The codes come out once, and each row's length is a
+/// lookup in a table of entry lengths by code
 fn decode_varlen_range(
     encoded: &[u8],
     row_count: usize,
@@ -516,42 +451,23 @@ fn decode_varlen_range(
     let code_bits = code_bit_width(dict_count);
     let end = end.min(row_count);
     let start = start.min(end);
+    let codes = codes_in(packed, code_bits, dict_count, start, end)?;
+    let lengths: Vec<u32> = offsets.windows(2).map(|w| w[1] - w[0]).collect();
 
-    let code_at = |i: usize| -> Result<usize> {
-        let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as usize;
-        if code >= dict_count {
-            return Err(ZyronError::DecodingFailed(format!(
-                "varlen dictionary code {} out of range (dict_count={})",
-                code, dict_count
-            )));
-        }
-        Ok(code)
-    };
-
-    let rows = end - start;
-    // Pass 1: total decoded blob length, which validates the range's codes
-    let mut blob_total: usize = 0;
-    for i in start..end {
-        let code = code_at(i)?;
-        blob_total += varlen_dict_entry(blob, &offsets, code).len();
-    }
-
+    let rows = codes.len();
+    let blob_total: usize = codes.iter().map(|&c| lengths[c as usize] as usize).sum();
     let header = 4 + 4 * (rows + 1);
-    let mut out = Vec::with_capacity(header + blob_total);
-    out.extend_from_slice(&(rows as u32).to_le_bytes());
-
-    // Pass 2a: cumulative offset array.
+    let mut out = vec![0u8; header];
+    out.reserve(blob_total);
+    out[..4].copy_from_slice(&(rows as u32).to_le_bytes());
     let mut cursor: u32 = 0;
-    out.extend_from_slice(&cursor.to_le_bytes());
-    for i in start..end {
-        let code = code_at(i)?;
-        cursor += varlen_dict_entry(blob, &offsets, code).len() as u32;
-        out.extend_from_slice(&cursor.to_le_bytes());
+    for (i, &c) in codes.iter().enumerate() {
+        cursor += lengths[c as usize];
+        let at = 8 + 4 * i;
+        out[at..at + 4].copy_from_slice(&cursor.to_le_bytes());
     }
-    // Pass 2b: values blob.
-    for i in start..end {
-        let code = code_at(i)?;
-        out.extend_from_slice(varlen_dict_entry(blob, &offsets, code));
+    for &c in &codes {
+        out.extend_from_slice(varlen_dict_entry(blob, &offsets, c as usize));
     }
     Ok(out)
 }
@@ -611,15 +527,164 @@ fn eval_predicate_varlen(
     if matching.is_empty() {
         return Ok(vec![0u8; bitmask_len]);
     }
-    matching.sort_unstable();
-    let code_at = |i: usize| unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as u32;
-    Ok(match matching.as_slice() {
-        [only] => {
-            let only = *only;
-            bitmask_from_rows(row_count, |i| code_at(i) == only)
+    Ok(bitmask_from_codes(
+        packed, code_bits, dict_count, row_count, &matching,
+    ))
+}
+
+/// Rows per block of unpacked codes. A block of eight byte codes stays in
+/// the first level cache while it is gathered or tested, and a multiple of
+/// eight rows keeps a block's bitmask on whole bytes
+const CODE_BLOCK: usize = 4096;
+
+/// Runs `each` over the codes of rows `start..end` a block at a time, with
+/// the block's offset from `start`, after checking every code of the block
+/// against the dictionary size in one pass over it
+fn for_code_blocks(
+    packed: &[u8],
+    code_bits: u8,
+    dict_count: usize,
+    start: usize,
+    end: usize,
+    mut each: impl FnMut(usize, &[u64]),
+) -> Result<()> {
+    let stream = Packed::new(packed, code_bits);
+    let mut codes = Vec::new();
+    let mut at = start;
+    while at < end {
+        let n = CODE_BLOCK.min(end - at);
+        stream.unpack_reusing(at, n, &mut codes);
+        if let Some(&widest) = codes.iter().max()
+            && widest as usize >= dict_count
+        {
+            return Err(ZyronError::DecodingFailed(format!(
+                "dictionary code {widest} out of range (dict_count={dict_count})"
+            )));
         }
-        _ => bitmask_from_rows(row_count, |i| matching.binary_search(&code_at(i)).is_ok()),
-    })
+        each(at - start, &codes);
+        at += n;
+    }
+    Ok(())
+}
+
+/// The codes of rows `start..end`, every one checked against the
+/// dictionary size
+fn codes_in(
+    packed: &[u8],
+    code_bits: u8,
+    dict_count: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u64>> {
+    let mut codes = Vec::with_capacity(end - start);
+    for_code_blocks(packed, code_bits, dict_count, start, end, |_, block| {
+        codes.extend_from_slice(block)
+    })?;
+    Ok(codes)
+}
+
+/// The dictionary entry of each of rows `start..end`, as one fixed-width
+/// buffer. The two hot widths read the dictionary into typed values once
+/// and gather through typed stores, other widths copy bytes
+fn gather(
+    dict: &[u8],
+    value_size: usize,
+    packed: &[u8],
+    code_bits: u8,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
+    let dict_count = dict.len() / value_size;
+    // SAFETY: every slot is written below, one per row, before anything
+    // reads the buffer, and an error on the way out drops it unread
+    let mut out = unsafe { super::scratch::take_uninit((end - start) * value_size) };
+    let out_ptr = out.as_mut_ptr();
+    match value_size {
+        8 => {
+            let entries: Vec<u64> = dict
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| u64::from_le_bytes(*b))
+                .collect();
+            let p = out_ptr as *mut u64;
+            for_code_blocks(packed, code_bits, dict_count, start, end, |slot, codes| {
+                for (i, &c) in codes.iter().enumerate() {
+                    // SAFETY: slot + i is inside out, which holds one slot
+                    // per row of the range
+                    unsafe { p.add(slot + i).write_unaligned(entries[c as usize]) };
+                }
+            })?;
+        }
+        4 => {
+            let entries: Vec<u32> = dict
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect();
+            let p = out_ptr as *mut u32;
+            for_code_blocks(packed, code_bits, dict_count, start, end, |slot, codes| {
+                for (i, &c) in codes.iter().enumerate() {
+                    // SAFETY: as above
+                    unsafe { p.add(slot + i).write_unaligned(entries[c as usize]) };
+                }
+            })?;
+        }
+        _ => {
+            for_code_blocks(packed, code_bits, dict_count, start, end, |slot, codes| {
+                for (i, &c) in codes.iter().enumerate() {
+                    let c = c as usize;
+                    let at = (slot + i) * value_size;
+                    out[at..at + value_size]
+                        .copy_from_slice(&dict[c * value_size..(c + 1) * value_size]);
+                }
+            })?;
+        }
+    }
+    Ok(out)
+}
+
+/// The rows whose code is one of `matching`, as a packed bitmask.
+///
+/// One matching code, which is what an equality resolves to, is a compare
+/// per row, and several are a lookup in a table of admitted codes. A code
+/// past the dictionary admits nothing rather than failing, the way the
+/// predicate path always answered
+fn bitmask_from_codes(
+    packed: &[u8],
+    code_bits: u8,
+    dict_count: usize,
+    row_count: usize,
+    matching: &[u32],
+) -> Vec<u8> {
+    let stream = Packed::new(packed, code_bits);
+    let mut admitted = vec![false; dict_count];
+    for &c in matching {
+        if let Some(slot) = admitted.get_mut(c as usize) {
+            *slot = true;
+        }
+    }
+    let only = match matching {
+        [only] => Some(*only as u64),
+        _ => None,
+    };
+    let mut bitmask = Vec::with_capacity(row_count.div_ceil(8));
+    let mut codes = Vec::new();
+    let mut start = 0;
+    while start < row_count {
+        let n = CODE_BLOCK.min(row_count - start);
+        stream.unpack_reusing(start, n, &mut codes);
+        let block = match only {
+            Some(only) => bitmask_from_rows(n, |i| codes[i] == only),
+            None => bitmask_from_rows(n, |i| {
+                admitted.get(codes[i] as usize).copied().unwrap_or(false)
+            }),
+        };
+        bitmask.extend_from_slice(&block);
+        start += n;
+    }
+    bitmask
 }
 
 /// Packs a u64 value at the given bit offset.
@@ -642,33 +707,6 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
         if byteIdx + j < packed.len() {
             packed[byteIdx + j] |= shiftedBytes[j];
         }
-    }
-}
-
-/// Unpacks a u64 value from the given bit offset.
-#[inline]
-fn unpack_bits(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
-    let byteIdx = (bit_offset / 8) as usize;
-    let bitIdx = (bit_offset % 8) as u32;
-    let mut buf = [0u8; 9];
-    let available = packed.len().saturating_sub(byteIdx).min(9);
-    buf[..available].copy_from_slice(&packed[byteIdx..byteIdx + available]);
-
-    let lo = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let val = lo >> bitIdx;
-    let mask = if bit_width >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bit_width) - 1
-    };
-
-    if bitIdx + bit_width as u32 > 64 {
-        let hi = (buf[8] as u64) << (64 - bitIdx);
-        (val | hi) & mask
-    } else {
-        val & mask
     }
 }
 

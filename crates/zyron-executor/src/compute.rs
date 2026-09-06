@@ -1116,13 +1116,20 @@ fn like_impl(
         }
     };
 
-    // The pattern column is almost always one literal replicated per row.
-    // The compiled form is cached and rebuilt only when a row's pattern
-    // string differs from the cached one, so the steady-state per-row cost
-    // is a short string equality instead of a fresh compilation
+    // One literal broadcast across every row is the shape nearly every query
+    // has, and there the compile happens once before the loop and no row
+    // looks at the pattern again. A pattern that varies per row keeps the
+    // cache, which rebuilds only when a row's pattern differs from the one
+    // already compiled
+    let broadcast = if pattern_len == 1 && !pattern.is_null(0) {
+        Some(compile_for(pats[0].as_str(), case_insensitive))
+    } else {
+        None
+    };
     let mut cached_raw: Option<&str> = None;
-    let mut program = CompiledLike::Exact(String::new());
+    let mut cached_program = CompiledLike::Exact(String::new());
     let mut scratch = LikeScratch::default();
+    let mut lowered = String::new();
 
     for i in 0..len {
         if col.is_null(i) || pattern.is_null(pat_idx(i)) {
@@ -1130,23 +1137,21 @@ fn like_impl(
             result.push(false);
             continue;
         }
-        let pat = pats[pat_idx(i)].as_str();
-        if cached_raw != Some(pat) {
-            program = if case_insensitive {
-                compile_like(&pat.to_lowercase())
-            } else {
-                compile_like(pat)
-            };
-            cached_raw = Some(pat);
+        if broadcast.is_none() {
+            let pat = pats[pat_idx(i)].as_str();
+            if cached_raw != Some(pat) {
+                cached_program = compile_for(pat, case_insensitive);
+                cached_raw = Some(pat);
+            }
         }
-        // ILIKE lowers the text through str::to_lowercase to keep its
-        // context-sensitive mappings (final sigma), which has no
-        // write-into-buffer form, so this is the one per-row allocation
-        let matched = if case_insensitive {
-            match_compiled(&vals[i].to_lowercase(), &program, &mut scratch)
-        } else {
-            match_compiled(&vals[i], &program, &mut scratch)
-        };
+        let program = broadcast.as_ref().unwrap_or(&cached_program);
+        let matched = match_text(
+            &vals[i],
+            program,
+            case_insensitive,
+            &mut lowered,
+            &mut scratch,
+        );
         result.push(if negated { !matched } else { matched });
     }
 
@@ -1169,6 +1174,15 @@ enum CompiledLike {
         middle: Vec<String>,
         end: Option<String>,
     },
+    /// A pattern with `_` but no `%`: the text has exactly as many characters,
+    /// each equal or covered by a `_`
+    Anchored(Vec<char>),
+    /// A pattern with `_` whose only `%` is its last character: the text
+    /// begins with the run before it and the wildcard absorbs the rest
+    PrefixWild(Vec<char>),
+    /// A pattern with `_` wrapped in a leading and a trailing `%` and no
+    /// other: the run between them occurs somewhere in the text
+    ContainsWild(Vec<char>),
     General(Vec<char>),
 }
 
@@ -1180,8 +1194,62 @@ struct LikeScratch {
     curr: Vec<bool>,
 }
 
+/// Compiles one pattern, lowering it first for the case-insensitive form so
+/// the match itself compares like against like.
+fn compile_for(pattern: &str, case_insensitive: bool) -> CompiledLike {
+    if case_insensitive {
+        compile_like(&pattern.to_lowercase())
+    } else {
+        compile_like(pattern)
+    }
+}
+
+/// Matches one row's text, lowering it first for ILIKE.
+///
+/// The lowered form goes into a buffer the caller keeps across rows rather
+/// than a String per row. Text that is all ASCII lowers in place, which is
+/// what `str::to_lowercase` produces for ASCII anyway. Anything else still
+/// goes through `to_lowercase`, whose context-sensitive mappings (Greek final
+/// sigma) an ASCII fold would get wrong.
+fn match_text(
+    text: &str,
+    program: &CompiledLike,
+    case_insensitive: bool,
+    lowered: &mut String,
+    scratch: &mut LikeScratch,
+) -> bool {
+    if !case_insensitive {
+        return match_compiled(text, program, scratch);
+    }
+    lowered.clear();
+    if text.is_ascii() {
+        lowered.push_str(text);
+        lowered.make_ascii_lowercase();
+    } else {
+        lowered.push_str(&text.to_lowercase());
+    }
+    match_compiled(lowered, program, scratch)
+}
+
 fn compile_like(pattern: &str) -> CompiledLike {
     if pattern.contains('_') {
+        // A `_` forces character-wise matching, but only a pattern whose
+        // wildcards can move needs the dynamic program. With no `%` the
+        // pattern is pinned to the whole text, and with a single trailing `%`
+        // it is pinned to the start, so both walk the text once
+        let percents = pattern.matches('%').count();
+        if percents == 0 {
+            return CompiledLike::Anchored(pattern.chars().collect());
+        }
+        if percents == 1 && pattern.ends_with('%') {
+            // '%' is one byte, so the run before it is the rest of the string
+            let head = &pattern[..pattern.len() - 1];
+            return CompiledLike::PrefixWild(head.chars().collect());
+        }
+        if percents == 2 && pattern.starts_with('%') && pattern.ends_with('%') {
+            let middle = &pattern[1..pattern.len() - 1];
+            return CompiledLike::ContainsWild(middle.chars().collect());
+        }
         return CompiledLike::General(pattern.chars().collect());
     }
     if !pattern.contains('%') {
@@ -1237,6 +1305,55 @@ fn match_compiled(text: &str, compiled: &CompiledLike, scratch: &mut LikeScratch
                 Some(suffix) => text.len() >= pos + suffix.len() && text.ends_with(suffix.as_str()),
                 None => true,
             }
+        }
+        CompiledLike::Anchored(pattern_chars) => {
+            let mut chars = text.chars();
+            for &p in pattern_chars {
+                match chars.next() {
+                    Some(c) if p == '_' || c == p => {}
+                    _ => return false,
+                }
+            }
+            chars.next().is_none()
+        }
+        CompiledLike::PrefixWild(pattern_chars) => {
+            let mut chars = text.chars();
+            for &p in pattern_chars {
+                match chars.next() {
+                    Some(c) if p == '_' || c == p => {}
+                    _ => return false,
+                }
+            }
+            true
+        }
+        CompiledLike::ContainsWild(pattern_chars) => {
+            let Some(&first) = pattern_chars.first() else {
+                // Both wildcards and nothing between them matches anything
+                return true;
+            };
+            // A literal first character rejects most starting positions on one
+            // comparison, so only the positions that could begin a match walk
+            // the rest of the run
+            for (offset, c) in text.char_indices() {
+                if first != '_' && c != first {
+                    continue;
+                }
+                let mut chars = text[offset..].chars();
+                let mut matched = true;
+                for &p in pattern_chars {
+                    match chars.next() {
+                        Some(tc) if p == '_' || tc == p => {}
+                        _ => {
+                            matched = false;
+                            break;
+                        }
+                    }
+                }
+                if matched {
+                    return true;
+                }
+            }
+            false
         }
         CompiledLike::General(pattern_chars) => {
             scratch.text_chars.clear();
@@ -3003,6 +3120,55 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
     }
 }
 
+/// Sorted indices of one integer column by LSD radix sort, or None for a
+/// type the radix passes cannot key. A 128-bit integer does not fit the
+/// key word and takes the comparison sort. Stable, since every pass is a
+/// counting sort that scatters in input order
+fn radix_indices(data: &ColumnData, asc: bool) -> Option<Vec<u32>> {
+    Some(match data {
+        ColumnData::Int64(v) => radix_sort_signed!(v, asc, u64, 0x8000_0000_0000_0000u64),
+        ColumnData::Int32(v) => radix_sort_signed!(v, asc, u32, 0x8000_0000u64),
+        ColumnData::Int16(v) => radix_sort_signed!(v, asc, u16, 0x8000u64),
+        ColumnData::Int8(v) => radix_sort_signed!(v, asc, u8, 0x80u64),
+        ColumnData::UInt64(v) => radix_sort_unsigned!(v, asc),
+        ColumnData::UInt32(v) => radix_sort_unsigned!(v, asc),
+        ColumnData::UInt16(v) => radix_sort_unsigned!(v, asc),
+        ColumnData::UInt8(v) => radix_sort_unsigned!(v, asc),
+        _ => return None,
+    })
+}
+
+/// Sort indices with ties left in input order.
+///
+/// A window's rows that tie on the ORDER BY keys are still distinct rows
+/// to LAG, ROW_NUMBER and a frame edge, so the order among them has to be
+/// the one thing that is the same on every run, which is the order they
+/// arrived in. The radix path is stable by construction and the comparison
+/// paths use the stable sort
+pub fn sort_indices_stable(
+    columns: &[&Column],
+    ascending: &[bool],
+    nulls_first: &[bool],
+    num_rows: usize,
+) -> Vec<u32> {
+    let any_nulls = columns.iter().any(|c| c.nulls.has_nulls());
+    if !any_nulls
+        && columns.len() == 1
+        && let Some(indices) = radix_indices(&columns[0].data, ascending[0])
+    {
+        return indices;
+    }
+    let mut indices: Vec<u32> = (0..num_rows as u32).collect();
+    if any_nulls {
+        indices.sort_by(|&a, &b| {
+            compare_rows_typed(columns, ascending, nulls_first, a as usize, b as usize)
+        });
+    } else {
+        indices.sort_by(|&a, &b| compare_rows_no_nulls(columns, ascending, a as usize, b as usize));
+    }
+    indices
+}
+
 /// Computes sort indices using typed comparison (no ScalarValue allocation).
 /// When no sort columns contain nulls, uses a streamlined comparison path
 /// that skips all null bitmap lookups. For single-key integer sorts, uses
@@ -3019,19 +3185,8 @@ pub fn sort_indices(
     // comparison sort for other types.
     if !any_nulls && columns.len() == 1 {
         let asc = ascending[0];
-        match &columns[0].data {
-            ColumnData::Int64(v) => {
-                return radix_sort_signed!(v, asc, u64, 0x8000_0000_0000_0000u64);
-            }
-            ColumnData::Int32(v) => return radix_sort_signed!(v, asc, u32, 0x8000_0000u64),
-            ColumnData::Int16(v) => return radix_sort_signed!(v, asc, u16, 0x8000u64),
-            ColumnData::Int8(v) => return radix_sort_signed!(v, asc, u8, 0x80u64),
-            ColumnData::UInt64(v) => return radix_sort_unsigned!(v, asc),
-            ColumnData::UInt32(v) => return radix_sort_unsigned!(v, asc),
-            ColumnData::UInt16(v) => return radix_sort_unsigned!(v, asc),
-            ColumnData::UInt8(v) => return radix_sort_unsigned!(v, asc),
-            // i128 doesn't fit in u64, fall through to comparison sort.
-            _ => {}
+        if let Some(indices) = radix_indices(&columns[0].data, asc) {
+            return indices;
         }
 
         // Comparison sort fallback for non-integer types.
@@ -3080,6 +3235,151 @@ pub fn sort_indices(
         });
     }
     indices
+}
+
+/// Partitions indices around the nth smallest of a single Ord-typed column
+/// without any enum dispatch in the comparison.
+macro_rules! select_single_ord {
+    ($indices:expr, $data:expr, $asc:expr, $nth:expr) => {
+        if $asc {
+            $indices
+                .select_nth_unstable_by($nth, |&a, &b| $data[a as usize].cmp(&$data[b as usize]));
+        } else {
+            $indices
+                .select_nth_unstable_by($nth, |&a, &b| $data[b as usize].cmp(&$data[a as usize]));
+        }
+    };
+}
+
+/// Indices whose first `keep` entries are the rows that sort first, with the
+/// row at position `keep - 1` the last of them. Neither the kept rows nor the
+/// rest are in any particular order.
+///
+/// A selection rather than a sort: a bounded sort finds the rows its limit
+/// keeps in one pass over its buffer and orders only those, once, at the
+/// end. Every row comes back untouched when the limit covers them all
+pub fn select_first_indices(
+    columns: &[&Column],
+    ascending: &[bool],
+    nulls_first: &[bool],
+    num_rows: usize,
+    keep: usize,
+) -> Vec<u32> {
+    let mut indices: Vec<u32> = (0..num_rows as u32).collect();
+    if keep == 0 || keep >= num_rows {
+        return indices;
+    }
+    let nth = keep - 1;
+    let any_nulls = columns.iter().any(|c| c.nulls.has_nulls());
+    if any_nulls {
+        indices.select_nth_unstable_by(nth, |&a, &b| {
+            compare_rows_typed(columns, ascending, nulls_first, a as usize, b as usize)
+        });
+        return indices;
+    }
+    if columns.len() == 1 {
+        let asc = ascending[0];
+        match &columns[0].data {
+            ColumnData::Int64(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::Int32(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::Int16(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::Int8(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::UInt64(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::UInt32(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::UInt16(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::UInt8(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::Int128(v) => select_single_ord!(indices, v, asc, nth),
+            ColumnData::Utf8(v) => select_single_ord!(indices, v, asc, nth),
+            _ => {
+                indices.select_nth_unstable_by(nth, |&a, &b| {
+                    compare_rows_no_nulls(columns, ascending, a as usize, b as usize)
+                });
+            }
+        }
+        return indices;
+    }
+    indices.select_nth_unstable_by(nth, |&a, &b| {
+        compare_rows_no_nulls(columns, ascending, a as usize, b as usize)
+    });
+    indices
+}
+
+/// Selects the rows of a single Ord-typed column that sort strictly before
+/// a bound value, in row order.
+macro_rules! rows_before_ord {
+    ($data:expr, $bound:expr, $asc:expr, $num_rows:expr) => {{
+        let bound = &$bound[0];
+        if $asc {
+            (0..$num_rows)
+                .filter(|&row| $data[row] < *bound)
+                .map(|row| row as u32)
+                .collect()
+        } else {
+            (0..$num_rows)
+                .filter(|&row| $data[row] > *bound)
+                .map(|row| row as u32)
+                .collect()
+        }
+    }};
+}
+
+/// Rows of `keys` that sort strictly before the one row of `bound`, as a
+/// selection in row order.
+///
+/// What a bounded sort holds every batch against once it has its limit's
+/// worth of rows: a row that ties with the bound cannot displace any of
+/// them, so only a row that beats it is worth buffering. One integer or
+/// text key with no null on either side is a typed loop, and every other
+/// shape goes through the row comparator
+pub fn rows_before_bound(
+    keys: &[&Column],
+    bound: &[&Column],
+    ascending: &[bool],
+    nulls_first: &[bool],
+    num_rows: usize,
+) -> Vec<u32> {
+    if keys.len() == 1 && !keys[0].nulls.has_nulls() && !bound[0].is_null(0) {
+        let asc = ascending[0];
+        match (&keys[0].data, &bound[0].data) {
+            (ColumnData::Int64(v), ColumnData::Int64(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::Int32(v), ColumnData::Int32(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::Int16(v), ColumnData::Int16(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::Int8(v), ColumnData::Int8(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::UInt64(v), ColumnData::UInt64(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::UInt32(v), ColumnData::UInt32(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::UInt16(v), ColumnData::UInt16(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::UInt8(v), ColumnData::UInt8(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::Int128(v), ColumnData::Int128(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            (ColumnData::Utf8(v), ColumnData::Utf8(b)) => {
+                return rows_before_ord!(v, b, asc, num_rows);
+            }
+            _ => {}
+        }
+    }
+    (0..num_rows)
+        .filter(|&row| {
+            compare_rows_across(keys, row, bound, 0, ascending, nulls_first) == Ordering::Less
+        })
+        .map(|row| row as u32)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3965,5 +4265,157 @@ mod radix_sort_tests {
             _ => panic!("radix has to take the wide range"),
         };
         assert_eq!(got, sparse);
+    }
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::*;
+    use crate::column::{Column, ColumnData, NullBitmap};
+    use zyron_common::TypeId;
+
+    fn utf8(values: &[&str]) -> Column {
+        let data = ColumnData::Utf8(values.iter().map(|s| (*s).to_string()).collect());
+        Column::with_nulls(data, NullBitmap::none(values.len()), TypeId::Varchar)
+    }
+
+    fn bools(col: &Column) -> Vec<bool> {
+        match &col.data {
+            ColumnData::Boolean(v) => v.clone(),
+            other => panic!("expected a boolean column, got {other:?}"),
+        }
+    }
+
+    /// The broadcast pattern is compiled once instead of per row, so it has to
+    /// land what the per-row path lands. Running the same rows against a
+    /// pattern column of one and a pattern column repeated per row is the
+    /// comparison that catches a divergence.
+    #[test]
+    fn a_broadcast_pattern_matches_the_per_row_pattern() {
+        let rows = utf8(&["alpha", "alpine", "beta", "ALPHA", "al", ""]);
+        for pattern in ["al%", "%a", "a_p%", "alpha", "%lp%", "%"] {
+            let one = utf8(&[pattern]);
+            let per_row = utf8(&[pattern; 6]);
+            for negated in [false, true] {
+                assert_eq!(
+                    bools(&like(&rows, &one, negated).unwrap()),
+                    bools(&like(&rows, &per_row, negated).unwrap()),
+                    "LIKE {pattern:?} negated={negated} diverged between broadcast and per row"
+                );
+                assert_eq!(
+                    bools(&ilike(&rows, &one, negated).unwrap()),
+                    bools(&ilike(&rows, &per_row, negated).unwrap()),
+                    "ILIKE {pattern:?} negated={negated} diverged between broadcast and per row"
+                );
+            }
+        }
+    }
+
+    /// ILIKE lowers ASCII text in a reused buffer and anything else through
+    /// `to_lowercase`. The split has to be invisible: the answer must be the
+    /// one `to_lowercase` alone would give, including where the two disagree.
+    /// Greek final sigma is where they disagree, so it is the case that pins
+    /// the non-ASCII branch.
+    #[test]
+    fn ilike_folds_non_ascii_the_way_to_lowercase_does() {
+        // Capital sigma lowercases to a final sigma at the end of a word and a
+        // medial sigma elsewhere, which an ASCII fold would leave untouched
+        let rows = utf8(&["ΟΔΟΣ", "ΣΙΓΜΑ", "Straße", "MIXED ascii", "plain"]);
+        for pattern in ["%ος", "σ%", "stra%", "%ascii", "PLAIN"] {
+            let pat = utf8(&[pattern]);
+            let got = bools(&ilike(&rows, &pat, false).unwrap());
+            // The reference: lower both sides with to_lowercase and match
+            let program = compile_like(&pattern.to_lowercase());
+            let mut scratch = LikeScratch::default();
+            let expected: Vec<bool> = ["ΟΔΟΣ", "ΣΙΓΜΑ", "Straße", "MIXED ascii", "plain"]
+                .iter()
+                .map(|t| match_compiled(&t.to_lowercase(), &program, &mut scratch))
+                .collect();
+            assert_eq!(got, expected, "ILIKE {pattern:?} folded differently");
+        }
+    }
+
+    /// Two shapes of pattern holding `_` need no dynamic program, because
+    /// their wildcards cannot move: no `%` at all pins the pattern to the
+    /// whole text, and a single trailing `%` pins it to the start. Both are
+    /// answered by one walk of the text, and both must answer exactly what
+    /// the dynamic program answers.
+    #[test]
+    fn the_anchored_paths_agree_with_the_dynamic_program() {
+        let texts = [
+            "", "a", "ab", "abc", "user_1", "user_12", "user_199", "user_9", "USER_1", "u", "user",
+            "user_", "xuser_1", "user_1x", "üser_1", "日本_1",
+        ];
+        let patterns = [
+            // No '%', so Anchored
+            "_", "a_", "_b", "a_c", "user_1", "user__", "user_1_", "_____",
+            // One trailing '%', so PrefixWild
+            "_%", "a_%", "user_1%", "user__%", "u_%", "_____%", "user_1_%",
+            // Leading and trailing '%', so ContainsWild
+            "%_%", "%a_%", "%user_1%", "%_1%", "%__%", "%ser_1%", "%9%",
+            // Still General, kept as a control
+            "_%_", "%user_1", "a_%b", "%_", "%a%_%b%",
+        ];
+        let mut scratch = LikeScratch::default();
+        for pattern in patterns {
+            let compiled = compile_like(pattern);
+            // The dynamic program over the same pattern is the reference
+            let reference: Vec<char> = pattern.chars().collect();
+            for text in texts {
+                let chars: Vec<char> = text.chars().collect();
+                let mut prev = Vec::new();
+                let mut curr = Vec::new();
+                let expected = sql_like_dp(&chars, &reference, &mut prev, &mut curr);
+                let got = match_compiled(text, &compiled, &mut scratch);
+                assert_eq!(
+                    got, expected,
+                    "pattern {pattern:?} against {text:?} disagreed with the dynamic program"
+                );
+            }
+        }
+    }
+
+    /// The shapes have to route where they are meant to, or the test above
+    /// would pass by running the dynamic program for everything.
+    #[test]
+    fn the_anchored_shapes_are_the_ones_that_skip_the_program() {
+        assert!(matches!(compile_like("user_1"), CompiledLike::Anchored(_)));
+        assert!(matches!(compile_like("_____"), CompiledLike::Anchored(_)));
+        assert!(matches!(
+            compile_like("user_1%"),
+            CompiledLike::PrefixWild(_)
+        ));
+        assert!(matches!(compile_like("_%"), CompiledLike::PrefixWild(_)));
+        assert!(matches!(
+            compile_like("%user_1%"),
+            CompiledLike::ContainsWild(_)
+        ));
+        assert!(matches!(compile_like("%_%"), CompiledLike::ContainsWild(_)));
+        // A '%' anywhere else still needs the program
+        assert!(matches!(compile_like("%user_1"), CompiledLike::General(_)));
+        assert!(matches!(compile_like("a_%b"), CompiledLike::General(_)));
+        assert!(matches!(compile_like("_%_"), CompiledLike::General(_)));
+        // No underscore keeps the existing literal paths
+        assert!(matches!(compile_like("abc"), CompiledLike::Exact(_)));
+        assert!(matches!(
+            compile_like("abc%"),
+            CompiledLike::Segments { .. }
+        ));
+    }
+
+    /// A NULL pattern makes every row NULL, and the broadcast path decides
+    /// that before the loop, so it has to reach the same answer.
+    #[test]
+    fn a_null_pattern_yields_null_for_every_row() {
+        let rows = utf8(&["a", "b"]);
+        let mut nulls = NullBitmap::none(1);
+        nulls.set_null(0);
+        let pat = Column::with_nulls(
+            ColumnData::Utf8(vec![String::new()]),
+            nulls,
+            TypeId::Varchar,
+        );
+        let out = like(&rows, &pat, false).unwrap();
+        assert!(out.is_null(0) && out.is_null(1));
     }
 }

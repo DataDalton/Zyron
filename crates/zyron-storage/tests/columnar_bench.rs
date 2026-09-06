@@ -176,9 +176,9 @@ fn test_column_segment_format() {
             .read_segment_raw(col.column_id)
             .expect("read segment failed");
         assert_eq!(
-            segRaw.len() % zyron_common::page::PAGE_SIZE,
+            segRaw.len() % zyron_storage::columnar::SEGMENT_ALIGNMENT,
             0,
-            "segment not page-aligned"
+            "segment not on the segment alignment"
         );
 
         let headerBuf: [u8; SEGMENT_HEADER_SIZE] =

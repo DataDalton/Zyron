@@ -11,8 +11,8 @@ use zyron_planner::physical::PhysicalPlan;
 use crate::batch::DataBatch;
 use crate::context::ExecutionContext;
 use crate::operator::aggregate::{
-    HashAggregateOperator, ParallelHashAggregateOperator, SortAggregateOperator,
-    aggregate_supports_parallel,
+    HashAggregateOperator, ParallelHashAggregateOperator, ParallelLakeAggregateOperator,
+    SortAggregateOperator, aggregate_supports_parallel,
 };
 use crate::operator::column_scan::{
     ColumnScanOperator, ColumnarMetadataAggregateOperator, HybridScanOperator,
@@ -250,6 +250,16 @@ fn build_operator_tree(
             ..
         } => Box::pin(build_columnar_metadata_aggregate(
             table_id, specs, schema, analyze, ctx,
+        )),
+
+        PhysicalPlan::LakeMetadataAggregate {
+            table_id,
+            specs,
+            schema,
+            as_of,
+            ..
+        } => Box::pin(build_lake_metadata_aggregate(
+            table_id, specs, schema, as_of, analyze, ctx,
         )),
 
         PhysicalPlan::IndexScan {
@@ -872,6 +882,28 @@ async fn build_columnar_metadata_aggregate(
 /// One arm of `build_operator_tree`, see that function for why the arms
 /// are not written inline
 #[inline(never)]
+async fn build_lake_metadata_aggregate(
+    table_id: zyron_catalog::TableId,
+    specs: Vec<zyron_planner::physical::MetaAggSpec>,
+    schema: Vec<zyron_planner::logical::LogicalColumn>,
+    as_of: Option<zyron_planner::logical::AsOfTarget>,
+    analyze: bool,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<BuildResult> {
+    let op = crate::operator::lake_scan::LakeMetadataAggregateOperator::new(
+        ctx.clone(),
+        table_id,
+        specs,
+        schema,
+        as_of,
+    );
+    let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
+    Ok(br.with_metrics("LakeMetadataAggregate", analyze, vec![]))
+}
+
+/// One arm of `build_operator_tree`, see that function for why the arms
+/// are not written inline
+#[inline(never)]
 async fn build_index_scan(
     table_id: zyron_catalog::TableId,
     index_id: zyron_catalog::IndexId,
@@ -1214,10 +1246,20 @@ async fn build_filter(
     let input_schema = child.output_schema();
     let params = ctx.params.clone();
     if crate::correlated::expr_has_correlated_subquery(&predicate) {
-        // A correlated subquery in the predicate runs once per row
-        // against the current outer row's values.
+        // A correlated EXISTS whose correlation is a conjunction of
+        // equalities is a semi join, and running it as one costs a single
+        // execution of the subquery instead of one per outer row. Decided
+        // before the child is built, so a refusal costs nothing
+        let semi = crate::decorrelate::plan_semi_join(&predicate, &input_schema, ctx).await?;
         let child_br = build_operator_tree(*child, ctx).await?;
         let child_m = collect_metrics(&[&child_br.metrics]);
+        if let Some(plan) = semi {
+            let op = plan.into_operator(child_br.op, &input_schema, &params, ctx);
+            let br = BuildResult::new(op);
+            return Ok(br.with_metrics("SemiJoinFilter", analyze, child_m));
+        }
+        // Anything the lift refused runs once per row against the current
+        // outer row's values
         let op = crate::correlated::build_correlated_filter(
             child_br.op,
             predicate,
@@ -1468,11 +1510,14 @@ async fn build_hash_aggregate(
     // DISTINCT aggregates are excluded: their partial states are not
     // associative across partitions (a value seen in two ranges
     // would be counted twice), so they must take the serial path.
-    let parallel_table = if !group_by.is_empty()
+    // A DISTINCT aggregate's partial states are not associative across
+    // partitions, since a value seen in two of them would be counted twice,
+    // so those keep the serial path whatever the child is
+    let parallelizable_aggregates = !group_by.is_empty()
         && aggregates
             .iter()
-            .all(|a| !a.distinct && aggregate_supports_parallel(&a.function_name))
-    {
+            .all(|a| !a.distinct && aggregate_supports_parallel(&a.function_name));
+    let parallel_table = if parallelizable_aggregates {
         match child.as_ref() {
             PhysicalPlan::SeqScan {
                 table_id,
@@ -1491,6 +1536,62 @@ async fn build_hash_aggregate(
     } else {
         None
     };
+
+    // A lake table splits by data file, which is already the unit its scan
+    // reads one at a time. The same merge the heap's partials go through
+    // applies, so the only thing that differs is how the work is divided
+    if parallelizable_aggregates
+        && let PhysicalPlan::LakeScan {
+            table_id,
+            columns,
+            predicate,
+            lowered,
+            as_of,
+            ..
+        } = child.as_ref()
+    {
+        let predicate = crate::subquery::materialize_opt(predicate.clone(), ctx).await?;
+        // Pruning and the cardinality estimate both come off one built
+        // scan, so neither is repeated in the workers
+        let probe = crate::operator::lake_scan::LakeScanOperator::new(
+            ctx.clone(),
+            *table_id,
+            columns.clone(),
+            predicate.clone(),
+            lowered.clone(),
+            as_of.clone(),
+        )?;
+        if probe.files().len() > 1
+            && crate::operator::aggregate::worth_splitting(probe.manifest(), &group_by)
+        {
+            let files = probe.files().to_vec();
+            // Rows the surviving files hold, which is what sizes the fan-out
+            let rows: u64 = probe
+                .manifest()
+                .entries
+                .iter()
+                .filter(|entry| files.contains(&entry.partition_id))
+                .map(|entry| entry.row_count)
+                .sum();
+            drop(probe);
+            let op = ParallelLakeAggregateOperator::new(
+                ctx.clone(),
+                *table_id,
+                columns.clone(),
+                predicate,
+                lowered.clone(),
+                as_of.clone(),
+                group_by,
+                aggregates,
+                input_schema,
+                output_schema,
+                files,
+                rows,
+            );
+            let br = BuildResult::new(Box::new(op));
+            return Ok(br.with_metrics("ParallelLakeAggregate", analyze, vec![]));
+        }
+    }
 
     if parallel_table.is_some() {
         if let PhysicalPlan::SeqScan {

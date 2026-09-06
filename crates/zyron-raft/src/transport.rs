@@ -33,6 +33,19 @@
 //! writer covers all of them with a single fsync, and the replies go back in
 //! the order the requests came.
 //!
+//! ## Calls go out in the order they are made
+//!
+//! A call's frame is placed on its connection's queue when the call is made,
+//! before the future for its reply is returned, and the queue is the order
+//! the socket writes in. The leader's pipeline rests on that: the batches it
+//! builds in sequence reach the follower in sequence, and the consistency
+//! check on each finds the one before it already in the log. A frame placed
+//! from whichever task happened to run first would arrive ahead of its
+//! predecessor often enough to have a tenth of all appends refused, and
+//! everything behind each refusal sent again. A lane with no connection
+//! places nothing until one is open, so calls made across a reconnect can
+//! cross, and a refused batch then costs one resend.
+//!
 //! ## Failure is a fact about a call, not about a node
 //!
 //! A call that cannot be delivered returns [`RaftRpcError`] rather than
@@ -40,6 +53,20 @@
 //! peer that did not answer, and it will try again on its own schedule with a
 //! message built from current state. A transport that retried on its own would
 //! deliver a stale AppendEntries after the leader had already moved on.
+//!
+//! ## Every frame names the protocol it speaks
+//!
+//! The members of one group run two adjacent releases for the length of a
+//! rolling upgrade, so a frame carries [`CONSENSUS_PROTOCOL_VERSION`] in its
+//! header and a reply carries the version of the request it answers. A
+//! message changes inside a version by appending a field after the ones
+//! that shipped, and its decoder reads an absent trailing field as the
+//! default, which is how a build without the field reads the request it
+//! knows and a build with it reads the older build's request. A change
+//! that cannot be expressed that way is a new version. A frame from a
+//! version newer than this build speaks is refused by name rather than
+//! decoded, so the sender's log says which of the two is behind, and a
+//! header that names no version at all is version one
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -64,13 +91,20 @@ use crate::snapshot::{InstallSnapshotReply, InstallSnapshotRequest};
 /// Identifies a consensus frame, so a stray connection to the wrong port
 /// fails on the first four bytes rather than on a decoded field
 const FRAME_MAGIC: u32 = 0x5A52_4654;
-/// magic 4, payload length 4, request id 8, kind 1, flags 1, reserved 2
+/// magic 4, payload length 4, request id 8, kind 1, flags 1, protocol
+/// version 2
 const FRAME_HEADER_LEN: usize = 20;
+
+/// The consensus protocol version this build speaks, stamped into every
+/// frame it sends. A header carrying zero is read as version one, which is
+/// what a build that stamped nothing sent
+pub const CONSENSUS_PROTOCOL_VERSION: u16 = 1;
 
 const KIND_REQUEST_VOTE: u8 = 1;
 const KIND_APPEND_ENTRIES: u8 = 2;
 const KIND_INSTALL_SNAPSHOT: u8 = 3;
 const KIND_READ_INDEX: u8 = 4;
+const KIND_TIMEOUT_NOW: u8 = 5;
 
 const FLAG_REPLY: u8 = 0x01;
 const FLAG_ERROR: u8 = 0x02;
@@ -146,8 +180,11 @@ impl From<RaftRpcError> for ZyronError {
     }
 }
 
-/// What a call returns once it has crossed a node boundary
-pub type RaftFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RaftRpcError>> + Send + 'a>>;
+/// What a call returns once it has crossed a node boundary.
+///
+/// Owned rather than borrowed from the transport, so the caller that makes
+/// the call can hand the wait for its answer to another task
+pub type RaftFuture<T> = Pin<Box<dyn Future<Output = Result<T, RaftRpcError>> + Send + 'static>>;
 
 /// What one node asks another.
 ///
@@ -158,21 +195,34 @@ pub trait RaftTransport: Send + Sync {
         &self,
         to: NodeId,
         req: RequestVoteRequest,
-    ) -> RaftFuture<'_, RequestVoteReply>;
+    ) -> RaftFuture<RequestVoteReply>;
 
+    /// Sends one batch, or a heartbeat.
+    ///
+    /// The call's frame is on the connection's queue when this returns, and
+    /// two calls made in sequence to one peer are delivered in that
+    /// sequence. The leader's pipeline rests on this: a batch reaching the
+    /// follower ahead of the one before it is refused
     fn send_append_entries(
         &self,
         to: NodeId,
         req: AppendEntriesRequest,
-    ) -> RaftFuture<'_, AppendEntriesReply>;
+    ) -> RaftFuture<AppendEntriesReply>;
 
     fn send_install_snapshot(
         &self,
         to: NodeId,
         req: InstallSnapshotRequest,
-    ) -> RaftFuture<'_, InstallSnapshotReply>;
+    ) -> RaftFuture<InstallSnapshotReply>;
 
-    fn send_read_index(&self, to: NodeId, req: ReadIndexRequest) -> RaftFuture<'_, ReadIndexReply>;
+    fn send_read_index(&self, to: NodeId, req: ReadIndexRequest) -> RaftFuture<ReadIndexReply>;
+
+    /// Tells a follower to campaign at once, which hands it the group
+    fn send_timeout_now(
+        &self,
+        to: NodeId,
+        req: crate::election::TimeoutNowRequest,
+    ) -> RaftFuture<crate::election::TimeoutNowReply>;
 
     /// Records where a node answers, called when membership changes
     fn set_address(&self, node: NodeId, address: &str);
@@ -206,6 +256,11 @@ pub trait RaftRequestHandler: Send + Sync {
     ) -> RaftHandlerFuture<'_, InstallSnapshotReply>;
 
     fn on_read_index(&self, req: ReadIndexRequest) -> RaftHandlerFuture<'_, ReadIndexReply>;
+
+    fn on_timeout_now(
+        &self,
+        req: crate::election::TimeoutNowRequest,
+    ) -> RaftHandlerFuture<'_, crate::election::TimeoutNowReply>;
 }
 
 /// Timers and bounds the transport enforces.
@@ -282,6 +337,8 @@ struct Frame {
     request_id: u64,
     kind: u8,
     flags: u8,
+    /// The protocol version the sender stamped, one when it stamped nothing
+    version: u16,
     payload: Vec<u8>,
 }
 
@@ -299,14 +356,23 @@ fn frame_buffer(body_hint: usize) -> Vec<u8> {
 }
 
 /// Stamps the header over the reserved prefix of a [`frame_buffer`]
-fn stamp_frame(buf: &mut [u8], request_id: u64, kind: u8, flags: u8) {
+fn stamp_frame(buf: &mut [u8], request_id: u64, kind: u8, flags: u8, version: u16) {
     let body_len = (buf.len() - FRAME_HEADER_LEN) as u32;
     buf[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
     buf[4..8].copy_from_slice(&body_len.to_le_bytes());
     buf[8..16].copy_from_slice(&request_id.to_le_bytes());
     buf[16] = kind;
     buf[17] = flags;
-    buf[18..20].copy_from_slice(&0u16.to_le_bytes());
+    buf[18..20].copy_from_slice(&version.to_le_bytes());
+}
+
+/// The refusal a frame from a newer protocol gets, so the sender's log names
+/// which build is behind
+fn version_refusal(version: u16) -> String {
+    format!(
+        "consensus protocol version {version} is newer than this build speaks, which is \
+         {CONSENSUS_PROTOCOL_VERSION}"
+    )
 }
 
 async fn read_frame<R>(reader: &mut R, max_bytes: usize) -> std::io::Result<Option<Frame>>
@@ -343,12 +409,17 @@ where
         header[8], header[9], header[10], header[11], header[12], header[13], header[14],
         header[15],
     ]);
+    let version = match u16::from_le_bytes([header[18], header[19]]) {
+        0 => 1,
+        stamped => stamped,
+    };
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
     Ok(Some(Frame {
         request_id,
         kind: header[16],
         flags: header[17],
+        version,
         payload,
     }))
 }
@@ -371,12 +442,51 @@ impl Conn {
         self.alive.store(false, Ordering::Release);
         self.pending.lock().clear();
     }
+
+    /// Stamps one frame and puts it on the socket queue, returning where its
+    /// reply arrives. The frame comes back when the connection has closed,
+    /// so the caller can send it on the next one
+    fn send(
+        &self,
+        kind: u8,
+        mut framed: Vec<u8>,
+    ) -> Result<(u64, oneshot::Receiver<Frame>), Vec<u8>> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        stamp_frame(&mut framed, id, kind, 0, CONSENSUS_PROTOCOL_VERSION);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().insert(id, tx);
+        match self.tx.send(framed) {
+            Ok(()) => Ok((id, rx)),
+            Err(mpsc::error::SendError(framed)) => {
+                self.pending.lock().remove(&id);
+                self.fail_all();
+                Err(framed)
+            }
+        }
+    }
+}
+
+/// One call after its frame has been placed
+enum Placed {
+    /// On the socket queue of a live connection, in the order it was made
+    Sent {
+        conn: Arc<Conn>,
+        id: u64,
+        rx: oneshot::Receiver<Frame>,
+    },
+    /// The lane had no connection, so the frame goes out once one is open
+    Unsent { kind: u8, framed: Vec<u8> },
 }
 
 struct PeerLane {
     node: NodeId,
     address: parking_lot::RwLock<String>,
-    conn: AsyncMutex<Option<Arc<Conn>>>,
+    /// The connection calls go out on, behind a lock that is never held
+    /// across an await, so a call places its frame at call time
+    conn: parking_lot::Mutex<Option<Arc<Conn>>>,
+    /// Held by the one task opening a connection, so a burst of calls on a
+    /// lane with none opens one socket rather than one each
+    connecting: AsyncMutex<()>,
     config: TransportConfig,
     /// The deadline for calls on this lane, which is the bulk one on the lane
     /// snapshots use
@@ -385,21 +495,27 @@ struct PeerLane {
 }
 
 impl PeerLane {
-    async fn connection(&self) -> Result<Arc<Conn>, RaftRpcError> {
-        {
-            let guard = self.conn.lock().await;
-            if let Some(conn) = guard.as_ref() {
-                if conn.alive.load(Ordering::Acquire) {
-                    return Ok(Arc::clone(conn));
-                }
+    /// The connection this lane holds, while it is still open
+    fn live(&self) -> Option<Arc<Conn>> {
+        let mut slot = self.conn.lock();
+        match slot.as_ref() {
+            Some(conn) if conn.alive.load(Ordering::Acquire) => Some(Arc::clone(conn)),
+            Some(_) => {
+                *slot = None;
+                None
             }
+            None => None,
         }
-        let mut guard = self.conn.lock().await;
-        // Another caller may have reconnected while this one waited
-        if let Some(conn) = guard.as_ref() {
-            if conn.alive.load(Ordering::Acquire) {
-                return Ok(Arc::clone(conn));
-            }
+    }
+
+    async fn connection(&self) -> Result<Arc<Conn>, RaftRpcError> {
+        if let Some(conn) = self.live() {
+            return Ok(conn);
+        }
+        let _opening = self.connecting.lock().await;
+        // Another caller may have connected while this one waited
+        if let Some(conn) = self.live() {
+            return Ok(conn);
         }
         let address = self.address.read().clone();
         if address.is_empty() {
@@ -435,8 +551,27 @@ impl PeerLane {
         let writer_pending = Arc::clone(&pending);
         let writer_stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
-            while let Some(bytes) = rx.recv().await {
-                if write_half.write_all(&bytes).await.is_err() {
+            let mut coalesced: Vec<u8> = Vec::new();
+            while let Some(first) = rx.recv().await {
+                // Whatever is queued behind a frame goes out in the same
+                // write. A pipelined run of appends is many small frames,
+                // and the syscall per frame costs more than joining them
+                let bytes: &[u8] = match rx.try_recv() {
+                    Ok(second) => {
+                        coalesced.clear();
+                        coalesced.extend_from_slice(&first);
+                        coalesced.extend_from_slice(&second);
+                        while coalesced.len() < WRITE_COALESCE_BYTES {
+                            match rx.try_recv() {
+                                Ok(more) => coalesced.extend_from_slice(&more),
+                                Err(_) => break,
+                            }
+                        }
+                        &coalesced
+                    }
+                    Err(_) => &first,
+                };
+                if write_half.write_all(bytes).await.is_err() {
                     break;
                 }
                 writer_stats
@@ -475,41 +610,81 @@ impl PeerLane {
         self.stats
             .connections_opened
             .fetch_add(1, Ordering::Relaxed);
-        *guard = Some(Arc::clone(&conn));
+        *self.conn.lock() = Some(Arc::clone(&conn));
         Ok(conn)
     }
 
-    /// Sends one call. `framed` is a [`frame_buffer`] whose body is already
-    /// written, so the header is stamped in place rather than concatenated
-    async fn call(&self, kind: u8, framed: Vec<u8>) -> Result<Vec<u8>, RaftRpcError> {
+    /// Places one call. `framed` is a [`frame_buffer`] whose body is already
+    /// written, so the header is stamped in place rather than concatenated.
+    ///
+    /// On a live connection the frame is on the socket queue when this
+    /// returns. The queue is the order the socket writes in and the lock is
+    /// held for the placing, so two calls made in sequence on one lane reach
+    /// the peer in that sequence, whatever order their replies are awaited in
+    fn place(&self, kind: u8, framed: Vec<u8>) -> Placed {
         self.stats.calls_sent.fetch_add(1, Ordering::Relaxed);
-        let result = self.call_inner(kind, framed).await;
+        let mut slot = self.conn.lock();
+        let live = slot
+            .as_ref()
+            .filter(|conn| conn.alive.load(Ordering::Acquire))
+            .cloned();
+        match live {
+            Some(conn) => match conn.send(kind, framed) {
+                Ok((id, rx)) => Placed::Sent { conn, id, rx },
+                Err(framed) => {
+                    *slot = None;
+                    self.stats.connections_lost.fetch_add(1, Ordering::Relaxed);
+                    Placed::Unsent { kind, framed }
+                }
+            },
+            None => {
+                *slot = None;
+                Placed::Unsent { kind, framed }
+            }
+        }
+    }
+
+    /// Waits for the answer to a placed call, opening the connection first
+    /// when the call found none
+    async fn finish(&self, placed: Placed) -> Result<Vec<u8>, RaftRpcError> {
+        let result = self.finish_inner(placed).await;
         if result.is_err() {
             self.stats.calls_failed.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
 
-    async fn call_inner(&self, kind: u8, mut framed: Vec<u8>) -> Result<Vec<u8>, RaftRpcError> {
-        let conn = self.connection().await?;
-        let id = conn.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        conn.pending.lock().insert(id, tx);
-        stamp_frame(&mut framed, id, kind, 0);
-        if conn.tx.send(framed).is_err() {
-            conn.fail_all();
-            self.stats.connections_lost.fetch_add(1, Ordering::Relaxed);
-            return Err(RaftRpcError::Unreachable {
-                node: self.node,
-                reason: "connection closed before the call was written".into(),
-            });
-        }
+    async fn finish_inner(&self, placed: Placed) -> Result<Vec<u8>, RaftRpcError> {
+        let (conn, id, rx) = match placed {
+            Placed::Sent { conn, id, rx } => (conn, id, rx),
+            Placed::Unsent { kind, framed } => {
+                let conn = self.connection().await?;
+                match conn.send(kind, framed) {
+                    Ok((id, rx)) => (conn, id, rx),
+                    Err(_) => {
+                        self.stats.connections_lost.fetch_add(1, Ordering::Relaxed);
+                        return Err(RaftRpcError::Unreachable {
+                            node: self.node,
+                            reason: "connection closed before the call was written".into(),
+                        });
+                    }
+                }
+            }
+        };
         match tokio::time::timeout(self.call_timeout, rx).await {
             Ok(Ok(frame)) => {
                 if frame.flags & FLAG_ERROR != 0 {
                     let mut c = Cursor::new(&frame.payload);
                     let reason = c.string().unwrap_or_else(|_| "unreadable".into());
                     return Err(RaftRpcError::Refused { reason });
+                }
+                // A peer answers in the version of the request it was sent,
+                // so a reply from a newer version is one this build never
+                // asked for and cannot read
+                if frame.version > CONSENSUS_PROTOCOL_VERSION {
+                    return Err(RaftRpcError::Malformed {
+                        reason: version_refusal(frame.version),
+                    });
                 }
                 Ok(frame.payload)
             }
@@ -577,9 +752,18 @@ impl TcpTransport {
         self.lanes.lock().clear();
     }
 
+    /// The lane a call to `node` goes out on, opened on the first call.
+    ///
+    /// The directory is consulted only when the lane does not exist yet. A
+    /// lane that exists was opened at the directory's address, and an
+    /// address change drops it, so the lookup and the string copy it costs
+    /// are not paid on every message
     fn lane(&self, node: NodeId, lane: u8) -> Result<Arc<PeerLane>, RaftRpcError> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(RaftRpcError::Shutdown);
+        }
+        if let Some(existing) = self.lanes.lock().get(&(node, lane)) {
+            return Ok(Arc::clone(existing));
         }
         let address = match self.directory.read().get(&node) {
             Some(a) => a.clone(),
@@ -590,7 +774,8 @@ impl TcpTransport {
             Arc::new(PeerLane {
                 node,
                 address: parking_lot::RwLock::new(address.clone()),
-                conn: AsyncMutex::new(None),
+                conn: parking_lot::Mutex::new(None),
+                connecting: AsyncMutex::new(()),
                 call_timeout: if lane == LANE_BULK {
                     self.config.bulk_rpc_timeout
                 } else {
@@ -603,19 +788,29 @@ impl TcpTransport {
         Ok(Arc::clone(entry))
     }
 
-    async fn call<T, F>(
+    /// Places a call on its lane and returns the wait for its answer. The
+    /// placing happens here, at call time, which is the ordering
+    /// [`RaftTransport::send_append_entries`] promises
+    fn call<T, F>(
         lane: Result<Arc<PeerLane>, RaftRpcError>,
         kind: u8,
         framed: Vec<u8>,
         decode: F,
-    ) -> Result<T, RaftRpcError>
+    ) -> RaftFuture<T>
     where
-        F: FnOnce(&[u8]) -> Result<T, zyron_common::error::ZyronError>,
+        T: Send + 'static,
+        F: FnOnce(&[u8]) -> Result<T, zyron_common::error::ZyronError> + Send + 'static,
     {
-        let lane = lane?;
-        let bytes = lane.call(kind, framed).await?;
-        decode(&bytes).map_err(|e| RaftRpcError::Malformed {
-            reason: e.to_string(),
+        let lane = match lane {
+            Ok(lane) => lane,
+            Err(e) => return Box::pin(async move { Err(e) }),
+        };
+        let placed = lane.place(kind, framed);
+        Box::pin(async move {
+            let bytes = lane.finish(placed).await?;
+            decode(&bytes).map_err(|e| RaftRpcError::Malformed {
+                reason: e.to_string(),
+            })
         })
     }
 }
@@ -625,48 +820,61 @@ impl RaftTransport for TcpTransport {
         &self,
         to: NodeId,
         req: RequestVoteRequest,
-    ) -> RaftFuture<'_, RequestVoteReply> {
+    ) -> RaftFuture<RequestVoteReply> {
         let lane = self.lane(to, LANE_CONTROL);
         let mut payload = frame_buffer(48);
         req.encode(&mut payload);
-        Box::pin(Self::call(lane, KIND_REQUEST_VOTE, payload, |b| {
+        Self::call(lane, KIND_REQUEST_VOTE, payload, |b| {
             RequestVoteReply::decode(&mut Cursor::new(b))
-        }))
+        })
+    }
+
+    fn send_timeout_now(
+        &self,
+        to: NodeId,
+        req: crate::election::TimeoutNowRequest,
+    ) -> RaftFuture<crate::election::TimeoutNowReply> {
+        let lane = self.lane(to, LANE_CONTROL);
+        let mut payload = frame_buffer(24);
+        req.encode(&mut payload);
+        Self::call(lane, KIND_TIMEOUT_NOW, payload, |b| {
+            crate::election::TimeoutNowReply::decode(&mut Cursor::new(b))
+        })
     }
 
     fn send_append_entries(
         &self,
         to: NodeId,
         req: AppendEntriesRequest,
-    ) -> RaftFuture<'_, AppendEntriesReply> {
+    ) -> RaftFuture<AppendEntriesReply> {
         let lane = self.lane(to, LANE_CONTROL);
         let mut payload = frame_buffer(req.encoded_len());
         req.encode(&mut payload);
-        Box::pin(Self::call(lane, KIND_APPEND_ENTRIES, payload, |b| {
+        Self::call(lane, KIND_APPEND_ENTRIES, payload, |b| {
             AppendEntriesReply::decode(&mut Cursor::new(b))
-        }))
+        })
     }
 
     fn send_install_snapshot(
         &self,
         to: NodeId,
         req: InstallSnapshotRequest,
-    ) -> RaftFuture<'_, InstallSnapshotReply> {
+    ) -> RaftFuture<InstallSnapshotReply> {
         let lane = self.lane(to, LANE_BULK);
         let mut payload = frame_buffer(req.data.len() + 128);
         req.encode(&mut payload);
-        Box::pin(Self::call(lane, KIND_INSTALL_SNAPSHOT, payload, |b| {
+        Self::call(lane, KIND_INSTALL_SNAPSHOT, payload, |b| {
             InstallSnapshotReply::decode(&mut Cursor::new(b))
-        }))
+        })
     }
 
-    fn send_read_index(&self, to: NodeId, req: ReadIndexRequest) -> RaftFuture<'_, ReadIndexReply> {
+    fn send_read_index(&self, to: NodeId, req: ReadIndexRequest) -> RaftFuture<ReadIndexReply> {
         let lane = self.lane(to, LANE_CONTROL);
         let mut payload = frame_buffer(16);
         req.encode(&mut payload);
-        Box::pin(Self::call(lane, KIND_READ_INDEX, payload, |b| {
+        Self::call(lane, KIND_READ_INDEX, payload, |b| {
             ReadIndexReply::decode(&mut Cursor::new(b))
-        }))
+        })
     }
 
     fn set_address(&self, node: NodeId, address: &str) {
@@ -773,7 +981,8 @@ async fn serve_connection(
         }
     });
 
-    let mut batch: Vec<(u64, u8, ReplyFuture<'_>)> = Vec::with_capacity(PIPELINE_DEPTH);
+    let mut batch: Vec<(u64, u8, u16, ReplyFuture<'_>)> = Vec::with_capacity(PIPELINE_DEPTH);
+    let mut answers: Vec<u8> = Vec::new();
     let result = loop {
         let first = tokio::select! {
             biased;
@@ -793,18 +1002,17 @@ async fn serve_connection(
                 break;
             }
         }
-        let mut failed = None;
-        for (request_id, kind, reply) in batch.drain(..) {
+        // The group's answers share one write. They became ready together,
+        // behind the one fsync the group waited for, so nothing is held back
+        // by joining them. Each answer is stamped with the version of the
+        // request it answers, which the sender is known to read
+        answers.clear();
+        for (request_id, kind, version, reply) in batch.drain(..) {
             let (flags, mut framed) = reply.await;
-            if failed.is_some() {
-                continue;
-            }
-            stamp_frame(&mut framed, request_id, kind, flags);
-            if let Err(e) = write_half.write_all(&framed).await {
-                failed = Some(e);
-            }
+            stamp_frame(&mut framed, request_id, kind, flags, version);
+            answers.extend_from_slice(&framed);
         }
-        if let Some(e) = failed {
+        if let Err(e) = write_half.write_all(&answers).await {
             break Err(e);
         }
     };
@@ -812,22 +1020,39 @@ async fn serve_connection(
     result
 }
 
+/// Bytes a coalesced write grows to before it goes out on its own. A
+/// snapshot chunk is this size and never needs company
+const WRITE_COALESCE_BYTES: usize = 1024 * 1024;
+
 /// Runs the synchronous half of one request and returns what is left to wait
 /// for.
 ///
 /// Deliberately not an async function: the decode and the handler call have to
 /// happen at call time so that a run of AppendEntries reaches the log in the
-/// order it arrived, whatever order the waits are polled in afterwards
+/// order it arrived, whatever order the waits are polled in afterwards.
+///
+/// A frame from a protocol version newer than this build speaks is refused
+/// before it is decoded, and the refusal goes back at this build's own
+/// version, which is the newest the sender is known to read
 fn begin_reply<'a>(
     handler: &'a Arc<dyn RaftRequestHandler>,
     frame: Frame,
-) -> (u64, u8, ReplyFuture<'a>) {
+) -> (u64, u8, u16, ReplyFuture<'a>) {
     let Frame {
         request_id,
         kind,
+        version,
         payload,
         ..
     } = frame;
+    if version > CONSENSUS_PROTOCOL_VERSION {
+        return (
+            request_id,
+            kind,
+            CONSENSUS_PROTOCOL_VERSION,
+            refused(version_refusal(version)),
+        );
+    }
     let reply: ReplyFuture<'a> = match kind {
         KIND_REQUEST_VOTE => match RequestVoteRequest::decode(&mut Cursor::new(&payload)) {
             Ok(req) => {
@@ -857,9 +1082,18 @@ fn begin_reply<'a>(
             }
             Err(e) => refused(e.to_string()),
         },
+        KIND_TIMEOUT_NOW => {
+            match crate::election::TimeoutNowRequest::decode(&mut Cursor::new(&payload)) {
+                Ok(req) => {
+                    let fut = handler.on_timeout_now(req);
+                    Box::pin(async move { finish(fut.await) })
+                }
+                Err(e) => refused(e.to_string()),
+            }
+        }
         other => refused(format!("consensus frame kind {other} is not known")),
     };
-    (request_id, kind, reply)
+    (request_id, kind, version, reply)
 }
 
 /// Turns a handler answer into a frame body
@@ -911,6 +1145,12 @@ impl Encodable for InstallSnapshotReply {
 impl Encodable for ReadIndexReply {
     fn encode(&self, buf: &mut Vec<u8>) {
         ReadIndexReply::encode(self, buf)
+    }
+}
+
+impl Encodable for crate::election::TimeoutNowReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        crate::election::TimeoutNowReply::encode(self, buf)
     }
 }
 
@@ -980,6 +1220,18 @@ mod tests {
                 })
             })
         }
+
+        fn on_timeout_now(
+            &self,
+            req: crate::election::TimeoutNowRequest,
+        ) -> RaftHandlerFuture<'_, crate::election::TimeoutNowReply> {
+            Box::pin(async move {
+                Ok(crate::election::TimeoutNowReply {
+                    term: req.term + 1,
+                    started: true,
+                })
+            })
+        }
     }
 
     struct Refuser;
@@ -1004,6 +1256,13 @@ mod tests {
             Box::pin(async move { Err(ZyronError::Internal("no".into())) })
         }
         fn on_read_index(&self, _req: ReadIndexRequest) -> RaftHandlerFuture<'_, ReadIndexReply> {
+            Box::pin(async move { Err(ZyronError::Internal("no".into())) })
+        }
+
+        fn on_timeout_now(
+            &self,
+            _req: crate::election::TimeoutNowRequest,
+        ) -> RaftHandlerFuture<'_, crate::election::TimeoutNowReply> {
             Box::pin(async move { Err(ZyronError::Internal("no".into())) })
         }
     }
@@ -1037,6 +1296,7 @@ mod tests {
                     last_log_index: 3,
                     last_log_term: 4,
                     pre_vote: true,
+                    transfer: false,
                 },
             )
             .await
@@ -1168,6 +1428,7 @@ mod tests {
                     last_log_index: 0,
                     last_log_term: 0,
                     pre_vote: false,
+                    transfer: false,
                 },
             )
             .await
@@ -1223,5 +1484,58 @@ mod tests {
             .expect("after restart");
         assert_eq!(reply.read_index, 4242);
         assert!(transport.stats().connections_opened >= 2);
+    }
+
+    /// A frame from a newer protocol is refused with both numbers in the
+    /// reason, at this build's own version, and the connection stays open
+    /// for the frames this build reads. A header that names no version is
+    /// version one, which is what a build that stamped nothing sent
+    #[tokio::test]
+    async fn a_newer_protocol_frame_is_refused_by_name_and_a_zero_version_reads_as_one() {
+        let (address, _stop) = start(Arc::new(Echo {
+            seen: Arc::new(AtomicU64::new(0)),
+        }))
+        .await;
+        let mut stream = TcpStream::connect(&address).await.expect("connect");
+
+        let mut newer = frame_buffer(16);
+        ReadIndexRequest { term: 1, from: 1 }.encode(&mut newer);
+        stamp_frame(
+            &mut newer,
+            7,
+            KIND_READ_INDEX,
+            0,
+            CONSENSUS_PROTOCOL_VERSION + 1,
+        );
+        stream.write_all(&newer).await.expect("write");
+        let reply = read_frame(&mut stream, 1024)
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(reply.request_id, 7);
+        assert_ne!(
+            reply.flags & FLAG_ERROR,
+            0,
+            "the frame was decoded rather than refused"
+        );
+        assert_eq!(reply.version, CONSENSUS_PROTOCOL_VERSION);
+        let mut cursor = Cursor::new(&reply.payload);
+        let reason = cursor.string().expect("reason");
+        assert!(reason.contains("version 2"), "{reason}");
+        assert!(reason.contains("which is 1"), "{reason}");
+
+        let mut unstamped = frame_buffer(16);
+        ReadIndexRequest { term: 1, from: 1 }.encode(&mut unstamped);
+        stamp_frame(&mut unstamped, 8, KIND_READ_INDEX, 0, 0);
+        stream.write_all(&unstamped).await.expect("write");
+        let reply = read_frame(&mut stream, 1024)
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(reply.request_id, 8);
+        assert_eq!(reply.flags & FLAG_ERROR, 0, "{:?}", reply.payload);
+        assert_eq!(reply.version, 1);
+        let decoded = ReadIndexReply::decode(&mut Cursor::new(&reply.payload)).expect("decodes");
+        assert_eq!(decoded.read_index, 4242);
     }
 }

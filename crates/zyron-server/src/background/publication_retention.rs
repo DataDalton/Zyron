@@ -9,7 +9,7 @@
 // -----------------------------------------------------------------------------
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tracing::info;
@@ -22,15 +22,12 @@ pub async fn publication_retention_loop(
     catalog: Arc<Catalog>,
     cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_secs: u64,
     metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(60)));
-    loop {
-        ticker.tick().await;
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         run_retention_sweep(&catalog, cdc_registry.as_deref(), metrics.as_deref()).await;
     }
 }

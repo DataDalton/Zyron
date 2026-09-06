@@ -4,14 +4,15 @@
 //! Converts heap tuple data into column-oriented .zyr files for
 //! scan queries. Background compaction materializes rows, sorts by
 //! primary key, encodes per-column with type-specific strategies, and
-//! writes page-aligned files with bloom filters and zone maps for
-//! segment pruning.
+//! writes files with 64-byte-aligned segments, bloom filters, and zone
+//! maps for segment pruning.
 
 pub mod bloom;
 pub mod cache;
 pub mod compaction;
 pub mod constants;
 pub mod file;
+pub mod migrations;
 pub mod patch;
 pub mod segment;
 pub mod sketch;

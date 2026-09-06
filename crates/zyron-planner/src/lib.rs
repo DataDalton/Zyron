@@ -23,6 +23,7 @@ pub use explain::{
 };
 pub use logical::LogicalPlan;
 pub use optimizer::Optimizer;
+pub use optimizer::rules::predicate_pushdown::collect_column_refs;
 pub use physical::{ClusterFitDetail, PhysicalPlan};
 
 use std::sync::Arc;

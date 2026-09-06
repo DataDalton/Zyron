@@ -101,6 +101,11 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Trigger) if self.peek_is_ident("manual") => {
                 self.parse_trigger_upgrade()
             }
+            Token::Ident(word)
+                if word.eq_ignore_ascii_case("acknowledge") && self.peek_is_ident("upgrade") =>
+            {
+                self.parse_acknowledge_upgrade_rewrites()
+            }
             // ROTATE and LIST are matched as soft keywords, so a column or a
             // table called `rotate` or `list` keeps working everywhere else
             Token::Ident(word) if word.eq_ignore_ascii_case("rotate") => self.parse_rotate(),
@@ -1224,7 +1229,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Type) => self.parse_create_type(),
             Token::Keyword(Keyword::Collation) => self.parse_create_collation(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, HYBRID, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, ENDPOINT, STREAMING, ABAC, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, EVENT, ANALYZER, SYNONYM, BULKHEAD, RETRY, TYPE, or COLLATION after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, HYBRID, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, ENDPOINT, STREAMING, ABAC, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, EVENT, ANALYZER, SYNONYM DICTIONARY, BULKHEAD, RETRY, TYPE, or COLLATION after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1490,7 +1495,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Type) => self.parse_drop_type(),
             Token::Keyword(Keyword::Collation) => self.parse_drop_collation(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, ENDPOINT, SECURITY, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, EVENT, ANALYZER, SYNONYM, BULKHEAD, RETRY, TYPE, or COLLATION after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, ENDPOINT, SECURITY, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, EVENT, ANALYZER, SYNONYM DICTIONARY, BULKHEAD, RETRY, TYPE, or COLLATION after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -1555,7 +1560,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Analyzer) => self.parse_alter_analyzer(),
             Token::Keyword(Keyword::Synonym) => self.parse_alter_synonym_dictionary(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, CLUSTER, STREAMING, ENDPOINT, SECURITY, PUBLICATION, ANALYZER, or SYNONYM after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, CLUSTER, STREAMING, ENDPOINT, SECURITY, PUBLICATION, ANALYZER, or SYNONYM DICTIONARY after ALTER, found {}",
                 self.current.token
             ))),
         }
@@ -4408,6 +4413,26 @@ impl<'a> Parser<'a> {
         }
         Err(self
             .error("Expected `TRIGGER MANUAL UPGRADE TO '<version>'` or `TRIGGER MANUAL ROLLBACK`"))
+    }
+
+    /// `ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS` or `ACKNOWLEDGE UPGRADE REWRITES UNSAFE`
+    fn parse_acknowledge_upgrade_rewrites(&mut self) -> Result<Statement> {
+        self.expect_ident_ignore_case("acknowledge")?;
+        self.expect_ident_ignore_case("upgrade")?;
+        self.expect_ident_ignore_case("rewrites")?;
+        let category = if self.consume_ident_ignore_case("ambiguous")? {
+            AcknowledgeRewriteCategory::Ambiguous
+        } else if self.consume_ident_ignore_case("unsafe")? {
+            AcknowledgeRewriteCategory::Unsafe
+        } else {
+            return Err(self.error(
+                "Expected `ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS` or `ACKNOWLEDGE UPGRADE \
+                 REWRITES UNSAFE`",
+            ));
+        };
+        Ok(Statement::AcknowledgeUpgradeRewrites(Box::new(
+            AcknowledgeUpgradeRewritesStatement { category },
+        )))
     }
 
     /// Reads a non-negative integer literal, which LIMIT needs.
@@ -9369,7 +9394,7 @@ fn parse_lsn_reset_spec(literal: &str) -> Option<LsnResetSpec> {
 
 /// Maps keywords that can be used as identifiers in non-keyword position.
 /// Returns the string representation, or None if the keyword cannot be used as an identifier.
-fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
+pub(crate) fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
     match kw {
         // Data type keywords commonly used as identifiers
         Keyword::Type => Some("type"),

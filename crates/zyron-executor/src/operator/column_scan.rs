@@ -32,7 +32,10 @@ use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
 use crate::context::ExecutionContext;
 use crate::expr::evaluate;
-use crate::operator::{ExecutionBatch, Operator, OperatorResult, apply_column_security};
+use crate::operator::{
+    ExecutionBatch, MetaAcc, Operator, OperatorResult, apply_column_security, expose_column_value,
+    fold_rows_into_meta_accs,
+};
 
 /// Per-projected-column decode plan.
 struct ColPlan {
@@ -87,6 +90,14 @@ pub struct ColumnScanOperator {
     /// them, so a segment rejected by its header or zone maps contributes rows
     /// and bytes of zero.
     io_stats: Option<Arc<zyron_common::TableIOStats>>,
+    /// Segments the predicate rejected from their header, zone maps or value
+    /// bloom, so no column of them was decoded.
+    ///
+    /// Reported rather than inferred from the bytes counter, because a
+    /// rejection reads a header and a bloom and those are metadata the byte
+    /// counter deliberately leaves out, so a skipped segment and a segment
+    /// with nothing to read look the same there
+    segments_skipped: usize,
     /// Which table instance the projected columns belong to, so a resolved
     /// path is offered to the column references that name this scan's table
     /// and to no others
@@ -258,9 +269,16 @@ impl ColumnScanOperator {
             pending: std::collections::VecDeque::new(),
             finished: false,
             io_stats,
+            segments_skipped: 0,
             table_idx,
             shreds,
         })
+    }
+
+    /// Registered segments the predicate rejected before decoding any column
+    /// of them.
+    pub fn segments_skipped(&self) -> usize {
+        self.segments_skipped
     }
 
     /// Sets the time-travel version. Rows are then dated by commit LSN instead
@@ -353,6 +371,40 @@ impl ColumnScanOperator {
             return Ok(());
         }
 
+        if self.segment_rejected(&reader, row_count, file_id)? {
+            self.segments_skipped += 1;
+            return Ok(());
+        }
+
+        let read_u64 = |buf: &[u8], i: usize| -> u64 {
+            let s = i * 8;
+            u64::from_le_bytes(buf[s..s + 8].try_into().unwrap())
+        };
+
+        // One file open per segment for every needed column (sys columns
+        // then projected columns), instead of reopening per column.
+        let mut col_ids: Vec<u32> = vec![SYS_COL_ROWID, SYS_COL_XMIN, SYS_COL_SUPERSEDE];
+        for p in &self.col_plans {
+            col_ids.push(p.column_id);
+        }
+        self.load_segment_rows(reader, row_count, file_id, col_ids, read_u64)
+    }
+
+    /// Whether the predicate proves this segment holds no matching row.
+    ///
+    /// Answered from metadata alone: the segment header's bounds, its zone
+    /// maps, and its value bloom. Every one of them is sized by the row
+    /// count or the cardinality rather than by the data, so rejecting a
+    /// segment costs a fraction of decoding one.
+    ///
+    /// A patched (dirty) segment is never rejected: a value patch could move
+    /// a row into range, and the patch is not in the metadata
+    fn segment_rejected(
+        &self,
+        reader: &ZyrFileReader,
+        row_count: usize,
+        file_id: u64,
+    ) -> Result<bool> {
         // Segment-level predicate pruning: if a fixed integer or
         // integer-backed temporal projected column has a range/equality
         // constraint disjoint from this segment's header [min, max], the
@@ -420,7 +472,7 @@ impl ColumnScanOperator {
                     let hi = hi.unwrap_or(i128::MAX);
                     if smax < lo || smin > hi {
                         // Predicate range cannot intersect this segment.
-                        return Ok(());
+                        return Ok(true);
                     }
                     // A segment's bounds are the union of its zones, so it
                     // can admit a range that no zone holds. This is what an
@@ -435,23 +487,74 @@ impl ColumnScanOperator {
                             .iter()
                             .any(|z| le(&z.max_value) >= lo && le(&z.min_value) <= hi)
                     {
-                        return Ok(());
+                        return Ok(true);
+                    }
+                    // Bounds and zones only say the value falls inside a
+                    // range they cover, and for a high cardinality column
+                    // every zone covers it, so an equality no row satisfies
+                    // still reaches the decode. The value bloom answers
+                    // whether the segment holds that exact cell, and it is
+                    // built for exactly the columns bounds cannot narrow:
+                    // cardinality at or above the threshold and an encoding
+                    // with no membership answer of its own. A filter wider
+                    // than the payload it would save reading is not a
+                    // saving, whatever it answers
+                    if lo == hi
+                        && bloom_worth_reading(&h)
+                        && let Some(cell) = int_cell_bytes(lo, width, signed)
+                        && let Some(bloom) = reader.read_bloom(p.column_id)?
+                        && !bloom.might_contain(&cell)
+                    {
+                        return Ok(true);
+                    }
+                }
+                // The same question for a column whose cells are bytes,
+                // where no bound is derived at all today, so an equality on
+                // a text column decodes every segment to find nothing
+                for p in &self.col_plans {
+                    if p.value_size != 0
+                        || !matches!(
+                            p.type_id,
+                            zyron_common::types::TypeId::Varchar
+                                | zyron_common::types::TypeId::Text
+                        )
+                    {
+                        continue;
+                    }
+                    let groups = predicate_equal_bytes(pred, p.column_id);
+                    if groups.is_empty() {
+                        continue;
+                    }
+                    let header = reader.read_segment_header(p.column_id)?;
+                    if !bloom_worth_reading(&header) {
+                        continue;
+                    }
+                    let Some(bloom) = reader.read_bloom(p.column_id)? else {
+                        continue;
+                    };
+                    // Each group is one term the rows have to satisfy, so a
+                    // group with no member the segment can hold is a term no
+                    // row here satisfies
+                    if groups
+                        .iter()
+                        .any(|group| !group.iter().any(|v| bloom.might_contain(v)))
+                    {
+                        return Ok(true);
                     }
                 }
             }
         }
+        Ok(false)
+    }
 
-        let read_u64 = |buf: &[u8], i: usize| -> u64 {
-            let s = i * 8;
-            u64::from_le_bytes(buf[s..s + 8].try_into().unwrap())
-        };
-
-        // One file open per segment for every needed column (sys columns
-        // then projected columns), instead of reopening per column.
-        let mut col_ids: Vec<u32> = vec![SYS_COL_ROWID, SYS_COL_XMIN, SYS_COL_SUPERSEDE];
-        for p in &self.col_plans {
-            col_ids.push(p.column_id);
-        }
+    fn load_segment_rows(
+        &mut self,
+        reader: ZyrFileReader,
+        row_count: usize,
+        file_id: u64,
+        mut col_ids: Vec<u32>,
+        read_u64: impl Fn(&[u8], usize) -> u64,
+    ) -> Result<()> {
         // Promoted paths this segment stores that the statement reads. Held
         // by value so the segment loop owns them while `self` is borrowed
         // again to queue the batches
@@ -891,6 +994,8 @@ impl HybridScanOperator {
 impl Operator for HybridScanOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         Box::pin(async move {
+            let _scan =
+                zyron_common::profile::scope(zyron_common::profile::Phase::ExecHybridScanNext);
             if !self.columnar_done {
                 match self.columnar.next().await? {
                     Some(b) => return Ok(Some(b)),
@@ -922,11 +1027,6 @@ pub struct ColumnarMetadataAggregateOperator {
     done: bool,
 }
 
-enum Acc {
-    Count(i64),
-    MinMax(Option<ScalarValue>),
-}
-
 impl ColumnarMetadataAggregateOperator {
     pub fn new(
         ctx: Arc<ExecutionContext>,
@@ -941,68 +1041,6 @@ impl ColumnarMetadataAggregateOperator {
             schema,
             done: false,
         }
-    }
-
-    fn fold_minmax(cur: &mut Option<ScalarValue>, v: ScalarValue, want_max: bool) {
-        if matches!(v, ScalarValue::Null) {
-            return;
-        }
-        match cur {
-            None => *cur = Some(v),
-            Some(c) => {
-                if let Some(ord) = v.partial_cmp(c) {
-                    let take = if want_max {
-                        ord == std::cmp::Ordering::Greater
-                    } else {
-                        ord == std::cmp::Ordering::Less
-                    };
-                    if take {
-                        *cur = Some(v);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn aggregate_scan(
-        &self,
-        mut op: Box<dyn Operator>,
-        proj_idx: &[Option<usize>],
-        accs: &mut [Acc],
-    ) -> Result<()> {
-        while let Some(eb) = op.next().await? {
-            let b = &eb.batch;
-            for (si, spec) in self.specs.iter().enumerate() {
-                match (&spec.kind, &mut accs[si]) {
-                    (MetaAggKind::CountStar, Acc::Count(c)) => {
-                        *c += b.num_rows as i64;
-                    }
-                    (MetaAggKind::CountCol, Acc::Count(c)) => {
-                        if let Some(ci) = proj_idx[si] {
-                            let col = &b.columns[ci];
-                            for r in 0..b.num_rows {
-                                if !col.is_null(r) {
-                                    *c += 1;
-                                }
-                            }
-                        }
-                    }
-                    (MetaAggKind::Min, Acc::MinMax(m)) | (MetaAggKind::Max, Acc::MinMax(m)) => {
-                        if let Some(ci) = proj_idx[si] {
-                            let want_max = spec.kind == MetaAggKind::Max;
-                            let col = &b.columns[ci];
-                            for r in 0..b.num_rows {
-                                if !col.is_null(r) {
-                                    Self::fold_minmax(m, col.get_scalar(r), want_max);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1059,14 +1097,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                 .map(|s| s.column_id.and_then(|c| col_to_proj.get(&c.0).copied()))
                 .collect();
 
-            let mut accs: Vec<Acc> = self
-                .specs
-                .iter()
-                .map(|s| match s.kind {
-                    MetaAggKind::CountStar | MetaAggKind::CountCol => Acc::Count(0),
-                    MetaAggKind::Min | MetaAggKind::Max => Acc::MinMax(None),
-                })
-                .collect();
+            let mut accs = MetaAcc::for_specs(&self.specs);
 
             // Columnar contribution.
             let segments = &te.columnar.segments;
@@ -1101,8 +1132,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                     None,
                     dirty.clone(),
                 )?;
-                self.aggregate_scan(Box::new(cs), &proj_idx, &mut accs)
-                    .await?;
+                fold_rows_into_meta_accs(Box::new(cs), &self.specs, &proj_idx, &mut accs).await?;
             }
             {
                 // Clean segments: answer from segment headers, no row decode.
@@ -1111,15 +1141,15 @@ impl Operator for ColumnarMetadataAggregateOperator {
                     let rc = reader.row_count() as i64;
                     for (si, spec) in self.specs.iter().enumerate() {
                         match (&spec.kind, &mut accs[si]) {
-                            (MetaAggKind::CountStar, Acc::Count(c)) => *c += rc,
-                            (MetaAggKind::CountCol, Acc::Count(c)) => {
+                            (MetaAggKind::CountStar, MetaAcc::Count(c)) => *c += rc,
+                            (MetaAggKind::CountCol, MetaAcc::Count(c)) => {
                                 if let Some(cid) = spec.column_id {
                                     let h = reader.read_segment_header(cid.0 as u32)?;
                                     *c += rc - h.null_count as i64;
                                 }
                             }
-                            (MetaAggKind::Min, Acc::MinMax(m))
-                            | (MetaAggKind::Max, Acc::MinMax(m)) => {
+                            (MetaAggKind::Min, MetaAcc::MinMax(m))
+                            | (MetaAggKind::Max, MetaAcc::MinMax(m)) => {
                                 if let Some(cid) = spec.column_id {
                                     let ce = te.columns.iter().find(|c| c.id == cid).ok_or_else(
                                         || {
@@ -1142,7 +1172,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                                             &h.min_value
                                         };
                                         let sv = decode_fixed_scalar(phys, &slot[..sz]);
-                                        Self::fold_minmax(m, sv, spec.kind == MetaAggKind::Max);
+                                        MetaAcc::fold_minmax(m, sv, spec.kind == MetaAggKind::Max);
                                     }
                                 }
                             }
@@ -1173,49 +1203,21 @@ impl Operator for ColumnarMetadataAggregateOperator {
                     None,
                 )
                 .await?;
-                self.aggregate_scan(Box::new(heap), &proj_idx, &mut accs)
-                    .await?;
+                fold_rows_into_meta_accs(Box::new(heap), &self.specs, &proj_idx, &mut accs).await?;
             }
 
-            // Materialize the single result row. MIN/MAX expose an actual
-            // column value, so they must honor the same column-level
-            // classification/masking the row-scan path enforces: if the
-            // session is not cleared for the column, or a masking policy
-            // applies to it, deny by returning NULL. COUNT does not expose a
-            // value and is left intact.
+            // Materialize the single result row. MIN and MAX expose an
+            // actual column value, so they honor the same column level
+            // classification and masking the row scan path enforces. COUNT
+            // exposes no value and is left intact.
             let table_id = self.table_id.0;
-            let sec = self
-                .ctx
-                .security_context
-                .as_ref()
-                .zip(self.ctx.security_manager.as_ref());
             let mut builders = create_builders(&self.schema, 1);
             for (si, acc) in accs.into_iter().enumerate() {
-                let sv = match acc {
-                    Acc::Count(c) => ScalarValue::Int64(c),
-                    Acc::MinMax(m) => {
-                        let mut v = m.unwrap_or(ScalarValue::Null);
-                        if let (Some(cid), Some((sc, sm))) = (self.specs[si].column_id, sec) {
-                            let cleared = sm.classification_store.check_clearance(
-                                sc.clearance,
-                                table_id,
-                                cid.0,
-                            );
-                            let mut probe = String::new();
-                            let has_mask = sm.masking_policy_store.apply_masking(
-                                table_id,
-                                cid.0,
-                                "",
-                                &sc.effective_roles,
-                                &mut probe,
-                            );
-                            if !cleared || has_mask {
-                                v = ScalarValue::Null;
-                            }
-                        }
-                        v
-                    }
-                };
+                let exposes_value = !matches!(acc, MetaAcc::Count(_));
+                let mut sv = acc.finish(self.specs[si].return_type)?;
+                if exposes_value {
+                    sv = expose_column_value(&self.ctx, table_id, self.specs[si].column_id, sv);
+                }
                 builders[si].push(&sv);
             }
             Ok(Some(ExecutionBatch::new(finalize_builders(builders))))
@@ -1228,6 +1230,113 @@ impl Operator for ColumnarMetadataAggregateOperator {
 /// unbounded there; `(None, None)` means "no usable constraint" (the caller
 /// then does not skip and scans normally, so this is always correctness
 /// safe). Only AND of simple `col CMP int-literal` comparisons is analyzed.
+/// Whether reading a segment's value bloom can save more than it costs.
+///
+/// Rejecting a segment here skips decoding every projected column of it and
+/// the three sys columns beside them, and the row loop over all of that, so
+/// what the probe avoids is the decoded size rather than the encoded one. A
+/// filter as wide as the values it would materialize is where that stops
+/// being a saving. Both sizes are in the header the probe has already read
+fn bloom_worth_reading(header: &zyron_storage::columnar::SegmentHeader) -> bool {
+    header.bloom_filter_size > 0 && u64::from(header.bloom_filter_size) < header.raw_size
+}
+
+/// The stored cell an integer-backed constant equals, or None when the
+/// constant does not fit the column's width.
+///
+/// A segment records its cells as `width` little endian bytes and its bloom
+/// holds those bytes, so a probe has to present the same. A constant the
+/// width cannot hold has no cell to present, and the bounds check has
+/// already decided that segment anyway
+fn int_cell_bytes(value: i128, width: usize, signed: bool) -> Option<Vec<u8>> {
+    if width == 0 || width > 16 {
+        return None;
+    }
+    if width < 16 {
+        let bits = 8 * width as u32;
+        let fits = if signed {
+            let limit = 1i128 << (bits - 1);
+            (-limit..limit).contains(&value)
+        } else {
+            (0..(1i128 << bits)).contains(&value)
+        };
+        if !fits {
+            return None;
+        }
+    } else if !signed && value < 0 {
+        return None;
+    }
+    Some(value.to_le_bytes()[..width].to_vec())
+}
+
+/// Byte-string values a column has to hold for the predicate to select any
+/// row, as one group per term.
+///
+/// A row satisfies the predicate only if it satisfies every group, so a
+/// group whose members a segment provably holds none of is a term no row of
+/// that segment satisfies. A disjunction contributes nothing: its arms are
+/// alternatives and rejecting one says nothing about the other
+fn predicate_equal_bytes(e: &BoundExpr, col: u32) -> Vec<Vec<Vec<u8>>> {
+    let is_col = |x: &BoundExpr| matches!(x, BoundExpr::ColumnRef(ColumnRef { column_id, .. }) if column_id.0 as u32 == col);
+    let as_str = |x: &BoundExpr| match x {
+        BoundExpr::Literal {
+            value: LiteralValue::String(s),
+            ..
+        } => Some(s.as_bytes().to_vec()),
+        _ => None,
+    };
+    match e {
+        BoundExpr::Nested(inner) => predicate_equal_bytes(inner, col),
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
+            let mut groups = predicate_equal_bytes(left, col);
+            groups.extend(predicate_equal_bytes(right, col));
+            groups
+        }
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+            ..
+        } => {
+            let cell = if is_col(left) {
+                as_str(right)
+            } else if is_col(right) {
+                as_str(left)
+            } else {
+                None
+            };
+            cell.map(|c| vec![vec![c]]).unwrap_or_default()
+        }
+        BoundExpr::InList {
+            expr,
+            list,
+            negated: false,
+            ..
+        } if is_col(expr) => {
+            let mut members = Vec::with_capacity(list.len());
+            for item in list {
+                // One member with no byte form makes the whole membership
+                // unprovable, since a row it admits must not be dropped
+                match as_str(item) {
+                    Some(c) => members.push(c),
+                    None => return Vec::new(),
+                }
+            }
+            if members.is_empty() {
+                Vec::new()
+            } else {
+                vec![members]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn predicate_int_bounds(e: &BoundExpr, col: u32) -> (Option<i128>, Option<i128>) {
     fn col_lit<'a>(l: &'a BoundExpr, r: &'a BoundExpr, col: u32) -> Option<(bool, i128)> {
         // Returns (col_on_left, literal) when exactly one side is the target

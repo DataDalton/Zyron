@@ -103,8 +103,8 @@ impl QueryMemoryBudget {
     }
 
     /// Reserves bytes against the budget, failing the query loudly once
-    /// the limit would be exceeded. Reservations are never released, the
-    /// budget's lifetime is the query's.
+    /// the limit would be exceeded. A reservation lasts for the query
+    /// unless the operator that made it gives it back with `release`.
     pub fn reserve(&self, bytes: u64) -> Result<()> {
         let limit = self.limit.load(Ordering::Relaxed);
         let prev = self.used.fetch_add(bytes, Ordering::Relaxed);
@@ -116,6 +116,16 @@ impl QueryMemoryBudget {
             )));
         }
         Ok(())
+    }
+
+    /// Gives reserved bytes back, for an operator that held rows and then
+    /// discarded them. The caller releases no more than it reserved.
+    ///
+    /// A sort under a limit cuts its buffer back to the limit as it reads,
+    /// and the rows it drops are no longer the query's to hold. Every other
+    /// reservation stands for the query's lifetime
+    pub fn release(&self, bytes: u64) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Bytes reserved so far.

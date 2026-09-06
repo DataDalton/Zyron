@@ -1647,6 +1647,7 @@ mod tests {
                 bounds: bounds(min, max),
                 bloom: None,
                 size_bytes: Some(4096),
+                sum: None,
             }]),
             delete_predicate_ids: Vec::new(),
         };

@@ -35,7 +35,6 @@
 use std::collections::{BTreeMap, HashSet};
 
 use zyron_common::ZyronError;
-use zyron_storage::columnar::FILE_HEADER_SIZE;
 
 use crate::cells::compare_cells;
 use crate::manifest::{ManifestFile, PartitionEntry};
@@ -498,14 +497,24 @@ pub fn covers_table(manifest: &ManifestFile, index_id: u32) -> bool {
         .all(|entry| covered.contains(&entry.partition_id))
 }
 
+/// What reaching one more file costs, on top of the bytes read out of it.
+///
+/// A file is a handle to open and the positioned reads that locate its
+/// segment index before any column can be addressed, and that is paid per
+/// file whatever the column costs. One page is the unit those reads land
+/// in. It is deliberately not the file header's size: the header is
+/// metadata a format is free to shrink, and shrinking it does not make
+/// reaching a file cheaper
+const FILE_TOUCH_BYTES: u64 = zyron_common::page::PAGE_SIZE as u64;
+
 /// Bytes a scan reads to answer a predicate on one column, across the data
 /// files pruning left.
 ///
-/// Each file costs the header page the reader consumes before it can find
-/// any segment, plus the predicate column's whole segment. The segment is
-/// charged whole because a ranged read still reads its contiguous payload
-/// and only narrows the decode, so the byte cost of touching a column does
-/// not depend on how many of its rows the caller wants.
+/// Each file costs what reaching it costs, plus the predicate column's
+/// whole segment. The segment is charged whole because a ranged read still
+/// reads its contiguous payload and only narrows the decode, so the byte
+/// cost of touching a column does not depend on how many of its rows the
+/// caller wants.
 ///
 /// Projected columns are outside this: both access paths read them, so
 /// they cancel. Returns None when any surviving file did not record its
@@ -518,7 +527,7 @@ pub fn scan_read_bytes(manifest: &ManifestFile, surviving: &[u64], column_id: u3
         let column = entry.stats_for(column_id)?.size_bytes?;
         total = total
             .saturating_add(column)
-            .saturating_add(FILE_HEADER_SIZE as u64);
+            .saturating_add(FILE_TOUCH_BYTES);
     }
     Some(total)
 }

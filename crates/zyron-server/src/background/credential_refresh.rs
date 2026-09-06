@@ -7,7 +7,7 @@
 // -----------------------------------------------------------------------------
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const DEFAULT_INTERVAL_SECS: u64 = 60;
@@ -26,6 +26,7 @@ mod tests {
         let called_clone = Arc::clone(&called);
         credential_refresh_loop(
             shutdown,
+            Arc::new(tokio::sync::Notify::new()),
             15,
             std::time::Duration::from_secs(60),
             move |_| {
@@ -41,6 +42,7 @@ mod tests {
 /// worker stays agnostic of the specific provider registry.
 pub async fn credential_refresh_loop<F>(
     shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     interval_secs: u64,
     refresh_window: Duration,
     mut on_tick: F,
@@ -48,11 +50,7 @@ pub async fn credential_refresh_loop<F>(
     F: FnMut(Duration) + Send + 'static,
 {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(15)));
-    loop {
-        ticker.tick().await;
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while super::tick_until_shutdown(&mut ticker, &shutdown, &wake).await {
         on_tick(refresh_window);
     }
 }

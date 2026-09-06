@@ -4,7 +4,10 @@
 //! table or column already called `rotate`, `list`, `upgrade`, `scheme` or
 //! `object` keeps working. The last test in this file is what holds that
 
-use zyron_parser::ast::{ListRegistryTarget, ShowUpgradeTarget, Statement, TriggerUpgradeAction};
+use zyron_parser::ast::{
+    AcknowledgeRewriteCategory, ListRegistryTarget, ShowUpgradeTarget, Statement,
+    TriggerUpgradeAction,
+};
 use zyron_parser::parse;
 
 fn one(sql: &str) -> Statement {
@@ -122,6 +125,26 @@ fn test_trigger_manual_upgrade_and_rollback() {
 }
 
 #[test]
+fn test_acknowledge_upgrade_rewrites_names_a_category() {
+    match one("ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS") {
+        Statement::AcknowledgeUpgradeRewrites(s) => {
+            assert_eq!(s.category, AcknowledgeRewriteCategory::Ambiguous);
+        }
+        other => panic!("parsed as {other:?}"),
+    }
+    match one("acknowledge upgrade rewrites unsafe") {
+        Statement::AcknowledgeUpgradeRewrites(s) => {
+            assert_eq!(s.category, AcknowledgeRewriteCategory::Unsafe);
+        }
+        other => panic!("parsed as {other:?}"),
+    }
+    // Safe rewrites apply on their own or are refused by policy, so there is
+    // nothing for an operator to acknowledge about them
+    let err = parse("ACKNOWLEDGE UPGRADE REWRITES SAFE").expect_err("safe is not a category");
+    assert!(err.to_string().contains("AMBIGUOUS"), "{err}");
+}
+
+#[test]
 fn test_show_upgrade_state_and_format_migrations() {
     match one("SHOW UPGRADE STATE") {
         Statement::ShowUpgrade(s) => assert_eq!(s.target, ShowUpgradeTarget::State),
@@ -220,6 +243,9 @@ fn test_new_words_still_work_as_identifiers() {
         "service",
         "state",
         "history",
+        "acknowledge",
+        "rewrites",
+        "ambiguous",
     ] {
         let select = format!("SELECT {word} FROM t");
         assert!(parse(&select).is_ok(), "`{select}` should parse");

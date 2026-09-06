@@ -47,7 +47,10 @@ pub use migration::{
     MigratedBody, MigrationBoard, MigrationError, MigrationProgress, OpenedFile, ReaderPath,
 };
 
-pub use record_version::{RECORD_VERSION_ABSENT, RecordVersion, WideRecordVersion};
+pub use record_version::{
+    RECORD_VERSION_ABSENT, RECORD_VERSION_MAX_INLINE, RECORD_VERSION_WIDE_ESCAPE, RecordTag,
+    RecordVersion, WideRecordVersion,
+};
 pub use registry::{
     DeprecationStatus, FormatEntry, FormatFixture, FormatMigrator, FormatRegistration,
     FormatRegistry, MigrateFn, MigrationPolicy, RegistryError,
@@ -69,7 +72,7 @@ pub use upgrade::{
 };
 pub use version::{FormatVersion, VersionWindow};
 pub use wire_version::{
-    WireProtocolVersion, WireVersionError, WireVersionRegistry, WireVersionStatus,
+    WireProtocol, WireProtocolVersion, WireVersionError, WireVersionRegistry, WireVersionStatus,
 };
 
 use crate::error::{Result, ZyronError};

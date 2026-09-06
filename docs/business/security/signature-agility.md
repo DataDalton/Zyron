@@ -17,6 +17,8 @@ Zyron can rotate the cryptographic scheme used for any signed artifact without b
 
 Zyron's own artifacts (JWTs, cluster identity certificates, federation invite tokens, App image signatures, session tokens, PATs) are signed with the current scheme configured for that artifact kind. External artifacts (WebAuthn assertions from hardware keys, JWTs from external identity providers) are verified against whatever scheme the external system uses.
 
+The registry also carries reserved slots for post-quantum schemes, which appear with status `Reserved` until a release enables one. A reserved scheme cannot yet sign or verify.
+
 ## Rotation with overlap
 
 Rotation always uses an overlap window. During the overlap, both the outgoing scheme and the new scheme are accepted. After the overlap ends, the outgoing scheme is rejected.
