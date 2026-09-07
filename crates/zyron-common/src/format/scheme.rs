@@ -616,6 +616,105 @@ impl SchemeRegistry {
         Ok((resolved, rest))
     }
 
+    /// One artifact kind's binding rendered as the value it persists and
+    /// replicates as.
+    ///
+    /// `Ed25519` on its own while nothing is rotating, and
+    /// `Ed25519|RS256|1757203200` during a rotation, which reads as the
+    /// incoming scheme, the outgoing one, and the unix second the outgoing
+    /// one stops being accepted
+    pub fn binding_setting(&self, kind: ArtifactKind) -> Option<String> {
+        let binding = self.binding(kind)?;
+        Some(
+            match (&binding.deprecating_scheme, binding.overlap_end_secs) {
+                (Some(outgoing), Some(end)) => {
+                    format!("{}|{outgoing}|{end}", binding.current_scheme)
+                }
+                (Some(outgoing), None) => format!("{}|{outgoing}|", binding.current_scheme),
+                _ => binding.current_scheme.clone(),
+            },
+        )
+    }
+
+    /// Applies a binding in the form `binding_setting` renders, and answers
+    /// with the value as it was stored.
+    ///
+    /// The persisted form and the replicated form are the same string read by
+    /// the same function, so a binding seeded at boot and one applied from the
+    /// log cannot end up meaning different things
+    pub fn apply_binding_setting(
+        &self,
+        kind: ArtifactKind,
+        value: &str,
+    ) -> Result<String, SchemeError> {
+        let mut parts = value.split('|');
+        let incoming = parts.next().unwrap_or_default().trim();
+        if incoming.is_empty() {
+            return Err(SchemeError::UnknownScheme {
+                named: value.to_string(),
+            });
+        }
+        let outgoing = parts.next().map(str::trim).filter(|s| !s.is_empty());
+        let overlap_end = match parts.next().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(text) => Some(
+                text.parse::<u64>()
+                    .map_err(|_| SchemeError::UnknownScheme {
+                        named: value.to_string(),
+                    })?,
+            ),
+            None => None,
+        };
+
+        // Both halves resolve before anything is written, so a binding naming
+        // a scheme this binary does not carry is refused whole rather than
+        // leaving the kind pointing at half a rotation
+        let current = self.canonical_signing_scheme(incoming)?.to_string();
+        let deprecating = match outgoing {
+            Some(name) => Some(self.canonical_signing_scheme(name)?.to_string()),
+            None => None,
+        };
+
+        let Ok(mut bindings) = self.bindings.lock() else {
+            return Err(SchemeError::UnknownScheme {
+                named: value.to_string(),
+            });
+        };
+        match bindings.iter_mut().find(|b| b.artifact_kind == kind) {
+            Some(binding) => {
+                binding.current_scheme = current;
+                binding.deprecating_scheme = deprecating;
+                binding.overlap_end_secs = overlap_end;
+            }
+            None => bindings.push(ArtifactSchemeBinding {
+                artifact_kind: kind,
+                current_scheme: current,
+                deprecating_scheme: deprecating,
+                overlap_end_secs: overlap_end,
+            }),
+        }
+        drop(bindings);
+        self.binding_setting(kind)
+            .ok_or_else(|| SchemeError::UnknownScheme {
+                named: value.to_string(),
+            })
+    }
+
+    /// The registry's own spelling of a scheme that is allowed to sign, so a
+    /// binding stores one spelling however it was typed
+    fn canonical_signing_scheme(&self, named: &str) -> Result<&'static str, SchemeError> {
+        let scheme = self
+            .by_name(named)
+            .ok_or_else(|| SchemeError::UnknownScheme {
+                named: named.to_string(),
+            })?;
+        if scheme.status == SchemeStatus::Reserved {
+            return Err(SchemeError::ReservedScheme {
+                scheme_name: scheme.scheme_name.to_string(),
+            });
+        }
+        Ok(scheme.scheme_name)
+    }
+
     /// Records the expiry of an artifact signed with a scheme, so the
     /// retention sweep knows when the verifier can go
     pub fn note_artifact_expiry(&self, scheme_name: &str, expiry_secs: u64) {

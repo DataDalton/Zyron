@@ -125,9 +125,50 @@ fn refused(message: impl Into<String>) -> ProtocolError {
     ProtocolError::Database(ZyronError::UpgradeRefused(message.into()))
 }
 
+/// The config key one artifact kind's binding persists and replicates under.
+///
+/// The server owns the section and the key shape, this is the spelling the
+/// DDL surface hands it so a binding set here reaches the same place a
+/// binding restored at boot came from
+pub fn binding_config_key(kind: ArtifactKind) -> String {
+    format!("crypto.{}", kind.catalog_name().to_ascii_lowercase())
+}
+
+/// Persists a binding that has already taken effect on this node.
+///
+/// The writer is the one `ALTER SYSTEM SET` uses, so the value is rehearsed
+/// against the config the next boot will load, written to `zyron.auto.conf`,
+/// and handed to the replicated log when this node is in a group. Without a
+/// writer there is nothing to persist through, and a binding that lasted
+/// only until the process ended would be a worse answer than refusing, so
+/// this says so instead of reporting a success
+fn persist_binding(
+    writer: Option<&SettingWriter>,
+    kind: ArtifactKind,
+    stored: &str,
+) -> Result<(), ProtocolError> {
+    let Some(writer) = writer else {
+        return Err(refused(
+            "this node has nowhere to persist a signature scheme binding, so the change would \
+             be lost at the next restart",
+        ));
+    };
+    writer(&binding_config_key(kind), stored).map_err(|message| {
+        database(zyron_common::ZyronError::Internal(format!(
+            "the signature scheme binding took effect but could not be persisted, {message}"
+        )))
+    })
+}
+
+/// What the DDL surface writes a persisted setting through. The server
+/// installs it, and it is the same one `ALTER SYSTEM SET` goes through
+pub type SettingWriter =
+    std::sync::Arc<dyn Fn(&str, &str) -> std::result::Result<(), String> + Send + Sync>;
+
 /// `SET SIGNATURE SCHEME <scheme> FOR ARTIFACT KIND <kind>`
 pub fn handle_set_signature_scheme(
     stmt: &SetSignatureSchemeStatement,
+    writer: Option<&SettingWriter>,
 ) -> Result<DdlResult, ProtocolError> {
     let substrate = zyron_common::format::substrate().map_err(database)?;
     let kind = ArtifactKind::parse(&stmt.artifact_kind).ok_or_else(|| {
@@ -141,12 +182,19 @@ pub fn handle_set_signature_scheme(
         .schemes
         .set_scheme(kind, &stmt.scheme)
         .map_err(|e| database(e.into()))?;
+    let stored = substrate.schemes.binding_setting(kind).ok_or_else(|| {
+        database(zyron_common::ZyronError::Internal(
+            "the binding was applied and then could not be read back".to_string(),
+        ))
+    })?;
+    persist_binding(writer, kind, &stored)?;
     Ok(DdlResult::Tag("SET SIGNATURE SCHEME".to_string()))
 }
 
 /// `ROTATE SIGNATURE SCHEME <kind> TO <scheme> [OVERLAP <interval>]`
 pub fn handle_rotate_signature_scheme(
     stmt: &RotateSignatureSchemeStatement,
+    writer: Option<&SettingWriter>,
 ) -> Result<DdlResult, ProtocolError> {
     let substrate = zyron_common::format::substrate().map_err(database)?;
     let kind = ArtifactKind::parse(&stmt.artifact_kind).ok_or_else(|| {
@@ -165,6 +213,15 @@ pub fn handle_rotate_signature_scheme(
         .schemes
         .rotate_scheme(kind, &stmt.new_scheme, now + overlap_secs)
         .map_err(|e| database(e.into()))?;
+    // The overlap end is an absolute second worked out here, so what the
+    // other members store is the instant this node chose rather than one
+    // counted again from each member's own clock
+    let stored = substrate.schemes.binding_setting(kind).ok_or_else(|| {
+        database(zyron_common::ZyronError::Internal(
+            "the rotation was applied and then could not be read back".to_string(),
+        ))
+    })?;
+    persist_binding(writer, kind, &stored)?;
     let columns = vec![
         ("artifact_kind".to_string(), PG_TEXT_OID),
         ("current_scheme".to_string(), PG_TEXT_OID),
@@ -188,63 +245,43 @@ pub fn handle_rotate_signature_scheme(
 }
 
 /// `ROTATE SERVICE PRINCIPAL KEY <sp> [SCHEME <scheme>] [OVERLAP <interval>]`
+///
+/// Refused, because there are no service principals to hold a key.
+///
+/// A key is one half of an identity: something has to be grantable, has to
+/// authenticate with the key, and has to be named by the statement. None of
+/// that exists. Every privilege in the catalog is granted to a role id, there
+/// is no principal kind a service principal could be, and the only JWT
+/// verification this engine performs is over a shared secret, so a key pair
+/// has nothing to present it to.
+///
+/// The rotation machinery underneath is complete and does work: it draws a
+/// key pair, seals it, retires the outgoing key over an overlap, and sweeps
+/// it afterwards. Running it here would write a key for a name that grants
+/// nothing and signs nothing, and report success for it, which is worse than
+/// saying so. It is refused in the handler rather than by the replication
+/// classifier so a single node and a consensus group answer the same way
 pub async fn handle_rotate_service_principal_key(
     stmt: &RotateServicePrincipalKeyStatement,
 ) -> Result<DdlResult, ProtocolError> {
+    // The clauses are still checked, so a statement that is wrong in two ways
+    // is not reported as wrong in only one of them
     let substrate = zyron_common::format::substrate().map_err(database)?;
-    let overlap_secs = match &stmt.overlap {
-        Some(text) => parse_duration_secs(text).map_err(refused)?,
-        None => zyron_auth::signature::DEFAULT_ROTATION_OVERLAP_SECS,
-    };
-    let now = now_secs();
-    let principal = stmt.principal.clone();
-    let new_scheme = stmt.new_scheme.clone();
-
-    // Key generation is CPU bound and its cost depends on the scheme: an
-    // RSA-2048 keypair is a prime search, measured at 40 to 150 ms with no
-    // hard ceiling, against microseconds for Ed25519. Running it inline would
-    // hold an async worker for the whole search, so it goes to the blocking
-    // pool and the runtime keeps serving other connections meanwhile
-    // A principal with no key yet is provisioned rather than refused, which
-    // is what makes this statement the way one is created. `rotate` already
-    // covers that case: with nothing to retire it defaults to Ed25519, issues
-    // once, and reports no previous scheme. Issuing here first would generate
-    // a second keypair, throw the first away, and leave a retiring key that
-    // never signed anything, and it would skip the registry check `rotate`
-    // makes before generating
-    let outcome = tokio::task::spawn_blocking(move || {
-        zyron_auth::signature::principal_keys().rotate(
-            &substrate.schemes,
-            &principal,
-            new_scheme.as_deref(),
-            overlap_secs,
-            now,
-        )
-    })
-    .await
-    .map_err(|e| {
-        database(zyron_common::ZyronError::Internal(format!(
-            "the key rotation task did not complete, {e}"
-        )))
-    })?
-    .map_err(database)?;
-    let columns = vec![
-        ("principal".to_string(), PG_TEXT_OID),
-        ("new_scheme".to_string(), PG_TEXT_OID),
-        ("previous_scheme".to_string(), PG_TEXT_OID),
-        ("overlap_end_secs".to_string(), PG_INT8_OID),
-    ];
-    let rows = vec![vec![
-        outcome.principal,
-        outcome.new_scheme,
-        outcome.previous_scheme.unwrap_or_default(),
-        outcome.overlap_end_secs.to_string(),
-    ]];
-    Ok(DdlResult::Rows {
-        tag: "ROTATE SERVICE PRINCIPAL KEY".to_string(),
-        columns,
-        rows,
-    })
+    if let Some(text) = &stmt.overlap {
+        parse_duration_secs(text).map_err(refused)?;
+    }
+    if let Some(named) = &stmt.new_scheme {
+        substrate
+            .schemes
+            .by_name(named)
+            .ok_or_else(|| refused(format!("`{named}` is not a registered signature scheme")))?;
+    }
+    Err(ProtocolError::Database(ZyronError::PlanError(format!(
+        "there is no service principal `{}` to hold a key, and no service principals at all. \
+         Creating one, granting to one, and authenticating as one are not built, so a key \
+         rotated here would name nothing and be presented to nothing",
+        stmt.principal
+    ))))
 }
 
 /// `LIST SIGNATURE SCHEMES`, `LIST ARTIFACT SCHEMES`,
@@ -605,16 +642,14 @@ mod tests {
         assert!(board.settings().window.is_open(15 * 3_600));
     }
 
-    /// The statement executes, not just parses. It provisions a principal
-    /// that has no key, rotates it onto RS256, and the key that comes out
-    /// signs something the verifier accepts.
+    /// The statement is refused, and it writes no key while refusing.
     ///
-    /// The generation runs on the blocking pool because an RSA keypair is a
-    /// prime search, so this drives the handler through its await rather than
-    /// calling the key store directly, which is the part the store's own
-    /// tests cannot reach
+    /// A key rotated for a name that grants nothing and authenticates nothing
+    /// would report success for an identity that does not exist. The refusal
+    /// names what is missing, and the key store is left as it was, so nothing
+    /// accumulates keys for principals that were never created
     #[tokio::test]
-    async fn test_rotate_service_principal_key_provisions_and_rotates_onto_rs256() {
+    async fn test_rotate_service_principal_key_is_refused_and_writes_nothing() {
         let principal = "sp_rotate_exec_test";
         let store = zyron_auth::signature::principal_keys();
         assert!(
@@ -622,58 +657,53 @@ mod tests {
             "the test principal has to start with no key"
         );
 
-        // No key yet, so the statement provisions one
-        let provision = RotateServicePrincipalKeyStatement {
+        let statement = RotateServicePrincipalKeyStatement {
             principal: principal.to_string(),
             new_scheme: None,
             overlap: None,
         };
-        let result = handle_rotate_service_principal_key(&provision)
+        let err = handle_rotate_service_principal_key(&statement)
             .await
-            .expect("provisions");
-        match result {
-            DdlResult::Rows { ref tag, .. } => {
-                assert_eq!(tag, "ROTATE SERVICE PRINCIPAL KEY")
-            }
-            other => panic!("expected rows, got {other:?}"),
-        }
-        assert_eq!(
-            store.current(principal).expect("has a key").scheme_name,
-            "Ed25519",
-            "an unnamed scheme provisions Ed25519"
+            .err()
+            .expect("refused");
+        let text = err.to_string();
+        assert!(text.contains(principal), "{text}");
+        assert!(text.contains("service principal"), "{text}");
+        assert!(
+            store.current(principal).is_none(),
+            "a refused rotation still wrote a key"
         );
+    }
 
-        // Now rotate the same principal onto RS256, which is the path that
-        // could not work while key material was a fixed 32-byte field
-        let onto_rs256 = RotateServicePrincipalKeyStatement {
-            principal: principal.to_string(),
-            new_scheme: Some("RS256".to_string()),
-            overlap: Some("1h".to_string()),
+    /// A clause that is wrong is reported as wrong, rather than the statement
+    /// answering only that service principals do not exist. Someone fixing
+    /// the interval should not have to fix it twice
+    #[tokio::test]
+    async fn test_rotate_service_principal_key_still_checks_its_clauses() {
+        let bad_interval = RotateServicePrincipalKeyStatement {
+            principal: "sp_clause_test".to_string(),
+            new_scheme: None,
+            overlap: Some("a fortnight".to_string()),
         };
-        handle_rotate_service_principal_key(&onto_rs256)
+        let err = handle_rotate_service_principal_key(&bad_interval)
             .await
-            .expect("rotates onto RS256");
-
-        let current = store.current(principal).expect("has a key");
-        assert_eq!(current.scheme_name, "RS256");
+            .err()
+            .expect("refused");
         assert!(
-            current.public_key.len() > 32,
-            "an RSA public key does not fit the old fixed field, got {}",
-            current.public_key.len()
+            !err.to_string().contains("service principal"),
+            "the interval is what is wrong here, got {err}"
         );
 
-        // The rotated key actually signs
-        let signature = store.sign(principal, b"assertion body").expect("signs");
-        let material = current.verifying_material().expect("material");
-        assert!(
-            zyron_auth::signature::verify_with(&material, b"assertion body", &signature)
-                .expect("verifies")
-        );
-
-        // And the outgoing Ed25519 key is still offered through the overlap
-        let verifying = store.verifying(principal, now_secs());
-        assert_eq!(verifying.len(), 2, "both keys verify during the overlap");
-        assert!(verifying.iter().any(|k| k.scheme_name == "Ed25519"));
+        let bad_scheme = RotateServicePrincipalKeyStatement {
+            principal: "sp_clause_test".to_string(),
+            new_scheme: Some("NotAScheme".to_string()),
+            overlap: None,
+        };
+        let err = handle_rotate_service_principal_key(&bad_scheme)
+            .await
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("NotAScheme"), "{err}");
     }
 
     #[test]
@@ -736,12 +766,92 @@ mod tests {
 
     #[test]
     fn test_setting_a_signature_scheme_for_an_unknown_artifact_kind_is_refused() {
-        let err = handle_set_signature_scheme(&SetSignatureSchemeStatement {
-            scheme: "Ed25519".to_string(),
-            artifact_kind: "NotAKind".to_string(),
-        })
+        let err = handle_set_signature_scheme(
+            &SetSignatureSchemeStatement {
+                scheme: "Ed25519".to_string(),
+                artifact_kind: "NotAKind".to_string(),
+            },
+            None,
+        )
         .expect_err("refused");
         assert!(err.to_string().contains("is not an artifact kind"), "{err}");
+    }
+
+    /// A binding that took effect and could not be written down would be gone
+    /// at the next restart and would never reach another member, so the
+    /// statement says so rather than reporting a success that does not last
+    #[test]
+    fn test_a_binding_with_nowhere_to_persist_is_refused() {
+        let err = handle_set_signature_scheme(
+            &SetSignatureSchemeStatement {
+                scheme: "Ed25519".to_string(),
+                artifact_kind: "JWT".to_string(),
+            },
+            None,
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("nowhere to persist"), "{err}");
+    }
+
+    /// The binding a node writes down is the one it applied, and it comes
+    /// back from the same string, so a restart lands on the state the
+    /// statement left rather than on the binary's default
+    #[test]
+    fn test_a_binding_persists_under_the_key_the_next_boot_reads() {
+        let written: std::sync::Arc<parking_lot::Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&written);
+        let writer: SettingWriter = std::sync::Arc::new(move |key: &str, value: &str| {
+            sink.lock().push((key.to_string(), value.to_string()));
+            Ok(())
+        });
+        let substrate = zyron_common::format::substrate().expect("substrate");
+        let before = substrate
+            .schemes
+            .binding_setting(ArtifactKind::Jwt)
+            .expect("JWT is bound");
+
+        handle_set_signature_scheme(
+            &SetSignatureSchemeStatement {
+                scheme: "Ed25519".to_string(),
+                artifact_kind: "JWT".to_string(),
+            },
+            Some(&writer),
+        )
+        .expect("applies");
+
+        let entries = written.lock().clone();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, binding_config_key(ArtifactKind::Jwt));
+        assert_eq!(entries[0].1, "Ed25519");
+
+        handle_rotate_signature_scheme(
+            &RotateSignatureSchemeStatement {
+                artifact_kind: "JWT".to_string(),
+                new_scheme: "RS256".to_string(),
+                overlap: Some("1h".to_string()),
+            },
+            Some(&writer),
+        )
+        .expect("rotates");
+
+        let entries = written.lock().clone();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let rotated = &entries[1].1;
+        let parts: Vec<&str> = rotated.split('|').collect();
+        assert_eq!(parts.len(), 3, "{rotated}");
+        assert_eq!(parts[0], "RS256");
+        assert_eq!(parts[1], "Ed25519");
+        assert!(
+            parts[2].parse::<u64>().is_ok(),
+            "the overlap end has to be an absolute second, it was `{}`",
+            parts[2]
+        );
+
+        substrate
+            .schemes
+            .apply_binding_setting(ArtifactKind::Jwt, &before)
+            .expect("restores");
     }
 
     #[test]

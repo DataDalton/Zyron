@@ -42,6 +42,22 @@ pub fn evaluate_borrowed<'a>(
 
 /// Evaluates a bound expression against a DataBatch, returning the result as a Column.
 /// The `params` slice provides values for query parameters ($1, $2, ...).
+/// How many values a per-row constant produces for this batch.
+///
+/// A batch carrying columns says how many rows there are, empty included: a
+/// filter that matched nothing still arrives, and answering one value for it
+/// builds a batch whose columns are not all the same length. A batch carrying
+/// no columns at all is a scalar context, `SELECT now()` with no FROM, where
+/// one value is the whole answer
+#[inline]
+fn broadcast_rows(batch: &DataBatch) -> usize {
+    if batch.columns.is_empty() {
+        batch.num_rows.max(1)
+    } else {
+        batch.num_rows
+    }
+}
+
 pub fn evaluate(
     expr: &BoundExpr,
     batch: &DataBatch,
@@ -1516,7 +1532,7 @@ fn evaluate_function(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as i64)
                 .unwrap_or(0);
-            let n = batch.num_rows.max(1);
+            let n = broadcast_rows(batch);
             Ok(Column::new(
                 ColumnData::Int64(vec![micros; n]),
                 TypeId::TimestampTz,
@@ -1529,7 +1545,7 @@ fn evaluate_function(
         // AtomicU64 CAS) per the standard HLC send rule.
         "hlc_now" => {
             let h = next_hlc() as i128;
-            let n = batch.num_rows.max(1);
+            let n = broadcast_rows(batch);
             Ok(Column::new_ts(
                 ColumnData::Int128(vec![h; n]),
                 TypeId::Hlc,
@@ -1817,7 +1833,7 @@ fn evaluate_function(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let days = secs.div_euclid(86_400) as i32;
-            let n = batch.num_rows.max(1);
+            let n = broadcast_rows(batch);
             Ok(Column::new(ColumnData::Int32(vec![days; n]), TypeId::Date))
         }
         "current_time" => {
@@ -1826,7 +1842,7 @@ fn evaluate_function(
                 .map(|d| d.as_micros() as i64)
                 .unwrap_or(0);
             let of_day = micros.rem_euclid(86_400_000_000);
-            let n = batch.num_rows.max(1);
+            let n = broadcast_rows(batch);
             Ok(Column::new(
                 ColumnData::Int64(vec![of_day; n]),
                 TypeId::Time,
@@ -1873,7 +1889,7 @@ fn eval_array(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
-    let rows = batch.num_rows.max(1);
+    let rows = broadcast_rows(batch);
     if args.is_empty() {
         let empty = zyron_common::array_value::encode(TypeId::Null, &[]);
         return Ok(Column::new(
@@ -1943,7 +1959,7 @@ fn eval_array_subscript(
     }
     let arrays = evaluate(&args[0], batch, schema, params)?;
     let indexes = evaluate(&args[1], batch, schema, params)?;
-    let rows = batch.num_rows.max(1);
+    let rows = broadcast_rows(batch);
 
     // The element type comes from the encoded value rather than the plan, so
     // a column whose element type was not known at bind time still decodes.
@@ -2316,7 +2332,7 @@ fn eval_cache_aside(
         std::time::Duration::from_millis(resilience_lit_i64(&args[3], "stale_ttl")? as u64)
             .max(ttl);
     let key_col = evaluate(&args[0], batch, schema, params)?;
-    let rows = batch.num_rows.max(1);
+    let rows = broadcast_rows(batch);
     let mut lookups = Vec::with_capacity(rows);
     let mut needs_fetch = false;
     for row in 0..rows {
@@ -3722,7 +3738,7 @@ fn eval_concat(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
-    let n = batch.num_rows.max(1);
+    let n = broadcast_rows(batch);
     let mut cols: Vec<Column> = Vec::with_capacity(args.len());
     for a in args {
         let c = evaluate(a, batch, schema, params)?;

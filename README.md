@@ -331,12 +331,12 @@ A few more numbers not shown in the charts above:
 | Lake | Commit rate (delete predicate) | ~2043 commits/sec |
 | Lake | Derived clustering expression files pruned | ~93% |
 | Lake | Load with clustering expression | ~752K rows/sec |
-| Consensus | Leader election after a kill | ~218 ms |
-| Consensus | Single log append | ~0.21 us |
-| Consensus | Snapshot 1GB, create | ~0.82 s |
-| Consensus | Snapshot 1GB, transfer | ~2.57 s |
-| Replication | Follower keep-up vs leader | ~99.7% |
-| Replication | Worst follower lag | ~162 entries |
+| Consensus | Leader election after a kill | ~213 ms |
+| Consensus | Single log append | ~0.20 us |
+| Consensus | Snapshot 1GB, create | ~0.79 s |
+| Consensus | Snapshot 1GB, transfer | ~2.40 s |
+| Replication | Follower keep-up vs leader | ~99.8% |
+| Replication | Worst follower lag | ~103 entries |
 | Transactions | Durable group-commit peak | ~741K txn/sec |
 | Transactions | Group-commit amplification (c=1 to c=512) | ~78.0x |
 | Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~0.8x (heap wins indexed points) |

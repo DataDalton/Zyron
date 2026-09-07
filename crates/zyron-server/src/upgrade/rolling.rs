@@ -44,6 +44,17 @@ pub struct SequencePlan {
 /// is exercised without a cluster
 #[async_trait::async_trait]
 pub trait NodeDriver: Send + Sync {
+    /// Whether this node still decides for the group.
+    ///
+    /// Checked before every node the sequence touches. Leadership moving
+    /// part way hands the group to a node that runs its own pass, and two
+    /// coordinators acting on one cluster drain a node neither restarts and
+    /// roll back a node the other is restarting. A driver that cannot lose
+    /// coordination answers true
+    fn still_coordinates(&self) -> bool {
+        true
+    }
+
     /// Fetches, verifies, and stages one release on a node, returning once
     /// the node reports it staged. A node that already holds it answers at
     /// once
@@ -98,6 +109,9 @@ pub enum RollingOutcome {
     },
     /// An operator paused the sequence
     PausedByOperator { nodes_upgraded: u32 },
+    /// This node stopped leading the group part way, so it stopped driving
+    /// rather than act on nodes another coordinator now decides for
+    HandedOff { nodes_upgraded: u32 },
 }
 
 impl RollingOutcome {
@@ -105,7 +119,8 @@ impl RollingOutcome {
         match self {
             RollingOutcome::Completed { nodes_upgraded }
             | RollingOutcome::PausedAfterRollback { nodes_upgraded, .. }
-            | RollingOutcome::PausedByOperator { nodes_upgraded } => *nodes_upgraded,
+            | RollingOutcome::PausedByOperator { nodes_upgraded }
+            | RollingOutcome::HandedOff { nodes_upgraded } => *nodes_upgraded,
         }
     }
 
@@ -168,6 +183,30 @@ pub async fn run(
     let total = nodes.len() as u32;
 
     for node in ordered {
+        // Re-read before every node rather than once at the start, because
+        // the node this sequence restarted last is what moves leadership
+        if !driver.still_coordinates() {
+            // What this node published about the others was said as their
+            // coordinator, and it is not that any more. Leaving those rows
+            // behind has one node reporting a phase for another that the
+            // node in question left long ago
+            for other in nodes.iter().filter(|n| n.node_id != node.node_id) {
+                board.remove_node_state(&other.node_id);
+            }
+            publish(
+                board,
+                node,
+                from_version,
+                to_version,
+                UpgradePhase::Paused,
+                driver.now_secs(),
+                started,
+                "this node no longer leads the group, so it stopped driving the sequence",
+            );
+            return Ok(RollingOutcome::HandedOff {
+                nodes_upgraded: upgraded,
+            });
+        }
         if board.settings().paused {
             publish(
                 board,
@@ -250,6 +289,30 @@ pub async fn run(
             }
             verdict => {
                 let reason = verdict.reason();
+                // The health watch runs for minutes, which is long enough
+                // to stop leading part way through it. A node that looks
+                // unhealthy to a coordinator that no longer decides for the
+                // group is one the new coordinator is restarting, and
+                // rolling it back would undo work in flight
+                if !driver.still_coordinates() {
+                    for other in nodes.iter().filter(|n| n.node_id != node.node_id) {
+                        board.remove_node_state(&other.node_id);
+                    }
+                    publish(
+                        board,
+                        node,
+                        from_version,
+                        to_version,
+                        UpgradePhase::Paused,
+                        driver.now_secs(),
+                        started,
+                        "this node stopped leading the group while the last one was watched, so \
+                         it left that node to the coordinator that took over",
+                    );
+                    return Ok(RollingOutcome::HandedOff {
+                        nodes_upgraded: upgraded,
+                    });
+                }
                 if settings.rollback_on_health_fail {
                     publish(
                         board,
@@ -390,6 +453,10 @@ pub struct SimulatedCluster {
     pub rolled_back: parking_lot::Mutex<Vec<String>>,
     pub leadership_transfers: parking_lot::Mutex<Vec<String>>,
     clock: std::sync::atomic::AtomicU64,
+    /// Nodes this driver keeps leading for. Once it has restarted this
+    /// many, it reports that it no longer decides for the group, which is
+    /// what a real restart does when it elects someone else
+    leads_until_restarts: Option<usize>,
 }
 
 impl SimulatedCluster {
@@ -403,12 +470,39 @@ impl SimulatedCluster {
             rolled_back: parking_lot::Mutex::new(Vec::new()),
             leadership_transfers: parking_lot::Mutex::new(Vec::new()),
             clock: std::sync::atomic::AtomicU64::new(1_000),
+            leads_until_restarts: None,
+        })
+    }
+
+    /// A cluster whose leadership moves away once it has restarted this
+    /// many nodes
+    pub fn losing_leadership_after(
+        observations: Vec<(String, HealthBaseline)>,
+        restarts: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            observations: parking_lot::Mutex::new(observations),
+            staged: parking_lot::Mutex::new(Vec::new()),
+            sequences: parking_lot::Mutex::new(Vec::new()),
+            drained: parking_lot::Mutex::new(Vec::new()),
+            restarted: parking_lot::Mutex::new(Vec::new()),
+            rolled_back: parking_lot::Mutex::new(Vec::new()),
+            leadership_transfers: parking_lot::Mutex::new(Vec::new()),
+            clock: std::sync::atomic::AtomicU64::new(1_000),
+            leads_until_restarts: Some(restarts),
         })
     }
 }
 
 #[async_trait::async_trait]
 impl NodeDriver for SimulatedCluster {
+    fn still_coordinates(&self) -> bool {
+        match self.leads_until_restarts {
+            Some(limit) => self.restarted.lock().len() < limit,
+            None => true,
+        }
+    }
+
     async fn stage(&self, node_id: &str, release: &ReleaseEntry) -> Result<()> {
         self.staged
             .lock()

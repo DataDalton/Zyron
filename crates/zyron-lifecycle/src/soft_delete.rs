@@ -41,10 +41,22 @@ fn column_name_by_id(entry: &TableEntry, col_id: u32) -> Option<String> {
 
 /// `<is_deleted_column> = false`
 pub fn build_is_deleted_false_predicate(cfg: &SoftDeleteConfig) -> Expr {
-    eq(
-        Expr::Identifier(cfg.is_deleted_column.clone()),
-        Expr::Literal(LiteralValue::Boolean(false)),
-    )
+    // A row is live unless the marker says it was deleted, so a marker that
+    // says nothing means live. Written as `= false` alone, the marker being
+    // NULL made the comparison NULL and the row vanished: rows already in the
+    // table when soft delete was turned on carry no marker, and so does any
+    // row an INSERT wrote without naming the column. Neither was ever deleted
+    Expr::BinaryOp {
+        left: Box::new(eq(
+            Expr::Identifier(cfg.is_deleted_column.clone()),
+            Expr::Literal(LiteralValue::Boolean(false)),
+        )),
+        op: BinaryOperator::Or,
+        right: Box::new(Expr::IsNull {
+            expr: Box::new(Expr::Identifier(cfg.is_deleted_column.clone())),
+            negated: false,
+        }),
+    }
 }
 
 /// `<is_deleted_column> = true`

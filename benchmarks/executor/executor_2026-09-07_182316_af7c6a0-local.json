@@ -1,0 +1,312 @@
+{
+  "id": "2026-09-07_182316_af7c6a0-local",
+  "date": "2026-09-07 18:23:58Z",
+  "ts": 1788805438,
+  "commit": "af7c6a0-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Filter Throughput": {
+      "util_before": { "cpu_pct": 13.0, "ram_used_gb": 15.33 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.38 },
+      "Filter throughput (rows/sec)": {
+        "average": 474749135.801712,
+        "runs": [439444542.10, 486926035.94, 483699332.49, 479179644.45, 484496124.03],
+        "target": 60000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Aggregate": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.39 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 15.35 },
+      "Aggregate throughput (rows/sec)": {
+        "average": 12099474260.824837,
+        "runs": [9000900090.01, 13280212483.40, 13642564802.18, 11947431302.27, 12626262626.26],
+        "target": 150000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Hash Build": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.36 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 15.31 },
+      "Hash build throughput (rows/sec)": {
+        "average": 152018670.653138,
+        "runs": [141653091.58, 153753901.51, 153179235.02, 153857989.08, 157649136.08],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Distinct": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 15.32 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 15.34 },
+      "Distinct throughput (rows/sec)": {
+        "average": 81876219.516230,
+        "runs": [77065351.42, 78258283.64, 84829873.69, 84911267.73, 84316321.11],
+        "target": 45000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Hash Build Many Groups": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.32 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 15.32 },
+      "Hash build throughput over many groups (rows/sec)": {
+        "average": 75459753.889277,
+        "runs": [66960399.62, 78151864.70, 73711522.59, 78843834.02, 79631148.52],
+        "target": 35000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "IN-List Predicate": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.31 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.29 },
+      "IN-list predicate (rows/sec)": {
+        "average": 79420473.742670,
+        "runs": [80690061.41, 72130296.17, 81011673.78, 81512879.03, 81757458.32],
+        "target": 35000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Hash Join": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.29 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.30 },
+      "Join throughput (rows/sec)": {
+        "average": 184024946.961218,
+        "runs": [165892501.66, 183762111.59, 188233683.56, 191091654.51, 191144783.49],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Scan Throughput": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.33 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 15.34 },
+      "Scan throughput (rows/sec)": {
+        "average": 8664194911.745472,
+        "runs": [6877579092.16, 8333333333.33, 9250693802.04, 9469696969.70, 9389671361.50],
+        "target": 75000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Limit": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.35 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 18.37 },
+      "Limit throughput (rows/sec)": {
+        "average": 814591379143.558838,
+        "runs": [813338755591.70, 811688311688.31, 804181745074.39, 818665575112.57, 825082508250.83],
+        "target": 200000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Sort": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 18.12 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 18.16 },
+      "Sort throughput (rows/sec)": {
+        "average": 580704077.810808,
+        "runs": [295490810.24, 598157674.36, 671050865.66, 665601703.94, 673219334.86],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Residual Join": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 18.11 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 18.13 },
+      "Residual-condition join throughput (rows/sec)": {
+        "average": 60282913.048546,
+        "runs": [57248432.17, 60940140.16, 62510655.23, 57858194.82, 62857142.86],
+        "target": 20000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Top-N Sort": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 18.16 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 18.17 },
+      "Top-N sort throughput (rows/sec)": {
+        "average": 1255673840.145216,
+        "runs": [811951932.45, 1123216893.18, 1373249107.39, 1418842224.74, 1551109042.97],
+        "target": 450000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Set Operations": {
+      "UNION ALL throughput (rows/sec)": {
+        "average": 10183631742.731155,
+        "runs": [8733624454.15, 10840108401.08, 11080332409.97, 9090909090.91, 11173184357.54],
+        "target": 2000000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "UNION throughput (rows/sec)": {
+        "average": 36922646.442922,
+        "runs": [26319945.25, 36295993.83, 41028165.84, 41044584.68, 39924542.61],
+        "target": 24000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "INTERSECT throughput (rows/sec)": {
+        "average": 58732215.110618,
+        "runs": [56698181.41, 60219197.88, 61066837.65, 59538871.44, 56137987.17],
+        "target": 38000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "EXCEPT throughput (rows/sec)": {
+        "average": 53667142.240149,
+        "runs": [53015944.55, 50741459.58, 59012717.24, 51702966.46, 53862623.38],
+        "target": 28000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "String Equality": {
+      "String equality predicate (rows/sec)": {
+        "average": 324534450.625238,
+        "runs": [325563224.38, 309655044.28, 330185564.29, 328299409.06, 328969011.12],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LIKE Prefix": {
+      "LIKE prefix predicate (rows/sec)": {
+        "average": 161066202.847545,
+        "runs": [176747145.53, 198121805.29, 171720987.74, 193730869.08, 65010206.60],
+        "target": 7000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LIKE General": {
+      "LIKE underscore predicate (rows/sec)": {
+        "average": 170344402.239008,
+        "runs": [164473684.21, 175444752.45, 177512692.16, 170033326.53, 164257555.85],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "ILIKE Contains": {
+      "ILIKE contains predicate (rows/sec)": {
+        "average": 69487949.302249,
+        "runs": [70155745.76, 69105634.87, 69976068.18, 68568294.02, 69634003.68],
+        "target": 4500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LIKE Literal Prefix": {
+      "LIKE literal prefix predicate (rows/sec)": {
+        "average": 211315747.428902,
+        "runs": [225063017.64, 178450337.27, 228039770.14, 212621194.08, 212404418.01],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LIKE Literal Suffix": {
+      "LIKE literal suffix predicate (rows/sec)": {
+        "average": 245730006.819073,
+        "runs": [257479787.84, 233623025.89, 258317834.26, 233830613.10, 245398773.01],
+        "target": 120000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LIKE Literal Contains": {
+      "LIKE literal contains predicate (rows/sec)": {
+        "average": 87195504.156967,
+        "runs": [87542677.06, 87893543.34, 86511177.24, 85885566.07, 88144557.07],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Window Frame": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 18.14 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 18.15 },
+      "Window explicit frame throughput (rows/sec)": {
+        "average": 41074488.232418,
+        "runs": [29424746.21, 42876130.86, 42319085.91, 45319616.60, 45432861.59],
+        "target": 9000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Window Partitioned": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 18.12 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 18.16 },
+      "Window partitioned running sum throughput (rows/sec)": {
+        "average": 22628666.127253,
+        "runs": [18783363.95, 21780513.41, 24054073.56, 24202409.59, 24322970.13],
+        "target": 12000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

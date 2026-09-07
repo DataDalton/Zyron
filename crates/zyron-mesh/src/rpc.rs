@@ -409,6 +409,15 @@ pub struct NodeStatus {
     /// mean anything
     pub queries_in_window: u64,
     pub uptime_secs: u64,
+    /// What this node's own upgrade journal says about it, absent when it has
+    /// never taken part in an upgrade or runs a release that does not report
+    /// one.
+    ///
+    /// Carried here so a member can fill in the rest of the group's upgrade
+    /// board from what each member says about itself, rather than inferring
+    /// it from the drain and version fields above. A release that does not
+    /// send it leaves this absent and the reader keeps whatever it held
+    pub upgrade: Option<zyron_common::format::NodeUpgradeState>,
 }
 
 impl NodeStatus {
@@ -765,6 +774,18 @@ mod tests {
             error_rate_ppm: 250,
             queries_in_window: 750,
             uptime_secs: 86_400,
+            // The peer's own journal row rides along, so the round trip
+            // covers it rather than only the flat fields
+            upgrade: Some(zyron_common::format::NodeUpgradeState {
+                node_id: "node-7".into(),
+                from_version: "0.12.0".into(),
+                to_version: "0.13.0".into(),
+                phase: zyron_common::format::UpgradePhase::Rolling,
+                started_at_secs: 11,
+                updated_at_secs: 22,
+                is_leader: true,
+                message: "draining".into(),
+            }),
         };
         assert!(status.valid());
         let text = serde_json::to_string(&status).expect("encode");

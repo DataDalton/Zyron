@@ -23,6 +23,45 @@ use zyron_common::{Result, ZyronError};
 /// Default overlap for a rotation that does not name one, twenty-four hours
 pub const DEFAULT_ROTATION_OVERLAP_SECS: u64 = 24 * 3_600;
 
+/// Ed25519 keys this process has already turned from bytes into a point.
+///
+/// The 32 bytes a key is stored and configured as are a compressed curve
+/// point, and using it means decompressing it, which costs a field square
+/// root. That work is identical every time the same key verifies, and a
+/// key verifies many signatures: the vendor's release key checks every
+/// artifact, and an identity provider's key checks every token. A process
+/// holds a handful of distinct keys, so a short list scanned in order beats
+/// hashing the key to find it
+static ED25519_KEYS: parking_lot::RwLock<Vec<([u8; 32], VerifyingKey)>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// How many parsed keys are kept. Past this the oldest goes, which for a
+/// list this size only happens when keys are being rotated through faster
+/// than they are used
+const ED25519_KEY_CACHE: usize = 16;
+
+/// The parsed form of a stored Ed25519 public key.
+///
+/// A key that does not decompress is not cached, so a bad key costs the
+/// same error every time rather than being remembered as usable
+fn ed25519_key(bytes: &[u8; 32]) -> Result<VerifyingKey> {
+    if let Some((_, key)) = ED25519_KEYS.read().iter().find(|(seen, _)| seen == bytes) {
+        return Ok(*key);
+    }
+    let key = VerifyingKey::from_bytes(bytes).map_err(|e| {
+        ZyronError::SignatureScheme(format!("Ed25519 public key is not on the curve, {e}"))
+    })?;
+    let mut cache = ED25519_KEYS.write();
+    // Another caller may have parsed the same key while this one worked
+    if !cache.iter().any(|(seen, _)| seen == bytes) {
+        if cache.len() >= ED25519_KEY_CACHE {
+            cache.remove(0);
+        }
+        cache.push((*bytes, key));
+    }
+    Ok(key)
+}
+
 /// The material one scheme needs to verify a signature
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyingMaterial {
@@ -52,9 +91,7 @@ impl VerifyingMaterial {
 pub fn verify_with(material: &VerifyingMaterial, message: &[u8], signature: &[u8]) -> Result<bool> {
     match material {
         VerifyingMaterial::Ed25519(public_key) => {
-            let key = VerifyingKey::from_bytes(public_key).map_err(|e| {
-                ZyronError::SignatureScheme(format!("Ed25519 public key is not on the curve, {e}"))
-            })?;
+            let key = ed25519_key(public_key)?;
             let bytes: [u8; 64] = match signature.try_into() {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(false),
@@ -277,6 +314,22 @@ impl PrincipalKey {
             self.scheme_name
         )))
     }
+
+    /// SHA-256 over the public half, in hex.
+    ///
+    /// Two members hold different keys for the same principal, because each
+    /// draws its own, so this is what an operator compares to tell which node
+    /// signed something. Taken over the public half, which is not a secret
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(&self.public_key);
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
 }
 
 /// A principal's outgoing key during a rotation
@@ -285,6 +338,19 @@ pub struct RetiringKey {
     pub key: PrincipalKey,
     /// Unix seconds the outgoing key stops being accepted at
     pub overlap_end_secs: u64,
+}
+
+/// One key this node holds, as it is reported to an operator.
+///
+/// The public half and its metadata. There is no method here or on the store
+/// that returns a secret half, which is what makes this safe to read out of a
+/// view and to compare between members
+#[derive(Debug, Clone)]
+pub struct PublishedKey {
+    pub key: PrincipalKey,
+    /// None for the key a principal signs with now, Some for one that is
+    /// still accepted until the moment it names
+    pub overlap_end_secs: Option<u64>,
 }
 
 /// What a rotation produced
@@ -296,12 +362,147 @@ pub struct RotationOutcome {
     pub overlap_end_secs: u64,
 }
 
+/// Bound into the principal key file's authenticated data, so a file lifted
+/// from one store cannot be opened as another kind of sealed blob
+const PRINCIPAL_KEY_FILE_AAD: &[u8] = b"principal-signing-keys";
+
+fn put_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32(buf, bytes.len() as u32);
+    buf.extend_from_slice(bytes);
+}
+
+/// Walks the decrypted key file, refusing a short read rather than reading
+/// past the end of one field into the next
+struct KeyFileReader<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl KeyFileReader<'_> {
+    fn short() -> ZyronError {
+        ZyronError::Internal("principal key file is truncated".to_string())
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let bytes: [u8; 4] = self
+            .data
+            .get(self.at..self.at + 4)
+            .ok_or_else(Self::short)?
+            .try_into()
+            .map_err(|_| Self::short())?;
+        self.at += 4;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let bytes: [u8; 8] = self
+            .data
+            .get(self.at..self.at + 8)
+            .ok_or_else(Self::short)?
+            .try_into()
+            .map_err(|_| Self::short())?;
+        self.at += 8;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn bytes(&mut self) -> Result<&[u8]> {
+        let len = self.u32()? as usize;
+        let slice = self
+            .data
+            .get(self.at..self.at + len)
+            .ok_or_else(Self::short)?;
+        self.at += len;
+        Ok(slice)
+    }
+
+    fn text(&mut self) -> Result<String> {
+        let slice = self.bytes()?;
+        String::from_utf8(slice.to_vec()).map_err(|_| {
+            ZyronError::Internal("principal key file holds a name that is not UTF-8".to_string())
+        })
+    }
+}
+
+/// Writes through a sibling file and a rename, so a crash part way leaves
+/// either the keys the last write sealed or the ones before them, never a
+/// file the next boot refuses and no key at all
+fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|e| {
+        ZyronError::Internal(format!("{} is not writable, {e}", directory.display()))
+    })?;
+    let temporary = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary).map_err(|e| {
+            ZyronError::Internal(format!("{} is not writable, {e}", temporary.display()))
+        })?;
+        file.write_all(bytes).map_err(|e| {
+            ZyronError::Internal(format!("{} was not written, {e}", temporary.display()))
+        })?;
+        file.sync_all().map_err(|e| {
+            ZyronError::Internal(format!("{} was not flushed, {e}", temporary.display()))
+        })?;
+    }
+    std::fs::rename(&temporary, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        ZyronError::Internal(format!("{} was not replaced, {e}", path.display()))
+    })?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(directory) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// Per-principal signing keys with overlap-aware rotation.
 ///
 /// A rotation issues a new key, marks the old one retiring, and keeps
 /// accepting the old one until the overlap ends. Both keys verify during the
 /// overlap and only the new one signs, which is what lets a caller holding an
-/// artifact signed a moment before the rotation still be believed
+/// artifact signed a moment before the rotation still be believed.
+///
+/// # Nothing holds a key here yet
+///
+/// Service principals do not exist. There is no principal kind one could be,
+/// every privilege is granted to a role id, and the only JWT this engine
+/// verifies is signed with a shared secret, so a key pair has nothing to be
+/// presented to. `ROTATE SERVICE PRINCIPAL KEY` is refused for that reason
+/// and this store has no caller outside its own tests.
+///
+/// It is kept rather than removed because the rotation it implements is the
+/// part that is hard to get right, and it is finished: overlap-aware
+/// rotation across three schemes, sealed at rest, swept when an overlap
+/// lapses. `published` and `zyron_sys.security.principal_keys` report what a
+/// node holds.
+///
+/// # Two questions to settle before anything uses it
+///
+/// A store belongs to the node that owns the data directory it is sealed in,
+/// because the file is wrapped by that node's own master key, which is
+/// derived per data directory. So two members that both drew a key for one
+/// principal hold different keys and neither can sign as the other. Whether
+/// that is right depends on what the key is for, and that is not decided:
+///
+/// - A principal that authenticates by signing an assertion holds its own
+///   secret, and this engine would keep only the public half to verify
+///   against. This store draws and seals a secret and never hands it out, so
+///   it does not serve that shape as written.
+/// - A principal whose tokens this engine issues needs the secret here, and
+///   then the public halves are published for others to verify against, one
+///   entry per key rather than one per principal.
+///
+/// A secret must not be carried between members either way: it would travel
+/// the consensus log and then sit in every member's write-ahead log, its
+/// snapshots, and every backup taken afterwards, permanently
 #[derive(Debug, Default)]
 pub struct PrincipalKeyStore {
     keys: parking_lot::RwLock<Vec<PrincipalKey>>,
@@ -310,11 +511,244 @@ pub struct PrincipalKeyStore {
     /// for Ed25519, a DER PKCS#8 PrivateKeyInfo for RS256. Zeroized on drop
     /// and on replacement, so a rotated-out secret does not stay in freed heap
     secrets: parking_lot::RwLock<Vec<(String, Zeroizing<Vec<u8>>)>>,
+    /// Where the keys are written down, absent for a store that lives only as
+    /// long as the process
+    storage: Option<PrincipalKeyStorage>,
+}
+
+/// Where a key store writes itself down, and what wraps the secret halves on
+/// the way
+struct PrincipalKeyStorage {
+    path: std::path::PathBuf,
+    key_store: Arc<dyn crate::encryption::KeyStore>,
+    /// The wrapping key's handle, allocated on the first write and read back
+    /// out of the file after that, so a restart opens what the last process
+    /// sealed
+    wrapping_key_id: parking_lot::Mutex<Option<u32>>,
+    /// Held across the read, change, and rename of one write, because an
+    /// issue and a rotation on two connections would otherwise each write a
+    /// file describing only what it knew
+    writing: std::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for PrincipalKeyStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrincipalKeyStorage")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PrincipalKeyStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Opens the store at `path`, putting back whatever the last process
+    /// sealed there.
+    ///
+    /// A missing file is a store that has issued nothing yet. A file that
+    /// cannot be opened is an error rather than an empty store, because
+    /// starting empty would silently issue a second key for a principal whose
+    /// artifacts are already signed with the first
+    pub fn open(
+        path: std::path::PathBuf,
+        key_store: Arc<dyn crate::encryption::KeyStore>,
+    ) -> Result<Self> {
+        let store = Self {
+            keys: parking_lot::RwLock::new(Vec::new()),
+            retiring: parking_lot::RwLock::new(Vec::new()),
+            secrets: parking_lot::RwLock::new(Vec::new()),
+            storage: Some(PrincipalKeyStorage {
+                path,
+                key_store,
+                wrapping_key_id: parking_lot::Mutex::new(None),
+                writing: std::sync::Mutex::new(()),
+            }),
+        };
+        store.load()?;
+        Ok(store)
+    }
+
+    /// How many principals hold a signing key here
+    pub fn len(&self) -> usize {
+        self.keys.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn load(&self) -> Result<()> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(());
+        };
+        let bytes = match std::fs::read(&storage.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(ZyronError::Internal(format!(
+                    "principal key file {} is not readable, {e}",
+                    storage.path.display()
+                )));
+            }
+        };
+        let parsed = zyron_common::format::envelope::decode_as(
+            &bytes,
+            zyron_common::format::FormatKind::PrincipalKeyStorePersistence,
+        )
+        .map_err(|e| {
+            ZyronError::Internal(format!(
+                "principal key file {}, {e}",
+                storage.path.display()
+            ))
+        })?;
+        if parsed.header.version != crate::format::PRINCIPAL_KEY_STORE_FORMAT_VERSION {
+            return Err(ZyronError::Internal(format!(
+                "principal key file is at format version {}, this binary writes and reads {}",
+                parsed.header.version,
+                crate::format::PRINCIPAL_KEY_STORE_FORMAT_VERSION
+            )));
+        }
+        let body = parsed.body;
+        let truncated = || ZyronError::Internal("principal key file is truncated".to_string());
+        let id_bytes: [u8; 4] = body
+            .get(0..4)
+            .ok_or_else(truncated)?
+            .try_into()
+            .unwrap_or([0; 4]);
+        let wrapping_key_id = u32::from_le_bytes(id_bytes);
+        let key_material = storage.key_store.get_key(wrapping_key_id)?;
+        let plaintext = Zeroizing::new(crate::encryption::decrypt_value(
+            body.get(4..).ok_or_else(truncated)?,
+            &key_material,
+            crate::encryption::EncryptionAlgorithm::Aes256Gcm,
+            PRINCIPAL_KEY_FILE_AAD,
+        )?);
+
+        let mut reader = KeyFileReader {
+            data: &plaintext,
+            at: 0,
+        };
+        let current_count = reader.u32()? as usize;
+        let mut keys = Vec::with_capacity(current_count);
+        let mut secrets = Vec::with_capacity(current_count);
+        for _ in 0..current_count {
+            let principal = reader.text()?;
+            let scheme_name = reader.text()?;
+            let public_key = reader.bytes()?.to_vec();
+            let issued_at_secs = reader.u64()?;
+            let secret = Zeroizing::new(reader.bytes()?.to_vec());
+            secrets.push((principal.clone(), secret));
+            keys.push(PrincipalKey {
+                principal,
+                scheme_name,
+                public_key,
+                issued_at_secs,
+            });
+        }
+        let retiring_count = reader.u32()? as usize;
+        let mut retiring = Vec::with_capacity(retiring_count);
+        for _ in 0..retiring_count {
+            let principal = reader.text()?;
+            let scheme_name = reader.text()?;
+            let public_key = reader.bytes()?.to_vec();
+            let issued_at_secs = reader.u64()?;
+            let overlap_end_secs = reader.u64()?;
+            retiring.push(RetiringKey {
+                key: PrincipalKey {
+                    principal,
+                    scheme_name,
+                    public_key,
+                    issued_at_secs,
+                },
+                overlap_end_secs,
+            });
+        }
+
+        *storage.wrapping_key_id.lock() = Some(wrapping_key_id);
+        *self.keys.write() = keys;
+        *self.secrets.write() = secrets;
+        *self.retiring.write() = retiring;
+        Ok(())
+    }
+
+    /// Writes the whole store down, sealed under the node's key store.
+    ///
+    /// Called after anything that changes a key. The file is rewritten whole
+    /// rather than appended to, because the set is one principal per row and
+    /// small, and a whole rewrite is what lets a rotated-out secret leave the
+    /// file instead of staying in a history nothing reads
+    fn persist(&self) -> Result<()> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(());
+        };
+        let _writing = storage
+            .writing
+            .lock()
+            .map_err(|_| ZyronError::Internal("the principal key file lock is poisoned".into()))?;
+
+        let mut plaintext = Zeroizing::new(Vec::new());
+        {
+            let keys = self.keys.read();
+            let secrets = self.secrets.read();
+            put_u32(&mut plaintext, keys.len() as u32);
+            for key in keys.iter() {
+                put_bytes(&mut plaintext, key.principal.as_bytes());
+                put_bytes(&mut plaintext, key.scheme_name.as_bytes());
+                put_bytes(&mut plaintext, &key.public_key);
+                put_u64(&mut plaintext, key.issued_at_secs);
+                let secret = secrets
+                    .iter()
+                    .find(|(name, _)| name == &key.principal)
+                    .map(|(_, secret)| secret.as_slice())
+                    .unwrap_or_default();
+                put_bytes(&mut plaintext, secret);
+            }
+            let retiring = self.retiring.read();
+            put_u32(&mut plaintext, retiring.len() as u32);
+            for entry in retiring.iter() {
+                put_bytes(&mut plaintext, entry.key.principal.as_bytes());
+                put_bytes(&mut plaintext, entry.key.scheme_name.as_bytes());
+                put_bytes(&mut plaintext, &entry.key.public_key);
+                put_u64(&mut plaintext, entry.key.issued_at_secs);
+                put_u64(&mut plaintext, entry.overlap_end_secs);
+            }
+        }
+
+        // One wrapping key for the life of the file, allocated on the first
+        // write. Allocating a new one each time would leave every previous
+        // key in the store with nothing referring to it
+        let key_id = {
+            let mut held = storage.wrapping_key_id.lock();
+            match *held {
+                Some(id) => id,
+                None => {
+                    let id = storage
+                        .key_store
+                        .create_key(crate::encryption::EncryptionAlgorithm::Aes256Gcm)?;
+                    *held = Some(id);
+                    id
+                }
+            }
+        };
+        let key_material = storage.key_store.get_key(key_id)?;
+        let ciphertext = crate::encryption::encrypt_value(
+            &plaintext,
+            &key_material,
+            crate::encryption::EncryptionAlgorithm::Aes256Gcm,
+            PRINCIPAL_KEY_FILE_AAD,
+        )?;
+
+        let mut body = Vec::with_capacity(4 + ciphertext.len());
+        body.extend_from_slice(&key_id.to_le_bytes());
+        body.extend_from_slice(&ciphertext);
+        let bytes = zyron_common::format::envelope::encode(
+            zyron_common::format::FormatKind::PrincipalKeyStorePersistence,
+            crate::format::PRINCIPAL_KEY_STORE_FORMAT_VERSION,
+            &body,
+        );
+        write_replacing(&storage.path, &bytes)
     }
 
     /// Issues a principal's first key
@@ -330,6 +764,10 @@ impl PrincipalKeyStore {
         self.keys.write().push(key.clone());
         self.secrets.write().retain(|(name, _)| name != principal);
         self.secrets.write().push((principal.to_string(), secret));
+        // Written down before the caller is told it has a key. A key reported
+        // as issued and not persisted would be gone at the next restart while
+        // the artifacts it signed were still in circulation
+        self.persist()?;
         Ok(key)
     }
 
@@ -340,6 +778,40 @@ impl PrincipalKeyStore {
             .iter()
             .find(|k| k.principal == principal)
             .cloned()
+    }
+
+    /// Every key this node holds at a point in time, sorted by principal and
+    /// with each principal's signing key before its retiring ones.
+    ///
+    /// Public halves only. A retiring key whose overlap has passed is left
+    /// out, because it no longer verifies anything and reporting it would
+    /// read as though it still did. Sweeping is what removes it for good, and
+    /// that happens on the next rotation
+    pub fn published(&self, now_secs: u64) -> Vec<PublishedKey> {
+        let mut out: Vec<PublishedKey> = self
+            .keys
+            .read()
+            .iter()
+            .map(|key| PublishedKey {
+                key: key.clone(),
+                overlap_end_secs: None,
+            })
+            .collect();
+        for retiring in self.retiring.read().iter() {
+            if now_secs < retiring.overlap_end_secs {
+                out.push(PublishedKey {
+                    key: retiring.key.clone(),
+                    overlap_end_secs: Some(retiring.overlap_end_secs),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.key
+                .principal
+                .cmp(&b.key.principal)
+                .then(a.overlap_end_secs.cmp(&b.overlap_end_secs))
+        });
+        out
     }
 
     /// The keys that still verify for a principal at a point in time, the
@@ -407,12 +879,28 @@ impl PrincipalKeyStore {
         })
     }
 
-    /// Drops retiring keys whose overlap has ended
+    /// Drops retiring keys whose overlap has ended.
+    ///
+    /// A sweep that could not be written down still took effect here, and the
+    /// next issue or rotation writes the file again, so the swept keys are
+    /// reported and the store carries on rather than holding them for a
+    /// failure that has nothing to do with them
     pub fn sweep(&self, now_secs: u64) -> usize {
-        let mut retiring = self.retiring.write();
-        let before = retiring.len();
-        retiring.retain(|k| now_secs < k.overlap_end_secs);
-        before - retiring.len()
+        let swept = {
+            let mut retiring = self.retiring.write();
+            let before = retiring.len();
+            retiring.retain(|k| now_secs < k.overlap_end_secs);
+            before - retiring.len()
+        };
+        if swept > 0
+            && let Err(e) = self.persist()
+        {
+            tracing::warn!(
+                "{swept} retired principal key(s) were dropped here and the key file was not \
+                 rewritten, {e}. They are dropped again at the next restart"
+            );
+        }
+        swept
     }
 
     /// Signs a message with a principal's current key
@@ -551,9 +1039,34 @@ pub fn is_signed(kind: ArtifactKind) -> bool {
 /// The process-wide principal key store
 static PRINCIPAL_KEYS: std::sync::OnceLock<Arc<PrincipalKeyStore>> = std::sync::OnceLock::new();
 
-/// The principal key store for this node
+/// The principal key store for this node.
+///
+/// Falls back to a store that lives only as long as the process, which is
+/// what a test or a tool that never opened a data directory gets
 pub fn principal_keys() -> Arc<PrincipalKeyStore> {
     Arc::clone(PRINCIPAL_KEYS.get_or_init(|| Arc::new(PrincipalKeyStore::new())))
+}
+
+/// Opens the node's key file and makes it the process's key store.
+///
+/// Called once during startup, before anything signs or verifies. Asking for
+/// the store first would install the process-lifetime one and this would have
+/// nothing to attach to, so that is reported rather than passed over: a node
+/// that silently ran on keys it never wrote down would issue a second key for
+/// a principal after every restart
+pub fn open_principal_keys(
+    path: std::path::PathBuf,
+    key_store: Arc<dyn crate::encryption::KeyStore>,
+) -> Result<Arc<PrincipalKeyStore>> {
+    let opened = Arc::new(PrincipalKeyStore::open(path, key_store)?);
+    PRINCIPAL_KEYS.set(Arc::clone(&opened)).map_err(|_| {
+        ZyronError::Internal(
+            "the principal key store was already in use before the key file was opened, so keys \
+             issued in this process would not survive a restart"
+                .to_string(),
+        )
+    })?;
+    Ok(opened)
 }
 
 #[cfg(test)]
@@ -563,6 +1076,66 @@ mod tests {
         ArtifactSchemeBinding, SchemeCategory, SchemeId, SchemeStatus, SignatureSchemeRegistration,
         default_artifact_bindings,
     };
+
+    /// A key issued before a restart is the key the node signs with after
+    /// one, and the artifacts it already signed still verify.
+    ///
+    /// Held in memory only, every restart issued a principal a fresh key and
+    /// every token the process signed before it became unverifiable
+    #[test]
+    fn a_key_issued_before_a_restart_is_the_key_after_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("principal_keys.zypk");
+        let key_store: Arc<dyn crate::encryption::KeyStore> = Arc::new(
+            crate::encryption::FileKeyStore::open([7u8; 32], dir.path().join("wrapping.zykeys"))
+                .expect("key store opens"),
+        );
+
+        let first = PrincipalKeyStore::open(path.clone(), Arc::clone(&key_store)).expect("opens");
+        let issued = first.issue("sp1", "Ed25519", 100).expect("issues");
+        first
+            .rotate(&SchemeRegistry::load(), "sp1", Some("Ed25519"), 500, 200)
+            .expect("rotates");
+        let after_rotation = first.current("sp1").expect("has a key");
+        drop(first);
+
+        // A second process opening the same file, which is what a restart is
+        let reopened = PrincipalKeyStore::open(path, key_store).expect("reopens");
+        let current = reopened
+            .current("sp1")
+            .expect("has a key after the restart");
+        assert_eq!(
+            current.public_key, after_rotation.public_key,
+            "the restart did not come back on the key the rotation left"
+        );
+        assert!(
+            reopened.sign("sp1", b"payload").is_ok(),
+            "the secret half did not survive the restart"
+        );
+
+        // The outgoing key is still inside its overlap, so an artifact signed
+        // before the rotation is still believed after the restart
+        let verifying = reopened.verifying("sp1", 300);
+        assert_eq!(verifying.len(), 2, "{verifying:?}");
+        assert!(
+            verifying.iter().any(|k| k.public_key == issued.public_key),
+            "the key that signed before the rotation was lost across the restart"
+        );
+
+        // Past the overlap the retired key goes, and stays gone
+        assert_eq!(reopened.sweep(1_000), 1);
+        assert_eq!(reopened.verifying("sp1", 1_000).len(), 1);
+    }
+
+    /// A store with no file behind it works exactly as it did, which is what
+    /// a tool that never opened a data directory gets
+    #[test]
+    fn a_store_without_storage_issues_and_signs() {
+        let store = PrincipalKeyStore::new();
+        store.issue("sp1", "Ed25519", 0).expect("issues");
+        assert!(store.sign("sp1", b"payload").is_ok());
+        assert_eq!(store.len(), 1);
+    }
 
     fn scheme(name: &'static str, id: u16, status: SchemeStatus) -> SignatureSchemeRegistration {
         SignatureSchemeRegistration {
@@ -757,6 +1330,65 @@ mod tests {
         let after = store.verifying("sp1", 2_000);
         assert_eq!(after.len(), 1, "only the new key verifies after it");
         assert!(!after.iter().any(|k| k.public_key == first.public_key));
+    }
+
+    /// What an operator reads out of `zyron_sys.security.principal_keys`.
+    ///
+    /// The signing key comes first with no end, a key inside its overlap
+    /// comes after it with the moment it stops, and one whose overlap has
+    /// passed is gone. Reporting a lapsed key would read as though it still
+    /// verified something
+    #[test]
+    fn test_published_reports_the_signing_key_then_the_ones_still_accepted() {
+        let registry = registry();
+        let store = PrincipalKeyStore::new();
+        store.issue("sp_b", "Ed25519", 10).expect("issues");
+        store.issue("sp_a", "Ed25519", 20).expect("issues");
+        let outgoing = store.current("sp_a").expect("has a key");
+        store
+            .rotate(&registry, "sp_a", Some("Ed25519"), 1_000, 100)
+            .expect("rotates");
+
+        let during = store.published(500);
+        assert_eq!(during.len(), 3, "two principals, one mid rotation");
+        assert_eq!(during[0].key.principal, "sp_a", "sorted by principal");
+        assert_eq!(
+            during[0].overlap_end_secs, None,
+            "the signing key comes before the retiring one"
+        );
+        assert_eq!(during[1].key.principal, "sp_a");
+        assert_eq!(during[1].overlap_end_secs, Some(1_100));
+        assert_eq!(during[1].key.public_key, outgoing.public_key);
+        assert_eq!(during[2].key.principal, "sp_b");
+
+        let after = store.published(2_000);
+        assert_eq!(after.len(), 2, "the lapsed key is not reported");
+        assert!(after.iter().all(|k| k.overlap_end_secs.is_none()));
+    }
+
+    /// The fingerprint is what tells two members apart.
+    ///
+    /// Each node draws its own key for a principal, so the same principal
+    /// name on two members is two different keys, and the fingerprint is how
+    /// an operator sees that rather than assuming they match
+    #[test]
+    fn test_a_fingerprint_is_taken_over_the_public_half_and_differs_per_key() {
+        let one = PrincipalKeyStore::new();
+        let other = PrincipalKeyStore::new();
+        let here = one.issue("sp1", "Ed25519", 0).expect("issues");
+        let there = other.issue("sp1", "Ed25519", 0).expect("issues");
+
+        assert_eq!(here.fingerprint().len(), 64, "SHA-256 as hex");
+        assert_eq!(
+            here.fingerprint(),
+            one.current("sp1").expect("has a key").fingerprint(),
+            "the same key fingerprints the same way twice"
+        );
+        assert_ne!(
+            here.fingerprint(),
+            there.fingerprint(),
+            "two nodes drew the same fingerprint for keys that are not the same"
+        );
     }
 
     #[test]

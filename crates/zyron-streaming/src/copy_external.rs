@@ -144,6 +144,8 @@ fn source_entry_from_endpoint(ep: &CopyEndpoint) -> ExternalSourceEntry {
         tags: Vec::new(),
         owner_role_id: 0,
         created_at: 0,
+        paused: false,
+        credential_provider: None,
     }
 }
 
@@ -165,6 +167,7 @@ fn sink_entry_from_endpoint(ep: &CopyEndpoint) -> ExternalSinkEntry {
         tags: Vec::new(),
         owner_role_id: 0,
         created_at: 0,
+        credential_provider: None,
     }
 }
 

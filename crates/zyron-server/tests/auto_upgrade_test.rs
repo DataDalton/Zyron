@@ -552,6 +552,117 @@ async fn a_three_node_upgrade_completes_with_no_probe_failure() {
     assert!(driver.rolled_back.lock().is_empty(), "no probe failed");
 }
 
+/// A sequence stops when the node running it stops leading the group,
+/// rather than carrying on over nodes the new leader now decides for.
+///
+/// Found by the first live three node run, where restarting a follower
+/// elected a new leader that began its own pass. Two coordinators drained
+/// a node neither restarted and one tried to roll back a node the other
+/// was restarting
+#[tokio::test]
+async fn a_sequence_stops_when_this_node_stops_leading() {
+    // Leadership moves once the first follower has restarted
+    let driver = SimulatedCluster::losing_leadership_after(Vec::new(), 1);
+    let board = UpgradeBoard::new();
+    let nodes = three_nodes();
+    let baseline = capture_baseline(driver.as_ref(), &nodes)
+        .await
+        .expect("captures");
+    let outcome = zyron_server::upgrade::rolling::run(
+        driver.as_ref(),
+        &board,
+        &nodes,
+        RUNNING,
+        TARGET,
+        baseline,
+        RollingSettings::default(),
+        None,
+    )
+    .await
+    .expect("runs");
+
+    assert_eq!(outcome, RollingOutcome::HandedOff { nodes_upgraded: 1 });
+    assert_eq!(
+        driver.restarted.lock().clone(),
+        vec!["node-2".to_string()],
+        "the sequence stopped instead of touching the nodes the new leader owns"
+    );
+    assert!(
+        driver.rolled_back.lock().is_empty(),
+        "a sequence that lost the group must never roll a node back"
+    );
+    assert!(
+        driver.leadership_transfers.lock().is_empty(),
+        "the leader never reached its own turn"
+    );
+
+    // What it published about the others was said as their coordinator,
+    // which it no longer is, so only its own row is left behind
+    let states = board.node_states();
+    assert_eq!(
+        states
+            .iter()
+            .map(|s| s.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["node-3"],
+        "a node that handed off kept a phase it no longer speaks for"
+    );
+    assert_eq!(states[0].phase, UpgradePhase::Paused);
+}
+
+/// Losing the group during the health watch leaves the node to whoever
+/// leads now, rather than rolling back work another coordinator started.
+///
+/// The watch runs for minutes, so this is the widest window in which
+/// leadership can move, and a rollback here undoes a restart in flight
+#[tokio::test]
+async fn a_node_watched_after_leadership_moved_is_not_rolled_back() {
+    let slow = HealthBaseline {
+        p99_latency_us: 120_000,
+        ..healthy()
+    };
+    // The baseline capture reads healthy, the check after the restart
+    // reads slow, and by then this node has restarted one and lost the group
+    let driver = SimulatedCluster::losing_leadership_after(
+        vec![
+            ("node-2".to_string(), healthy()),
+            ("node-2".to_string(), slow),
+        ],
+        1,
+    );
+    let board = UpgradeBoard::new();
+    let nodes = three_nodes();
+    let baseline = capture_baseline(driver.as_ref(), &nodes)
+        .await
+        .expect("captures");
+    let outcome = zyron_server::upgrade::rolling::run(
+        driver.as_ref(),
+        &board,
+        &nodes,
+        RUNNING,
+        TARGET,
+        baseline,
+        RollingSettings {
+            health_recovery_timeout_secs: 0,
+            health_poll_interval_secs: 5,
+            ..RollingSettings::default()
+        },
+        None,
+    )
+    .await
+    .expect("runs");
+
+    assert_eq!(outcome, RollingOutcome::HandedOff { nodes_upgraded: 0 });
+    assert!(
+        driver.rolled_back.lock().is_empty(),
+        "a coordinator that lost the group rolled a node back anyway"
+    );
+    assert!(
+        !board.settings().paused,
+        "handing off is not an operator pause, the next leader carries on"
+    );
+}
+
 /// Item 31. A health regression on one node rolls that node back and pauses
 /// the whole sequence, waiting for an operator
 #[tokio::test]
@@ -1160,6 +1271,18 @@ impl MeshRpc for VersionedMesh {
             let scripted = self.versions.lock().get(&r.target.name).cloned();
             match scripted {
                 Some(Some(version)) => Ok(NodeStatus {
+                    // A node that answers reports its own journal row, which
+                    // is what a member's board takes for that member
+                    upgrade: Some(zyron_common::format::NodeUpgradeState {
+                        node_id: r.target.name.clone(),
+                        from_version: version.clone(),
+                        to_version: version.clone(),
+                        phase: zyron_common::format::UpgradePhase::Rolling,
+                        started_at_secs: 1,
+                        updated_at_secs: 2,
+                        is_leader: false,
+                        message: "scripted".to_string(),
+                    }),
                     target: r.target,
                     sequence: r.sequence,
                     version,
@@ -1169,8 +1292,11 @@ impl MeshRpc for VersionedMesh {
                     node: r.target.name,
                     reason: "connection refused".into(),
                 }),
+                // A node from before the status path existed answers that it
+                // does not know the path, which is what the health listener
+                // returns for a mesh path it has no route for
                 None => Err(MeshRpcError::Unknown {
-                    what: format!("node {}", r.target.name),
+                    what: zyron_mesh::PATH_NODE_STATUS.to_string(),
                 }),
             }
         })
@@ -1228,6 +1354,99 @@ fn driver_over(
         },
         dir.join("zyron-server"),
     )
+}
+
+/// A peer that answers it does not serve the status path is reported as
+/// running an older release, not as one that failed to answer.
+///
+/// The release that added the status path is the release the first upgrade
+/// moves to, so every member still on the old one answers exactly this way.
+/// Reporting it as a failed probe would send an operator hunting a network
+/// fault that is not there, through the whole rollout
+#[tokio::test]
+async fn a_peer_without_the_status_path_reads_as_an_older_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // node-2 is not scripted, so it answers that it does not know the status
+    // path, exactly as a release from before that path would
+    let mesh = VersionedMesh::new(&[]);
+    let driver = driver_over(Arc::clone(&mesh), "node-1", &["node-2"], dir.path());
+    let members: Vec<String> = ["node-1", "node-2"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+
+    let floor = driver.version_floor(&members).await;
+    assert_eq!(
+        floor,
+        Floor::Predates {
+            member: "node-2".to_string(),
+        },
+        "a peer that does not serve the path runs a release from before it"
+    );
+
+    let refusal = driver
+        .cluster_allows(INTRODUCED_IN, &members)
+        .await
+        .expect_err("an older member holds the setting back")
+        .to_string();
+    assert!(refusal.contains("node-2"), "{refusal}");
+    assert!(refusal.contains("older than"), "{refusal}");
+    assert!(
+        !refusal.contains("did not answer"),
+        "an old member is not a silent one, got {refusal}"
+    );
+}
+
+/// A member fills in the rest of the group's rows from what each member says
+/// about itself.
+///
+/// Every node writes its own row and nothing wrote anyone else's, so a
+/// follower's board held one row and reported a single node in a group of
+/// three. A peer's phase is that peer's own journal state, so it is asked for
+/// rather than inferred from its version or its drain flag, and this node is
+/// left out because its row is already there.
+///
+/// A member that does not answer comes back with no row rather than an empty
+/// one, which is what lets the merge keep whatever the board already held for
+/// a node that is mid restart
+#[tokio::test]
+async fn the_board_takes_each_peers_row_from_that_peer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mesh = VersionedMesh::new(&[("node-2", Some(RUNNING)), ("node-3", None)]);
+    let driver = driver_over(
+        Arc::clone(&mesh),
+        "node-1",
+        &["node-2", "node-3"],
+        dir.path(),
+    );
+    let members: Vec<String> = ["node-1", "node-2", "node-3"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+
+    let reported = driver.peer_upgrade_states(&members).await;
+    assert_eq!(
+        reported
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["node-2", "node-3"],
+        "this node answers for itself and is not probed"
+    );
+
+    let answered = reported[0].1.as_ref().expect("node-2 reported a row");
+    assert_eq!(answered.node_id, "node-2");
+    assert_eq!(
+        answered.phase,
+        zyron_common::format::UpgradePhase::Rolling,
+        "the peer's own phase came across rather than one inferred here"
+    );
+    assert_eq!(answered.message, "scripted");
+
+    assert!(
+        reported[1].1.is_none(),
+        "a member that did not answer must report no row, not an empty one"
+    );
 }
 
 /// The leader puts a cluster setting in front of the group only once every

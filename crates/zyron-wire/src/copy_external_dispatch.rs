@@ -199,6 +199,14 @@ fn build_sink_endpoint(
 fn lookup_source_entry(catalog: &Arc<Catalog>, name: &str) -> Result<ExternalSourceEntry> {
     for entry in catalog.list_external_sources() {
         if entry.name == name {
+            // A held source yields nothing to anything, so a COPY is refused
+            // here rather than reading rows a streaming job is not allowed to
+            // read at the same moment
+            if entry.paused {
+                return Err(ZyronError::PlanError(format!(
+                    "external source '{name}' is paused, resume it to read from it"
+                )));
+            }
             return Ok((*entry).clone());
         }
     }

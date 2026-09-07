@@ -1096,6 +1096,49 @@ use crate::external_source::ExternalTableSource;
 use std::time::Instant;
 use zyron_catalog::schema::ExternalMode;
 
+/// Pushes out whatever the sink is coalescing and acknowledges the objects
+/// whose rows made it, naming what prompted it.
+///
+/// A flush failure leaves the objects unacknowledged, so the rows and the
+/// acknowledgement are retried together on the next cycle rather than the
+/// objects being marked done for rows that never landed
+fn flush_and_acknowledge<Fut>(
+    rt: &tokio::runtime::Runtime,
+    entry: &StreamingJobEntry,
+    source: &ExternalTableSource,
+    flush: impl FnOnce() -> Fut,
+    reason: &str,
+) where
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    match rt.block_on(flush()) {
+        Ok(()) => {
+            if let Err(e) = source.commit_progress() {
+                tracing::warn!(
+                    job_id = entry.id.0,
+                    "ingest progress commit on {reason} failed: {e}"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            job_id = entry.id.0,
+            "sink flush on {reason} failed, ingest progress not committed: {e}"
+        ),
+    }
+}
+
+/// Whether the catalog is holding ingest from the source this job reads.
+///
+/// An inline endpoint has no catalog entry and is never held, so a job
+/// defined against a URI rather than a named source keeps running
+fn external_source_paused(source: &ExternalTableSource, catalog: &Catalog) -> bool {
+    source
+        .source_id()
+        .and_then(|id| catalog.get_external_source_by_id(id))
+        .map(|entry| entry.paused)
+        .unwrap_or(false)
+}
+
 /// Drives external-to-external streaming pipelines. Applies the spec's
 /// predicate and projections to decoded rows, writes the surviving rows to
 /// the external sink. One-shot mode exits when the source reports
@@ -1125,6 +1168,9 @@ fn run_external_loop(
     // string when cron parsing fails, supporting strings like "60s", "5m".
     let schedule = schedule_cron.as_deref().and_then(parse_schedule);
     let mut report = RunnerReport::new(&entry);
+    // True while the source is held, so the flush that empties the sink runs
+    // once when the hold begins rather than on every idle tick
+    let mut holding = false;
 
     loop {
         let cycle_start = std::time::Instant::now();
@@ -1152,6 +1198,19 @@ fn run_external_loop(
             None => break,
             _ => {}
         }
+
+        // A held source stops being read here rather than at the backend, so
+        // whatever the sink is still coalescing goes out and its objects are
+        // acknowledged once, before the job idles
+        if external_source_paused(&source, &catalog) {
+            if !holding {
+                holding = true;
+                flush_and_acknowledge(&rt, &entry, &source, || sink.flush(), "pause");
+            }
+            std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
+            continue;
+        }
+        holding = false;
 
         // Read one batch from the source.
         let rows = match source.read_batch(RUNNER_BATCH) {
@@ -1556,6 +1615,9 @@ fn run_external_to_zyron_loop(
     };
     let schedule = schedule_cron.as_deref().and_then(parse_schedule);
     let mut report = RunnerReport::new(&entry);
+    // True while the source is held, so the flush that empties the sink runs
+    // once when the hold begins rather than on every idle tick
+    let mut holding = false;
 
     loop {
         let cycle_start = std::time::Instant::now();
@@ -1582,6 +1644,19 @@ fn run_external_to_zyron_loop(
             None => break,
             _ => {}
         }
+
+        // A held source stops being read here rather than at the backend, so
+        // whatever the sink is still coalescing goes out and its objects are
+        // acknowledged once, before the job idles
+        if external_source_paused(&source, &catalog) {
+            if !holding {
+                holding = true;
+                flush_and_acknowledge(&rt, &entry, &source, || sink.flush(), "pause");
+            }
+            std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
+            continue;
+        }
+        holding = false;
 
         let rows = match source.read_batch(RUNNER_BATCH) {
             Ok(v) => v,

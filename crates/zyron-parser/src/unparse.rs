@@ -1422,6 +1422,73 @@ pub(crate) fn write_statement(out: &mut String, statement: &Statement) -> Out {
                 let _ = write!(out, " MAX REQUEST BODY {} KB", endpoint.max_body_kb);
             }
         }
+        Statement::CreateExternalSource(source) => {
+            out.push_str("CREATE EXTERNAL SOURCE ");
+            if source.if_not_exists {
+                out.push_str("IF NOT EXISTS ");
+            }
+            write_ident(out, &source.name);
+            out.push_str(" TYPE ");
+            out.push_str(external_backend_sql(&source.backend));
+            out.push_str(" URI ");
+            write_string(out, &source.uri);
+            out.push_str(" FORMAT ");
+            out.push_str(external_format_sql(&source.format));
+            write_external_mode(out, &source.mode)?;
+            if !source.options.is_empty() {
+                out.push_str(" OPTIONS ");
+                write_kv_options(out, &source.options);
+            }
+            if !source.credentials.is_empty() {
+                out.push_str(" CREDENTIALS ");
+                write_kv_options(out, &source.credentials);
+            }
+            if let Some(provider) = &source.credential_provider {
+                out.push_str(" CREDENTIAL_PROVIDER ");
+                write_credential_provider(out, provider);
+            }
+            if !source.columns.is_empty() {
+                out.push_str(" COLUMNS (");
+                for (i, (name, data_type)) in source.columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_ident(out, name);
+                    out.push(' ');
+                    out.push_str(&data_type_to_sql(data_type));
+                }
+                out.push(')');
+            }
+        }
+        Statement::AlterExternalSource(alter) => {
+            out.push_str("ALTER EXTERNAL SOURCE ");
+            write_ident(out, &alter.name);
+            out.push(' ');
+            write_alter_external_source_action(out, &alter.action)?;
+        }
+        Statement::AlterExternalSink(alter) => {
+            out.push_str("ALTER EXTERNAL SINK ");
+            write_ident(out, &alter.name);
+            out.push(' ');
+            match &alter.action {
+                AlterExternalSinkAction::Rename(new_name) => {
+                    out.push_str("RENAME TO ");
+                    write_ident(out, new_name);
+                }
+                AlterExternalSinkAction::SetOptions(options) => {
+                    out.push_str("SET OPTIONS ");
+                    write_kv_options(out, options);
+                }
+                AlterExternalSinkAction::SetCredentials(credentials) => {
+                    out.push_str("SET CREDENTIALS ");
+                    write_kv_options(out, credentials);
+                }
+                AlterExternalSinkAction::SetCredentialProvider(provider) => {
+                    out.push_str("SET CREDENTIAL_PROVIDER ");
+                    write_credential_provider(out, provider);
+                }
+            }
+        }
         other => {
             let debug = format!("{other:?}");
             let kind = debug
@@ -1435,9 +1502,248 @@ pub(crate) fn write_statement(out: &mut String, statement: &Statement) -> Out {
     Ok(())
 }
 
+const fn external_backend_sql(backend: &ExternalBackendKind) -> &'static str {
+    match backend {
+        ExternalBackendKind::File => "FILE",
+        ExternalBackendKind::S3 => "S3",
+        ExternalBackendKind::Gcs => "GCS",
+        ExternalBackendKind::Azure => "AZURE",
+        ExternalBackendKind::Http => "HTTP",
+        ExternalBackendKind::Zyron => "ZYRON",
+    }
+}
+
+const fn external_format_sql(format: &ExternalFormatKind) -> &'static str {
+    match format {
+        ExternalFormatKind::Json => "JSON",
+        ExternalFormatKind::JsonLines => "JSONLINES",
+        ExternalFormatKind::Csv => "CSV",
+        ExternalFormatKind::Parquet => "PARQUET",
+        ExternalFormatKind::ArrowIpc => "ARROW",
+        ExternalFormatKind::Avro => "AVRO",
+    }
+}
+
+const fn credential_provider_type_sql(kind: &CredentialProviderType) -> &'static str {
+    match kind {
+        CredentialProviderType::Vault => "vault",
+        CredentialProviderType::AwsSecretsManager => "aws_secrets_manager",
+        CredentialProviderType::GcpSecretManager => "gcp_secret_manager",
+        CredentialProviderType::AzureKeyVault => "azure_key_vault",
+        CredentialProviderType::OAuth2ClientCredentials => "oauth2_client_credentials",
+        CredentialProviderType::AwsIamAssumeRole => "aws_iam_assume_role",
+        CredentialProviderType::K8sSaToken => "k8s_sa_token",
+    }
+}
+
+/// ONESHOT is what the parser leaves behind when no mode was written, so it
+/// renders as nothing and the statement reads back to the same tree either way
+fn write_external_mode(out: &mut String, mode: &ExternalModeSpec) -> Out {
+    match mode {
+        ExternalModeSpec::OneShot => {}
+        ExternalModeSpec::Watch => out.push_str(" MODE WATCH"),
+        ExternalModeSpec::Scheduled { cron, every } => match (cron, every) {
+            (Some(cron), _) => {
+                out.push_str(" MODE SCHEDULED CRON ");
+                write_string(out, cron);
+            }
+            (None, Some(every)) => {
+                out.push_str(" MODE SCHEDULED EVERY ");
+                write_string(out, every);
+            }
+            (None, None) => {
+                return unsupported("a scheduled mode with neither a cron nor an interval");
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Writes one ALTER EXTERNAL SOURCE action back in the grammar that parses
+/// it. RESET LSN takes a string literal, so the position is spelled the way
+/// `parse_lsn_reset_spec` reads it back
+fn write_alter_external_source_action(out: &mut String, action: &AlterExternalSourceAction) -> Out {
+    match action {
+        AlterExternalSourceAction::Rename(new_name) => {
+            out.push_str("RENAME TO ");
+            write_ident(out, new_name);
+        }
+        AlterExternalSourceAction::RefreshSchema => out.push_str("REFRESH SCHEMA"),
+        AlterExternalSourceAction::ResetLsn(reset) => {
+            out.push_str("RESET LSN TO ");
+            match reset {
+                LsnResetSpec::Earliest => write_string(out, "earliest"),
+                LsnResetSpec::Latest => write_string(out, "latest"),
+                LsnResetSpec::Explicit(n) => write_string(out, &format!("lsn:{n}")),
+            }
+        }
+        AlterExternalSourceAction::Pause => out.push_str("PAUSE"),
+        AlterExternalSourceAction::Resume => out.push_str("RESUME"),
+        AlterExternalSourceAction::SetOptions(options) => {
+            out.push_str("SET OPTIONS ");
+            write_kv_options(out, options);
+        }
+        AlterExternalSourceAction::SetCredentials(credentials) => {
+            out.push_str("SET CREDENTIALS ");
+            write_kv_options(out, credentials);
+        }
+        AlterExternalSourceAction::SetCredentialProvider(provider) => {
+            out.push_str("SET CREDENTIAL_PROVIDER ");
+            write_credential_provider(out, provider);
+        }
+        // SET MODE takes the spec on its own, where the CREATE form writes
+        // the MODE keyword with it and omits the whole clause for one shot
+        AlterExternalSourceAction::SetMode(mode) => {
+            out.push_str("SET MODE ");
+            match mode {
+                ExternalModeSpec::OneShot => out.push_str("ONESHOT"),
+                ExternalModeSpec::Watch => out.push_str("WATCH"),
+                ExternalModeSpec::Scheduled { cron, every } => match (cron, every) {
+                    (Some(cron), _) => {
+                        out.push_str("SCHEDULED CRON ");
+                        write_string(out, cron);
+                    }
+                    (None, Some(every)) => {
+                        out.push_str("SCHEDULED EVERY ");
+                        write_string(out, every);
+                    }
+                    (None, None) => {
+                        return unsupported("a scheduled mode with neither a cron nor an interval");
+                    }
+                },
+            }
+        }
+        AlterExternalSourceAction::SetColumns(columns) => {
+            out.push_str("SET COLUMNS (");
+            for (i, (name, data_type)) in columns.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_ident(out, name);
+                out.push(' ');
+                out.push_str(&data_type_to_sql(data_type));
+            }
+            out.push(')');
+        }
+    }
+    Ok(())
+}
+
+/// `(type = 'kind', key = 'value', ...)`, the spelling
+/// `parse_credential_provider_clause` reads back. The provider kind travels
+/// as the `type` entry rather than as a keyword, which is what that clause
+/// pulls out of the option list
+fn write_credential_provider(out: &mut String, provider: &CredentialProviderSpec) {
+    out.push_str("(type = ");
+    write_string(out, credential_provider_type_sql(&provider.provider_type));
+    for (key, value) in &provider.options {
+        out.push_str(", ");
+        write_ident(out, key);
+        out.push_str(" = ");
+        write_string(out, value);
+    }
+    out.push(')');
+}
+
+/// `(key = 'value', ...)`. Every value renders as a string literal, which is a
+/// spelling `parse_kv_options` reads for any of the forms it accepts, and what
+/// it stores is the text either way
+fn write_kv_options(out: &mut String, options: &[(String, String)]) {
+    out.push('(');
+    for (i, (key, value)) in options.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_ident(out, key);
+        out.push_str(" = ");
+        write_string(out, value);
+    }
+    out.push(')');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rendering a tree and parsing it back gives the tree it came from.
+    ///
+    /// This is what lets a node resolve a statement and hand the resolved form
+    /// to the group: what the other members parse has to mean exactly what
+    /// this node settled on
+    fn round_trips(sql: &str) {
+        let parsed = crate::Parser::new(sql)
+            .expect("lexes")
+            .parse_statement()
+            .expect("parses");
+        let rendered = statement_to_sql(&parsed).expect("renders");
+        let reparsed = crate::Parser::new(&rendered)
+            .unwrap_or_else(|e| panic!("`{rendered}` does not lex: {e}"))
+            .parse_statement()
+            .unwrap_or_else(|e| panic!("`{rendered}` does not parse: {e}"));
+        assert_eq!(parsed, reparsed, "`{sql}` rendered to `{rendered}`");
+    }
+
+    /// Every ALTER EXTERNAL SOURCE action survives being rendered.
+    ///
+    /// A node that resolves REFRESH SCHEMA into a column list replicates the
+    /// resolved statement rather than the one that was typed, so an action
+    /// this cannot render is an action the other members never hear about
+    #[test]
+    fn every_alter_external_source_action_round_trips() {
+        round_trips("ALTER EXTERNAL SOURCE s RENAME TO t");
+        round_trips("ALTER EXTERNAL SOURCE s REFRESH SCHEMA");
+        round_trips("ALTER EXTERNAL SOURCE s RESET LSN TO 'earliest'");
+        round_trips("ALTER EXTERNAL SOURCE s RESET LSN TO 'latest'");
+        round_trips("ALTER EXTERNAL SOURCE s RESET LSN TO 'lsn:4096'");
+        round_trips("ALTER EXTERNAL SOURCE s PAUSE");
+        round_trips("ALTER EXTERNAL SOURCE s RESUME");
+        round_trips("ALTER EXTERNAL SOURCE s SET OPTIONS (region = 'us-east-1')");
+        round_trips("ALTER EXTERNAL SOURCE s SET CREDENTIALS (key = 'secret')");
+        round_trips(
+            "ALTER EXTERNAL SOURCE s SET CREDENTIAL_PROVIDER (type = 'vault',              url = 'https://v:8200')",
+        );
+        round_trips("ALTER EXTERNAL SOURCE s SET MODE ONESHOT");
+        round_trips("ALTER EXTERNAL SOURCE s SET MODE WATCH");
+        round_trips("ALTER EXTERNAL SOURCE s SET MODE SCHEDULED CRON '0 */5 * * *'");
+        round_trips("ALTER EXTERNAL SOURCE s SET MODE SCHEDULED EVERY '60s'");
+        round_trips("ALTER EXTERNAL SOURCE s SET COLUMNS (id BIGINT, name VARCHAR)");
+    }
+
+    /// Every ALTER EXTERNAL SINK action survives being rendered
+    #[test]
+    fn every_alter_external_sink_action_round_trips() {
+        round_trips("ALTER EXTERNAL SINK s RENAME TO t");
+        round_trips("ALTER EXTERNAL SINK s SET OPTIONS (compression = 'gzip')");
+        round_trips("ALTER EXTERNAL SINK s SET CREDENTIALS (key = 'secret')");
+        round_trips(
+            "ALTER EXTERNAL SINK s SET CREDENTIAL_PROVIDER (type = 'aws_secrets_manager',              region = 'us-west-2', secret_id = 'prod/etl')",
+        );
+    }
+
+    /// Every clause of CREATE EXTERNAL SOURCE survives being rendered.
+    ///
+    /// A node that infers a Parquet layout replicates the resolved statement
+    /// rather than the one that was typed, so a clause this drops is a clause
+    /// the other members never hear about
+    #[test]
+    fn an_external_source_round_trips_through_every_clause() {
+        round_trips("CREATE EXTERNAL SOURCE s TYPE FILE URI '/tmp/x' FORMAT PARQUET");
+        round_trips(
+            "CREATE EXTERNAL SOURCE IF NOT EXISTS s TYPE S3 URI 's3://b/k' FORMAT AVRO              COLUMNS (id BIGINT, name VARCHAR)",
+        );
+        round_trips(
+            "CREATE EXTERNAL SOURCE s TYPE GCS URI 'gs://b/k' FORMAT ARROW MODE WATCH              OPTIONS (region = 'us-east-1') CREDENTIALS (key = 'secret')",
+        );
+        round_trips(
+            "CREATE EXTERNAL SOURCE s TYPE AZURE URI 'az://c/p' FORMAT JSONLINES              MODE SCHEDULED EVERY '5m' COLUMNS (a INT)",
+        );
+        round_trips(
+            "CREATE EXTERNAL SOURCE s TYPE FILE URI '/tmp/y' FORMAT CSV              MODE SCHEDULED CRON '0 * * * *'",
+        );
+        round_trips(
+            "CREATE EXTERNAL SOURCE s TYPE ZYRON URI 'zyron://u@h/db/pub:p'              CREDENTIAL_PROVIDER (type = 'vault', path = 'secret/data/x')",
+        );
+    }
 
     #[test]
     fn identifiers_are_quoted_only_when_the_lexer_needs_it() {

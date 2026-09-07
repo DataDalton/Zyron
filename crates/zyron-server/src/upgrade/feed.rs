@@ -99,6 +99,10 @@ impl From<&ReleaseManifest> for ManifestDocument {
 /// reads: a Linux node and a Windows node download different binaries
 pub const RELEASE_TARGET: &str = env!("ZYRON_TARGET");
 
+/// Bytes hashed at a time when checking an artifact on disk. One megabyte
+/// keeps the read count low without holding the artifact in memory
+const SHA256_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// The name of a channel's manifest for this binary's target, without the
 /// `.manifest` suffix
 pub fn feed_name(channel: &str) -> String {
@@ -416,8 +420,32 @@ impl ReleasePoller {
 
 /// Verifies a staged binary against the SHA-256 the manifest declares
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
-    let bytes = std::fs::read(path).map_err(ZyronError::Io)?;
-    verify_sha256_bytes(&bytes, expected_hex, &path.display().to_string())
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    // Read in chunks rather than whole. A server binary is tens of
+    // megabytes and this runs on a node that is serving, so holding the
+    // whole artifact to hash it is that much memory taken from the buffer
+    // pool for as long as the hash takes
+    let mut file = std::fs::File::open(path).map_err(ZyronError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; SHA256_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(ZyronError::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = encode_hex(&hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_hex) {
+        return Err(ZyronError::UpgradeRefused(format!(
+            "the staged binary at {} hashes to {actual}, the manifest declares {expected_hex}. \
+             The download was corrupted or the artifact was replaced",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The SHA-256 of bytes as lower-case hex, the form a manifest declares

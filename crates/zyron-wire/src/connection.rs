@@ -4,6 +4,7 @@
 //! handshake, authentication, simple query protocol, extended query protocol,
 //! transaction management, and connection teardown.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -143,22 +144,32 @@ pub enum ReplicationClass {
     /// Each node decides these for itself, and vacuum in particular must,
     /// because the oldest snapshot it may reclaim behind is its own
     Local,
-    /// Not yet safe to run in a group.
+    /// Refused on a node in a group.
     ///
-    /// These move rows through paths that neither capture them nor replay
-    /// deterministically. Refusing is the only honest answer: running one
-    /// would leave this node holding data no other node has, and nothing
-    /// later would notice
-    Unsupported,
+    /// Running one would leave this node holding data no other node has, and
+    /// nothing later would notice. The reason travels with the refusal, so an
+    /// operator reads why this statement in particular cannot go to the group
+    /// and, where there is one, what form of it can
+    Unsupported {
+        /// Sentences appended to the refusal, addressed to whoever typed the
+        /// statement rather than to whoever reads this file
+        reason: &'static str,
+    },
 }
 
 /// Decides how a statement reaches the group.
 ///
-/// Written as an allowlist with an explicit refusal at the end rather than as
-/// a rule with exceptions, because the failure mode of a wrong guess here is
-/// two nodes holding different data and no error anywhere
+/// Written as an allowlist rather than as a rule with exceptions, because
+/// the failure mode of a wrong guess here is two nodes holding different
+/// data and no error anywhere.
+///
+/// The match names every statement and has no wildcard, so adding one to
+/// the parser does not compile until it is classified here. A wildcard
+/// reads as a safe default and is not one: what it defaults to is a refusal
+/// on every node of every group, which is invisible until an operator hits
+/// it on a cluster and never on a node standing alone
 pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
-    use ReplicationClass::{Local, Rows, Statement as AsStatement, Unsupported};
+    use ReplicationClass::{Local, Rows, Statement as AsStatement};
     use zyron_parser::Statement as S;
     match stmt {
         // Rows the DML operators capture on the way past
@@ -168,7 +179,41 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         | S::Merge(_)
         | S::Copy(_)
         | S::Call(_)
-        | S::DoBlock(_) => Rows,
+        | S::DoBlock(_)
+        // A refresh empties the backing table and fills it from the view's own
+        // query, both as ordinary statements under one transaction, so what
+        // reaches the group is the rows it settled on. Replicating the text
+        // instead would have each member run the query against its own copy at
+        // its own moment, which is the one way two members could disagree
+        // about what the view holds
+        | S::RefreshMaterializedView(_)
+        // A retention pass deletes the rows a table's TTL has aged out. What
+        // it deletes depends on the clock at the moment it runs, so the rows
+        // it settled on are what reaches the group rather than the statement,
+        // which two members would answer differently
+        | S::RunRetentionJob(_)
+        // Undoing a soft delete clears the delete marker on the rows the
+        // predicate matches, which is an update the group is told about like
+        // any other
+        | S::RestoreSoftDelete(_)
+        // An archive reads the rows out, writes them to the destination once,
+        // and deletes what it wrote. The destination write has to happen on
+        // one node only, so the deletes travel as rows rather than the
+        // statement travelling and every member writing the archive again
+        | S::ArchiveTable(_)
+        // A pipeline stage clears and loads its target under one transaction.
+        // The rows it settles on depend on what its sources held when it ran,
+        // so they are what reaches the group
+        | S::RunPipeline(_)
+        // A restore reads an archive that only the node running it can see,
+        // and inserts what it read, so the rows travel rather than the
+        // statement sending every member to look for the same file
+        | S::RestoreTable(_)
+        // Merging a branch into main lands the branch's rows on the base
+        // heap. Those rows are what the other members need, and the branch
+        // itself is consumed by the merge, so replaying the statement
+        // elsewhere would find no branch to merge
+        | S::MergeBranch(_) => Rows,
 
         // Catalog work
         S::CreateTable(_)
@@ -249,8 +294,100 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         | S::DropAggregate(_)
         | S::CreateProcedure(_)
         | S::DropProcedure(_)
+        // The job's definition belongs in every member's catalog, because a
+        // member that does not hold it cannot take the job over when
+        // leadership moves. Only the node that owns the jobs runs a runner,
+        // which is what stops every member writing the same sink, and the
+        // ownership pass moves that with the group
+        | S::CreateStreamingJob(_)
+        // An erasure has to happen on every member, because the rows it
+        // removes are on every member, and each one records in its own
+        // compliance log the erasure it carried out. The tables it reaches are
+        // found by scanning a catalog every member holds the same, and the
+        // deletes name the subject rather than depending on when they run
+        | S::ForgetUser(_)
+        // A listener on any member is waiting on the channel, so the
+        // notification reaches every member and each delivers to its own
+        // listeners. Answered on the node it was typed at alone, a client
+        // listening anywhere else never heard it
+        | S::Notify(_)
+        // ANALYZE means analyze the cluster. Every member plans against its
+        // own statistics, so each one measures the copy it holds rather than
+        // the numbers travelling: the rows are the same everywhere but the
+        // physical layout a plan is priced against is the node's own. Run on
+        // one member alone it left every other member planning on whatever it
+        // last measured
+        | S::Analyze(_)
+        // UNDROP takes a table back out of the recycle bin, which is a catalog
+        // write and nothing else, so every member does it from the same
+        // applied position the drop reached them at
+        | S::UndropTable(_)
+        // Rolling a lake table back names a version out of a history every
+        // member already holds, because the commits that built it replicated
+        // as they happened. So each member rolls its own log back to the same
+        // version rather than the file set travelling again
+        | S::RestoreTableVersion(_)
         | S::CreateEventHandler(_)
-        | S::LegalHold(_) => AsStatement,
+        // DROP EVENT HANDLER takes back the catalog row its CREATE put there.
+        // Leaving it out made a handler creatable on a group and never
+        // removable from one
+        | S::DropEventHandler(_)
+        | S::LegalHold(_)
+        // Analyzers, synonym dictionaries, resilience policies, user defined
+        // types and collations are catalog rows built from the statement text
+        // and nothing else. A hybrid index builds its full text and its vector
+        // half on each node the way the index statements above do
+        | S::CreateAnalyzer(_)
+        | S::AlterAnalyzer(_)
+        | S::DropAnalyzer(_)
+        | S::CreateSynonymDictionary(_)
+        | S::AlterSynonymDictionary(_)
+        | S::DropSynonymDictionary(_)
+        | S::CreateBulkhead(_)
+        | S::DropBulkhead(_)
+        | S::CreateRetryPolicy(_)
+        | S::DropRetryPolicy(_)
+        | S::CreateType(_)
+        | S::DropType(_)
+        | S::CreateCollation(_)
+        | S::DropCollation(_)
+        | S::CreateHybridIndex(_)
+        // Endpoints, security maps, publication tags and ABAC policies are
+        // dispatched through the same binder as CREATE PUBLICATION above and
+        // land in the catalog beside it. Each node registers the endpoint in
+        // its own gateway router and loads its own security map from the row
+        // it has just written, so a request answered by any member of the
+        // group finds the same objects
+        | S::CreateEndpoint(_)
+        | S::CreateStreamingEndpoint(_)
+        | S::AlterEndpoint(_)
+        | S::DropEndpoint(_)
+        | S::AlterSecurityMap(_)
+        | S::DropSecurityMap(_)
+        | S::TagPublication(_)
+        | S::UntagPublication(_)
+        | S::CreateAbacPolicy(_)
+        // A graph schema is held by each node's graph manager and its backing
+        // tables are ordinary tables, so both halves are built from the
+        // statement on every member
+        | S::CreateGraphSchema(_)
+        | S::DropGraphSchema(_)
+        // External sources and sinks are catalog rows naming a backend, a URI
+        // and a format. Credentials are sealed by whichever node writes the
+        // row, so every member holds the same secret under its own key
+        | S::CreateExternalSink(_)
+        | S::AlterExternalSink(_)
+        | S::DropExternalSink(_)
+        | S::AlterExternalSource(_)
+        | S::DropExternalSource(_)
+        // A source written without a column list takes its layout from a file
+        // in the external store, which is the ordinary way to point at a self
+        // describing format and what this engine does on a node standing
+        // alone. The node the statement arrives at reads that file once and
+        // the group is given the resolved statement, so no member reads the
+        // store for itself and none can settle on a different layout. See
+        // `Connection::resolve_for_group`
+        | S::CreateExternalSource(_) => AsStatement,
 
         // Reads, session state, and per-node physical work
         S::Select(_)
@@ -269,25 +406,150 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         | S::Execute(_)
         | S::Deallocate(_)
         | S::Listen(_)
-        | S::Notify(_)
         | S::ValuesQuery(_)
         | S::Vacuum(_)
         | S::Reindex(_)
         | S::Checkpoint(_)
-        | S::Analyze(_)
         | S::OptimizeTable(_)
         | S::AlterSystemSet(_)
         | S::UseBranch(_)
+        // An upgrade statement leaves an intent on this node. What reaches
+        // the other members is the sequence the coordinator then drives over
+        // the mesh, node by node, not the statement, so replicating the
+        // statement would have every member start its own sequence. A member
+        // that does not lead refuses it already and names the one that does
+        | S::TriggerUpgrade(_)
+        | S::AcknowledgeUpgradeRewrites(_)
+        // Reporting, which reads and writes nothing, and cancelling a
+        // backend, which reaches a session on this node and no other. None
+        // of these can leave two members holding different data, so
+        // refusing them in a group only made a node less usable than one
+        // standing alone
+        | S::ExplainRewrite(_)
+        | S::ListRegistry(_)
+        | S::ShowUpgrade(_)
+        | S::CancelBackend { .. }
+        // An export reads rows and writes them to a destination outside the
+        // database, so it happens once, on the node it was asked of. Running
+        // it on every member would write the same export once per member, and
+        // the compliance entry belongs to the node that produced it
+        | S::ExportUser(_)
+        // A scheme binding is policy for the whole group, so it takes effect
+        // on the node it was typed at and then rides the replicated log as a
+        // setting, the same carrier and the same writer `ALTER SYSTEM SET`
+        // above uses. Replicating the statement instead would have every
+        // member work out its own overlap end from its own clock
+        | S::SetSignatureScheme(_)
+        | S::RotateSignatureScheme(_)
+        // A principal's signing key belongs to the node that holds it. The key
+        // store is per node and has never been shared, so every member already
+        // holds its own key for a principal and rotating replaces the one on
+        // the node the statement was typed at. Replicating the statement would
+        // have each member generate a keypair of its own and call it the same
+        // rotation
+        | S::RotateServicePrincipalKey(_)
         | S::AlterCluster(_) => Local,
-
-        // Everything else moves rows through a path that neither captures
-        // them nor replays the same way twice. CREATE STREAMING JOB sits here
-        // rather than with the catalog work because the job starts writing
-        // its sink table the moment it is created, straight through the heap
-        // with nothing capturing the rows, and running one per node writes
-        // each node a sink of its own
-        _ => Unsupported,
     }
+}
+
+/// What one ANALYZE settled on.
+pub(crate) enum AnalyzeOutcome {
+    /// Every named table was measured
+    Analyzed,
+    /// ANALYZE named one table and the catalog does not have it
+    NoSuchTable(String),
+}
+
+/// Measures tables and stores their statistics.
+///
+/// Shared by the connection that was asked for ANALYZE and by the applier
+/// replaying it on another member, so every node measures the copy it holds
+/// through one path. The numbers are not shipped: the rows are the same
+/// everywhere but the physical layout a plan is priced against is the node's
+/// own, so each member reads its own heap.
+///
+/// A table whose heap cannot be opened or whose scan fails keeps the
+/// statistics it had, and the whole statement fails naming it, rather than
+/// reporting success while the planner runs on stale numbers
+pub(crate) async fn analyze_tables(
+    server: &Arc<ServerState>,
+    table_name: Option<&str>,
+) -> Result<AnalyzeOutcome, ProtocolError> {
+    use zyron_catalog::analyze_table;
+
+    let tables = server.catalog.list_all_tables();
+    let target_tables: Vec<_> = if let Some(name) = table_name {
+        tables.into_iter().filter(|t| t.name == name).collect()
+    } else {
+        tables
+    };
+
+    if target_tables.is_empty()
+        && let Some(name) = table_name
+    {
+        return Ok(AnalyzeOutcome::NoSuchTable(name.to_string()));
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for table in &target_tables {
+        let heap_file = match open_table_heap(server, table).await {
+            Ok(hf) => hf,
+            Err(e) => {
+                failures.push(format!("{}: {e}", table.name));
+                continue;
+            }
+        };
+
+        match analyze_table(table, &heap_file).await {
+            Ok((mut table_stats, column_stats)) => {
+                // Folded rows live in columnar segments the heap scan cannot
+                // see. Add their live count (segment rows minus rows with a
+                // committed supersede) so the planner costs segment-bearing
+                // tables by their true cardinality. Only committed supersedes
+                // count, an uncommitted or rolled back delete leaves the row
+                // live
+                if !table.columnar.segments.is_empty() {
+                    let store = zyron_storage::columnar::ColumnarPatchManager::store_for_segment(
+                        table.id.0 as u64,
+                        std::path::Path::new(&table.columnar.segments[0].path),
+                    )
+                    .map_err(ProtocolError::Database)?;
+                    let status_map = server.txn_manager.status_map();
+                    let mut columnar_rows: u64 = 0;
+                    for seg in &table.columnar.segments {
+                        let superseded = store
+                            .file_overlay(seg.file_id)
+                            .values()
+                            .filter(|o| o.supersedes.iter().any(|x| status_map.is_committed(*x)))
+                            .count() as u64;
+                        columnar_rows += seg.row_count.saturating_sub(superseded);
+                    }
+                    table_stats.row_count += columnar_rows;
+                }
+                server
+                    .catalog
+                    .persist_stats(table.id, table_stats, column_stats)
+                    .await
+                    .map_err(ProtocolError::Database)?;
+                server
+                    .table_io_stats
+                    .get_or_create(table.id.0)
+                    .record_analyze(epoch_seconds_now());
+            }
+            Err(e) => failures.push(format!("{}: {e}", table.name)),
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(ProtocolError::Database(ZyronError::ExecutionError(
+            format!(
+                "ANALYZE failed for {} table(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+        )));
+    }
+    Ok(AnalyzeOutcome::Analyzed)
 }
 
 /// Tells the applier how the schema change it handed over went.
@@ -1556,7 +1818,9 @@ impl<T: WireTransport> Connection<T> {
         };
 
         // Create session
-        let session = Session::with_security_context(user, database, database_id, security_context);
+        let mut session =
+            Session::with_security_context(user, database, database_id, security_context);
+        session.process_id = self.process_id;
 
         // Encode all startup responses into self.write_buf (reuses existing allocation
         // instead of creating a new BytesMut per handshake), then write once.
@@ -1854,10 +2118,24 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
+            // Anything the statement would work out separately on each member
+            // is settled here first, so what the group agrees is what this
+            // node is about to do rather than an instruction to go and find
+            // out
+            let (stmt, agreed_sql) =
+                match Self::resolve_for_group(&self.server, &self.session, stmt, &sql).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        self.send_error(&e).await?;
+                        self.mark_failed_if_in_transaction();
+                        continue;
+                    }
+                };
+
             // A schema change reaches the group before it runs here, so the
             // object ids it allocates are the same on every node and the
             // order it happens in is the group's
-            let turn = match self.agree_statement(&stmt, &sql).await {
+            let turn = match self.agree_statement(&stmt, &agreed_sql).await {
                 Some(Ok(turn)) => Some(turn),
                 Some(Err(e)) => {
                     self.send_error(&e).await?;
@@ -1874,7 +2152,7 @@ impl<T: WireTransport> Connection<T> {
                 &mut self.session,
                 &mut self.transaction,
                 &mut self.active_branch,
-                &sql,
+                &agreed_sql,
             )
             .await;
             if matches!(&handled, Some(Ok(_))) {
@@ -1941,24 +2219,11 @@ impl<T: WireTransport> Connection<T> {
                 }
                 continue;
             }
-
-            if let zyron_parser::Statement::Notify(ref notify_stmt) = stmt {
-                if let Some(ref nc) = self.server.notification_channels {
-                    let payload = notify_stmt.payload.as_deref().unwrap_or("");
-                    nc.notify(&notify_stmt.channel, payload, self.process_id);
-                    self.feed(BackendMessage::CommandComplete {
-                        tag: "NOTIFY".to_string(),
-                    })
-                    .await?;
-                } else {
-                    self.send_error(&ZyronError::Internal(
-                        "notification channels not enabled".into(),
-                    ))
-                    .await?;
-                    self.mark_failed_if_in_transaction();
-                }
-                continue;
-            }
+            // NOTIFY is deliberately not answered here. This runs ahead of
+            // the classifier, so anything answered here never reaches the
+            // group, and a listener on another member would never hear it. It
+            // goes through the DDL dispatcher, which is the one path the
+            // applier replays a statement through
 
             // ---------------------------------------------------------------
             // PREPARE / EXECUTE / DEALLOCATE
@@ -3812,8 +4077,19 @@ impl<T: WireTransport> Connection<T> {
             return Ok(());
         }
 
+        // Settled here first, the same as the simple query path
+        let (stmt, agreed_sql) =
+            match Self::resolve_for_group(&self.server, &self.session, stmt, query).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.send_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
+                    return Ok(());
+                }
+            };
+
         // A schema change reaches the group before it runs here
-        let turn = match self.agree_statement(&stmt, query).await {
+        let turn = match self.agree_statement(&stmt, &agreed_sql).await {
             Some(Ok(turn)) => Some(turn),
             Some(Err(e)) => {
                 self.send_error(&e).await?;
@@ -3830,7 +4106,7 @@ impl<T: WireTransport> Connection<T> {
             &mut self.session,
             &mut self.transaction,
             &mut self.active_branch,
-            query,
+            &agreed_sql,
         )
         .await;
         if matches!(&handled, Some(Ok(_))) {
@@ -4023,6 +4299,68 @@ impl<T: WireTransport> Connection<T> {
         Ok((txn.txn_id, txn.snapshot.clone()))
     }
 
+    /// Settles anything a statement would otherwise work out separately on
+    /// each member, before the group is told about it.
+    ///
+    /// Returns the statement and the text to agree. Both are the ones that
+    /// came in unless something had to be resolved, in which case what the
+    /// group hears is the resolved form and this node runs that too, so the
+    /// member that resolved it and the members that replay it do the same
+    /// work.
+    ///
+    /// Only reached on a node in a group. Standing alone there is nobody to
+    /// disagree with, and the handler resolves as it always has
+    async fn resolve_for_group<'a>(
+        server: &Arc<ServerState>,
+        session: &Option<Session>,
+        stmt: zyron_parser::Statement,
+        sql: &'a str,
+    ) -> Result<(zyron_parser::Statement, Cow<'a, str>), ZyronError> {
+        // Almost every statement is handed on untouched, and a node in no
+        // group hands on all of them, so the text is borrowed rather than
+        // copied. Only a statement this rewrites owns its SQL
+        if server.replication.is_none() {
+            return Ok((stmt, Cow::Borrowed(sql)));
+        }
+        let resolved_stmt = match &stmt {
+            zyron_parser::Statement::CreateExternalSource(source) => {
+                let resolved = crate::ddl_dispatch::resolve_external_source_columns(source)
+                    .await
+                    .map_err(|e| ZyronError::Internal(e.to_string()))?;
+                let Some(columns) = resolved else {
+                    return Ok((stmt, Cow::Borrowed(sql)));
+                };
+                let mut resolved_source = source.clone();
+                resolved_source.columns = columns;
+                zyron_parser::Statement::CreateExternalSource(Box::new(*resolved_source))
+            }
+            // REFRESH SCHEMA is an instruction to read the external store,
+            // which is the one thing every member must not do separately. The
+            // layout is read once here and the group is given the column list
+            zyron_parser::Statement::AlterExternalSource(alter) => {
+                let resolved =
+                    crate::ddl_dispatch::resolve_refreshed_source_columns(alter, server, session)
+                        .await
+                        .map_err(|e| ZyronError::Internal(e.to_string()))?;
+                let Some(columns) = resolved else {
+                    return Ok((stmt, Cow::Borrowed(sql)));
+                };
+                let mut resolved_alter = alter.clone();
+                resolved_alter.action =
+                    zyron_parser::ast::AlterExternalSourceAction::SetColumns(columns);
+                zyron_parser::Statement::AlterExternalSource(Box::new(*resolved_alter))
+            }
+            _ => return Ok((stmt, Cow::Borrowed(sql))),
+        };
+
+        let resolved_sql = zyron_parser::statement_to_sql(&resolved_stmt).map_err(|e| {
+            ZyronError::Internal(format!(
+                "the external source layout was read from the store and could not be written                  back as SQL for the group, {e}"
+            ))
+        })?;
+        Ok((resolved_stmt, Cow::Owned(resolved_sql)))
+    }
+
     /// Puts a schema change to the group before it runs here.
     ///
     /// Returns None on a node in no group, or for a statement that is not
@@ -4040,9 +4378,10 @@ impl<T: WireTransport> Connection<T> {
         let router = self.server.replication.as_ref()?;
         match replication_class(stmt) {
             ReplicationClass::Statement => {}
-            ReplicationClass::Unsupported => {
+            ReplicationClass::Unsupported { reason } => {
                 return Some(Err(ZyronError::NotReplicable {
                     statement: statement_op_name(stmt).to_string(),
+                    reason: reason.to_string(),
                 }));
             }
             ReplicationClass::Rows | ReplicationClass::Local => return None,
@@ -4065,6 +4404,14 @@ impl<T: WireTransport> Connection<T> {
                 .as_ref()
                 .map(|s| s.search_path.clone())
                 .unwrap_or_else(zyron_catalog::default_search_path),
+            // The role in force here, which `SET ROLE` may have moved off the
+            // login user's own. The router drops it when a member of the
+            // group does not read it yet
+            actor_role_id: self
+                .session
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .map(|ctx| ctx.current_role.0),
         };
         Some(
             router
@@ -4841,10 +5188,11 @@ impl<T: WireTransport> Connection<T> {
                 let result = self.handle_vacuum(v.table.as_deref()).await;
                 Some(result)
             }
-            zyron_parser::Statement::Analyze(a) => {
-                let result = self.handle_analyze(a.table.as_deref()).await;
-                Some(result)
-            }
+            // ANALYZE is deliberately not answered here. This layer runs
+            // ahead of the classifier, so anything it answers never reaches
+            // the group, and every member has to measure the copy it holds.
+            // It goes through the DDL dispatcher instead, which is the one
+            // path the applier replays a statement through
             zyron_parser::Statement::Reindex(r) => {
                 let target = match &r.target {
                     zyron_parser::ast::ReindexTarget::Table(t) => (Some(t.clone()), None),
@@ -5527,103 +5875,6 @@ impl<T: WireTransport> Connection<T> {
 
     /// Handles the ANALYZE SQL command. Scans heap pages and computes table
     /// and column statistics for query planner cost estimation.
-    async fn handle_analyze(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
-        use zyron_catalog::analyze_table;
-
-        let tables = self.server.catalog.list_all_tables();
-        let target_tables: Vec<_> = if let Some(name) = table_name {
-            tables.into_iter().filter(|t| t.name == name).collect()
-        } else {
-            tables
-        };
-
-        if target_tables.is_empty() {
-            if let Some(name) = table_name {
-                let fields = crate::messages::backend::ErrorFields {
-                    severity: "ERROR".into(),
-                    code: "42P01".into(),
-                    message: format!("relation \"{}\" does not exist", name),
-                    detail: None,
-                    hint: None,
-                    position: None,
-                };
-                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
-                return Ok(());
-            }
-        }
-
-        // Collect per-table failures. A table whose heap cannot be opened or
-        // whose scan fails keeps stale stats, so report it rather than letting
-        // ANALYZE claim success while the planner runs on outdated statistics.
-        let mut failures: Vec<String> = Vec::new();
-        for table in &target_tables {
-            let heap_file = match open_table_heap(&self.server, table).await {
-                Ok(hf) => hf,
-                Err(e) => {
-                    failures.push(format!("{}: {e}", table.name));
-                    continue;
-                }
-            };
-
-            match analyze_table(&table, &heap_file).await {
-                Ok((mut table_stats, column_stats)) => {
-                    // Folded rows live in columnar segments the heap scan
-                    // cannot see. Add their live count (segment rows minus
-                    // rows with a committed supersede) so the planner costs
-                    // segment-bearing tables by their true cardinality. Only
-                    // committed supersedes count, an uncommitted or rolled
-                    // back delete leaves the row live
-                    if !table.columnar.segments.is_empty() {
-                        let store =
-                            zyron_storage::columnar::ColumnarPatchManager::store_for_segment(
-                                table.id.0 as u64,
-                                std::path::Path::new(&table.columnar.segments[0].path),
-                            )
-                            .map_err(ProtocolError::Database)?;
-                        let status_map = self.server.txn_manager.status_map();
-                        let mut columnar_rows: u64 = 0;
-                        for seg in &table.columnar.segments {
-                            let superseded = store
-                                .file_overlay(seg.file_id)
-                                .values()
-                                .filter(|o| {
-                                    o.supersedes.iter().any(|x| status_map.is_committed(*x))
-                                })
-                                .count() as u64;
-                            columnar_rows += seg.row_count.saturating_sub(superseded);
-                        }
-                        table_stats.row_count += columnar_rows;
-                    }
-                    self.server
-                        .catalog
-                        .persist_stats(table.id, table_stats, column_stats)
-                        .await
-                        .map_err(ProtocolError::Database)?;
-                    self.server
-                        .table_io_stats
-                        .get_or_create(table.id.0)
-                        .record_analyze(epoch_seconds_now());
-                }
-                Err(e) => failures.push(format!("{}: {e}", table.name)),
-            }
-        }
-
-        if !failures.is_empty() {
-            return Err(ProtocolError::Database(ZyronError::ExecutionError(
-                format!(
-                    "ANALYZE failed for {} table(s): {}",
-                    failures.len(),
-                    failures.join("; ")
-                ),
-            )));
-        }
-
-        self.feed(BackendMessage::CommandComplete {
-            tag: "ANALYZE".into(),
-        })
-        .await
-    }
-
     /// Routes a SELECT that names an entity of the `zyron_sys` catalog.
     ///
     /// Returns None when the statement names something else, which sends it
@@ -7597,12 +7848,227 @@ mod subscribe_authz_tests {
 
 #[cfg(test)]
 mod transaction_option_tests {
-    use super::{is_read_only_safe_statement, map_isolation_level, statement_op_name};
+    use super::{
+        ReplicationClass, is_read_only_safe_statement, map_isolation_level, replication_class,
+        statement_op_name,
+    };
     use zyron_parser::{Parser, TxnIsolation};
     use zyron_storage::txn::IsolationLevel;
 
     fn parse(sql: &str) -> zyron_parser::Statement {
         Parser::new(sql).unwrap().parse_statement().unwrap()
+    }
+
+    /// The operator surface for upgrades runs on the node it is typed at.
+    ///
+    /// The classifier refuses anything it does not name, so a statement
+    /// left out of it is refused on every node in a group, which is the
+    /// only deployment these statements are for. What reaches the other
+    /// members is the sequence the coordinator drives over the mesh
+    #[test]
+    fn the_upgrade_statements_run_on_the_node_they_are_typed_at() {
+        for sql in [
+            "TRIGGER MANUAL UPGRADE TO '0.12.1'",
+            "TRIGGER MANUAL ROLLBACK",
+            "ACKNOWLEDGE UPGRADE REWRITES AMBIGUOUS",
+            "ACKNOWLEDGE UPGRADE REWRITES UNSAFE",
+        ] {
+            assert_eq!(
+                replication_class(&parse(sql)),
+                ReplicationClass::Local,
+                "{sql} would be refused on every node in a consensus group"
+            );
+        }
+    }
+
+    /// A statement that reads, or that reaches a session on this node only,
+    /// changes nothing another member could disagree about, so refusing it
+    /// in a group makes a clustered node less usable than a lone one for no
+    /// safety gained
+    #[test]
+    fn reporting_and_cancelling_are_not_refused_in_a_group() {
+        for sql in [
+            "SHOW UPGRADE STATUS",
+            "LIST FORMAT REGISTRY",
+            "CANCEL BACKEND 42",
+        ] {
+            assert_eq!(
+                replication_class(&parse(sql)),
+                ReplicationClass::Local,
+                "{sql} reads or is node-local and must not be refused in a group"
+            );
+        }
+    }
+
+    /// Catalog objects reach every member of the group.
+    ///
+    /// Each of these writes a catalog row and nothing else, built from the
+    /// text of the statement, so replaying it elsewhere builds the same row.
+    /// Refused, they left a clustered node unable to hold objects a node
+    /// standing alone holds fine
+    #[test]
+    fn catalog_objects_are_agreed_by_the_group() {
+        for sql in [
+            "CREATE ANALYZER a AS (tokenizer = 'standard')",
+            "CREATE SYNONYM DICTIONARY d (('car', 'automobile'))",
+            "CREATE TYPE us_zipcode AS (storage = TEXT)",
+            "CREATE COLLATION c (locale = 'de_DE')",
+            "CREATE BULKHEAD b (max_concurrent = 10)",
+            "CREATE RETRY POLICY r (max_attempts = 3)",
+            "CREATE ENDPOINT e1 ON PATH '/p' METHOD GET USING 'SELECT 1' AUTH NONE",
+            "CREATE GRAPH SCHEMA social (NODE Person (id INT))",
+            "ALTER SECURITY MAP KUBERNETES SA 'default/app' TO ROLE 'reader'",
+            "TAG PUBLICATION p WITH '#pii'",
+            "CREATE ABAC POLICY p1 ON PUBLICATION orders_pub WHERE region = 'us-east-1'",
+            "CREATE EXTERNAL SINK s TYPE FILE URI '/tmp' FORMAT CSV",
+        ] {
+            assert_eq!(
+                replication_class(&parse(sql)),
+                ReplicationClass::Statement,
+                "{sql} is refused on every node of every group"
+            );
+        }
+    }
+
+    /// An object the group can be given is one the group can be rid of.
+    ///
+    /// A CREATE that reaches every member beside a DROP that reaches none
+    /// leaves an object every node holds and no node can remove
+    #[test]
+    fn a_create_the_group_agrees_has_a_drop_the_group_agrees() {
+        for (create, drop) in [
+            (
+                "CREATE ANALYZER a AS (tokenizer = 'standard')",
+                "DROP ANALYZER a",
+            ),
+            (
+                "CREATE SYNONYM DICTIONARY d (('car', 'automobile'))",
+                "DROP SYNONYM DICTIONARY d",
+            ),
+            (
+                "CREATE TYPE us_zipcode AS (storage = TEXT)",
+                "DROP TYPE us_zipcode",
+            ),
+            ("CREATE COLLATION c (locale = 'de_DE')", "DROP COLLATION c"),
+            ("CREATE BULKHEAD b (max_concurrent = 10)", "DROP BULKHEAD b"),
+            (
+                "CREATE RETRY POLICY r (max_attempts = 3)",
+                "DROP RETRY POLICY r",
+            ),
+            (
+                "CREATE ENDPOINT e1 ON PATH '/p' METHOD GET USING 'SELECT 1' AUTH NONE",
+                "DROP ENDPOINT e1",
+            ),
+            (
+                "CREATE GRAPH SCHEMA social (NODE Person (id INT))",
+                "DROP GRAPH SCHEMA social",
+            ),
+            (
+                "CREATE EVENT HANDLER h WHEN table_change EXECUTE FUNCTION act",
+                "DROP EVENT HANDLER h",
+            ),
+            (
+                "CREATE EXTERNAL SINK s TYPE FILE URI '/tmp' FORMAT CSV",
+                "DROP EXTERNAL SINK s",
+            ),
+        ] {
+            assert_eq!(
+                replication_class(&parse(create)),
+                replication_class(&parse(drop)),
+                "`{create}` and `{drop}` do not reach the same nodes"
+            );
+        }
+    }
+
+    /// A source reaches the group whether or not the statement names its
+    /// columns.
+    ///
+    /// Written without a column list is the ordinary way to point at a self
+    /// describing format, and it is what the engine does on a node standing
+    /// alone, so a group must not need the clause. The layout is read once by
+    /// the node the statement arrives at and the resolved statement is what
+    /// the group agrees, which is what stops members reading the store
+    /// separately
+    #[test]
+    fn an_external_source_is_agreed_with_or_without_a_column_list() {
+        assert_eq!(
+            replication_class(&parse(
+                "CREATE EXTERNAL SOURCE x TYPE FILE URI '/tmp' FORMAT CSV                  COLUMNS (id BIGINT, name VARCHAR)"
+            )),
+            ReplicationClass::Statement,
+        );
+        assert_eq!(
+            replication_class(&parse(
+                "CREATE EXTERNAL SOURCE x TYPE S3 URI 's3://bucket/logs' FORMAT PARQUET"
+            )),
+            ReplicationClass::Statement,
+            "a source that infers its layout is resolved before it is agreed, not refused"
+        );
+    }
+
+    /// A scheme binding reaches the group as a replicated setting, so the
+    /// statement runs where it was typed and the value travels rather than
+    /// the text. Replicating the text would have each member work out its own
+    /// rotation overlap from its own clock
+    #[test]
+    fn a_scheme_binding_runs_where_it_was_typed() {
+        for sql in [
+            "SET SIGNATURE SCHEME Ed25519 FOR ARTIFACT KIND JWT",
+            "ROTATE SIGNATURE SCHEME JWT TO Ed25519",
+        ] {
+            assert_eq!(
+                replication_class(&parse(sql)),
+                ReplicationClass::Local,
+                "{sql} is refused on every node of every group"
+            );
+        }
+    }
+
+    /// A principal's key belongs to the node that holds it.
+    ///
+    /// The key store is per node and has never been shared, so a rotation
+    /// replaces the key on the node the statement was typed at. Refusing it in
+    /// a group protected nothing, it only meant a key that could never be
+    /// rotated
+    #[test]
+    fn a_principal_key_rotation_runs_where_it_was_typed() {
+        assert_eq!(
+            replication_class(&parse("ROTATE SERVICE PRINCIPAL KEY sp1")),
+            ReplicationClass::Local,
+        );
+    }
+
+    /// Nothing is refused any more.
+    ///
+    /// `Unsupported` is the escape hatch for a statement whose effects cannot
+    /// reach the group, and every statement this engine has now has a way to.
+    /// A statement that lands back in it needs a demonstrated reason and a
+    /// case in the conformance suite showing why, not a comment
+    #[test]
+    fn no_statement_is_refused_on_a_node_in_a_group() {
+        for sql in [
+            "ARCHIVE TABLE old_data TO '/backup/old'",
+            "EXPORT USER 'u1'",
+            "FORGET USER 'u1'",
+            "RUN RETENTION JOB ON t",
+            "UNDROP TABLE t",
+            "MERGE BRANCH b INTO main",
+            "RESTORE FROM t WHERE id = 1",
+            "REFRESH MATERIALIZED VIEW mv",
+            "RESTORE TABLE t FROM '/backup/old'",
+            "RESTORE TABLE t TO VERSION 1",
+            "RUN PIPELINE p",
+            "ROTATE SERVICE PRINCIPAL KEY sp1",
+            "CREATE EXTERNAL SOURCE x TYPE S3 URI 's3://b/l' FORMAT PARQUET",
+        ] {
+            assert!(
+                !matches!(
+                    replication_class(&parse(sql)),
+                    ReplicationClass::Unsupported { .. }
+                ),
+                "{sql} is refused on every node of every group"
+            );
+        }
     }
 
     #[test]

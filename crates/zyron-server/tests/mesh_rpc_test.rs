@@ -13,17 +13,19 @@
 //! Run: cargo test -p zyron-server --test mesh_rpc_test
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use zyron_common::{Admission, InFlightGuard, QueryMetrics};
 use zyron_mesh::rpc::{
     BeginDrainRequest, DrainStatusRequest, HotSetManifestRequest, MeshRpc, MeshRpcError,
     PrefetchRequest,
 };
 use zyron_mesh::{HttpMeshRpc, MeshDirectory, MeshNode, NodeRef};
-use zyron_server::mesh_node::{InFlight, ServerMeshNode};
+use zyron_server::mesh_node::ServerMeshNode;
+use zyron_server::upgrade::control::NodeControl;
 
 /// Serves mesh calls the way the health listener does, and stops when the
 /// test drops the handle.
@@ -70,15 +72,25 @@ fn local() -> NodeRef {
     NodeRef::new(1, "served")
 }
 
-fn node(queries: u64) -> Arc<ServerMeshNode> {
-    let in_flight = Arc::new(InFlight::default());
-    in_flight.queries.store(queries, Ordering::Relaxed);
-    Arc::new(ServerMeshNode::new(
+/// A node with `queries` statements running on it, and the guards that keep
+/// them running.
+///
+/// The count is not a field to be set: a query is in flight because something
+/// holds a guard, so the guards come back with the node and the caller keeps
+/// them for as long as the count is supposed to hold. Its own `NodeControl`
+/// rather than the shared one, so a drain one test starts is invisible to the
+/// next
+fn node(queries: u64) -> (Arc<ServerMeshNode>, Vec<InFlightGuard>) {
+    let admission = Arc::new(Admission::new());
+    let held: Vec<InFlightGuard> = (0..queries).map(|_| admission.begin_query()).collect();
+    let node = Arc::new(ServerMeshNode::new(
         local(),
-        Arc::new(AtomicBool::new(false)),
-        in_flight,
+        admission,
+        Arc::new(QueryMetrics::new()),
+        Arc::new(NodeControl::new()),
         Arc::new(parking_lot::RwLock::new(std::path::PathBuf::new())),
-    ))
+    ));
+    (node, held)
 }
 
 fn client(address: &str) -> HttpMeshRpc {
@@ -90,7 +102,7 @@ fn client(address: &str) -> HttpMeshRpc {
 /// A drain begins over the wire, and the answer is the node's real state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drain_crosses_the_wire_and_comes_back_with_the_nodes_state() {
-    let served = node(4);
+    let (served, _held) = node(4);
     let (address, handle) = serve(Arc::clone(&served)).await;
     let client = client(&address);
 
@@ -119,7 +131,8 @@ async fn a_drain_crosses_the_wire_and_comes_back_with_the_nodes_state() {
 /// survives the round trip as a refusal rather than as a transport fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refusal_arrives_as_a_refusal() {
-    let (address, handle) = serve(node(0)).await;
+    let (served, _held) = node(0);
+    let (address, handle) = serve(served).await;
     let client = client(&address);
 
     let error = client
@@ -140,7 +153,7 @@ async fn a_refusal_arrives_as_a_refusal() {
 /// A prefetch reaches the node's queue, and the count comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_prefetch_reaches_the_node_and_is_queued() {
-    let served = node(0);
+    let (served, _held) = node(0);
     let (address, handle) = serve(Arc::clone(&served)).await;
     let client = client(&address);
 
@@ -166,7 +179,8 @@ async fn a_prefetch_reaches_the_node_and_is_queued() {
 /// chunk, which is what tells a scheduler there is nothing to hand over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_manifest_is_an_answer_not_an_error() {
-    let (address, handle) = serve(node(0)).await;
+    let (served, _held) = node(0);
+    let (address, handle) = serve(served).await;
     let client = client(&address);
 
     let chunk = client
@@ -187,7 +201,7 @@ async fn an_empty_manifest_is_an_answer_not_an_error() {
 /// misrouted request cannot drain the wrong machine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_misrouted_call_is_refused_by_the_node_that_got_it() {
-    let served = node(0);
+    let (served, _held) = node(0);
     let (address, handle) = serve(Arc::clone(&served)).await;
 
     // The directory points a different node's name at this listener, which is
@@ -218,7 +232,8 @@ async fn a_misrouted_call_is_refused_by_the_node_that_got_it() {
 /// report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_transport_counts_its_calls_and_its_bytes() {
-    let (address, handle) = serve(node(0)).await;
+    let (served, _held) = node(0);
+    let (address, handle) = serve(served).await;
     let client = client(&address);
     let stats = client.stats();
 

@@ -12,6 +12,14 @@ use std::time::{Duration, Instant};
 
 use super::stager::StagedRelease;
 
+/// How long a drain is honored when the caller named no deadline
+pub const DEFAULT_PEER_DRAIN_SECS: u64 = 300;
+
+/// Added to the caller's own deadline before this node serves again, so the
+/// node outlives the wait the coordinator is doing and a restart that
+/// arrives on time is never cut short
+pub const PEER_DRAIN_MARGIN: Duration = Duration::from_secs(30);
+
 /// A restart the service armed, read by the run loop after it has drained
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartIntent {
@@ -70,6 +78,15 @@ pub struct NodeControl {
     /// Wakes the run loop for a restart
     restart_wake: tokio::sync::Notify,
     started_at: Instant,
+    /// When a drain another node asked for stops being honored.
+    ///
+    /// A drain is entered on a peer's word and left on the same peer's
+    /// word, so a coordinator that stops talking would otherwise hold this
+    /// node out of service for as long as the process lives. The deadline
+    /// is the one the caller itself named, refreshed every time that caller
+    /// asks how far the drain has got, so a slow coordinator keeps the node
+    /// drained and a dead one does not
+    peer_drain_deadline: parking_lot::Mutex<Option<Instant>>,
 }
 
 impl Default for NodeControl {
@@ -85,6 +102,7 @@ impl NodeControl {
             wake: tokio::sync::Notify::new(),
             restart_wake: tokio::sync::Notify::new(),
             started_at: Instant::now(),
+            peer_drain_deadline: parking_lot::Mutex::new(None),
         }
     }
 
@@ -95,6 +113,33 @@ impl NodeControl {
     /// Seconds this process has been running
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Records how long a peer's drain is honored for.
+    ///
+    /// A caller that names no deadline gets [`DEFAULT_PEER_DRAIN_SECS`],
+    /// because a drain no one ever lifts takes the node out of service for
+    /// good. The margin is added so the node outlives the coordinator's own
+    /// wait and a restart that arrives on time is never cut short
+    pub fn note_peer_drain(&self, deadline_ms: u32, now: Instant) {
+        let asked = if deadline_ms == 0 {
+            Duration::from_secs(DEFAULT_PEER_DRAIN_SECS)
+        } else {
+            Duration::from_millis(u64::from(deadline_ms))
+        };
+        *self.peer_drain_deadline.lock() = Some(now + asked + PEER_DRAIN_MARGIN);
+    }
+
+    /// Whether a drain a peer asked for has outlived its deadline
+    pub fn peer_drain_expired(&self, now: Instant) -> bool {
+        self.peer_drain_deadline
+            .lock()
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Forgets the deadline, for a drain that ended the way it should
+    pub fn clear_peer_drain(&self) {
+        *self.peer_drain_deadline.lock() = None;
     }
 
     /// Wakes the service so it runs a pass now
@@ -426,5 +471,57 @@ mod tests {
             control.restart_intent().map(|i| i.version().to_string()),
             Some("0.13.0".into())
         );
+    }
+
+    /// A drain a peer asked for lapses on the deadline that peer named, so
+    /// a coordinator that stopped between draining a node and restarting it
+    /// cannot hold that node out of service for the life of the process.
+    /// Asking how far the drain has got is what buys it more time
+    #[test]
+    fn test_a_peer_drain_lapses_on_the_deadline_the_caller_named() {
+        let control = NodeControl::new();
+        let at = Instant::now();
+        assert!(
+            !control.peer_drain_expired(at),
+            "nothing has asked this node to drain"
+        );
+
+        control.note_peer_drain(30_000, at);
+        assert!(!control.peer_drain_expired(at + Duration::from_secs(30)));
+        assert!(
+            !control.peer_drain_expired(
+                at + Duration::from_secs(30) + PEER_DRAIN_MARGIN - Duration::from_millis(1)
+            ),
+            "the margin outlives the wait the caller itself is doing"
+        );
+        assert!(control.peer_drain_expired(at + Duration::from_secs(30) + PEER_DRAIN_MARGIN));
+
+        // A later poll from a caller that is still there moves it out again
+        let polled = at + Duration::from_secs(20);
+        control.note_peer_drain(30_000, polled);
+        assert!(!control.peer_drain_expired(at + Duration::from_secs(30) + PEER_DRAIN_MARGIN));
+
+        control.clear_peer_drain();
+        assert!(
+            !control.peer_drain_expired(polled + Duration::from_secs(86_400)),
+            "a drain that ended properly leaves no deadline behind"
+        );
+
+        // A deadline left by a coordinator that went away must not reach
+        // into a drain this node later begins for itself, which is what
+        // `drain_here` clears it for
+        control.note_peer_drain(30_000, at);
+        control.clear_peer_drain();
+        assert!(
+            !control.peer_drain_expired(at + Duration::from_secs(3_600)),
+            "a peer's deadline outlived the drain it belonged to"
+        );
+
+        // A caller that names no deadline still gets a bounded one
+        control.note_peer_drain(0, at);
+        assert!(!control.peer_drain_expired(at + Duration::from_secs(DEFAULT_PEER_DRAIN_SECS)));
+        assert!(control.peer_drain_expired(
+            at + Duration::from_secs(DEFAULT_PEER_DRAIN_SECS) + PEER_DRAIN_MARGIN
+        ));
     }
 }

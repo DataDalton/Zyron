@@ -31,11 +31,12 @@ use std::time::{Duration, Instant};
 
 use zyron_auth::signature::VerifyingMaterial;
 use zyron_common::format::{
-    BinaryVersion, FormatSubstrate, HealthBaseline, ReleaseEntry, UpgradeBoard,
+    BinaryVersion, FormatSubstrate, HealthBaseline, NodeUpgradeState, ReleaseEntry, UpgradeBoard,
 };
 use zyron_common::{Admission, QueryMetrics, Result, ZyronError};
 use zyron_mesh::{
-    MeshScheduler, NodeRef, NodeStatusRequest, RestartRequest, RollbackRequest, StageReleaseRequest,
+    MeshRpcError, MeshScheduler, NodeRef, NodeStatusRequest, RestartRequest, RollbackRequest,
+    StageReleaseRequest,
 };
 use zyron_raft::RaftNode;
 
@@ -43,7 +44,7 @@ use super::control::{NodeControl, RestartIntent};
 use super::journal::{Journal, PendingRestart, RestartKind};
 use super::rolling::{NodeDriver, NodePlan, SequencePlan};
 use super::stager::{self, ArtifactSource, StagedRelease};
-use super::version_gate::{Floor, MemberVersion, VersionGate};
+use super::version_gate::{Floor, MemberVersion, UnknownVersion, VersionGate};
 
 /// Timings the driver works to
 #[derive(Debug, Clone, Copy)]
@@ -255,8 +256,14 @@ impl ClusterDriver {
     }
 
     /// Whether the staged binary for a release is already on disk and still
-    /// matches its digest
-    fn already_staged(&self, release: &ReleaseEntry) -> Option<StagedRelease> {
+    /// matches its digest.
+    ///
+    /// Reading and hashing tens of megabytes takes far longer than a
+    /// consensus heartbeat, so it runs on a blocking thread. Left on an
+    /// async worker it stalls whatever else that worker holds, which on a
+    /// node that is also a group member is the replication and election
+    /// timers, and the group elects someone else while this node hashes
+    async fn already_staged(&self, release: &ReleaseEntry) -> Option<StagedRelease> {
         let access = self.releases.as_ref()?;
         let path = access
             .staging_root
@@ -264,8 +271,14 @@ impl ClusterDriver {
         if !path.is_file() {
             return None;
         }
-        super::feed::verify_sha256(&path, &release.sha256).ok()?;
-        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let digest = release.sha256.clone();
+        let checked = path.clone();
+        let size_bytes = tokio::task::spawn_blocking(move || {
+            super::feed::verify_sha256(&checked, &digest).ok()?;
+            Some(std::fs::metadata(&checked).map(|m| m.len()).unwrap_or(0))
+        })
+        .await
+        .ok()??;
         Some(StagedRelease {
             version: release.version.clone(),
             path,
@@ -277,7 +290,7 @@ impl ClusterDriver {
 
     /// Stages a release on this node, or reports the one already staged
     pub async fn stage_here(&self, release: &ReleaseEntry) -> Result<StagedRelease> {
-        if let Some(staged) = self.already_staged(release) {
+        if let Some(staged) = self.already_staged(release).await {
             self.control.set_staged(Some(staged.clone()));
             return Ok(staged);
         }
@@ -298,6 +311,11 @@ impl ClusterDriver {
     /// Drains this node: stops taking new work and waits for what is in
     /// flight. On timeout the drain is abandoned so the node serves again
     pub async fn drain_here(&self) -> Result<()> {
+        // A deadline a peer left behind belongs to a drain this node is no
+        // longer in. Leaving it set would have the watcher end this drain,
+        // which is this node's own, and put the node back in service in
+        // the moments before it restarts
+        self.control.clear_peer_drain();
         self.admission.begin_drain();
         let deadline =
             std::time::Instant::now() + Duration::from_secs(self.settings.drain_timeout_secs);
@@ -323,13 +341,13 @@ impl ClusterDriver {
 
     /// Activates the staged binary, journals the restart, and arms it.
     /// Returns the journal record it wrote
-    pub fn arm_upgrade_restart(
+    pub async fn arm_upgrade_restart(
         &self,
         staged: &StagedRelease,
         context: &SequenceContext,
         coordinated: bool,
     ) -> Result<PendingRestart> {
-        let previous = stager::activate(staged, &self.live_path)?;
+        let previous = stager::activate(staged, &self.live_path).await?;
         let record = PendingRestart {
             kind: RestartKind::Upgrade,
             upgrade_id: context.upgrade_id,
@@ -466,10 +484,10 @@ impl ClusterDriver {
                 return MemberVersion {
                     name: name.clone(),
                     version: running.ok_or_else(|| {
-                        format!(
+                        UnknownVersion::NotAnswered(format!(
                             "this binary reports `{}`, which is not major.minor.patch",
                             env!("CARGO_PKG_VERSION")
-                        )
+                        ))
                     }),
                 };
             }
@@ -478,7 +496,7 @@ impl ClusterDriver {
                 Err(e) => {
                     return MemberVersion {
                         name: name.clone(),
-                        version: Err(e.to_string()),
+                        version: Err(UnknownVersion::NotAnswered(e.to_string())),
                     };
                 }
             };
@@ -489,22 +507,75 @@ impl ClusterDriver {
             let rpc = scheduler.rpc();
             let version = match tokio::time::timeout(timeout, rpc.node_status(request)).await {
                 Ok(Ok(status)) => BinaryVersion::parse(&status.version).ok_or_else(|| {
-                    format!(
+                    UnknownVersion::NotAnswered(format!(
                         "it reports `{}`, which is not major.minor.patch",
                         status.version
-                    )
+                    ))
                 }),
-                Ok(Err(e)) => Err(format!("it did not answer a status probe, {e}")),
-                Err(_) => Err(format!(
+                // A peer that answers it does not know this path is not a peer
+                // with a problem, it is a peer from before the path existed.
+                // Reporting that as a failed probe sends an operator looking
+                // for a network fault in the middle of an upgrade.
+                //
+                // The path is what it has to name. A misrouted call answers
+                // 404 as well, naming the node rather than the path, and that
+                // is a routing fault rather than an old release
+                Ok(Err(MeshRpcError::Unknown { what }))
+                    if super::version_gate::predates_probe(&what) =>
+                {
+                    Err(UnknownVersion::PredatesProbe)
+                }
+                Ok(Err(e)) => Err(UnknownVersion::NotAnswered(format!(
+                    "it did not answer a status probe, {e}"
+                ))),
+                Err(_) => Err(UnknownVersion::NotAnswered(format!(
                     "it did not answer a status probe inside {}s",
                     timeout.as_secs()
-                )),
+                ))),
             };
             MemberVersion {
                 name: name.clone(),
                 version,
             }
         });
+        futures::future::join_all(probes).await
+    }
+
+    /// What every other member says about its own place in an upgrade.
+    ///
+    /// Each member's journal row comes from that member, because a node's
+    /// phase is its own state and nothing else can speak for it. This node is
+    /// left out, since its row is already on its board.
+    ///
+    /// A member that does not answer, has no mesh address, or runs a release
+    /// that does not report a row comes back as `None` against its name. That
+    /// is not the same as having no upgrade state, so the caller keeps
+    /// whatever it already held for that member rather than clearing it.
+    ///
+    /// The probes run together and each carries the configured timeout, so
+    /// one unreachable member costs one timeout rather than delaying the rest
+    pub async fn peer_upgrade_states(
+        &self,
+        members: &[String],
+    ) -> Vec<(String, Option<NodeUpgradeState>)> {
+        let timeout = Duration::from_secs(self.settings.probe_timeout_secs);
+        let probes = members
+            .iter()
+            .filter(|name| !self.is_self(name))
+            .map(|name| async move {
+                let Ok((scheduler, node)) = self.peer(name) else {
+                    return (name.clone(), None);
+                };
+                let request = NodeStatusRequest {
+                    target: node,
+                    sequence: scheduler.next_call_sequence(),
+                };
+                let rpc = scheduler.rpc();
+                match tokio::time::timeout(timeout, rpc.node_status(request)).await {
+                    Ok(Ok(status)) => (name.clone(), status.upgrade),
+                    Ok(Err(_)) | Err(_) => (name.clone(), None),
+                }
+            });
         futures::future::join_all(probes).await
     }
 
@@ -561,6 +632,16 @@ fn unreachable() -> HealthBaseline {
 
 #[async_trait::async_trait]
 impl NodeDriver for ClusterDriver {
+    /// A node with no group always decides for itself. In a group the
+    /// leader decides, and the moment it stops being the leader another
+    /// node is deciding instead
+    fn still_coordinates(&self) -> bool {
+        match self.raft.as_ref() {
+            Some(raft) => raft.is_leader(),
+            None => true,
+        }
+    }
+
     async fn stage(&self, node_id: &str, release: &ReleaseEntry) -> Result<()> {
         if self.is_self(node_id) {
             self.stage_here(release).await?;
@@ -696,7 +777,7 @@ impl NodeDriver for ClusterDriver {
                         .to_string(),
                 )
             })?;
-            self.arm_upgrade_restart(&staged, &context, false)?;
+            self.arm_upgrade_restart(&staged, &context, false).await?;
             tracing::info!(
                 to_version,
                 "this node is restarting on the new binary, the next process judges the outcome"

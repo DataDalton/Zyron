@@ -1505,6 +1505,7 @@ mod tests {
             tags: Vec::new(),
             owner_role_id: 0,
             created_at: 0,
+            credential_provider: None,
         }
     }
 

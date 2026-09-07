@@ -11,9 +11,15 @@
 //!
 //! The leader of the consensus group, or the only node when there is no
 //! group. Every other node stages releases and restarts when asked, and
-//! serves its status. After the leader hands leadership off for its own
-//! restart, the new leader finds itself already on the new binary and its
-//! passes find nothing newer, so no two nodes ever drive the same sequence
+//! serves its status.
+//!
+//! Leadership can move part way. Restarting a node is what elects a new
+//! leader, and the node that takes over is not always one this sequence has
+//! already upgraded. So a sequence stops the moment the node running it
+//! stops leading, rather than acting on nodes another coordinator now
+//! decides for, and the node that leads next runs its own pass over what is
+//! left. Two coordinators driving one cluster drain a node neither of them
+//! restarts and roll back a node the other is restarting
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -78,6 +84,10 @@ pub struct ServiceParts {
     /// The LSN of the last checkpoint
     pub checkpoint_lsn: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub shutdown: Arc<AtomicBool>,
+    /// Raised once every member of the group runs a binary that reads the
+    /// actor role off a replicated schema change. None on a node in no group,
+    /// where nothing is replicated and there is nothing to hold back
+    pub group_carries_actor_role: Option<Arc<AtomicBool>>,
 }
 
 /// What the post-upgrade migrations did on this node
@@ -113,7 +123,13 @@ pub struct UpgradeService {
     checkpoint: Option<Arc<dyn Fn() + Send + Sync>>,
     checkpoint_lsn: Arc<dyn Fn() -> u64 + Send + Sync>,
     shutdown: Arc<AtomicBool>,
+    /// Raised once every member reads the actor role off a schema change, so
+    /// the replication path knows it may carry one
+    group_carries_actor_role: Option<Arc<AtomicBool>>,
     last_poll: parking_lot::Mutex<Option<Instant>>,
+    /// When the board last took the other members' rows, so the probe runs on
+    /// its own interval rather than on every pass of the one-second loop
+    last_board_reconcile: parking_lot::Mutex<Option<Instant>>,
     /// The last reason a cluster setting could not reach the log, so the
     /// retry each second does not repeat it
     setting_warning: parking_lot::Mutex<Option<String>>,
@@ -279,6 +295,7 @@ impl UpgradeService {
         };
 
         Ok(Arc::new(Self {
+            last_board_reconcile: parking_lot::Mutex::new(None),
             config: parts.config,
             data_dir,
             wal_dir,
@@ -297,6 +314,7 @@ impl UpgradeService {
             checkpoint: parts.checkpoint,
             checkpoint_lsn: parts.checkpoint_lsn,
             shutdown: parts.shutdown,
+            group_carries_actor_role: parts.group_carries_actor_role,
             last_poll: parking_lot::Mutex::new(None),
             setting_warning: parking_lot::Mutex::new(None),
         }))
@@ -392,6 +410,46 @@ impl UpgradeService {
             .await
     }
 
+    /// Reads whether every member of the group runs a binary that takes the
+    /// actor role off a replicated schema change, and lets the replication
+    /// path know.
+    ///
+    /// Only the leader proposes a schema change, so only the leader has to
+    /// know. The flag is lowered again the moment this node stops leading or
+    /// a member's version cannot be read, because a member that joined on an
+    /// older release must not be sent an operation it refuses. The reading is
+    /// the one the version gate already caches, so this costs a map lookup on
+    /// most passes rather than a round of mesh calls
+    async fn refresh_actor_role_carriage(&self) {
+        let Some(flag) = self.group_carries_actor_role.as_ref() else {
+            return;
+        };
+        let Some(raft) = self.raft.as_ref() else {
+            return;
+        };
+        if !raft.is_leader() {
+            flag.store(false, Ordering::Relaxed);
+            return;
+        }
+        let members = match group_member_names(
+            &raft.cluster_config(),
+            &self.node_name,
+            &self.cluster_members,
+        ) {
+            Ok(members) => members,
+            Err(_) => {
+                flag.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
+        let carried = self
+            .driver
+            .cluster_allows(crate::replication::ACTOR_ROLE_INTRODUCED_IN, &members)
+            .await
+            .is_ok();
+        flag.store(carried, Ordering::Relaxed);
+    }
+
     /// Carries every waiting cluster setting to the log, keeping the ones
     /// that could not go yet for the next pass
     async fn carry_cluster_settings(&self) {
@@ -457,6 +515,7 @@ impl UpgradeService {
     /// Runs until shutdown or until a restart is armed
     pub async fn run(self: Arc<Self>) {
         let mut was_paused = self.board.settings().paused;
+        let mut was_coordinator = false;
         loop {
             if self.shutdown.load(Ordering::Acquire) || self.control.restart_intent().is_some() {
                 return;
@@ -468,6 +527,17 @@ impl UpgradeService {
                 *self.last_poll.lock() = None;
             }
             was_paused = paused;
+            // Taking the group means picking up whatever the node that led
+            // before left unfinished, and the interval between polls is
+            // hours, so a node that has just become the coordinator looks
+            // at once rather than waiting out an interval it has already
+            // spent as a follower
+            let coordinates = self.is_coordinator();
+            if coordinates && !was_coordinator {
+                *self.last_poll.lock() = None;
+            }
+            was_coordinator = coordinates;
+            self.resume_after_abandoned_drain();
             if let Some(request) = self.control.take_coordinated() {
                 self.perform_coordinated(request).await;
                 continue;
@@ -476,6 +546,8 @@ impl UpgradeService {
                 self.stage_requested(&version).await;
             }
             self.carry_cluster_settings().await;
+            self.refresh_actor_role_carriage().await;
+            self.reconcile_board().await;
             if self
                 .board
                 .rewrites()
@@ -502,6 +574,83 @@ impl UpgradeService {
             }
             self.control.wait_wake(Duration::from_secs(1)).await;
         }
+    }
+
+    /// Fills in the rest of the group's rows on this node's board.
+    ///
+    /// Every node writes its own row and nothing wrote anyone else's, so a
+    /// follower's board held one row and `SHOW UPGRADE STATE` reported a
+    /// single node in a group of five. Each member's row is asked for rather
+    /// than inferred, because a node's phase is its own journal state and no
+    /// other node can speak for it.
+    ///
+    /// Runs on every member, not only the coordinator: a follower is exactly
+    /// where the board was incomplete. A member that does not answer keeps
+    /// whatever row is already there, which is what stops a restarting node
+    /// from erasing the coordinator's record of why it is down
+    async fn reconcile_board(&self) {
+        let interval =
+            Duration::from_secs(crate::background::upgrade_board_reconcile::DEFAULT_INTERVAL_SECS);
+        if let Some(at) = *self.last_board_reconcile.lock()
+            && at.elapsed() < interval
+        {
+            return;
+        }
+        let Some(raft) = self.raft.as_ref() else {
+            // A node in no group is the whole group, and its own row is
+            // already on the board
+            return;
+        };
+        let Ok(members) = group_member_names(
+            &raft.cluster_config(),
+            &self.node_name,
+            &self.cluster_members,
+        ) else {
+            return;
+        };
+        *self.last_board_reconcile.lock() = Some(Instant::now());
+
+        let reported = self.driver.peer_upgrade_states(&members).await;
+        if reported.is_empty() {
+            return;
+        }
+        let held: Vec<String> = self
+            .board
+            .node_states()
+            .into_iter()
+            .map(|state| state.node_id)
+            .collect();
+        let decided =
+            crate::background::upgrade_board_reconcile::plan(&reported, &held, now_secs());
+        if !decided.changed() {
+            return;
+        }
+        for row in decided.write {
+            self.board.set_node_state(row);
+        }
+        self.persist_board();
+    }
+
+    /// Serves again after a drain whose caller never came back.
+    ///
+    /// A node drains on a peer's word and leaves the drain on the same
+    /// peer's word, so a coordinator that stopped between the two would
+    /// hold this node out of service for the life of the process. The
+    /// deadline the caller named bounds that, and a restart already armed
+    /// is left alone because the drain is about to end with the process
+    fn resume_after_abandoned_drain(&self) {
+        if !self.admission.is_draining() || self.control.restart_intent().is_some() {
+            return;
+        }
+        if !self.control.peer_drain_expired(Instant::now()) {
+            return;
+        }
+        self.control.clear_peer_drain();
+        self.admission.end_drain();
+        tracing::warn!(
+            "the node that asked this one to drain stopped before it was restarted, so it is \
+             serving again"
+        );
     }
 
     fn poll_due(&self) -> bool {
@@ -737,22 +886,33 @@ impl UpgradeService {
     /// each proven to run the same version as this node
     async fn plan(&self, running: &str) -> Result<Vec<NodePlan>> {
         let leader = self.raft.as_ref().and_then(|raft| raft.leader_id());
-        let mut nodes = Vec::with_capacity(self.cluster_members.len());
-        for name in &self.cluster_members {
-            let is_leader = if name == &self.node_name {
+        // Every member is asked at the same time. One after another costs a
+        // round trip per member, so a group whose members sit in different
+        // regions waited once per node to learn what the whole group runs
+        let answers = self.driver.member_versions(&self.cluster_members).await;
+        let expected = BinaryVersion::parse(running);
+        let mut nodes = Vec::with_capacity(answers.len());
+        for member in answers {
+            let is_leader = if member.name == self.node_name {
                 self.is_coordinator()
             } else {
-                let version = self.driver.peer_version(name).await?;
-                if version != running {
+                let version = member.version.map_err(|reason| {
+                    ZyronError::UpgradeRefused(format!(
+                        "cluster member {} could not be asked what it runs, {reason}",
+                        member.name
+                    ))
+                })?;
+                if expected != Some(version) {
                     return Err(ZyronError::UpgradeRefused(format!(
-                        "cluster member {name} runs {version} while this node runs {running}. \
-                         Every member starts a sequence from the same version"
+                        "cluster member {} runs {version} while this node runs {running}. \
+                         Every member starts a sequence from the same version",
+                        member.name
                     )));
                 }
-                Some(zyron_raft::node_id_for_name(name)) == leader
+                Some(zyron_raft::node_id_for_name(&member.name)) == leader
             };
             nodes.push(NodePlan {
-                node_id: name.clone(),
+                node_id: member.name,
                 is_leader,
             });
         }
@@ -877,7 +1037,11 @@ impl UpgradeService {
                     UpgradePhase::Rolling,
                     "restarting on the new binary",
                 );
-                if let Err(e) = self.driver.arm_upgrade_restart(&staged, &context, true) {
+                if let Err(e) = self
+                    .driver
+                    .arm_upgrade_restart(&staged, &context, true)
+                    .await
+                {
                     self.admission.end_drain();
                     tracing::error!(error = %e, "the new binary could not be activated");
                     self.publish_self(&version, UpgradePhase::Failed, &e.to_string());

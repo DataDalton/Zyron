@@ -259,14 +259,29 @@ pub fn rolled_back_path(live_path: &Path) -> PathBuf {
 
 /// Puts a staged binary in place, keeping the previous one beside it so a
 /// rollback is a rename rather than a download. A binary an earlier
-/// rollback left beside the live one is removed here, once nothing runs it
-pub fn activate(staged: &StagedRelease, live_path: &Path) -> Result<PathBuf> {
+/// rollback left beside the live one is removed here, once nothing runs it.
+///
+/// The copy moves tens of megabytes, which is longer than a consensus
+/// heartbeat, so it runs on a blocking thread. On an async worker it stalls
+/// the timers of every group this node belongs to and the group elects
+/// someone else while the node copies
+pub async fn activate(staged: &StagedRelease, live_path: &Path) -> Result<PathBuf> {
     let previous = live_path.with_extension("previous");
-    let _ = std::fs::remove_file(rolled_back_path(live_path));
-    if live_path.exists() {
-        std::fs::rename(live_path, &previous).map_err(ZyronError::Io)?;
-    }
-    std::fs::copy(&staged.path, live_path).map_err(ZyronError::Io)?;
+    let source = staged.path.clone();
+    let live = live_path.to_path_buf();
+    let moved_aside = previous.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let _ = std::fs::remove_file(rolled_back_path(&live));
+        if live.exists() {
+            std::fs::rename(&live, &moved_aside).map_err(ZyronError::Io)?;
+        }
+        std::fs::copy(&source, &live).map_err(ZyronError::Io)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        ZyronError::Internal(format!("activating the staged binary did not finish, {e}"))
+    })??;
     Ok(previous)
 }
 
@@ -360,7 +375,7 @@ mod tests {
 
         let live = dir.path().join("zyron-server");
         std::fs::write(&live, b"the old binary").expect("writes");
-        let previous = activate(&staged, &live).expect("activates");
+        let previous = activate(&staged, &live).await.expect("activates");
         assert_eq!(std::fs::read(&live).expect("reads"), bytes);
         assert_eq!(
             std::fs::read(&previous).expect("reads"),
@@ -378,7 +393,7 @@ mod tests {
             bytes
         );
 
-        activate(&staged, &live).expect("activates again");
+        activate(&staged, &live).await.expect("activates again");
         assert!(!rolled_back_path(&live).exists());
         assert_eq!(std::fs::read(&live).expect("reads"), bytes);
     }

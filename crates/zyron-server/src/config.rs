@@ -89,6 +89,23 @@ pub struct ZyronConfig {
     /// is seeded from here at boot and `ALTER SYSTEM SET` writes back here,
     /// so the settings an operator sees are the ones the next boot reads
     pub upgrade: UpgradeSection,
+    /// Which signature scheme signs each artifact kind. The scheme registry
+    /// is seeded from here at boot and `SET SIGNATURE SCHEME` writes back
+    /// here through the replicated log, so a scheme an operator chose is
+    /// still in force after a restart and on every member of the group
+    pub crypto: CryptoSection,
+}
+
+/// [crypto] section of the config file.
+///
+/// One entry per artifact kind, keyed by the kind's catalog name lowercased,
+/// holding the binding in the form the scheme registry reads. The kinds are
+/// not fields because the set of them belongs to the registry, so a kind
+/// added there needs no change here
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CryptoSection {
+    #[serde(flatten)]
+    pub artifact_schemes: std::collections::BTreeMap<String, String>,
 }
 
 /// [upgrade] section of the config file.
@@ -403,6 +420,7 @@ impl Default for ZyronConfig {
             cluster: ClusterSection::default(),
             media: MediaSection::default(),
             upgrade: UpgradeSection::default(),
+            crypto: CryptoSection::default(),
         }
     }
 }
@@ -984,6 +1002,20 @@ impl ZyronConfig {
                 }
                 _ => return unknown_key(section, key),
             },
+            // One entry per artifact kind, and the kinds belong to the
+            // signature registry rather than to this file, so the key is
+            // checked against the registry instead of against a list here
+            // that would have to be kept in step with it
+            "crypto" => {
+                if !crate::crypto_settings::is_crypto_setting(&format!("{section}.{key}")) {
+                    return Err(ZyronError::Internal(format!(
+                        "`{key}` is not an artifact kind, so `{section}.{key}` binds nothing"
+                    )));
+                }
+                self.crypto
+                    .artifact_schemes
+                    .insert(key.to_ascii_lowercase(), value.to_string());
+            }
             _ => {
                 return Err(ZyronError::Internal(format!(
                     "unknown config section '{}'",
@@ -1495,6 +1527,12 @@ impl ZyronConfig {
             "server_version" => Some(env!("CARGO_PKG_VERSION").to_string()),
             "port" => Some(self.server.port.to_string()),
             "data_dir" | "data_directory" => Some(self.storage.data_dir.display().to_string()),
+            // A scheme binding answers from the config rather than from the
+            // registry, so what this reports is what the next boot loads
+            other if crate::crypto_settings::is_crypto_setting(other) => other
+                .split_once('.')
+                .and_then(|(_, field)| self.crypto.artifact_schemes.get(field))
+                .cloned(),
             _ => None,
         }
     }

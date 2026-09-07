@@ -7867,10 +7867,15 @@ impl<'a> Parser<'a> {
                 AlterExternalSinkAction::SetOptions(self.parse_kv_options()?)
             } else if self.consume_keyword(Keyword::Credentials)? {
                 AlterExternalSinkAction::SetCredentials(self.parse_kv_options()?)
+            } else if self.consume_keyword(Keyword::CredentialProvider)? {
+                AlterExternalSinkAction::SetCredentialProvider(
+                    self.parse_credential_provider_clause()?,
+                )
             } else {
-                return Err(
-                    self.error("Expected OPTIONS or CREDENTIALS after SET in ALTER EXTERNAL SINK")
-                );
+                return Err(self.error(
+                    "Expected OPTIONS, CREDENTIALS, or CREDENTIAL_PROVIDER after SET in ALTER \
+                     EXTERNAL SINK",
+                ));
             }
         } else {
             return Err(self.error("Expected SET or RENAME after ALTER EXTERNAL SINK <name>"));

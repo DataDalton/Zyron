@@ -30,6 +30,7 @@ pub mod masking;
 pub mod mtls_pinning;
 pub mod oauth2_client;
 pub mod privilege;
+pub mod provider_factory;
 pub mod rcu;
 pub mod rls;
 pub mod role;

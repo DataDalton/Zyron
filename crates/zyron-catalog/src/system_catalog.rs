@@ -483,6 +483,18 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
         kind: SystemObjectKind::View,
         doc: "External credential cache hits, misses, and refreshes per provider",
     },
+    SystemObject {
+        schema: "stat",
+        object: "external_sources",
+        kind: SystemObjectKind::View,
+        doc: "Every external source with its backend, ingest cadence, whether it is paused, and where its credentials come from",
+    },
+    SystemObject {
+        schema: "stat",
+        object: "external_sinks",
+        kind: SystemObjectKind::View,
+        doc: "Every external sink with its backend, format, and where its credentials come from",
+    },
     // -----------------------------------------------------------------------
     // security
     // -----------------------------------------------------------------------
@@ -491,6 +503,12 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
         object: "users",
         kind: SystemObjectKind::View,
         doc: "Every account, with whether it may log in, whether it is a               superuser, and when its password expires",
+    },
+    SystemObject {
+        schema: "security",
+        object: "principal_keys",
+        kind: SystemObjectKind::View,
+        doc: "Service principal signing keys held by this node, with their scheme, fingerprint, and how long a rotated key is still accepted",
     },
     // -----------------------------------------------------------------------
     // time_travel

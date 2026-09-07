@@ -50,6 +50,14 @@ use zyron_bench_harness::*;
 // Performance targets (minimum thresholds)
 const HANDSHAKE_TARGET_US: f64 = 50.0;
 const SIMPLE_QUERY_TARGET_US: f64 = 20.0;
+/// What a trivial statement must round trip in, over loopback, through the
+/// whole path from the socket to the reply.
+///
+/// A requirement rather than a reading of what this machine does: a statement
+/// doing no work has to stay inside the budget an interactive client expects,
+/// and half a millisecond is that budget. Catching a slide from one release to
+/// the next is the history comparison's job, not this number's
+const STATEMENT_EXECUTION_TARGET_US: f64 = 500.0;
 const PARSE_MESSAGE_TARGET_US: f64 = 8.0;
 const BIND_MESSAGE_TARGET_US: f64 = 4.0;
 const EXECUTE_MESSAGE_TARGET_US: f64 = 20.0;
@@ -1914,6 +1922,11 @@ fn test_wire_connection_handshake_latency() {
 
             let start = Instant::now();
             let mut success_count = 0;
+            // Split so the figure can be attributed. The socket has to exist
+            // before a byte of protocol is exchanged, and on loopback that
+            // connect is a kernel round trip this server does not control
+            let mut connect_total = std::time::Duration::ZERO;
+            let mut exchange_total = std::time::Duration::ZERO;
 
             for _ in 0..iterations {
                 let state = Arc::clone(&server_state);
@@ -1927,8 +1940,13 @@ fn test_wire_connection_handshake_latency() {
                 });
 
                 // Client side - runs concurrently with server accept
+                let at_connect = Instant::now();
                 let mut client = TcpStream::connect(addr).await.expect("connect failed");
-                match do_handshake(&mut client, "test_user", "testdb").await {
+                connect_total += at_connect.elapsed();
+                let at_exchange = Instant::now();
+                let handshake = do_handshake(&mut client, "test_user", "testdb").await;
+                exchange_total += at_exchange.elapsed();
+                match handshake {
                     Ok(msg_types) => {
                         assert!(msg_types.contains(&b'R'), "Should receive AuthenticationOk");
                         assert!(msg_types.contains(&b'Z'), "Should receive ReadyForQuery");
@@ -1955,6 +1973,12 @@ fn test_wire_connection_handshake_latency() {
                 elapsed,
                 avg_us,
             );
+            tprintln!(
+                "    of which socket connect {:.1} us, protocol exchange {:.1} us, the rest \
+                 accept, spawn, terminate and join\n",
+                connect_total.as_secs_f64() * 1_000_000.0 / iterations as f64,
+                exchange_total.as_secs_f64() * 1_000_000.0 / iterations as f64,
+            );
             assert_eq!(success_count, iterations, "All handshakes should succeed");
         }
 
@@ -1970,6 +1994,113 @@ fn test_wire_connection_handshake_latency() {
         assert!(
             !result.regression_detected,
             "Regression detected in handshake latency"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 15a: Statement execution latency
+// ---------------------------------------------------------------------------
+
+/// One connection, many statements, measuring what a statement costs beyond
+/// the protocol.
+///
+/// Every other case in this suite stops at the codec: it encodes a Query
+/// message and decodes a reply without ever running one. So the path a
+/// statement actually takes, through `run_simple_query` and everything it
+/// calls before the planner sees it, had no measurement anywhere.
+///
+/// `SELECT 1`, deliberately. What is wanted is the fixed cost every statement
+/// pays whatever it does, and a statement that reads rows buries that cost
+/// under its own work. One connection for the whole run, so connection setup
+/// is not in the figure either.
+///
+/// This server holds no replication, which is the arrangement most
+/// deployments run and the one where per-statement work done only for a group
+/// is pure waste
+#[test]
+fn test_wire_statement_execution_latency() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Statement Execution Latency Test ===");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (server_state, _tmp) = create_test_server("testdb").await;
+        let std_listener = zyron_wire::create_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+            .expect("bind failed");
+        let listener = Arc::new(TcpListener::from_std(std_listener).expect("from_std"));
+        let addr = listener.local_addr().unwrap();
+        tprintln!("  Server listening on {}\n", addr);
+
+        let iterations = 2_000;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+        let query = build_query_bytes("SELECT 1");
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let state = Arc::clone(&server_state);
+            let lis = Arc::clone(&listener);
+            let server_handle = tokio::task::spawn_local(async move {
+                let (stream, _) = lis.accept().await.expect("accept failed");
+                let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
+                let _ = conn.run().await;
+            });
+
+            let mut client = TcpStream::connect(addr).await.expect("connect failed");
+            do_handshake(&mut client, "test_user", "testdb")
+                .await
+                .expect("handshake failed");
+
+            let start = Instant::now();
+            for _ in 0..iterations {
+                client.write_all(&query).await.expect("write query");
+                let types = read_until_ready(&mut client).await.expect("read reply");
+                // A reply that carried an error is not a statement this
+                // measured, so the run fails rather than reporting the cost
+                // of refusing something
+                assert!(
+                    !types.contains(&b'E'),
+                    "the server answered SELECT 1 with an error"
+                );
+            }
+            let elapsed = start.elapsed();
+
+            let _ = client.write_all(&build_terminate_bytes()).await;
+            let _ = client.shutdown().await;
+            let _ = server_handle.await;
+
+            let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+            results.push(avg_us);
+            tprintln!(
+                "  {} statements in {:.2?}, avg {:.1} us/statement\n",
+                iterations,
+                elapsed,
+                avg_us,
+            );
+        }
+
+        let result = validate_metric(
+            "Statement Execution",
+            "Statement latency (us)",
+            results,
+            STATEMENT_EXECUTION_TARGET_US,
+            false,
+        );
+
+        assert!(
+            result.passed,
+            "Statement latency above the round trip budget"
+        );
+        assert!(
+            !result.regression_detected,
+            "Regression detected in statement latency"
         );
     });
 }

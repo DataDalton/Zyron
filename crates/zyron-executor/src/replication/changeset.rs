@@ -61,6 +61,15 @@ const OP_TRUNCATE: u8 = 4;
 const OP_LAKE_VERSION: u8 = 5;
 const OP_SEQUENCE: u8 = 6;
 const OP_DDL: u8 = 10;
+/// A schema change carrying the role that ran it.
+///
+/// A separate tag rather than a field appended to `OP_DDL`, because the
+/// operations in a chunk are read one after another with no length ahead of
+/// each, so a trailing field would be read as the next operation's tag by a
+/// binary that did not expect it. A tag it does not know is refused by name
+/// instead, and the leader holds this one back until every member of the
+/// group runs a binary that reads it
+const OP_DDL_ACTOR: u8 = 11;
 
 /// Written where an index id would go when rows are matched by their whole
 /// image instead
@@ -329,6 +338,11 @@ pub enum ChangesetOp<'a> {
         /// `CREATE TABLE t` would mean `public.t` on one node and something
         /// else on another, and the two would never notice
         search_path: Vec<&'a str>,
+        /// The role that ran it, so an object it creates carries the same
+        /// owner on every node. None from a leader that held it back because
+        /// a member of the group does not read it yet, and from an entry
+        /// written before this build
+        actor_role_id: Option<u32>,
     },
 }
 
@@ -524,7 +538,7 @@ impl<'a> ChangesetReader<'a> {
                 sequence_id: self.u32()?,
                 last_value: self.u64()? as i64,
             }),
-            OP_DDL => {
+            OP_DDL | OP_DDL_ACTOR => {
                 let sql = self.text()?;
                 let user = self.text()?;
                 let database = self.text()?;
@@ -534,11 +548,16 @@ impl<'a> ChangesetReader<'a> {
                 for _ in 0..count {
                     search_path.push(self.text()?);
                 }
+                let actor_role_id = match tag {
+                    OP_DDL_ACTOR => Some(self.u32()?),
+                    _ => None,
+                };
                 Ok(ChangesetOp::Ddl {
                     sql,
                     user,
                     database,
                     search_path,
+                    actor_role_id,
                 })
             }
             other => Err(bad(&format!(
@@ -581,6 +600,15 @@ pub struct StatementContext {
     pub user: String,
     pub database: String,
     pub search_path: Vec<String>,
+    /// The role the statement ran under, which is the role an object it
+    /// creates is owned by. Distinct from the user, because `SET ROLE` moves
+    /// it, and carried rather than worked out again on the applying node for
+    /// the same reason.
+    ///
+    /// None on a leader that is holding it back because a member of the group
+    /// does not read it yet. The applying node then owns what it creates the
+    /// way it did before, rather than being handed a role the leader guessed
+    pub actor_role_id: Option<u32>,
 }
 
 /// One chunk on its way to the log.
@@ -846,13 +874,19 @@ impl TxnChangeset {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut buffer = self.buffer.lock();
         let buf = &mut buffer.payload;
-        buf.push(OP_DDL);
+        buf.push(match context.actor_role_id {
+            Some(_) => OP_DDL_ACTOR,
+            None => OP_DDL,
+        });
         put_bytes(buf, sql.as_bytes());
         put_bytes(buf, context.user.as_bytes());
         put_bytes(buf, context.database.as_bytes());
         put_u32(buf, context.search_path.len() as u32);
         for schema in &context.search_path {
             put_bytes(buf, schema.as_bytes());
+        }
+        if let Some(role) = context.actor_role_id {
+            put_u32(buf, role);
         }
         buffer.ops += 1;
         // Deliberately never streamed. A statement is one unit: it is handed
@@ -1268,6 +1302,101 @@ mod tests {
             }
             other => panic!("expected a lake version, got {other:?}"),
         }
+    }
+
+    /// A schema change with no actor role writes the operation the release
+    /// before this one wrote, byte for byte, so a member on that release
+    /// reads an entry from a leader on this one.
+    ///
+    /// The two forms are told apart by their tag rather than by a trailing
+    /// field, because the operations in a chunk are read one after another
+    /// and a field a reader did not expect would be taken for the next
+    /// operation's tag
+    #[test]
+    fn a_schema_change_without_an_actor_writes_the_operation_it_always_did() {
+        let context = StatementContext {
+            user: "alice".to_string(),
+            database: "zyron".to_string(),
+            search_path: vec!["app".to_string()],
+            actor_role_id: None,
+        };
+        let set = TxnChangeset::new(origin(), 1 << 20, Arc::new(NullSink));
+        set.capture_ddl("CREATE TABLE t (a INT)", &context)
+            .expect("ddl");
+        let chunk = set.seal(0).expect("chunk");
+        assert_eq!(chunk.payload[HEADER_LEN], OP_DDL);
+
+        let (_, reader) = ChangesetReader::open(&chunk.payload).expect("header");
+        let ops: Vec<_> = reader.map(|op| op.expect("op")).collect();
+        match &ops[0] {
+            ChangesetOp::Ddl {
+                sql,
+                user,
+                search_path,
+                actor_role_id,
+                ..
+            } => {
+                assert_eq!(*sql, "CREATE TABLE t (a INT)");
+                assert_eq!(*user, "alice");
+                assert_eq!(search_path, &["app"]);
+                assert_eq!(*actor_role_id, None);
+            }
+            other => panic!("expected a schema change, got {other:?}"),
+        }
+    }
+
+    /// The role the statement ran under reaches the applying node, which is
+    /// what makes an object it creates carry the same owner everywhere
+    #[test]
+    fn a_schema_change_carries_the_role_that_ran_it() {
+        let context = StatementContext {
+            user: "alice".to_string(),
+            database: "zyron".to_string(),
+            search_path: vec!["app".to_string(), "zyron_sys".to_string()],
+            actor_role_id: Some(42),
+        };
+        let set = TxnChangeset::new(origin(), 1 << 20, Arc::new(NullSink));
+        set.capture_ddl("CREATE VIEW v AS SELECT 1", &context)
+            .expect("ddl");
+        let chunk = set.seal(0).expect("chunk");
+        assert_eq!(
+            chunk.payload[HEADER_LEN], OP_DDL_ACTOR,
+            "a change carrying a role has to be told apart by its tag"
+        );
+
+        let (_, reader) = ChangesetReader::open(&chunk.payload).expect("header");
+        let ops: Vec<_> = reader.map(|op| op.expect("op")).collect();
+        match &ops[0] {
+            ChangesetOp::Ddl {
+                sql,
+                search_path,
+                actor_role_id,
+                ..
+            } => {
+                assert_eq!(*sql, "CREATE VIEW v AS SELECT 1");
+                assert_eq!(search_path, &["app", "zyron_sys"]);
+                assert_eq!(*actor_role_id, Some(42));
+            }
+            other => panic!("expected a schema change, got {other:?}"),
+        }
+    }
+
+    /// An operation tag this build does not know is refused by name rather
+    /// than read as whatever the bytes happen to be, which is what lets a
+    /// leader add one and a member on an older release stop instead of
+    /// applying something else
+    #[test]
+    fn an_unknown_operation_tag_is_refused_by_name() {
+        let mut payload = vec![0u8; HEADER_LEN];
+        payload[0] = FORMAT_VERSION;
+        payload.push(200);
+        let (_, reader) = ChangesetReader::open(&payload).expect("header");
+        let err = reader
+            .into_iter()
+            .next()
+            .expect("an operation")
+            .expect_err("refused");
+        assert!(err.to_string().contains("200"), "{err}");
     }
 
     #[test]

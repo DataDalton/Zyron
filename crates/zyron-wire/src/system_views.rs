@@ -581,6 +581,7 @@ pub async fn query_system_view(
         ("security", "users") => {
             crate::system_core_views::build(object.schema, object.object, server).await?
         }
+        ("security", "principal_keys") => build_principal_keys(),
         ("stat", object) => build_stat_view(object, server)?,
         ("streaming", object) => crate::system_streaming_views::build(object, server)?,
         ("retention", object) => crate::system_retention_views::build(object, server).await?,
@@ -615,6 +616,8 @@ fn build_stat_view(object: &str, server: &ServerState) -> Result<ViewRows, Zyron
         "zyron_sinks" => build_stat_zyron_sinks(server),
         "zyron_sources" => build_stat_zyron_sources(server),
         "credential_cache" => build_stat_credential_cache(server),
+        "external_sources" => build_stat_external_sources(server),
+        "external_sinks" => build_stat_external_sinks(server),
         "summary" => build_stat_summary(server),
         other => {
             return Err(ZyronError::Internal(format!(
@@ -747,10 +750,12 @@ fn build_stat_dead_letters(server: &ServerState) -> ViewRows {
 /// Builds zyron_sys.stat.zyron_sinks. Lists remote Zyron sink entries from the
 /// external-sink catalog whose backend is Zyron.
 fn build_stat_zyron_sinks(server: &ServerState) -> ViewRows {
+    // A sink has no ingest cadence, what it has is a format, and that is what
+    // the third column has always carried
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("uri", PG_TEXT_OID, -1),
-        make_field("mode", PG_TEXT_OID, -1),
+        make_field("format", PG_TEXT_OID, -1),
     ];
     let rows = server
         .catalog
@@ -786,6 +791,136 @@ fn build_stat_zyron_sources(server: &ServerState) -> ViewRows {
                 Some(e.name.as_bytes().to_vec()),
                 Some(e.uri.as_bytes().to_vec()),
                 Some(format!("{:?}", e.mode).into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_sys.security.principal_keys. The service principal keys this
+/// node holds.
+///
+/// This node's, not the group's. Each member draws its own key for a
+/// principal and the secret half never leaves the node that drew it, so the
+/// same principal has a different fingerprint on every member and running
+/// this on each is how an operator sees which node signed what.
+///
+/// The public half's fingerprint, never the key material and never a secret.
+/// `overlap_end` is empty for the key a principal signs with and holds the
+/// moment a rotated-out key stops being accepted, which is the reading an
+/// operator needs to know whether a rotation has finished
+fn build_principal_keys() -> ViewRows {
+    let fields = vec![
+        make_field("principal", PG_TEXT_OID, -1),
+        make_field("scheme", PG_TEXT_OID, -1),
+        make_field("state", PG_TEXT_OID, -1),
+        make_field("fingerprint", PG_TEXT_OID, -1),
+        make_field("issued_at", PG_INT8_OID, 8),
+        make_field("overlap_end", PG_INT8_OID, 8),
+    ];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rows = zyron_auth::signature::principal_keys()
+        .published(now)
+        .into_iter()
+        .map(|published| {
+            vec![
+                Some(published.key.principal.as_bytes().to_vec()),
+                Some(published.key.scheme_name.as_bytes().to_vec()),
+                Some(match published.overlap_end_secs {
+                    None => b"current".to_vec(),
+                    Some(_) => b"retiring".to_vec(),
+                }),
+                Some(published.key.fingerprint().into_bytes()),
+                Some(published.key.issued_at_secs.to_string().into_bytes()),
+                published
+                    .overlap_end_secs
+                    .map(|end| end.to_string().into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_sys.stat.external_sinks. One row per external sink with the
+/// state an operator changes through ALTER EXTERNAL SINK.
+///
+/// The credentials column names where a credential comes from, never what it
+/// is, the same as the source view
+fn build_stat_external_sinks(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("backend", PG_TEXT_OID, -1),
+        make_field("format", PG_TEXT_OID, -1),
+        make_field("uri", PG_TEXT_OID, -1),
+        make_field("credentials", PG_TEXT_OID, -1),
+        make_field("columns", PG_INT8_OID, 8),
+    ];
+    let rows = server
+        .catalog
+        .list_external_sinks()
+        .into_iter()
+        .map(|e| {
+            let credentials = match (e.credential_provider, e.credential_key_id.is_some()) {
+                (Some(kind), _) => kind.catalog_name().to_string(),
+                (None, true) => "SEALED".to_string(),
+                (None, false) => "NONE".to_string(),
+            };
+            vec![
+                Some(e.name.as_bytes().to_vec()),
+                Some(format!("{:?}", e.backend).into_bytes()),
+                Some(format!("{:?}", e.format).into_bytes()),
+                Some(e.uri.as_bytes().to_vec()),
+                Some(credentials.into_bytes()),
+                Some(e.columns.len().to_string().into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_sys.stat.external_sources. One row per external source with
+/// the state an operator changes through ALTER EXTERNAL SOURCE.
+///
+/// The credentials column names where a credential comes from, never what it
+/// is. A source with a provider reports the provider, one with a sealed list
+/// reports that it has one, and one with neither reports none
+fn build_stat_external_sources(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("backend", PG_TEXT_OID, -1),
+        make_field("format", PG_TEXT_OID, -1),
+        make_field("mode", PG_TEXT_OID, -1),
+        make_field("uri", PG_TEXT_OID, -1),
+        make_field("paused", PG_BOOL_OID, 1),
+        make_field("credentials", PG_TEXT_OID, -1),
+        make_field("columns", PG_INT8_OID, 8),
+    ];
+    let rows = server
+        .catalog
+        .list_external_sources()
+        .into_iter()
+        .map(|e| {
+            let credentials = match (e.credential_provider, e.credential_key_id.is_some()) {
+                (Some(kind), _) => kind.catalog_name().to_string(),
+                (None, true) => "SEALED".to_string(),
+                (None, false) => "NONE".to_string(),
+            };
+            vec![
+                Some(e.name.as_bytes().to_vec()),
+                Some(format!("{:?}", e.backend).into_bytes()),
+                Some(format!("{:?}", e.format).into_bytes()),
+                Some(format!("{:?}", e.mode).into_bytes()),
+                Some(e.uri.as_bytes().to_vec()),
+                Some(if e.paused {
+                    b"t".to_vec()
+                } else {
+                    b"f".to_vec()
+                }),
+                Some(credentials.into_bytes()),
+                Some(e.columns.len().to_string().into_bytes()),
             ]
         })
         .collect();

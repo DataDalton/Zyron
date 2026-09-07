@@ -831,6 +831,10 @@ pub struct BoundCreateExternalSource {
     pub mode: zyron_parser::ast::ExternalModeSpec,
     pub options: Vec<(String, String)>,
     pub credentials: Vec<(String, String)>,
+    // Dynamic credential provider named by CREDENTIAL PROVIDER. Mutually
+    // exclusive with a static CREDENTIALS list, which the binder enforces so
+    // the entry never carries two answers to where its secret comes from.
+    pub credential_provider: Option<zyron_parser::ast::CredentialProviderSpec>,
     // Explicit COLUMNS clause resolved to TypeIds. Empty when the user did
     // not supply a columns clause, in which case the dispatcher may infer
     // the schema from the first matching file.
@@ -849,6 +853,10 @@ pub struct BoundCreateExternalSink {
     pub format: zyron_parser::ast::ExternalFormatKind,
     pub options: Vec<(String, String)>,
     pub credentials: Vec<(String, String)>,
+    // Dynamic credential provider named by CREDENTIAL PROVIDER. Mutually
+    // exclusive with a static CREDENTIALS list, which the binder enforces so
+    // the entry never carries two answers to where its secret comes from.
+    pub credential_provider: Option<zyron_parser::ast::CredentialProviderSpec>,
     // Explicit COLUMNS clause resolved to TypeIds.
     pub columns: Vec<(String, zyron_common::TypeId)>,
 }
@@ -7254,6 +7262,21 @@ impl<'a> Binder<'a> {
                 "CREATE EXTERNAL SOURCE with backend FILE cannot declare CREDENTIALS".to_string(),
             ));
         }
+        // A static list and a provider are two answers to where the secret
+        // comes from, and nothing downstream could pick between them
+        if stmt.credential_provider.is_some() && !stmt.credentials.is_empty() {
+            return Err(ZyronError::PlanError(format!(
+                "CREATE EXTERNAL SOURCE '{}' declares both CREDENTIALS and CREDENTIAL PROVIDER, \
+                 declare one",
+                stmt.name
+            )));
+        }
+        if matches!(stmt.backend, ExternalBackendKind::File) && stmt.credential_provider.is_some() {
+            return Err(ZyronError::PlanError(
+                "CREATE EXTERNAL SOURCE with backend FILE cannot declare CREDENTIAL PROVIDER"
+                    .to_string(),
+            ));
+        }
         if matches!(stmt.backend, ExternalBackendKind::Zyron) {
             validate_zyron_tls_options(&stmt.options)?;
         }
@@ -7273,6 +7296,7 @@ impl<'a> Binder<'a> {
             options: stmt.options.clone(),
             columns,
             credentials: stmt.credentials.clone(),
+            credential_provider: stmt.credential_provider.clone(),
         })
     }
 
@@ -7286,6 +7310,21 @@ impl<'a> Binder<'a> {
         if matches!(stmt.backend, ExternalBackendKind::File) && !stmt.credentials.is_empty() {
             return Err(ZyronError::PlanError(
                 "CREATE EXTERNAL SINK with backend FILE cannot declare CREDENTIALS".to_string(),
+            ));
+        }
+        // A static list and a provider are two answers to where the secret
+        // comes from, and nothing downstream could pick between them
+        if stmt.credential_provider.is_some() && !stmt.credentials.is_empty() {
+            return Err(ZyronError::PlanError(format!(
+                "CREATE EXTERNAL SINK '{}' declares both CREDENTIALS and CREDENTIAL PROVIDER, \
+                 declare one",
+                stmt.name
+            )));
+        }
+        if matches!(stmt.backend, ExternalBackendKind::File) && stmt.credential_provider.is_some() {
+            return Err(ZyronError::PlanError(
+                "CREATE EXTERNAL SINK with backend FILE cannot declare CREDENTIAL PROVIDER"
+                    .to_string(),
             ));
         }
         if matches!(stmt.backend, ExternalBackendKind::Zyron) {
@@ -7306,6 +7345,7 @@ impl<'a> Binder<'a> {
             options: stmt.options.clone(),
             columns,
             credentials: stmt.credentials.clone(),
+            credential_provider: stmt.credential_provider.clone(),
         })
     }
 
@@ -9948,6 +9988,8 @@ mod tests {
             tags: vec![],
             owner_role_id: 0,
             created_at: 0,
+            paused: false,
+            credential_provider: None,
         };
         catalog.create_external_source(entry).await.unwrap()
     }
@@ -9975,6 +10017,7 @@ mod tests {
             tags: vec![],
             owner_role_id: 0,
             created_at: 0,
+            credential_provider: None,
         };
         catalog.create_external_sink(entry).await.unwrap()
     }

@@ -37,6 +37,24 @@ inventory::submit! {
     }
 }
 
+/// Version the principal key file is written at
+pub const PRINCIPAL_KEY_STORE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+inventory::submit! {
+    FormatRegistration {
+        kind: FormatKind::PrincipalKeyStorePersistence,
+        writer_current_version: PRINCIPAL_KEY_STORE_FORMAT_VERSION,
+        reader_supported_versions: VersionWindow::single(PRINCIPAL_KEY_STORE_FORMAT_VERSION),
+        migration_policy: MigrationPolicy::Lazy,
+        migration_reversible: true,
+        binary_version_gate: "0.13.0",
+        deprecation_status: DeprecationStatus::Active,
+        retirement_date: None,
+        downgrade_write_supported: false,
+        notes: "principal signing keys, rewritten in full on the next issue or rotation",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Signature schemes
 // ---------------------------------------------------------------------------

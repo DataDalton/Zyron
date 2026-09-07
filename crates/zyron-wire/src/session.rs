@@ -26,6 +26,21 @@ pub struct Session {
     pub search_path: Vec<String>,
     /// Security context for privilege checks. None if auth system is not initialized.
     pub security_context: Option<zyron_auth::SecurityContext>,
+    /// The backend process id of the connection this session belongs to.
+    ///
+    /// Carried on a notification so a listener can tell which backend sent it.
+    /// Zero on the session the applier builds to replay a statement, because
+    /// the backend that sent it is on another member and its id means nothing
+    /// here
+    pub process_id: i32,
+    /// The role a replicated schema change ran under on the node that
+    /// originated it.
+    ///
+    /// Set only on the session the applier builds to replay one, and read
+    /// only for the owner an object is created with. It carries identity and
+    /// not authority: the group agreed the statement before it ran anywhere,
+    /// so a node replaying it does not decide again whether it was allowed
+    pub replicated_actor: Option<u32>,
     /// Per-session circuit breaker registry. Holds named breakers for use with
     /// CIRCUIT_BREAKER_STATUS('name') and ALTER CIRCUIT BREAKER 'name'.
     pub circuit_breakers: std::sync::Arc<zyron_types::resilience::CircuitBreakerRegistry>,
@@ -94,6 +109,8 @@ impl Session {
             quotas: std::sync::Arc::new(zyron_types::scheduling::QuotaRegistry::new()),
             sequence_state: std::sync::Arc::new(zyron_executor::sequence::SessionSeqState::new()),
             statement_timeout_override: None,
+            process_id: 0,
+            replicated_actor: None,
         }
     }
 

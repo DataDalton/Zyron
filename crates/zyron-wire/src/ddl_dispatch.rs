@@ -113,12 +113,18 @@ pub fn try_handle_ddl_utility<'a>(
 
         // The format substrate answers from its registries rather than from
         // the catalog, so it is dispatched here
-        Statement::SetSignatureScheme(s) => {
-            Box::pin(async move { Some(crate::format_dispatch::handle_set_signature_scheme(s)) })
-        }
-        Statement::RotateSignatureScheme(s) => {
-            Box::pin(async move { Some(crate::format_dispatch::handle_rotate_signature_scheme(s)) })
-        }
+        Statement::SetSignatureScheme(s) => Box::pin(async move {
+            Some(crate::format_dispatch::handle_set_signature_scheme(
+                s,
+                server.alter_system_set.as_ref(),
+            ))
+        }),
+        Statement::RotateSignatureScheme(s) => Box::pin(async move {
+            Some(crate::format_dispatch::handle_rotate_signature_scheme(
+                s,
+                server.alter_system_set.as_ref(),
+            ))
+        }),
         Statement::RotateServicePrincipalKey(s) => Box::pin(async move {
             Some(crate::format_dispatch::handle_rotate_service_principal_key(s).await)
         }),
@@ -153,8 +159,7 @@ pub fn try_handle_ddl_utility<'a>(
         | Statement::Show(_)
         | Statement::AlterSystemSet(_)
         | Statement::Checkpoint(_)
-        | Statement::Vacuum(_)
-        | Statement::Analyze(_) => Box::pin(async move { None }),
+        | Statement::Vacuum(_) => Box::pin(async move { None }),
 
         // EXPLAIN handled by handle_explain_statement
         Statement::Explain(_) => Box::pin(async move { None }),
@@ -247,6 +252,27 @@ pub fn try_handle_ddl_utility<'a>(
         Statement::UndropTable(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_undrop_table(s, server, session).await)
         }),
+        // ANALYZE reaches every member, because each one plans against the
+        // copy it holds. The applier runs a replicated statement through this
+        // dispatcher and nowhere else, so it is answered here rather than only
+        // at the session command layer where a connection finds it
+        Statement::Analyze(a) => {
+            let table = a.table.clone();
+            Box::pin(async move {
+                match crate::connection::analyze_tables(server, table.as_deref()).await {
+                    Ok(crate::connection::AnalyzeOutcome::Analyzed) => {
+                        Some(Ok(DdlResult::Tag("ANALYZE".to_string())))
+                    }
+                    // A name the catalog does not have is refused the same way
+                    // on every member, which leaves them all in the same state
+                    Ok(crate::connection::AnalyzeOutcome::NoSuchTable(name)) => Some(Err(
+                        ProtocolError::Database(ZyronError::TableNotFound(name)),
+                    )),
+                    Err(e) => Some(Err(e)),
+                }
+            })
+        }
+
         // OPTIMIZE TABLE and REINDEX are handled by the session command layer
         // (connection.rs handle_optimize / handle_reindex) before this dispatch
         // runs, so these never reach here; route to None for consistency.
@@ -467,7 +493,24 @@ pub fn try_handle_ddl_utility<'a>(
         }
 
         // -- Pub/Sub: handled by caller (needs notification_receivers) --
-        Statement::Listen(_) | Statement::Notify(_) => Box::pin(async move { None }),
+        Statement::Listen(_) => Box::pin(async move { None }),
+
+        // NOTIFY reaches every member, because a listener on any of them is
+        // waiting on the channel. Each member delivers to its own listeners,
+        // which is what the statement means, and the applier replays a
+        // statement through this dispatcher and nowhere else
+        Statement::Notify(n) => Box::pin(async move {
+            let Some(channels) = server.notification_channels.as_ref() else {
+                return Some(Err(ProtocolError::Database(ZyronError::Internal(
+                    "notification channels not enabled".into(),
+                ))));
+            };
+            // Zero on the member replaying it, because the backend that sent
+            // it is on another node and its id names nothing here
+            let sender = session.as_ref().map(|s| s.process_id).unwrap_or(0);
+            channels.notify(&n.channel, n.payload.as_deref().unwrap_or(""), sender);
+            Some(Ok(DdlResult::Tag("NOTIFY".to_string())))
+        }),
 
         // -- COPY: handled by caller (needs wire protocol interaction) --
         Statement::Copy(_) => Box::pin(async move { None }),
@@ -2143,76 +2186,20 @@ async fn execute_write_stmt(
 /// lets a refresh replace a table's contents without ever exposing an empty
 /// or half-loaded state. Statements share the transaction's id and snapshot
 /// the same way statements inside an explicit BEGIN block do.
+///
+/// The rows go to the group, the same as any other write. This was once a
+/// second copy of the body below that built its own context and committed
+/// straight through the transaction manager, so nothing captured what it
+/// wrote and every statement that reached it had to be refused on a node in a
+/// group. Two write paths meant one of them could be forgotten, so there is
+/// one
 async fn execute_write_stmts_atomic(
     server: &Arc<ServerState>,
     db_id: zyron_catalog::DatabaseId,
     search_path: Vec<String>,
     stmts: Vec<zyron_parser::Statement>,
 ) -> Result<(), ProtocolError> {
-    use zyron_executor::context::ExecutionContext;
-
-    let mut txn = server
-        .txn_manager
-        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
-        .map_err(ProtocolError::Database)?;
-    let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id;
-
-    for stmt in stmts {
-        let plan = match zyron_planner::plan(
-            &server.catalog,
-            db_id,
-            search_path.clone(),
-            stmt,
-            Some(&server.peer_facts()),
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = server.txn_manager.abort(&mut txn);
-                return Err(ProtocolError::Database(e));
-            }
-        };
-
-        let mut ctx = ExecutionContext::new(
-            server.catalog.clone(),
-            server.wal.clone(),
-            server.buffer_pool.clone(),
-            server.disk_manager.clone(),
-            txn_id,
-            snapshot.clone(),
-        );
-        ctx.heap_files = Some(Arc::clone(&server.heap_files));
-        ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
-        ctx.foreign_reader = server.foreign_reader.clone();
-        ctx.peers = Some(Arc::clone(&server.peers));
-        ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
-        ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
-        ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
-        if let Some(m) = &server.fts_manager {
-            ctx.set_fts_manager(Arc::clone(m));
-        }
-        if let Some(m) = &server.vector_manager {
-            ctx.set_vector_manager(Arc::clone(m));
-        }
-        if let Some(m) = &server.spatial_manager {
-            ctx.set_spatial_manager(Arc::clone(m));
-        }
-        let ctx = Arc::new(ctx);
-
-        if let Err(e) = zyron_executor::execute(plan, &ctx).await {
-            let _ = server.txn_manager.abort(&mut txn);
-            return Err(ProtocolError::Database(e));
-        }
-    }
-
-    server
-        .txn_manager
-        .commit(&mut txn)
-        .await
-        .map_err(ProtocolError::Database)?;
-    Ok(())
+    execute_call_body(server, stmts, Vec::new(), db_id, search_path, true).await
 }
 
 /// Replays reshaped batches through the InsertOperator under a write
@@ -8285,12 +8272,21 @@ async fn plan_select_columns(
 /// Builds the execution context used for pipeline statements. Mirrors
 /// `execute_write_stmt` but plans against the caller's database and search path
 /// so stage tables resolve in the pipeline's own schema.
+/// A transaction and the context a pipeline stage runs against.
+///
+/// `capture` decides whether the rows it writes are collected for the group.
+/// A stage that only reads passes false and nothing is collected; one that
+/// writes passes true and the caller commits through
+/// [`commit_pipeline_txn`], which is what carries the rows to the other
+/// members
 async fn pipeline_context(
     server: &Arc<ServerState>,
+    capture: bool,
 ) -> Result<
     (
         zyron_storage::txn::Transaction,
         Arc<zyron_executor::context::ExecutionContext>,
+        Option<Arc<zyron_executor::replication::TxnChangeset>>,
     ),
     ProtocolError,
 > {
@@ -8325,7 +8321,13 @@ async fn pipeline_context(
     if let Some(m) = &server.spatial_manager {
         ctx.set_spatial_manager(Arc::clone(m));
     }
-    Ok((txn, Arc::new(ctx)))
+    let changeset = if capture {
+        server.replication.as_ref().map(|r| r.changeset(txn_id))
+    } else {
+        None
+    };
+    ctx.replication = changeset.clone();
+    Ok((txn, Arc::new(ctx), changeset))
 }
 
 /// Runs one read statement (a SELECT) in its own transaction, returning the
@@ -8364,7 +8366,7 @@ async fn run_pipeline_read(
             (name, c.type_id)
         })
         .collect();
-    let (mut txn, ctx) = pipeline_context(server).await?;
+    let (mut txn, ctx, _) = pipeline_context(server, false).await?;
     match zyron_executor::execute(plan, &ctx).await {
         Ok(batches) => {
             server
@@ -8404,23 +8406,63 @@ async fn run_pipeline_write_txn(
             .map_err(ProtocolError::Database)?,
         );
     }
-    let (mut txn, ctx) = pipeline_context(server).await?;
+    let (mut txn, ctx, changeset) = pipeline_context(server, true).await?;
+    let txn_id = txn.txn_id;
     let mut last = Vec::new();
     for plan in plans {
         match zyron_executor::execute(plan, &ctx).await {
             Ok(batches) => last = batches,
             Err(e) => {
                 let _ = server.txn_manager.abort(&mut txn);
+                withdraw_streamed(server, changeset.as_deref());
                 return Err(ProtocolError::Database(e));
             }
         }
     }
-    server
-        .txn_manager
-        .commit(&mut txn)
-        .await
-        .map_err(ProtocolError::Database)?;
+    commit_pipeline_txn(server, txn, txn_id, changeset).await?;
     Ok(last)
+}
+
+/// Commits a stage's transaction, through the group when there is one.
+///
+/// A stage writes rows like any other statement, so they reach the other
+/// members the same way. Committing straight through the transaction manager
+/// left them on the node that ran the stage and nowhere else
+async fn commit_pipeline_txn(
+    server: &Arc<ServerState>,
+    mut txn: zyron_storage::txn::Transaction,
+    txn_id: u64,
+    changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
+) -> Result<(), ProtocolError> {
+    match (server.replication.as_ref(), changeset) {
+        (Some(router), Some(changeset)) => {
+            if let Err(e) = router.capture_lake(txn_id, &changeset) {
+                let _ = server.txn_manager.abort(&mut txn);
+                withdraw_streamed(server, Some(&changeset));
+                return Err(ProtocolError::Database(e));
+            }
+            if changeset.is_dirty() {
+                router
+                    .commit(txn, changeset)
+                    .await
+                    .map_err(ProtocolError::Database)?;
+            } else {
+                server
+                    .txn_manager
+                    .commit(&mut txn)
+                    .await
+                    .map_err(ProtocolError::Database)?;
+            }
+        }
+        _ => {
+            server
+                .txn_manager
+                .commit(&mut txn)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+    }
+    Ok(())
 }
 
 /// Converts a scalar key value to a SQL literal for an IN list. Returns None
@@ -9423,7 +9465,7 @@ async fn merge_branch_into_main(
 
     let mgr = branch_manager(server)?;
 
-    let mut txn = server
+    let txn = server
         .txn_manager
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
@@ -9452,6 +9494,13 @@ async fn merge_branch_into_main(
         ctx.set_spatial_manager(Arc::clone(m));
     }
     // No branch_catalog / active_branch_id: the merge writes land on main.
+    //
+    // The rows the merge lands on main are collected for the group, the same
+    // as any other write. A merge that committed straight through the
+    // transaction manager put the branch's rows on the node that ran it and
+    // nowhere else, which is why the statement had to be refused in a group
+    let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
+    ctx.replication = changeset.clone();
     let ctx = Arc::new(ctx);
 
     let mut total_inserted = 0u64;
@@ -9545,11 +9594,7 @@ async fn merge_branch_into_main(
             .map_err(ProtocolError::Database)?;
     }
 
-    server
-        .txn_manager
-        .commit(&mut txn)
-        .await
-        .map_err(ProtocolError::Database)?;
+    commit_pipeline_txn(server, txn, txn_id, changeset).await?;
 
     // Lake side: every lake table holding a branch of this name replays
     // that branch's file set onto its main log, the same merge the
@@ -13288,18 +13333,31 @@ async fn handle_create_streaming_job(
         ))
     })?;
 
-    // Dispatch to the matching spawn path based on endpoint topology. Shared
-    // with the server-side recovery path so both entry points exercise the
-    // same code.
-    spawn_bound_streaming_job(
-        &bsj,
-        &stored_entry,
-        spec,
-        security_ctx,
-        security_manager,
-        cdc_registry,
-        server,
-    )?;
+    // The definition is in the catalog now and reaches every member, because a
+    // member that does not hold it cannot take the job over. The runner is a
+    // different thing: it writes the sink continuously, so only the node that
+    // owns the jobs starts one. On every other member the statement leaves the
+    // definition and nothing running, and the ownership pass starts it there
+    // if that member takes the group later
+    let owns = match server.raft.as_ref() {
+        Some(raft) => raft.is_leader(),
+        None => true,
+    };
+    if owns {
+        // Dispatch to the matching spawn path based on endpoint topology.
+        // Shared with the server-side recovery path so both entry points
+        // exercise the same code.
+        spawn_bound_streaming_job(
+            &bsj,
+            &stored_entry,
+            spec,
+            security_ctx,
+            security_manager,
+            cdc_registry,
+            server,
+        )
+        .await?;
+    }
 
     Ok(DdlResult::Tag("CREATE STREAMING JOB".to_string()))
 }
@@ -13316,7 +13374,7 @@ async fn handle_create_streaming_job(
 /// the creator SecurityContext before invoking this function. The runner
 /// registers itself with the manager under the StreamingJobId of stored_entry.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_bound_streaming_job(
+pub async fn spawn_bound_streaming_job(
     bsj: &zyron_planner::BoundStreamingJob,
     stored_entry: &zyron_catalog::StreamingJobEntry,
     spec: zyron_streaming::job_runner::StreamingJobSpec,
@@ -13380,7 +13438,7 @@ pub fn spawn_bound_streaming_job(
             if source_is_zyron_backend(src_variant, server) =>
         {
             let (zyron_source_client, start_lsn) =
-                build_zyron_source_client(src_variant, &src_columns, server)?;
+                build_zyron_source_client(src_variant, &src_columns, server).await?;
             let target_entry = server
                 .catalog
                 .get_table_by_id(tgt_table_id)
@@ -13451,13 +13509,9 @@ pub fn spawn_bound_streaming_job(
             if sink_is_zyron_backend(tgt_variant, server) =>
         {
             let ctx_arc = Arc::new(parking_lot::Mutex::new(security_ctx));
-            let zyron_sink_client = build_zyron_sink_client(
-                tgt_variant,
-                &tgt_columns,
-                bsj.write_mode,
-                server,
-                ctx_arc,
-            )?;
+            let zyron_sink_client =
+                build_zyron_sink_client(tgt_variant, &tgt_columns, bsj.write_mode, server, ctx_arc)
+                    .await?;
             let source = zyron_streaming::source_connector::ZyronTableSource::new(
                 src_table_id.0,
                 Arc::clone(&cdc_registry),
@@ -13483,7 +13537,7 @@ pub fn spawn_bound_streaming_job(
         // External source -> Zyron table sink
         (src_variant, BoundStreamingSink::ZyronTable { .. }) => {
             let (external_source, mode, schedule_cron) =
-                build_external_source(src_variant, &src_columns, server)?;
+                build_external_source(src_variant, &src_columns, server).await?;
             // Objects the job has acknowledged survive a restart, so the
             // recovery respawn resumes instead of ingesting them again and
             // duplicating rows on an appending target
@@ -13554,7 +13608,7 @@ pub fn spawn_bound_streaming_job(
 
         // Zyron table source -> external sink
         (BoundStreamingSource::ZyronTable { .. }, tgt_variant) => {
-            let external_sink = build_external_sink(tgt_variant, &tgt_columns, server)?;
+            let external_sink = build_external_sink(tgt_variant, &tgt_columns, server).await?;
             let source = zyron_streaming::source_connector::ZyronTableSource::new(
                 src_table_id.0,
                 Arc::clone(&cdc_registry),
@@ -13577,11 +13631,11 @@ pub fn spawn_bound_streaming_job(
         // External source -> external sink
         (src_variant, tgt_variant) => {
             let (external_source, mode, schedule_cron) =
-                build_external_source(src_variant, &src_columns, server)?;
+                build_external_source(src_variant, &src_columns, server).await?;
             let external_source = external_source
                 .with_progress(streaming_progress_path(server, stored_entry.id))
                 .map_err(ProtocolError::Database)?;
-            let external_sink = build_external_sink(tgt_variant, &tgt_columns, server)?;
+            let external_sink = build_external_sink(tgt_variant, &tgt_columns, server).await?;
             manager
                 .lock()
                 .spawn_external_to_external_job(
@@ -13608,12 +13662,22 @@ pub fn spawn_bound_streaming_job(
 
 /// Returns the effective role id from the session's security context. Zero
 /// when no context is attached, used as the audit actor identifier.
+/// The role an object created by this statement is owned by.
+///
+/// A connection answers from its own security context. A node replaying a
+/// schema change the group agreed has no security context, because it does
+/// not decide again whether the statement was allowed, so it answers from the
+/// role the originating node carried with it. Without that second source the
+/// owner was the real role on the node the statement was typed at and zero on
+/// every other member, for every replicated CREATE
 fn actor_role_id(session: &Option<Session>) -> u32 {
-    session
-        .as_ref()
-        .and_then(|s| s.security_context.as_ref())
-        .map(|ctx| ctx.current_role.0)
-        .unwrap_or(0)
+    let Some(session) = session.as_ref() else {
+        return 0;
+    };
+    if let Some(ctx) = session.security_context.as_ref() {
+        return ctx.current_role.0;
+    }
+    session.replicated_actor.unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -13753,7 +13817,7 @@ fn build_zyron_pool_from_endpoint(
 }
 
 /// Builds a ZyronSinkClient from a BoundStreamingSink whose backend is Zyron.
-fn build_zyron_sink_client(
+async fn build_zyron_sink_client(
     tgt: &zyron_planner::binder::BoundStreamingSink,
     tgt_columns: &[zyron_catalog::ColumnEntry],
     write_mode: zyron_catalog::schema::CatalogStreamingWriteMode,
@@ -13772,11 +13836,7 @@ fn build_zyron_sink_client(
                         sink_id.0
                     )))
                 })?;
-            let unsealed = unseal_entry_credentials(
-                entry.credential_key_id,
-                entry.credential_ciphertext.as_deref(),
-                server,
-            )?;
+            let unsealed = resolve_sink_credentials(&entry, server).await?;
             (
                 entry.uri.clone(),
                 entry.options.clone(),
@@ -13932,7 +13992,7 @@ fn build_zyron_sink_client(
 
 /// Builds a ZyronSourceClient from a BoundStreamingSource whose backend is
 /// Zyron. Returns the client plus the LSN the runner should resume from.
-fn build_zyron_source_client(
+async fn build_zyron_source_client(
     src: &zyron_planner::binder::BoundStreamingSource,
     _src_columns: &[zyron_catalog::ColumnEntry],
     server: &Arc<ServerState>,
@@ -13949,11 +14009,7 @@ fn build_zyron_source_client(
                         source_id.0
                     )))
                 })?;
-            let unsealed = unseal_entry_credentials(
-                entry.credential_key_id,
-                entry.credential_ciphertext.as_deref(),
-                server,
-            )?;
+            let unsealed = resolve_source_credentials(&entry, server).await?;
             (entry.uri.clone(), entry.options.clone(), unsealed)
         }
         BoundStreamingSource::ExternalInline { uri, options, .. } => (
@@ -14051,7 +14107,7 @@ fn streaming_progress_path(
 /// inline definition. Unseals credentials through the server key store when
 /// the named entry carries them. Inline variants carry no credentials, the
 /// source runs unauthenticated against whichever backend it points at.
-fn build_external_source(
+async fn build_external_source(
     src: &zyron_planner::binder::BoundStreamingSource,
     src_columns: &[zyron_catalog::ColumnEntry],
     server: &Arc<ServerState>,
@@ -14075,11 +14131,7 @@ fn build_external_source(
                         source_id.0
                     )))
                 })?;
-            let creds = unseal_entry_credentials(
-                entry.credential_key_id,
-                entry.credential_ciphertext.as_deref(),
-                server,
-            )?;
+            let creds = resolve_source_credentials(&entry, server).await?;
             let column_schema = columns_to_specs(src_columns);
             let source = zyron_streaming::external_source::ExternalTableSource::new(
                 &entry,
@@ -14117,6 +14169,8 @@ fn build_external_source(
                 tags: Vec::new(),
                 owner_role_id: 0,
                 created_at: 0,
+                paused: false,
+                credential_provider: None,
             };
             let column_schema = columns_to_specs(src_columns);
             let source = zyron_streaming::external_source::ExternalTableSource::new(
@@ -14137,7 +14191,7 @@ fn build_external_source(
 
 /// Opens an ExternalRowSink from either a named catalog entry or an inline
 /// definition.
-fn build_external_sink(
+async fn build_external_sink(
     tgt: &zyron_planner::binder::BoundStreamingSink,
     tgt_columns: &[zyron_catalog::ColumnEntry],
     server: &Arc<ServerState>,
@@ -14154,11 +14208,7 @@ fn build_external_sink(
                         sink_id.0
                     )))
                 })?;
-            let creds = unseal_entry_credentials(
-                entry.credential_key_id,
-                entry.credential_ciphertext.as_deref(),
-                server,
-            )?;
+            let creds = resolve_sink_credentials(&entry, server).await?;
             let column_schema = columns_to_specs(tgt_columns);
             zyron_streaming::external_sink::ExternalRowSink::new(&entry, creds, column_schema)
                 .map_err(ProtocolError::Database)
@@ -14185,6 +14235,7 @@ fn build_external_sink(
                 tags: Vec::new(),
                 owner_role_id: 0,
                 created_at: 0,
+                credential_provider: None,
             };
             let column_schema = columns_to_specs(tgt_columns);
             zyron_streaming::external_sink::ExternalRowSink::new(
@@ -14224,6 +14275,125 @@ fn unseal_entry_credentials(
         }
         _ => Ok(std::collections::HashMap::new()),
     }
+}
+
+/// How much of a credential's life to leave before fetching a fresh one, so a
+/// credential handed to a long read does not lapse while the read is running
+const CREDENTIAL_REFRESH_BEFORE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The cache key one source's fetched credentials live under. The provider
+/// kind is part of it so a source moved from one provider to another does not
+/// read the previous provider's cached answer
+fn source_credential_cache_key(
+    id: zyron_catalog::ExternalSourceId,
+    kind: zyron_catalog::CredentialProviderKind,
+) -> String {
+    format!("external_source:{}:{}", id.0, kind.catalog_name())
+}
+
+/// The cache key one sink's fetched credentials live under. Sources and sinks
+/// number their ids separately, so the kind of endpoint is part of the key
+fn sink_credential_cache_key(
+    id: zyron_catalog::ExternalSinkId,
+    kind: zyron_catalog::CredentialProviderKind,
+) -> String {
+    format!("external_sink:{}:{}", id.0, kind.catalog_name())
+}
+
+/// Fetches through the shared credential cache, or straight from the provider
+/// when there is no cache to fetch through.
+///
+/// Without a security manager there is no shared cache, so the provider is
+/// asked directly rather than the endpoint being refused for a component that
+/// is only there to make repeat fetches cheap
+async fn fetch_provider_credentials(
+    provider: Arc<dyn zyron_auth::CredentialProvider>,
+    cache_key: &str,
+    server: &Arc<ServerState>,
+) -> Result<std::collections::HashMap<String, String>, ProtocolError> {
+    let Some(security_manager) = server.security_manager.as_ref() else {
+        let (credentials, _ttl) = provider.fetch().await.map_err(ProtocolError::Database)?;
+        return Ok(credentials);
+    };
+    security_manager
+        .credential_cache
+        .get_or_fetch(cache_key, provider.as_ref(), CREDENTIAL_REFRESH_BEFORE)
+        .await
+        .map_err(ProtocolError::Database)
+}
+
+/// The credentials an external sink presents to its backend, resolved the
+/// same way a source's are
+pub(crate) async fn resolve_sink_credentials(
+    entry: &zyron_catalog::ExternalSinkEntry,
+    server: &Arc<ServerState>,
+) -> Result<std::collections::HashMap<String, String>, ProtocolError> {
+    let sealed = unseal_entry_credentials(
+        entry.credential_key_id,
+        entry.credential_ciphertext.as_deref(),
+        server,
+    )?;
+    let Some(kind) = entry.credential_provider else {
+        return Ok(sealed);
+    };
+    let provider =
+        zyron_auth::provider_factory::build_credential_provider(kind.catalog_name(), &sealed)
+            .map_err(ProtocolError::Database)?;
+    fetch_provider_credentials(provider, &sink_credential_cache_key(entry.id, kind), server).await
+}
+
+/// Drops whatever the credential cache holds for a sink, so the next fetch
+/// goes to the provider rather than serving an answer the altered
+/// configuration would no longer produce
+fn invalidate_sink_credentials(
+    entry: &zyron_catalog::ExternalSinkEntry,
+    server: &Arc<ServerState>,
+) {
+    let (Some(kind), Some(security_manager)) =
+        (entry.credential_provider, server.security_manager.as_ref())
+    else {
+        return;
+    };
+    security_manager
+        .credential_cache
+        .invalidate(&sink_credential_cache_key(entry.id, kind));
+}
+
+/// The credentials an external source presents to its backend.
+///
+/// A source with no provider carries its credentials sealed and they are used
+/// as they are. A source with a provider carries that provider's own
+/// configuration sealed instead, and the credential is fetched at this point
+/// rather than stored, so a secret rotated at the provider is picked up
+/// without the source being altered.
+///
+/// This runs once per open of a source, and an open builds the backend client
+/// that holds the credential for as long as the source lives. A COPY and a
+/// schema inference open one and drop it, a streaming job keeps its own for
+/// the life of the job, so a rotation reaches a running job when it next
+/// restarts rather than mid-run. The cache is what keeps the repeated opens
+/// off a remote round trip to Vault or STS
+pub(crate) async fn resolve_source_credentials(
+    entry: &zyron_catalog::ExternalSourceEntry,
+    server: &Arc<ServerState>,
+) -> Result<std::collections::HashMap<String, String>, ProtocolError> {
+    let sealed = unseal_entry_credentials(
+        entry.credential_key_id,
+        entry.credential_ciphertext.as_deref(),
+        server,
+    )?;
+    let Some(kind) = entry.credential_provider else {
+        return Ok(sealed);
+    };
+    let provider =
+        zyron_auth::provider_factory::build_credential_provider(kind.catalog_name(), &sealed)
+            .map_err(ProtocolError::Database)?;
+    fetch_provider_credentials(
+        provider,
+        &source_credential_cache_key(entry.id, kind),
+        server,
+    )
+    .await
 }
 
 async fn handle_drop_streaming_job(
@@ -14411,6 +14581,48 @@ fn parser_format_to_catalog(
 /// Translates a parser ExternalModeSpec into a catalog ExternalMode plus the
 /// trigger string. Scheduled mode returns cron or every as a single string
 /// with a prefix, the runner parses it back out of the entry.
+/// The catalog kind a parsed CREDENTIAL PROVIDER names
+fn parser_provider_to_catalog(
+    t: zyron_parser::ast::CredentialProviderType,
+) -> zyron_catalog::CredentialProviderKind {
+    use zyron_catalog::CredentialProviderKind as K;
+    use zyron_parser::ast::CredentialProviderType as T;
+    match t {
+        T::Vault => K::Vault,
+        T::AwsSecretsManager => K::AwsSecretsManager,
+        T::GcpSecretManager => K::GcpSecretManager,
+        T::AzureKeyVault => K::AzureKeyVault,
+        T::OAuth2ClientCredentials => K::OAuth2ClientCredentials,
+        T::AwsIamAssumeRole => K::AwsIamAssumeRole,
+        T::K8sSaToken => K::K8sSaToken,
+    }
+}
+
+/// Seals a credential provider's configuration into the slot the entry keeps
+/// its secrets in, and hands back the kind to store alongside it.
+///
+/// The configuration is checked by building the provider from it first, so a
+/// missing or misspelled option is reported where the statement runs rather
+/// than at the first ingest attempt
+fn seal_provider_config(
+    spec: &zyron_parser::ast::CredentialProviderSpec,
+    server: &Arc<ServerState>,
+) -> Result<
+    (
+        zyron_catalog::CredentialProviderKind,
+        zyron_auth::SealedCredentials,
+    ),
+    ProtocolError,
+> {
+    let kind = parser_provider_to_catalog(spec.provider_type);
+    let config: std::collections::HashMap<String, String> = spec.options.iter().cloned().collect();
+    zyron_auth::provider_factory::build_credential_provider(kind.catalog_name(), &config)
+        .map_err(ProtocolError::Database)?;
+    let sealed = zyron_auth::seal_credentials(&config, server.key_store.as_ref())
+        .map_err(ProtocolError::Database)?;
+    Ok((kind, sealed))
+}
+
 fn parser_mode_to_catalog(
     m: &zyron_parser::ast::ExternalModeSpec,
 ) -> (zyron_catalog::ExternalMode, Option<String>) {
@@ -14444,7 +14656,10 @@ async fn handle_create_external_source(
         zyron_auth::ObjectType::Schema,
         bound.schema_id.0,
     )?;
-    if !bound.credentials.is_empty() {
+    // A provider's configuration is as sensitive as a static credential list,
+    // it holds the Vault token or the OAuth client secret that reaches the
+    // secret, so both need the same privilege
+    if !bound.credentials.is_empty() || bound.credential_provider.is_some() {
         check_ddl_privilege(
             server,
             session,
@@ -14469,15 +14684,27 @@ async fn handle_create_external_source(
         ))));
     }
 
-    let creds_map: std::collections::HashMap<String, String> =
-        bound.credentials.iter().cloned().collect();
-    let sealed = if creds_map.is_empty() {
-        None
-    } else {
-        Some(
-            zyron_auth::seal_credentials(&creds_map, server.key_store.as_ref())
-                .map_err(ProtocolError::Database)?,
-        )
+    // The sealed slot holds either the credentials themselves or, when a
+    // provider is named, that provider's configuration. The binder has
+    // already refused a statement carrying both
+    let (provider_kind, sealed) = match &bound.credential_provider {
+        Some(spec) => {
+            let (kind, sealed) = seal_provider_config(spec, server)?;
+            (Some(kind), Some(sealed))
+        }
+        None => {
+            let creds_map: std::collections::HashMap<String, String> =
+                bound.credentials.iter().cloned().collect();
+            let sealed = if creds_map.is_empty() {
+                None
+            } else {
+                Some(
+                    zyron_auth::seal_credentials(&creds_map, server.key_store.as_ref())
+                        .map_err(ProtocolError::Database)?,
+                )
+            };
+            (None, sealed)
+        }
     };
 
     let (mode, schedule_cron) = parser_mode_to_catalog(&bound.mode);
@@ -14485,11 +14712,7 @@ async fn handle_create_external_source(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let owner_role_id = session
-        .as_ref()
-        .and_then(|s| s.security_context.as_ref())
-        .map(|ctx| ctx.current_role.0)
-        .unwrap_or(0);
+    let owner_role_id = actor_role_id(session);
 
     // Resolve the persisted column layout. Explicit COLUMNS (...) wins,
     // otherwise infer from the first matching file when the format carries
@@ -14516,16 +14739,22 @@ async fn handle_create_external_source(
                     schedule_cron: schedule_cron.clone(),
                     options: bound.options.clone(),
                     columns: Vec::new(),
-                    credential_key_id: None,
-                    credential_ciphertext: None,
+                    credential_key_id: sealed.as_ref().map(|s| s.key_id),
+                    credential_ciphertext: sealed.as_ref().map(|s| s.ciphertext.clone()),
                     classification: zyron_catalog::CatalogClassification::Internal,
                     tags: Vec::new(),
                     owner_role_id,
                     created_at: now,
+                    paused: false,
+                    credential_provider: provider_kind,
                 };
+                // Reading the file needs the credentials the finished source
+                // would present, which for a provider-backed source means
+                // fetching them rather than reading the sealed slot
+                let probe_credentials = resolve_source_credentials(&probe_entry, server).await?;
                 let specs = zyron_streaming::external_source::infer_schema_from_first_file(
                     &probe_entry,
-                    creds_map.clone(),
+                    probe_credentials,
                 )
                 .await
                 .map_err(ProtocolError::Database)?;
@@ -14559,6 +14788,8 @@ async fn handle_create_external_source(
         tags: Vec::new(),
         owner_role_id,
         created_at: now,
+        paused: false,
+        credential_provider: provider_kind,
     };
 
     let has_creds = entry.credential_key_id.is_some();
@@ -14592,7 +14823,10 @@ async fn handle_create_external_sink(
         zyron_auth::ObjectType::Schema,
         bound.schema_id.0,
     )?;
-    if !bound.credentials.is_empty() {
+    // A provider's configuration is as sensitive as a static credential list,
+    // it holds the token or client secret that reaches the credential, so
+    // both need the same privilege
+    if !bound.credentials.is_empty() || bound.credential_provider.is_some() {
         check_ddl_privilege(
             server,
             session,
@@ -14616,26 +14850,34 @@ async fn handle_create_external_sink(
         ))));
     }
 
-    let creds_map: std::collections::HashMap<String, String> =
-        bound.credentials.iter().cloned().collect();
-    let sealed = if creds_map.is_empty() {
-        None
-    } else {
-        Some(
-            zyron_auth::seal_credentials(&creds_map, server.key_store.as_ref())
-                .map_err(ProtocolError::Database)?,
-        )
+    // The sealed slot holds either the credentials themselves or, when a
+    // provider is named, that provider's configuration. The binder has
+    // already refused a statement carrying both
+    let (provider_kind, sealed) = match &bound.credential_provider {
+        Some(spec) => {
+            let (kind, sealed) = seal_provider_config(spec, server)?;
+            (Some(kind), Some(sealed))
+        }
+        None => {
+            let creds_map: std::collections::HashMap<String, String> =
+                bound.credentials.iter().cloned().collect();
+            let sealed = if creds_map.is_empty() {
+                None
+            } else {
+                Some(
+                    zyron_auth::seal_credentials(&creds_map, server.key_store.as_ref())
+                        .map_err(ProtocolError::Database)?,
+                )
+            };
+            (None, sealed)
+        }
     };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let owner_role_id = session
-        .as_ref()
-        .and_then(|s| s.security_context.as_ref())
-        .map(|ctx| ctx.current_role.0)
-        .unwrap_or(0);
+    let owner_role_id = actor_role_id(session);
 
     // Sinks cannot infer a schema, they produce rows whose shape is decided
     // by the streaming job binder. An explicit COLUMNS clause is carried
@@ -14655,6 +14897,7 @@ async fn handle_create_external_sink(
         tags: Vec::new(),
         owner_role_id,
         created_at: now,
+        credential_provider: provider_kind,
     };
 
     let has_creds = entry.credential_key_id.is_some();
@@ -14847,6 +15090,142 @@ async fn handle_drop_external_sink(
 // ALTER EXTERNAL SOURCE / SINK
 // ---------------------------------------------------------------------------
 
+/// Drops whatever the credential cache holds for a source, so the next fetch
+/// goes to the provider rather than serving an answer the altered
+/// configuration would no longer produce
+fn invalidate_source_credentials(
+    entry: &zyron_catalog::ExternalSourceEntry,
+    server: &Arc<ServerState>,
+) {
+    let (Some(kind), Some(security_manager)) =
+        (entry.credential_provider, server.security_manager.as_ref())
+    else {
+        return;
+    };
+    security_manager
+        .credential_cache
+        .invalidate(&source_credential_cache_key(entry.id, kind));
+}
+
+/// Re-reads the column layout from the data the source points at now.
+///
+/// Only the formats that carry their own schema can answer this. A CSV or
+/// JSON source's layout was declared, not discovered, so there is nothing to
+/// re-read and the refusal says to set the columns instead of silently
+/// leaving the old layout in place
+async fn refreshed_source_columns(
+    entry: &zyron_catalog::ExternalSourceEntry,
+    server: &Arc<ServerState>,
+) -> Result<Vec<(String, zyron_common::TypeId)>, ProtocolError> {
+    use zyron_catalog::ExternalFormat;
+    if !matches!(
+        entry.format,
+        ExternalFormat::Parquet | ExternalFormat::ArrowIpc | ExternalFormat::Avro
+    ) {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "external source '{}' is {:?}, whose layout is declared rather than carried in the \
+             data. Use SET COLUMNS to change it",
+            entry.name, entry.format
+        ))));
+    }
+    let credentials = resolve_source_credentials(entry, server).await?;
+    let specs = zyron_streaming::external_source::infer_schema_from_first_file(entry, credentials)
+        .await
+        .map_err(ProtocolError::Database)?;
+    if specs.is_empty() {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "external source '{}' matched no object to read a layout from, so the columns it has \
+             are left as they are",
+            entry.name
+        ))));
+    }
+    Ok(specs.into_iter().map(|c| (c.name, c.type_id)).collect())
+}
+
+/// The head of the change feed a publication publishes, which is the highest
+/// version any of its tables has recorded.
+///
+/// A publication over a table with no feed contributes nothing rather than
+/// pinning the answer to zero, so a subscription reset to the latest position
+/// skips what is already there instead of replaying it
+fn publication_head_lsn(
+    publication_id: zyron_catalog::PublicationId,
+    server: &Arc<ServerState>,
+) -> u64 {
+    let Some(registry) = server.cdc_registry.as_ref() else {
+        return 0;
+    };
+    server
+        .catalog
+        .get_publication_tables(publication_id)
+        .iter()
+        .filter_map(|t| registry.get_feed(t.table_id.0))
+        .filter_map(|feed| feed.latest_version())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Moves every subscription bound to this source to a new log position, and
+/// reports how many moved.
+///
+/// A log position belongs to a backend that keeps a log. An object store
+/// keeps a set of acknowledged object keys instead, which no sequence number
+/// addresses, so the statement is refused there by name rather than accepted
+/// and quietly applied to nothing
+async fn reset_source_lsn(
+    entry: &zyron_catalog::ExternalSourceEntry,
+    reset: &zyron_parser::ast::LsnResetSpec,
+    server: &Arc<ServerState>,
+) -> Result<usize, ProtocolError> {
+    use zyron_parser::ast::LsnResetSpec;
+    if !matches!(entry.backend, zyron_catalog::ExternalBackend::Zyron) {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "external source '{}' has backend {:?}, which tracks ingest as acknowledged objects \
+             rather than a log position, so it has no LSN to reset",
+            entry.name, entry.backend
+        ))));
+    }
+    let bound: Vec<_> = server
+        .catalog
+        .list_subscriptions()
+        .into_iter()
+        .filter(|s| s.source_id == Some(entry.id))
+        .collect();
+    if bound.is_empty() {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "external source '{}' has no subscription reading it, so there is no position to reset",
+            entry.name
+        ))));
+    }
+    let mut moved = 0usize;
+    for subscription in bound {
+        let new_lsn = match reset {
+            LsnResetSpec::Earliest => 0,
+            LsnResetSpec::Latest => publication_head_lsn(subscription.publication_id, server),
+            LsnResetSpec::Explicit(n) => *n,
+        };
+        if subscription.last_seen_lsn == new_lsn {
+            continue;
+        }
+        let mut updated = (*subscription).clone();
+        updated.last_seen_lsn = new_lsn;
+        // A position moved backwards is a replay, and the advance stamp is
+        // what the reaper reads to spot a subscriber that stopped confirming
+        // progress. Stamping it now stops the reset from looking like a stall
+        updated.last_advance_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        server
+            .catalog
+            .update_subscription(updated)
+            .await
+            .map_err(ProtocolError::Database)?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
 async fn handle_alter_external_source(
     bound: zyron_planner::binder::BoundAlterExternalSource,
     server: &Arc<ServerState>,
@@ -14871,7 +15250,11 @@ async fn handle_alter_external_source(
         zyron_auth::ObjectType::ExternalSource,
         entry.id.0,
     )?;
-    if matches!(bound.action, AlterExternalSourceAction::SetCredentials(_)) {
+    if matches!(
+        bound.action,
+        AlterExternalSourceAction::SetCredentials(_)
+            | AlterExternalSourceAction::SetCredentialProvider(_)
+    ) {
         check_ddl_privilege(
             server,
             session,
@@ -14906,6 +15289,12 @@ async fn handle_alter_external_source(
             updated.options = map.into_iter().collect();
         }
         AlterExternalSourceAction::SetCredentials(new_creds) => {
+            // The sealed slot holds either credentials or a provider's
+            // configuration, so setting a static list also clears the
+            // provider rather than leaving the entry naming a provider whose
+            // configuration has been overwritten
+            invalidate_source_credentials(&entry, server);
+            updated.credential_provider = None;
             let creds_map: std::collections::HashMap<String, String> =
                 new_creds.into_iter().collect();
             if creds_map.is_empty() {
@@ -14917,6 +15306,45 @@ async fn handle_alter_external_source(
                 updated.credential_key_id = Some(sealed.key_id);
                 updated.credential_ciphertext = Some(sealed.ciphertext);
             }
+        }
+        AlterExternalSourceAction::SetCredentialProvider(spec) => {
+            if matches!(entry.backend, zyron_catalog::ExternalBackend::File) {
+                return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                    "external source '{}' has backend FILE, which reads nothing that takes a \
+                     credential",
+                    bound.name
+                ))));
+            }
+            let (kind, sealed) = seal_provider_config(&spec, server)?;
+            invalidate_source_credentials(&entry, server);
+            updated.credential_provider = Some(kind);
+            updated.credential_key_id = Some(sealed.key_id);
+            updated.credential_ciphertext = Some(sealed.ciphertext);
+        }
+        AlterExternalSourceAction::RefreshSchema => {
+            updated.columns = refreshed_source_columns(&entry, server).await?;
+        }
+        // The position lives on the subscriptions reading this source, not on
+        // the source row, so this one reports and returns rather than falling
+        // through to the entry write the other actions share
+        AlterExternalSourceAction::ResetLsn(reset) => {
+            let moved = reset_source_lsn(&entry, &reset, server).await?;
+            tracing::info!(
+                target: "zyron::audit",
+                event = "ExternalSourceAltered",
+                object = %bound.name,
+                schema_id = bound.schema_id.0,
+                actor_role = actor_role_id(session),
+                action = action_kind_str,
+                subscriptions_moved = moved,
+            );
+            return Ok(DdlResult::Tag(format!("ALTER EXTERNAL SOURCE {moved}")));
+        }
+        AlterExternalSourceAction::Pause => {
+            updated.paused = true;
+        }
+        AlterExternalSourceAction::Resume => {
+            updated.paused = false;
         }
         AlterExternalSourceAction::SetMode(mode_spec) => {
             let (mode, cron) = parser_mode_to_catalog(&mode_spec);
@@ -14933,15 +15361,6 @@ async fn handle_alter_external_source(
         }
         AlterExternalSourceAction::Rename(new_name) => {
             updated.name = new_name;
-        }
-        AlterExternalSourceAction::SetCredentialProvider(_)
-        | AlterExternalSourceAction::RefreshSchema
-        | AlterExternalSourceAction::ResetLsn(_)
-        | AlterExternalSourceAction::Pause
-        | AlterExternalSourceAction::Resume => {
-            return Err(ProtocolError::Database(ZyronError::Internal(
-                "ALTER EXTERNAL SOURCE action pending later phase wiring".to_string(),
-            )));
         }
     }
 
@@ -14987,7 +15406,11 @@ async fn handle_alter_external_sink(
         zyron_auth::ObjectType::ExternalSink,
         entry.id.0,
     )?;
-    if matches!(bound.action, AlterExternalSinkAction::SetCredentials(_)) {
+    if matches!(
+        bound.action,
+        AlterExternalSinkAction::SetCredentials(_)
+            | AlterExternalSinkAction::SetCredentialProvider(_)
+    ) {
         check_ddl_privilege(
             server,
             session,
@@ -15000,6 +15423,7 @@ async fn handle_alter_external_sink(
     let action_kind_str: &'static str = match &bound.action {
         AlterExternalSinkAction::SetOptions(_) => "SetOptions",
         AlterExternalSinkAction::SetCredentials(_) => "SetCredentials",
+        AlterExternalSinkAction::SetCredentialProvider(_) => "SetCredentialProvider",
         AlterExternalSinkAction::Rename(_) => "Rename",
     };
     let mut updated = (*entry).clone();
@@ -15012,7 +15436,27 @@ async fn handle_alter_external_sink(
             }
             updated.options = map.into_iter().collect();
         }
+        AlterExternalSinkAction::SetCredentialProvider(spec) => {
+            if matches!(entry.backend, zyron_catalog::ExternalBackend::File) {
+                return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                    "external sink '{}' has backend FILE, which writes nothing that takes a \
+                     credential",
+                    bound.name
+                ))));
+            }
+            let (kind, sealed) = seal_provider_config(&spec, server)?;
+            invalidate_sink_credentials(&entry, server);
+            updated.credential_provider = Some(kind);
+            updated.credential_key_id = Some(sealed.key_id);
+            updated.credential_ciphertext = Some(sealed.ciphertext);
+        }
         AlterExternalSinkAction::SetCredentials(new_creds) => {
+            // The sealed slot holds either credentials or a provider's
+            // configuration, so setting a static list also clears the
+            // provider rather than leaving the entry naming a provider whose
+            // configuration has been overwritten
+            invalidate_sink_credentials(&entry, server);
+            updated.credential_provider = None;
             let creds_map: std::collections::HashMap<String, String> =
                 new_creds.into_iter().collect();
             if creds_map.is_empty() {
@@ -16686,4 +17130,140 @@ mod nested_shape_wiring_tests {
             "building specs registers the nested codec"
         );
     }
+}
+
+/// Fills in the column layout a CREATE EXTERNAL SOURCE left out, by reading
+/// the external store once here.
+///
+/// A source over a self describing format is written without a column list,
+/// the same as in every engine that reads Parquet. The layout then comes from
+/// a file rather than from the statement, and a group whose members each read
+/// that file for themselves can settle on different columns, or one can fail
+/// to reach the store at all. So the node the statement arrived at resolves it
+/// and the group is given the resolved form.
+///
+/// Answers None when there is nothing to resolve: the statement already names
+/// its columns, or the format carries no schema and the handler refuses it
+/// with the remedy
+/// Reads the layout REFRESH SCHEMA would settle on, so the group is given a
+/// column list rather than an instruction to go and read the external store.
+///
+/// Two members reading an object store at two moments can see two different
+/// files, and the statement is replicated as itself, so leaving each member
+/// to look for itself is how their catalogs come apart. None for any action
+/// that is already the same on every member
+pub(crate) async fn resolve_refreshed_source_columns(
+    stmt: &zyron_parser::ast::AlterExternalSourceStatement,
+    server: &Arc<ServerState>,
+    session: &Option<Session>,
+) -> Result<Option<Vec<(String, zyron_parser::ast::DataType)>>, ProtocolError> {
+    if !matches!(
+        stmt.action,
+        zyron_parser::ast::AlterExternalSourceAction::RefreshSchema
+    ) {
+        return Ok(None);
+    }
+    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let entry = server
+        .catalog
+        .get_external_source(schema_id, &stmt.name)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "external source '{}' not found",
+                stmt.name
+            )))
+        })?;
+    let columns = refreshed_source_columns(&entry, server).await?;
+
+    let mut out = Vec::with_capacity(columns.len());
+    for (name, type_id) in columns {
+        // A type the grammar cannot spell back cannot travel as a column
+        // list. Refused by name rather than stored as something the file does
+        // not hold
+        let data_type = zyron_parser::ast::DataType::from_type_id(type_id).ok_or_else(|| {
+            ProtocolError::Database(ZyronError::PlanError(format!(
+                "column '{}' of external source '{}' has type {type_id} which cannot be written \
+                 as a COLUMNS entry, name the layout explicitly with SET COLUMNS",
+                name, stmt.name
+            )))
+        })?;
+        out.push((name, data_type));
+    }
+    Ok(Some(out))
+}
+
+pub(crate) async fn resolve_external_source_columns(
+    stmt: &zyron_parser::ast::CreateExternalSourceStatement,
+) -> Result<Option<Vec<(String, zyron_parser::ast::DataType)>>, ProtocolError> {
+    use zyron_catalog::ExternalFormat;
+
+    if !stmt.columns.is_empty() {
+        return Ok(None);
+    }
+    let format = parser_format_to_catalog(stmt.format.clone());
+    if !matches!(
+        format,
+        ExternalFormat::Parquet | ExternalFormat::ArrowIpc | ExternalFormat::Avro
+    ) {
+        return Ok(None);
+    }
+
+    let (mode, schedule_cron) = parser_mode_to_catalog(&stmt.mode);
+    let probe = zyron_catalog::ExternalSourceEntry {
+        id: zyron_catalog::ExternalSourceId(0),
+        schema_id: zyron_catalog::SchemaId(0),
+        name: stmt.name.clone(),
+        backend: parser_backend_to_catalog(stmt.backend.clone()),
+        uri: stmt.uri.clone(),
+        format,
+        mode,
+        schedule_cron,
+        options: stmt.options.clone(),
+        columns: Vec::new(),
+        credential_key_id: None,
+        credential_ciphertext: None,
+        classification: zyron_catalog::CatalogClassification::Internal,
+        tags: Vec::new(),
+        owner_role_id: 0,
+        created_at: 0,
+        paused: false,
+        credential_provider: None,
+    };
+    // The entry does not exist yet, so a provider is asked directly rather
+    // than through the cache, which is keyed on a source id
+    let credentials = match &stmt.credential_provider {
+        Some(spec) => {
+            let kind = parser_provider_to_catalog(spec.provider_type);
+            let config: std::collections::HashMap<String, String> =
+                spec.options.iter().cloned().collect();
+            let provider = zyron_auth::provider_factory::build_credential_provider(
+                kind.catalog_name(),
+                &config,
+            )
+            .map_err(ProtocolError::Database)?;
+            let (credentials, _ttl) = provider.fetch().await.map_err(ProtocolError::Database)?;
+            credentials
+        }
+        None => stmt.credentials.iter().cloned().collect(),
+    };
+    let specs = zyron_streaming::external_source::infer_schema_from_first_file(&probe, credentials)
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    let mut columns = Vec::with_capacity(specs.len());
+    for spec in specs {
+        // A type the grammar cannot spell back cannot travel as a column list.
+        // Refused by name rather than stored as something the file does not
+        // hold
+        let data_type =
+            zyron_parser::ast::DataType::from_type_id(spec.type_id).ok_or_else(|| {
+                ProtocolError::Database(ZyronError::PlanError(format!(
+                    "column '{}' of external source '{}' has type {} which cannot be written as a \
+                 COLUMNS entry, name the layout explicitly",
+                    spec.name, stmt.name, spec.type_id
+                )))
+            })?;
+        columns.push((spec.name, data_type));
+    }
+    Ok(Some(columns))
 }

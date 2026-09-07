@@ -72,6 +72,8 @@ pub enum FormatKind {
     AppImageBundle,
     /// Upgrade journal, the durable half of the upgrade board
     UpgradeJournal,
+    /// Service principal signing keys, the durable half of the key store
+    PrincipalKeyStorePersistence,
 }
 
 /// One row of the magic byte allocation registry
@@ -265,6 +267,12 @@ pub const MAGIC_ALLOCATIONS: &[MagicAllocation] = &[
         owner: "zyron-server",
         doc: "Upgrade journal holding the settings, history, rewrite queue and any restart in progress",
     },
+    MagicAllocation {
+        kind: FormatKind::PrincipalKeyStorePersistence,
+        magic: *b"ZPKS",
+        owner: "zyron-auth",
+        doc: "Service principal signing keys, each secret half wrapped by the node's key store",
+    },
 ];
 
 /// Every format kind, in allocation order
@@ -298,6 +306,7 @@ pub const ALL_FORMAT_KINDS: &[FormatKind] = &[
     FormatKind::StreamingCdcCheckpoint,
     FormatKind::AppImageBundle,
     FormatKind::UpgradeJournal,
+    FormatKind::PrincipalKeyStorePersistence,
 ];
 
 impl FormatKind {
@@ -385,6 +394,7 @@ impl FormatKind {
             FormatKind::StreamingCdcCheckpoint => "streaming_cdc_checkpoint",
             FormatKind::AppImageBundle => "app_image_bundle",
             FormatKind::UpgradeJournal => "upgrade_journal",
+            FormatKind::PrincipalKeyStorePersistence => "principal_key_store_persistence",
         }
     }
 

@@ -27,6 +27,8 @@ pub mod retention;
 pub mod schedule;
 pub mod stats;
 pub mod stream_monitor;
+pub mod streaming_job_owner;
+pub mod upgrade_board_reconcile;
 pub mod vacuum;
 pub mod wal_archiver;
 

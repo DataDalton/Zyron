@@ -28,11 +28,21 @@ pub const INTRODUCED_IN: BinaryVersion = BinaryVersion::new(0, 12, 0);
 /// Whether a config key is one the cluster replicates
 pub fn is_cluster_setting(key: &str) -> bool {
     zyron_wire::format_dispatch::setting_for_config_key(key).is_some()
+        || crate::crypto_settings::is_crypto_setting(key)
 }
 
 /// Applies one replicated setting on this node. The value written to the
-/// config file is the one the board stored, so the file and the board agree
+/// config file is the one the applier stored, so the file and the live state
+/// agree.
+///
+/// Two families share the carrier. Upgrade settings land on the board, scheme
+/// bindings land on the signature registry, and both are policy for the whole
+/// group rather than for a node, which is what puts them in the log rather
+/// than in each node's own config
 pub fn apply(data_dir: &Path, key: &str, value: &str) -> Result<()> {
+    if crate::crypto_settings::is_crypto_setting(key) {
+        return crate::crypto_settings::apply(data_dir, key, value);
+    }
     let setting = zyron_wire::format_dispatch::setting_for_config_key(key).ok_or_else(|| {
         ZyronError::Internal(format!("`{key}` is not a setting the cluster replicates"))
     })?;

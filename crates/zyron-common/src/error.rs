@@ -483,9 +483,9 @@ pub enum ZyronError {
     /// this node holding data no other member has and nothing later would
     /// notice the difference
     #[error(
-        "{statement} cannot run on a node in a consensus group, because its effects would not reach the other members"
+        "{statement} cannot run on a node in a consensus group, because its effects would not reach the other members. {reason}"
     )]
-    NotReplicable { statement: String },
+    NotReplicable { statement: String, reason: String },
 
     /// A consensus operation did not finish inside the caller's deadline.
     /// Distinct from a failure: the group may still commit the work, and the

@@ -672,11 +672,13 @@ impl ChangesetMachine {
                     user,
                     database,
                     search_path,
+                    actor_role_id,
                 } => {
                     let context = zyron_executor::replication::StatementContext {
                         user: (*user).to_string(),
                         database: (*database).to_string(),
                         search_path: search_path.iter().map(|s| (*s).to_string()).collect(),
+                        actor_role_id: *actor_role_id,
                     };
                     self.apply_ddl(ctx, sql, &context).await?;
                 }
@@ -768,6 +770,9 @@ impl ChangesetMachine {
             user: "zyron".to_string(),
             database: "zyron".to_string(),
             search_path: zyron_catalog::default_search_path(),
+            // The node acting for itself, so there is no operator role behind
+            // it and nothing to carry
+            actor_role_id: None,
         }
     }
 
@@ -997,7 +1002,22 @@ pub struct ReplicationHandle {
     /// How long a caller waits for its transaction to reach the front of the
     /// log and commit
     pub propose_timeout: std::time::Duration,
+    /// Whether every member of the group runs a binary that reads the actor
+    /// role off a replicated schema change.
+    ///
+    /// False until the upgrade service has seen the group's version floor
+    /// reach [`ACTOR_ROLE_INTRODUCED_IN`], because a member that does not know
+    /// the operation refuses the whole entry and stops applying. False is the
+    /// answer that behaves the way the release before this one did, so the
+    /// wrong answer costs an owner column and never a stalled member
+    pub group_carries_actor_role: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The release whose applier reads the actor role off a schema change. The
+/// leader holds the field back until every member of the group runs this or
+/// later
+pub const ACTOR_ROLE_INTRODUCED_IN: zyron_common::format::BinaryVersion =
+    zyron_common::format::BinaryVersion::new(0, 13, 0);
 
 impl ReplicationHandle {
     /// The origin stamp for one transaction.
@@ -1198,6 +1218,20 @@ async fn begin_statement_inner(
         .wrapping_add(STATEMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed));
     let origin = handle.origin(txn_id);
     let changeset = handle.changeset(txn_id);
+    // The actor role travels only once the whole group reads it. A member on
+    // an earlier release refuses an operation tag it does not know and stops
+    // applying, so this is held back rather than sent and hoped for
+    let held_back;
+    let context = match context.actor_role_id {
+        Some(_) if !handle.group_carries_actor_role.load(Ordering::Relaxed) => {
+            held_back = zyron_executor::replication::StatementContext {
+                actor_role_id: None,
+                ..context.clone()
+            };
+            &held_back
+        }
+        _ => context,
+    };
     changeset.capture_ddl(sql, context)?;
     let barrier = handle.node.last_applied();
     let Some(chunk) = changeset.seal(barrier) else {
@@ -1323,6 +1357,12 @@ impl DdlRunner for DispatchedDdl {
                 ));
                 if let Some(session) = session.as_mut() {
                     session.search_path = context.search_path.clone();
+                    // The role the statement ran under, carried rather than
+                    // enforced. The group agreed the statement before it ran
+                    // anywhere, so re-deciding here whether it was allowed
+                    // could have this node refuse what the others carried out.
+                    // What this settles is who owns what it creates
+                    session.replicated_actor = context.actor_role_id;
                 }
                 let mut txn = None;
                 let mut branch = None;

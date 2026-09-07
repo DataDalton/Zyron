@@ -514,6 +514,7 @@ mod tests {
                     error_rate_ppm: 0,
                     queries_in_window: 0,
                     uptime_secs: 0,
+                    upgrade: None,
                 })
             })
         }

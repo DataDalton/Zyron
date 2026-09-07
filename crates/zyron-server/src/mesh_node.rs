@@ -31,6 +31,11 @@ use zyron_pressure::hot_set::HotSetManifest;
 
 use crate::upgrade::control::{CoordinatedRestart, NodeControl};
 
+/// How long a drain poll buys the drain that answers it. A coordinator
+/// polls a drain every couple of seconds, so this outlives a few missed
+/// polls without keeping a node out of service after the caller is gone
+const DRAIN_POLL_GRACE_MS: u32 = 60_000;
+
 /// What this node reports and does when the mesh asks.
 pub struct ServerMeshNode {
     /// This node, so an answer names who gave it
@@ -152,6 +157,11 @@ impl MeshNode for ServerMeshNode {
             .store(request.relocate_sessions, Ordering::Relaxed);
         self.drain_sequence
             .store(request.sequence, Ordering::Relaxed);
+        // The caller's own deadline bounds how long this node stays out of
+        // service, so a coordinator that never comes back does not hold it
+        // there for the life of the process
+        self.control
+            .note_peer_drain(request.deadline_ms, std::time::Instant::now());
         tracing::info!(
             sequence = request.sequence,
             deadline_ms = request.deadline_ms,
@@ -167,6 +177,10 @@ impl MeshNode for ServerMeshNode {
                 reason: "this node is not draining".into(),
             });
         }
+        // Asking how far the drain has got is the coordinator saying it is
+        // still there, which is what earns the drain more time
+        self.control
+            .note_peer_drain(DRAIN_POLL_GRACE_MS, std::time::Instant::now());
         Ok(self.status(request.target.clone(), request.sequence))
     }
 
@@ -282,6 +296,13 @@ impl MeshNode for ServerMeshNode {
             error_rate_ppm: (sample.error_rate * 1_000_000.0).clamp(0.0, 1_000_000.0) as u64,
             queries_in_window: sample.queries_in_window,
             uptime_secs: self.control.uptime_secs(),
+            // This node's own journal row, which is the only one it can speak
+            // for. A member reading the group's board takes each peer's row
+            // from the peer rather than guessing it from the fields above
+            upgrade: zyron_common::format::upgrade_board()
+                .node_states()
+                .into_iter()
+                .find(|state| state.node_id == self.local.name),
         })
     }
 

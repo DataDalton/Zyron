@@ -382,11 +382,20 @@ fn table_scoped_path(
     }
 }
 
+/// Plans and runs one statement, committing when `dml`.
+///
+/// `through_group` says whether the rows it writes are proposed to the group.
+/// True for a statement classified `Rows`, which runs only on the node it was
+/// typed at, so what the other members get is the rows it settled on. False
+/// for one classified `Statement`, which the group agreed before it ran and
+/// which every member is now running for itself: proposing again from inside
+/// it waits on a commit that cannot finish until this call returns
 async fn run_sql(
     server: &Arc<ServerState>,
     ns: (zyron_catalog::DatabaseId, Vec<String>),
     sql: &str,
     dml: bool,
+    through_group: bool,
 ) -> Result<(u64, Vec<zyron_executor::batch::DataBatch>), ProtocolError> {
     let stmts = zyron_parser::parse(sql).map_err(ProtocolError::Database)?;
     let stmt = stmts
@@ -416,30 +425,85 @@ async fn run_sql(
         txn_id,
         snapshot,
     );
+    // The same registries a client's statement runs against. Built bare, an
+    // update through here reached no heap file, took no row lock, and left
+    // every full text, vector and spatial index untouched while reporting
+    // success
+    ctx.heap_files = Some(Arc::clone(&server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    ctx.foreign_reader = server.foreign_reader.clone();
+    ctx.peers = Some(Arc::clone(&server.peers));
+    ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+    if let Some(m) = &server.fts_manager {
+        ctx.set_fts_manager(Arc::clone(m));
+    }
+    if let Some(m) = &server.vector_manager {
+        ctx.set_vector_manager(Arc::clone(m));
+    }
+    if let Some(m) = &server.spatial_manager {
+        ctx.set_spatial_manager(Arc::clone(m));
+    }
     ctx.dml_hook = Some(
         std::sync::Arc::new(crate::dml_enforce::LegalHoldDmlHook::new(
             std::sync::Arc::clone(&server.legal_holds),
             std::sync::Arc::clone(&server.catalog),
         )) as std::sync::Arc<dyn zyron_executor::context::DmlHook>,
     );
+    // The rows a lifecycle statement moves go to the group the same way a
+    // client's own DML does. Without this the erasure, restore and retention
+    // statements wrote rows nothing captured, so each of them had to be
+    // refused on a node in a group rather than leaving one member holding
+    // rows the others had dropped
+    let changeset = if dml && through_group {
+        server.replication.as_ref().map(|r| r.changeset(txn_id))
+    } else {
+        None
+    };
+    ctx.replication = changeset.clone();
     let ctx = std::sync::Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
     match result {
         Ok(batches) => {
-            if dml {
-                server
-                    .txn_manager
-                    .commit(&mut txn)
-                    .await
-                    .map_err(ProtocolError::Database)?;
-            } else {
-                let _ = server.txn_manager.abort(&mut txn);
-            }
             let n: u64 = batches.iter().map(|b| b.num_rows as u64).sum();
+            if !dml {
+                let _ = server.txn_manager.abort(&mut txn);
+                return Ok((n, batches));
+            }
+            match (server.replication.as_ref(), changeset) {
+                (Some(router), Some(changeset)) => {
+                    router
+                        .capture_lake(txn_id, &changeset)
+                        .map_err(ProtocolError::Database)?;
+                    if changeset.is_dirty() {
+                        router
+                            .commit(txn, changeset)
+                            .await
+                            .map_err(ProtocolError::Database)?;
+                    } else {
+                        server
+                            .txn_manager
+                            .commit(&mut txn)
+                            .await
+                            .map_err(ProtocolError::Database)?;
+                    }
+                }
+                _ => {
+                    server
+                        .txn_manager
+                        .commit(&mut txn)
+                        .await
+                        .map_err(ProtocolError::Database)?;
+                }
+            }
             Ok((n, batches))
         }
         Err(e) => {
             let _ = server.txn_manager.abort(&mut txn);
+            if let (Some(router), Some(changeset)) = (server.replication.as_ref(), changeset) {
+                router.abort(&changeset);
+            }
             Err(ProtocolError::Database(e))
         }
     }
@@ -833,6 +897,7 @@ pub async fn handle_forget_user(
             table_scoped_path(server, t.table_id),
             &count_sql,
             false,
+            false,
         )
         .await?;
         if matched == 0 && t.history_table_id == 0 {
@@ -849,6 +914,7 @@ pub async fn handle_forget_user(
             table_scoped_path(server, t.table_id),
             &del_sql,
             true,
+            false,
         )
         .await?;
         total_rows += deleted;
@@ -871,6 +937,7 @@ pub async fn handle_forget_user(
                     crate::ddl_dispatch::schema_scoped_path(server, hist.schema_id),
                     &h_sql,
                     true,
+                    false,
                 )
                 .await?;
                 total_rows += hn;
@@ -910,8 +977,14 @@ pub async fn handle_export_user(
             "SELECT * FROM \"{}\" WHERE \"{}\" = {} INCLUDING DELETED",
             t.table_name, t.id_column, subject
         );
-        let (_, batches) =
-            run_sql(server, table_scoped_path(server, t.table_id), &sel, false).await?;
+        let (_, batches) = run_sql(
+            server,
+            table_scoped_path(server, t.table_id),
+            &sel,
+            false,
+            false,
+        )
+        .await?;
         let mut records: Vec<Vec<u8>> = Vec::new();
         for b in &batches {
             for r in 0..b.num_rows {
@@ -1444,6 +1517,7 @@ pub async fn handle_restore_soft_delete(
         crate::ddl_dispatch::schema_scoped_path(server, table.schema_id),
         &restore_sql,
         true,
+        true,
     )
     .await?;
 
@@ -1555,6 +1629,7 @@ pub async fn handle_run_retention_job(
                 crate::ddl_dispatch::schema_scoped_path(server, table.schema_id),
                 &sel,
                 false,
+                false,
             )
             .await?;
             (n, 4u8) // skipped/dry-run
@@ -1564,6 +1639,7 @@ pub async fn handle_run_retention_job(
                 server,
                 crate::ddl_dispatch::schema_scoped_path(server, table.schema_id),
                 &del,
+                true,
                 true,
             )
             .await?;

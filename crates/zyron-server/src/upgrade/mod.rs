@@ -380,6 +380,13 @@ impl UpgradeController {
                     format!("{nodes_upgraded} node(s) upgraded before the pause"),
                 )
             }
+            RollingOutcome::HandedOff { nodes_upgraded } => (
+                UpgradeOutcome::Paused,
+                format!(
+                    "{nodes_upgraded} node(s) upgraded before this node stopped leading the \
+                     group, the node that leads now carries on"
+                ),
+            ),
         };
 
         context

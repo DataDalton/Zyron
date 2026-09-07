@@ -10,6 +10,7 @@ pub mod cluster_settings;
 pub mod columnar_recovery;
 pub mod columnar_wal_pin;
 pub mod config;
+pub mod crypto_settings;
 pub mod feature_persistence;
 pub mod format;
 pub mod gateway;
@@ -357,6 +358,16 @@ impl Server {
         // rather than discovering the gap at the first read
         let substrate_report = crate::startup_validation::validate()?;
         info!("{}", substrate_report);
+
+        // The signature registry is built from what this binary submits, so
+        // the bindings an operator chose are put back before anything signs or
+        // verifies. They sit in the config because the replicated log wrote
+        // them there, which is what carries a binding to every member and past
+        // a restart
+        let seeded = crate::crypto_settings::seed_from_config(&self.config);
+        if seeded > 0 {
+            info!("{seeded} signature scheme binding(s) restored from the config");
+        }
 
         // 1. Create data and WAL directories
         let data_dir = &self.config.storage.data_dir;
@@ -1526,6 +1537,9 @@ impl Server {
                         .load(std::sync::atomic::Ordering::Relaxed)
                 }),
                 shutdown: Arc::clone(&self.shutdown),
+                group_carries_actor_role: cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.replication.group_carries_actor_role)),
             })
             .await?
         };
@@ -1799,6 +1813,22 @@ impl Server {
                 as Arc<dyn zyron_wire::format_dispatch::UpgradeControl>),
         });
 
+        // Service principal signing keys, put back before anything issues a
+        // token. Each secret half is sealed by the node's key store, which is
+        // the same one column keys go through, so the file is readable only
+        // where that store's master key is
+        let principal_key_file = data_dir.join("principal_keys.zypk");
+        let principal_keys = zyron_auth::signature::open_principal_keys(
+            principal_key_file,
+            Arc::clone(&server_state.key_store),
+        )?;
+        if !principal_keys.is_empty() {
+            info!(
+                "{} service principal signing key(s) restored",
+                principal_keys.len()
+            );
+        }
+
         // The retention worker's age-tiering pass drives the wire
         // relocation, which needs the server state that exists only now
         background.attach_server_state(Arc::clone(&server_state));
@@ -2009,6 +2039,25 @@ impl Server {
                     .await;
                 }));
             }
+
+            // Streaming job ownership follows the group's leader. The
+            // definitions reach every member through the catalog, and this
+            // decides which member actually runs them, correcting whatever a
+            // leadership change left behind
+            let sh_jobs = Arc::clone(&self.shutdown);
+            let wake_jobs = Arc::clone(&self.shutdown_wake);
+            let state_for_jobs = Arc::clone(&server_state);
+            spawned_workers.push(tokio::spawn(async move {
+                background::streaming_job_owner::streaming_job_owner_loop(
+                    sh_jobs,
+                    wake_jobs,
+                    background::streaming_job_owner::DEFAULT_INTERVAL_SECS,
+                    move || {
+                        reconcile_streaming_job_ownership(&state_for_jobs);
+                    },
+                )
+                .await;
+            }));
 
             let sh_dlq = Arc::clone(&self.shutdown);
             let wake_dlq = Arc::clone(&self.shutdown_wake);
@@ -2513,6 +2562,82 @@ fn parse_auth_method(method: &str) -> zyron_common::Result<zyron_auth::auth_rule
 }
 
 // -----------------------------------------------------------------------------
+// Streaming-job ownership
+// -----------------------------------------------------------------------------
+
+/// Whether this node owns the streaming jobs right now.
+///
+/// A node in no group owns them, because there is nobody else to. In a group
+/// the leader owns them, so exactly one member writes each job's sink
+fn owns_streaming_jobs(state: &Arc<zyron_wire::connection::ServerState>) -> bool {
+    match state.raft.as_ref() {
+        Some(raft) => raft.is_leader(),
+        None => true,
+    }
+}
+
+/// Brings the runners on this node in line with what it owns.
+///
+/// Stopping is what matters most: a node that has just lost the group is still
+/// running every job it started, and two members writing one sink is the
+/// failure this whole arrangement exists to prevent, so a runner is given up
+/// before anything is started
+fn reconcile_streaming_job_ownership(state: &Arc<zyron_wire::connection::ServerState>) {
+    let Some(manager) = state.stream_job_manager.as_ref() else {
+        return;
+    };
+    let leads = owns_streaming_jobs(state);
+    let active: Vec<u32> = state
+        .catalog
+        .list_streaming_jobs()
+        .iter()
+        .filter(|j| j.status == zyron_catalog::StreamingJobStatus::Active)
+        .map(|j| j.id.0)
+        .collect();
+    let running: Vec<u32> = {
+        let manager = manager.lock();
+        manager
+            .list()
+            .into_iter()
+            .filter(|(_, _, status)| status.is_active())
+            .map(|(id, _, _)| id.as_u32())
+            .collect()
+    };
+
+    let (start, stop) = background::streaming_job_owner::plan(leads, &active, &running);
+    if start.is_empty() && stop.is_empty() {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let manager = manager.lock();
+    for id in &stop {
+        if let Err(e) = manager.stop(zyron_streaming::job::StreamJobId::new(*id)) {
+            warn!("streaming job {id} could not be stopped after leadership moved: {e}");
+        }
+    }
+    for id in &start {
+        if let Err(e) = manager.start(zyron_streaming::job::StreamJobId::new(*id), now_ms) {
+            warn!("streaming job {id} could not be started on the node that owns it: {e}");
+        }
+    }
+    if !stop.is_empty() {
+        info!(
+            "gave up {} streaming job runner(s) this node no longer owns",
+            stop.len()
+        );
+    }
+    if !start.is_empty() {
+        info!(
+            "took on {} streaming job runner(s) this node now owns",
+            start.len()
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Streaming-job startup recovery
 // -----------------------------------------------------------------------------
 
@@ -2524,6 +2649,18 @@ async fn recover_streaming_jobs(
 ) -> zyron_common::Result<()> {
     let jobs = state.catalog.list_streaming_jobs();
     if jobs.is_empty() {
+        return Ok(());
+    }
+
+    // A member that does not own the jobs holds their definitions and runs
+    // none of them. Respawning here on every member would put a runner for
+    // each job on each node, and every one of them would write the same sink.
+    // The ownership pass picks them up if this node takes the group later
+    if !owns_streaming_jobs(state) {
+        info!(
+            "{} streaming job(s) are held here but owned by the node that leads the group",
+            jobs.len()
+        );
         return Ok(());
     }
 
@@ -2631,6 +2768,7 @@ async fn respawn_streaming_job(
         cdc_registry,
         state,
     )
+    .await
     .map_err(|e| match e {
         zyron_wire::messages::ProtocolError::Database(err) => err,
         other => ZyronError::StreamingError(format!("recovery dispatch failed: {other}")),

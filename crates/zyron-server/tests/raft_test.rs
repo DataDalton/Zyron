@@ -1597,6 +1597,34 @@ async fn test_raft_write_throughput() {
     const TOTAL: u64 = 100_000;
     const LATENCY_WRITES: u64 = 5_000;
 
+    // Every recorded run but the first follows a saturated phase, whose
+    // freed heap and deleted log files the next run's latency tail pays
+    // for. A throwaway run of both phases puts the first recorded run in
+    // the same state as the rest, so the five measure one thing
+    {
+        let mut config = RaftConfig::default();
+        config.snapshot_threshold = 0;
+        let warm = Cluster::start(3, config).await;
+        let leader = warm.wait_leader(Duration::from_secs(5)).await;
+        drive_writes(
+            warm.node(leader),
+            "warm",
+            0,
+            LATENCY_WRITES,
+            LATENCY_CONCURRENCY,
+        )
+        .await;
+        drive_writes(
+            warm.node(leader),
+            "warmsat",
+            0,
+            TOTAL,
+            THROUGHPUT_CONCURRENCY,
+        )
+        .await;
+        warm.shutdown().await;
+    }
+
     let mut throughputs = Vec::with_capacity(VALIDATION_RUNS);
     let mut p99s = Vec::with_capacity(VALIDATION_RUNS);
     let mut saturated_p99s = Vec::with_capacity(VALIDATION_RUNS);
@@ -1608,6 +1636,7 @@ async fn test_raft_write_throughput() {
         let cluster = Cluster::start(3, config).await;
         let leader = cluster.wait_leader(Duration::from_secs(5)).await;
 
+        let quiet_before = cluster.node(leader).metrics().consensus;
         // What one write costs, with the group well short of saturation
         let mut latencies = drive_writes(
             cluster.node(leader),
@@ -1630,6 +1659,44 @@ async fn test_raft_write_throughput() {
             latencies.last().copied().unwrap_or_default(),
         );
         p99s.push(millis(percentile(&latencies, 0.99)));
+        // Read before the saturated phase adds to it. Each run builds a
+        // fresh group whose counters start at zero, so this is the
+        // unsaturated phase's own disk cost and nothing else. A tail that
+        // grows run over run while these stay flat is not the disk
+        for id in cluster.live() {
+            let m = cluster.node(id).metrics();
+            tprintln!(
+                "  unsaturated node {id}: {} log fsyncs, the slowest {:.2?}",
+                m.log_fsyncs,
+                Duration::from_micros(m.log_fsync_max_us)
+            );
+        }
+        // How the unsaturated writes were carried. A tail that grows while
+        // p50 holds is a share of the writes waiting longer for a message
+        // to leave, so the mix and the shape of the tail say which writes
+        // those are
+        let quiet_after = cluster.node(leader).metrics().consensus;
+        let quiet_heartbeats = quiet_after.heartbeats_built - quiet_before.heartbeats_built;
+        let quiet_carriers = quiet_after.commit_carriers_built - quiet_before.commit_carriers_built;
+        let quiet_carrying = quiet_after.appends_built
+            - quiet_before.appends_built
+            - quiet_heartbeats
+            - quiet_carriers;
+        let quiet_entries = quiet_after.entries_replicated - quiet_before.entries_replicated;
+        let over = |limit: Duration| latencies.iter().filter(|d| **d > limit).count();
+        tprintln!(
+            "  unsaturated mix: {} messages with entries, {:.1} entries each, {} heartbeats, {} commit carriers",
+            format_with_commas(quiet_carrying as f64),
+            quiet_entries as f64 / quiet_carrying.max(1) as f64,
+            quiet_heartbeats,
+            quiet_carriers
+        );
+        tprintln!(
+            "  unsaturated tail: {} writes over 1ms, {} over 2ms, {} over 4ms",
+            over(Duration::from_millis(1)),
+            over(Duration::from_millis(2)),
+            over(Duration::from_millis(4)),
+        );
 
         // What the group commits per second, driven to saturation
         let before = cluster.node(leader).metrics().consensus;

@@ -16,6 +16,7 @@ use parking_lot::Mutex as PlMutex;
 
 use crate::format::{ColumnSpec, FormatKind, reader_for};
 use crate::row_codec::StreamValue;
+use zyron_catalog::ids::ExternalSourceId;
 use zyron_catalog::schema::{ExternalBackend, ExternalFormat, ExternalMode, ExternalSourceEntry};
 use zyron_common::{Result, ZyronError};
 
@@ -53,6 +54,10 @@ pub struct ExternalTableSource {
     // job resumes after the last acknowledged object instead of ingesting
     // every object again and duplicating rows on an appending target
     progress: Option<PlMutex<std::fs::File>>,
+    // The catalog entry this was opened from, absent for an inline endpoint
+    // that has no entry. A runner reads it back to ask whether ingest from
+    // the source is held
+    source_id: Option<ExternalSourceId>,
 }
 
 impl ExternalTableSource {
@@ -82,7 +87,15 @@ impl ExternalTableSource {
             listed_once: PlMutex::new(false),
             delivered: PlMutex::new(Vec::new()),
             progress: None,
+            // Id zero is the transient entry an inline endpoint is built
+            // from, which is never in the catalog to be looked up
+            source_id: (entry.id.0 != 0).then_some(entry.id),
         })
+    }
+
+    /// The catalog entry this source reads, absent for an inline endpoint
+    pub fn source_id(&self) -> Option<ExternalSourceId> {
+        self.source_id
     }
 
     /// Attaches a durable progress log. Keys already recorded there load as
@@ -654,6 +667,7 @@ mod tests {
             listed_once: PlMutex::new(false),
             delivered: PlMutex::new(Vec::new()),
             progress: None,
+            source_id: None,
         }
     }
 

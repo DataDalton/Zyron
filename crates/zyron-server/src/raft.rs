@@ -385,6 +385,10 @@ pub async fn start_cluster(
         chunk_bytes: section.chunk_bytes as usize,
         epoch,
         propose_timeout,
+        // Raised by the upgrade service once it has seen every member's
+        // version. Until then a schema change replicates the way the previous
+        // release wrote it
+        group_carries_actor_role: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     tracing::info!(

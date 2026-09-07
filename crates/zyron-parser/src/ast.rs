@@ -3292,6 +3292,82 @@ impl DataType {
             DataType::ExternalRef => TypeId::ExternalRef,
         }
     }
+
+    /// The spelling a stored type id is written back as.
+    ///
+    /// The inverse of `to_type_id`, and partial on purpose. A type whose
+    /// spelling carries a parameter the id does not keep, an array's element
+    /// type or a vector's dimension, cannot be written back from the id alone,
+    /// and answering with a guess would store a column the source does not
+    /// have. Those answer None so the caller refuses rather than inventing
+    /// one.
+    ///
+    /// Exhaustive over the ids, so a type added to the engine has to say here
+    /// whether it can be written back
+    pub fn from_type_id(type_id: TypeId) -> Option<DataType> {
+        Some(match type_id {
+            TypeId::Boolean => DataType::Boolean,
+            TypeId::Int8 => DataType::TinyInt,
+            TypeId::Int16 => DataType::SmallInt,
+            TypeId::Int32 => DataType::Int,
+            TypeId::Int64 => DataType::BigInt,
+            TypeId::Int128 => DataType::Int128,
+            TypeId::UInt8 => DataType::UInt8,
+            TypeId::UInt16 => DataType::UInt16,
+            TypeId::UInt32 => DataType::UInt32,
+            TypeId::UInt64 => DataType::UInt64,
+            TypeId::UInt128 => DataType::UInt128,
+            TypeId::Float32 => DataType::Real,
+            TypeId::Float64 => DataType::DoublePrecision,
+            TypeId::Decimal => DataType::Decimal(None, None),
+            TypeId::Char => DataType::Char(None),
+            TypeId::Varchar => DataType::Varchar(None),
+            TypeId::Text => DataType::Text,
+            TypeId::Binary => DataType::Binary(None),
+            TypeId::Varbinary => DataType::Varbinary(None),
+            TypeId::Bytea => DataType::Bytea,
+            TypeId::Date => DataType::Date,
+            TypeId::Time => DataType::Time,
+            TypeId::Timestamp => DataType::Timestamp(None),
+            TypeId::TimestampTz => DataType::TimestampTz(None),
+            TypeId::Hlc => DataType::Hlc,
+            TypeId::Interval => DataType::Interval,
+            TypeId::Uuid => DataType::Uuid,
+            TypeId::Json => DataType::Json,
+            TypeId::Jsonb => DataType::Jsonb,
+            TypeId::Geometry => DataType::Geometry,
+            TypeId::Matrix => DataType::Matrix,
+            TypeId::Color => DataType::Color,
+            TypeId::SemVer => DataType::SemVer,
+            TypeId::Inet => DataType::Inet,
+            TypeId::Cidr => DataType::Cidr,
+            TypeId::MacAddr => DataType::MacAddr,
+            TypeId::Money => DataType::Money,
+            TypeId::HyperLogLog => DataType::HyperLogLog,
+            TypeId::BloomFilter => DataType::BloomFilter,
+            TypeId::TDigest => DataType::TDigest,
+            TypeId::CountMinSketch => DataType::CountMinSketch,
+            TypeId::Bitfield => DataType::Bitfield,
+            TypeId::Quantity => DataType::Quantity,
+            TypeId::Variant => DataType::Variant,
+            TypeId::Ltree => DataType::Ltree,
+            TypeId::Image => DataType::Image,
+            TypeId::Video => DataType::Video,
+            TypeId::Audio => DataType::Audio,
+            TypeId::Document => DataType::Document,
+            TypeId::ExternalRef => DataType::ExternalRef,
+            // A column with no type of its own, which a source cannot declare
+            TypeId::Null => return None,
+            // The id keeps no element type, dimension, field list or bound, so
+            // there is nothing to write the spelling back from
+            TypeId::Array
+            | TypeId::Vector
+            | TypeId::Range
+            | TypeId::Struct
+            | TypeId::Map
+            | TypeId::Composite => return None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3682,6 +3758,7 @@ pub struct AlterExternalSourceStatement {
 pub enum AlterExternalSinkAction {
     SetOptions(Vec<(String, String)>),
     SetCredentials(Vec<(String, String)>),
+    SetCredentialProvider(CredentialProviderSpec),
     Rename(String),
 }
 

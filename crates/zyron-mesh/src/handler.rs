@@ -292,6 +292,7 @@ mod tests {
                 error_rate_ppm: 0,
                 queries_in_window: 600,
                 uptime_secs: 60,
+                upgrade: None,
             })
         }
         fn stage_release(&self, request: &StageReleaseRequest) -> Result<NodeAck, MeshRpcError> {

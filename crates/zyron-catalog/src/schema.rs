@@ -2942,6 +2942,55 @@ impl CatalogClassification {
     }
 }
 
+/// Where an external source fetches its credentials from when they are not
+/// sealed into the entry.
+///
+/// A static credential is written once and stays until it is replaced. A
+/// provider is asked for one each time it is needed, so a rotated secret is
+/// picked up without touching the catalog.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CredentialProviderKind {
+    Vault = 0,
+    AwsSecretsManager = 1,
+    GcpSecretManager = 2,
+    AzureKeyVault = 3,
+    OAuth2ClientCredentials = 4,
+    AwsIamAssumeRole = 5,
+    K8sSaToken = 6,
+}
+
+impl CredentialProviderKind {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(CredentialProviderKind::Vault),
+            1 => Ok(CredentialProviderKind::AwsSecretsManager),
+            2 => Ok(CredentialProviderKind::GcpSecretManager),
+            3 => Ok(CredentialProviderKind::AzureKeyVault),
+            4 => Ok(CredentialProviderKind::OAuth2ClientCredentials),
+            5 => Ok(CredentialProviderKind::AwsIamAssumeRole),
+            6 => Ok(CredentialProviderKind::K8sSaToken),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown CredentialProviderKind value: {val}"
+            ))),
+        }
+    }
+
+    /// The name the grammar spells this provider with, which is also what a
+    /// system view reports
+    pub fn catalog_name(&self) -> &'static str {
+        match self {
+            CredentialProviderKind::Vault => "VAULT",
+            CredentialProviderKind::AwsSecretsManager => "AWS_SECRETS_MANAGER",
+            CredentialProviderKind::GcpSecretManager => "GCP_SECRET_MANAGER",
+            CredentialProviderKind::AzureKeyVault => "AZURE_KEY_VAULT",
+            CredentialProviderKind::OAuth2ClientCredentials => "OAUTH2_CLIENT_CREDENTIALS",
+            CredentialProviderKind::AwsIamAssumeRole => "AWS_IAM_ASSUME_ROLE",
+            CredentialProviderKind::K8sSaToken => "K8S_SA_TOKEN",
+        }
+    }
+}
+
 /// Catalog entry for an external data source.
 #[derive(Debug, Clone)]
 pub struct ExternalSourceEntry {
@@ -2967,6 +3016,20 @@ pub struct ExternalSourceEntry {
     pub tags: Vec<String>,
     pub owner_role_id: u32,
     pub created_at: u64,
+    /// Ingest from this source is held. Every reader checks this before it
+    /// pulls, so a paused source yields nothing to a streaming job, to a
+    /// COPY, or to a subscription, rather than being stopped in only one of
+    /// them. Entries written before the field decode as running.
+    pub paused: bool,
+    /// Which provider is asked for credentials at use time. None means the
+    /// sealed credential fields hold the credentials themselves.
+    ///
+    /// When this is set, the sealed fields hold the provider's own
+    /// configuration instead, because a Vault token or an OAuth client secret
+    /// is as sensitive as the credential it fetches and must not sit in the
+    /// clear. The two share one slot, which is what makes a static credential
+    /// list and a provider mutually exclusive
+    pub credential_provider: Option<CredentialProviderKind>,
 }
 
 impl ExternalSourceEntry {
@@ -3006,6 +3069,17 @@ impl ExternalSourceEntry {
         }
         write_u32(&mut buf, self.owner_role_id);
         write_u64(&mut buf, self.created_at);
+        // Append-only trailer. Everything past this point is read back only
+        // when the bytes are there, so an entry written before these fields
+        // existed still decodes
+        write_u8(&mut buf, self.paused as u8);
+        match self.credential_provider {
+            None => write_u8(&mut buf, 0),
+            Some(kind) => {
+                write_u8(&mut buf, 1);
+                write_u8(&mut buf, kind as u8);
+            }
+        }
         buf
     }
 
@@ -3056,6 +3130,27 @@ impl ExternalSourceEntry {
         }
         let owner_role_id = read_u32(data, &mut off)?;
         let created_at = read_u64(data, &mut off)?;
+        // Append-only trailer, an entry written before the field decodes as
+        // running rather than as a decode error
+        let paused = if off < data.len() {
+            read_u8(data, &mut off)? != 0
+        } else {
+            false
+        };
+        let credential_provider = if off < data.len() {
+            let tag = read_u8(data, &mut off)?;
+            match tag {
+                0 => None,
+                1 => Some(CredentialProviderKind::from_u8(read_u8(data, &mut off)?)?),
+                _ => {
+                    return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                        "unknown ExternalSourceEntry.credential_provider tag: {tag}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             id,
             schema_id,
@@ -3073,6 +3168,8 @@ impl ExternalSourceEntry {
             tags,
             owner_role_id,
             created_at,
+            paused,
+            credential_provider,
         })
     }
 }
@@ -3095,6 +3192,13 @@ pub struct ExternalSinkEntry {
     pub tags: Vec<String>,
     pub owner_role_id: u32,
     pub created_at: u64,
+    /// Which provider is asked for credentials at use time. None means the
+    /// sealed credential fields hold the credentials themselves.
+    ///
+    /// When this is set, the sealed fields hold the provider's own
+    /// configuration instead, which is what makes a static credential list
+    /// and a provider mutually exclusive. The same arrangement a source uses
+    pub credential_provider: Option<CredentialProviderKind>,
 }
 
 impl ExternalSinkEntry {
@@ -3131,6 +3235,15 @@ impl ExternalSinkEntry {
         }
         write_u32(&mut buf, self.owner_role_id);
         write_u64(&mut buf, self.created_at);
+        // Append-only trailer, read back only when the bytes are there so an
+        // entry written before the field still decodes
+        match self.credential_provider {
+            None => write_u8(&mut buf, 0),
+            Some(kind) => {
+                write_u8(&mut buf, 1);
+                write_u8(&mut buf, kind as u8);
+            }
+        }
         buf
     }
 
@@ -3179,6 +3292,20 @@ impl ExternalSinkEntry {
         }
         let owner_role_id = read_u32(data, &mut off)?;
         let created_at = read_u64(data, &mut off)?;
+        let credential_provider = if off < data.len() {
+            let tag = read_u8(data, &mut off)?;
+            match tag {
+                0 => None,
+                1 => Some(CredentialProviderKind::from_u8(read_u8(data, &mut off)?)?),
+                _ => {
+                    return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                        "unknown ExternalSinkEntry.credential_provider tag: {tag}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             id,
             schema_id,
@@ -3194,6 +3321,7 @@ impl ExternalSinkEntry {
             tags,
             owner_role_id,
             created_at,
+            credential_provider,
         })
     }
 }
@@ -5063,6 +5191,59 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_provider_kind_roundtrips_through_its_byte() {
+        let all = [
+            CredentialProviderKind::Vault,
+            CredentialProviderKind::AwsSecretsManager,
+            CredentialProviderKind::GcpSecretManager,
+            CredentialProviderKind::AzureKeyVault,
+            CredentialProviderKind::OAuth2ClientCredentials,
+            CredentialProviderKind::AwsIamAssumeRole,
+            CredentialProviderKind::K8sSaToken,
+        ];
+        for kind in all {
+            assert_eq!(CredentialProviderKind::from_u8(kind as u8).unwrap(), kind);
+            assert!(!kind.catalog_name().is_empty());
+        }
+        assert!(CredentialProviderKind::from_u8(7).is_err());
+    }
+
+    /// An entry written before the pause and provider trailer existed still
+    /// decodes, as a running source with no provider. Truncating the trailer
+    /// off a current encoding is the byte sequence an older release wrote
+    #[test]
+    fn test_external_source_entry_decodes_older_layout_without_trailer() {
+        let entry = ExternalSourceEntry {
+            id: ExternalSourceId(5),
+            schema_id: SchemaId(1),
+            name: "legacy".to_string(),
+            backend: ExternalBackend::File,
+            uri: "/tmp/in".to_string(),
+            format: ExternalFormat::JsonLines,
+            mode: ExternalMode::OneShot,
+            schedule_cron: None,
+            options: Vec::new(),
+            columns: vec![("id".to_string(), TypeId::Int64)],
+            credential_key_id: None,
+            credential_ciphertext: None,
+            classification: CatalogClassification::Internal,
+            tags: Vec::new(),
+            owner_role_id: 1,
+            created_at: 42,
+            paused: true,
+            credential_provider: Some(CredentialProviderKind::K8sSaToken),
+        };
+        let bytes = entry.to_bytes();
+        // The trailer is one pause byte plus a provider tag byte and its kind
+        let older = &bytes[..bytes.len() - 3];
+        let decoded = ExternalSourceEntry::from_bytes(older).unwrap();
+        assert!(!decoded.paused, "an entry with no trailer reads as running");
+        assert_eq!(decoded.credential_provider, None);
+        assert_eq!(decoded.name, entry.name);
+        assert_eq!(decoded.columns, entry.columns);
+    }
+
+    #[test]
     fn test_external_source_entry_roundtrip() {
         let entry = ExternalSourceEntry {
             id: ExternalSourceId(77),
@@ -5087,9 +5268,13 @@ mod tests {
             tags: vec!["pii".to_string(), "prod".to_string()],
             owner_role_id: 9,
             created_at: 1_700_000_000,
+            paused: true,
+            credential_provider: Some(CredentialProviderKind::Vault),
         };
         let bytes = entry.to_bytes();
         let decoded = ExternalSourceEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.paused, entry.paused);
+        assert_eq!(decoded.credential_provider, entry.credential_provider);
         assert_eq!(decoded.id, entry.id);
         assert_eq!(decoded.schema_id, entry.schema_id);
         assert_eq!(decoded.name, entry.name);
@@ -5131,9 +5316,17 @@ mod tests {
             tags: vec!["export".to_string()],
             owner_role_id: 3,
             created_at: 1_700_000_123,
+            credential_provider: Some(CredentialProviderKind::AzureKeyVault),
         };
         let bytes = entry.to_bytes();
         let decoded = ExternalSinkEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.credential_provider, entry.credential_provider);
+        // An entry written before the trailer existed decodes with no
+        // provider rather than failing
+        let older = &bytes[..bytes.len() - 2];
+        let without = ExternalSinkEntry::from_bytes(older).unwrap();
+        assert_eq!(without.credential_provider, None);
+        assert_eq!(without.name, entry.name);
         assert_eq!(decoded.id, entry.id);
         assert_eq!(decoded.schema_id, entry.schema_id);
         assert_eq!(decoded.name, entry.name);

@@ -1,0 +1,265 @@
+# suite:   raft
+# run:     2026-09-07_182024_af7c6a0-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Replication Pages Back Evicted Entries ===
+
+=== Network Partition ===
+
+=== Snapshot ===
+
+=== Linearizable Read ===
+
+=== Pre-Vote ===
+
+=== Membership Change ===
+
+=== Log Replication ===
+
+=== Leadership Transfer ===
+
+=== Apply Pages Back Evicted Entries ===
+
+=== ALTER CLUSTER ===
+
+=== Failover ===
+
+=== Cluster Configuration ===
+
+=== Log Append Latency ===
+
+=== Leader Election ===
+  every incomplete group description is refused
+--- Run 1/5 ---
+  append mean 0.23us, p99 1.50us, 50,000 entries durable in 15.35ms (3,257,966 entries/sec including fsync)
+--- Run 2/5 ---
+  append mean 0.19us, p99 0.90us, 50,000 entries durable in 13.10ms (3,817,960 entries/sec including fsync)
+--- Run 3/5 ---
+  append mean 0.19us, p99 0.70us, 50,000 entries durable in 13.91ms (3,594,976 entries/sec including fsync)
+--- Run 4/5 ---
+  append mean 0.20us, p99 1.20us, 50,000 entries durable in 14.10ms (3,545,295 entries/sec including fsync)
+--- Run 5/5 ---
+  append mean 0.17us, p99 0.90us, 50,000 entries durable in 16.52ms (3,026,763 entries/sec including fsync)
+  One append into the replicated log [PASS/OK]:
+    Runs: [0.2268us, 0.1892us, 0.1945us, 0.2046us, 0.1728us]
+    Average: 0.1976us <= 50us (target)
+    Min/Max: 0.1728us / 0.2268us, StdDev: 0.0178us
+  Entries made durable by group commit:
+    Runs: [3,257,966 entries/sec, 3,817,960 entries/sec, 3,594,976 entries/sec, 3,545,295 entries/sec, 3,026,763 entries/sec]
+    Average: 3,448,592 entries/sec (no target set)
+    Min/Max: 3,026,763 entries/sec / 3,817,960 entries/sec, StdDev: 276,221 entries/sec
+
+=== Follower Read Latency ===
+--- Run 1/5 ---
+  leader 2 elected in 179.61ms
+  all three nodes agree on leader 2 at term 1
+  First election on a cold group [PASS]: 179.6069ms <= 1,000ms (target)
+  isolating follower 1 at term 1
+  258 entries applied, 225 of them read back from the log file
+  partitioning into minority [2, 1] and majority [3, 4, 5]
+  leader 1 committed through 201 before the kill
+  1000 commands committed in 39.24ms, commit index 1 -> 1001
+  follower ReadIndex over 50 write-then-read rounds: p50 56.00µs, p99 1.08ms
+  Follower read after a write, p99 [PASS]: 1.0795ms <= 5ms (target)
+  20 of 20 leader reads were answered from the lease
+  all three logs are identical through index 1001
+  the follower was 128 entries behind, the leader read 112 of them back from its log file, the follower refused 0 appends and installed 0 snapshots
+  node 4 went learner then voter in 35.63ms
+  ADD NODE brought node-4 in as id 6874636927747685848
+  the four node group committed 200 more writes
+  REMOVE NODE took node-4 back out
+  node 1 removed in 3.16ms
+  the three node group carried on committing
+  1000 reads: p50 32.90µs, p99 72.00µs
+--- Run 2/5 ---
+  leadership moved from 2 to 1 in 5.13ms
+  snapshot at index 7984 term 1 covering 205426 bytes, log now starts at 7985
+  new leader 3 elected 218.41ms after the kill
+  node 9 joined in 30.74ms
+  joiner received 205426 snapshot bytes and holds 10000 keys
+  the new node matched the group from a snapshot, not a full replay
+  both survivors hold all 400 keys, none of the pre-failover commits were lost
+  Successor elected after a leader dies [PASS]: 218.4111ms <= 500ms (target)
+  1000 reads: p50 26.00µs, p99 81.30µs
+--- Run 3/5 ---
+  majority elected 3 at term 3
+  the minority refused the write: not the leader of the consensus group, known leader: None
+  minority terms during the partition: [1, 1]
+  all five nodes converged on index 202 with no inconsistent data
+  1000 reads: p50 26.00µs, p99 61.70µs
+--- Run 4/5 ---
+  1000 reads: p50 26.50µs, p99 61.50µs
+--- Run 5/5 ---
+  1000 reads: p50 25.50µs, p99 59.10µs
+  ReadIndex round trip and local apply wait, p99 [PASS/OK]:
+    Runs: [0.0720ms, 0.0813ms, 0.0617ms, 0.0615ms, 0.0591ms]
+    Average: 0.0671ms <= 5ms (target)
+    Min/Max: 0.0591ms / 0.0813ms, StdDev: 0.0084ms
+
+=== Membership Change Latency ===
+--- Run 1/5 ---
+  learner to voter in 11.88ms
+--- Run 2/5 ---
+  learner to voter in 14.37ms
+--- Run 3/5 ---
+  learner to voter in 16.54ms
+--- Run 4/5 ---
+  learner to voter in 16.61ms
+--- Run 5/5 ---
+  learner to voter in 17.13ms
+  Add a node as learner and promote it [PASS/OK]:
+    Runs: [0.0119s, 0.0144s, 0.0165s, 0.0166s, 0.0171s]
+    Average: 0.0153s <= 5s (target)
+    Min/Max: 0.0119s / 0.0171s, StdDev: 0.0020s
+
+=== Replication Lag, Leader Commit to Follower Apply ===
+--- Run 1/5 ---
+  after the warm-up the follower was 20 entries behind and caught up in 185.40µs
+  500 writes: p50 22.70µs, p99 69.50µs, max 85.70µs
+--- Run 2/5 ---
+  after the warm-up the follower was 8 entries behind and caught up in 8.10µs
+  isolated node is still at term 1 after 13 pre-vote rounds and 0 elections
+  node 1 rejoined at term 1 without an election
+  500 writes: p50 22.20µs, p99 67.90µs, max 81.70µs
+--- Run 3/5 ---
+  after the warm-up the follower was 13 entries behind and caught up in 19.40µs
+  500 writes: p50 24.40µs, p99 66.90µs, max 177.00µs
+--- Run 4/5 ---
+  after the warm-up the follower was 6 entries behind and caught up in 27.10µs
+  500 writes: p50 24.10µs, p99 95.30µs, max 220.80µs
+--- Run 5/5 ---
+  after the warm-up the follower was 27 entries behind and caught up in 173.00µs
+  500 writes: p50 23.30µs, p99 62.70µs, max 196.70µs
+  Leader commit to follower apply, p99 [PASS/OK]:
+    Runs: [0.0695ms, 0.0679ms, 0.0669ms, 0.0953ms, 0.0627ms]
+    Average: 0.0725ms <= 5ms (target)
+    Min/Max: 0.0627ms / 0.0953ms, StdDev: 0.0116ms
+
+=== Write Throughput, Three Nodes ===
+--- Run 1/5 ---
+  5,000 writes at 16 outstanding: p50 732.50µs, p90 1.03ms, p99 1.66ms, max 2.82ms
+  unsaturated node 1: 672 log fsyncs, the slowest 768.00µs
+  unsaturated node 2: 684 log fsyncs, the slowest 735.00µs
+  unsaturated node 3: 658 log fsyncs, the slowest 850.00µs
+  unsaturated mix: 2,213 messages with entries, 4.5 entries each, 0 heartbeats, 26 commit carriers
+  unsaturated tail: 633 writes over 1ms, 36 over 2ms, 0 over 4ms
+  100,000 writes at 512 outstanding in 292.02ms, 342,437 ops/sec, p50 1.43ms, p99 2.48ms
+  the leader sent 1,993 messages with entries, 100.4 entries each, 0 heartbeats and 5 commit carriers
+  follower 1 appended 105,001 entries, refused 0 appends, truncated 0 times
+  follower 3 appended 105,001 entries, refused 0 appends, truncated 0 times
+  node 1: 1203 log fsyncs, the slowest 3.59ms
+  node 2: 1379 log fsyncs, the slowest 3.74ms
+  node 3: 1180 log fsyncs, the slowest 3.60ms
+--- Run 2/5 ---
+  5,000 writes at 16 outstanding: p50 703.00µs, p90 1.00ms, p99 1.99ms, max 5.40ms
+  unsaturated node 1: 674 log fsyncs, the slowest 4.69ms
+  unsaturated node 2: 679 log fsyncs, the slowest 4.57ms
+  unsaturated node 3: 692 log fsyncs, the slowest 3.26ms
+  unsaturated mix: 2,205 messages with entries, 4.5 entries each, 0 heartbeats, 28 commit carriers
+  unsaturated tail: 514 writes over 1ms, 47 over 2ms, 7 over 4ms
+  100,000 writes at 512 outstanding in 271.50ms, 368,327 ops/sec, p50 1.34ms, p99 2.22ms
+  the leader sent 1,996 messages with entries, 100.2 entries each, 0 heartbeats and 3 commit carriers
+  follower 1 appended 105,001 entries, refused 0 appends, truncated 0 times
+  follower 2 appended 105,001 entries, refused 0 appends, truncated 0 times
+  node 1: 1244 log fsyncs, the slowest 4.69ms
+  node 2: 1244 log fsyncs, the slowest 4.57ms
+  node 3: 1400 log fsyncs, the slowest 3.26ms
+--- Run 3/5 ---
+  5,000 writes at 16 outstanding: p50 734.10µs, p90 1.05ms, p99 2.19ms, max 2.51ms
+  unsaturated node 1: 668 log fsyncs, the slowest 699.00µs
+  unsaturated node 2: 700 log fsyncs, the slowest 663.00µs
+  unsaturated node 3: 675 log fsyncs, the slowest 671.00µs
+  unsaturated mix: 2,232 messages with entries, 4.5 entries each, 0 heartbeats, 34 commit carriers
+  unsaturated tail: 706 writes over 1ms, 67 over 2ms, 0 over 4ms
+  100,000 writes at 512 outstanding in 275.86ms, 362,498 ops/sec, p50 1.38ms, p99 2.29ms
+  the leader sent 1,999 messages with entries, 100.1 entries each, 0 heartbeats and 2 commit carriers
+  follower 1 appended 105,001 entries, refused 0 appends, truncated 0 times
+  follower 3 appended 105,001 entries, refused 0 appends, truncated 0 times
+  node 1: 1248 log fsyncs, the slowest 699.00µs
+  node 2: 1395 log fsyncs, the slowest 756.00µs
+  node 3: 1231 log fsyncs, the slowest 684.00µs
+--- Run 4/5 ---
+  5,000 writes at 16 outstanding: p50 774.40µs, p90 1.08ms, p99 1.54ms, max 4.60ms
+  unsaturated node 1: 683 log fsyncs, the slowest 3.66ms
+  unsaturated node 2: 688 log fsyncs, the slowest 3.71ms
+  unsaturated node 3: 674 log fsyncs, the slowest 3.69ms
+  unsaturated mix: 2,220 messages with entries, 4.5 entries each, 0 heartbeats, 31 commit carriers
+  unsaturated tail: 867 writes over 1ms, 27 over 2ms, 16 over 4ms
+  100,000 writes at 512 outstanding in 290.40ms, 344,354 ops/sec, p50 1.42ms, p99 3.26ms
+  the leader sent 1,894 messages with entries, 105.6 entries each, 0 heartbeats and 3 commit carriers
+  follower 1 appended 105,001 entries, refused 0 appends, truncated 0 times
+  follower 3 appended 105,001 entries, refused 0 appends, truncated 0 times
+  node 1: 1264 log fsyncs, the slowest 3.66ms
+  node 2: 1347 log fsyncs, the slowest 3.71ms
+  node 3: 1252 log fsyncs, the slowest 3.69ms
+--- Run 5/5 ---
+  5,000 writes at 16 outstanding: p50 676.10µs, p90 997.30µs, p99 1.72ms, max 2.68ms
+  unsaturated node 1: 671 log fsyncs, the slowest 689.00µs
+  unsaturated node 2: 692 log fsyncs, the slowest 661.00µs
+  unsaturated node 3: 670 log fsyncs, the slowest 708.00µs
+  unsaturated mix: 2,197 messages with entries, 4.6 entries each, 0 heartbeats, 29 commit carriers
+  unsaturated tail: 485 writes over 1ms, 43 over 2ms, 0 over 4ms
+  100,000 writes at 512 outstanding in 269.94ms, 370,459 ops/sec, p50 1.35ms, p99 2.20ms
+  the leader sent 2,001 messages with entries, 100.0 entries each, 0 heartbeats and 3 commit carriers
+  follower 1 appended 105,001 entries, refused 0 appends, truncated 0 times
+  follower 3 appended 105,001 entries, refused 0 appends, truncated 0 times
+  node 1: 1218 log fsyncs, the slowest 689.00µs
+  node 2: 1371 log fsyncs, the slowest 755.00µs
+  node 3: 1219 log fsyncs, the slowest 708.00µs
+  Committed writes on a three node group [PASS/OK]:
+    Runs: [342,437 ops/sec, 368,327 ops/sec, 362,498 ops/sec, 344,354 ops/sec, 370,459 ops/sec]
+    Average: 357,615 ops/sec >= 50,000 ops/sec (target)
+    Min/Max: 342,437 ops/sec / 370,459 ops/sec, StdDev: 11,914 ops/sec
+  Write latency p99, group not saturated [PASS/OK]:
+    Runs: [1.6580ms, 1.9917ms, 2.1929ms, 1.5371ms, 1.7219ms]
+    Average: 1.8203ms <= 10ms (target)
+    Min/Max: 1.5371ms / 2.1929ms, StdDev: 0.2385ms
+  Write latency p99, group saturated:
+    Runs: [2.4818ms, 2.2236ms, 2.2936ms, 3.2645ms, 2.1980ms]
+    Average: 2.4923ms (no target set)
+    Min/Max: 2.1980ms / 3.2645ms, StdDev: 0.3987ms
+
+=== Snapshot Create and Transfer, One Gigabyte ===
+  built 1.00 GiB of state in 1.07s
+--- Run 1/5 ---
+  created a 1.00 GiB snapshot in 631.33ms (1622 MiB/sec)
+  transferred and installed 1,074,053,156 bytes in 2.87s (358 MiB/sec)
+--- Run 2/5 ---
+  created a 1.00 GiB snapshot in 863.94ms (1186 MiB/sec)
+  transferred and installed 1,074,053,156 bytes in 2.25s (456 MiB/sec)
+--- Run 3/5 ---
+  created a 1.00 GiB snapshot in 830.86ms (1233 MiB/sec)
+  transferred and installed 1,074,053,156 bytes in 2.34s (437 MiB/sec)
+--- Run 4/5 ---
+  created a 1.00 GiB snapshot in 807.03ms (1269 MiB/sec)
+  transferred and installed 1,074,053,156 bytes in 2.37s (432 MiB/sec)
+--- Run 5/5 ---
+  created a 1.00 GiB snapshot in 805.12ms (1272 MiB/sec)
+  transferred and installed 1,074,053,156 bytes in 2.17s (471 MiB/sec)
+  Checkpoint one gigabyte of state [PASS/OK]:
+    Runs: [0.6313s, 0.8639s, 0.8309s, 0.8070s, 0.8051s]
+    Average: 0.7877s <= 30s (target)
+    Min/Max: 0.6313s / 0.8639s, StdDev: 0.0810s
+  Stream one gigabyte to a node that has none of it [PASS/OK]:
+    Runs: [2.8651s, 2.2458s, 2.3440s, 2.3684s, 2.1741s]
+    Average: 2.3995s <= 60s (target)
+    Min/Max: 2.1741s / 2.8651s, StdDev: 0.2430s
+
+=== Leader Election Latency ===
+--- Run 1/5 ---
+  10 elections: mean 216.0ms, worst 266.9ms
+--- Run 2/5 ---
+  10 elections: mean 235.0ms, worst 482.1ms
+--- Run 3/5 ---
+  10 elections: mean 232.3ms, worst 474.1ms
+--- Run 4/5 ---
+  10 elections: mean 188.4ms, worst 296.4ms
+--- Run 5/5 ---
+  10 elections: mean 192.8ms, worst 249.7ms
+  Leader replaced after a kill [PASS/OK]:
+    Runs: [216.0420ms, 235.0334ms, 232.2691ms, 188.4403ms, 192.7874ms]
+    Average: 212.9144ms <= 500ms (target)
+    Min/Max: 188.4403ms / 235.0334ms, StdDev: 19.3789ms
