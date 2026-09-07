@@ -279,6 +279,15 @@ impl UpgradeService {
                     .to_string(),
             });
         }
+        let discord = parts.config.upgrade.notify_discord_webhook_url.trim();
+        if !discord.is_empty() {
+            // A configured address outside the Discord webhook shape stops
+            // the node here, so a configured alerting path is live or the
+            // node says why it is not
+            channels.push(ContactChannel::discord(discord).map_err(|reason| {
+                ZyronError::Internal(format!("upgrade.notify_discord_webhook_url, {reason}"))
+            })?);
+        }
         let sink = HttpNotificationSink::new(NOTIFY_TIMEOUT_SECS).map_err(ZyronError::Internal)?;
         let notifier = Notifier::new(channels, Arc::new(sink));
 

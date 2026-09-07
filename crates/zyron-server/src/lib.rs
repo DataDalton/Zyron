@@ -11,6 +11,7 @@ pub mod columnar_recovery;
 pub mod columnar_wal_pin;
 pub mod config;
 pub mod crypto_settings;
+pub mod deprecations;
 pub mod feature_persistence;
 pub mod format;
 pub mod gateway;

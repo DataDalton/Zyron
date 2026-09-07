@@ -25,6 +25,9 @@
 //! | Format documentation query               | latency  | 20ms         |
 //! | Startup with 30 formats registered       | latency  | 100ms        |
 //! | System catalog registration at startup   | latency  | 30ms         |
+//! | Discord embed encode per event           | latency  | 10us         |
+//! | Discord webhook address check            | latency  | 5us          |
+//! | Discord delivery through a 1s rate limit | latency  | 1.2s         |
 //!
 //! Validation Requirements:
 //! - Each measurement runs 5 iterations
@@ -61,11 +64,13 @@ use zyron_common::format::version::VersionWindow;
 use zyron_common::format::wire_version::WireVersionRegistry;
 use zyron_common::format::{
     ALL_FORMAT_KINDS, FormatKind, FormatRegistry, FormatSubstrate, FormatVersion, UpgradeBoard,
+    UpgradeOutcome,
 };
 use zyron_parser::ast::Statement;
 use zyron_parser::rewriter::{self, RenameTarget, UserObjectRewrite, default_diff, rename};
 use zyron_server::upgrade::compat_gate::{self, GateInput, UserObject};
 use zyron_server::upgrade::migrations::{self, InMemoryCatalogStore};
+use zyron_server::upgrade::notification::{self, NotificationSink, UpgradeEvent};
 
 // =============================================================================
 // Performance Target Constants
@@ -85,6 +90,9 @@ const COMPAT_GATE_10K_TARGET_MS: f64 = 120_000.0;
 const FORMAT_DOC_QUERY_TARGET_MS: f64 = 20.0;
 const SUBSTRATE_LOAD_TARGET_MS: f64 = 100.0;
 const CATALOG_REGISTRATION_TARGET_MS: f64 = 30.0;
+const DISCORD_EMBED_ENCODE_TARGET_US: f64 = 10.0;
+const DISCORD_URL_VALIDATION_TARGET_US: f64 = 5.0;
+const DISCORD_RATE_LIMITED_DELIVERY_TARGET_MS: f64 = 1_200.0;
 
 /// The suite's measurements are serialized so one test's allocation and
 /// cache pressure does not land in another's numbers
@@ -1165,4 +1173,185 @@ async fn bench_deprecation_scan() {
 
     let after = take_util_snapshot();
     record_test_util("Deprecation Scan", before, after);
+}
+
+// =============================================================================
+// 15. Discord contact channel delivery
+// =============================================================================
+
+/// The embed body a Discord channel encodes for one event, and the address
+/// check every channel construction pays. Both are pure CPU on the path an
+/// upgrade step takes to reach a person
+#[tokio::test]
+async fn bench_discord_embed_and_url_validation() {
+    zyron_bench_harness::init("format_substrate");
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    calibrate();
+    let before = take_util_snapshot();
+
+    tprintln!("\n=== Discord Embed Encode and URL Validation ===");
+
+    // One event of each kind, so the encode measurement spans the whole
+    // field and color map
+    let events = vec![
+        UpgradeEvent::PendingDetected {
+            from_version: "0.12.0".to_string(),
+            to_version: "0.13.0".to_string(),
+            gate_summary: "0 blocker(s), 4 safe rewrites".to_string(),
+        },
+        UpgradeEvent::Started {
+            from_version: "0.12.0".to_string(),
+            to_version: "0.13.0".to_string(),
+        },
+        UpgradeEvent::NodeCompleted {
+            node_id: "node-2".to_string(),
+            to_version: "0.13.0".to_string(),
+            nodes_remaining: 1,
+        },
+        UpgradeEvent::RolledBack {
+            node_id: "node-2".to_string(),
+            reason: "p99 latency stayed above the baseline multiplier".to_string(),
+        },
+        UpgradeEvent::Paused {
+            reason: "operator".to_string(),
+        },
+        UpgradeEvent::Blocked {
+            reason: "an unsafe rewrite has no acknowledgment".to_string(),
+        },
+        UpgradeEvent::Completed {
+            to_version: "0.13.0".to_string(),
+            outcome: UpgradeOutcome::Completed,
+            detail: "3 node(s) upgraded".to_string(),
+        },
+    ];
+
+    let iterations = 100_000usize;
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let mut bytes = 0usize;
+        for i in 0..iterations {
+            let payload =
+                notification::discord_payload(black_box(&events[i % events.len()]), 1_757_251_845);
+            bytes += payload.to_string().len();
+        }
+        black_box(bytes);
+        runs.push(start.elapsed().as_micros() as f64 / iterations as f64);
+    }
+    let v = validate_metric_with_unit(
+        "Discord Embed Encode",
+        "one event",
+        "us",
+        runs,
+        DISCORD_EMBED_ENCODE_TARGET_US,
+        false,
+    );
+    assert!(v.passed, "the embed encode exceeded its target");
+
+    // The address check, over the forms it accepts and the forms it refuses,
+    // because a refusal that scans the whole address is the slower half
+    let addresses = [
+        "https://discord.com/api/webhooks/123456789012345678/aB9_-zZtoken",
+        "https://canary.discord.com/api/webhooks/1/a",
+        "https://ptb.discordapp.com/api/webhooks/98765432109876543/tok",
+        "http://discord.com/api/webhooks/1/a",
+        "https://discord.evil.com/api/webhooks/1/a",
+        "https://discord.com/api/webhooks/1/a/extra",
+    ];
+    let iterations = 1_000_000usize;
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let mut accepted = 0usize;
+        for i in 0..iterations {
+            accepted += usize::from(notification::discord_webhook_url_is_wellformed(black_box(
+                addresses[i % addresses.len()],
+            )));
+        }
+        black_box(accepted);
+        runs.push(start.elapsed().as_micros() as f64 / iterations as f64);
+    }
+    let v = validate_metric_with_unit(
+        "Discord URL Validation",
+        "one address",
+        "us",
+        runs,
+        DISCORD_URL_VALIDATION_TARGET_US,
+        false,
+    );
+    assert!(v.passed, "the address check exceeded its target");
+
+    let after = take_util_snapshot();
+    record_test_util("Discord Embed and URL", before, after);
+}
+
+/// A rate-limited delivery end to end: the channel answers 429 asking for a
+/// second, the sink waits it out and posts again. What is measured is the
+/// wall time an upgrade step pays for one throttled channel, which is the
+/// interval the channel asked for plus two round trips
+#[tokio::test]
+async fn bench_discord_rate_limited_delivery() {
+    zyron_bench_harness::init("format_substrate");
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    calibrate();
+    let before = take_util_snapshot();
+
+    tprintln!("\n=== Discord Delivery Through a 1s Rate Limit ===");
+
+    let event = UpgradeEvent::NodeCompleted {
+        node_id: "node-2".to_string(),
+        to_version: "0.13.0".to_string(),
+        nodes_remaining: 1,
+    };
+    let sink = notification::HttpNotificationSink::new(30).expect("builds");
+
+    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        // A fresh server per run, so the first post of each run is the one
+        // that gets throttled
+        let server = httpmock::MockServer::start_async().await;
+        let limited = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/hook");
+                then.status(429).header("retry-after", "1");
+            })
+            .await;
+        let channel = notification::ContactChannel::Discord {
+            webhook_url: server.url("/hook"),
+        };
+
+        let start = Instant::now();
+        let delivery = tokio::join!(sink.deliver(&channel, &event), async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            limited.delete_async().await;
+            server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::POST).path("/hook");
+                    then.status(200);
+                })
+                .await;
+        })
+        .0;
+        runs.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+        assert!(delivery.delivered, "{}", delivery.detail);
+        assert!(
+            delivery.detail.contains("second attempt answered 200"),
+            "{}",
+            delivery.detail
+        );
+    }
+
+    let v = validate_metric_with_unit(
+        "Discord Rate-Limited Delivery",
+        "one event",
+        "ms",
+        runs,
+        DISCORD_RATE_LIMITED_DELIVERY_TARGET_MS,
+        false,
+    );
+    assert!(v.passed, "the throttled delivery exceeded its target");
+
+    let after = take_util_snapshot();
+    record_test_util("Discord Rate-Limited Delivery", before, after);
 }

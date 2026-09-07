@@ -163,6 +163,9 @@ pub struct UpgradeSection {
     /// A Slack incoming webhook that receives upgrade notifications, empty
     /// for none
     pub notify_slack_webhook_url: String,
+    /// A Discord channel webhook that receives upgrade notifications as an
+    /// embed, empty for none
+    pub notify_discord_webhook_url: String,
 }
 
 impl Default for UpgradeSection {
@@ -197,6 +200,7 @@ impl Default for UpgradeSection {
             release_signing_scheme: "Ed25519".to_string(),
             notify_webhook_url: String::new(),
             notify_slack_webhook_url: String::new(),
+            notify_discord_webhook_url: String::new(),
         }
     }
 }
@@ -1000,6 +1004,22 @@ impl ZyronConfig {
                 "notify_slack_webhook_url" => {
                     self.upgrade.notify_slack_webhook_url = value.into();
                 }
+                // The address is checked here, so a malformed one is
+                // refused where it is set and the next restart builds the
+                // channel from a value that already passed
+                "notify_discord_webhook_url" => {
+                    let address = value.trim();
+                    if !address.is_empty() {
+                        crate::upgrade::notification::ContactChannel::discord(address).map_err(
+                            |reason| {
+                                ZyronError::Internal(format!(
+                                    "invalid value for config key {section}.{key}, {reason}"
+                                ))
+                            },
+                        )?;
+                    }
+                    self.upgrade.notify_discord_webhook_url = address.into();
+                }
                 _ => return unknown_key(section, key),
             },
             // One entry per artifact kind, and the kinds belong to the
@@ -1523,6 +1543,9 @@ impl ZyronConfig {
             "upgrade.notify_slack_webhook_url" => {
                 Some(self.upgrade.notify_slack_webhook_url.clone())
             }
+            "upgrade.notify_discord_webhook_url" => {
+                Some(self.upgrade.notify_discord_webhook_url.clone())
+            }
             // Also support shorthand aliases
             "server_version" => Some(env!("CARGO_PKG_VERSION").to_string()),
             "port" => Some(self.server.port.to_string()),
@@ -1903,6 +1926,13 @@ impl ZyronConfig {
                 "upgrade.notify_slack_webhook_url".into(),
                 self.upgrade.notify_slack_webhook_url.clone(),
                 "Slack incoming webhook that receives upgrade notifications, empty for none".into(),
+            ),
+            (
+                "upgrade.notify_discord_webhook_url".into(),
+                self.upgrade.notify_discord_webhook_url.clone(),
+                "Discord channel webhook that receives upgrade notifications as an embed, \
+                 empty for none"
+                    .into(),
             ),
         ]
     }
@@ -2683,6 +2713,48 @@ deployment_mode = "lake"
 
     // ALTER SYSTEM overrides are refused up front instead of being dropped
     // silently at the next boot
+    #[test]
+    fn test_a_discord_notify_url_is_checked_where_it_is_set() {
+        let mut config = ZyronConfig::default();
+        config
+            .apply_override(
+                "upgrade.notify_discord_webhook_url",
+                " https://discord.com/api/webhooks/1/abc ",
+            )
+            .expect("a Discord webhook address is taken, trimmed");
+        assert_eq!(
+            config.upgrade.notify_discord_webhook_url,
+            "https://discord.com/api/webhooks/1/abc"
+        );
+        assert_eq!(
+            config.get_config_value("upgrade.notify_discord_webhook_url"),
+            Some("https://discord.com/api/webhooks/1/abc".to_string())
+        );
+
+        let err = config
+            .apply_override("upgrade.notify_discord_webhook_url", "https://example/hook")
+            .expect_err("an address that is not a Discord webhook must be refused");
+        assert!(
+            err.to_string()
+                .contains("upgrade.notify_discord_webhook_url"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("is not a Discord webhook address"),
+            "{err}"
+        );
+        assert_eq!(
+            config.upgrade.notify_discord_webhook_url, "https://discord.com/api/webhooks/1/abc",
+            "a refused address leaves the configured one in place"
+        );
+
+        // Empty clears the channel, so an operator can turn it off
+        config
+            .apply_override("upgrade.notify_discord_webhook_url", "")
+            .expect("empty is accepted");
+        assert!(config.upgrade.notify_discord_webhook_url.is_empty());
+    }
+
     #[test]
     fn test_apply_override_refuses_unknown_and_unparseable() {
         let mut config = ZyronConfig::default();

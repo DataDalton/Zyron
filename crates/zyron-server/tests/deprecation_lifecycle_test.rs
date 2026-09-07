@@ -619,10 +619,38 @@ fn a_malformed_deprecation_record_is_refused_at_load() {
 /// This release deprecates nothing, which is what makes the registry empty
 /// and the release check's rewriter requirement vacuously satisfied
 #[test]
-fn this_release_deprecates_nothing() {
-    assert!(
-        substrate().deprecations.records().is_empty(),
+fn this_release_deprecates_the_removed_contact_channel_kind() {
+    let records = substrate().deprecations.records();
+    assert_eq!(
+        records.len(),
+        1,
         "a deprecation added here needs a rewriter and a guide"
     );
-    assert!(substrate().deprecations.guides().is_empty());
+    let record = &records[0];
+    assert_eq!(record.item_id, "upgrade contact channel kind pagerduty");
+    assert_eq!(record.item_kind, DeprecatedItemKind::ConfigKey);
+    assert!(
+        !record.item_kind.is_user_authored_sql(),
+        "a config key is owed no SQL rewriter"
+    );
+    assert_eq!(
+        record.stage(BinaryVersion::parse("0.14.0").expect("parses")),
+        DeprecationStage::Removed
+    );
+
+    // The replacement the record names is a channel this binary builds
+    assert!(
+        zyron_server::upgrade::notification::ContactChannel::discord(
+            "https://discord.com/api/webhooks/1/abc"
+        )
+        .is_ok()
+    );
+
+    let guides = substrate().deprecations.guides();
+    assert_eq!(guides.len(), 1);
+    assert!(
+        guides[0].body.contains("notify_discord_webhook_url"),
+        "{}",
+        guides[0].body
+    );
 }

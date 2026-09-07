@@ -9,7 +9,7 @@ Auto-upgrade composes existing subsystems rather than adding coordination of its
 - Raft consensus for leadership transfer and rolling coordination.
 - The drain coordinator for a per-node restart that hands its hot set to survivors first.
 - The audit hash chain for a step-by-step record.
-- Contact channels for notification delivery.
+- Contact channels for notification delivery, one of email, webhook, Slack, or Discord.
 - Signature agility for release manifest signing and verification.
 - Federation coordination for the cross-cluster compatibility gate.
 - App compatibility declarations for matching an App against the target version.
@@ -117,7 +117,40 @@ The release workflow signs. `zyron-ctl release keygen` draws the key, its privat
 
 ## Notification dispatch
 
-Every upgrade state transition emits an audit event and a notification. Targets are the webhook and Slack channels configured with `upgrade.notify_webhook_url` and `upgrade.notify_slack_webhook_url`, delivered by an HTTP POST of the event JSON. `rolling::run` announces each node that completes with how many remain.
+Every upgrade state transition emits an audit event and a notification. Targets are the webhook, Slack, and Discord channels configured with `upgrade.notify_webhook_url`, `upgrade.notify_slack_webhook_url`, and `upgrade.notify_discord_webhook_url`. `rolling::run` announces each node that completes with how many remain.
+
+The webhook and Slack kinds take an HTTP POST of the event JSON, one attempt, and report the status they got back. The email kind reports undelivered because this node has no mail transport.
+
+### Discord delivery
+
+A Discord channel posts one embed per event:
+
+```json
+{"embeds": [{"title": "<event subject>",
+             "description": "<event body>",
+             "color": 3447003,
+             "fields": [{"name": "To version", "value": "0.13.0", "inline": true}],
+             "footer": {"text": "Zyron auto-upgrade"},
+             "timestamp": "2025-09-07T13:30:45Z"}]}
+```
+
+`title` is `UpgradeEvent::subject()` and `description` is `UpgradeEvent::body()`. `fields` is `UpgradeEvent::detail_fields()`, the labeled details that event holds: the from-version and to-version where the event moves between two, the node id where the event is about one node, the compatibility gate summary on a pending release, and the outcome on a completed sequence. An event with no such detail carries an empty array. `timestamp` is the event's second, formatted ISO-8601 UTC.
+
+`color` is `UpgradeEvent::embed_color()`, an integer Discord reads as a hex color:
+
+| Event | Color | Class |
+| ----- | ----- | ----- |
+| `PendingDetected` | `0x3498DB` | informational |
+| `Started` | `0x3498DB` | informational |
+| `NodeCompleted` | `0x2ECC71` | progress that landed |
+| `RolledBack` | `0xE74C3C` | alarm |
+| `Paused` | `0xF39C12` | attention |
+| `Blocked` | `0xE74C3C` | alarm |
+| `Completed` | `0x2ECC71` | progress that landed |
+
+`ContactChannel::discord` is the only path that builds the variant, and it refuses an address that does not match `^https://(canary\.|ptb\.)?discord(app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+$`. `discord_webhook_url_is_wellformed` walks the address once. `config.set` runs the same check, so a malformed address is refused where it is set, and `UpgradeService::new` refuses to start a node whose configured address does not pass.
+
+A Discord delivery is the one path that retries. On HTTP 429 the sink reads `retry-after`, sleeps that many seconds, posts once more, and reports what the second attempt answered. The honored interval caps at `DISCORD_MAX_RETRY_AFTER_SECS`, 60 seconds. An interval past the cap reports undelivered naming the cap, so one channel's rate limit never holds an upgrade step. A 429 carrying no usable `retry-after` reports undelivered at once, with no sleep. Every other status is reported as it came back.
 
 ## Downgrade eligibility check
 

@@ -213,6 +213,49 @@ Say the heap page format goes from 3.0 to 4.0 because a field widens. The migrat
 
 The release check verifies the migrator and fixture are present and fails the release if either is missing.
 
+## Developer workflow: removing a feature
+
+A `migrations/` folder holds format version steps. A step file carries a `FormatMigrator` that transforms bytes and the `FormatFixture` of the version it reads, and it is named after the format version pair it moves between.
+
+A deprecation record carries metadata and no code. It lives in the crate's `deprecations.rs`, beside the `format.rs` where the same crate submits its formats. Records are grouped by the release that removed the item, newest last, so retiring one is deleting its block.
+
+A removal that transforms no bytes on disk has a deprecation record, no step file, and no fixture.
+
+Say the pagerduty contact channel kind goes away in 0.14.0.
+
+1. Delete the variant, its match arms, and its delivery path. Nothing is kept for compatibility.
+
+2. Add the record to `crates/zyron-server/src/deprecations.rs`, declared with `pub mod deprecations;` from `lib.rs`:
+
+   ```rust
+   inventory::submit! {
+       DeprecationRecord {
+           item_kind: DeprecatedItemKind::ConfigKey,
+           item_id: "upgrade contact channel kind pagerduty",
+           deprecated_since_version: "0.14.0",
+           warn_until_version: "0.14.0",
+           error_since_version: "0.14.0",
+           removed_since_version: "0.14.0",
+           replacement_ref: Some("upgrade.notify_discord_webhook_url"),
+           migration_guide_url: None,
+           no_guide_required: true,
+           summary: "The pagerduty contact channel kind was removed. Upgrade \
+                     notifications go to a Discord, Slack, or plain webhook channel",
+           before_example: "ALTER SYSTEM SET upgrade.notify_pagerduty_routing_key = 'RK-XXXX'",
+           after_example: "ALTER SYSTEM SET upgrade.notify_discord_webhook_url = \
+                           'https://discord.com/api/webhooks/123/abc'",
+           migration_snippet: "SHOW ALL",
+           common_pitfall: "A PagerDuty routing key is not a URL",
+       }
+   }
+   ```
+
+3. A removal that lands in one release carries that release in all four lifecycle fields, which is what makes `stage()` report `removed` on that binary and every later one. A removal announced ahead of time carries the earlier release in `deprecated_since_version` and `warn_until_version` and walks the stages as the running version passes each.
+
+4. A record whose `item_kind` is a user-authored SQL surface needs a registered rewriter, and the startup gate refuses to start without one. A config key, a wire message, and a format version need none.
+
+The record reaches `zyron_sys.deprecation.registry`, and `zyron_sys.deprecation.migration_guides` publishes a guide generated from the before and after examples. `zyron-ctl release verify` counts the records and fails the release if one carries no `migration_guide_url` and is not marked `no_guide_required`.
+
 ## Worked examples in the tree
 
 Two formats carry a live migration today, both own-trailer, both forward-only.
@@ -223,12 +266,14 @@ The lake manifest moved 2.0 to 2.1 in `crates/zyron-lake/src/manifest/migrations
 
 Both declare the migration policy eager, the migration not reversible, and the retirement date 2027-03-01 for the reader of the older version. The user's stance is old to new only, no backward function and no downgrade for these steps.
 
+One deprecation record is live, in `crates/zyron-server/src/deprecations.rs`. The pagerduty contact channel kind was removed in 0.14.0 and the record names `upgrade.notify_discord_webhook_url` as its replacement. It carries no step file and no fixture. Nothing on disk holds a contact channel.
+
 ## Retention lifecycle
 
 - A reader is carried for the current version and the versions in its window. Widen the window when a version is added, narrow it when the oldest retires.
 - A migrator moving files from the oldest supported version into the window is kept as long as that version is in the window.
 - A major version boundary is the place to consolidate prior-major migrations into a single step.
-- The deprecation registry keeps a metadata-only record, no code.
+- The deprecation registry keeps a metadata-only record, no code. It lives in the crate's `deprecations.rs`. See [Developer workflow: removing a feature](#developer-workflow-removing-a-feature).
 
 When a version passes its `retirement_date`, `zyron-ctl release verify` fails while its reader, migrator, or fixture is still in the tree, so the decision to delete old code is a date, not a judgment call.
 

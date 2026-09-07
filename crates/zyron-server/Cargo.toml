@@ -70,6 +70,9 @@ profile = [
 
 [dev-dependencies]
 tempfile = "3"
+# Stands in for a Discord webhook so the embed body, the 429 retry-after
+# path, and its cap are exercised against a real HTTP answer
+httpmock = "0.7"
 # Writes the Parquet fixture the conformance suite points an external source
 # at. Pinned to the version zyron-streaming reads with, so the test exercises
 # the reader this build ships

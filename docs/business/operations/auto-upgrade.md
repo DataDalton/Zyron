@@ -128,6 +128,7 @@ The settings live in the `[upgrade]` section of `zyron.toml`. Each one can also 
 | | `upgrade.release_signing_scheme` | `Ed25519` | The scheme that key belongs to. |
 | | `upgrade.notify_webhook_url` | (unset) | Webhook that receives upgrade notifications. |
 | | `upgrade.notify_slack_webhook_url` | (unset) | Slack incoming webhook that receives upgrade notifications. |
+| | `upgrade.notify_discord_webhook_url` | (unset) | Discord channel webhook that receives upgrade notifications as an embed. |
 
 Each node reads its own `[upgrade]` section at start, and a value set with `ALTER SYSTEM SET` reaches every node through the replicated log and is written to each node's `zyron.auto.conf`, so keep the `[upgrade]` section the same across a cluster. The overrides converge on their own.
 
@@ -163,7 +164,7 @@ Live progress is also available via WebSocket subscription:
 
 ## Notification
 
-Every upgrade step is written to the audit hash chain and delivered to the channels configured with `upgrade.notify_webhook_url` and `upgrade.notify_slack_webhook_url`, both HTTP posts of the event made by the node directly. Notifications fire when an upgrade is pending, when it starts, when each node completes, on any rollback or pause event, and when the sequence finishes.
+Every upgrade step is written to the audit hash chain and delivered to the channels configured with `upgrade.notify_webhook_url`, `upgrade.notify_slack_webhook_url`, and `upgrade.notify_discord_webhook_url`, all HTTP posts of the event made by the node directly. Notifications fire when an upgrade is pending, when it starts, when each node completes, on any rollback or pause event, and when the sequence finishes. A Discord channel takes the webhook address a Discord server's channel integrations page issues, described in [Discord's own webhook guide](https://support.discord.com/hc/en-us/articles/228383668), and an address that is not one is refused where it is set. Discord answers a burst with a rate limit. The node waits it out once for up to 60 seconds, and an interval past that reports the event undelivered so one channel never holds an upgrade step.
 
 ## Troubleshooting
 
