@@ -41,6 +41,22 @@ pub struct Session {
     /// not authority: the group agreed the statement before it ran anywhere,
     /// so a node replaying it does not decide again whether it was allowed
     pub replicated_actor: Option<u32>,
+    /// The transaction this node's applier is replaying a schema change under.
+    ///
+    /// Set only on the session the applier builds. An online build waits for
+    /// the transactions that were running when it published, and this one
+    /// cannot end until the build returns, so it is held out of that wait. It
+    /// resolved no index set for the table before publication either: a schema
+    /// change is a barrier in the changeset and applies alone
+    pub apply_txn_id: Option<u64>,
+    /// The session's own open transaction, when a statement runs inside an
+    /// explicit BEGIN.
+    ///
+    /// Held out of an online build's wait for the same reason as the
+    /// applier's: it cannot end until the statement returns, and it is the
+    /// statement rather than a writer that would go unindexed. Set by the DDL
+    /// dispatch on every statement, so it is never stale
+    pub open_txn_id: Option<u64>,
     /// Per-session circuit breaker registry. Holds named breakers for use with
     /// CIRCUIT_BREAKER_STATUS('name') and ALTER CIRCUIT BREAKER 'name'.
     pub circuit_breakers: std::sync::Arc<zyron_types::resilience::CircuitBreakerRegistry>,
@@ -111,6 +127,8 @@ impl Session {
             statement_timeout_override: None,
             process_id: 0,
             replicated_actor: None,
+            apply_txn_id: None,
+            open_txn_id: None,
         }
     }
 

@@ -65,7 +65,15 @@ pub async fn read_heap_rows(
             if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
                 continue;
             }
-            let batch = decode_tuple_to_batch(view.data, table);
+            let batch = decode_tuple_to_batch(
+                view.data,
+                table,
+                view.header.schema_epoch,
+                Some(zyron_common::RowLocator::Heap {
+                    page: page_id,
+                    slot,
+                }),
+            )?;
             append_batch_row(&mut columns, table, &batch, 0);
         }
     }

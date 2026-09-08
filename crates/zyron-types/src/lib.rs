@@ -12,6 +12,8 @@ pub use registry::{
     is_types_window_function,
 };
 
+pub use representation::{Representation, representation_compatible};
+
 pub mod arena;
 pub mod barcode;
 pub mod bitfield;
@@ -48,6 +50,7 @@ pub mod range;
 pub mod rate_limit;
 pub mod rating;
 pub mod regex_type;
+pub mod representation;
 pub mod resilience;
 pub mod scheduling;
 pub mod semver;

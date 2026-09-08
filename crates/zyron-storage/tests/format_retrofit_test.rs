@@ -293,8 +293,14 @@ fn the_index_checkpoint_declares_its_version() {
     );
     assert_eq!(
         registration.writer_current_version,
+        FormatVersion::new(11, 1),
+        "the checkpoint stores each row's address once, in the locator behind its value, \
+         rather than again in the suffix of the key"
+    );
+    assert_eq!(
+        registration.reader_supported_versions.oldest,
         FormatVersion::new(11, 0),
-        "the checkpoint format carries the version it reached before this phase"
+        "a checkpoint written before the locator moved is still readable"
     );
     assert_eq!(registration.migration_policy.label(), "eager");
 }

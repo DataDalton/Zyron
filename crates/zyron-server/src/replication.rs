@@ -191,10 +191,15 @@ pub trait DdlRunner: Send + Sync {
     /// A context wired the way a statement's context is wired
     fn apply_context(&self, txn_id: u64, snapshot: Snapshot) -> Arc<ExecutionContext>;
 
+    /// `apply_txn_id` is the transaction this node is replaying the statement
+    /// under. An online build waits for the transactions that were running
+    /// when it published, and this one cannot end until the statement returns,
+    /// so the build is told to hold it out of that wait
     fn run<'a>(
         &'a self,
         sql: &'a str,
         context: &'a zyron_executor::replication::StatementContext,
+        apply_txn_id: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 }
 
@@ -690,7 +695,8 @@ impl ChangesetMachine {
     async fn apply_truncate(&self, ctx: &Arc<ExecutionContext>, table_id: u32) -> Result<()> {
         let entry = ctx.get_table_entry(zyron_catalog::TableId(table_id))?;
         let sql = format!("TRUNCATE TABLE {}", quote_ident(&entry.name));
-        self.run_dispatched(&sql, &self.local_context()).await
+        self.run_dispatched(&sql, &self.local_context(), ctx.txn_id)
+            .await
     }
 
     /// Applies a lake commit by replaying the leader's version file into this
@@ -755,13 +761,14 @@ impl ChangesetMachine {
         &self,
         sql: &str,
         context: &zyron_executor::replication::StatementContext,
+        apply_txn_id: u64,
     ) -> Result<()> {
         let Some(runner) = self.ddl.get() else {
             return Err(ZyronError::Internal(
                 "a schema change reached the applier before this node finished starting".into(),
             ));
         };
-        runner.run(sql, context).await
+        runner.run(sql, context, apply_txn_id).await
     }
 
     /// The context a change this node makes on its own behalf runs under
@@ -792,8 +799,7 @@ impl ChangesetMachine {
         // this node, and it is caught by the first entry that depends on what
         // this one was supposed to make: that one fails to apply and the node
         // stops rather than carrying on wrong
-        let _ = ctx;
-        if let Err(e) = self.run_dispatched(sql, context).await {
+        if let Err(e) = self.run_dispatched(sql, context, ctx.txn_id).await {
             tracing::warn!(
                 error = %e,
                 statement = %sql,
@@ -1338,6 +1344,7 @@ impl DdlRunner for DispatchedDdl {
         &'a self,
         sql: &'a str,
         context: &'a zyron_executor::replication::StatementContext,
+        apply_txn_id: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let Some(server) = self.server.upgrade() else {
@@ -1363,6 +1370,9 @@ impl DdlRunner for DispatchedDdl {
                     // could have this node refuse what the others carried out.
                     // What this settles is who owns what it creates
                     session.replicated_actor = context.actor_role_id;
+                    // An online build this statement runs cannot wait for the
+                    // transaction the statement is being replayed under
+                    session.apply_txn_id = Some(apply_txn_id);
                 }
                 let mut txn = None;
                 let mut branch = None;

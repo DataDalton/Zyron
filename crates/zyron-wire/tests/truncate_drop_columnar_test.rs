@@ -63,6 +63,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         replication: None,
         node_capabilities: None,
         catalog,
+        ddl_progress: std::sync::Arc::new(zyron_wire::ddl_progress::DdlProgressRegistry::new()),
+        shadow_targets: std::sync::Arc::new(scc::HashMap::new()),
         wal,
         buffer_pool: pool,
         disk_manager: disk,

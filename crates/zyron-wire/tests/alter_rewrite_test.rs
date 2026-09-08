@@ -57,6 +57,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         replication: None,
         node_capabilities: None,
         catalog,
+        ddl_progress: std::sync::Arc::new(zyron_wire::ddl_progress::DdlProgressRegistry::new()),
+        shadow_targets: std::sync::Arc::new(scc::HashMap::new()),
         wal,
         buffer_pool: pool,
         disk_manager: disk,
@@ -420,6 +422,19 @@ async fn drop_column_index_is_removed_other_index_survives() {
     .await;
 
     let table = server.catalog.get_table(schema_id, "t").unwrap();
+
+    // An index keyed on the column is refused rather than cascaded: dropping
+    // it changes which plans the table can serve, and that is the operator's
+    // decision to make
+    let refused = try_exec(&server, &mut session, "ALTER TABLE t DROP COLUMN name")
+        .await
+        .expect_err("an index on the column blocks the drop");
+    assert!(
+        refused.contains("idx_name"),
+        "the refusal names the index: {refused}"
+    );
+
+    exec(&server, &mut session, "DROP INDEX idx_name").await;
     exec(&server, &mut session, "ALTER TABLE t DROP COLUMN name").await;
 
     let table_after = server.catalog.get_table(schema_id, "t").unwrap();
@@ -438,8 +453,8 @@ async fn drop_column_index_is_removed_other_index_survives() {
         "index on surviving column kept: {names:?}"
     );
 
-    // The surviving index points at the new heap, so an indexed lookup returns
-    // the rebuilt rows.
+    // Nothing moved, so the index on the surviving column still points at the
+    // rows it pointed at before
     let rows = exec(
         &server,
         &mut session,
@@ -448,10 +463,13 @@ async fn drop_column_index_is_removed_other_index_survives() {
     .await;
     assert_eq!(total_rows(&rows), 1);
     assert_eq!(column_values(&rows, 0), vec![ScalarValue::Int32(2)]);
-    let _ = table; // table id is stable across the rewrite
     assert_eq!(
         table.id, table_after.id,
-        "table id preserved across rewrite"
+        "a column change never moves the table"
+    );
+    assert_eq!(
+        table.heap_file_id, table_after.heap_file_id,
+        "DROP COLUMN writes no heap page, so the files do not change"
     );
 }
 

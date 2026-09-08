@@ -39,7 +39,8 @@ pub use freespace::{
     space_to_category,
 };
 pub use heap::{
-    HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot,
+    EpochCensus, HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId,
+    TupleSlot,
 };
 pub use tuple::{
     Tuple, TupleFlags, TupleHeader, TupleId, TupleView, VERSIONED_TUPLE_HEADER_SIZE,

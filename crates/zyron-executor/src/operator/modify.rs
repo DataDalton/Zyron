@@ -12,8 +12,7 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_storage::TupleId;
 
 use crate::batch::{
-    DataBatch, batch_to_tuples, build_column_to_builder_map, create_builders,
-    decode_tuple_into_builders, encode_scalar_value, finalize_builders,
+    DataBatch, batch_to_tuples, create_builders, encode_scalar_value, finalize_builders,
 };
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
 use zyron_storage::columnar::{ColumnarPatchManager, PatchStore};
@@ -814,7 +813,12 @@ async fn insert_branch_batch(
 
     check_unique_constraints(ctx, table_entry, &batch, index_snap, &[]).await?;
 
-    let tuples = batch_to_tuples(&batch, &table_entry.columns, txn_id);
+    let tuples = batch_to_tuples(
+        &batch,
+        &table_entry.columns,
+        txn_id,
+        table_entry.schema_epoch,
+    );
     let ids =
         crate::operator::branch_write::branch_insert(ctx, branch_id, heap_file_id, &tuples).await?;
 
@@ -876,7 +880,15 @@ async fn branch_append_holds_value(
             {
                 continue;
             }
-            let row = crate::operator::fk::decode_tuple_to_batch(view.data, table_entry);
+            let row = crate::operator::fk::decode_tuple_to_batch(
+                view.data,
+                table_entry,
+                view.header.schema_epoch,
+                Some(zyron_common::RowLocator::Heap {
+                    page: page_id,
+                    slot,
+                }),
+            )?;
             if !encode_btree_index_key_into(&row, 0, key_cols, &mut scratch) {
                 continue;
             }
@@ -974,6 +986,22 @@ pub fn effective_retention_floor(
 
 /// Removes B+tree index entries for rows that vacuum reclaimed from the heap.
 ///
+/// One heap row lifted out of a page, with everything needed to rebuild the
+/// index key it contributed.
+///
+/// The epoch travels with the bytes because the bytes alone do not say how
+/// many columns they hold, and a row captured under an older layout is exactly
+/// the case index maintenance has to get right.
+#[derive(Debug, Clone)]
+pub struct CapturedRow {
+    /// Slot the row occupied, which is half of its locator
+    pub slot: u16,
+    /// Layout the row bytes were encoded under
+    pub schema_epoch: u16,
+    /// The row image
+    pub data: Vec<u8>,
+}
+
 /// On an MVCC delete or update the old row's index entries are intentionally
 /// kept: a still-live snapshot can read the old version, and an index scan
 /// rechecks visibility and the composite key on fetch. Once vacuum reclaims the
@@ -986,7 +1014,7 @@ pub fn effective_retention_floor(
 pub fn vacuum_index_cleanup(
     table_entry: &zyron_catalog::TableEntry,
     page_id: zyron_common::page::PageId,
-    dead: &[(u16, Vec<u8>)],
+    dead: &[CapturedRow],
     btree: &[zyron_catalog::BTreeIndexSpec],
     registry: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) {
@@ -1008,15 +1036,17 @@ pub fn vacuum_index_cleanup(
         })
         .collect();
     let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
-    let column_to_builder = build_column_to_builder_map(&table_entry.columns, &col_ids);
+    let decoder = crate::epoch_decode::EpochDecoder::new(table_entry, &col_ids);
     let mut builders = create_builders(&logical, dead.len());
-    for (_slot, row_data) in dead {
-        decode_tuple_into_builders(
-            row_data,
-            &table_entry.columns,
-            &column_to_builder,
-            &mut builders,
-        );
+    let mut decoded: Vec<&CapturedRow> = Vec::with_capacity(dead.len());
+    for row in dead {
+        // A row whose epoch names no layout leaves its index entries behind
+        // rather than deleting whatever key a misread produces. Vacuum runs
+        // again, and a stale entry is filtered on fetch, while a wrong
+        // deletion takes a live row's entry with it
+        if decoder.try_decode(row.schema_epoch, &row.data, &mut builders) {
+            decoded.push(row);
+        }
     }
     let batch = finalize_builders(builders);
 
@@ -1028,9 +1058,9 @@ pub fn vacuum_index_cleanup(
         let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        for (row_idx, (slot, _)) in dead.iter().enumerate() {
+        for (row_idx, row) in decoded.iter().enumerate() {
             if encode_btree_index_key_into(&batch, row_idx, &key_cols, &mut scratch) {
-                btree_heap_locator(page_id.page_num, *slot).append_key_suffix(&mut scratch);
+                btree_heap_locator(page_id.page_num, row.slot).append_key_suffix(&mut scratch);
                 tree.delete_sync(&scratch);
             }
         }
@@ -1043,18 +1073,135 @@ pub fn vacuum_index_cleanup(
 /// indexed value followed by the row's tuple id) is encoded exactly as
 /// `maintain_btree_insert` builds it, so the rebuilt tree is identical to one
 /// populated incrementally. Returns the number of entries inserted.
-pub fn rebuild_btree_index_from_rows(
+/// Adds one batch of rows to every full-text, vector and spatial index on a
+/// table.
+///
+/// The same call serves two callers. An insert uses it to maintain the indexes
+/// a table already has. An index build uses it to fill a new one from the rows
+/// that predate it, which is the only way the two can agree on what a row
+/// contributes.
+///
+/// `fts` and `vectors` are the handles the caller already resolved, so a
+/// statement inserting many batches looks each index up once rather than once
+/// per batch.
+pub fn fill_search_indexes(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    batch: &DataBatch,
+    locators: &[zyron_common::RowLocator],
+    fts: &[(
+        zyron_catalog::IndexId,
+        Arc<zyron_search::InvertedIndex>,
+        Arc<dyn zyron_search::Analyzer>,
+    )],
+    vectors: &[(u32, Arc<zyron_search::vector::VectorIndex>)],
+    index_snap: &zyron_catalog::TableIndexSnapshot,
+) -> zyron_common::Result<()> {
+    let needs_docs = !fts.is_empty() || !vectors.is_empty() || !index_snap.spatial.is_empty();
+    if !needs_docs {
+        return Ok(());
+    }
+    // One registry ordinal per row, shared by all three index kinds so a row
+    // is the same document to each of them
+    let Some(reg) = &ctx.doc_registry else {
+        return Err(ZyronError::Internal(
+            "search index maintenance requires the document registry".into(),
+        ));
+    };
+    let doc_ids: Vec<u64> = locators
+        .iter()
+        .map(|loc| reg.allocate(table_entry.id.0, *loc))
+        .collect();
+
+    if !fts.is_empty() {
+        let mut fts_buf = zyron_search::AnalysisBuffer::new();
+        let mut text_buf = String::with_capacity(256);
+        for (row_idx, doc_id) in doc_ids.iter().enumerate() {
+            text_buf.clear();
+            extract_fts_text_into(batch, row_idx, &table_entry.columns, &mut text_buf);
+            for (idx_id, fts_idx, analyzer) in fts.iter() {
+                if let Err(e) = fts_idx.add_document_with_buf(
+                    *doc_id,
+                    &text_buf,
+                    analyzer.as_ref(),
+                    &mut fts_buf,
+                ) {
+                    tracing::error!(
+                        target: "zyron::ddl",
+                        index_id = idx_id.0,
+                        "a full-text index did not take a document: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    if !vectors.is_empty() {
+        for (row_idx, doc_id) in doc_ids.iter().enumerate() {
+            for (idx_id, vec_idx) in vectors {
+                let col_id = vec_idx.column_id();
+                if let Some(vec_bytes) =
+                    extract_vector_bytes(batch, row_idx, &table_entry.columns, col_id)
+                {
+                    let vec_data = bytes_to_f32_slice(vec_bytes);
+                    if let Err(e) = zyron_search::vector::VectorSearch::insert(
+                        vec_idx.as_ref(),
+                        *doc_id,
+                        vec_data,
+                    ) {
+                        tracing::error!(
+                            target: "zyron::ddl",
+                            index_id = idx_id,
+                            "a vector index did not take a vector: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // For each indexed geometry column, decode WKB to a Geometry, take its
+    // MBR, and insert (mbr, rowid) into the live R-tree
+    if !index_snap.spatial.is_empty()
+        && let Some(spatial_mgr) = ctx.spatial_manager.as_ref()
+    {
+        for (row_idx, doc_id) in doc_ids.iter().enumerate() {
+            for (idx_id, col_id) in &index_snap.spatial {
+                let Some(tree) = spatial_mgr.get(idx_id.0) else {
+                    continue;
+                };
+                let Some(geom_bytes) =
+                    extract_column_bytes(batch, row_idx, &table_entry.columns, *col_id)
+                else {
+                    continue;
+                };
+                let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes) else {
+                    continue;
+                };
+                let mbr = zyron_types::spatial_index::mbr_from_geometry(&geom, tree.dims());
+                tree.insert(zyron_types::spatial_index::LeafEntry {
+                    mbr,
+                    data: *doc_id,
+                    deleted: false,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn index_keys_for_rows(
     table_entry: &zyron_catalog::TableEntry,
     page_id: zyron_common::page::PageId,
-    live: &[(u16, Vec<u8>)],
+    live: &[CapturedRow],
     key_columns: &[zyron_catalog::ColumnId],
-    btree: &Arc<zyron_storage::BTreeIndex>,
-) -> usize {
+    out: &mut Vec<(Vec<u8>, zyron_common::RowLocator)>,
+) -> zyron_common::Result<()> {
     if live.is_empty() {
-        return 0;
+        return Ok(());
     }
     let Some(key_cols) = index_key_columns(table_entry, key_columns) else {
-        return 0;
+        return Ok(());
     };
 
     // Decode the live rows into a batch with every table column in order, so a
@@ -1072,58 +1219,54 @@ pub fn rebuild_btree_index_from_rows(
         })
         .collect();
     let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
-    let column_to_builder = build_column_to_builder_map(&table_entry.columns, &col_ids);
+    let decoder = crate::epoch_decode::EpochDecoder::new(table_entry, &col_ids);
     let mut builders = create_builders(&logical, live.len());
-    for (_slot, row_data) in live {
-        decode_tuple_into_builders(
-            row_data,
-            &table_entry.columns,
-            &column_to_builder,
+    for row in live {
+        decoder.decode(
+            row.schema_epoch,
+            &row.data,
+            Some(zyron_common::RowLocator::Heap {
+                page: page_id,
+                slot: row.slot,
+            }),
             &mut builders,
-        );
+        )?;
     }
     let batch = finalize_builders(builders);
 
-    let mut inserted = 0usize;
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (row_idx, (slot, _)) in live.iter().enumerate() {
+    for (row_idx, row) in live.iter().enumerate() {
         if encode_btree_index_key_into(&batch, row_idx, &key_cols, &mut scratch) {
-            let loc = btree_heap_locator(page_id.page_num, *slot);
+            let loc = btree_heap_locator(page_id.page_num, row.slot);
             loc.append_key_suffix(&mut scratch);
-            if btree.insert_sync(&scratch, loc).is_ok() {
-                inserted += 1;
-            }
+            out.push((scratch.clone(), loc));
         }
     }
-    inserted
+    Ok(())
 }
 
 /// Rebuilds one B+tree index's entries from an already-materialized batch of
 /// rows during REINDEX, used for columnar-resident rows whose values come
 /// from the columnar scan. Batch columns are in table-column order and
 /// `locators` is row-aligned. Returns the number of entries inserted.
-pub fn rebuild_btree_index_from_batch(
+pub fn index_keys_for_batch(
     table_entry: &zyron_catalog::TableEntry,
     batch: &DataBatch,
     locators: &[zyron_common::RowLocator],
     key_columns: &[zyron_catalog::ColumnId],
-    btree: &Arc<zyron_storage::BTreeIndex>,
-) -> usize {
+    out: &mut Vec<(Vec<u8>, zyron_common::RowLocator)>,
+) {
     let Some(key_cols) = index_key_columns(table_entry, key_columns) else {
-        return 0;
+        return;
     };
-    let mut inserted = 0usize;
     let mut scratch: Vec<u8> = Vec::with_capacity(48);
     for (row_idx, loc) in locators.iter().enumerate() {
         if encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
             let normalized = btree_normalize_locator(*loc);
             normalized.append_key_suffix(&mut scratch);
-            if btree.insert_sync(&scratch, normalized).is_ok() {
-                inserted += 1;
-            }
+            out.push((scratch.clone(), normalized));
         }
     }
-    inserted
 }
 
 /// Extracts text content from a DataBatch row for FTS indexing into a reusable buffer.
@@ -1602,7 +1745,7 @@ async fn write_quarantine(
         zyron_common::TypeId::Int64,
     ));
 
-    let tuples = batch_to_tuples(&q_batch, &q_entry.columns, txn_id);
+    let tuples = batch_to_tuples(&q_batch, &q_entry.columns, txn_id, q_entry.schema_epoch);
     let mut records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
     for t in &tuples {
         records.push((txn_id, t.data()));
@@ -3688,7 +3831,12 @@ impl Operator for InsertOperator {
                 #[cfg(feature = "profile")]
                 drop(_uc_span);
 
-                let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                let tuples = batch_to_tuples(
+                    &exec_batch.batch,
+                    &table_entry.columns,
+                    txn_id,
+                    table_entry.schema_epoch,
+                );
 
                 // Reused scratch lives outside the inner alloc paths so the
                 // common-case OLTP single-row insert does not heap-allocate
@@ -3735,6 +3883,20 @@ impl Operator for InsertOperator {
                 #[cfg(feature = "profile")]
                 drop(_heap_span);
 
+                // A rewrite copying this table into a shadow needs the same
+                // rows. Mirroring here rather than after the statement means
+                // a row is in both heaps or in neither
+                if !index_snap.shadow.is_empty() {
+                    crate::shadow_write::mirror_insert(
+                        &self.ctx,
+                        &table_entry,
+                        &index_snap.shadow,
+                        &exec_batch.batch,
+                        &tuple_ids,
+                    )
+                    .await?;
+                }
+
                 // Drop any graph CSR built from this table so the next graph
                 // algorithm rebuilds from current data.
                 if let Some(gm) = &self.ctx.graph_manager {
@@ -3776,126 +3938,22 @@ impl Operator for InsertOperator {
                     }
                 }
 
-                // One registry ordinal per inserted row, shared by FTS,
-                // vector and spatial maintenance below. Allocated only when
-                // a search index exists, ordinary tables pay nothing.
-                let needs_docs = !fts_resolved.is_empty()
-                    || !vec_resolved.is_empty()
-                    || !index_snap.spatial.is_empty();
-                let doc_ids: Vec<u64> = if needs_docs {
-                    let Some(reg) = &self.ctx.doc_registry else {
-                        return Err(ZyronError::Internal(
-                            "search index maintenance requires the document registry".into(),
-                        ));
-                    };
-                    tuple_ids
-                        .iter()
-                        .map(|tid| reg.allocate(table_entry.id.0, tid.locator()))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Maintain FTS indexes: add each inserted document.
-                let fts_indexes: &[(
-                    zyron_catalog::IndexId,
-                    Arc<zyron_search::InvertedIndex>,
-                    Arc<dyn zyron_search::Analyzer>,
-                )] = fts_resolved.as_slice();
-                if !fts_indexes.is_empty() {
-                    let mut fts_buf = zyron_search::AnalysisBuffer::new();
-                    let mut text_buf = String::with_capacity(256);
-                    for (row_idx, _tid) in tuple_ids.iter().enumerate() {
-                        let doc_id = doc_ids[row_idx];
-                        text_buf.clear();
-                        extract_fts_text_into(
-                            &exec_batch.batch,
-                            row_idx,
-                            &table_entry.columns,
-                            &mut text_buf,
-                        );
-                        for (idx_id, fts_idx, analyzer) in fts_indexes.iter() {
-                            if let Err(e) = fts_idx.add_document_with_buf(
-                                doc_id,
-                                &text_buf,
-                                analyzer.as_ref(),
-                                &mut fts_buf,
-                            ) {
-                                eprintln!("FTS index {} insert failed: {e}", idx_id.0);
-                            }
-                        }
-                    }
-                }
-
-                // Maintain vector indexes: insert each new vector into every
-                // vector index on the table, sourced from that index's column.
-                if !vec_resolved.is_empty() {
-                    for (row_idx, _tid) in tuple_ids.iter().enumerate() {
-                        let vec_id = doc_ids[row_idx];
-                        for (idx_id, vec_idx) in &vec_resolved {
-                            let col_id = vec_idx.column_id();
-                            if let Some(vec_bytes) = extract_vector_bytes(
-                                &exec_batch.batch,
-                                row_idx,
-                                &table_entry.columns,
-                                col_id,
-                            ) {
-                                let vec_data = bytes_to_f32_slice(vec_bytes);
-                                if let Err(e) = zyron_search::vector::VectorSearch::insert(
-                                    vec_idx.as_ref(),
-                                    vec_id,
-                                    vec_data,
-                                ) {
-                                    eprintln!("vector index {} insert failed: {e}", idx_id);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Maintain spatial (R-tree) indexes: for each indexed
-                // geometry column, decode WKB to a Geometry, take its MBR,
-                // and insert (mbr, rowid) into the live R-tree.
-                if !index_snap.spatial.is_empty() {
-                    if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
-                        for (row_idx, _tid) in tuple_ids.iter().enumerate() {
-                            let rowid = doc_ids[row_idx];
-                            for (idx_id, col_id) in &index_snap.spatial {
-                                let Some(tree) = spatial_mgr.get(idx_id.0) else {
-                                    continue;
-                                };
-                                let Some(geom_bytes) = extract_column_bytes(
-                                    &exec_batch.batch,
-                                    row_idx,
-                                    &table_entry.columns,
-                                    *col_id,
-                                ) else {
-                                    continue;
-                                };
-                                let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes)
-                                else {
-                                    continue;
-                                };
-                                let mbr = zyron_types::spatial_index::mbr_from_geometry(
-                                    &geom,
-                                    tree.dims(),
-                                );
-                                tree.insert(zyron_types::spatial_index::LeafEntry {
-                                    mbr,
-                                    data: rowid,
-                                    deleted: false,
-                                });
-                            }
-                        }
-                    }
-                }
+                let index_locators: Vec<zyron_common::RowLocator> =
+                    tuple_ids.iter().map(|t| t.locator()).collect();
+                fill_search_indexes(
+                    &self.ctx,
+                    &table_entry,
+                    &exec_batch.batch,
+                    &index_locators,
+                    &fts_resolved,
+                    &vec_resolved,
+                    &index_snap,
+                )?;
 
                 // Maintain B+Tree indexes for the inserted rows.
                 #[cfg(feature = "profile")]
                 let _idx_span =
                     zyron_common::profile::scope(zyron_common::profile::Phase::ExecIndexInsert);
-                let index_locators: Vec<zyron_common::RowLocator> =
-                    tuple_ids.iter().map(|t| t.locator()).collect();
                 maintain_btree_insert(
                     &self.ctx,
                     &table_entry,
@@ -4650,7 +4708,12 @@ impl Operator for DeleteOperator {
 
                     // Fire BEFORE DELETE triggers if present.
                     if let Some(ref hook) = self.ctx.dml_hook {
-                        let old_tuples = batch_to_tuples(&exec_batch.batch, &te.columns, txn_id);
+                        let old_tuples = batch_to_tuples(
+                            &exec_batch.batch,
+                            &te.columns,
+                            txn_id,
+                            te.schema_epoch,
+                        );
                         let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                         if !hook.before_delete(self.table_id.0, &refs, txn_id)? {
                             continue; // Trigger cancelled the delete
@@ -4671,7 +4734,12 @@ impl Operator for DeleteOperator {
                     // Capture old tuples for the CDC hook before the rows are
                     // superseded.
                     let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
-                        Some(batch_to_tuples(&exec_batch.batch, &te.columns, txn_id))
+                        Some(batch_to_tuples(
+                            &exec_batch.batch,
+                            &te.columns,
+                            txn_id,
+                            te.schema_epoch,
+                        ))
                     } else {
                         None
                     };
@@ -4817,8 +4885,12 @@ impl Operator for DeleteOperator {
                 // Fire BEFORE DELETE triggers if present.
                 if let Some(ref hook) = self.ctx.dml_hook {
                     let table_entry = self.ctx.get_table_entry(self.table_id)?;
-                    let old_tuples =
-                        batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                    let old_tuples = batch_to_tuples(
+                        &exec_batch.batch,
+                        &table_entry.columns,
+                        txn_id,
+                        table_entry.schema_epoch,
+                    );
                     let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                     if !hook.before_delete(self.table_id.0, &refs, txn_id)? {
                         continue; // Trigger cancelled the delete
@@ -4891,6 +4963,7 @@ impl Operator for DeleteOperator {
                         &exec_batch.batch,
                         &table_entry.columns,
                         txn_id,
+                        table_entry.schema_epoch,
                     ))
                 } else {
                     None
@@ -4925,6 +4998,16 @@ impl Operator for DeleteOperator {
                         retain_history,
                     )
                     .await?;
+
+                // A rewrite copying this table needs the delete too, or the
+                // swap would install a table still holding the row
+                {
+                    let snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+                    if !snap.shadow.is_empty() {
+                        crate::shadow_write::mirror_delete(&self.ctx, &snap.shadow, &tuple_ids)
+                            .await?;
+                    }
+                }
 
                 if let Some(gm) = &self.ctx.graph_manager {
                     gm.invalidate_for_table(self.table_id.0);
@@ -5392,10 +5475,18 @@ impl Operator for UpdateOperator {
 
                     // Fire BEFORE UPDATE triggers if present.
                     if let Some(ref hook) = self.ctx.dml_hook {
-                        let old_tuples =
-                            batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
-                        let new_tuples =
-                            batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
+                        let old_tuples = batch_to_tuples(
+                            &exec_batch.batch,
+                            &table_entry.columns,
+                            txn_id,
+                            table_entry.schema_epoch,
+                        );
+                        let new_tuples = batch_to_tuples(
+                            &updated_batch,
+                            &table_entry.columns,
+                            txn_id,
+                            table_entry.schema_epoch,
+                        );
                         let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                         let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
                         if !hook.before_update(self.table_id.0, &old_refs, &new_refs, txn_id)? {
@@ -5580,10 +5671,18 @@ impl Operator for UpdateOperator {
 
                     // Notify CDC hook if present.
                     if let Some(ref hook) = self.ctx.cdc_hook {
-                        let old_tuples =
-                            batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
-                        let new_tuples =
-                            batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
+                        let old_tuples = batch_to_tuples(
+                            &exec_batch.batch,
+                            &table_entry.columns,
+                            txn_id,
+                            table_entry.schema_epoch,
+                        );
+                        let new_tuples = batch_to_tuples(
+                            &updated_batch,
+                            &table_entry.columns,
+                            txn_id,
+                            table_entry.schema_epoch,
+                        );
                         let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                         let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
                         let now = std::time::SystemTime::now()
@@ -5762,12 +5861,21 @@ impl Operator for UpdateOperator {
                 )
                 .await?;
 
-                let new_tuples = batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
+                let new_tuples = batch_to_tuples(
+                    &updated_batch,
+                    &table_entry.columns,
+                    txn_id,
+                    table_entry.schema_epoch,
+                );
 
                 // Fire BEFORE UPDATE triggers if present.
                 if let Some(ref hook) = self.ctx.dml_hook {
-                    let old_tuples =
-                        batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                    let old_tuples = batch_to_tuples(
+                        &exec_batch.batch,
+                        &table_entry.columns,
+                        txn_id,
+                        table_entry.schema_epoch,
+                    );
                     let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                     let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
                     if !hook.before_update(self.table_id.0, &old_refs, &new_refs, txn_id)? {
@@ -5908,6 +6016,25 @@ impl Operator for UpdateOperator {
 
                 total_updated += tuple_ids.len() as i64;
 
+                // A rewrite copying this table takes the update as the same
+                // pair of steps the heap did, retiring the old copy and
+                // writing the new one
+                {
+                    let snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+                    if !snap.shadow.is_empty() {
+                        crate::shadow_write::mirror_delete(&self.ctx, &snap.shadow, &tuple_ids)
+                            .await?;
+                        crate::shadow_write::mirror_insert(
+                            &self.ctx,
+                            &table_entry,
+                            &snap.shadow,
+                            &updated_batch,
+                            &new_tuple_ids,
+                        )
+                        .await?;
+                    }
+                }
+
                 // Maintain B+tree indexes: add the new image's keys. The old
                 // image's entries are intentionally kept (the old row is only
                 // xmax-stamped, not removed); an index scan rechecks visibility
@@ -6038,8 +6165,12 @@ impl Operator for UpdateOperator {
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
-                    let old_tuples =
-                        batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                    let old_tuples = batch_to_tuples(
+                        &exec_batch.batch,
+                        &table_entry.columns,
+                        txn_id,
+                        table_entry.schema_epoch,
+                    );
                     let old_slices: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                     let new_refs_data: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
                     let now = std::time::SystemTime::now()

@@ -6,7 +6,8 @@
 
 pub mod constants;
 mod file;
+pub mod migrations;
 mod page;
 
 pub use file::{HeapFile, HeapFileConfig};
-pub use page::{HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot};
+pub use page::{EpochCensus, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot};

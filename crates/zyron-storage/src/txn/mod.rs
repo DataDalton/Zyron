@@ -355,6 +355,17 @@ impl TransactionManager {
         &self.retention_clock
     }
 
+    /// Returns the active-transaction registry.
+    ///
+    /// An online index build reads it twice: once to record which
+    /// transactions were running when the index published, and then until
+    /// every one of them has ended. That wait is what makes maintaining the
+    /// index from publication onward enough to cover every later write.
+    #[inline]
+    pub fn proc_array(&self) -> &Arc<ProcArray> {
+        &self.proc_array
+    }
+
     /// Builds the durability queue and registers a flush waker that drains it.
     /// After each flush the WAL calls the waker, which wakes only the committers
     /// whose target LSN the flush satisfied. The closure holds an Arc to the

@@ -22,6 +22,7 @@ pub mod record_version;
 pub mod registry;
 pub mod reserved;
 pub mod rewrite;
+pub mod scan_migration;
 pub mod scheme;
 pub mod stamp;
 pub mod text_envelope;
@@ -58,6 +59,10 @@ pub use registry::{
 pub use rewrite::{
     ALL_OBJECT_KINDS, ObjectKind, RewriteCategory, RewriteClassification, RewriteDisposition,
     RewriteStatus, UserObjectRewritePolicy,
+};
+pub use scan_migration::{
+    CatalogScanMigration, FormatDocumentation, catalog_scan_for, catalog_scan_migrations,
+    documentation_for, downgrade_refusal,
 };
 pub use scheme::{
     ALL_ARTIFACT_KINDS, ArtifactKind, ArtifactSchemeBinding, SchemeCategory, SchemeError, SchemeId,

@@ -708,6 +708,8 @@ mod tests {
                             tz_offset_secs: None,
                             element_type: None,
                             attrs: Default::default(),
+                            absent_value: None,
+                            dropped: false,
                         },
                         ColumnEntry {
                             id: ColumnId(1),
@@ -722,6 +724,8 @@ mod tests {
                             tz_offset_secs: None,
                             element_type: None,
                             attrs: Default::default(),
+                            absent_value: None,
+                            dropped: false,
                         },
                     ],
                     constraints: vec![],
@@ -740,6 +744,9 @@ mod tests {
                     lake: Default::default(),
                     cluster: Default::default(),
                     foreign: Default::default(),
+                    schema_epoch: 1,
+                    schema_epochs: Vec::new(),
+                    pre_stamp_columns: Vec::new(),
                 },
                 TableEntry {
                     id: TableId(20),
@@ -764,6 +771,9 @@ mod tests {
                     lake: Default::default(),
                     cluster: Default::default(),
                     foreign: Default::default(),
+                    schema_epoch: 1,
+                    schema_epochs: Vec::new(),
+                    pre_stamp_columns: Vec::new(),
                 },
             ],
         });

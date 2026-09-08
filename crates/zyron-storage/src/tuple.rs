@@ -4,19 +4,20 @@ use crate::txn::Snapshot;
 use zyron_common::page::PageId;
 use zyron_common::zerocopy::{AsBytes, FromBytes};
 
-/// Packed 20-byte tuple header for single-memcpy serialization.
+/// Packed 22-byte tuple header for single-memcpy serialization.
 /// All fields stored in little-endian format. Transaction ids are full
 /// 64-bit values, the allocator never wraps them
 #[repr(C, packed)]
 struct PackedTupleHeader {
     flags: u16,
     data_len: u16,
+    schema_epoch: u16,
     xmin: u64,
     xmax: u64,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PackedTupleHeader>() == 2 + 2 + 8 + 8);
+    assert!(std::mem::size_of::<PackedTupleHeader>() == 2 + 2 + 2 + 8 + 8);
     assert!(std::mem::align_of::<PackedTupleHeader>() == 1);
 };
 
@@ -98,17 +99,25 @@ pub struct Tuple {
 
 /// Header for a tuple.
 ///
-/// Layout (12 bytes):
+/// Layout (22 bytes):
 /// - flags: 2 bytes
 /// - data_len: 2 bytes
-/// - xmin: 4 bytes (transaction that created this tuple)
-/// - xmax: 4 bytes (transaction that deleted/updated this tuple, 0 if live)
+/// - schema_epoch: 2 bytes (the column layout the row bytes were written under)
+/// - xmin: 8 bytes (transaction that created this tuple)
+/// - xmax: 8 bytes (transaction that deleted/updated this tuple, 0 if live)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TupleHeader {
     /// Tuple flags.
     pub flags: TupleFlags,
     /// Length of tuple data in bytes.
     pub data_len: u16,
+    /// The table's schema epoch when these row bytes were encoded.
+    ///
+    /// The bytes carry no column count and no type list, so this is the only
+    /// thing that says how to walk them. Zero means the row was written
+    /// before tuples were stamped, and reads through the layout the table
+    /// recorded at that upgrade.
+    pub schema_epoch: u16,
     /// Transaction ID that created this tuple.
     pub xmin: u64,
     /// Transaction ID that deleted or updated this tuple (0 if still live).
@@ -117,13 +126,31 @@ pub struct TupleHeader {
 
 impl TupleHeader {
     /// Size of the tuple header in bytes.
-    pub const SIZE: usize = 20;
+    pub const SIZE: usize = 22;
 
-    /// Creates a new tuple header.
+    /// Creates a new tuple header carrying no schema epoch.
+    ///
+    /// Epoch 0 is what a system heap writes: its rows are decoded by the
+    /// entry codec that owns them rather than by walking a table's column
+    /// list, so there is no layout for an epoch to name. A user table's row
+    /// goes through `with_epoch`.
     pub fn new(data_len: u16, xmin: u64) -> Self {
         Self {
             flags: TupleFlags::empty(),
             data_len,
+            schema_epoch: 0,
+            xmin,
+            xmax: 0,
+        }
+    }
+
+    /// Creates a header stamped with the layout its row bytes were encoded
+    /// under.
+    pub fn with_epoch(data_len: u16, xmin: u64, schema_epoch: u16) -> Self {
+        Self {
+            flags: TupleFlags::empty(),
+            data_len,
+            schema_epoch,
             xmin,
             xmax: 0,
         }
@@ -134,6 +161,7 @@ impl TupleHeader {
         Self {
             flags: TupleFlags::empty(),
             data_len,
+            schema_epoch: 0,
             xmin,
             xmax,
         }
@@ -160,6 +188,7 @@ impl TupleHeader {
         let packed = PackedTupleHeader {
             flags: self.flags.0.to_le(),
             data_len: self.data_len.to_le(),
+            schema_epoch: self.schema_epoch.to_le(),
             xmin: self.xmin.to_le(),
             xmax: self.xmax.to_le(),
         };
@@ -174,6 +203,7 @@ impl TupleHeader {
         Self {
             flags: TupleFlags(u16::from_le(packed.flags)),
             data_len: u16::from_le(packed.data_len),
+            schema_epoch: u16::from_le(packed.schema_epoch),
             xmin: u64::from_le(packed.xmin),
             xmax: u64::from_le(packed.xmax),
         }
@@ -182,13 +212,14 @@ impl TupleHeader {
     /// Deserializes the header from bytes without bounds checks.
     ///
     /// # Safety
-    /// Caller must ensure buf has at least SIZE (20) bytes.
+    /// Caller must ensure buf has at least SIZE (22) bytes.
     #[inline(always)]
     pub unsafe fn from_bytes_unchecked(buf: &[u8]) -> Self {
         let packed = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const PackedTupleHeader) };
         Self {
             flags: TupleFlags(u16::from_le(packed.flags)),
             data_len: u16::from_le(packed.data_len),
+            schema_epoch: u16::from_le(packed.schema_epoch),
             xmin: u64::from_le(packed.xmin),
             xmax: u64::from_le(packed.xmax),
         }
@@ -278,13 +309,18 @@ impl Tuple {
     ///
     /// Panics if data exceeds 65535 bytes (u16::MAX), the maximum tuple data length.
     pub fn new(data: Vec<u8>, xmin: u64) -> Self {
+        Self::with_epoch(data, xmin, 0)
+    }
+
+    /// Creates a tuple stamped with the layout its bytes were encoded under.
+    pub fn with_epoch(data: Vec<u8>, xmin: u64, schema_epoch: u16) -> Self {
         assert!(
             data.len() <= u16::MAX as usize,
             "tuple data length {} exceeds maximum {} bytes",
             data.len(),
             u16::MAX
         );
-        let header = TupleHeader::new(data.len() as u16, xmin);
+        let header = TupleHeader::with_epoch(data.len() as u16, xmin, schema_epoch);
         Self { header, data }
     }
 
@@ -399,11 +435,12 @@ impl<'a> TupleView<'a> {
 // Versioned tuple header (28 bytes): base header + version tracking
 // ---------------------------------------------------------------------------
 
-/// Packed 36-byte versioned tuple header for single-memcpy serialization.
+/// Packed 38-byte versioned tuple header for single-memcpy serialization.
 #[repr(C, packed)]
 struct PackedVersionedTupleHeader {
     flags: u16,
     data_len: u16,
+    schema_epoch: u16,
     xmin: u64,
     xmax: u64,
     version_id: u64,
@@ -411,7 +448,7 @@ struct PackedVersionedTupleHeader {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PackedVersionedTupleHeader>() == 36);
+    assert!(std::mem::size_of::<PackedVersionedTupleHeader>() == 38);
     assert!(std::mem::align_of::<PackedVersionedTupleHeader>() == 1);
 };
 
@@ -419,12 +456,12 @@ unsafe impl AsBytes for PackedVersionedTupleHeader {}
 unsafe impl FromBytes for PackedVersionedTupleHeader {}
 
 /// Size of the versioned tuple header in bytes.
-pub const VERSIONED_TUPLE_HEADER_SIZE: usize = 36;
+pub const VERSIONED_TUPLE_HEADER_SIZE: usize = 38;
 
 /// Extended tuple header with version tracking.
 ///
-/// Layout (36 bytes):
-/// - base: 20 bytes (flags, data_len, xmin, xmax)
+/// Layout (38 bytes):
+/// - base: 22 bytes (flags, data_len, schema_epoch, xmin, xmax)
 /// - version_id: 8 bytes (version that created this tuple)
 /// - deleted_at_version: 8 bytes (version that deleted this tuple, 0 if live)
 #[derive(Debug, Clone, Copy, Default)]
@@ -481,6 +518,7 @@ impl VersionedTupleHeader {
         let packed = PackedVersionedTupleHeader {
             flags: self.base.flags.0.to_le(),
             data_len: self.base.data_len.to_le(),
+            schema_epoch: self.base.schema_epoch.to_le(),
             xmin: self.base.xmin.to_le(),
             xmax: self.base.xmax.to_le(),
             version_id: self.version_id.to_le(),
@@ -498,6 +536,7 @@ impl VersionedTupleHeader {
             base: TupleHeader {
                 flags: TupleFlags(u16::from_le(packed.flags)),
                 data_len: u16::from_le(packed.data_len),
+                schema_epoch: u16::from_le(packed.schema_epoch),
                 xmin: u64::from_le(packed.xmin),
                 xmax: u64::from_le(packed.xmax),
             },
@@ -518,6 +557,7 @@ impl VersionedTupleHeader {
             base: TupleHeader {
                 flags: TupleFlags(u16::from_le(packed.flags)),
                 data_len: u16::from_le(packed.data_len),
+                schema_epoch: u16::from_le(packed.schema_epoch),
                 xmin: u64::from_le(packed.xmin),
                 xmax: u64::from_le(packed.xmax),
             },
@@ -606,12 +646,14 @@ mod tests {
         let header = TupleHeader {
             flags: TupleFlags(0x0003),
             data_len: 256,
+            schema_epoch: 7,
             xmin: 12345,
             xmax: 67890,
         };
 
         let bytes = header.to_bytes();
         let recovered = TupleHeader::from_bytes(&bytes);
+        assert_eq!(recovered.schema_epoch, 7);
 
         assert_eq!(recovered.flags.0, header.flags.0);
         assert_eq!(recovered.data_len, header.data_len);
@@ -711,6 +753,7 @@ mod tests {
         let header = TupleHeader {
             flags: TupleFlags(TupleFlags::HAS_NULLS),
             data_len: 5,
+            schema_epoch: 0,
             xmin: 42,
             xmax: 0,
         };
@@ -843,8 +886,8 @@ mod tests {
 
     #[test]
     fn test_versioned_header_size_constant() {
-        assert_eq!(VERSIONED_TUPLE_HEADER_SIZE, 36);
-        assert_eq!(VersionedTupleHeader::SIZE, 36);
+        assert_eq!(VERSIONED_TUPLE_HEADER_SIZE, 38);
+        assert_eq!(VersionedTupleHeader::SIZE, 38);
         assert_eq!(
             VersionedTupleHeader::SIZE,
             TupleHeader::SIZE + std::mem::size_of::<u64>() * 2

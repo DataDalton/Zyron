@@ -83,7 +83,7 @@ fn prefetch_row(row: &Tuple) {
 /// - offset: 2 bytes (offset from page start to tuple data, 0 = empty slot)
 /// - data_len: 2 bytes
 /// - flags: 2 bytes
-/// - reserved: 2 bytes
+/// - schema_epoch: 2 bytes (the column layout the row bytes were written under)
 /// - xmin: 8 bytes
 /// - xmax: 8 bytes
 ///
@@ -134,6 +134,7 @@ impl TupleSlot {
         buf[0..2].copy_from_slice(&self.offset.to_le_bytes());
         buf[2..4].copy_from_slice(&self.header.data_len.to_le_bytes());
         buf[4..6].copy_from_slice(&self.header.flags.0.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.header.schema_epoch.to_le_bytes());
         buf[8..16].copy_from_slice(&self.header.xmin.to_le_bytes());
         buf[16..24].copy_from_slice(&self.header.xmax.to_le_bytes());
         buf
@@ -146,6 +147,7 @@ impl TupleSlot {
             header: TupleHeader {
                 flags: TupleFlags(u16::from_le_bytes([buf[4], buf[5]])),
                 data_len: u16::from_le_bytes([buf[2], buf[3]]),
+                schema_epoch: u16::from_le_bytes([buf[6], buf[7]]),
                 xmin: u64::from_le_bytes([
                     buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
                 ]),
@@ -154,6 +156,58 @@ impl TupleSlot {
                 ]),
             },
         }
+    }
+}
+
+/// What one vacuum pass saw of the layouts a page's surviving tuples were
+/// written under.
+///
+/// A table can retire a recorded layout once no live tuple carries it, and the
+/// only pass that visits every live tuple is vacuum. Counting here is one
+/// compare per slot on a walk that already reads the slot.
+#[derive(Debug, Clone, Copy)]
+pub struct EpochCensus {
+    /// Lowest epoch above zero seen on a surviving tuple. `u16::MAX` when the
+    /// pass saw none, which is what an empty page reports
+    pub min_live_epoch: u16,
+    /// Whether any surviving tuple predates stamping
+    pub any_unstamped: bool,
+}
+
+impl Default for EpochCensus {
+    fn default() -> Self {
+        Self {
+            min_live_epoch: u16::MAX,
+            any_unstamped: false,
+        }
+    }
+}
+
+impl EpochCensus {
+    /// Folds one surviving tuple's epoch in.
+    #[inline]
+    pub fn observe(&mut self, epoch: u16) {
+        if epoch == 0 {
+            self.any_unstamped = true;
+        } else if epoch < self.min_live_epoch {
+            self.min_live_epoch = epoch;
+        }
+    }
+
+    /// Folds another pass's result in, so a per-page count rolls up to a
+    /// per-table one.
+    #[inline]
+    pub fn merge(&mut self, other: EpochCensus) {
+        self.any_unstamped |= other.any_unstamped;
+        if other.min_live_epoch < self.min_live_epoch {
+            self.min_live_epoch = other.min_live_epoch;
+        }
+    }
+
+    /// True when the pass saw no surviving tuple at all.
+    #[inline]
+    pub fn saw_nothing(&self) -> bool {
+        self.min_live_epoch == u16::MAX && !self.any_unstamped
     }
 }
 
@@ -451,21 +505,22 @@ impl HeapPage {
         data: &mut [u8],
         is_dead: &impl Fn(u64, u64) -> bool,
         is_aborted: &impl Fn(u64) -> bool,
-    ) -> (u64, bool) {
+    ) -> (u64, bool, EpochCensus) {
         Self::vacuum_in_slice_inner(data, is_dead, is_aborted, None)
     }
 
     /// Same as `vacuum_in_slice` but, before pruning, records each reclaimed
-    /// tuple as (slot_id, row data) into `dead_out`. The vacuum worker uses this
-    /// to delete the reclaimed rows' B+tree index entries: the composite index
-    /// key includes the row's value and tuple id, so the entry is removed using
-    /// the row image that is about to disappear from the heap.
+    /// tuple as (slot_id, schema epoch, row data) into `dead_out`. The vacuum
+    /// worker uses this to delete the reclaimed rows' B+tree index entries: the
+    /// composite index key includes the row's value and tuple id, so the entry
+    /// is removed using the row image that is about to disappear from the heap,
+    /// read through the layout that row was written under.
     pub fn vacuum_in_slice_collect(
         data: &mut [u8],
         is_dead: &impl Fn(u64, u64) -> bool,
         is_aborted: &impl Fn(u64) -> bool,
-        dead_out: &mut Vec<(u16, Vec<u8>)>,
-    ) -> (u64, bool) {
+        dead_out: &mut Vec<(u16, u16, Vec<u8>)>,
+    ) -> (u64, bool, EpochCensus) {
         Self::vacuum_in_slice_inner(data, is_dead, is_aborted, Some(dead_out))
     }
 
@@ -473,11 +528,12 @@ impl HeapPage {
         data: &mut [u8],
         is_dead: &impl Fn(u64, u64) -> bool,
         is_aborted: &impl Fn(u64) -> bool,
-        mut dead_out: Option<&mut Vec<(u16, Vec<u8>)>>,
-    ) -> (u64, bool) {
+        mut dead_out: Option<&mut Vec<(u16, u16, Vec<u8>)>>,
+    ) -> (u64, bool, EpochCensus) {
         let header = Self::heap_header_from_slice(data);
         let mut reclaimed = 0u64;
         let mut modified = false;
+        let mut census = EpochCensus::default();
         for i in 0..header.slot_count {
             let slot_id = SlotId(i);
             let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
@@ -494,20 +550,25 @@ impl HeapPage {
                     let ds = slot.offset as usize;
                     let de = ds + slot.data_len();
                     if de <= data.len() {
-                        out.push((i, data[ds..de].to_vec()));
+                        out.push((i, slot.header.schema_epoch, data[ds..de].to_vec()));
                     }
                 }
-            } else if slot.header.xmax != 0 && is_aborted(slot.header.xmax) {
-                // Live row whose deleter aborted: clear the stale stamp.
-                let xoff = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
-                data[xoff..xoff + 8].copy_from_slice(&0u64.to_le_bytes());
-                modified = true;
+            } else {
+                // The row survives this pass, so its layout is still one the
+                // table has to be able to read
+                census.observe(slot.header.schema_epoch);
+                if slot.header.xmax != 0 && is_aborted(slot.header.xmax) {
+                    // Live row whose deleter aborted: clear the stale stamp.
+                    let xoff = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
+                    data[xoff..xoff + 8].copy_from_slice(&0u64.to_le_bytes());
+                    modified = true;
+                }
             }
         }
         if Self::prune_dead_in_slice(data, is_dead) {
             modified = true;
         }
-        (reclaimed, modified)
+        (reclaimed, modified, census)
     }
 
     /// Compacts a page slice by moving all active tuples together.
@@ -732,10 +793,12 @@ impl HeapPage {
                             // Everything above the publish word first, so a
                             // reader that sees the slot sees a whole header
                             let th = t.header();
-                            // flags with the reserved half zeroed, then the
-                            // two 64-bit transaction ids
-                            (slot_addr.add(4) as *mut u32)
-                                .write_unaligned((th.flags.0 as u32).to_le());
+                            // flags in the low half and the schema epoch in
+                            // the high half of one word, then the two 64-bit
+                            // transaction ids
+                            (slot_addr.add(4) as *mut u32).write_unaligned(
+                                ((th.flags.0 as u32) | ((th.schema_epoch as u32) << 16)).to_le(),
+                            );
                             (slot_addr.add(8) as *mut u64).write_unaligned(th.xmin.to_le());
                             (slot_addr.add(16) as *mut u64).write_unaligned(th.xmax.to_le());
 
@@ -1138,11 +1201,13 @@ mod tests {
 
         let is_dead = |xmin: u64, xmax: u64| xmin == 20 || xmax == 12;
         let is_aborted = |xid: u64| xid == 20 || xid == 21;
-        let (reclaimed, modified) =
+        let (reclaimed, modified, census) =
             HeapPage::vacuum_in_slice(page.as_bytes_mut(), &is_dead, &is_aborted);
 
         assert!(modified);
         assert_eq!(reclaimed, 2); // aborted insert + committed delete
+        // The rows that survived were written by the test at epoch 0
+        assert!(census.any_unstamped);
         // Dead rows are gone.
         assert!(page.get_tuple(s_ai).is_none());
         assert!(page.get_tuple(s_cd).is_none());

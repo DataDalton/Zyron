@@ -13,6 +13,7 @@
 //! streaming hot path pays nothing.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zyron_auth::{AbacPolicy, SecurityManager};
 use zyron_catalog::{Catalog, ColumnEntry, PublicationEntry, TableId};
@@ -28,7 +29,10 @@ struct CompiledTablePredicate {
     /// Columns the predicate references, in decode order. The predicate's
     /// ColumnRefs resolve by position in this slice.
     output_columns: Vec<LogicalColumn>,
-    /// Full table schema, used to decode the NSM tuple bytes.
+    /// The table the rows belong to, which carries the layouts its tuples
+    /// were written under as well as its column list.
+    table: Arc<zyron_catalog::TableEntry>,
+    /// Full table schema, used to re-encode a projected tuple.
     table_columns: Vec<ColumnEntry>,
     predicate: BoundExpr,
 }
@@ -143,6 +147,7 @@ impl PublicationRowFilter {
                     tid,
                     CompiledTablePredicate {
                         output_columns,
+                        table: Arc::clone(&table),
                         table_columns: table.columns.clone(),
                         predicate,
                     },
@@ -201,9 +206,14 @@ impl PublicationRowFilter {
     pub fn mask_for(&self, table_id: u32, rows: &[&[u8]]) -> Result<Option<Vec<bool>>> {
         match self.per_table.get(&table_id) {
             None => Ok(None),
+            // A row image on the change stream was encoded by the leader
+            // against the schema in force when it wrote the row, and a schema
+            // change is a barrier in that stream, so the epoch it carries is
+            // the table's current one
             Some(c) => Ok(Some(zyron_executor::evaluate_row_filter(
                 &c.output_columns,
-                &c.table_columns,
+                &c.table,
+                c.table.schema_epoch,
                 &c.predicate,
                 rows,
             )?)),

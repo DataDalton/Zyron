@@ -293,6 +293,7 @@ impl ExplainNode {
                 columns,
                 predicate,
                 cost,
+                deferred_index,
                 ..
             } => {
                 let mut details = vec![
@@ -301,6 +302,12 @@ impl ExplainNode {
                 ];
                 if predicate.is_some() {
                     details.push(("filter".to_string(), "yes".to_string()));
+                }
+                if let Some(name) = deferred_index {
+                    details.push((
+                        "index_building".to_string(),
+                        format!("{name} is still building, this scan runs without it"),
+                    ));
                 }
                 Self {
                     operator_name: "SeqScan".to_string(),

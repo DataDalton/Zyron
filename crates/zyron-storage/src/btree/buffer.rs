@@ -368,6 +368,23 @@ mod tests {
     use zyron_common::ZyronError;
     use zyron_common::page::{PAGE_SIZE, PageId};
 
+    /// A heap row on the page under test, addressed by slot.
+    fn at(slot: u16) -> RowLocator {
+        RowLocator::Heap {
+            page: PageId::new(0, 0),
+            slot,
+        }
+    }
+
+    /// Builds the key a leaf holds, the value followed by the suffix naming
+    /// the row it points at. A leaf reads the row out of that suffix, so a key
+    /// built without one names nothing.
+    fn keyed(value: &[u8], locator: RowLocator) -> Bytes {
+        let mut key = value.to_vec();
+        locator.append_key_suffix(&mut key);
+        Bytes::from(key)
+    }
+
     #[test]
     fn test_leaf_header_roundtrip() {
         let header = LeafPageHeader {
@@ -404,16 +421,17 @@ mod tests {
 
     #[test]
     fn test_leaf_entry_roundtrip() {
+        let locator = RowLocator::Heap {
+            page: PageId::new(1, 42),
+            slot: 5,
+        };
         let entry = LeafEntry {
-            key: Bytes::from_static(b"test_key"),
-            locator: RowLocator::Heap {
-                page: PageId::new(1, 42),
-                slot: 5,
-            },
+            key: keyed(b"test_key", locator),
+            locator,
         };
 
         let bytes = entry.to_bytes();
-        let (recovered, consumed) = LeafEntry::from_bytes(&bytes).unwrap();
+        let (recovered, consumed) = LeafEntry::from_bytes(&bytes, entry.key.len()).unwrap();
 
         assert_eq!(recovered.key, entry.key);
         // heap file_id is not stored on disk, reconstructed as 0
@@ -456,11 +474,11 @@ mod tests {
     fn test_leaf_page_insert_and_get() {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
 
-        let key = Bytes::from_static(b"hello");
         let tuple_id = RowLocator::Heap {
             page: PageId::new(1, 10),
             slot: 5,
         };
+        let key = keyed(b"hello", tuple_id);
 
         page.insert(key.clone(), tuple_id).unwrap();
 
@@ -478,60 +496,28 @@ mod tests {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
 
         // Insert in random order
-        page.insert(
-            Bytes::from_static(b"charlie"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 3,
-            },
-        )
-        .unwrap();
-        page.insert(
-            Bytes::from_static(b"alpha"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 1,
-            },
-        )
-        .unwrap();
-        page.insert(
-            Bytes::from_static(b"bravo"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 2,
-            },
-        )
-        .unwrap();
+        page.insert(keyed(b"charlie", at(3)), at(3)).unwrap();
+        page.insert(keyed(b"alpha", at(1)), at(1)).unwrap();
+        page.insert(keyed(b"bravo", at(2)), at(2)).unwrap();
 
         assert_eq!(page.num_entries(), 3);
 
-        // Should be stored in sorted order
+        // Should be stored in sorted order. The suffix follows the value, so
+        // the value is the part the order is read from
         let entries = page.entries();
-        assert_eq!(entries[0].key.as_ref(), b"alpha");
-        assert_eq!(entries[1].key.as_ref(), b"bravo");
-        assert_eq!(entries[2].key.as_ref(), b"charlie");
+        assert_eq!(&entries[0].key[..5], b"alpha");
+        assert_eq!(&entries[1].key[..5], b"bravo");
+        assert_eq!(&entries[2].key[..7], b"charlie");
     }
 
     #[test]
     fn test_leaf_page_duplicate_key() {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
 
-        page.insert(
-            Bytes::from_static(b"key"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 1,
-            },
-        )
-        .unwrap();
+        page.insert(keyed(b"key", at(1)), at(1)).unwrap();
 
-        let result = page.insert(
-            Bytes::from_static(b"key"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 2,
-            },
-        );
+        // The same value naming the same row is the same key
+        let result = page.insert(keyed(b"key", at(1)), at(1));
         assert!(matches!(result, Err(ZyronError::DuplicateKey)));
     }
 
@@ -539,31 +525,20 @@ mod tests {
     fn test_leaf_page_delete() {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
 
-        page.insert(
-            Bytes::from_static(b"key1"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 1,
-            },
-        )
-        .unwrap();
-        page.insert(
-            Bytes::from_static(b"key2"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 2,
-            },
-        )
-        .unwrap();
+        page.insert(keyed(b"key1", at(1)), at(1)).unwrap();
+        page.insert(keyed(b"key2", at(2)), at(2)).unwrap();
 
         // Delete returns DeleteResult, check for Underfull since page has little data
-        let result = page.delete(b"key1");
+        let result = page.delete(&keyed(b"key1", at(1)));
         assert!(result == DeleteResult::Ok || result == DeleteResult::Underfull);
         assert_eq!(page.num_entries(), 1);
-        assert!(page.get(b"key1").is_none());
-        assert!(page.get(b"key2").is_some());
+        assert!(page.get(&keyed(b"key1", at(1))).is_none());
+        assert!(page.get(&keyed(b"key2", at(2))).is_some());
 
-        assert_eq!(page.delete(b"nonexistent"), DeleteResult::NotFound);
+        assert_eq!(
+            page.delete(&keyed(b"nonexistent", at(9))),
+            DeleteResult::NotFound
+        );
     }
 
     #[test]
@@ -574,14 +549,7 @@ mod tests {
         assert!(!page.is_underfull());
 
         // Insert a single small entry
-        page.insert(
-            Bytes::from_static(b"key"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 1,
-            },
-        )
-        .unwrap();
+        page.insert(keyed(b"key", at(1)), at(1)).unwrap();
 
         // A page with only one small entry is underfull (below 50% capacity)
         assert!(page.is_underfull());
@@ -593,39 +561,16 @@ mod tests {
         let mut right = BTreeLeafPage::new(PageId::new(0, 1));
 
         // Set up left page with one entry
-        left.insert(
-            Bytes::from_static(b"a"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 1,
-            },
-        )
-        .unwrap();
+        left.insert(keyed(b"a", at(1)), at(1)).unwrap();
 
         // Set up right page with multiple entries
-        right
-            .insert(
-                Bytes::from_static(b"b"),
-                RowLocator::Heap {
-                    page: PageId::new(0, 0),
-                    slot: 2,
-                },
-            )
-            .unwrap();
-        right
-            .insert(
-                Bytes::from_static(b"c"),
-                RowLocator::Heap {
-                    page: PageId::new(0, 0),
-                    slot: 3,
-                },
-            )
-            .unwrap();
+        right.insert(keyed(b"b", at(2)), at(2)).unwrap();
+        right.insert(keyed(b"c", at(3)), at(3)).unwrap();
 
         // Borrow from right
         let new_separator = left.borrow_from_right(&mut right);
         assert!(new_separator.is_some());
-        assert_eq!(new_separator.unwrap().as_ref(), b"c");
+        assert_eq!(new_separator.unwrap(), keyed(b"c", at(3)));
 
         // Left should now have 2 entries
         assert_eq!(left.num_entries(), 2);
@@ -638,23 +583,8 @@ mod tests {
         let mut left = BTreeLeafPage::new(PageId::new(0, 0));
         let mut right = BTreeLeafPage::new(PageId::new(0, 1));
 
-        left.insert(
-            Bytes::from_static(b"a"),
-            RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 1,
-            },
-        )
-        .unwrap();
-        right
-            .insert(
-                Bytes::from_static(b"b"),
-                RowLocator::Heap {
-                    page: PageId::new(0, 0),
-                    slot: 2,
-                },
-            )
-            .unwrap();
+        left.insert(keyed(b"a", at(1)), at(1)).unwrap();
+        right.insert(keyed(b"b", at(2)), at(2)).unwrap();
 
         // Link pages
         left.set_next_leaf(Some(PageId::new(0, 1)));
@@ -712,14 +642,8 @@ mod tests {
 
         // Insert many entries
         for i in 0..100 {
-            let key = Bytes::from(format!("key_{:03}", i));
-            let _ = page.insert(
-                key,
-                RowLocator::Heap {
-                    page: PageId::new(0, 0),
-                    slot: i as u16,
-                },
-            );
+            let loc = at(i as u16);
+            let _ = page.insert(keyed(format!("key_{:03}", i).as_bytes(), loc), loc);
         }
 
         let entries_before = page.num_entries();
@@ -743,14 +667,12 @@ mod tests {
     #[test]
     fn test_leaf_page_from_bytes() {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
-        page.insert(
-            Bytes::from_static(b"test"),
-            RowLocator::Heap {
-                page: PageId::new(1, 2),
-                slot: 3,
-            },
-        )
-        .unwrap();
+        let locator = RowLocator::Heap {
+            page: PageId::new(1, 2),
+            slot: 3,
+        };
+        let key = keyed(b"test", locator);
+        page.insert(key.clone(), locator).unwrap();
 
         let bytes = *page.as_bytes();
         let recovered = BTreeLeafPage::from_bytes(bytes);
@@ -758,7 +680,7 @@ mod tests {
         assert_eq!(recovered.num_entries(), 1);
         // file_id is not stored per entry, reads back as 0
         assert_eq!(
-            recovered.get(b"test"),
+            recovered.get(&key),
             Some(RowLocator::Heap {
                 page: PageId::new(0, 2),
                 slot: 3
@@ -843,15 +765,14 @@ mod tests {
     #[test]
     fn test_leaf_entry_size_on_disk() {
         let entry = LeafEntry {
-            key: Bytes::from_static(b"hello"),
-            locator: RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 0,
-            },
+            key: keyed(b"hello", at(0)),
+            locator: at(0),
         };
 
-        // 2 (key_len) + 5 (key) + 7 (narrow heap payload) = 14
-        assert_eq!(entry.size_on_disk(), 2 + 5 + RowLocator::NARROW_PAYLOAD_LEN);
+        // 5 (value) + 17 (the suffix naming the row). The address rides in the
+        // key rather than a second time beside it, and the length rides in the
+        // slot rather than in front of the key
+        assert_eq!(entry.size_on_disk(), 5 + RowLocator::KEY_SUFFIX_LEN);
     }
 
     /// The child an ordered separator list routes `probe` to, derived

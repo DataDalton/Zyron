@@ -1200,6 +1200,16 @@ impl Server {
                 ..compaction_config
             }
         };
+        // Anything an online schema change left half done when this node last
+        // stopped goes now, before a connection can read a partial index or
+        // write into a shadow nothing will install
+        zyron_wire::index_build::discard_incomplete_ddl(
+            &catalog,
+            &disk_manager,
+            &self.config.storage.data_dir,
+        )
+        .await;
+
         // Shared B+tree index registry: the same instance the connection and DML
         // paths use, so the vacuum worker deletes reclaimed rows' index entries
         // from the live indexes rather than a private copy.
@@ -1553,6 +1563,8 @@ impl Server {
             }),
             node_capabilities: Some(std::sync::Arc::clone(&capabilities)),
             catalog: Arc::clone(&catalog),
+            ddl_progress: Arc::new(zyron_wire::ddl_progress::DdlProgressRegistry::new()),
+            shadow_targets: Arc::new(scc::HashMap::new()),
             legal_holds: Arc::clone(&legal_hold_registry),
             dlq_registry: Arc::clone(&dlq_registry_arc),
             wal: Arc::clone(&wal),

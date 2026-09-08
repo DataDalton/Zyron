@@ -208,6 +208,12 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
     },
     SystemObject {
         schema: "core",
+        object: "constraints",
+        kind: SystemObjectKind::View,
+        doc: "Every constraint on every live table, with whether the rows that predate it have been checked",
+    },
+    SystemObject {
+        schema: "core",
         object: "system_view_documentation",
         kind: SystemObjectKind::View,
         doc: "One row per registered system entity: catalog, schema, object, kind, docstring",
@@ -220,6 +226,12 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
         object: "indexes",
         kind: SystemObjectKind::View,
         doc: "Every index, with its table, type, uniqueness, and key columns",
+    },
+    SystemObject {
+        schema: "storage",
+        object: "ddl_progress",
+        kind: SystemObjectKind::View,
+        doc: "Online schema changes running now, with the phase each is in and the rows it has read",
     },
     SystemObject {
         schema: "storage",

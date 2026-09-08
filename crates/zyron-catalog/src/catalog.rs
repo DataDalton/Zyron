@@ -91,6 +91,10 @@ const DDL_CREATE_USER_TYPE: u8 = 0x42;
 const DDL_DROP_USER_TYPE: u8 = 0x43;
 const DDL_CREATE_COLLATION: u8 = 0x44;
 const DDL_DROP_COLLATION: u8 = 0x45;
+/// Moves one index between build states. Payload is index id, table id, and
+/// the state byte, so recovery replays the transition without carrying the
+/// whole entry a second time
+const DDL_INDEX_STATE: u8 = 0x46;
 
 /// Result of a `drop_table` call. `soft_dropped` is true when the table went
 /// to the recycle bin (entry and backing files retained for UNDROP); false
@@ -731,6 +735,11 @@ impl Catalog {
                     };
                     Some((4, id as u64))
                 }
+                // A build-state flip carries only the transition, so it keeps
+                // its own key. Sharing the index key would let the flip
+                // supersede the create it depends on, and the flip alone
+                // cannot rebuild the entry
+                DDL_INDEX_STATE => Some((30, id_u32(entry_bytes)? as u64)),
                 DDL_CREATE_STREAMING_JOB | DDL_ALTER_STREAMING_JOB | DDL_DROP_STREAMING_JOB => {
                     let id: u32 = if ddl_type == DDL_DROP_STREAMING_JOB {
                         id_u32(entry_bytes)?
@@ -1006,6 +1015,7 @@ impl Catalog {
                     | DDL_DROP_TABLE
                     | DDL_CREATE_INDEX
                     | DDL_DROP_INDEX
+                    | DDL_INDEX_STATE
                     | DDL_CREATE_STREAMING_JOB
                     | DDL_ALTER_STREAMING_JOB
                     | DDL_DROP_STREAMING_JOB
@@ -1188,6 +1198,40 @@ impl Catalog {
                         ]);
                         if have_indexes.remove(&id) {
                             let _ = self.storage.delete_index(IndexId(id)).await;
+                        }
+                    }
+                }
+                DDL_INDEX_STATE => {
+                    // The record carries the transition, not the entry, so
+                    // the stored entry is read back and rewritten with the
+                    // new state. An id the store no longer holds was dropped
+                    // after the flip, and the drop is what stands
+                    if entry_bytes.len() >= 9 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        let raw = entry_bytes[8];
+                        let state = IndexState::from_u8(raw).ok_or_else(|| {
+                            ZyronError::CatalogCorrupted(format!(
+                                "index state record for index {id} carries state byte {raw}, \
+                                 which names no state"
+                            ))
+                        })?;
+                        if have_indexes.contains(&id) {
+                            let stored = self
+                                .storage
+                                .load_indexes()
+                                .await?
+                                .into_iter()
+                                .find(|e| e.id.0 == id);
+                            if let Some(mut entry) = stored {
+                                entry.state = state;
+                                let _ = self.storage.delete_index(IndexId(id)).await;
+                                let _ = self.storage.store_index(&entry).await;
+                            }
                         }
                     }
                 }
@@ -2694,6 +2738,7 @@ impl Catalog {
                             quarantine_table_id: None,
                             without_overlaps: None,
                             fk_period: false,
+                            validated: true,
                         });
                     }
                     ColumnConstraint::Unique => {
@@ -2711,6 +2756,7 @@ impl Catalog {
                             quarantine_table_id: None,
                             without_overlaps: None,
                             fk_period: false,
+                            validated: true,
                         });
                     }
                     ColumnConstraint::NotNull => {
@@ -2728,6 +2774,7 @@ impl Catalog {
                             quarantine_table_id: None,
                             without_overlaps: None,
                             fk_period: false,
+                            validated: true,
                         });
                     }
                     ColumnConstraint::Check(expr) => {
@@ -2745,6 +2792,7 @@ impl Catalog {
                             quarantine_table_id: None,
                             without_overlaps: None,
                             fk_period: false,
+                            validated: true,
                         });
                     }
                     ColumnConstraint::References {
@@ -2780,6 +2828,7 @@ impl Catalog {
                             quarantine_table_id: None,
                             without_overlaps: None,
                             fk_period: false,
+                            validated: true,
                         });
                     }
                     ColumnConstraint::Default(_) => {
@@ -2812,7 +2861,12 @@ impl Catalog {
             lake: Default::default(),
             cluster: Default::default(),
             foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         };
+        let mut entry = entry;
+        entry.seal_initial_epoch();
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
@@ -2898,7 +2952,12 @@ impl Catalog {
                 peer: peer.to_string(),
                 table: remote_table.to_string(),
             },
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         };
+        let mut entry = entry;
+        entry.seal_initial_epoch();
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
         self.cache.put_table(entry);
@@ -3188,6 +3247,7 @@ impl Catalog {
         column_names: &[String],
         unique: bool,
         index_type: IndexType,
+        state: IndexState,
     ) -> Result<IndexId> {
         // Check for duplicate index name in cache
         let existing = self.cache.get_indexes_for_table(table_id);
@@ -3226,6 +3286,7 @@ impl Catalog {
             index_file_id,
             index_type,
             parameters: None,
+            state,
         };
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
@@ -3246,6 +3307,7 @@ impl Catalog {
         name: &str,
         columns: &[(String, bool)],
         unique: bool,
+        state: IndexState,
     ) -> Result<IndexId> {
         let existing = self.cache.get_indexes_for_table(table_id);
         for idx in &existing {
@@ -3282,6 +3344,7 @@ impl Catalog {
             index_file_id,
             index_type: IndexType::BTree,
             parameters: None,
+            state,
         };
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
@@ -3303,6 +3366,7 @@ impl Catalog {
         unique: bool,
         index_type: IndexType,
         parameters: Option<Vec<u8>>,
+        state: IndexState,
     ) -> Result<IndexId> {
         let existing = self.cache.get_indexes_for_table(table_id);
         for idx in &existing {
@@ -3339,12 +3403,45 @@ impl Catalog {
             index_file_id,
             index_type,
             parameters,
+            state,
         };
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
         self.storage.store_index(&entry).await?;
         self.cache.put_index(entry);
         Ok(index_id)
+    }
+
+    /// Moves an index between build states, which is the flip that makes a
+    /// finished build visible to the planner.
+    ///
+    /// The state rides its own DDL record rather than a whole-entry rewrite,
+    /// so recovery replays exactly the transition and nothing else. Returns
+    /// the entry as it now stands.
+    pub async fn set_index_state(
+        &self,
+        table_id: TableId,
+        name: &str,
+        state: IndexState,
+    ) -> Result<Arc<IndexEntry>> {
+        let existing = self
+            .cache
+            .get_indexes_for_table(table_id)
+            .into_iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| ZyronError::IndexNotFound(name.to_string()))?;
+        let mut entry = (*existing).clone();
+        entry.state = state;
+        let mut payload = Vec::with_capacity(9);
+        payload.extend_from_slice(&entry.id.0.to_le_bytes());
+        payload.extend_from_slice(&table_id.0.to_le_bytes());
+        payload.push(state as u8);
+        self.log_ddl(DDL_INDEX_STATE, &payload)?;
+        self.storage.delete_index(entry.id).await?;
+        self.storage.store_index(&entry).await?;
+        self.cache.invalidate_index(entry.id);
+        self.cache.put_index(entry.clone());
+        Ok(Arc::new(entry))
     }
 
     pub async fn drop_index(&self, table_id: TableId, name: &str) -> Result<()> {
@@ -3399,6 +3496,84 @@ impl Catalog {
     /// separate catalog `RwLock` reads + allocations per batch.
     pub fn index_snapshot(&self, table_id: TableId) -> Arc<crate::cache::TableIndexSnapshot> {
         self.cache.index_snapshot(table_id)
+    }
+
+    /// Points an index entry at a freshly built tree file.
+    ///
+    /// A REINDEX builds beside the live tree so queries keep being answered
+    /// while it runs, and this one update is what makes the new file the
+    /// index. The old file stops being reachable at the same instant.
+    pub async fn replace_index_file(
+        &self,
+        table_id: TableId,
+        name: &str,
+        new_file_id: u32,
+    ) -> Result<()> {
+        let existing = self
+            .cache
+            .get_indexes_for_table(table_id)
+            .into_iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| ZyronError::IndexNotFound(name.to_string()))?;
+        let mut entry = (*existing).clone();
+        entry.index_file_id = new_file_id;
+        self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
+        self.storage.delete_index(entry.id).await?;
+        self.storage.store_index(&entry).await?;
+        self.cache.invalidate_index(entry.id);
+        self.cache.put_index(entry);
+        Ok(())
+    }
+
+    /// Drops the layouts no live tuple of a table carries any more.
+    ///
+    /// A vacuum pass is the only thing that visits every live tuple, so it is
+    /// the only thing that can say an epoch is gone. `min_live_epoch` is the
+    /// lowest epoch above zero the pass saw, and `any_unstamped` says whether
+    /// it saw a tuple that predates stamping. An epoch below the minimum is
+    /// carried by nothing and its column list is dead weight; epoch 0 and the
+    /// pre-stamp layout retire together, because they describe the same rows.
+    ///
+    /// A pass that saw no live tuple at all changes nothing: an empty table
+    /// still has to be able to read the rows a concurrent writer is adding
+    /// under the current epoch.
+    ///
+    /// Returns true when the entry was rewritten.
+    pub async fn retire_schema_epochs(
+        &self,
+        table_id: TableId,
+        min_live_epoch: u16,
+        any_unstamped: bool,
+        saw_nothing: bool,
+    ) -> Result<bool> {
+        if saw_nothing {
+            return Ok(false);
+        }
+        let existing = self.get_table_by_id(table_id)?;
+        let current = existing.schema_epoch;
+        // The current epoch is never retired, because the next write uses it
+        let floor = min_live_epoch.min(current);
+        let drops_epochs = existing.schema_epochs.iter().any(|e| e.epoch < floor);
+        let drops_pre_stamp = !any_unstamped && !existing.pre_stamp_columns.is_empty();
+        if !drops_epochs && !drops_pre_stamp {
+            return Ok(false);
+        }
+        let mut entry = (*existing).clone();
+        entry.schema_epochs.retain(|e| e.epoch >= floor);
+        if drops_pre_stamp {
+            entry.pre_stamp_columns.clear();
+        }
+        self.update_table(entry).await?;
+        Ok(true)
+    }
+
+    /// Publishes the shadow tables a rewrite is filling from `table_id`, or
+    /// clears them with an empty list when it ends.
+    ///
+    /// From the moment this returns, every write that resolves its
+    /// maintenance list applies to the shadow as well.
+    pub fn set_shadow_targets(&self, table_id: TableId, targets: Vec<crate::ShadowSpec>) {
+        self.cache.set_shadow_targets(table_id, targets);
     }
 
     // -----------------------------------------------------------------------
@@ -3977,6 +4152,8 @@ impl Catalog {
                     tz_offset_secs: None,
                     element_type: None,
                     attrs: crate::schema::ColumnAttributes::default(),
+                    absent_value: None,
+                    dropped: false,
                 },
             )
             .collect();
@@ -4004,7 +4181,69 @@ impl Catalog {
             lake: Default::default(),
             cluster: Default::default(),
             foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         };
+        let mut entry = entry;
+        entry.seal_initial_epoch();
+        self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
+        self.storage.store_table(&entry).await?;
+        self.cache.put_table(entry);
+        Ok(table_id)
+    }
+
+    /// Registers a table from a resolved column list and storage files the
+    /// caller already allocated.
+    ///
+    /// The shadow a rewrite copies into needs its files chosen before the
+    /// entry exists: the entry has to name them, and the rewrite has to be
+    /// able to delete them by id if it gives up before the entry is written.
+    pub async fn create_table_with_files(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+        mut columns: Vec<ColumnEntry>,
+        constraints: Vec<crate::schema::ConstraintEntry>,
+        heap_file_id: u32,
+        fsm_file_id: u32,
+    ) -> Result<TableId> {
+        if self.cache.get_table_by_name(schema_id, name).is_some() {
+            return Err(ZyronError::TableAlreadyExists(name.to_string()));
+        }
+        let table_id = TableId(self.oid_allocator.next());
+        for (i, c) in columns.iter_mut().enumerate() {
+            c.table_id = table_id;
+            c.ordinal = i as u16;
+        }
+        let mut entry = TableEntry {
+            id: table_id,
+            schema_id,
+            name: name.to_string(),
+            heap_file_id,
+            fsm_file_id,
+            columns,
+            constraints,
+            created_at: current_timestamp(),
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+        };
+        entry.seal_initial_epoch();
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
         self.cache.put_table(entry);
@@ -6682,6 +6921,8 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
             tz_offset_secs: None,
             element_type: extract_element_type(&def.data_type),
             attrs,
+            absent_value: None,
+            dropped: false,
         });
     }
     Ok(entries)
@@ -6777,6 +7018,7 @@ fn convert_table_constraints(
                     None => None,
                 },
                 fk_period: tc.fk_period,
+                validated: true,
             },
             TableConstraintKind::Unique(col_names) => ConstraintEntry {
                 name: tc
@@ -6798,6 +7040,7 @@ fn convert_table_constraints(
                     None => None,
                 },
                 fk_period: tc.fk_period,
+                validated: true,
             },
             TableConstraintKind::Check(expr) => ConstraintEntry {
                 name: tc.name.clone().unwrap_or_else(|| "ck_table".to_string()),
@@ -6816,6 +7059,7 @@ fn convert_table_constraints(
                     None => None,
                 },
                 fk_period: tc.fk_period,
+                validated: true,
             },
             TableConstraintKind::ForeignKey {
                 columns: col_names,
@@ -6843,6 +7087,7 @@ fn convert_table_constraints(
                     None => None,
                 },
                 fk_period: tc.fk_period,
+                validated: true,
             },
         };
         result.push(entry);
@@ -6965,6 +7210,8 @@ mod tests {
                 tz_offset_secs: None,
                 element_type: None,
                 attrs: Default::default(),
+                absent_value: None,
+                dropped: false,
             },
             ColumnEntry {
                 id: ColumnId(1),
@@ -6979,6 +7226,8 @@ mod tests {
                 tz_offset_secs: None,
                 element_type: None,
                 attrs: Default::default(),
+                absent_value: None,
+                dropped: false,
             },
         ];
         let tcs = vec![

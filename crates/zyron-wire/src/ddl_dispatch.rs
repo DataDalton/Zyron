@@ -53,6 +53,15 @@ pub fn try_handle_ddl_utility<'a>(
 > {
     use zyron_parser::Statement;
 
+    // An online build waits for the transactions that were running when it
+    // published. The session's own open transaction is one of them and cannot
+    // end until this statement returns, so the build has to know about it.
+    // Recorded on every statement rather than only the ones that build, so it
+    // is never a stale id from an earlier transaction
+    if let Some(s) = session.as_mut() {
+        s.open_txn_id = txn.as_ref().map(|t| t.txn_id);
+    }
+
     match stmt {
         // The currency rates system table is file backed, so its DML is
         // handled here instead of the planner
@@ -802,6 +811,12 @@ async fn handle_alter_table(
     // constraint leaves no tree behind it
     let mut provision_indexes_after = false;
     let mut drop_index_after: Option<String> = None;
+    // A CHECK, NOT NULL or FOREIGN KEY published unvalidated, with the
+    // declaration the scan checks the existing rows against
+    let mut validate_after: Option<(String, zyron_parser::ast::TableConstraint)> = None;
+    // The constraint this statement added, so a failure to enforce it can
+    // take it back out
+    let mut added_constraint: Option<String> = None;
 
     match &stmt.operation {
         Op::RenameTable { new_name } => {
@@ -846,19 +861,28 @@ async fn handle_alter_table(
             });
         }
         Op::AddConstraint(tc) => {
-            let ce = build_constraint_entry(&stmt.name, tc, &entry.columns, server, schema_id)?;
+            let mut ce = build_constraint_entry(&stmt.name, tc, &entry.columns, server, schema_id)?;
             if entry.constraints.iter().any(|c| c.name == ce.name) {
                 return Err(ProtocolError::Database(ZyronError::Internal(format!(
                     "constraint \"{}\" already exists",
                     ce.name
                 ))));
             }
-            // Reject the constraint if any current row already violates it.
-            validate_constraint_against_existing(&stmt.name, tc, server, schema_id).await?;
+            // The constraint is published unvalidated and enforced from this
+            // instant, so every write after it is held to the rule while the
+            // rows that predate it are still being read. The scan answers for
+            // the past and names the rule it found broken, which is what an
+            // operator needs: a PRIMARY KEY refuses a NULL as well as a
+            // duplicate, and only the scan knows which one it hit
+            let needs_scan = true;
+            if needs_scan {
+                ce.validated = false;
+                validate_after = Some((ce.name.clone(), tc.clone()));
+            }
+            added_constraint = Some(ce.name.clone());
             entry.constraints.push(ce);
-            // Validating the existing rows settles the past. Ongoing
-            // enforcement needs the index, which is provisioned once the
-            // catalog carries the constraint
+            // Ongoing enforcement of a uniqueness rule needs the index, which
+            // is provisioned once the catalog carries the constraint
             provision_indexes_after = true;
         }
         Op::DropConstraint { name, if_exists } => {
@@ -920,31 +944,147 @@ async fn handle_alter_table(
             if table.lake.is_lake() {
                 return alter_lake_table_columns(&stmt.operation, server, &table).await;
             }
-            // Column-shape changes rewrite the heap: the tuple decoder walks the
-            // full column list and drops any tuple narrower than the schema, so
-            // existing rows must be re-encoded under the new layout. The rewrite
-            // builds a fresh heap in side files and swaps the catalog, leaving
-            // the old heap intact until it commits.
-            return rewrite_table_columns(&stmt.operation, &stmt.name, server, schema_id, &table)
-                .await;
+            // A heap tuple carries the epoch it was written under, so a column
+            // change is a catalog record and the rows are read through the
+            // layout each one already has. Only a type change the old bytes
+            // cannot be read as touches a row, and that runs beside the live
+            // table rather than in place
+            return alter_heap_table_columns(
+                &stmt.operation,
+                &stmt.name,
+                server,
+                schema_id,
+                &table,
+                session,
+            )
+            .await;
         }
     }
 
     let table_id = entry.id;
+    // The publication. From here on the constraint is enforced on every write
+    // that resolves the table entry, which is what makes the scan below
+    // responsible only for the rows that predate it
+    let active_at_publication = server.txn_manager.proc_array().active_txn_ids();
     server
         .catalog
         .update_table(entry)
         .await
         .map_err(ProtocolError::Database)?;
 
-    if provision_indexes_after {
-        provision_constraint_indexes(server, schema_id, &stmt.name).await?;
+    let hold_open = transactions_held_open(session);
+    if let Some((name, declaration)) = validate_after {
+        let issuer = session
+            .as_ref()
+            .map(|s| s.user.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        validate_published_constraint(
+            server,
+            schema_id,
+            table_id,
+            &stmt.name,
+            &name,
+            &declaration,
+            &active_at_publication,
+            &hold_open,
+            &issuer,
+        )
+        .await?;
+    }
+    if provision_indexes_after
+        && let Err(e) =
+            provision_constraint_indexes(server, schema_id, &stmt.name, &hold_open).await
+    {
+        // The index is what enforces a uniqueness rule, so a constraint whose
+        // index could not be built is a rule nothing applies. It comes back
+        // out rather than sitting in the catalog unenforced
+        if let Some(name) = &added_constraint
+            && let Ok(current) = server.catalog.get_table_by_id(table_id)
+        {
+            let mut entry = (*current).clone();
+            entry.constraints.retain(|c| &c.name != name);
+            let _ = server.catalog.update_table(entry).await;
+        }
+        return Err(e);
     }
     if let Some(name) = drop_index_after {
         drop_constraint_index(server, table_id, &name).await;
     }
 
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+}
+
+/// Checks the rows that predate a published CHECK or NOT NULL, then records
+/// the constraint as settled.
+///
+/// The constraint is already enforced on every write, so this only has to
+/// answer for the past. A violating row leaves the constraint off the table
+/// entirely and names the row, because a rule the data does not satisfy is not
+/// a rule the table can carry.
+#[allow(clippy::too_many_arguments)]
+async fn validate_published_constraint(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+    table_id: zyron_catalog::TableId,
+    table_name: &str,
+    constraint_name: &str,
+    declaration: &zyron_parser::ast::TableConstraint,
+    active_at_publication: &[u64],
+    hold_open: &[u64],
+    issuing_session: &str,
+) -> Result<(), ProtocolError> {
+    use crate::ddl_progress::{DdlOperation, DdlPhase};
+
+    let progress = server.ddl_progress.begin(
+        table_name,
+        constraint_name,
+        DdlOperation::ValidateConstraint,
+        issuing_session,
+    );
+    progress.set_phase(DdlPhase::WaitingOldTxns);
+    // A transaction that resolved the table entry before publication is not
+    // enforcing the constraint, so its writes are not covered by the
+    // enforcement and are not in the snapshot the scan reads either
+    crate::index_build::wait_for_transactions_active_at(
+        server,
+        active_at_publication,
+        hold_open,
+        None,
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+
+    progress.set_phase(DdlPhase::Scanning);
+    let outcome =
+        validate_constraint_against_existing(table_name, declaration, server, schema_id).await;
+    if let Err(e) = outcome {
+        // The constraint never becomes part of the table, so nothing is left
+        // enforcing a rule the rows do not meet
+        if let Ok(current) = server.catalog.get_table_by_id(table_id) {
+            let mut entry = (*current).clone();
+            entry.constraints.retain(|c| c.name != constraint_name);
+            let _ = server.catalog.update_table(entry).await;
+        }
+        return Err(e);
+    }
+
+    progress.set_phase(DdlPhase::Swapping);
+    let current = server
+        .catalog
+        .get_table_by_id(table_id)
+        .map_err(ProtocolError::Database)?;
+    let mut entry = (*current).clone();
+    for c in entry.constraints.iter_mut() {
+        if c.name == constraint_name {
+            c.validated = true;
+        }
+    }
+    server
+        .catalog
+        .update_table(entry)
+        .await
+        .map_err(ProtocolError::Database)?;
+    Ok(())
 }
 
 /// Ensures a table's companion quarantine table exists and returns its id.
@@ -1256,6 +1396,8 @@ async fn alter_lake_table_columns(
                 tz_offset_secs: None,
                 element_type: None,
                 attrs: Default::default(),
+                absent_value: None,
+                dropped: false,
             });
             server
                 .catalog
@@ -1483,17 +1625,24 @@ async fn alter_lake_table_columns(
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
 }
 
-/// Rewrites a table's heap to apply ADD COLUMN, DROP COLUMN, or ALTER COLUMN
-/// TYPE. Reads all rows under the old schema, reshapes them, builds a new heap
-/// in freshly allocated files, rebuilds every index, and swaps the catalog.
-/// The old heap files are retained until the new heap is populated so a failure
-/// mid-rewrite leaves the original data recoverable.
-async fn rewrite_table_columns(
+/// Applies ADD COLUMN, DROP COLUMN or ALTER COLUMN SET TYPE to a heap table.
+///
+/// None of the three reads or writes a row, because none of them has to. A
+/// tuple carries the epoch it was written under, so a row that predates a
+/// column reads that column's recorded absent value, a row that still carries a
+/// dropped column has its bytes walked past, and a row whose column widened is
+/// widened on the way into the batch. What each of these writes is one catalog
+/// record.
+///
+/// A type change the old bytes cannot be read as is the exception, and it goes
+/// to the shadow rewrite instead.
+async fn alter_heap_table_columns(
     op: &zyron_parser::ast::AlterTableOperation,
     table_name: &str,
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::ids::SchemaId,
-    old_table: &zyron_catalog::schema::TableEntry,
+    old_table: &Arc<zyron_catalog::schema::TableEntry>,
+    session: &Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     use zyron_catalog::ids::ColumnId;
     use zyron_catalog::schema::{ColumnEntry, ConstraintType};
@@ -1503,28 +1652,17 @@ async fn rewrite_table_columns(
     let table_id = old_table.id;
     debug_assert!(
         !old_table.lake.is_lake(),
-        "lake tables never reach the heap rewrite"
+        "lake tables never reach the heap column path"
     );
 
-    // Read every current row under the old schema. INCLUDING DELETED keeps
-    // soft-deleted tombstones so the rewrite does not silently drop them.
-    // SELECT * returns columns in ordinal order, so each batch column lines up
-    // with old_table.columns.
-    let mut new_batches = select_query_batches(
-        server,
-        schema_scoped_path(server, schema_id),
-        &format!("SELECT * FROM \"{table_name}\" INCLUDING DELETED"),
-    )
-    .await?;
-
-    // Build the new column list and reshape the batches together so the batch
-    // column order always matches the catalog column order the encoder uses.
-    let mut new_columns = old_table.columns.clone();
-    let mut dropped_col_id: Option<ColumnId> = None;
+    let mut entry = (**old_table).clone();
 
     match op {
         Op::AddColumn(def) => {
-            if new_columns.iter().any(|c| c.name == def.name) {
+            if entry
+                .live_columns()
+                .any(|c| c.name.eq_ignore_ascii_case(&def.name))
+            {
                 return Err(ProtocolError::Database(ZyronError::Internal(format!(
                     "column \"{}\" already exists",
                     def.name
@@ -1536,50 +1674,58 @@ async fn rewrite_table_columns(
             // TIMESTAMP(p) and a DECIMAL(p,s)
             let fractional_digits = def.data_type.fractional_digits();
 
-            // Resolve the backfill value once. A volatile default (now()) is
-            // evaluated a single time for the rewrite, matching the semantics
-            // of a one-shot column add.
+            // Resolved once, here. A volatile default like now() answers with
+            // one value for every row that predates the column, which is what
+            // adding a column with a default means
             let fill = match &def.default {
                 Some(expr) => eval_default_scalar(server, expr, type_id).await?,
                 None => {
                     if !nullable {
                         return Err(ProtocolError::Database(ZyronError::Internal(format!(
-                            "column \"{}\" is NOT NULL but has no DEFAULT; cannot backfill existing rows",
+                            "column \"{}\" is NOT NULL but has no DEFAULT, so the rows that \
+                             predate it have no value to read",
                             def.name
                         ))));
                     }
                     ScalarValue::Null
                 }
             };
+            let absent_value = encode_absent_value(type_id, fractional_digits, &fill)?;
 
-            for b in new_batches.iter_mut() {
-                let col = build_constant_column(type_id, fractional_digits, &fill, b.num_rows)?;
-                b.columns.push(col);
-            }
-
-            let next_id = new_columns
+            let next_id = entry
+                .columns
                 .iter()
                 .map(|c| c.id.0)
                 .max()
                 .map(|m| m + 1)
                 .unwrap_or(0);
-            new_columns.push(ColumnEntry {
+            entry.columns.push(ColumnEntry {
                 id: ColumnId(next_id),
                 table_id,
                 name: def.name.clone(),
                 type_id,
-                ordinal: new_columns.len() as u16,
+                ordinal: entry.columns.len() as u16,
                 nullable,
                 default_expr: def.default.as_ref().map(zyron_parser::expr_to_sql),
                 max_length: alter_extract_max_length(&def.data_type),
                 fractional_digits,
                 tz_offset_secs: None,
-                element_type: None,
+                element_type: def.data_type.declared_element_type(),
                 attrs: Default::default(),
+                absent_value,
+                dropped: false,
             });
+            // The encoded shape changed, so rows written from now on carry a
+            // new epoch and rows written before it keep reading through theirs
+            let layout = entry.current_physical_columns();
+            entry.push_schema_epoch(layout);
         }
         Op::DropColumn { name, if_exists } => {
-            let Some(pos) = new_columns.iter().position(|c| c.name == *name) else {
+            let Some(pos) = entry
+                .columns
+                .iter()
+                .position(|c| !c.dropped && c.name.eq_ignore_ascii_case(name))
+            else {
                 if *if_exists {
                     return Ok(DdlResult::Tag("ALTER TABLE".to_string()));
                 }
@@ -1587,22 +1733,41 @@ async fn rewrite_table_columns(
                     name.clone(),
                 )));
             };
-            if new_columns.len() == 1 {
-                return Err(ProtocolError::Database(ZyronError::Internal(
-                    "cannot drop the only column of a table".to_string(),
-                )));
+            if entry.live_columns().count() == 1 {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "cannot drop \"{name}\", it is the only column table \"{table_name}\" has \
+                     left and a table with no columns cannot hold a row"
+                ))));
             }
-            let col_id = new_columns[pos].id;
+            let col_id = entry.columns[pos].id;
+
+            // An index on the column is refused rather than cascaded. Dropping
+            // the index is a separate decision with its own consequences for
+            // the plans that use it, so the operator makes it
+            let indexes = server.catalog.get_indexes_for_table(table_id);
+            let using: Vec<String> = indexes
+                .iter()
+                .filter(|i| i.columns.iter().any(|ic| ic.column_id == col_id))
+                .map(|i| i.name.clone())
+                .collect();
+            if !using.is_empty() {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "cannot drop column \"{name}\": index {} keys on it. Drop {} first",
+                    using.join(", "),
+                    if using.len() == 1 { "it" } else { "them" }
+                ))));
+            }
 
             // A column in a primary key or a foreign key cannot be dropped.
-            for c in &old_table.constraints {
+            for c in &entry.constraints {
                 if (c.constraint_type == ConstraintType::PrimaryKey
-                    || c.constraint_type == ConstraintType::ForeignKey)
+                    || c.constraint_type == ConstraintType::ForeignKey
+                    || c.constraint_type == ConstraintType::Unique)
                     && c.columns.contains(&col_id)
                 {
                     return Err(ProtocolError::Database(ZyronError::Internal(format!(
-                        "cannot drop column \"{name}\": it participates in a {:?} constraint",
-                        c.constraint_type
+                        "cannot drop column \"{name}\": constraint \"{}\" is a {:?} over it",
+                        c.name, c.constraint_type
                     ))));
                 }
             }
@@ -1621,335 +1786,157 @@ async fn rewrite_table_columns(
                 }
             }
 
-            for b in new_batches.iter_mut() {
-                b.columns.remove(pos);
-            }
-            new_columns.remove(pos);
-            dropped_col_id = Some(col_id);
+            // The bytes stay where they are in every tuple already written, so
+            // the epoch does not move. Vacuum omits them the next time it
+            // rewrites a tuple, which is how the space comes back
+            entry.columns[pos].dropped = true;
+            entry.constraints.retain(|c| !c.columns.contains(&col_id));
         }
         Op::AlterColumnSetType { column, data_type } => {
-            let Some(pos) = new_columns.iter().position(|c| c.name == *column) else {
+            let Some(pos) = entry
+                .columns
+                .iter()
+                .position(|c| !c.dropped && c.name.eq_ignore_ascii_case(column))
+            else {
                 return Err(ProtocolError::Database(ZyronError::ColumnNotFound(
                     column.clone(),
                 )));
             };
             let target = data_type.to_type_id();
-            for b in new_batches.iter_mut() {
-                // Converting to a decimal needs the declared scale, which
-                // the bare TypeId does not carry
-                let casted = if target == zyron_common::TypeId::Decimal {
-                    zyron_executor::compute::cast_column_to_decimal(
-                        &b.columns[pos],
-                        data_type.fractional_digits().unwrap_or(0),
-                    )
-                } else {
-                    zyron_executor::compute::cast_column(&b.columns[pos], target)
-                }
-                .map_err(ProtocolError::Database)?;
-                b.columns[pos] = casted;
+            let target_digits = data_type.fractional_digits();
+            let target_len = alter_extract_max_length(data_type);
+            let current = &entry.columns[pos];
+            let from = zyron_types::Representation {
+                type_id: current.type_id,
+                max_length: current.max_length,
+                fractional_digits: current.fractional_digits,
+                nullable: current.nullable,
+            };
+            let to = zyron_types::Representation {
+                type_id: target,
+                max_length: target_len,
+                fractional_digits: target_digits,
+                nullable: current.nullable,
+            };
+            if !zyron_types::representation_compatible(from, to) {
+                // The stored bytes do not decode as the new type, so every row
+                // has to be re-encoded. That runs beside the live table
+                return run_shadow_rewrite(
+                    server,
+                    schema_id,
+                    old_table,
+                    column,
+                    target,
+                    target_digits,
+                    target_len,
+                    session,
+                )
+                .await;
             }
-            let col = &mut new_columns[pos];
+            let col = &mut entry.columns[pos];
             col.type_id = target;
-            col.max_length = alter_extract_max_length(data_type);
-            col.fractional_digits = data_type.fractional_digits();
+            col.max_length = target_len;
+            col.fractional_digits = target_digits;
+            // A widened column is a different encoded shape for the rows
+            // written from now on, and the rows already written widen as they
+            // are read
+            let layout = entry.current_physical_columns();
+            entry.push_schema_epoch(layout);
         }
         _ => {
             return Err(ProtocolError::Database(ZyronError::Internal(
-                "rewrite_table_columns invoked for a non-column-shape operation".to_string(),
+                "alter_heap_table_columns invoked for a non-column-shape operation".to_string(),
             )));
         }
     }
 
-    // Renumber ordinals to match the new physical position.
-    for (i, c) in new_columns.iter_mut().enumerate() {
-        c.ordinal = i as u16;
-    }
-
-    // Capture every index definition (reading vector configs from the live
-    // manager) before anything is dropped. Indexes on the dropped column do
-    // not survive; the rest are rebuilt from the new heap.
-    let old_indexes = server.catalog.get_indexes_for_table(table_id);
-    let mut survivors: Vec<IndexRebuild> = Vec::new();
-    for idx in &old_indexes {
-        let mut col_names = Vec::with_capacity(idx.columns.len());
-        let mut references_dropped = false;
-        for ic in &idx.columns {
-            if Some(ic.column_id) == dropped_col_id {
-                references_dropped = true;
-            }
-            if let Some(c) = old_table.columns.iter().find(|c| c.id == ic.column_id) {
-                col_names.push(c.name.clone());
-            }
-        }
-        if references_dropped {
-            continue;
-        }
-        let vector_config = if idx.index_type == zyron_catalog::IndexType::Vector {
-            server
-                .vector_manager
-                .as_ref()
-                .and_then(|m| m.get_index(idx.id.0))
-                .map(|vi| (vi.dimension_count(), vi.hnsw_config()))
-        } else {
-            None
-        };
-        survivors.push(IndexRebuild {
-            name: idx.name.clone(),
-            col_names,
-            index_type: idx.index_type,
-            unique: idx.unique,
-            parameters: idx.parameters.clone(),
-            vector_config,
-        });
-    }
-
-    // Allocate fresh heap and FSM files. The old files stay intact until the
-    // new heap is fully built and the rewrite commits.
-    let (new_heap_id, new_fsm_id) = server.catalog.alloc_heap_files();
-    let old_heap_id = old_table.heap_file_id;
-    let old_fsm_id = old_table.fsm_file_id;
-
-    // Swap the catalog to the new schema and new files. Constraints that
-    // reference the dropped column are pruned.
-    let mut new_entry = old_table.clone();
-    new_entry.columns = new_columns;
-    new_entry.heap_file_id = new_heap_id;
-    new_entry.fsm_file_id = new_fsm_id;
-    if let Some(did) = dropped_col_id {
-        new_entry.constraints.retain(|c| !c.columns.contains(&did));
-    }
     server
         .catalog
-        .update_table(new_entry)
+        .update_table(entry)
         .await
         .map_err(ProtocolError::Database)?;
-
-    // Drop every old index from the catalog and its manager.
-    for idx in &old_indexes {
-        let _ = server.catalog.drop_index(table_id, &idx.name).await;
-        match idx.index_type {
-            zyron_catalog::IndexType::BTree => {
-                let _ = server.btree_indexes.remove_async(&idx.id.0).await;
-            }
-            zyron_catalog::IndexType::Fulltext => {
-                if let Some(m) = &server.fts_manager {
-                    let _ = m.drop_index(idx.id.0);
-                }
-            }
-            zyron_catalog::IndexType::Vector => {
-                if let Some(m) = &server.vector_manager {
-                    let _ = m.drop_index(idx.id.0);
-                }
-            }
-            zyron_catalog::IndexType::Spatial => {
-                if let Some(m) = &server.spatial_manager {
-                    m.drop_index(idx.id.0);
-                }
-            }
-            zyron_catalog::IndexType::Hybrid => {
-                // Both engine halves registered under the hybrid id
-                if let Some(m) = &server.fts_manager {
-                    let _ = m.drop_index(idx.id.0);
-                }
-                if let Some(m) = &server.vector_manager {
-                    let _ = m.drop_index(idx.id.0);
-                }
-            }
-        }
-    }
-
-    // Recreate the surviving indexes empty, resolving column ids against the
-    // updated table. The InsertOperator repopulates them as it writes the new
-    // heap.
-    let updated = server
-        .catalog
-        .get_table(schema_id, table_name)
-        .map_err(ProtocolError::Database)?;
-    let checkpoint_dir = server.data_dir.join("indexes");
-    let _ = std::fs::create_dir_all(&checkpoint_dir);
-    for s in &survivors {
-        match s.index_type {
-            zyron_catalog::IndexType::BTree => {
-                let new_id = server
-                    .catalog
-                    .create_index(
-                        table_id,
-                        schema_id,
-                        &s.name,
-                        &s.col_names,
-                        s.unique,
-                        zyron_catalog::IndexType::BTree,
-                    )
-                    .await
-                    .map_err(ProtocolError::Database)?;
-                let entry = server
-                    .catalog
-                    .get_indexes_for_table(table_id)
-                    .into_iter()
-                    .find(|e| e.id == new_id)
-                    .ok_or_else(|| {
-                        ProtocolError::Database(ZyronError::Internal(
-                            "recreated B-tree index missing from catalog".to_string(),
-                        ))
-                    })?;
-                let btree =
-                    zyron_storage::BTreeIndex::create(entry.index_file_id, checkpoint_dir.clone())
-                        .await
-                        .map_err(ProtocolError::Database)?;
-                let _ = server
-                    .btree_indexes
-                    .insert_async(new_id.0, Arc::new(btree))
-                    .await;
-            }
-            zyron_catalog::IndexType::Fulltext => {
-                let new_id = server
-                    .catalog
-                    .create_index(
-                        table_id,
-                        schema_id,
-                        &s.name,
-                        &s.col_names,
-                        false,
-                        zyron_catalog::IndexType::Fulltext,
-                    )
-                    .await
-                    .map_err(ProtocolError::Database)?;
-                if let Some(m) = &server.fts_manager {
-                    let col_ids: Vec<u16> = s
-                        .col_names
-                        .iter()
-                        .filter_map(|n| {
-                            updated
-                                .columns
-                                .iter()
-                                .find(|c| c.name == *n)
-                                .map(|c| c.id.0)
-                        })
-                        .collect();
-                    m.create_index(new_id.0, table_id.0, col_ids)
-                        .map_err(ProtocolError::Database)?;
-                }
-            }
-            zyron_catalog::IndexType::Vector => {
-                let new_id = server
-                    .catalog
-                    .create_index(
-                        table_id,
-                        schema_id,
-                        &s.name,
-                        &s.col_names,
-                        false,
-                        zyron_catalog::IndexType::Vector,
-                    )
-                    .await
-                    .map_err(ProtocolError::Database)?;
-                if let (Some(m), Some((dims, cfg)), Some(col0)) = (
-                    &server.vector_manager,
-                    &s.vector_config,
-                    s.col_names.first(),
-                ) {
-                    let col_id = updated
-                        .columns
-                        .iter()
-                        .find(|c| c.name == *col0)
-                        .map(|c| c.id.0)
-                        .unwrap_or(0);
-                    m.create_index(new_id.0, table_id.0, col_id, *dims, cfg.clone())
-                        .map_err(ProtocolError::Database)?;
-                }
-            }
-            zyron_catalog::IndexType::Spatial => {
-                let new_id = server
-                    .catalog
-                    .create_index_with_params(
-                        table_id,
-                        schema_id,
-                        &s.name,
-                        &s.col_names,
-                        false,
-                        zyron_catalog::IndexType::Spatial,
-                        s.parameters.clone(),
-                    )
-                    .await
-                    .map_err(ProtocolError::Database)?;
-                if let Some(m) = &server.spatial_manager {
-                    let (dims, srid) = decode_spatial_params(&s.parameters);
-                    m.create_index(new_id.0, dims, srid);
-                }
-            }
-            zyron_catalog::IndexType::Hybrid => {
-                let new_id = server
-                    .catalog
-                    .create_index_with_params(
-                        table_id,
-                        schema_id,
-                        &s.name,
-                        &s.col_names,
-                        false,
-                        zyron_catalog::IndexType::Hybrid,
-                        s.parameters.clone(),
-                    )
-                    .await
-                    .map_err(ProtocolError::Database)?;
-                let params = zyron_catalog::index_params::decode_hybrid_params(&s.parameters);
-                let text_id = s
-                    .col_names
-                    .first()
-                    .and_then(|n| updated.columns.iter().find(|c| c.name == *n))
-                    .map(|c| c.id.0);
-                let vector_col = s
-                    .col_names
-                    .get(1)
-                    .and_then(|n| updated.columns.iter().find(|c| c.name == *n));
-                if let (Some(m), Some(text_id)) = (&server.fts_manager, text_id) {
-                    m.create_index(new_id.0, table_id.0, vec![text_id])
-                        .map_err(ProtocolError::Database)?;
-                    if let Some(p) = &params {
-                        crate::search_resilience_ddl::install_index_analyzer(
-                            &server.catalog,
-                            m,
-                            new_id.0,
-                            &p.fulltext,
-                        )
-                        .map_err(ProtocolError::Database)?;
-                    }
-                }
-                if let (Some(m), Some(p), Some(col)) = (&server.vector_manager, &params, vector_col)
-                {
-                    let metric = match p.vector_distance.as_str() {
-                        "euclidean" | "l2" => zyron_search::vector::DistanceMetric::Euclidean,
-                        "dot_product" | "dot" => zyron_search::vector::DistanceMetric::DotProduct,
-                        "manhattan" | "l1" => zyron_search::vector::DistanceMetric::Manhattan,
-                        _ => zyron_search::vector::DistanceMetric::Cosine,
-                    };
-                    let config = zyron_search::vector::HnswConfig {
-                        m: 16,
-                        efConstruction: 200,
-                        efSearch: 64,
-                        metric,
-                    };
-                    m.create_index(new_id.0, table_id.0, col.id.0, p.vector_dims, config)
-                        .map_err(ProtocolError::Database)?;
-                }
-            }
-        }
-    }
-
-    // Populate the new heap and the recreated indexes by replaying the reshaped
-    // rows through the standard insert pipeline.
-    run_rebuild_insert(server, table_id, new_batches).await?;
-
-    // The rewrite committed. Reclaim the old heap files and drop the stale
-    // cached handle so later reads open the new files.
-    let _ = server.heap_files.remove_async(&old_heap_id).await;
-    if let Err(e) = server.disk_manager.delete_file(old_heap_id).await {
-        eprintln!("ALTER TABLE: failed to remove old heap file {old_heap_id}: {e}");
-    }
-    if let Err(e) = server.disk_manager.delete_file(old_fsm_id).await {
-        eprintln!("ALTER TABLE: failed to remove old FSM file {old_fsm_id}: {e}");
-    }
-
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+}
+
+/// Encodes the value a row that predates a column reads, in the column's
+/// physical type.
+///
+/// The bytes are what the decoder pushes, so they are produced by the same
+/// encoder the heap uses rather than by a second copy of the layout rules.
+fn encode_absent_value(
+    type_id: zyron_common::TypeId,
+    fractional_digits: Option<u8>,
+    fill: &zyron_executor::column::ScalarValue,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
+    use zyron_executor::column::ScalarValue;
+    if matches!(fill, ScalarValue::Null) {
+        return Ok(None);
+    }
+    // Built through the same constant-column path a backfill would have used,
+    // so a decimal lands on its declared scale and a TIMESTAMP(p>6) lands as
+    // picoseconds rather than as whatever the literal parsed to
+    let column = build_constant_column(type_id, fractional_digits, fill, 1)?;
+    let physical = zyron_common::TypeId::timestamp_physical_type_id(type_id, fractional_digits);
+    let bytes = zyron_executor::batch::encode_scalar_value(
+        physical,
+        &column.get_scalar(0),
+        physical.fixed_size().unwrap_or(0),
+    );
+    Ok(Some(bytes))
+}
+
+/// Runs an incompatible SET TYPE through the shadow rewrite and turns its
+/// outcome into the statement's answer.
+#[allow(clippy::too_many_arguments)]
+async fn run_shadow_rewrite(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::ids::SchemaId,
+    table: &Arc<zyron_catalog::schema::TableEntry>,
+    column: &str,
+    target: zyron_common::TypeId,
+    target_digits: Option<u8>,
+    target_len: Option<usize>,
+    session: &Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    let issuer = session
+        .as_ref()
+        .map(|s| s.user.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let outcome = crate::shadow_rewrite::run(
+        server,
+        schema_id,
+        table,
+        column,
+        target,
+        target_digits,
+        target_len,
+        &issuer,
+        &transactions_held_open(session),
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+    match outcome {
+        crate::shadow_rewrite::RewriteOutcome::Swapped { rows } => {
+            tracing::info!(
+                target: "zyron::ddl",
+                table = %table.name,
+                column,
+                rows,
+                "ALTER COLUMN SET TYPE rewrote the table beside the live one"
+            );
+            Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+        }
+        crate::shadow_rewrite::RewriteOutcome::CastFailed {
+            locator,
+            value,
+            reason,
+        } => Err(ProtocolError::Database(ZyronError::ExecutionError(
+            format!(
+                "ALTER COLUMN \"{column}\" SET TYPE stopped: the row at {locator:?} holds {value}, \
+             which the new type cannot represent ({reason}). Nothing was changed"
+            ),
+        ))),
+    }
 }
 
 /// Extracts the max_length parameter from a sized data type, mirroring the
@@ -2395,6 +2382,7 @@ fn build_constraint_entry(
                 None => None,
             },
             fk_period: false,
+            validated: true,
             ref_table_id: None,
             ref_columns: vec![],
             check_expr: None,
@@ -2416,6 +2404,7 @@ fn build_constraint_entry(
                 None => None,
             },
             fk_period: false,
+            validated: true,
             ref_table_id: None,
             ref_columns: vec![],
             check_expr: None,
@@ -2433,6 +2422,7 @@ fn build_constraint_entry(
             constraint_type: ConstraintType::Check,
             without_overlaps: None,
             fk_period: false,
+            validated: true,
             columns: vec![],
             ref_table_id: None,
             ref_columns: vec![],
@@ -2480,6 +2470,7 @@ fn build_constraint_entry(
                 columns: resolve(cols)?,
                 without_overlaps: None,
                 fk_period: tc.fk_period,
+                validated: true,
                 ref_table_id: Some(ref_tbl.id),
                 ref_columns: ref_col_ids,
                 check_expr: None,
@@ -3142,7 +3133,14 @@ async fn handle_create_table(
             }
             // A declared PRIMARY KEY or UNIQUE needs the index that enforces
             // it, or the constraint is recorded and never checked
-            if let Err(e) = provision_constraint_indexes(server, schema_id, &name).await {
+            if let Err(e) = provision_constraint_indexes(
+                server,
+                schema_id,
+                &name,
+                &transactions_held_open(session),
+            )
+            .await
+            {
                 let _ = server.catalog.drop_table(schema_id, &name).await;
                 return Err(e);
             }
@@ -3278,6 +3276,7 @@ async fn provision_constraint_indexes(
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::SchemaId,
     table_name: &str,
+    hold_open: &[u64],
 ) -> Result<(), ProtocolError> {
     use zyron_catalog::schema::ConstraintType;
 
@@ -3341,15 +3340,20 @@ async fn provision_constraint_indexes(
             &constraint.name,
             &column_names,
             unique,
+            hold_open,
         )
         .await?;
     }
     Ok(())
 }
 
-/// Creates a unique B+tree index and fills it from the rows the table already
-/// holds, so a constraint added to a populated table starts enforcing against
-/// every existing row rather than only later ones.
+/// Creates the B+tree behind a UNIQUE or PRIMARY KEY constraint over the rows
+/// the table already holds.
+///
+/// Runs the same publish, wait, scan, load, flip sequence CREATE INDEX runs, so
+/// a constraint added to a populated table starts enforcing against every
+/// existing row without closing the table while it does.
+#[allow(clippy::too_many_arguments)]
 async fn create_backing_btree(
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::SchemaId,
@@ -3357,48 +3361,22 @@ async fn create_backing_btree(
     index_name: &str,
     column_names: &[String],
     unique: bool,
+    hold_open: &[u64],
 ) -> Result<(), ProtocolError> {
-    let index_id = server
-        .catalog
-        .create_index(
-            table.id,
-            schema_id,
-            index_name,
-            column_names,
-            unique,
-            zyron_catalog::IndexType::BTree,
-        )
-        .await
-        .map_err(ProtocolError::Database)?;
-
-    let entry = server
-        .catalog
-        .get_indexes_for_table(table.id)
-        .into_iter()
-        .find(|e| e.id == index_id)
-        .ok_or_else(|| {
-            ProtocolError::Database(ZyronError::Internal(format!(
-                "index backing constraint \"{index_name}\" not found in catalog after creation"
-            )))
-        })?;
-
-    let checkpoint_dir = server.data_dir.join("indexes");
-    let _ = std::fs::create_dir_all(&checkpoint_dir);
-    let btree = Arc::new(
-        zyron_storage::BTreeIndex::create(entry.index_file_id, checkpoint_dir)
-            .await
-            .map_err(ProtocolError::Database)?,
-    );
-
-    let key_columns: Vec<zyron_catalog::ColumnId> =
-        entry.columns.iter().map(|c| c.column_id).collect();
-    let rows = crate::index_build::collect_live_rows(server, table)
-        .await
-        .map_err(ProtocolError::Database)?;
-    crate::index_build::fill_btree_from_live_rows(table, &rows, &key_columns, &btree);
-
-    let _ = server.btree_indexes.insert_async(index_id.0, btree).await;
-    Ok(())
+    let key_columns: Vec<(String, bool)> =
+        column_names.iter().map(|n| (n.clone(), false)).collect();
+    build_heap_btree_index(
+        server,
+        schema_id,
+        table.id,
+        index_name,
+        &key_columns,
+        unique,
+        "constraint",
+        hold_open,
+    )
+    .await
+    .map_err(ProtocolError::Database)
 }
 
 /// Drops the index backing a constraint, if the constraint had one. Called
@@ -3558,7 +3536,12 @@ async fn handle_set_using(
             .map_err(ProtocolError::Database)?;
         let mut writer_txn = conversion_txn;
         for batch in &batches {
-            let tuples = zyron_executor::batch::batch_to_tuples(batch, &table.columns, ctx.txn_id);
+            let tuples = zyron_executor::batch::batch_to_tuples(
+                batch,
+                &table.columns,
+                ctx.txn_id,
+                table.schema_epoch,
+            );
             let mut records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
             for tuple in &tuples {
                 records.push((ctx.txn_id, tuple.data()));
@@ -5503,106 +5486,424 @@ async fn handle_create_index(
         }
     }
 
-    match server
-        .catalog
-        .create_btree_index(table.id, schema_id, &stmt.name, &key_columns, stmt.unique)
-        .await
-    {
-        Ok(index_id) => {
-            // A lake table's index is a lake artifact committed into its
-            // own transaction log, not a B+tree over heap addresses. It is
-            // versioned with the data, survives the rewrites clustering and
-            // compaction perform, and is readable at a past version
-            if table.lake.is_lake() {
-                let result = crate::index_build::build_lake_index(
-                    server,
-                    &table,
-                    &column_names,
-                    stmt.unique,
-                )
-                .await;
-                if let Err(e) = result {
-                    // The catalog entry would otherwise describe an index
-                    // the table does not have
-                    let _ = server.catalog.drop_index(table.id, &stmt.name).await;
-                    let _ = index_id;
-                    return Err(ProtocolError::Database(e));
-                }
-                fire_event(
-                    server,
-                    zyron_pipeline::event_handler::EventType::IndexCreated,
-                    &stmt.name,
-                    &[
-                        ("index".to_string(), stmt.name.clone()),
-                        ("table".to_string(), stmt.table.clone()),
-                    ],
-                )
-                .await;
-                return Ok(DdlResult::Tag("CREATE INDEX".to_string()));
-            }
-            let checkpoint_dir = server.data_dir.join("indexes");
-            let _ = std::fs::create_dir_all(&checkpoint_dir);
-            let entry = server
-                .catalog
-                .get_indexes_for_table(table.id)
-                .into_iter()
-                .find(|e| e.id == index_id)
-                .ok_or_else(|| {
-                    ProtocolError::Database(ZyronError::Internal(format!(
-                        "newly created index {} not found in catalog",
-                        index_id.0
-                    )))
-                })?;
-            let btree = Arc::new(
-                zyron_storage::BTreeIndex::create(entry.index_file_id, checkpoint_dir)
-                    .await
-                    .map_err(ProtocolError::Database)?,
-            );
-            // Fill the tree from the rows the table already holds. Without
-            // this the index is empty, and every query the planner routes
-            // through it returns nothing for rows that predate it, which is a
-            // wrong answer rather than a slow one
-            let key_columns: Vec<zyron_catalog::ColumnId> =
-                entry.columns.iter().map(|c| c.column_id).collect();
-            if !key_columns.is_empty() {
-                let rows = crate::index_build::collect_live_rows(server, &table)
-                    .await
-                    .map_err(ProtocolError::Database)?;
-                let entries = crate::index_build::fill_btree_from_live_rows(
-                    &table,
-                    &rows,
-                    &key_columns,
-                    &btree,
-                );
-                if entries > 0 {
-                    tracing::info!(
-                        target: "zyron::ddl",
-                        index = %stmt.name,
-                        entries,
-                        "CREATE INDEX populated from existing rows"
-                    );
-                }
-            }
-            let _ = server.btree_indexes.insert_async(index_id.0, btree).await;
-            fire_event(
-                server,
-                zyron_pipeline::event_handler::EventType::IndexCreated,
+    // A lake table's index is a lake artifact committed into its own
+    // transaction log, not a B+tree over heap addresses. It is versioned with
+    // the data, survives the rewrites clustering and compaction perform, and
+    // is readable at a past version
+    if table.lake.is_lake() {
+        let index_id = server
+            .catalog
+            .create_btree_index(
+                table.id,
+                schema_id,
                 &stmt.name,
-                &[
-                    ("index".to_string(), stmt.name.clone()),
-                    ("table".to_string(), stmt.table.clone()),
-                ],
+                &key_columns,
+                stmt.unique,
+                zyron_catalog::IndexState::Ready,
             )
-            .await;
-            Ok(DdlResult::Tag("CREATE INDEX".to_string()))
+            .await
+            .map_err(|e| match e {
+                ZyronError::IndexAlreadyExists(_) => {
+                    ProtocolError::Database(ZyronError::IndexAlreadyExists(stmt.name.clone()))
+                }
+                other => ProtocolError::Database(other),
+            })?;
+        let _ = index_id;
+        if let Err(e) =
+            crate::index_build::build_lake_index(server, &table, &column_names, stmt.unique).await
+        {
+            // The catalog entry would otherwise describe an index the table
+            // does not have
+            let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+            return Err(ProtocolError::Database(e));
         }
-        Err(ZyronError::IndexAlreadyExists(_)) => {
-            // CreateIndexStatement does not have if_not_exists, treat as error
-            Err(ProtocolError::Database(ZyronError::IndexAlreadyExists(
-                stmt.name.clone(),
+        fire_event(
+            server,
+            zyron_pipeline::event_handler::EventType::IndexCreated,
+            &stmt.name,
+            &[
+                ("index".to_string(), stmt.name.clone()),
+                ("table".to_string(), stmt.table.clone()),
+            ],
+        )
+        .await;
+        return Ok(DdlResult::Tag("CREATE INDEX".to_string()));
+    }
+
+    let issuer = session
+        .as_ref()
+        .map(|s| s.user.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    build_heap_btree_index(
+        server,
+        schema_id,
+        table.id,
+        &stmt.name,
+        &key_columns,
+        stmt.unique,
+        &issuer,
+        &transactions_held_open(session),
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+
+    fire_event(
+        server,
+        zyron_pipeline::event_handler::EventType::IndexCreated,
+        &stmt.name,
+        &[
+            ("index".to_string(), stmt.name.clone()),
+            ("table".to_string(), stmt.table.clone()),
+        ],
+    )
+    .await;
+    Ok(DdlResult::Tag("CREATE INDEX".to_string()))
+}
+
+/// Builds a B+tree index on a heap table without closing the table to anyone.
+///
+/// The sequence is publish, wait, scan, load, flip, and each step exists to
+/// close a specific hole. Publishing first is what makes concurrent writes
+/// maintain the index. Waiting for the transactions that were running at
+/// publication is what makes that maintenance sufficient, because a
+/// transaction that resolved its index set earlier will never see the new
+/// index. Scanning under one snapshot after the wait covers everything older.
+/// Loading merges the two sets. Flipping is what lets the planner choose it.
+///
+/// Only the session that issued the statement waits. Every other session reads
+/// and writes the table throughout.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_heap_btree_index(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+    table_id: zyron_catalog::TableId,
+    index_name: &str,
+    key_columns: &[(String, bool)],
+    unique: bool,
+    issuing_session: &str,
+    hold_open: &[u64],
+) -> Result<(), ZyronError> {
+    use crate::ddl_progress::{DdlOperation, DdlPhase};
+
+    let table = server.catalog.get_table_by_id(table_id)?;
+    let progress = server.ddl_progress.begin(
+        &table.name,
+        index_name,
+        DdlOperation::CreateIndex,
+        issuing_session,
+    );
+
+    // ---- Publish -------------------------------------------------------
+    progress.set_phase(DdlPhase::Publishing);
+    let index_id = server
+        .catalog
+        .create_btree_index(
+            table_id,
+            schema_id,
+            index_name,
+            key_columns,
+            unique,
+            zyron_catalog::IndexState::Building,
+        )
+        .await?;
+    let entry = server
+        .catalog
+        .get_indexes_for_table(table_id)
+        .into_iter()
+        .find(|e| e.id == index_id)
+        .ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "index {} is missing from the catalog immediately after being written",
+                index_id.0
+            ))
+        })?;
+    let checkpoint_dir = server.data_dir.join("indexes");
+    if let Err(e) = std::fs::create_dir_all(&checkpoint_dir) {
+        let _ = server.catalog.drop_index(table_id, index_name).await;
+        return Err(ZyronError::IoError(format!(
+            "index build could not create {}: {e}",
+            checkpoint_dir.display()
+        )));
+    }
+    let btree =
+        Arc::new(zyron_storage::BTreeIndex::create(entry.index_file_id, checkpoint_dir).await?);
+    // The empty tree goes into the registry before anything is read, so every
+    // write that resolves its index set from here on maintains it
+    let _ = server
+        .btree_indexes
+        .insert_async(index_id.0, Arc::clone(&btree))
+        .await;
+    let active_at_publication = server.txn_manager.proc_array().active_txn_ids();
+
+    let result = drive_heap_index_build(
+        server,
+        &table,
+        index_id.0,
+        &entry,
+        unique,
+        &btree,
+        &active_at_publication,
+        hold_open,
+        progress.progress(),
+    )
+    .await;
+
+    match result {
+        Ok(None) => {
+            // ---- Flip ---------------------------------------------------
+            progress.set_phase(DdlPhase::Swapping);
+            crate::index_build::flip_to_ready(server, table_id, index_name).await?;
+            Ok(())
+        }
+        Ok(Some(duplicate)) => {
+            abandon_index_build(server, table_id, index_name, index_id.0).await;
+            Err(ZyronError::ExecutionError(format!(
+                "CREATE UNIQUE INDEX \"{index_name}\" found the key {} on two live rows, at {:?} \
+                 and at {:?}. The index was not created",
+                hex_key(&duplicate.key),
+                duplicate.first,
+                duplicate.second
             )))
         }
-        Err(e) => Err(ProtocolError::Database(e)),
+        Err(e) => {
+            abandon_index_build(server, table_id, index_name, index_id.0).await;
+            Err(e)
+        }
+    }
+}
+
+/// The wait, scan and load, with the publish already done.
+#[allow(clippy::too_many_arguments)]
+async fn drive_heap_index_build(
+    server: &Arc<ServerState>,
+    table: &Arc<zyron_catalog::schema::TableEntry>,
+    index_id: u32,
+    entry: &zyron_catalog::IndexEntry,
+    unique: bool,
+    btree: &Arc<zyron_storage::BTreeIndex>,
+    active_at_publication: &[u64],
+    hold_open: &[u64],
+    progress: &crate::ddl_progress::DdlProgress,
+) -> Result<Option<crate::index_build::DuplicateKey>, ZyronError> {
+    use crate::ddl_progress::DdlPhase;
+
+    // ---- Wait ----------------------------------------------------------
+    progress.set_phase(DdlPhase::WaitingOldTxns);
+    crate::index_build::wait_for_transactions_active_at(
+        server,
+        active_at_publication,
+        hold_open,
+        None,
+    )
+    .await?;
+
+    let key_columns: Vec<zyron_catalog::ColumnId> =
+        entry.columns.iter().map(|c| c.column_id).collect();
+    if key_columns.is_empty() {
+        return Ok(None);
+    }
+
+    // ---- Scan and load -------------------------------------------------
+    let outcome = crate::index_build::scan_and_load(
+        server,
+        table,
+        index_id,
+        &key_columns,
+        unique,
+        btree,
+        progress,
+        crate::index_build::DEFAULT_BUILD_BATCH_ROWS,
+    )
+    .await?;
+    match outcome {
+        Ok(built) => {
+            progress.add_bytes_spilled(built.spilled_bytes);
+            Ok(None)
+        }
+        Err(duplicate) => Ok(Some(duplicate)),
+    }
+}
+
+/// Removes everything a failed build put in place.
+///
+/// The catalog entry, the registered tree and the spill directory all go, so
+/// nothing is left that a writer would maintain or that recovery would have to
+/// reason about.
+async fn abandon_index_build(
+    server: &Arc<ServerState>,
+    table_id: zyron_catalog::TableId,
+    index_name: &str,
+    index_id: u32,
+) {
+    let _ = server.catalog.drop_index(table_id, index_name).await;
+    let _ = server.btree_indexes.remove_async(&index_id).await;
+    crate::index_build::remove_build_dir(&crate::index_build::build_spill_dir(
+        &server.data_dir,
+        index_id,
+    ));
+}
+
+/// Publishes a full-text, vector or spatial index and fills it from the rows
+/// the table already holds.
+///
+/// The race an index build has to close is in the sequence, not in the tree
+/// type, so these run the same publish, wait, scan, flip order a B+tree build
+/// runs. What differs is the fill: rather than sorted keys and a bulk load,
+/// each batch is handed to the search managers the same call an insert uses.
+pub async fn fill_search_index_from_rows(
+    server: &Arc<ServerState>,
+    table_id: zyron_catalog::TableId,
+    index_name: &str,
+    active_at_publication: &[u64],
+    hold_open: &[u64],
+    issuing_session: &str,
+) -> Result<(), ZyronError> {
+    use crate::ddl_progress::{DdlOperation, DdlPhase};
+
+    let table = server.catalog.get_table_by_id(table_id)?;
+    if table.lake.is_lake() {
+        // A lake table's search postings are committed into its own log by
+        // the lake index path, not built from heap pages it does not have
+        return Ok(());
+    }
+    let progress = server.ddl_progress.begin(
+        &table.name,
+        index_name,
+        DdlOperation::CreateIndex,
+        issuing_session,
+    );
+
+    progress.set_phase(DdlPhase::WaitingOldTxns);
+    crate::index_build::wait_for_transactions_active_at(
+        server,
+        active_at_publication,
+        hold_open,
+        None,
+    )
+    .await?;
+
+    // Resolved once. The snapshot already carries the new index, because it
+    // was published before the wait
+    let index_snap = server.catalog.index_snapshot(table_id);
+    let fts: Vec<(
+        zyron_catalog::IndexId,
+        Arc<zyron_search::InvertedIndex>,
+        Arc<dyn zyron_search::Analyzer>,
+    )> = match server.fts_manager.as_ref() {
+        Some(mgr) => index_snap
+            .fts
+            .iter()
+            .filter_map(|id| {
+                mgr.get_index(id.0)
+                    .map(|idx| (*id, idx, mgr.analyzer_for_index(id.0)))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let vectors: Vec<(u32, Arc<zyron_search::vector::VectorIndex>)> =
+        match server.vector_manager.as_ref() {
+            Some(mgr) => index_snap
+                .vector
+                .iter()
+                .filter_map(|id| mgr.get_index(id.0).map(|idx| (id.0, idx)))
+                .collect(),
+            None => Vec::new(),
+        };
+    if fts.is_empty() && vectors.is_empty() && index_snap.spatial.is_empty() {
+        return Ok(());
+    }
+
+    progress.set_phase(DdlPhase::Scanning);
+    let mut pacer = crate::ddl_progress::BuildPacer::new(DdlPhase::Scanning);
+    let mut stream = crate::index_build::LiveRowStream::open(
+        server,
+        &table,
+        crate::index_build::DEFAULT_BUILD_BATCH_ROWS,
+    )
+    .await?;
+    progress.set_rows_total_estimate(stream.rows_total_estimate());
+
+    // The fill writes through the managers rather than the heap, so the
+    // context it runs under only has to be able to read the catalog and
+    // allocate document ordinals
+    let txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
+    let mut fill_ctx = zyron_executor::context::ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn.txn_id,
+        txn.snapshot.clone(),
+    );
+    fill_ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+    if let Some(m) = &server.spatial_manager {
+        fill_ctx.set_spatial_manager(Arc::clone(m));
+    }
+    let fill_ctx = Arc::new(fill_ctx);
+
+    while let Some(batch) = stream.next_batch().await? {
+        if batch.is_empty() {
+            continue;
+        }
+        let rows = batch.rows();
+        let (decoded, locators) = crate::index_build::decode_live_batch(&table, &batch)?;
+        zyron_executor::operator::modify::fill_search_indexes(
+            &fill_ctx,
+            &table,
+            &decoded,
+            &locators,
+            &fts,
+            &vectors,
+            &index_snap,
+        )?;
+        progress.add_rows(rows);
+        pacer.between_batches(progress.progress()).await;
+    }
+    stream.close();
+    let mut txn = txn;
+    let _ = server.txn_manager.abort(&mut txn);
+
+    progress.set_phase(DdlPhase::Swapping);
+    crate::index_build::flip_to_ready(server, table_id, index_name).await?;
+    Ok(())
+}
+
+/// The transactions this statement is itself running inside.
+///
+/// An online build waits for the transactions that were running when it
+/// published. These two cannot end until the build returns, so waiting for
+/// them would wait forever: the session's own open transaction, and the
+/// transaction an applier is replaying the statement under. Neither resolved
+/// an index set for the table before publication, so neither belongs in the
+/// wait.
+pub fn transactions_held_open(session: &Option<Session>) -> Vec<u64> {
+    let mut held = Vec::with_capacity(2);
+    let Some(s) = session.as_ref() else {
+        return held;
+    };
+    if let Some(id) = s.open_txn_id {
+        held.push(id);
+    }
+    if let Some(id) = s.apply_txn_id {
+        held.push(id);
+    }
+    held
+}
+
+/// Renders an index key for a message, printable whatever bytes it holds.
+fn hex_key(key: &[u8]) -> String {
+    match std::str::from_utf8(key) {
+        Ok(text) if text.chars().all(|c| !c.is_control()) => format!("'{text}'"),
+        _ => {
+            let mut out = String::with_capacity(key.len() * 2 + 2);
+            out.push_str("0x");
+            for b in key {
+                out.push_str(&format!("{b:02x}"));
+            }
+            out
+        }
     }
 }
 
@@ -12213,7 +12514,10 @@ async fn handle_create_fulltext_index(
         None => None,
     };
 
-    // Register index in the catalog with IndexType::Fulltext
+    // Register index in the catalog with IndexType::Fulltext. Building until
+    // the rows that predate it have been read, so nothing routes a query
+    // through an index that covers only what was written after it
+    let active_at_publication = server.txn_manager.proc_array().active_txn_ids();
     let index_id = server
         .catalog
         .create_index_with_params(
@@ -12224,6 +12528,7 @@ async fn handle_create_fulltext_index(
             false,
             zyron_catalog::IndexType::Fulltext,
             encoded,
+            zyron_catalog::IndexState::Building,
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -12258,6 +12563,27 @@ async fn handle_create_fulltext_index(
             let _ = server.catalog.drop_index(table.id, &stmt.name).await;
             return Err(ProtocolError::Database(e));
         }
+    }
+
+    let issuer = session
+        .as_ref()
+        .map(|s| s.user.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Err(e) = fill_search_index_from_rows(
+        server,
+        table.id,
+        &stmt.name,
+        &active_at_publication,
+        &transactions_held_open(session),
+        &issuer,
+    )
+    .await
+    {
+        if let Some(m) = &server.fts_manager {
+            let _ = m.drop_index(index_id.0);
+        }
+        let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+        return Err(ProtocolError::Database(e));
     }
 
     Ok(DdlResult::Tag("CREATE INDEX".to_string()))
@@ -12354,7 +12680,9 @@ async fn handle_create_vector_index(
             )))
         })?;
 
-    // Register in catalog with IndexType::Vector
+    // Register in catalog with IndexType::Vector, Building until the rows
+    // that predate it have been read
+    let active_at_publication = server.txn_manager.proc_array().active_txn_ids();
     let index_id = server
         .catalog
         .create_index(
@@ -12364,6 +12692,7 @@ async fn handle_create_vector_index(
             &[stmt.column.clone()],
             false,
             zyron_catalog::IndexType::Vector,
+            zyron_catalog::IndexState::Building,
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -12386,6 +12715,27 @@ async fn handle_create_vector_index(
             let _ = server.catalog.drop_index(table.id, &stmt.name).await;
             return Err(ProtocolError::Database(e));
         }
+    }
+
+    let issuer = session
+        .as_ref()
+        .map(|s| s.user.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Err(e) = fill_search_index_from_rows(
+        server,
+        table.id,
+        &stmt.name,
+        &active_at_publication,
+        &transactions_held_open(session),
+        &issuer,
+    )
+    .await
+    {
+        if let Some(m) = &server.vector_manager {
+            let _ = m.drop_index(index_id.0);
+        }
+        let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+        return Err(ProtocolError::Database(e));
     }
 
     Ok(DdlResult::Tag("CREATE INDEX".to_string()))
@@ -12472,7 +12822,9 @@ async fn handle_create_spatial_index(
     params.push(dims);
     params.extend_from_slice(&srid.to_le_bytes());
 
-    // Register in catalog.
+    // Register in catalog, Building until the rows that predate it have been
+    // read into the tree
+    let active_at_publication = server.txn_manager.proc_array().active_txn_ids();
     let index_id = server
         .catalog
         .create_index_with_params(
@@ -12483,6 +12835,7 @@ async fn handle_create_spatial_index(
             false,
             zyron_catalog::IndexType::Spatial,
             Some(params),
+            zyron_catalog::IndexState::Building,
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -12490,6 +12843,27 @@ async fn handle_create_spatial_index(
     // Create the live R-tree if a spatial manager is configured.
     if let Some(ref spatial_mgr) = server.spatial_manager {
         spatial_mgr.create_index(index_id.0, dims, srid);
+    }
+
+    let issuer = session
+        .as_ref()
+        .map(|s| s.user.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Err(e) = fill_search_index_from_rows(
+        server,
+        table.id,
+        &stmt.name,
+        &active_at_publication,
+        &transactions_held_open(session),
+        &issuer,
+    )
+    .await
+    {
+        if let Some(m) = &server.spatial_manager {
+            m.drop_index(index_id.0);
+        }
+        let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+        return Err(ProtocolError::Database(e));
     }
 
     Ok(DdlResult::Tag("CREATE SPATIAL INDEX".to_string()))

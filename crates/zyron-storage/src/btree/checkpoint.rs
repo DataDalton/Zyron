@@ -8,14 +8,24 @@
 //!     magic(4) = "ZCPT", format_version(4), header_length(4), flags(4),
 //!     header_checksum(4), lsn(8), entry_count(4), key_len(2),
 //!     prefix_len(2), value_width(2), reserved(2)
-//!   Key prefix: prefix_len bytes (common prefix of all keys)
-//!   Key suffixes: entry_count * suffix_len bytes
-//!   Values: entry_count * value_width bytes of locator payload
+//!   Key prefix: prefix_len bytes, the head every value shares
+//!   Entries: entry_count * (suffix_len + value_width) bytes
 //!   Footer: body checksum(4)
 //!
-//! value_width is the locator payload width shared by every entry: 7 when the
-//! index addresses heap rows, 17 otherwise. An index holding both kinds is
-//! written entirely in the wide form so the column keeps one stride.
+//! key_len is the whole key an index writes, its value followed by the
+//! seventeen byte suffix naming the row. Only the value reaches the file, so
+//! suffix_len is key_len minus that suffix and minus the shared prefix, and
+//! the load rebuilds the suffix from the locator stored behind each value.
+//! Carrying the value and a seven byte locator rather than the whole key is
+//! ten bytes an entry, and the prefix then compresses the value, which is the
+//! part keys actually share.
+//!
+//! Every key in one checkpoint is the same width, so key_len is written once
+//! here rather than in front of every entry.
+//!
+//! value_width is the locator width shared by every entry: 7 when the index
+//! addresses heap rows, 17 otherwise. An index holding both kinds is written
+//! entirely in the wide form so the entries keep one stride.
 
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::{InMemoryPageStore, UninitPage};
@@ -30,6 +40,10 @@ use zyron_common::{Result, ZyronError};
 /// Version the checkpoint file is written at. The envelope in the header
 /// carries it, and the format registry declares the same value.
 const ZYIDX_FORMAT_VERSION: FormatVersion = crate::format::CHECKPOINT_FORMAT_VERSION;
+
+/// The oldest checkpoint this binary reads, which carried a column of locator
+/// payloads beside the keys.
+const ZYIDX_OLDEST_READABLE: FormatVersion = crate::format::CHECKPOINT_OLDEST_READABLE;
 
 /// Envelope header plus the checkpoint's own 20-byte header extension.
 const ZYIDX_HEADER_SIZE: usize = 40;
@@ -65,21 +79,30 @@ const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
 const SLOT_SIZE: usize = 4;
 const WIDE_VALUE_WIDTH: usize = zyron_common::RowLocator::MAX_PAYLOAD_LEN;
 
-/// Copies one locator payload. The narrow form is three direct stores, which
-/// avoids the memcpy call a runtime-sized copy would emit for seven bytes.
+/// Turns one stored locator back into the order-preserving suffix the key
+/// carries, written straight into the rebuilt entry.
+///
+/// The body keeps the address in the seven byte form and the key wants the
+/// seventeen byte one, so the rebuild expands it rather than the file carrying
+/// the wider shape for every entry.
 ///
 /// # Safety
-/// `src` and `dst` must both be valid for `width` bytes and must not overlap
+/// `payload` must be valid for `width` bytes and `dst` for
+/// `RowLocator::KEY_SUFFIX_LEN`, and the two must not overlap
 #[inline(always)]
-unsafe fn copy_value(src: *const u8, dst: *mut u8, width: usize) {
+unsafe fn write_key_suffix(payload: *const u8, width: usize, dst: *mut u8) {
+    let bytes = unsafe { std::slice::from_raw_parts(payload, width) };
+    let (tag, a, b) = match zyron_common::RowLocator::read_payload(bytes) {
+        Some(locator) => locator.key_suffix_words(),
+        // A payload the writer produced always reads back. An all-zero suffix
+        // is what a torn body would leave, and the footer checksum is what
+        // catches that rather than a guess made here
+        None => (0u8, 0u64, 0u64),
+    };
     unsafe {
-        if width == zyron_common::RowLocator::NARROW_PAYLOAD_LEN {
-            (dst as *mut u32).write_unaligned((src as *const u32).read_unaligned());
-            (dst.add(4) as *mut u16).write_unaligned((src.add(4) as *const u16).read_unaligned());
-            dst.add(6).write(src.add(6).read());
-        } else {
-            std::ptr::copy_nonoverlapping(src, dst, width);
-        }
+        dst.write(tag);
+        std::ptr::copy_nonoverlapping(a.to_be_bytes().as_ptr(), dst.add(1), 8);
+        std::ptr::copy_nonoverlapping(b.to_be_bytes().as_ptr(), dst.add(9), 8);
     }
 }
 
@@ -122,10 +145,19 @@ struct GatherLayout {
     /// Leading key bytes the whole index shares, stored once and skipped per
     /// entry
     prefix_len: usize,
-    /// Key bytes per entry after the shared prefix
+    /// Value bytes per entry after the shared prefix
     suffix_len: usize,
-    /// Stride of the value column
+    /// Locator bytes that follow each entry's value bytes
     value_width: usize,
+}
+
+impl GatherLayout {
+    /// Bytes one entry takes in the body, its value past the shared prefix
+    /// followed by the locator that names its row.
+    #[inline]
+    fn stride(&self) -> usize {
+        self.suffix_len + self.value_width
+    }
 }
 
 /// Why a run of leaf pages stopped.
@@ -133,23 +165,23 @@ struct GatherLayout {
 enum GatherStop {
     /// Every entry the run was given was copied
     Complete,
-    /// An entry's locator payload is a different width than the column's, so
-    /// the body is rebuilt with every value at the wide width
+    /// An entry names its row in more bytes than the column's stride, so the
+    /// body is built again with every locator at the wide width
     MixedWidths,
-    /// A leaf page or a locator payload could not be read
+    /// A leaf page could not be read, or one of its keys names no row
     Unreadable,
 }
 
 /// Copies a run of consecutive leaf pages into the checkpoint body.
 ///
-/// `suffixes` and `values` are the two columns, each written front to back at
-/// its own fixed stride.
+/// `suffixes` is the one column the body holds, written front to back at a
+/// fixed stride. The row each key points at is the key's own trailing suffix,
+/// so there is no second column to fill.
 fn gather_leaf_run(
     store: &InMemoryPageStore,
     leaves: &[(u32, u16)],
     layout: &GatherLayout,
     suffixes: &mut [u8],
-    values: &mut [u8],
 ) -> GatherStop {
     let GatherLayout {
         kl,
@@ -158,7 +190,6 @@ fn gather_leaf_run(
         value_width,
     } = *layout;
     let mut sk = suffixes.as_mut_ptr();
-    let mut vp = values.as_mut_ptr();
     for &(pn, ns) in leaves {
         let Some(pd) = store.get(pn) else {
             return GatherStop::Unreadable;
@@ -170,29 +201,29 @@ fn gather_leaf_run(
             // two byte entry offset per slot, so slot < ns keeps the read
             // inside the page
             let entry_off = unsafe { (pp.add(slot_off) as *const u16).read_unaligned() as usize };
-            let pid_offset = entry_off + 2 + kl;
-            let entry_width = zyron_common::RowLocator::payload_len_for_tag(pd[pid_offset]);
-            if entry_width != value_width && value_width != WIDE_VALUE_WIDTH {
+            // The row comes out of the key's own trailing suffix and goes back
+            // in as the seven byte payload, which is the same address in ten
+            // fewer bytes. An insert already refused any key whose suffix does
+            // not name its row, so this cannot fail on a page the tree wrote
+            let Some(locator) = zyron_common::RowLocator::from_key(&pd[entry_off..entry_off + kl])
+            else {
+                return GatherStop::Unreadable;
+            };
+            if locator.payload_len() != value_width && value_width != WIDE_VALUE_WIDTH {
                 return GatherStop::MixedWidths;
             }
-            // SAFETY: the entry holds key_len(2) + key + payload, so the
-            // suffix and the payload are both inside the page, and the two
-            // destinations advance by exactly the strides their spans were
-            // sized from
+            // SAFETY: the entry holds key_len(2) + key, so the value span is
+            // inside the page, and the destination advances by exactly the
+            // stride its span was sized from
             unsafe {
-                copy_suffix(pp.add(entry_off + 2 + prefix_len), sk, suffix_len);
-                sk = sk.add(suffix_len);
-                if entry_width == value_width {
-                    copy_value(pp.add(pid_offset), vp, value_width);
+                copy_suffix(pp.add(entry_off + prefix_len), sk, suffix_len);
+                let payload = std::slice::from_raw_parts_mut(sk.add(suffix_len), value_width);
+                if value_width == WIDE_VALUE_WIDTH {
+                    locator.write_payload_wide(payload);
                 } else {
-                    // A narrow entry written into the wide column
-                    let Some(loc) = zyron_common::RowLocator::read_payload(&pd[pid_offset..])
-                    else {
-                        return GatherStop::Unreadable;
-                    };
-                    loc.write_payload_wide(std::slice::from_raw_parts_mut(vp, WIDE_VALUE_WIDTH));
+                    locator.write_payload(payload);
                 }
-                vp = vp.add(value_width);
+                sk = sk.add(suffix_len + value_width);
             }
         }
     }
@@ -270,42 +301,33 @@ const BODY_BYTES_PER_RUN: usize = 4 * 1024 * 1024;
 struct BodyRun<'a> {
     leaves: &'a [(u32, u16)],
     suffixes: &'a mut [u8],
-    values: &'a mut [u8],
     suffix_offset: u64,
-    value_offset: u64,
 }
 
-/// Cuts both columns into one span per run of leaf pages.
+/// Cuts the key column into one span per run of leaf pages.
 ///
-/// Every entry contributes a fixed stride to each column, so a run's spans and
-/// their file offsets follow from the entry counts alone, before a byte is
+/// Every entry contributes a fixed stride to the column, so a run's span and
+/// its file offset follow from the entry counts alone, before a byte is
 /// copied. Splitting up front is also what lets the gather hand a finished span
 /// to another thread: the spans are disjoint by construction.
 fn split_body_runs<'a>(
     leaf_pages: &'a [(u32, u16)],
     layout: &GatherLayout,
     mut suffixes: &'a mut [u8],
-    mut values: &'a mut [u8],
     mut suffix_offset: u64,
-    mut value_offset: u64,
     pages_per_run: usize,
 ) -> Vec<BodyRun<'a>> {
     let mut runs = Vec::with_capacity(leaf_pages.len().div_ceil(pages_per_run));
     for leaves in leaf_pages.chunks(pages_per_run) {
         let entries: usize = leaves.iter().map(|&(_, ns)| ns as usize).sum();
-        let (s_head, s_rest) = suffixes.split_at_mut(entries * layout.suffix_len);
+        let (s_head, s_rest) = suffixes.split_at_mut(entries * layout.stride());
         suffixes = s_rest;
-        let (v_head, v_rest) = values.split_at_mut(entries * layout.value_width);
-        values = v_rest;
         runs.push(BodyRun {
             leaves,
             suffix_offset,
-            value_offset,
             suffixes: s_head,
-            values: v_head,
         });
-        suffix_offset += (entries * layout.suffix_len) as u64;
-        value_offset += (entries * layout.value_width) as u64;
+        suffix_offset += (entries * layout.stride()) as u64;
     }
     runs
 }
@@ -333,13 +355,11 @@ fn gather_and_write(
     leaf_pages: &[(u32, u16)],
     layout: &GatherLayout,
     suffixes: &mut [u8],
-    values: &mut [u8],
     suffix_offset: u64,
-    value_offset: u64,
     file: &std::fs::File,
     hasher: &mut zyron_common::checksum::Hasher,
 ) -> std::io::Result<GatherStop> {
-    let body_bytes = suffixes.len() + values.len();
+    let body_bytes = suffixes.len();
     let writers = write_thread_count(body_bytes);
     // One run when nothing is going to overlap it, so a small checkpoint still
     // goes out in one transfer per column
@@ -349,32 +369,17 @@ fn gather_and_write(
         body_bytes.div_ceil(BODY_BYTES_PER_RUN).max(1)
     };
     let pages_per_run = leaf_pages.len().div_ceil(run_count).max(1);
-    let runs = split_body_runs(
-        leaf_pages,
-        layout,
-        suffixes,
-        values,
-        suffix_offset,
-        value_offset,
-        pages_per_run,
-    );
+    let runs = split_body_runs(leaf_pages, layout, suffixes, suffix_offset, pages_per_run);
 
     if writers <= 1 {
-        let mut value_spans = Vec::with_capacity(runs.len());
         for run in runs {
-            match gather_leaf_run(store, run.leaves, layout, run.suffixes, run.values) {
+            match gather_leaf_run(store, run.leaves, layout, run.suffixes) {
                 GatherStop::Complete => {}
                 other => return Ok(other),
             }
             let suffixes: &[u8] = run.suffixes;
-            let values: &[u8] = run.values;
             hasher.update(suffixes);
-            value_spans.push(values);
             write_all_at(file, suffixes, run.suffix_offset)?;
-            write_all_at(file, values, run.value_offset)?;
-        }
-        for span in value_spans {
-            hasher.update(span);
         }
         return Ok(GatherStop::Complete);
     }
@@ -406,33 +411,19 @@ fn gather_and_write(
             });
         }
 
-        let mut value_spans = Vec::with_capacity(runs.len());
         for run in runs {
-            stop = gather_leaf_run(store, run.leaves, layout, run.suffixes, run.values);
+            stop = gather_leaf_run(store, run.leaves, layout, run.suffixes);
             if stop != GatherStop::Complete {
                 break;
             }
-            // The run is finished, so handing its spans over as shared borrows
-            // cannot race the gather, which has moved past them
+            // The run is finished, so handing its span over as a shared borrow
+            // cannot race the gather, which has moved past it
             let suffixes: &[u8] = run.suffixes;
-            let values: &[u8] = run.values;
             hasher.update(suffixes);
-            value_spans.push(values);
             let _ = tx.send((suffixes, run.suffix_offset));
-            let _ = tx.send((values, run.value_offset));
         }
         // Closes the queue, which is how the writers learn there is no more
         drop(tx);
-
-        // The writers still have most of the body to transfer, so folding the
-        // value column in here costs nothing the scope was not already waiting
-        // on. Skipped when the gather stopped early, since the body is about to
-        // be built again at the wide stride
-        if stop == GatherStop::Complete {
-            for span in value_spans {
-                hasher.update(span);
-            }
-        }
     });
 
     if let Some(e) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
@@ -468,7 +459,7 @@ pub fn write_checkpoint_from_store(
     // Walk leaf chain: collect entry counts and determine key_len.
     let mut total_entries = 0u32;
     let mut key_len: u16 = 0;
-    let mut value_width = WIDE_VALUE_WIDTH;
+    let mut first_locator: Option<zyron_common::RowLocator> = None;
     let mut leaf_pages: Vec<(u32, u16)> = Vec::with_capacity(4096);
 
     {
@@ -479,12 +470,9 @@ pub fn write_checkpoint_from_store(
             if leaf_pages.is_empty() && ns > 0 {
                 let e0_off =
                     u16::from_le_bytes([pd[SLOT_ARRAY_START], pd[SLOT_ARRAY_START + 1]]) as usize;
-                key_len = u16::from_le_bytes([pd[e0_off], pd[e0_off + 1]]);
-                // The whole column takes the first entry's width, and the
-                // extraction below verifies every other entry against it
-                value_width = zyron_common::RowLocator::payload_len_for_tag(
-                    pd[e0_off + 2 + key_len as usize],
-                );
+                key_len = u16::from_le_bytes([pd[SLOT_ARRAY_START + 2], pd[SLOT_ARRAY_START + 3]]);
+                first_locator =
+                    zyron_common::RowLocator::from_key(&pd[e0_off..e0_off + key_len as usize]);
             }
             leaf_pages.push((cur, ns));
             total_entries += ns as u32;
@@ -510,10 +498,15 @@ pub fn write_checkpoint_from_store(
     }
 
     let kl = key_len as usize;
+    // The key column holds the value in front of the suffix and nothing else.
+    // The suffix names the row, and the locator column already carries that in
+    // the seven byte form rather than the seventeen byte order-preserving one,
+    // so storing it twice would cost ten bytes an entry to say the same thing
+    let vl = kl.saturating_sub(zyron_common::RowLocator::KEY_SUFFIX_LEN);
 
     // Common prefix: compare first key of first leaf with last key of last leaf.
     let mut prefix_len = 0usize;
-    if leaf_pages.len() > 1 && kl > 0 {
+    if leaf_pages.len() > 1 && vl > 0 {
         let (fp, fns) = leaf_pages[0];
         let (lp, lns) = leaf_pages[leaf_pages.len() - 1];
         if fns > 0 && lns > 0 {
@@ -523,14 +516,19 @@ pub fn write_checkpoint_from_store(
                 u16::from_le_bytes([fd[SLOT_ARRAY_START], fd[SLOT_ARRAY_START + 1]]) as usize;
             let l_slot_off = SLOT_ARRAY_START + (lns as usize - 1) * SLOT_SIZE;
             let l_off = u16::from_le_bytes([ld[l_slot_off], ld[l_slot_off + 1]]) as usize;
-            while prefix_len < kl && fd[f_off + 2 + prefix_len] == ld[l_off + 2 + prefix_len] {
+            while prefix_len < vl && fd[f_off + 2 + prefix_len] == ld[l_off + 2 + prefix_len] {
                 prefix_len += 1;
             }
         }
     }
 
-    let suffix_len = kl - prefix_len;
+    let suffix_len = vl - prefix_len;
     let n = total_entries as usize;
+    // Width every entry's locator takes in the column beside the keys, decided
+    // by the first entry and held to by the rest
+    let mut value_width = first_locator
+        .map(|loc| loc.payload_len())
+        .unwrap_or(zyron_common::RowLocator::NARROW_PAYLOAD_LEN);
     let prefix_start = ZYIDX_HEADER_SIZE;
 
     let io_err = |e: std::io::Error| {
@@ -546,7 +544,7 @@ pub fn write_checkpoint_from_store(
         let total_size = ZYIDX_HEADER_SIZE + data_size + ENVELOPE_FOOTER_LEN;
 
         // Every byte of this buffer is written below: the envelope header and
-        // its extension, the shared key prefix, both columns, and the footer.
+        // its extension, the shared key prefix, the column, and the footer.
         // A zeroed allocation fills the whole body with bytes the gather
         // overwrites immediately, which at ten million keys is ninety five
         // megabytes written twice
@@ -589,21 +587,19 @@ pub fn write_checkpoint_from_store(
                 .copy_from_slice(&fd[f_off + 2..f_off + 2 + prefix_len]);
         }
 
-        // The two columns the entries are copied into. On disk a leaf entry is
-        // key_len(2) + key + locator payload, and the checkpoint stores the key
-        // past the shared prefix in one column and the raw locator payload in
-        // the other
+        // The one column the entries are copied into. A leaf entry is
+        // key_len(2) + key, and the checkpoint stores the key past the shared
+        // prefix. The row each key points at is its own trailing suffix, so
+        // there is no second column
         let suffixes_start = prefix_start + prefix_len;
-        let values_start = suffixes_start + n * suffix_len;
 
         // The envelope footer covers the body, which is the key prefix followed
-        // by the two columns. The prefix goes in here and the columns are folded
-        // in as the gather finishes them
+        // by the column. The prefix goes in here and the column is folded in as
+        // the gather finishes it
         let mut hasher = zyron_common::checksum::Hasher::new();
         hasher.update(&buf[prefix_start..suffixes_start]);
 
-        let columns = &mut buf[suffixes_start..total_size - ENVELOPE_FOOTER_LEN];
-        let (suffixes, values) = columns.split_at_mut(n * suffix_len);
+        let suffixes = &mut buf[suffixes_start..total_size - ENVELOPE_FOOTER_LEN];
         let layout = GatherLayout {
             kl,
             prefix_len,
@@ -611,8 +607,7 @@ pub fn write_checkpoint_from_store(
             value_width,
         };
 
-        // Sized up front so no writer extends the file, and truncated by the
-        // create so a retry at the wide stride leaves nothing of this pass
+        // Sized up front so no writer extends the file
         let file = std::fs::File::create(path).map_err(io_err)?;
         file.set_len(total_size as u64).map_err(io_err)?;
 
@@ -623,9 +618,7 @@ pub fn write_checkpoint_from_store(
                 &leaf_pages,
                 &layout,
                 suffixes,
-                values,
                 suffixes_start as u64,
-                values_start as u64,
                 &file,
                 &mut hasher,
             )
@@ -635,11 +628,13 @@ pub fn write_checkpoint_from_store(
             GatherStop::Complete => break (buf, total_size, file, hasher.finish32()),
             GatherStop::Unreadable => {
                 return Err(ZyronError::RecoveryFailed(
-                    "unreadable locator payload in index page".into(),
+                    "an index page holds a key that names no row, so the checkpoint would \
+                     describe an entry it cannot read back"
+                        .into(),
                 ));
             }
-            // This index mixes locator kinds, so the column cannot keep the
-            // narrow stride and every value is written at the wide one
+            // This index addresses more than one kind of row, so the column
+            // cannot keep the narrow stride and every locator goes in wide
             GatherStop::MixedWidths => value_width = WIDE_VALUE_WIDTH,
         }
     };
@@ -835,9 +830,9 @@ pub fn load_checkpoint_into_store(
     }
     if header.version != ZYIDX_FORMAT_VERSION {
         return Err(ZyronError::RecoveryFailed(format!(
-            "checkpoint is at format version {}, this binary writes and reads {}. Upgrade \
-             through a release that still reads {} to move the checkpoint forward first",
-            header.version, ZYIDX_FORMAT_VERSION, header.version
+            "checkpoint is at format version {}, this binary loads {}. A {} file is moved \
+             forward by the registered migration before it reaches this point",
+            header.version, ZYIDX_FORMAT_VERSION, ZYIDX_OLDEST_READABLE
         )));
     }
 
@@ -845,20 +840,25 @@ pub fn load_checkpoint_into_store(
     let entry_count = u32::from_le_bytes(extension[8..12].try_into().unwrap());
     let key_len = u16::from_le_bytes([extension[12], extension[13]]);
     let prefix_len = u16::from_le_bytes([extension[14], extension[15]]) as usize;
+    // Locator bytes each entry carries after its value. Every entry takes the
+    // same width, decided when the file was written
     let value_width = u16::from_le_bytes([extension[16], extension[17]]) as usize;
     if entry_count > 0
         && value_width != zyron_common::RowLocator::NARROW_PAYLOAD_LEN
         && value_width != WIDE_VALUE_WIDTH
     {
         return Err(ZyronError::RecoveryFailed(format!(
-            "unsupported checkpoint value width: {value_width}"
+            "checkpoint declares a locator {value_width} bytes wide, which is neither form"
         )));
     }
 
     let kl = key_len as usize;
-    let suffix_len = kl - prefix_len;
+    // The body holds each key's value, the suffix that names its row being
+    // rebuilt from the locator beside it
+    let vl = kl.saturating_sub(zyron_common::RowLocator::KEY_SUFFIX_LEN);
+    let suffix_len = vl.saturating_sub(prefix_len);
     let n = entry_count as usize;
-    let data_size = prefix_len + n * suffix_len + n * value_width;
+    let data_size = prefix_len + n * (suffix_len + value_width);
     let expected_size = ZYIDX_HEADER_SIZE + data_size + ENVELOPE_FOOTER_LEN;
     if buf.len() < expected_size {
         return Err(ZyronError::RecoveryFailed(
@@ -894,7 +894,9 @@ pub fn load_checkpoint_into_store(
     let suffixes_start = prefix_start + prefix_len;
     let values_start = suffixes_start + n * suffix_len;
 
-    let eds = 2 + kl + value_width; // entry data size per entry: key_len(2) + key + locator payload
+    // Bytes an entry takes in a page, the key alone. Its length is in the slot
+    // and the row it names is its own trailing suffix, so neither is repeated
+    let eds = kl;
     let max_entries_per_page = (PAGE_SIZE - SLOT_ARRAY_START) / (eds + SLOT_SIZE);
     let num_leaves = n.div_ceil(max_entries_per_page);
     let data_end_full = PAGE_SIZE - max_entries_per_page * eds;
@@ -940,13 +942,12 @@ pub fn load_checkpoint_into_store(
     let mut first_keys: Vec<u8> = vec![0u8; num_leaves * kl];
     drop(alloc);
 
-    // Pre-build a full entry template: [key_len:2][prefix:prefix_len][...suffix...][...pid...][...sid...]
-    // Stamp key_len and prefix once, then the inner loop only writes suffix + value fields.
+    // Pre-build a full entry template, the shared prefix followed by room for
+    // the value bytes and the suffix naming the row. The prefix is stamped
+    // once and the inner loop writes only what differs per entry
     let mut entry_tmpl = vec![0u8; eds];
-    entry_tmpl[0..2].copy_from_slice(&key_len.to_le_bytes());
     if prefix_len > 0 {
-        entry_tmpl[2..2 + prefix_len]
-            .copy_from_slice(&buf[prefix_start..prefix_start + prefix_len]);
+        entry_tmpl[..prefix_len].copy_from_slice(&buf[prefix_start..prefix_start + prefix_len]);
     }
 
     let layout = LeafLayout {
@@ -1064,13 +1065,12 @@ unsafe fn rebuild_leaf_run(
     let kl = layout.kl;
     let eds = layout.eds;
     let key_len = layout.key_len;
-    let value_width = layout.value_width;
     let suffix_len = layout.suffix_len;
+    let value_width = layout.value_width;
     let max_entries_per_page = layout.max_entries_per_page;
-    let suffix_in_entry = 2 + layout.prefix_len;
-    let pid_in_entry = 2 + kl;
+    let suffix_in_entry = layout.prefix_len;
     let tmpl_ptr = layout.entry_tmpl.as_ptr();
-    let tmpl_fixed = 2 + layout.prefix_len;
+    let tmpl_fixed = layout.prefix_len;
 
     for (i, page) in pages.iter().enumerate() {
         let leaf_idx = leaf_start + i;
@@ -1128,50 +1128,46 @@ unsafe fn rebuild_leaf_run(
         // Specialized for common key sizes to emit direct mov instructions
         // instead of memcpy calls from copy_nonoverlapping with runtime sizes.
         let mut entry_base = PAGE_SIZE - eds;
-        let mut s_off = layout.suffixes_start + ei * suffix_len;
-        let mut v_off = layout.values_start + ei * value_width;
+        let stride = suffix_len + value_width;
+        let mut s_off = layout.suffixes_start + ei * stride;
+        // Where the row-naming suffix goes back in the rebuilt key, which is
+        // straight after the value
+        let locator_in_entry = kl - zyron_common::RowLocator::KEY_SUFFIX_LEN;
 
         match (tmpl_fixed, suffix_len) {
-            // u64 keys with no common prefix: direct u16 + u64 writes.
-            (2, 8) => {
-                let kl_le = key_len.to_le();
+            // u64 values with no common prefix, a direct u64 write
+            (0, 8) => {
                 for _ in 0..ns {
                     unsafe {
-                        (pp.add(entry_base) as *mut u16).write_unaligned(kl_le);
                         let suf = (src.add(s_off) as *const u64).read_unaligned();
-                        (pp.add(entry_base + 2) as *mut u64).write_unaligned(suf);
-                        // Copy the raw locator payload directly.
-                        copy_value(
-                            src.add(v_off),
-                            pp.add(entry_base + pid_in_entry),
+                        (pp.add(entry_base) as *mut u64).write_unaligned(suf);
+                        write_key_suffix(
+                            src.add(s_off + suffix_len),
                             value_width,
+                            pp.add(entry_base + locator_in_entry),
                         );
                     }
                     entry_base -= eds;
-                    s_off += 8;
-                    v_off += value_width;
+                    s_off += stride;
                 }
             }
-            // u32 keys with no common prefix: direct u16 + u32 writes.
-            (2, 4) => {
-                let kl_le = key_len.to_le();
+            // u32 values with no common prefix, a direct u32 write
+            (0, 4) => {
                 for _ in 0..ns {
                     unsafe {
-                        (pp.add(entry_base) as *mut u16).write_unaligned(kl_le);
                         let suf = (src.add(s_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + 2) as *mut u32).write_unaligned(suf);
-                        copy_value(
-                            src.add(v_off),
-                            pp.add(entry_base + pid_in_entry),
+                        (pp.add(entry_base) as *mut u32).write_unaligned(suf);
+                        write_key_suffix(
+                            src.add(s_off + suffix_len),
                             value_width,
+                            pp.add(entry_base + locator_in_entry),
                         );
                     }
                     entry_base -= eds;
-                    s_off += 4;
-                    v_off += value_width;
+                    s_off += stride;
                 }
             }
-            // Generic fallback for other key sizes.
+            // Generic fallback for other value sizes
             _ => {
                 for _ in 0..ns {
                     unsafe {
@@ -1181,15 +1177,14 @@ unsafe fn rebuild_leaf_run(
                             pp.add(entry_base + suffix_in_entry),
                             suffix_len,
                         );
-                        copy_value(
-                            src.add(v_off),
-                            pp.add(entry_base + pid_in_entry),
+                        write_key_suffix(
+                            src.add(s_off + suffix_len),
                             value_width,
+                            pp.add(entry_base + locator_in_entry),
                         );
                     }
                     entry_base -= eds;
-                    s_off += suffix_len;
-                    v_off += value_width;
+                    s_off += stride;
                 }
             }
         }
@@ -1197,7 +1192,7 @@ unsafe fn rebuild_leaf_run(
         // Record first key for internal page construction.
         let feo = PAGE_SIZE - eds;
         unsafe {
-            std::ptr::copy_nonoverlapping(pp.add(feo + 2), first_keys.as_mut_ptr().add(i * kl), kl);
+            std::ptr::copy_nonoverlapping(pp.add(feo), first_keys.as_mut_ptr().add(i * kl), kl);
         }
 
         // Set next-leaf pointer (stored as PageId.as_u64() = file_id << 32 | page_num).
@@ -1343,6 +1338,108 @@ mod tests {
     use tempfile::tempdir;
     use zyron_common::RowLocator;
 
+    /// Builds the bytes an 11.0 writer laid down, whole keys prefix-compressed
+    /// over their whole length, followed by a column of locator payloads.
+    /// 11.1 keeps that column and drops the suffix from the keys instead.
+    ///
+    /// Run with `--ignored` to regenerate `fixtures/v11_0.zyridx`. The file is
+    /// checked in because the registry exercises the 11.0 reader and its
+    /// migration against bytes rather than against a round trip through the
+    /// current writer, and the column is laid out here rather than by calling
+    /// the backward migration so the round-trip test compares two independent
+    /// implementations.
+    #[test]
+    #[ignore = "writes the checked-in fixture, run deliberately"]
+    fn emit_checkpoint_11_0_fixture() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.zyridx");
+        let mut store = InMemoryPageStore::new();
+        let root = store.allocate();
+        let mut leaf = BTreeLeafPage::new(PageId::new(0, root as u64));
+        for i in 0..64u64 {
+            let loc = RowLocator::Heap {
+                page: PageId::new(0, i % 8),
+                slot: (i % 5) as u16,
+            };
+            leaf.insert(keyed(i, loc), loc).unwrap();
+        }
+        store.write(root, leaf.as_bytes());
+        write_checkpoint_from_store(&path, &store, 4242, root, 1, false).unwrap();
+        let current = std::fs::read(&path).unwrap();
+
+        // The 11.0 body is the whole key of every entry, prefix-compressed
+        // over the whole key, with a locator column behind it. Laid out from
+        // the tree rather than from the file this version writes, so the two
+        // shapes are built independently
+        let (_, extension) = envelope::decode_header(&current[..ZYIDX_HEADER_SIZE]).unwrap();
+        let key_len = u16::from_le_bytes([extension[12], extension[13]]) as usize;
+        let entries: Vec<(Vec<u8>, RowLocator)> = leaf
+            .entries()
+            .into_iter()
+            .map(|e| (e.key.to_vec(), e.locator))
+            .collect();
+        let entry_count = entries.len();
+
+        let mut prefix_len = 0usize;
+        while prefix_len < key_len
+            && entries[0].0[prefix_len] == entries[entry_count - 1].0[prefix_len]
+        {
+            prefix_len += 1;
+        }
+        let suffix_len = key_len - prefix_len;
+
+        let width = RowLocator::NARROW_PAYLOAD_LEN;
+        let mut body = Vec::with_capacity(prefix_len + entry_count * (suffix_len + width));
+        body.extend_from_slice(&entries[0].0[..prefix_len]);
+        for (key, _) in &entries {
+            body.extend_from_slice(&key[prefix_len..]);
+        }
+        let mut payload = [0u8; RowLocator::MAX_PAYLOAD_LEN];
+        for (_, loc) in &entries {
+            let written = loc.write_payload(&mut payload);
+            assert_eq!(written, width, "the fixture holds one locator width");
+            body.extend_from_slice(&payload[..written]);
+        }
+
+        let mut ext = [0u8; ZYIDX_HEADER_SIZE - ENVELOPE_HEADER_LEN];
+        ext.copy_from_slice(extension);
+        ext[8..12].copy_from_slice(&(entry_count as u32).to_le_bytes());
+        ext[14..16].copy_from_slice(&(prefix_len as u16).to_le_bytes());
+        ext[16..18].copy_from_slice(&(width as u16).to_le_bytes());
+        let header = envelope::encode_header(
+            FormatKind::Checkpoint,
+            crate::format::CHECKPOINT_OLDEST_READABLE,
+            0,
+            &ext,
+        );
+        let mut out = Vec::with_capacity(ZYIDX_HEADER_SIZE + body.len() + ENVELOPE_FOOTER_LEN);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&ext);
+        out.extend_from_slice(&body);
+        let mut hasher = zyron_common::checksum::Hasher::new();
+        hasher.update(&body);
+        out.extend_from_slice(&hasher.finish32().to_le_bytes());
+
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("btree")
+            .join("fixtures")
+            .join("v11_0.zyridx");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, &out).unwrap();
+        println!("wrote {} bytes to {}", out.len(), target.display());
+    }
+
+    /// Builds the key an index writes, the value big-endian so byte order is
+    /// numeric order, followed by the suffix naming the row it points at. A
+    /// leaf reads the row out of that suffix, so a key without one names
+    /// nothing.
+    fn keyed(i: u64, locator: RowLocator) -> bytes::Bytes {
+        let mut key = i.to_be_bytes().to_vec();
+        locator.append_key_suffix(&mut key);
+        bytes::Bytes::from(key)
+    }
+
     #[test]
     fn test_checkpoint_round_trip() {
         let dir = tempdir().unwrap();
@@ -1351,14 +1448,11 @@ mod tests {
         let root = store.allocate();
         let mut leaf = BTreeLeafPage::new(PageId::new(0, root as u64));
         for i in 0..100u64 {
-            leaf.insert(
-                bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
-                RowLocator::Heap {
-                    page: PageId::new(0, i % 10),
-                    slot: (i % 5) as u16,
-                },
-            )
-            .unwrap();
+            let loc = RowLocator::Heap {
+                page: PageId::new(0, i % 10),
+                slot: (i % 5) as u16,
+            };
+            leaf.insert(keyed(i, loc), loc).unwrap();
         }
         store.write(root, leaf.as_bytes());
         write_checkpoint_from_store(&path, &store, 42, root, 1, false).unwrap();
@@ -1368,15 +1462,13 @@ mod tests {
         assert_eq!(c, 100);
         assert_eq!(h, 1);
         for i in 0..100u64 {
-            let f = BTreeLeafPage::get_in_slice(ls.get(lr).unwrap(), &i.to_be_bytes());
+            let loc = RowLocator::Heap {
+                page: PageId::new(0, i % 10),
+                slot: (i % 5) as u16,
+            };
+            let f = BTreeLeafPage::get_in_slice(ls.get(lr).unwrap(), &keyed(i, loc));
             assert!(f.is_some(), "Key {} missing", i);
-            assert_eq!(
-                f,
-                Some(RowLocator::Heap {
-                    page: PageId::new(0, i % 10),
-                    slot: (i % 5) as u16,
-                })
-            );
+            assert_eq!(f, Some(loc));
         }
     }
 
@@ -1406,10 +1498,7 @@ mod tests {
         let mut leaf = BTreeLeafPage::new(PageId::new(0, root as u64));
         let mut written = 0usize;
         for i in 0..entries as u64 {
-            if leaf
-                .insert(bytes::Bytes::copy_from_slice(&i.to_be_bytes()), locator(i))
-                .is_err()
-            {
+            if leaf.insert(keyed(i, locator(i)), locator(i)).is_err() {
                 break;
             }
             written += 1;
@@ -1422,7 +1511,7 @@ mod tests {
         assert_eq!(lsn, 7);
         assert_eq!(count as usize, written);
         for i in 0..written as u64 {
-            let found = BTreeLeafPage::get_in_slice(ls.get(lr).unwrap(), &i.to_be_bytes());
+            let found = BTreeLeafPage::get_in_slice(ls.get(lr).unwrap(), &keyed(i, locator(i)));
             assert_eq!(found, Some(locator(i)), "entry {i} did not survive");
         }
         (written, size)
@@ -1479,7 +1568,7 @@ mod tests {
             };
             for k in &keys {
                 btree
-                    .insert_exclusive(&k.to_be_bytes(), locator(*k))
+                    .insert_exclusive(&keyed(*k, locator(*k)), locator(*k))
                     .unwrap();
             }
             btree.force_checkpoint(11).unwrap();
@@ -1489,7 +1578,7 @@ mod tests {
                 .unwrap();
             for k in &keys {
                 assert_eq!(
-                    loaded.search_sync(&k.to_be_bytes()),
+                    loaded.search_sync(&keyed(*k, locator(*k))),
                     Some(locator(*k)),
                     "key {k:#x} did not survive the rebuild"
                 );
@@ -1552,7 +1641,7 @@ mod tests {
             };
             for i in 0..n {
                 btree
-                    .insert_exclusive(&i.to_be_bytes(), locator(i))
+                    .insert_exclusive(&keyed(i, locator(i)), locator(i))
                     .unwrap();
             }
             btree.force_checkpoint(17).unwrap();
@@ -1572,7 +1661,7 @@ mod tests {
             assert_eq!(loaded.checkpoint_lsn(), 17);
             for i in 0..n {
                 assert_eq!(
-                    loaded.search_sync(&i.to_be_bytes()),
+                    loaded.search_sync(&keyed(i, locator(i))),
                     Some(locator(i)),
                     "entry {i} did not survive the split write"
                 );
@@ -1613,7 +1702,7 @@ mod tests {
             let n = 50_000u64;
             for i in 0..n {
                 btree
-                    .insert_exclusive(&i.to_be_bytes(), mixed_locator(i))
+                    .insert_exclusive(&keyed(i, mixed_locator(i)), mixed_locator(i))
                     .unwrap();
             }
             btree.force_checkpoint(13).unwrap();
@@ -1643,7 +1732,7 @@ mod tests {
                 .unwrap();
             for i in 0..n {
                 assert_eq!(
-                    loaded.search_sync(&i.to_be_bytes()),
+                    loaded.search_sync(&keyed(i, mixed_locator(i))),
                     Some(mixed_locator(i)),
                     "entry {i} did not survive the wide rewrite"
                 );
@@ -1669,14 +1758,11 @@ mod tests {
         let root = store.allocate();
         let mut leaf = BTreeLeafPage::new(PageId::new(0, root as u64));
         for i in 0..10u64 {
-            leaf.insert(
-                bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
-                RowLocator::Heap {
-                    page: PageId::new(0, 0),
-                    slot: 0,
-                },
-            )
-            .unwrap();
+            let loc = RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 0,
+            };
+            leaf.insert(keyed(i, loc), loc).unwrap();
         }
         store.write(root, leaf.as_bytes());
         write_checkpoint_from_store(&path, &store, 1, root, 1, false).unwrap();
@@ -1747,12 +1833,11 @@ mod tests {
             // run, and a partial last page to cover the trailing free space
             let n = 200_003u64;
             for i in 0..n {
-                let key = i.to_be_bytes();
                 let tid = RowLocator::Heap {
                     page: PageId::new(0, i % 1000),
                     slot: (i % 100) as u16,
                 };
-                btree.insert_exclusive(&key, tid).unwrap();
+                btree.insert_exclusive(&keyed(i, tid), tid).unwrap();
             }
             btree.force_checkpoint(7).unwrap();
 
@@ -1825,12 +1910,11 @@ mod tests {
 
             let n = 1_000_000u64;
             for i in 0..n {
-                let key = i.to_be_bytes();
                 let tid = RowLocator::Heap {
                     page: PageId::new(0, i % 1000),
                     slot: (i % 100) as u16,
                 };
-                btree.insert_exclusive(&key, tid).unwrap();
+                btree.insert_exclusive(&keyed(i, tid), tid).unwrap();
             }
 
             btree.force_checkpoint(42).unwrap();
@@ -1843,12 +1927,11 @@ mod tests {
             let mut first_missing = None;
             let mut missing_count = 0;
             for i in 0..n {
-                let key = i.to_be_bytes();
                 let expected = RowLocator::Heap {
                     page: PageId::new(0, i % 1000),
                     slot: (i % 100) as u16,
                 };
-                let found = loaded.search_sync(&key);
+                let found = loaded.search_sync(&keyed(i, expected));
                 if found != Some(expected) {
                     missing_count += 1;
                     if first_missing.is_none() {

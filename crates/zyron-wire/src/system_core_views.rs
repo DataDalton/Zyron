@@ -34,8 +34,10 @@ pub async fn build(
         ("core", "schemas") => build_schemas(server),
         ("core", "tables") => build_tables(server),
         ("core", "columns") => build_columns(server),
+        ("core", "constraints") => build_constraints(server),
         ("core", "system_view_documentation") => build_documentation(),
         ("storage", "indexes") => build_indexes(server),
+        ("storage", "ddl_progress") => build_ddl_progress(server),
         ("storage", "variant_shredding_stats") => build_variant_shredding_stats(server),
         ("sql", "triggers") => build_triggers(server),
         ("session", "prepared_statements") => {
@@ -181,7 +183,10 @@ fn build_tables(server: &ServerState) -> ViewRows {
                 cell(schema_name),
                 cell(catalog_name),
                 cell(storage_format(&table)),
-                cell(table.columns.len()),
+                // Columns a reader can name. A dropped column keeps its place
+                // in the encoded row so older rows still decode, and counting
+                // it here would report a width no query can select
+                cell(table.live_columns().count()),
                 cell(table.constraints.len()),
                 cell(table.cdf_enabled),
                 cell(table.versioning_enabled),
@@ -220,7 +225,9 @@ fn build_columns(server: &ServerState) -> ViewRows {
             .find(|s| s.id == table.schema_id)
             .map(|s| s.name.clone())
             .unwrap_or_default();
-        let mut columns: Vec<_> = table.columns.iter().collect();
+        // A dropped column still occupies its position in every tuple already
+        // written, which is the decoder's business and nobody else's
+        let mut columns: Vec<_> = table.live_columns().collect();
         columns.sort_by_key(|c| c.ordinal);
         for column in columns {
             rows.push(vec![
@@ -295,6 +302,8 @@ fn build_indexes(server: &ServerState) -> ViewRows {
         make_field("is_unique", PG_TEXT_OID, -1),
         make_field("column_count", PG_INT4_OID, 4),
         make_field("key_columns", PG_TEXT_OID, -1),
+        make_field("state", PG_TEXT_OID, -1),
+        make_field("build_progress_id", PG_INT8_OID, 8),
     ];
     let schemas = server.catalog.list_schemas();
     let rows = server
@@ -330,6 +339,17 @@ fn build_indexes(server: &ServerState) -> ViewRows {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            // A build in flight has a progress row, and pointing at it is
+            // what turns "why is this index not being used" into one more
+            // query rather than a guess
+            let progress_id = if index.state == zyron_catalog::IndexState::Building {
+                table
+                    .as_ref()
+                    .and_then(|t| server.ddl_progress.row_for_object(&t.name, &index.name))
+                    .map(|row| row.id)
+            } else {
+                None
+            };
             vec![
                 cell(index.id.0),
                 cell(&index.name),
@@ -340,6 +360,121 @@ fn build_indexes(server: &ServerState) -> ViewRows {
                 cell(index.unique),
                 cell(index.columns.len()),
                 cell(rendered),
+                cell(index.state.as_str()),
+                match progress_id {
+                    Some(id) => cell(id),
+                    None => None,
+                },
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_sys.core.constraints.
+///
+/// `state` says whether the rows that predate the constraint have been
+/// checked. A constraint reported not-yet-valid is still enforced on every
+/// write, which is the difference between a rule nobody is applying and a rule
+/// whose history has not been settled.
+fn build_constraints(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("schema_name", PG_TEXT_OID, -1),
+        make_field("constraint_name", PG_TEXT_OID, -1),
+        make_field("constraint_type", PG_TEXT_OID, -1),
+        make_field("columns", PG_TEXT_OID, -1),
+        make_field("check_expr", PG_TEXT_OID, -1),
+        make_field("enforced", PG_TEXT_OID, -1),
+        make_field("state", PG_TEXT_OID, -1),
+    ];
+    let schemas = server.catalog.list_schemas();
+    let mut rows = Vec::new();
+    let mut tables = server.catalog.list_all_tables();
+    tables.sort_by_key(|t| t.id.0);
+    for table in tables {
+        let schema_name = schemas
+            .iter()
+            .find(|s| s.id == table.schema_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        for constraint in &table.constraints {
+            let columns = constraint
+                .columns
+                .iter()
+                .map(|cid| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|c| c.id == *cid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| format!("column_{}", cid.0))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            rows.push(vec![
+                cell(table.id.0),
+                cell(&table.name),
+                cell(&schema_name),
+                cell(&constraint.name),
+                cell(format!("{:?}", constraint.constraint_type)),
+                cell(columns),
+                constraint
+                    .check_expr
+                    .as_ref()
+                    .map(|e| e.clone().into_bytes()),
+                cell(constraint.enforced),
+                cell(if constraint.validated {
+                    "valid"
+                } else {
+                    "validating"
+                }),
+            ]);
+        }
+    }
+    (fields, rows)
+}
+
+/// Builds zyron_sys.storage.ddl_progress.
+///
+/// One row per online DDL operation running in this process, gone the moment
+/// the operation ends however it ends. `rows_total_estimate` is named an
+/// estimate because it comes from table statistics, which lag writes.
+fn build_ddl_progress(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("progress_id", PG_INT8_OID, 8),
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("operation", PG_TEXT_OID, -1),
+        make_field("object_name", PG_TEXT_OID, -1),
+        make_field("phase", PG_TEXT_OID, -1),
+        make_field("rows_done", PG_INT8_OID, 8),
+        make_field("rows_total_estimate", PG_INT8_OID, 8),
+        make_field("bytes_spilled", PG_INT8_OID, 8),
+        make_field("started_at_secs", PG_INT8_OID, 8),
+        make_field("issuing_session", PG_TEXT_OID, -1),
+        make_field("pause_signal", PG_TEXT_OID, -1),
+    ];
+    let rows = server
+        .ddl_progress
+        .rows()
+        .into_iter()
+        .map(|row| {
+            vec![
+                cell(row.id),
+                cell(&row.table),
+                cell(row.operation.as_str()),
+                cell(&row.object),
+                cell(row.phase().as_str()),
+                cell(row.rows_done()),
+                cell(row.rows_total_estimate()),
+                cell(row.bytes_spilled()),
+                cell(row.started_at_secs),
+                cell(&row.issuing_session),
+                match row.pause_signal() {
+                    Some(signal) => cell(signal),
+                    None => None,
+                },
             ]
         })
         .collect();

@@ -155,7 +155,16 @@ pub const fn format_kind_for_page(page_type: PageType) -> Option<FormatKind> {
 }
 
 /// Version heap pages are written at.
-pub const HEAP_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+///
+/// 1.1 records that the two slot bytes at offset 6 carry the schema epoch a
+/// row was written under. The byte layout is unchanged, which is why the
+/// migration touches no page image: what moved is what the field means.
+pub const HEAP_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::new(1, 1);
+
+/// The oldest heap page version this binary reads. A 1.0 page carries zeroes
+/// in the epoch field, which is exactly the epoch that says "read through the
+/// layout recorded at upgrade".
+pub const HEAP_PAGE_OLDEST_READABLE: FormatVersion = FormatVersion::V1;
 
 /// Version B+tree pages are written at, internal and leaf alike.
 pub const BTREE_PAGE_FORMAT_VERSION: FormatVersion = FormatVersion::V1;

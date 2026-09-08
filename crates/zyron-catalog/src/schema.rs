@@ -85,6 +85,95 @@ impl SchemaEntry {
 }
 
 // ---------------------------------------------------------------------------
+// PhysicalColumn and EpochColumns
+// ---------------------------------------------------------------------------
+
+/// One column's position and width inside an encoded tuple.
+///
+/// A heap tuple carries no column count and no type list, so the only way to
+/// walk one is to know the layout it was written under. This is that layout,
+/// one entry per encoded column in the order the encoder emitted them,
+/// including columns since dropped, whose bytes still occupy their position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalColumn {
+    /// Which catalog column these bytes belong to
+    pub column_id: ColumnId,
+    /// The type the bytes were encoded at, which drives the width and the
+    /// length prefix rather than the column's current declared type
+    pub physical_type: TypeId,
+    /// Digits below the point the encoded value carries, for the two types
+    /// that declare them
+    pub fractional_digits: Option<u8>,
+    /// Position in the encoded tuple, which is also the bit index in the
+    /// null bitmap
+    pub ordinal: u16,
+}
+
+impl PhysicalColumn {
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        write_u16(buf, self.column_id.0);
+        write_u8(buf, self.physical_type as u8);
+        // 0 = None, 1..=39 = Some(0..=38), the same encoding ColumnEntry uses
+        write_u8(buf, self.fractional_digits.map(|p| p + 1).unwrap_or(0));
+        write_u16(buf, self.ordinal);
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let column_id = ColumnId(read_u16(data, off)?);
+        let physical_type = type_id_from_u8(read_u8(data, off)?)?;
+        let fractional_digits = match read_u8(data, off)? {
+            0 => None,
+            n if n <= 39 => Some(n - 1),
+            n => {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "invalid fractional_digits byte {n} in a physical column (expected 0..=39)"
+                )));
+            }
+        };
+        let ordinal = read_u16(data, off)?;
+        Ok(Self {
+            column_id,
+            physical_type,
+            fractional_digits,
+            ordinal,
+        })
+    }
+}
+
+/// The exact positional layout a tuple stamped with one epoch was written
+/// under.
+///
+/// An epoch is minted whenever the encoded shape changes, which is an added
+/// column or a compatible type change. Dropping a column does not mint one,
+/// because the bytes keep their positions. The list retires when vacuum
+/// reports that no live tuple carries the epoch any more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochColumns {
+    pub epoch: u16,
+    pub columns: Vec<PhysicalColumn>,
+}
+
+impl EpochColumns {
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        write_u16(buf, self.epoch);
+        write_u16(buf, self.columns.len() as u16);
+        for c in &self.columns {
+            c.write_into(buf);
+        }
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let epoch = read_u16(data, off)?;
+        let count = read_u16(data, off)? as usize;
+        let mut columns = Vec::with_capacity(count);
+        for _ in 0..count {
+            columns.push(PhysicalColumn::read_from(data, off)?);
+        }
+        Ok(Self { epoch, columns })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ColumnEntry
 // ---------------------------------------------------------------------------
 
@@ -120,6 +209,21 @@ pub struct ColumnEntry {
     /// Declared per column behaviors: generation, encryption, collation,
     /// and user defined type backing. Defaults to all absent.
     pub attrs: ColumnAttributes,
+    /// What a tuple written before this column existed reads as, encoded in
+    /// the column's physical type. None means NULL, which is what a column
+    /// added without a DEFAULT reads as.
+    ///
+    /// The value is resolved once, at the moment the column is added, so a
+    /// volatile default lands the same value on every row that predates the
+    /// column rather than a different one per read.
+    #[serde(default)]
+    pub absent_value: Option<Vec<u8>>,
+    /// True once DROP COLUMN has removed the column from every user-facing
+    /// listing. The bytes stay in place in every tuple already written, so
+    /// the decoder still walks past them, and vacuum omits them the next
+    /// time it rewrites a tuple.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// A type declared inside a nested column.
@@ -449,6 +553,16 @@ impl ColumnEntry {
         write_u8(&mut buf, self.element_type.map(|t| t as u8).unwrap_or(255));
         // Tail-appended attribute block, guarded the same way
         self.attrs.to_bytes(&mut buf);
+        // Tail-appended absent value and drop marker
+        match &self.absent_value {
+            Some(bytes) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, bytes.len() as u32);
+                buf.extend_from_slice(bytes);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        write_bool(&mut buf, self.dropped);
         buf
     }
 
@@ -493,6 +607,35 @@ impl ColumnEntry {
         } else {
             ColumnAttributes::from_bytes(data, &mut off)?
         };
+        let absent_value = if off >= data.len() {
+            None
+        } else {
+            match read_u8(data, &mut off)? {
+                0 => None,
+                1 => {
+                    let len = read_u32(data, &mut off)? as usize;
+                    if off + len > data.len() {
+                        return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                            "column \"{name}\" declares a {len}-byte absent value that runs past \
+                             the end of its row"
+                        )));
+                    }
+                    let bytes = data[off..off + len].to_vec();
+                    off += len;
+                    Some(bytes)
+                }
+                n => {
+                    return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                        "invalid absent_value presence byte {n} on column \"{name}\""
+                    )));
+                }
+            }
+        };
+        let dropped = if off >= data.len() {
+            false
+        } else {
+            read_bool(data, &mut off)?
+        };
         Ok(Self {
             id,
             table_id,
@@ -506,6 +649,8 @@ impl ColumnEntry {
             tz_offset_secs,
             element_type,
             attrs,
+            absent_value,
+            dropped,
         })
     }
 
@@ -527,6 +672,17 @@ impl ColumnEntry {
     /// True when values encrypt at write and decrypt at read
     pub fn is_encrypted(&self) -> bool {
         self.attrs.encryption_algorithm != ColumnAttributes::NOT_ENCRYPTED
+    }
+
+    /// This column's contribution to a tuple layout: where its bytes sit and
+    /// what width they carry.
+    pub fn physical_column(&self) -> PhysicalColumn {
+        PhysicalColumn {
+            column_id: self.id,
+            physical_type: self.physical_type_id(),
+            fractional_digits: self.fractional_digits,
+            ordinal: self.ordinal,
+        }
     }
 }
 
@@ -637,6 +793,21 @@ pub struct ConstraintEntry {
     /// pair by period containment
     #[serde(default)]
     pub fk_period: bool,
+    /// False while the rows that predate the constraint are still being
+    /// checked (tail-appended).
+    ///
+    /// A constraint is enforced on every write from the moment it is
+    /// published, so a value written during the validation is already held to
+    /// it. What is not settled until the scan finishes is the past, and that
+    /// is what this says.
+    #[serde(default = "constraint_validated_default")]
+    pub validated: bool,
+}
+
+/// Serde default for `ConstraintEntry::validated`: a constraint written
+/// before validation had a state was validated before it was recorded.
+fn constraint_validated_default() -> bool {
+    true
 }
 
 /// What happens to a row a constraint rejects.
@@ -708,6 +879,8 @@ impl ConstraintEntry {
             }
         }
         write_u8(&mut buf, self.fk_period as u8);
+        // Tail-appended validation state
+        write_u8(&mut buf, self.validated as u8);
         buf
     }
 
@@ -759,6 +932,13 @@ impl ConstraintEntry {
         } else {
             false
         };
+        // A constraint written before validation had a state was validated
+        // before it was recorded, so an absent byte reads as settled
+        let validated = if *offset < data.len() {
+            read_u8(data, offset)? != 0
+        } else {
+            true
+        };
         Ok(Self {
             name,
             constraint_type,
@@ -773,6 +953,7 @@ impl ConstraintEntry {
             quarantine_table_id,
             without_overlaps,
             fk_period,
+            validated,
         })
     }
 }
@@ -895,6 +1076,22 @@ pub struct TableEntry {
     /// lake root, no segments. Every read of it is a read of the peer.
     #[serde(default)]
     pub foreign: ForeignConfig,
+    /// The epoch every heap write stamps into the tuple slot right now
+    /// (tail-appended). A tuple carrying it decodes through the matching
+    /// entry of `schema_epochs`.
+    #[serde(default)]
+    pub schema_epoch: u16,
+    /// Every layout a live tuple of this table may still have been written
+    /// under (tail-appended), newest last. An entry retires once vacuum
+    /// reports that no live tuple carries its epoch.
+    #[serde(default)]
+    pub schema_epochs: Vec<EpochColumns>,
+    /// The layout recorded for this table when the heap page format gained
+    /// the epoch field (tail-appended). A tuple stamped 0 predates the
+    /// stamping and decodes through this list. Empty once no 0-stamped tuple
+    /// remains.
+    #[serde(default)]
+    pub pre_stamp_columns: Vec<PhysicalColumn>,
 }
 
 /// The remote a foreign table stands for.
@@ -1669,6 +1866,17 @@ impl TableEntry {
         // Foreign table target (tail-appended)
         self.foreign.write_into(&mut buf);
 
+        // Schema epochs (tail-appended)
+        write_u16(&mut buf, self.schema_epoch);
+        write_u16(&mut buf, self.schema_epochs.len() as u16);
+        for e in &self.schema_epochs {
+            e.write_into(&mut buf);
+        }
+        write_u16(&mut buf, self.pre_stamp_columns.len() as u16);
+        for c in &self.pre_stamp_columns {
+            c.write_into(&mut buf);
+        }
+
         buf
     }
 
@@ -1793,6 +2001,35 @@ impl TableEntry {
         // Foreign target (tail-appended, local when absent).
         let foreign = ForeignConfig::read_from(data, &mut off)?;
 
+        // Schema epochs (tail-appended). A row written before the epoch
+        // fields existed reads as epoch 0 with no recorded layouts, which is
+        // exactly what the upgrade migration fills in
+        let schema_epoch = if off + 2 <= data.len() {
+            read_u16(data, &mut off)?
+        } else {
+            0
+        };
+        let schema_epochs = if off + 2 <= data.len() {
+            let count = read_u16(data, &mut off)? as usize;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                list.push(EpochColumns::read_from(data, &mut off)?);
+            }
+            list
+        } else {
+            Vec::new()
+        };
+        let pre_stamp_columns = if off + 2 <= data.len() {
+            let count = read_u16(data, &mut off)? as usize;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                list.push(PhysicalColumn::read_from(data, &mut off)?);
+            }
+            list
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             id,
             schema_id,
@@ -1816,7 +2053,74 @@ impl TableEntry {
             lake,
             cluster,
             foreign,
+            schema_epoch,
+            schema_epochs,
+            pre_stamp_columns,
         })
+    }
+
+    /// The columns a user, a planner, or a wire row description sees. A
+    /// dropped column is gone from every one of those, while its bytes stay
+    /// in every tuple already written.
+    pub fn live_columns(&self) -> impl Iterator<Item = &ColumnEntry> {
+        self.columns.iter().filter(|c| !c.dropped)
+    }
+
+    /// The live columns as an owned list, for the callers that need a slice
+    /// rather than an iterator.
+    pub fn live_column_list(&self) -> Vec<ColumnEntry> {
+        self.live_columns().cloned().collect()
+    }
+
+    /// The layout the encoder writes right now, which is every column the
+    /// table carries including the dropped ones whose positions are held.
+    pub fn current_physical_columns(&self) -> Vec<PhysicalColumn> {
+        self.columns.iter().map(|c| c.physical_column()).collect()
+    }
+
+    /// The layout a tuple stamped `epoch` was written under.
+    ///
+    /// Epoch 0 predates stamping and reads through the layout recorded at
+    /// upgrade. An epoch that is neither 0 nor recorded is not a layout this
+    /// table ever wrote, so the caller reports corruption rather than
+    /// guessing a list and misreading every column.
+    pub fn physical_columns_for_epoch(&self, epoch: u16) -> Option<&[PhysicalColumn]> {
+        if epoch == 0 {
+            if self.pre_stamp_columns.is_empty() {
+                return None;
+            }
+            return Some(&self.pre_stamp_columns);
+        }
+        self.schema_epochs
+            .iter()
+            .find(|e| e.epoch == epoch)
+            .map(|e| e.columns.as_slice())
+    }
+
+    /// Sets a freshly created table's first epoch to its declared columns.
+    ///
+    /// A table created after tuples began carrying an epoch has no rows that
+    /// predate stamping, so `pre_stamp_columns` stays empty and epoch 0 never
+    /// appears on one of its tuples.
+    pub fn seal_initial_epoch(&mut self) {
+        let columns = self.current_physical_columns();
+        self.schema_epoch = 1;
+        self.schema_epochs = vec![EpochColumns { epoch: 1, columns }];
+        self.pre_stamp_columns.clear();
+    }
+
+    /// Records a new layout and makes it the one writes stamp.
+    ///
+    /// Called by the column-shape changes that alter the encoded bytes, an
+    /// added column and a compatible type change. Dropping a column does not
+    /// call it, because the positions do not move.
+    pub fn push_schema_epoch(&mut self, columns: Vec<PhysicalColumn>) {
+        let next = self.schema_epoch.saturating_add(1);
+        self.schema_epoch = next;
+        self.schema_epochs.push(EpochColumns {
+            epoch: next,
+            columns,
+        });
     }
 }
 
@@ -1834,6 +2138,38 @@ pub enum IndexType {
     Spatial = 3,
     /// Combined full-text plus vector index, config carried in `parameters`
     Hybrid = 4,
+}
+
+/// Where an index is in its build.
+///
+/// A Building index is maintained by every write that resolves its index set
+/// after the entry was published, and is invisible to the planner. It becomes
+/// Ready once the rows that predate publication have been loaded, which is the
+/// point at which the two sources together cover the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum IndexState {
+    /// Writers maintain it, the planner does not choose it
+    Building = 0,
+    /// Complete and available to the planner
+    Ready = 1,
+}
+
+impl IndexState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IndexState::Building => "building",
+            IndexState::Ready => "ready",
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(IndexState::Building),
+            1 => Some(IndexState::Ready),
+            _ => None,
+        }
+    }
 }
 
 /// A column participating in an index.
@@ -1856,6 +2192,16 @@ pub struct IndexEntry {
     pub index_file_id: u32,
     pub index_type: IndexType,
     pub parameters: Option<Vec<u8>>,
+    /// Whether the build has finished (tail-appended). An index written
+    /// before the field existed reads as Ready, which is what it was.
+    #[serde(default = "index_state_ready")]
+    pub state: IndexState,
+}
+
+/// Serde default for `IndexEntry::state`: an entry that carries no state was
+/// written before builds had one, and it was complete.
+fn index_state_ready() -> IndexState {
+    IndexState::Ready
 }
 
 impl IndexEntry {
@@ -1884,6 +2230,8 @@ impl IndexEntry {
                 write_u8(&mut buf, 0);
             }
         }
+        // Tail-appended build state
+        write_u8(&mut buf, self.state as u8);
         buf
     }
 
@@ -1931,6 +2279,18 @@ impl IndexEntry {
         } else {
             None
         };
+        // Tail-appended build state. An entry written before the field
+        // existed is complete, which is what Ready says
+        let state = if off < data.len() {
+            let raw = read_u8(data, &mut off)?;
+            IndexState::from_u8(raw).ok_or_else(|| {
+                zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "index \"{name}\" carries build state byte {raw}, which names no state"
+                ))
+            })?
+        } else {
+            IndexState::Ready
+        };
         Ok(Self {
             id,
             table_id,
@@ -1941,6 +2301,7 @@ impl IndexEntry {
             index_file_id,
             index_type,
             parameters,
+            state,
         })
     }
 }
@@ -4831,6 +5192,8 @@ mod tests {
             tz_offset_secs: None,
             element_type: None,
             attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -4856,6 +5219,8 @@ mod tests {
             tz_offset_secs: None,
             element_type: None,
             attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -4886,6 +5251,8 @@ mod tests {
                 tz_offset_secs: off,
                 element_type: None,
                 attrs: Default::default(),
+                absent_value: None,
+                dropped: false,
             };
             let decoded = ColumnEntry::from_bytes(&entry.to_bytes()).unwrap();
             assert_eq!(decoded.fractional_digits, p, "precision {p:?}");
@@ -4915,6 +5282,8 @@ mod tests {
                     tz_offset_secs: None,
                     element_type: None,
                     attrs: Default::default(),
+                    absent_value: None,
+                    dropped: false,
                 },
                 ColumnEntry {
                     id: ColumnId(1),
@@ -4929,6 +5298,8 @@ mod tests {
                     tz_offset_secs: None,
                     element_type: None,
                     attrs: Default::default(),
+                    absent_value: None,
+                    dropped: false,
                 },
             ],
             constraints: vec![ConstraintEntry {
@@ -4945,6 +5316,7 @@ mod tests {
                 quarantine_table_id: None,
                 without_overlaps: None,
                 fk_period: false,
+                validated: true,
             }],
             created_at: 1700000000,
             versioning_enabled: false,
@@ -4961,6 +5333,9 @@ mod tests {
             lake: Default::default(),
             cluster: Default::default(),
             foreign: Default::default(),
+            schema_epoch: 1,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -4993,6 +5368,7 @@ mod tests {
             quarantine_table_id: None,
             without_overlaps: None,
             fk_period: false,
+            validated: true,
         };
         let bytes = entry.to_bytes();
         let mut off = 0;
@@ -5020,6 +5396,7 @@ mod tests {
             index_file_id: 10000,
             index_type: IndexType::BTree,
             parameters: None,
+            state: IndexState::Ready,
         };
         let bytes = entry.to_bytes();
         let decoded = IndexEntry::from_bytes(&bytes).unwrap();
@@ -5151,6 +5528,9 @@ mod tests {
             lake: Default::default(),
             cluster: Default::default(),
             foreign: Default::default(),
+            schema_epoch: 1,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

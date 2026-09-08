@@ -32,6 +32,24 @@ use zyron_storage::{
 };
 use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWriterConfig};
 
+/// The row key `i` names in the checkpoint and recovery measurements.
+fn spread(i: u64) -> RowLocator {
+    RowLocator::Heap {
+        page: PageId::new(0, i % 1000),
+        slot: (i % 100) as u16,
+    }
+}
+
+/// Builds the key an index writes, the value big-endian so the byte order the
+/// tree compares on is the numeric order, followed by the suffix naming the
+/// row it points at. The tree reads the row out of that suffix, so measuring
+/// against a key without one measures a shape no index holds.
+fn keyed(i: u64, locator: RowLocator) -> Vec<u8> {
+    let mut key = i.to_be_bytes().to_vec();
+    locator.append_key_suffix(&mut key);
+    key
+}
+
 // Performance targets
 const WAL_WRITE_TARGET_OPS_SEC: f64 = 8_000_000.0;
 const WAL_REPLAY_TARGET_OPS_SEC: f64 = 12_000_000.0;
@@ -1423,7 +1441,7 @@ async fn test_checkpoint_round_trip_1m() {
 
         // Insert 1M keys using exclusive access for maximum speed
         for i in 0..KEY_COUNT as u64 {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             let tid = RowLocator::Heap {
                 page: PageId::new(0, i % 1000),
                 slot: (i % 100) as u16,
@@ -1453,7 +1471,7 @@ async fn test_checkpoint_round_trip_1m() {
 
         // Verify every key round-trips
         for i in 0..KEY_COUNT as u64 {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             let expected = RowLocator::Heap {
                 page: PageId::new(0, i % 1000),
                 slot: (i % 100) as u16,
@@ -1563,12 +1581,11 @@ async fn test_checkpoint_corrupt_fallback() {
     .unwrap();
 
     for i in 0..KEY_COUNT as u64 {
-        let key = i.to_be_bytes();
         let tid = RowLocator::Heap {
             page: PageId::new(0, i % 100),
             slot: (i % 50) as u16,
         };
-        btree.insert_exclusive(&key, tid).unwrap();
+        btree.insert_exclusive(&keyed(i, tid), tid).unwrap();
     }
     btree.force_checkpoint(1000).unwrap();
     drop(btree);
@@ -1592,7 +1609,7 @@ async fn test_checkpoint_corrupt_fallback() {
     assert_eq!(loaded.height(), 1, "Fallback tree should have height 1");
 
     // Searching should find nothing (empty tree)
-    let key = 0u64.to_be_bytes();
+    let key = keyed(0, spread(0));
     assert!(
         loaded.search_sync(&key).is_none(),
         "Empty fallback tree should have no keys"
@@ -1652,7 +1669,7 @@ async fn test_recovery_with_checkpoint() {
             .unwrap();
 
             for i in 0..PRE_CHECKPOINT_KEYS as u64 {
-                let key = i.to_be_bytes();
+                let key = keyed(i, spread(i));
                 let tid = RowLocator::Heap {
                     page: PageId::new(0, i % 1000),
                     slot: (i % 100) as u16,
@@ -1686,7 +1703,7 @@ async fn test_recovery_with_checkpoint() {
 
             // Insert the post-checkpoint keys into the btree as well
             for i in PRE_CHECKPOINT_KEYS..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) {
-                let key = (i as u64).to_be_bytes();
+                let key = keyed(i as u64, spread(i as u64));
                 let tid = RowLocator::Heap {
                     page: PageId::new(0, (i % 1000) as u64),
                     slot: (i as u64 % 100) as u16,
@@ -1722,7 +1739,7 @@ async fn test_recovery_with_checkpoint() {
                 let payload_str = String::from_utf8_lossy(&record.payload);
                 if let Some(key_str) = payload_str.strip_prefix("key:") {
                     if let Ok(i) = key_str.parse::<u64>() {
-                        let key = i.to_be_bytes();
+                        let key = keyed(i, spread(i));
                         let tid = RowLocator::Heap {
                             page: PageId::new(0, i % 1000),
                             slot: (i % 100) as u16,
@@ -1748,7 +1765,7 @@ async fn test_recovery_with_checkpoint() {
 
         // Verify all keys are present
         for i in 0..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) as u64 {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             assert!(
                 recovered.search_sync(&key).is_some(),
                 "Key {} missing after recovery (run {})",
@@ -1839,7 +1856,7 @@ async fn test_recovery_without_checkpoint() {
             let payload_str = String::from_utf8_lossy(&record.payload);
             if let Some(key_str) = payload_str.strip_prefix("key:") {
                 if let Ok(i) = key_str.parse::<u64>() {
-                    let key = i.to_be_bytes();
+                    let key = keyed(i, spread(i));
                     let tid = RowLocator::Heap {
                         page: PageId::new(0, i % 1000),
                         slot: (i % 100) as u16,
@@ -1863,7 +1880,7 @@ async fn test_recovery_without_checkpoint() {
 
     // Verify all keys present
     for i in 0..KEY_COUNT as u64 {
-        let key = i.to_be_bytes();
+        let key = keyed(i, spread(i));
         assert!(
             recovered.search_sync(&key).is_some(),
             "Key {} missing after full WAL replay",
@@ -2152,7 +2169,7 @@ async fn test_graceful_shutdown_checkpoint() {
             .unwrap();
 
             for i in 0..KEY_COUNT as u64 {
-                let key = i.to_be_bytes();
+                let key = keyed(i, spread(i));
                 let tid = RowLocator::Heap {
                     page: PageId::new(0, i % 1000),
                     slot: (i % 100) as u16,
@@ -2188,7 +2205,7 @@ async fn test_graceful_shutdown_checkpoint() {
         // Verify all keys are present (spot-check a sample for speed)
         let sample_step = KEY_COUNT / 10_000;
         for i in (0..KEY_COUNT as u64).step_by(sample_step) {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             let expected = RowLocator::Heap {
                 page: PageId::new(0, i % 1000),
                 slot: (i % 100) as u16,
@@ -2279,7 +2296,7 @@ async fn test_checkpoint_scale_10m() {
         .unwrap();
 
         for i in 0..KEY_COUNT as u64 {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             let tid = RowLocator::Heap {
                 page: PageId::new(0, i % 1000),
                 slot: (i % 100) as u16,
@@ -2339,7 +2356,7 @@ async fn test_checkpoint_scale_10m() {
                 .unwrap();
             writer.log_commit(txn_id, insert_lsn).unwrap();
 
-            let key = (i as u64).to_be_bytes();
+            let key = keyed(i as u64, spread(i as u64));
             let tid = RowLocator::Heap {
                 page: PageId::new(0, (i % 1000) as u64),
                 slot: (i as u64 % 100) as u16,
@@ -2363,7 +2380,7 @@ async fn test_checkpoint_scale_10m() {
                 let payload_str = String::from_utf8_lossy(&record.payload);
                 if let Some(key_str) = payload_str.strip_prefix("key:") {
                     if let Ok(i) = key_str.parse::<u64>() {
-                        let key = i.to_be_bytes();
+                        let key = keyed(i, spread(i));
                         let tid = RowLocator::Heap {
                             page: PageId::new(0, i % 1000),
                             slot: (i % 100) as u16,
@@ -2390,7 +2407,7 @@ async fn test_checkpoint_scale_10m() {
         // Verify spot-check: 1000 pre-checkpoint keys + all post-checkpoint keys
         let sample_step = KEY_COUNT / 1000;
         for i in (0..KEY_COUNT as u64).step_by(sample_step) {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             assert!(
                 recovered.search_sync(&key).is_some(),
                 "Pre-checkpoint key {} missing (run {})",
@@ -2399,7 +2416,7 @@ async fn test_checkpoint_scale_10m() {
             );
         }
         for i in KEY_COUNT..(KEY_COUNT + POST_KEYS) {
-            let key = (i as u64).to_be_bytes();
+            let key = keyed(i as u64, spread(i as u64));
             assert!(
                 recovered.search_sync(&key).is_some(),
                 "Post-checkpoint key {} missing (run {})",

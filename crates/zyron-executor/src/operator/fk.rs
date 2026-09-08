@@ -73,9 +73,19 @@ fn encode_composite_key(
 
 /// Decodes one heap tuple's bytes into a single-row batch over a table's full
 /// column set so key columns can be read back by position.
-pub(crate) fn decode_tuple_to_batch(data: &[u8], table: &TableEntry) -> DataBatch {
-    let column_to_builder: Vec<Option<u16>> =
-        (0..table.columns.len()).map(|i| Some(i as u16)).collect();
+///
+/// `epoch` is the layout the row was written under, which the caller reads
+/// from the tuple's slot. Every position in the batch is a current column of
+/// the table, so a caller indexing by position gets the same answer whichever
+/// epoch the row carries.
+pub(crate) fn decode_tuple_to_batch(
+    data: &[u8],
+    table: &TableEntry,
+    epoch: u16,
+    at: Option<zyron_common::RowLocator>,
+) -> Result<DataBatch> {
+    let output_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
+    let decoder = crate::epoch_decode::EpochDecoder::new(table, &output_ids);
     let mut builders: Vec<ColumnBuilder> = table
         .columns
         .iter()
@@ -88,8 +98,10 @@ pub(crate) fn decode_tuple_to_batch(data: &[u8], table: &TableEntry) -> DataBatc
             }
         })
         .collect();
-    decode_tuple_into_builders(data, &table.columns, &column_to_builder, &mut builders);
-    DataBatch::new(builders.into_iter().map(|b| b.finish()).collect())
+    decode_tuple_into_builders(data, &decoder, epoch, at, &mut builders)?;
+    Ok(DataBatch::new(
+        builders.into_iter().map(|b| b.finish()).collect(),
+    ))
 }
 
 /// Returns the B+tree index id whose leading column is `col_id` for the table,
@@ -128,7 +140,12 @@ async fn read_visible_tuple(
     if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
         return Ok(None);
     }
-    Ok(Some(decode_tuple_to_batch(view.data, table)))
+    Ok(Some(decode_tuple_to_batch(
+        view.data,
+        table,
+        view.header.schema_epoch,
+        Some(tid.locator()),
+    )?))
 }
 
 /// Collects the composite keys of every live, visible row over `positions`,
@@ -171,7 +188,15 @@ async fn for_each_append_row(
             if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
                 continue;
             }
-            let batch = decode_tuple_to_batch(view.data, table);
+            let batch = decode_tuple_to_batch(
+                view.data,
+                table,
+                view.header.schema_epoch,
+                Some(zyron_common::RowLocator::Heap {
+                    page: PageId::new(append_file_id, page_num),
+                    slot,
+                }),
+            )?;
             f(&batch, 0);
         }
     }
@@ -241,7 +266,15 @@ async fn for_each_visible_row(
             if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
                 continue;
             }
-            let batch = decode_tuple_to_batch(view.data, table);
+            let batch = decode_tuple_to_batch(
+                view.data,
+                table,
+                view.header.schema_epoch,
+                Some(zyron_common::RowLocator::Heap {
+                    page: page_id,
+                    slot,
+                }),
+            )?;
             f(&batch, 0);
         }
     }
@@ -914,7 +947,15 @@ async fn gather_children_matching(
             if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
                 continue;
             }
-            let row = decode_tuple_to_batch(view.data, child);
+            let row = decode_tuple_to_batch(
+                view.data,
+                child,
+                view.header.schema_epoch,
+                Some(zyron_common::RowLocator::Heap {
+                    page: page_id,
+                    slot,
+                }),
+            )?;
             if keep(&row, 0) {
                 for (b, col) in builders.iter_mut().zip(&row.columns) {
                     b.push(&col.get_scalar(0));

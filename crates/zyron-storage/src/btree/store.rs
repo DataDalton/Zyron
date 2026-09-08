@@ -229,6 +229,16 @@ impl InMemoryPageStore {
         p
     }
 
+    /// Pages handed out so far, which is what the tree costs in memory once
+    /// multiplied by the page size.
+    ///
+    /// Read directly rather than inferred from the process resident set,
+    /// because the allocator holds freed pages back from the operating system
+    /// and a resident set therefore carries every earlier tree as well.
+    pub fn pages_allocated(&self) -> u32 {
+        self.next_page.load(Ordering::Relaxed)
+    }
+
     /// Bulk-allocates `count` consecutive pages, returns the first page
     /// number. Used by checkpoint loading for arena-style initialization.
     pub fn bulk_allocate(&self, count: usize) -> u32 {

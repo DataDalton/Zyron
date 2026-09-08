@@ -12,6 +12,7 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_storage::Tuple;
 
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
+use crate::epoch_decode::EpochDecoder;
 
 /// Number of rows per execution batch.
 pub const BATCH_SIZE: usize = 1024;
@@ -524,89 +525,25 @@ pub fn build_column_to_builder_map(
 /// Decodes one tuple's data bytes into column builders.
 ///
 /// Tuple data layout (NSM, little-endian):
-/// - Null bitmap: ceil(num_columns / 8) bytes, bit N set = column N is null
-/// - Column values in ordinal order:
+/// - Null bitmap: ceil(columns in the epoch's layout / 8) bytes, bit N set =
+///   the layout's column N is null
+/// - Column values in the epoch's positional order:
 ///   - Fixed-size types: inline at TypeId::fixed_size() bytes (zeroed if null)
 ///   - Variable-length types: 4-byte LE length prefix + data bytes (length=0, no data if null)
 ///
-/// `column_to_builder` is the precomputed per-ordinal lookup produced by
-/// `build_column_to_builder_map`. The decoder walks every table column to
-/// keep the offset cursor aligned with the encoded row, but only touches
-/// `builders[b]` when `column_to_builder[i] == Some(b)`. Pass the table's
-/// full column list as `columns` even when the scan projects a subset.
+/// `epoch` is the layout the row was written under, read from its slot. The
+/// decoder resolves it against the plans `decoder` holds, so a row older than
+/// a column fills that column from its recorded absent value and a row that
+/// still carries a dropped column walks past it. `at` names the row for the
+/// corruption report an epoch with no recorded layout produces.
 pub fn decode_tuple_into_builders(
     data: &[u8],
-    columns: &[ColumnEntry],
-    column_to_builder: &[Option<u16>],
+    decoder: &EpochDecoder,
+    epoch: u16,
+    at: Option<zyron_common::RowLocator>,
     builders: &mut [ColumnBuilder],
-) {
-    debug_assert_eq!(column_to_builder.len(), columns.len());
-    let num_cols = columns.len();
-    let null_bitmap_len = num_cols.div_ceil(8);
-    let null_bitmap = &data[..null_bitmap_len];
-    let mut offset = null_bitmap_len;
-
-    for (i, col) in columns.iter().enumerate() {
-        let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-        let builder_idx = column_to_builder[i].map(|b| b as usize);
-        // Physical type drives byte layout: a TIMESTAMP(p>6) column is stored
-        // as 16-byte i128 picoseconds even though its logical type is a
-        // timestamp.
-        let phys_type = col.physical_type_id();
-
-        if let Some(fixed_size) = phys_type.fixed_size() {
-            if is_null {
-                if let Some(b) = builder_idx {
-                    builders[b].push_null();
-                }
-                offset += fixed_size;
-            } else {
-                let value_bytes = &data[offset..offset + fixed_size];
-                // Straight into the typed buffer, the scalar only for a
-                // pairing the typed push does not carry
-                if let Some(b) = builder_idx
-                    && !builders[b].push_fixed(phys_type, value_bytes)
-                {
-                    let scalar = decode_fixed_scalar(phys_type, value_bytes);
-                    builders[b].push_owned(scalar);
-                }
-                offset += fixed_size;
-            }
-        } else {
-            // Variable-length: 4-byte LE length prefix
-            let len = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as usize;
-            offset += 4;
-
-            if is_null {
-                if let Some(b) = builder_idx {
-                    builders[b].push_null();
-                }
-                offset += len;
-            } else {
-                let value_bytes = &data[offset..offset + len];
-                if let Some(b) = builder_idx {
-                    // push_owned moves the freshly decoded text or binary
-                    // allocation into the column instead of copying it again.
-                    // An ENCRYPTED column stores ciphertext, decoding those
-                    // bytes by the logical text type would corrupt them
-                    // through the lossy utf8 conversion, so they stay binary
-                    // for the scan-side decrypt
-                    let scalar = if col.is_encrypted() {
-                        ScalarValue::Binary(value_bytes.to_vec())
-                    } else {
-                        decode_varlen_scalar(col.type_id, value_bytes)
-                    };
-                    builders[b].push_owned(scalar);
-                }
-                offset += len;
-            }
-        }
-    }
+) -> Result<()> {
+    decoder.decode(epoch, data, at, builders)
 }
 
 /// Evaluates a bound predicate against a set of encoded tuple rows and returns
@@ -621,7 +558,8 @@ pub fn decode_tuple_into_builders(
 /// in `output_columns` are materialized.
 pub fn evaluate_row_filter(
     output_columns: &[LogicalColumn],
-    table_columns: &[ColumnEntry],
+    table: &zyron_catalog::TableEntry,
+    epoch: u16,
     predicate: &BoundExpr,
     rows: &[&[u8]],
 ) -> Result<Vec<bool>> {
@@ -629,19 +567,18 @@ pub fn evaluate_row_filter(
         return Ok(Vec::new());
     }
     let output_ids: Vec<ColumnId> = output_columns.iter().map(|c| c.column_id).collect();
-    let column_to_builder = build_column_to_builder_map(table_columns, &output_ids);
+    let decoder = EpochDecoder::new(table, &output_ids);
 
-    // Fail closed on a row whose bytes do not span the full schema: a truncated
-    // or malformed change record is dropped (mask = false) rather than panicking
-    // the decoder or evaluating a garbage predicate result. Only well-formed
-    // rows are decoded into the batch; their predicate results are scattered
-    // back to their original positions.
+    // Fail closed on a row whose bytes do not span the epoch's layout: a
+    // truncated or malformed change record is dropped (mask = false) rather
+    // than panicking the decoder or evaluating a garbage predicate result.
+    // Only well-formed rows are decoded into the batch; their predicate
+    // results are scattered back to their original positions.
     let mut keep = vec![false; rows.len()];
     let mut decodable: Vec<usize> = Vec::with_capacity(rows.len());
     let mut builders = create_builders(output_columns, rows.len());
     for (i, row) in rows.iter().enumerate() {
-        if tuple_decodes_within_bounds(row, table_columns) {
-            decode_tuple_into_builders(row, table_columns, &column_to_builder, &mut builders);
+        if decoder.try_decode(epoch, row, &mut builders) {
             decodable.push(i);
         }
     }
@@ -655,44 +592,6 @@ pub fn evaluate_row_filter(
         keep[i] = sub.get(j).copied().unwrap_or(false);
     }
     Ok(keep)
-}
-
-/// Returns whether `data` holds a complete NSM tuple for `columns` without
-/// reading past its end. MUST mirror the offset advancement in
-/// `decode_tuple_into_builders` (null bitmap, fixed sizes by physical type,
-/// 4-byte length prefix for variable-length columns) so a row that passes here
-/// decodes without an out-of-bounds index.
-fn tuple_decodes_within_bounds(data: &[u8], columns: &[ColumnEntry]) -> bool {
-    let num_cols = columns.len();
-    let null_bitmap_len = num_cols.div_ceil(8);
-    if data.len() < null_bitmap_len {
-        return false;
-    }
-    let mut offset = null_bitmap_len;
-    for col in columns {
-        let phys_type = col.physical_type_id();
-        if let Some(fixed_size) = phys_type.fixed_size() {
-            offset += fixed_size;
-            if offset > data.len() {
-                return false;
-            }
-        } else {
-            if offset + 4 > data.len() {
-                return false;
-            }
-            let len = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as usize;
-            offset += 4 + len;
-            if offset > data.len() {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Decodes a fixed-size value from raw bytes into a ScalarValue.
@@ -820,11 +719,7 @@ fn encode_varlen_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 /// prefix) when `value_size == 0`. This is the exact inverse of
 /// `decode_fixed_scalar` / `decode_varlen_scalar`, so a value written here by
 /// the columnar patch path round-trips through the columnar read path.
-pub(crate) fn encode_scalar_value(
-    type_id: TypeId,
-    scalar: &ScalarValue,
-    value_size: usize,
-) -> Vec<u8> {
+pub fn encode_scalar_value(type_id: TypeId, scalar: &ScalarValue, value_size: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(value_size);
     encode_scalar_value_into(&mut buf, type_id, scalar, value_size);
     buf
@@ -921,11 +816,20 @@ fn encode_varlen_scalar(buf: &mut Vec<u8>, scalar: &ScalarValue) {
 }
 
 /// Converts an entire DataBatch to storage Tuples.
-pub fn batch_to_tuples(batch: &DataBatch, columns: &[ColumnEntry], xmin: u64) -> Vec<Tuple> {
+///
+/// Every tuple is stamped with `schema_epoch`, which is the layout `columns`
+/// describes. A row written without its epoch could not be read back: the
+/// decoder would have no way to know how many columns its null bitmap covers.
+pub fn batch_to_tuples(
+    batch: &DataBatch,
+    columns: &[ColumnEntry],
+    xmin: u64,
+    schema_epoch: u16,
+) -> Vec<Tuple> {
     let mut tuples = Vec::with_capacity(batch.num_rows);
     for row_idx in 0..batch.num_rows {
         let data = encode_row(batch, row_idx, columns);
-        tuples.push(Tuple::new(data, xmin));
+        tuples.push(Tuple::with_epoch(data, xmin, schema_epoch));
     }
     tuples
 }
@@ -951,7 +855,43 @@ mod row_filter_tests {
             tz_offset_secs: None,
             element_type: None,
             attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
         }
+    }
+
+    /// A table entry over `columns`, sealed at its first epoch, which is what
+    /// the filter reads a row image through.
+    fn table_of(columns: Vec<ColumnEntry>) -> zyron_catalog::TableEntry {
+        let mut entry = zyron_catalog::TableEntry {
+            id: TableId(1),
+            schema_id: zyron_catalog::SchemaId(1),
+            name: "t".to_string(),
+            heap_file_id: 1,
+            fsm_file_id: 2,
+            columns,
+            constraints: Vec::new(),
+            created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+        };
+        entry.seal_initial_epoch();
+        entry
     }
 
     fn lcol(id: u16, name: &str, type_id: TypeId) -> LogicalColumn {
@@ -1010,11 +950,21 @@ mod row_filter_tests {
             type_id: TypeId::Boolean,
         };
 
-        let mask = evaluate_row_filter(&output_columns, &table_columns, &predicate, &rows).unwrap();
+        let table = table_of(table_columns.clone());
+        let mask = evaluate_row_filter(
+            &output_columns,
+            &table,
+            table.schema_epoch,
+            &predicate,
+            &rows,
+        )
+        .unwrap();
         assert_eq!(mask, vec![true, false, true]);
 
         // Empty input is a no-op.
-        let empty = evaluate_row_filter(&output_columns, &table_columns, &predicate, &[]).unwrap();
+        let empty =
+            evaluate_row_filter(&output_columns, &table, table.schema_epoch, &predicate, &[])
+                .unwrap();
         assert!(empty.is_empty());
     }
 
@@ -1055,7 +1005,15 @@ mod row_filter_tests {
             type_id: TypeId::Boolean,
         };
 
-        let mask = evaluate_row_filter(&output_columns, &table_columns, &predicate, &rows).unwrap();
+        let table = table_of(table_columns.clone());
+        let mask = evaluate_row_filter(
+            &output_columns,
+            &table,
+            table.schema_epoch,
+            &predicate,
+            &rows,
+        )
+        .unwrap();
         // Good row passes; the two malformed rows are dropped.
         assert_eq!(mask, vec![true, false, false]);
     }

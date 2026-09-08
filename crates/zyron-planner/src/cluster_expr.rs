@@ -421,6 +421,8 @@ mod tests {
             tz_offset_secs: None,
             element_type: None,
             attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
         }
     }
 

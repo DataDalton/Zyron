@@ -37,6 +37,14 @@ pub struct BTreeIndex {
     /// Serializes root-replacement during split propagation. Held only
     /// when the root itself splits, which is rare.
     root_change_lock: parking_lot::Mutex<()>,
+    /// Held for writing across the moment a bulk load installs its root, and
+    /// for reading by index maintenance while a build is in flight.
+    ///
+    /// Only maintenance of an index whose entry says Building takes the read
+    /// side, so a tree serving queries never touches this lock at all. The
+    /// write side is held for the swap and the catch-up that follows it,
+    /// which is bounded by the writes that arrived during the load.
+    build_swap: parking_lot::RwLock<()>,
 }
 
 impl BTreeIndex {
@@ -71,6 +79,7 @@ impl BTreeIndex {
             wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
             checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
             root_change_lock: parking_lot::Mutex::new(()),
+            build_swap: parking_lot::RwLock::new(()),
         })
     }
 
@@ -107,6 +116,7 @@ impl BTreeIndex {
                             checkpoint_config,
                         )),
                         root_change_lock: parking_lot::Mutex::new(()),
+                        build_swap: parking_lot::RwLock::new(()),
                     });
                 }
                 Err(_) => {
@@ -132,6 +142,7 @@ impl BTreeIndex {
             wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
             checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
             root_change_lock: parking_lot::Mutex::new(()),
+            build_swap: parking_lot::RwLock::new(()),
         })
     }
 
@@ -150,10 +161,40 @@ impl BTreeIndex {
         self.file_id
     }
 
-    /// Returns a reference to the page store (for debugging/testing).
-    #[cfg(test)]
+    /// Returns a reference to the page store.
     pub fn pages_ref(&self) -> &InMemoryPageStore {
         &self.pages
+    }
+
+    /// The height ceiling a bulk load is held to, which is the same one the
+    /// per-key descent uses.
+    pub(crate) const fn max_height() -> usize {
+        Self::MAX_HEIGHT
+    }
+
+    /// Parks index maintenance while a bulk load installs its root.
+    ///
+    /// Taken for reading by the maintenance path of an index that is still
+    /// building, and for writing by the load. A finished index never reaches
+    /// either side.
+    pub fn maintenance_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.build_swap.read()
+    }
+
+    /// Holds off maintenance for the root swap and the catch-up after it.
+    pub(crate) fn lock_build_swap(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.build_swap.write()
+    }
+
+    /// Points the tree at a root a bulk load wrote.
+    ///
+    /// The height moves with the root because a search reads both, and a
+    /// search that took the new root at the old height would stop above the
+    /// leaves and find nothing.
+    pub(crate) fn install_root(&self, root_page_num: u32, height: u32) {
+        let _guard = self.root_change_lock.lock();
+        self.height.store(height, Ordering::Release);
+        self.root_page_num.store(root_page_num, Ordering::Release);
     }
 
     /// Returns the tree height.
@@ -1367,8 +1408,8 @@ impl BTreeIndex {
                         let mid = lo + (hi - lo) / 2;
                         let so = sa + mid * ss;
                         let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
-                        let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
-                        let ek = &data[eo + 2..eo + 2 + kl];
+                        let kl = u16::from_le_bytes([data[so + 2], data[so + 3]]) as usize;
+                        let ek = &data[eo..eo + kl];
                         if compare_keys(ek, sk).is_lt() {
                             lo = mid + 1;
                         } else {
@@ -1386,8 +1427,8 @@ impl BTreeIndex {
             for slot_idx in start_slot..ns {
                 let so = sa + slot_idx * ss;
                 let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
-                let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
-                let ek = &data[eo + 2..eo + 2 + kl];
+                let kl = u16::from_le_bytes([data[so + 2], data[so + 3]]) as usize;
+                let ek = &data[eo..eo + kl];
 
                 if let Some(end) = end_key
                     && compare_keys(ek, end).is_gt()
@@ -1403,9 +1444,9 @@ impl BTreeIndex {
                     continue;
                 }
 
-                let to = eo + 2 + kl;
-                // a corrupt payload tag is skipped rather than fabricated
-                let Some(loc) = RowLocator::read_payload(&data[to..]) else {
+                // a key that does not end in a suffix names no row, so it is
+                // skipped rather than answered with a fabricated address
+                let Some(loc) = RowLocator::from_key(ek) else {
                     continue;
                 };
                 results.push((Bytes::copy_from_slice(ek), loc));
@@ -1472,8 +1513,8 @@ impl BTreeIndex {
                         let mid = lo + (hi - lo) / 2;
                         let so = sa + mid * ss;
                         let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
-                        let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
-                        let ek = &data[eo + 2..eo + 2 + kl];
+                        let kl = u16::from_le_bytes([data[so + 2], data[so + 3]]) as usize;
+                        let ek = &data[eo..eo + kl];
                         if compare_keys(ek, sk).is_lt() {
                             lo = mid + 1;
                         } else {
@@ -1491,8 +1532,8 @@ impl BTreeIndex {
             for slot_idx in start_slot..ns {
                 let so = sa + slot_idx * ss;
                 let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
-                let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
-                let ek = &data[eo + 2..eo + 2 + kl];
+                let kl = u16::from_le_bytes([data[so + 2], data[so + 3]]) as usize;
+                let ek = &data[eo..eo + kl];
 
                 if let Some(end) = end_key
                     && compare_keys(ek, end).is_gt()
@@ -1508,10 +1549,10 @@ impl BTreeIndex {
                     continue;
                 }
 
-                let to = eo + 2 + kl;
                 last_emitted = Some(Bytes::copy_from_slice(ek));
-                // a corrupt payload tag is skipped rather than fabricated
-                let Some(loc) = RowLocator::read_payload(&data[to..]) else {
+                // a key that does not end in a suffix names no row, so it is
+                // skipped rather than answered with a fabricated address
+                let Some(loc) = RowLocator::from_key(ek) else {
                     continue;
                 };
                 if !f(ek, loc) {
@@ -1709,6 +1750,42 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Builds the key an index writes, the value big-endian so byte order is
+    /// numeric order, followed by the suffix naming the row it points at. The
+    /// tree reads the row out of that suffix, so a key without one names
+    /// nothing.
+    fn keyed(i: u64, locator: RowLocator) -> Vec<u8> {
+        let mut key = i.to_be_bytes().to_vec();
+        locator.append_key_suffix(&mut key);
+        key
+    }
+
+    /// The row `i` sits at in the tests that spread rows over a thousand
+    /// pages.
+    fn spread(i: u64) -> RowLocator {
+        RowLocator::Heap {
+            page: PageId::new(0, i % 1000),
+            slot: (i % 100) as u16,
+        }
+    }
+
+    /// The row `i` sits at in the test that spreads rows over five hundred
+    /// pages.
+    fn halved(i: u64) -> RowLocator {
+        RowLocator::Heap {
+            page: PageId::new(0, i % 500),
+            slot: 0,
+        }
+    }
+
+    /// The single row every key names in the tests that only care about keys.
+    fn origin() -> RowLocator {
+        RowLocator::Heap {
+            page: PageId::new(0, 0),
+            slot: 0,
+        }
+    }
+
     #[tokio::test]
     async fn test_insert_exclusive_10k() {
         let dir = tempdir().unwrap();
@@ -1716,14 +1793,11 @@ mod tests {
         std::fs::create_dir_all(&ckpt_dir).unwrap();
         let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
         for i in 0..10_000u64 {
-            let key = i.to_be_bytes();
-            let tid = RowLocator::Heap {
-                page: PageId::new(0, 0),
-                slot: 0,
-            };
+            let tid = origin();
+            let key = keyed(i, tid);
             btree.insert_exclusive(&key, tid).unwrap();
         }
-        assert!(btree.search_exclusive(&500u64.to_be_bytes()).is_some());
+        assert!(btree.search_exclusive(&keyed(500, origin())).is_some());
     }
 
     #[tokio::test]
@@ -1739,11 +1813,8 @@ mod tests {
 
         let n = 200_000u64;
         for i in 0..n {
-            let key = i.to_be_bytes();
-            let tid = RowLocator::Heap {
-                page: PageId::new(0, i % 1000),
-                slot: (i % 100) as u16,
-            };
+            let tid = spread(i);
+            let key = keyed(i, tid);
             btree.insert_exclusive(&key, tid).unwrap();
         }
         assert!(btree.height() > 1, "expected a multi-level tree");
@@ -1751,7 +1822,7 @@ mod tests {
         // Delete every third key.
         for i in (0..n).step_by(3) {
             assert!(
-                btree.delete_exclusive(&i.to_be_bytes()),
+                btree.delete_exclusive(&keyed(i, spread(i))),
                 "delete {} failed",
                 i
             );
@@ -1759,7 +1830,7 @@ mod tests {
 
         // Survivors all present with exact tuple id; deleted all absent.
         for i in 0..n {
-            let key = i.to_be_bytes();
+            let key = keyed(i, spread(i));
             let found = btree.search_exclusive(&key);
             if i % 3 == 0 {
                 assert_eq!(found, None, "key {} should be deleted", i);
@@ -1777,9 +1848,11 @@ mod tests {
         let scanned = btree.range_scan_sync(None, None);
         let mut expected_keys: Vec<u64> = (0..n).filter(|i| i % 3 != 0).collect();
         expected_keys.sort_unstable();
+        // The value leads the key and the suffix naming the row follows it, so
+        // the value is the first eight bytes
         let scanned_keys: Vec<u64> = scanned
             .iter()
-            .map(|(k, _)| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .map(|(k, _)| u64::from_be_bytes(k[..8].try_into().unwrap()))
             .collect();
         assert_eq!(scanned_keys, expected_keys, "scan lost or reordered keys");
     }
@@ -1796,40 +1869,29 @@ mod tests {
         let n = 5_000u64;
         for i in 0..n {
             btree
-                .insert_exclusive(
-                    &i.to_be_bytes(),
-                    RowLocator::Heap {
-                        page: PageId::new(0, 0),
-                        slot: 0,
-                    },
-                )
+                .insert_exclusive(&keyed(i, origin()), origin())
                 .unwrap();
         }
         for i in 0..n {
-            assert!(btree.delete_exclusive(&i.to_be_bytes()));
+            assert!(btree.delete_exclusive(&keyed(i, origin())));
         }
         for i in 0..n {
-            assert_eq!(btree.search_exclusive(&i.to_be_bytes()), None);
+            assert_eq!(btree.search_exclusive(&keyed(i, origin())), None);
         }
         assert_eq!(btree.height(), 1, "tree should collapse to a single leaf");
         assert!(btree.range_scan_sync(None, None).is_empty());
 
         // Reinserting after full deletion still works.
+        let reinserted = RowLocator::Heap {
+            page: PageId::new(0, 7),
+            slot: 3,
+        };
         btree
-            .insert_exclusive(
-                &42u64.to_be_bytes(),
-                RowLocator::Heap {
-                    page: PageId::new(0, 7),
-                    slot: 3,
-                },
-            )
+            .insert_exclusive(&keyed(42, reinserted), reinserted)
             .unwrap();
         assert_eq!(
-            btree.search_exclusive(&42u64.to_be_bytes()),
-            Some(RowLocator::Heap {
-                page: PageId::new(0, 7),
-                slot: 3
-            })
+            btree.search_exclusive(&keyed(42, reinserted)),
+            Some(reinserted)
         );
     }
 
@@ -1851,15 +1913,7 @@ mod tests {
         let n = 100_000u64;
         // Seed via the concurrent insert path.
         for i in 0..n {
-            btree
-                .insert_sync(
-                    &i.to_be_bytes(),
-                    RowLocator::Heap {
-                        page: PageId::new(0, i % 500),
-                        slot: 0,
-                    },
-                )
-                .unwrap();
+            btree.insert_sync(&keyed(i, halved(i)), halved(i)).unwrap();
         }
 
         // Survivors are the even keys; odd keys will be deleted concurrently.
@@ -1873,7 +1927,7 @@ mod tests {
                 while !stop.load(AtOrd::Relaxed) {
                     for i in (0..n).step_by(2) {
                         assert!(
-                            btree.search_sync(&i.to_be_bytes()).is_some(),
+                            btree.search_sync(&keyed(i, halved(i))).is_some(),
                             "survivor {} vanished during concurrent delete",
                             i
                         );
@@ -1884,7 +1938,7 @@ mod tests {
 
         // Delete all odd keys on the concurrent path.
         for i in (1..n).step_by(2) {
-            assert!(btree.delete_sync(&i.to_be_bytes()));
+            assert!(btree.delete_sync(&keyed(i, halved(i))));
         }
         stop.store(true, AtOrd::Relaxed);
         for r in readers {
@@ -1893,7 +1947,7 @@ mod tests {
 
         // Final check: evens present, odds gone.
         for i in 0..n {
-            let found = btree.search_sync(&i.to_be_bytes()).is_some();
+            let found = btree.search_sync(&keyed(i, halved(i))).is_some();
             assert_eq!(
                 found,
                 i % 2 == 0,
@@ -1911,23 +1965,16 @@ mod tests {
         let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
         let n = 1_000_000u64;
         for i in 0..n {
-            let key = i.to_be_bytes();
-            let tid = RowLocator::Heap {
-                page: PageId::new(0, i % 1000),
-                slot: (i % 100) as u16,
-            };
+            let tid = spread(i);
+            let key = keyed(i, tid);
             btree.insert_exclusive(&key, tid).unwrap();
         }
         eprintln!("Tree height: {}", btree.height());
         let mut missing = 0u64;
         let mut first_missing = None;
         for i in 0..n {
-            let key = i.to_be_bytes();
-            let expected = RowLocator::Heap {
-                page: PageId::new(0, i % 1000),
-                slot: (i % 100) as u16,
-            };
-            let found = btree.search_exclusive(&key);
+            let expected = spread(i);
+            let found = btree.search_exclusive(&keyed(i, expected));
             if found != Some(expected) {
                 missing += 1;
                 if first_missing.is_none() {

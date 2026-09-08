@@ -148,6 +148,12 @@ The registry rejects an inconsistent set at load, which is what the startup gate
 
 There is no cap on how many versions a window may hold.
 
+A `retirement_date` is six months past the release that ships the new writer. Six months covers a deployment that skips a release cycle, which is the slowest upgrade a reader has to survive, and it is short enough that a reader is deleted rather than accumulating. A lazy format needs the whole window, because a cold file moves only when something writes it and a table nobody touches keeps reading the old layout until then.
+
+The date is wall-clock rather than a version, because the question it answers is whether every deployment in the field has had time to upgrade, and a version that never ships would keep an old reader alive forever. Steps landing in the same release share one date, so a reader deletion removes them together.
+
+Once the date passes, `zyron-ctl release verify` names the format and says to delete the old reader, its migrator and its fixture, then narrow `reader_supported_versions` back to the writer's version. It reports rather than fails, so a candidate is never blocked at midnight, and the report stands until the code is gone.
+
 ## Runtime behavior
 
 On open, `migration::open` peeks the header for the kind, then `open_as` selects a reader path from the version. A version equal to the writer version is the current path with no migrator scan. A version inside the window but below the writer version plans a chain of adjacent migrators. A version outside the window fails closed with `EnvelopeError::UnknownVersion`, naming the versions the binary reads. A version inside the window but above the writer version, which is an older node reading a newer peer's file, also fails closed.
@@ -258,13 +264,19 @@ The record reaches `zyron_sys.deprecation.registry`, and `zyron_sys.deprecation.
 
 ## Worked examples in the tree
 
-Two formats carry a live migration today, both own-trailer, both forward-only.
+Four formats carry a live migration today, all forward-only.
 
 The `.zyr` columnar file moved 1.0 to 1.1 in `crates/zyron-storage/src/columnar/migrations/v1_0_to_v1_1.rs`. The step repacks segments onto a 64-byte alignment behind a 512-byte header, in place of a page of padding per segment. Its fixture is `columnar/fixtures/v1_0.bin`, written by 0.11.0. See [formats/zyr-spec.md](formats/zyr-spec.md).
 
 The lake manifest moved 2.0 to 2.1 in `crates/zyron-lake/src/manifest/migrations/v2_0_to_v2_1.rs`. The step decodes and re-encodes, adding an exact column sum behind a presence flag. Its fixture is `manifest/fixtures/v2_0.bin`.
 
-Both declare the migration policy eager, the migration not reversible, and the retirement date 2027-03-01 for the reader of the older version. The user's stance is old to new only, no backward function and no downgrade for these steps.
+Those two are own-trailer. Both declare the migration policy eager, the migration not reversible, and a retirement date for the reader of the older version. The user's stance is old to new only, no backward function and no downgrade for these steps.
+
+All four steps landed in the same release and share one retirement date, so the readers go together. Each date is a constant beside its registration in `crates/zyron-storage/src/format.rs` and `crates/zyron-lake/src/format.rs`, and `zyron_sys.storage.format_registry` reports the live value.
+
+The heap page moved 1.0 to 1.1 in `crates/zyron-storage/src/heap/migrations.rs`. A 1.0 page and a 1.1 page are the same bytes, the slot's two spare bytes at offset 6 having always been written zero, so the step hands the page back and declares `no_body_change`. What completes the move is the catalog scan registered beside it, which records the column layout every tuple stamped epoch 0 decodes through. That is why the step is one way. Its fixture is `heap/fixtures/v1_0.bin` and its policy lazy, which is why 1.0 needs the whole retirement window. See [online-ddl.md](online-ddl.md).
+
+The index checkpoint moved 11.0 to 11.1 in `crates/zyron-storage/src/btree/migrations.rs`. An 11.0 file carries whole keys and a column of row locators, which names every row twice, once in the key's seventeen byte order-preserving suffix and once in a seven byte locator. The step takes each key apart into its value and the row it names, keeps the seven byte form, measures the shared prefix over values rather than whole keys, and writes the shorter body. Its fixture is `btree/fixtures/v11_0.zyridx` and its policy eager, so an 11.0 file is replaced the first time its index checkpoints again. See [formats/zyridx-spec.md](formats/zyridx-spec.md).
 
 One deprecation record is live, in `crates/zyron-server/src/deprecations.rs`. The pagerduty contact channel kind was removed in 0.14.0 and the record names `upgrade.notify_discord_webhook_url` as its replacement. It carries no step file and no fixture. Nothing on disk holds a contact channel.
 

@@ -227,6 +227,11 @@ impl VacuumWorker {
             // windows). Commit LSNs at or below it are no longer needed to date
             // any retained version, so their segments can be freed.
             let mut global_floor = u64::MAX;
+            // What each table's pass saw of the layouts its live tuples carry.
+            // Applied after the loop, because retiring a layout writes the
+            // catalog and the loop is holding the table list it would change
+            let mut epoch_census: Vec<(zyron_catalog::TableId, zyron_storage::EpochCensus)> =
+                Vec::new();
 
             for table_entry in &tables {
                 if shutdown.load(Ordering::Acquire) {
@@ -279,9 +284,13 @@ impl VacuumWorker {
                     &index_snap.btree,
                     btree_indexes,
                 ) {
-                    Ok((reclaimed, pages)) => {
+                    Ok((reclaimed, pages, census)) => {
                         total_reclaimed += reclaimed;
                         total_pages += pages;
+                        // A layout no live tuple carries is dead weight in the
+                        // table entry, and this pass is the only thing that
+                        // visits every live tuple
+                        epoch_census.push((table_entry.id, census));
                         // Only a pass that reached the end of the table clears
                         // the dead estimate. A page-capped cycle left dead rows
                         // behind, so reporting zero would be a lie the next
@@ -308,6 +317,27 @@ impl VacuumWorker {
                     }
                 }
             }
+            // Retire the layouts nothing carries any more. Done after the
+            // per-table loop because each retirement rewrites a catalog entry
+            // the loop is reading
+            for (table_id, census) in epoch_census.drain(..) {
+                if census.saw_nothing() {
+                    continue;
+                }
+                let outcome = catalog.retire_schema_epochs(
+                    table_id,
+                    census.min_live_epoch,
+                    census.any_unstamped,
+                    false,
+                );
+                if let Err(e) = futures::executor::block_on(outcome) {
+                    debug!(
+                        "vacuum could not retire spent schema epochs for table {}: {}",
+                        table_id.0, e
+                    );
+                }
+            }
+
             // Dropped tables leave no gate entries behind. Set membership
             // rather than a scan per entry, which would be quadratic in the
             // number of tables every cycle
@@ -402,7 +432,7 @@ impl VacuumWorker {
         retention_floor: u64,
         btree: &[zyron_catalog::BTreeIndexSpec],
         btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
-    ) -> std::result::Result<(u64, u64), String> {
+    ) -> std::result::Result<(u64, u64, zyron_storage::EpochCensus), String> {
         let heap_file = HeapFile::new(
             Arc::clone(disk_manager),
             Arc::clone(buffer_pool),
@@ -441,6 +471,9 @@ impl VacuumWorker {
         };
         let is_aborted = |xid: u64| status_map.is_aborted(xid);
         let clean_indexes = !btree.is_empty();
+        // Folded across every page this cycle visits, so the caller can retire
+        // the layouts nothing carries any more
+        let mut census = zyron_storage::EpochCensus::default();
 
         for &page_id in page_ids.iter().take(page_limit) {
             pages_scanned += 1;
@@ -453,27 +486,38 @@ impl VacuumWorker {
             };
             // Reclaimed rows' images, captured under the lock so their index
             // entries can be deleted after the lock is released.
-            let mut dead: Vec<(u16, Vec<u8>)> = Vec::new();
-            let (reclaimed_on_page, modified) = {
+            let mut dead: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+            let (reclaimed_on_page, modified, page_census) = {
                 let mut guard = frame.write_data();
                 let data: &mut [u8] = &mut guard[..];
                 if HeapPage::heap_header_from_slice(data).slot_count == 0 {
-                    (0u64, false)
+                    (0u64, false, zyron_storage::EpochCensus::default())
                 } else if clean_indexes {
                     HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead)
                 } else {
                     HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted)
                 }
             };
+            census.merge(page_census);
             buffer_pool.unpin_page(page_id, modified);
 
             // Delete the reclaimed rows' B+tree entries outside the frame lock,
             // so a stale entry never outlives the heap tuple it points at.
             if clean_indexes && !dead.is_empty() {
+                let captured: Vec<zyron_executor::operator::modify::CapturedRow> = dead
+                    .iter()
+                    .map(
+                        |(slot, epoch, data)| zyron_executor::operator::modify::CapturedRow {
+                            slot: *slot,
+                            schema_epoch: *epoch,
+                            data: data.clone(),
+                        },
+                    )
+                    .collect();
                 zyron_executor::operator::modify::vacuum_index_cleanup(
                     table,
                     page_id,
-                    &dead,
+                    &captured,
                     btree,
                     btree_indexes,
                 );
@@ -488,10 +532,18 @@ impl VacuumWorker {
             }
         }
 
+        // A partial pass, one that stopped at the page limit, saw only some of
+        // the table's live tuples, so its minimum is not a minimum over the
+        // table and nothing may be retired from it
+        let complete = page_limit >= page_ids.len();
+
         // Drop the scan guard to unpin all pages
         drop(scan_guard);
 
-        Ok((tuples_reclaimed, pages_scanned))
+        if !complete {
+            census = zyron_storage::EpochCensus::default();
+        }
+        Ok((tuples_reclaimed, pages_scanned, census))
     }
 
     /// Returns a reference to vacuum statistics.
@@ -531,7 +583,7 @@ pub fn vacuum_table_immediate(
     retention_floor: u64,
     btree: &[zyron_catalog::BTreeIndexSpec],
     btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
-) -> std::result::Result<(u64, u64), String> {
+) -> std::result::Result<(u64, u64, zyron_storage::EpochCensus), String> {
     VacuumWorker::vacuum_table(
         table,
         prune_horizon,

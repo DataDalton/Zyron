@@ -146,9 +146,15 @@ async fn setup() -> Env {
         },
     )
     .unwrap();
+    // Stamped with the layout the table declares, the way the insert path
+    // stamps every row it writes
     let mut tuples = Vec::new();
     for i in 0..12i64 {
-        tuples.push(Tuple::new(encode_row2(i, i * 100), 1));
+        tuples.push(Tuple::with_epoch(
+            encode_row2(i, i * 100),
+            1,
+            pe.schema_epoch,
+        ));
     }
     parent_heap.insert_batch(&tuples).await.unwrap();
     parent_heap.flush().await.unwrap();
@@ -164,7 +170,7 @@ async fn setup() -> Env {
     )
     .unwrap();
     child_heap
-        .insert_batch(&[Tuple::new(encode_row2(1, 3), 1)])
+        .insert_batch(&[Tuple::with_epoch(encode_row2(1, 3), 1, ce.schema_epoch)])
         .await
         .unwrap();
     child_heap.flush().await.unwrap();
@@ -671,6 +677,7 @@ async fn create_notes_with_fts(
             &["body".to_string()],
             false,
             zyron_catalog::IndexType::Fulltext,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();
@@ -823,6 +830,7 @@ async fn vector_search_finds_a_row_after_it_folds_and_its_heap_slot_is_gone() {
             &["emb".to_string()],
             false,
             zyron_catalog::IndexType::Vector,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();
@@ -859,7 +867,7 @@ async fn vector_search_finds_a_row_after_it_folds_and_its_heap_slot_is_gone() {
     let tuples: Vec<Tuple> = vectors
         .iter()
         .enumerate()
-        .map(|(i, v)| Tuple::new(encode_row_id_vec(i as i64 + 1, v), 1))
+        .map(|(i, v)| Tuple::with_epoch(encode_row_id_vec(i as i64 + 1, v), 1, te.schema_epoch))
         .collect();
     let tids = heap.insert_batch(&tuples).await.unwrap();
     heap.flush().await.unwrap();
@@ -971,6 +979,7 @@ async fn spatial_search_finds_a_row_after_it_folds_and_its_heap_slot_is_gone() {
             &["loc".to_string()],
             false,
             zyron_catalog::IndexType::Spatial,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();
@@ -1187,6 +1196,7 @@ async fn unique_conflicts_are_detected_between_folded_rows() {
             &["email".to_string()],
             true,
             zyron_catalog::IndexType::BTree,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();
@@ -1340,6 +1350,7 @@ async fn secondary_index_point_lookup_returns_the_row_after_it_folds() {
             &["k".to_string()],
             false,
             zyron_catalog::IndexType::BTree,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();
@@ -1483,6 +1494,7 @@ async fn reindex_rebuild_covers_folded_rows() {
             &["tag".to_string()],
             false,
             zyron_catalog::IndexType::BTree,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();
@@ -1551,17 +1563,27 @@ async fn reindex_rebuild_covers_folded_rows() {
         None,
     )
     .unwrap();
-    let mut rebuilt = 0usize;
+    // The keys the folded rows contribute, then loaded in one pass the way an
+    // index build loads them
+    let mut keys: Vec<(Vec<u8>, zyron_common::RowLocator)> = Vec::new();
     while let Some(eb) = op.next().await.unwrap() {
         let locs = eb.locators.clone().expect("dml scan emits locators");
-        rebuilt += zyron_executor::operator::modify::rebuild_btree_index_from_batch(
+        zyron_executor::operator::modify::index_keys_for_batch(
             te.as_ref(),
             &eb.batch,
             &locs,
             &[tag_col],
-            &fresh,
+            &mut keys,
         );
     }
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    let rebuilt = fresh
+        .bulk_build_sorted(
+            keys.into_iter()
+                .map(|(k, l)| (bytes::Bytes::from(k), l))
+                .collect::<Vec<_>>(),
+        )
+        .expect("bulk load") as usize;
     env.txn_manager.abort(&mut txn).unwrap();
     assert_eq!(rebuilt, 5, "every folded row re-entered the index");
 
@@ -1732,6 +1754,7 @@ async fn spatial_rebuild_from_table_covers_folded_rows() {
             &["loc".to_string()],
             false,
             zyron_catalog::IndexType::Spatial,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap();

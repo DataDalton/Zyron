@@ -90,7 +90,7 @@ pub enum DeleteResult {
 /// |      Free Space        |
 /// +------------------------+ data_end
 /// | Entry Data             |
-/// | (key_len:2+key+loc17) |  <- grows backward from PAGE_SIZE
+/// | (key)                  |  <- grows backward from PAGE_SIZE
 /// +------------------------+ PAGE_SIZE
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -223,12 +223,10 @@ impl Default for InternalPageHeader {
 
 /// A key-value entry in a leaf page.
 ///
-/// Layout (on-disk):
-/// - key_len: 2 bytes
-/// - key: variable
-/// - locator payload: 7 bytes for a heap row, 17 otherwise, the width is
-///   recoverable from the leading tag byte and the heap file_id is implicit
-///   from the B+tree index
+/// In a page the entry is the key and nothing else. Its length is in the slot
+/// pointing at it, and the row it names is its own trailing suffix, so neither
+/// is stored a second time. A heap locator read back that way carries file_id
+/// 0, which the caller stamps from the index it read the entry out of.
 #[derive(Debug, Clone)]
 pub struct LeafEntry {
     /// The key bytes.
@@ -238,41 +236,39 @@ pub struct LeafEntry {
 }
 
 impl LeafEntry {
-    /// Size of this entry on disk.
+    /// Size of this entry in a page.
+    ///
+    /// The key alone. It ends in the suffix that names the row, so the address
+    /// is not carried a second time beside it, and its length is the one the
+    /// slot pointing at it already records.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + self.locator.payload_len()
+        self.key.len()
     }
 
-    /// Serializes the entry to bytes. Heap locators store no file_id, it is
-    /// reconstructed from the B+tree index context on read.
+    /// Serializes the entry to bytes.
     pub fn to_bytes(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(self.size_on_disk());
-        buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&self.key);
-        let mut payload = [0u8; RowLocator::MAX_PAYLOAD_LEN];
-        let written = self.locator.write_payload(&mut payload);
-        buf.extend_from_slice(&payload[..written]);
-        buf.freeze()
+        Bytes::copy_from_slice(&self.key)
     }
 
     /// Deserializes an entry from bytes. Returns (entry, bytes_consumed).
-    /// Heap locators decode with file_id=0. Callers that need the correct
-    /// file_id must set it from context after deserialization.
-    pub fn from_bytes(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 2 {
+    ///
+    /// The row the entry points at is read out of the key's own suffix. Heap
+    /// locators decode with file_id 0, and callers that need the real one
+    /// stamp it from the index they read the entry out of.
+    pub fn from_bytes(buf: &[u8], key_len: usize) -> Option<(Self, usize)> {
+        if buf.len() < key_len {
             return None;
         }
 
-        let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        let value_offset = 2 + key_len;
-        let width = RowLocator::payload_len_for_tag(*buf.get(value_offset)?);
-        if buf.len() < value_offset + width {
-            return None;
-        }
-
-        let key = Bytes::copy_from_slice(&buf[2..value_offset]);
-        let locator = RowLocator::read_payload(&buf[value_offset..])?;
-        Some((Self { key, locator }, value_offset + width))
+        let key = &buf[..key_len];
+        let locator = RowLocator::from_key(key)?;
+        Some((
+            Self {
+                key: Bytes::copy_from_slice(key),
+                locator,
+            },
+            key_len,
+        ))
     }
 }
 
@@ -311,24 +307,21 @@ pub struct LeafEntryView<'a> {
 
 impl<'a> LeafEntryView<'a> {
     /// Parses a leaf entry view from a byte slice without copying the key.
-    pub fn from_bytes(buf: &'a [u8]) -> Option<(Self, usize)> {
-        if buf.len() < 2 {
+    ///
+    /// The length comes from the slot pointing at the entry, the entry itself
+    /// being the key and nothing else.
+    pub fn from_bytes(buf: &'a [u8], key_len: usize) -> Option<(Self, usize)> {
+        if buf.len() < key_len {
             return None;
         }
-        let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        let value_offset = 2 + key_len;
-        let total = value_offset + RowLocator::payload_len_for_tag(*buf.get(value_offset)?);
-        if buf.len() < total {
-            return None;
-        }
-        let key = &buf[2..value_offset];
-        let locator = RowLocator::read_payload(&buf[value_offset..])?;
-        Some((Self { key, locator }, total))
+        let key = &buf[..key_len];
+        let locator = RowLocator::from_key(key)?;
+        Some((Self { key, locator }, key_len))
     }
 
-    /// Size of this entry on disk.
+    /// Size of this entry in a page, the key alone.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + self.locator.payload_len()
+        self.key.len()
     }
 
     /// Converts to an owned LeafEntry by copying the key.
@@ -344,10 +337,8 @@ impl<'a> LeafEntryView<'a> {
     #[inline]
     pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
         let kl = self.key.len();
-        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
-        buf[offset + 2..offset + 2 + kl].copy_from_slice(self.key);
-        let vo = offset + 2 + kl;
-        2 + kl + self.locator.write_payload(&mut buf[vo..])
+        buf[offset..offset + kl].copy_from_slice(self.key);
+        kl
     }
 }
 
@@ -357,10 +348,8 @@ impl LeafEntry {
     #[inline]
     pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
         let kl = self.key.len();
-        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
-        buf[offset + 2..offset + 2 + kl].copy_from_slice(&self.key);
-        let vo = offset + 2 + kl;
-        2 + kl + self.locator.write_payload(&mut buf[vo..])
+        buf[offset..offset + kl].copy_from_slice(&self.key);
+        kl
     }
 }
 
@@ -420,6 +409,18 @@ mod tests {
 
     // Packed struct fields can't be referenced in assert_eq! due to alignment.
     // Copy fields to locals before comparing.
+
+    /// Builds a leaf entry the way an index writes one, the value followed by
+    /// the suffix naming the row it points at. The entry carries the address
+    /// only there, so a key built without it names no row.
+    fn entry(value: &[u8], locator: RowLocator) -> LeafEntry {
+        let mut key = value.to_vec();
+        locator.append_key_suffix(&mut key);
+        LeafEntry {
+            key: Bytes::from(key),
+            locator,
+        }
+    }
 
     #[test]
     fn test_packed_leaf_header_roundtrip() {
@@ -530,16 +531,16 @@ mod tests {
 
     #[test]
     fn test_leaf_entry_roundtrip() {
-        let entry = LeafEntry {
-            key: Bytes::from(vec![1, 2, 3, 4]),
-            locator: RowLocator::Heap {
+        let entry = entry(
+            &[1, 2, 3, 4],
+            RowLocator::Heap {
                 page: PageId::new(0, 10),
                 slot: 5,
             },
-        };
+        );
 
         let bytes = entry.to_bytes();
-        let (restored, _size) = LeafEntry::from_bytes(&bytes).unwrap();
+        let (restored, _size) = LeafEntry::from_bytes(&bytes, entry.key.len()).unwrap();
         assert_eq!(restored.key, entry.key);
         assert_eq!(
             restored.locator,
@@ -552,17 +553,17 @@ mod tests {
 
     #[test]
     fn test_leaf_entry_roundtrip_columnar() {
-        let entry = LeafEntry {
-            key: Bytes::from(vec![9, 9, 9]),
-            locator: RowLocator::Columnar {
+        let entry = entry(
+            &[9, 9, 9],
+            RowLocator::Columnar {
                 file_id: 204,
                 sys_rowid: 4096,
             },
-        };
+        );
 
         let bytes = entry.to_bytes();
-        let (restored, size) = LeafEntry::from_bytes(&bytes).unwrap();
-        assert_eq!(size, 2 + 3 + RowLocator::MAX_PAYLOAD_LEN);
+        let (restored, size) = LeafEntry::from_bytes(&bytes, entry.key.len()).unwrap();
+        assert_eq!(size, 3 + RowLocator::KEY_SUFFIX_LEN);
         assert_eq!(restored.key, entry.key);
         assert_eq!(
             restored.locator,

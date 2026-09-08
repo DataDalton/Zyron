@@ -10,19 +10,62 @@
 //! version, and what lets `zyron_sys.storage.catalog_schema_evolution`
 //! answer for every table rather than only the ones that have changed
 
-use zyron_common::format::catalog_evolution::CatalogTableRegistration;
+use zyron_common::format::catalog_evolution::{CatalogSchemaEvolution, CatalogTableRegistration};
 use zyron_common::format::version::FormatVersion;
 
 /// The Zyron version these tables were last reshaped in
 const GATE: &str = "0.11.0";
 
-/// The version every catalog table's rows are written at today
+/// The Zyron version the table and index rows gained their schema epoch and
+/// build state
+const EPOCH_GATE: &str = "0.15.0";
+
+/// The version every catalog table's rows are written at today, for the tables
+/// that have not been reshaped since
 pub const CATALOG_SCHEMA_VERSION: FormatVersion = FormatVersion::V1;
+
+/// The version a table row is written at.
+///
+/// V2 carries the schema epoch the table stamps into every tuple, the layout
+/// each recorded epoch describes, and the layout its unstamped rows read
+/// through. A V1 row cannot be defaulted into V2: without the recorded layout
+/// there is nothing to read its existing tuples with.
+pub const TABLE_SCHEMA_VERSION: FormatVersion = FormatVersion::new(2, 0);
+
+/// The version an index row is written at. V2 carries the build state.
+pub const INDEX_SCHEMA_VERSION: FormatVersion = FormatVersion::new(2, 0);
 
 /// One persistent catalog table
 struct Table {
     name: &'static str,
     doc: &'static str,
+}
+
+/// Position of `zyron_sys.core.tables` in `TABLES`, checked by a test rather
+/// than trusted, because the version below is attached by position
+const TABLES_INDEX: usize = 2;
+
+/// Position of `zyron_sys.storage.indexes` in `TABLES`
+const INDEXES_INDEX: usize = 4;
+
+/// The version one table's rows are written at.
+///
+/// Two tables have moved past the shared version, so the row shape a
+/// migration has to produce is per table rather than per release.
+const fn version_of(index: usize) -> FormatVersion {
+    match index {
+        TABLES_INDEX => TABLE_SCHEMA_VERSION,
+        INDEXES_INDEX => INDEX_SCHEMA_VERSION,
+        _ => CATALOG_SCHEMA_VERSION,
+    }
+}
+
+/// The Zyron version one table's current row shape was introduced in.
+const fn gate_of(index: usize) -> &'static str {
+    match index {
+        TABLES_INDEX | INDEXES_INDEX => EPOCH_GATE,
+        _ => GATE,
+    }
 }
 
 /// Every catalog table the server persists rows for.
@@ -174,8 +217,8 @@ macro_rules! register_table {
         inventory::submit! {
             CatalogTableRegistration {
                 catalog_table: TABLES[$index].name,
-                current_schema_version: CATALOG_SCHEMA_VERSION,
-                introduced_in_binary_version: GATE,
+                current_schema_version: version_of($index),
+                introduced_in_binary_version: gate_of($index),
                 doc: TABLES[$index].doc,
             }
         }
@@ -222,6 +265,82 @@ pub const REGISTERED_TABLE_COUNT: usize = TABLES.len();
 /// Every registered catalog table name
 pub fn table_names() -> Vec<&'static str> {
     TABLES.iter().map(|table| table.name).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Schema epoch evolution
+// ---------------------------------------------------------------------------
+
+/// Fills a table row's schema epoch fields from the columns it already names.
+///
+/// This is the catalog half of the heap page version bump. A tuple written
+/// before the bump carries epoch 0, and epoch 0 means "read through the layout
+/// recorded here", so a table that reached this binary without one has rows
+/// nothing can decode. Recording the current column list as both the pre-stamp
+/// layout and epoch 1 is exactly right: nothing has changed the shape, so the
+/// layout the old rows were written under is the layout the table declares.
+///
+/// Re-running it changes nothing, because a row that already carries an epoch
+/// is left alone.
+fn fill_table_schema_epoch(row: &mut Vec<u8>) -> std::result::Result<(), String> {
+    let mut entry = crate::schema::TableEntry::from_bytes(row)
+        .map_err(|e| format!("a table row did not decode, {e}"))?;
+    if entry.schema_epoch != 0 || !entry.schema_epochs.is_empty() {
+        return Ok(());
+    }
+    let layout = entry.current_physical_columns();
+    entry.pre_stamp_columns = layout.clone();
+    entry.schema_epoch = 1;
+    entry.schema_epochs = vec![crate::schema::EpochColumns {
+        epoch: 1,
+        columns: layout,
+    }];
+    *row = entry.to_bytes();
+    Ok(())
+}
+
+/// Marks an index row complete.
+///
+/// Every index that reached this binary finished being built, because there
+/// was no way to record an unfinished one. Ready is what that says.
+fn fill_index_state(row: &mut Vec<u8>) -> std::result::Result<(), String> {
+    let mut entry = crate::schema::IndexEntry::from_bytes(row)
+        .map_err(|e| format!("an index row did not decode, {e}"))?;
+    entry.state = crate::schema::IndexState::Ready;
+    *row = entry.to_bytes();
+    Ok(())
+}
+
+inventory::submit! {
+    CatalogSchemaEvolution {
+        catalog_table: TABLES[TABLES_INDEX].name,
+        from_version: CATALOG_SCHEMA_VERSION,
+        to_version: TABLE_SCHEMA_VERSION,
+        migration_function_ref: "zyron_catalog::catalog_schema::fill_table_schema_epoch",
+        // The layout a table's unstamped rows read through cannot be
+        // reconstructed once the table's columns move on, so there is no way
+        // back
+        reversible: false,
+        introduced_in_binary_version: EPOCH_GATE,
+        forward: fill_table_schema_epoch,
+        backward: None,
+        description: "records the column layout every tuple stamped 0 decodes through, and \
+                      makes it epoch 1",
+    }
+}
+
+inventory::submit! {
+    CatalogSchemaEvolution {
+        catalog_table: TABLES[INDEXES_INDEX].name,
+        from_version: CATALOG_SCHEMA_VERSION,
+        to_version: INDEX_SCHEMA_VERSION,
+        migration_function_ref: "zyron_catalog::catalog_schema::fill_index_state",
+        reversible: false,
+        introduced_in_binary_version: EPOCH_GATE,
+        forward: fill_index_state,
+        backward: None,
+        description: "marks every index that predates online builds complete",
+    }
 }
 
 #[cfg(test)]
@@ -272,18 +391,94 @@ mod tests {
     #[test]
     fn test_the_registry_loads_with_every_table() {
         let registry = zyron_common::format::CatalogSchemaRegistry::load().expect("loads");
-        for name in table_names() {
+        for (index, name) in table_names().into_iter().enumerate() {
             let table = registry
                 .table(name)
                 .unwrap_or_else(|| panic!("`{name}` is in the registry"));
-            assert_eq!(
-                table.registration.current_schema_version,
-                CATALOG_SCHEMA_VERSION
-            );
-            assert!(
-                table.steps.is_empty(),
-                "`{name}` is at its first version, so it has no steps yet"
-            );
+            assert_eq!(table.registration.current_schema_version, version_of(index));
+            if index == TABLES_INDEX || index == INDEXES_INDEX {
+                assert_eq!(
+                    table.steps.len(),
+                    1,
+                    "`{name}` moved past the shared version and needs its step"
+                );
+            } else {
+                assert!(
+                    table.steps.is_empty(),
+                    "`{name}` is at its first version, so it has no steps yet"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn test_the_versioned_tables_sit_where_their_indices_say() {
+        assert_eq!(TABLES[TABLES_INDEX].name, "zyron_sys.core.tables");
+        assert_eq!(TABLES[INDEXES_INDEX].name, "zyron_sys.storage.indexes");
+    }
+
+    /// A table row that reached this binary without an epoch is unreadable,
+    /// so the step has to produce one, and running it twice has to leave the
+    /// first answer alone
+    #[test]
+    fn test_the_table_step_records_a_layout_and_is_idempotent() {
+        use crate::ids::{ColumnId, SchemaId, TableId};
+        use crate::schema::{ColumnEntry, TableEntry};
+
+        let mut entry = TableEntry {
+            id: TableId(7),
+            schema_id: SchemaId(1),
+            name: "t".to_string(),
+            heap_file_id: 10,
+            fsm_file_id: 11,
+            columns: vec![ColumnEntry {
+                id: ColumnId(0),
+                table_id: TableId(7),
+                name: "a".to_string(),
+                type_id: zyron_common::TypeId::Int32,
+                ordinal: 0,
+                nullable: true,
+                default_expr: None,
+                max_length: None,
+                fractional_digits: None,
+                tz_offset_secs: None,
+                element_type: None,
+                attrs: Default::default(),
+                absent_value: None,
+                dropped: false,
+            }],
+            constraints: Vec::new(),
+            created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+        };
+        entry.schema_epoch = 0;
+        let mut row = entry.to_bytes();
+
+        fill_table_schema_epoch(&mut row).expect("first run");
+        let after = TableEntry::from_bytes(&row).expect("decodes");
+        assert_eq!(after.schema_epoch, 1);
+        assert_eq!(after.schema_epochs.len(), 1);
+        assert_eq!(after.pre_stamp_columns.len(), 1);
+        assert_eq!(after.pre_stamp_columns[0].column_id, ColumnId(0));
+
+        let before_second = row.clone();
+        fill_table_schema_epoch(&mut row).expect("second run");
+        assert_eq!(row, before_second, "the step is not idempotent");
     }
 }

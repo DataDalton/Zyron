@@ -83,6 +83,67 @@ impl RowLocator {
         buf.extend_from_slice(&b.to_be_bytes());
     }
 
+    /// Reads back the locator an index key's trailing suffix encodes.
+    ///
+    /// Exact inverse of [`RowLocator::append_key_suffix`], so a key carrying a
+    /// suffix names its own row and nothing has to store the address a second
+    /// time beside it. A heap row comes back with file_id 0, the same as
+    /// [`RowLocator::read_payload`], because the suffix does not carry one and
+    /// the caller stamps it from the index it read the key out of.
+    ///
+    /// Returns None when the key is shorter than a suffix or ends in a tag no
+    /// suffix is ever written with, which is a caller that built a key without
+    /// one rather than a locator worth guessing at.
+    #[inline]
+    pub fn from_key(key: &[u8]) -> Option<RowLocator> {
+        if key.len() < Self::KEY_SUFFIX_LEN {
+            return None;
+        }
+        let suffix = &key[key.len() - Self::KEY_SUFFIX_LEN..];
+        let a = u64::from_be_bytes(suffix[1..9].try_into().ok()?);
+        let b = u64::from_be_bytes(suffix[9..17].try_into().ok()?);
+        match suffix[0] {
+            Self::TAG_HEAP => Some(RowLocator::Heap {
+                page: PageId::new(0, a),
+                slot: b as u16,
+            }),
+            Self::TAG_COLUMNAR => Some(RowLocator::Columnar {
+                file_id: a,
+                sys_rowid: b,
+            }),
+            Self::TAG_LAKE => Some(RowLocator::Lake {
+                file_id: a,
+                ordinal: b,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The tag and two words the key suffix encodes, big-endian on the wire.
+    ///
+    /// Exposed so a caller writing the suffix straight into a buffer does not
+    /// have to build a Vec to get at it.
+    #[inline]
+    pub fn key_suffix_words(&self) -> (u8, u64, u64) {
+        self.codec_words()
+    }
+
+    /// Whether `key` ends in the suffix this locator writes.
+    ///
+    /// The index stores the address once, in the key, so an entry whose key
+    /// disagrees with the locator handed in beside it would be stored under
+    /// one address and read back under another. Checking is what turns that
+    /// into a refused insert rather than a row the index points away from.
+    #[inline]
+    pub fn key_suffix_matches(&self, key: &[u8]) -> bool {
+        if key.len() < Self::KEY_SUFFIX_LEN {
+            return false;
+        }
+        let (tag, a, b) = self.codec_words();
+        let suffix = &key[key.len() - Self::KEY_SUFFIX_LEN..];
+        suffix[0] == tag && suffix[1..9] == a.to_be_bytes() && suffix[9..17] == b.to_be_bytes()
+    }
+
     /// Bytes `write_payload` will produce for this locator.
     #[inline]
     pub fn payload_len(&self) -> usize {

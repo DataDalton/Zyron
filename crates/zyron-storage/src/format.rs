@@ -14,9 +14,11 @@
 
 use zyron_common::format::FormatKind;
 use zyron_common::format::registry::{DeprecationStatus, FormatRegistration, MigrationPolicy};
+use zyron_common::format::scan_migration::{CatalogScanMigration, FormatDocumentation};
 use zyron_common::format::version::{FormatVersion, VersionWindow};
 use zyron_common::page::{
     BTREE_PAGE_FORMAT_VERSION, FSM_PAGE_FORMAT_VERSION, HEAP_PAGE_FORMAT_VERSION,
+    HEAP_PAGE_OLDEST_READABLE,
 };
 
 use crate::columnar::constants::{ZYR_FORMAT_VERSION, ZYR_READER_WINDOW};
@@ -33,7 +35,18 @@ const ZYR_GATE: &str = "0.12.0";
 const ZYR_1_0_RETIREMENT: &str = "2027-03-01";
 
 /// Version the B+tree index checkpoint is written at
-pub const CHECKPOINT_FORMAT_VERSION: FormatVersion = FormatVersion::new(11, 0);
+pub const CHECKPOINT_FORMAT_VERSION: FormatVersion = FormatVersion::new(11, 1);
+
+/// The oldest checkpoint this binary reads. 11.0 stored a column of locator
+/// payloads beside the keys, which 11.1 leaves out because each key already
+/// ends in the suffix naming its row.
+pub const CHECKPOINT_OLDEST_READABLE: FormatVersion = FormatVersion::new(11, 0);
+
+/// The day the 11.0 checkpoint reader and its migration leave the tree.
+///
+/// A checkpoint is derived from the tree it describes, so an 11.0 file is
+/// replaced the first time its index checkpoints again.
+const CHECKPOINT_11_0_RETIREMENT: &str = "2027-03-01";
 
 /// Version a serialized bloom filter is written at
 pub const BLOOM_FILTER_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
@@ -41,18 +54,63 @@ pub const BLOOM_FILTER_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
 /// Version the MVCC commit log file is written at
 pub const MVCC_CLOG_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
 
+/// The Zyron version the heap page moved to 1.1 in, when the slot's spare
+/// two bytes became the schema epoch
+const HEAP_EPOCH_GATE: &str = "0.15.0";
+
+/// The day the 1.0 heap page reader and its migration leave the tree.
+///
+/// A 1.0 page moves to 1.1 the next time it is written, and a page nothing
+/// ever writes again keeps reading through the layout recorded at upgrade, so
+/// the reader stays until every directory has been through a full write cycle.
+/// This is the date the release check holds the code to
+const HEAP_1_0_RETIREMENT: &str = "2027-03-01";
+
 inventory::submit! {
     FormatRegistration {
         kind: FormatKind::HeapPage,
         writer_current_version: HEAP_PAGE_FORMAT_VERSION,
-        reader_supported_versions: VersionWindow::single(HEAP_PAGE_FORMAT_VERSION),
+        reader_supported_versions: VersionWindow::new(HEAP_PAGE_OLDEST_READABLE, HEAP_PAGE_FORMAT_VERSION),
         migration_policy: MigrationPolicy::Lazy,
-        migration_reversible: true,
-        binary_version_gate: GATE,
+        migration_reversible: false,
+        binary_version_gate: HEAP_EPOCH_GATE,
         deprecation_status: DeprecationStatus::Active,
-        retirement_date: None,
+        retirement_date: Some(HEAP_1_0_RETIREMENT),
         downgrade_write_supported: false,
         notes: "slotted heap page, stamp in the page header, lazy on next page write",
+    }
+}
+
+inventory::submit! {
+    CatalogScanMigration {
+        kind: FormatKind::HeapPage,
+        from: HEAP_PAGE_OLDEST_READABLE,
+        to: HEAP_PAGE_FORMAT_VERSION,
+        introduced_in_binary_version: HEAP_EPOCH_GATE,
+        one_way: true,
+        scan_name: "heap_pre_stamp_columns",
+        description: "records each heap table's column layout as the one every tuple stamped 0 decodes through",
+    }
+}
+
+inventory::submit! {
+    FormatDocumentation {
+        kind: FormatKind::HeapPage,
+        version: HEAP_PAGE_FORMAT_VERSION,
+        text: "Heap tuple slots now record the schema epoch a row was written under. \
+               Existing rows carry epoch 0 and read through the column layout recorded at upgrade. \
+               ADD COLUMN, DROP COLUMN and compatible type changes complete without rewriting rows",
+    }
+}
+
+inventory::submit! {
+    FormatDocumentation {
+        kind: FormatKind::Checkpoint,
+        version: CHECKPOINT_FORMAT_VERSION,
+        text: "An index checkpoint stores each key's value and the row it points at once rather \
+               than twice. The seventeen byte suffix naming the row is rebuilt when the file \
+               loads, from the seven byte locator kept behind each value. Existing checkpoints \
+               are moved forward the first time their index checkpoints again",
     }
 }
 
@@ -120,16 +178,24 @@ inventory::submit! {
     FormatRegistration {
         kind: FormatKind::Checkpoint,
         writer_current_version: CHECKPOINT_FORMAT_VERSION,
-        reader_supported_versions: VersionWindow::single(CHECKPOINT_FORMAT_VERSION),
+        reader_supported_versions: VersionWindow::new(
+            CHECKPOINT_OLDEST_READABLE,
+            CHECKPOINT_FORMAT_VERSION,
+        ),
         migration_policy: MigrationPolicy::Eager,
+        // The locator column 11.0 carried is derivable from the keys beside
+        // it, so the step back down can rebuild it exactly
         migration_reversible: true,
-        binary_version_gate: GATE,
+        binary_version_gate: CHECKPOINT_KEY_NAMES_ROW_GATE,
         deprecation_status: DeprecationStatus::Active,
-        retirement_date: None,
+        retirement_date: Some(CHECKPOINT_11_0_RETIREMENT),
         downgrade_write_supported: false,
-        notes: "prefix-compressed keys and a locator column, eager on the next checkpoint",
+        notes: "prefix-compressed keys, each ending in the suffix naming its row, eager on the next checkpoint",
     }
 }
+
+/// The Zyron version the checkpoint dropped its locator column in.
+const CHECKPOINT_KEY_NAMES_ROW_GATE: &str = "0.15.0";
 
 inventory::submit! {
     FormatRegistration {

@@ -84,6 +84,11 @@ pub enum PhysicalPlan {
         cost: PlanCost,
         /// Time travel target for versioned table scans.
         as_of: Option<super::logical::AsOfTarget>,
+        /// An index whose shape fits this scan but whose build has not
+        /// finished. The scan runs as if the index did not exist, and the
+        /// name is carried so a plan says why the index it names went unused
+        /// rather than leaving the reader to guess.
+        deferred_index: Option<String>,
     },
 
     /// Hybrid scan: the union of the table's registered .zyr columnar

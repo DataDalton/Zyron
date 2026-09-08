@@ -16,8 +16,28 @@ use zyron_common::format::registry::is_iso_date;
 use zyron_common::format::scheme::SchemeStatus;
 use zyron_common::format::wire_version::{WireProtocol, WireVersionRegistry, WireVersionStatus};
 use zyron_common::format::{
-    ALL_FORMAT_KINDS, BinaryVersion, FormatKind, FormatSubstrate, MAGIC_ALLOCATIONS,
+    ALL_FORMAT_KINDS, BinaryVersion, FormatKind, FormatSubstrate, FormatVersion, MAGIC_ALLOCATIONS,
 };
+
+/// What a fixture says it is, however its framing carries that.
+struct FixtureIdentity {
+    kind: FormatKind,
+    version: FormatVersion,
+}
+
+/// Reads the format stamp out of a page-resident fixture.
+///
+/// A page carries its identity in the page header the container checksums
+/// rather than in a header of its own, so the fixture is a page image and the
+/// stamp is read from where a page keeps it.
+fn fixture_stamp(bytes: &[u8]) -> Option<(FormatKind, FormatVersion)> {
+    use zyron_common::page::PageHeader;
+    if bytes.len() < PageHeader::SIZE {
+        return None;
+    }
+    let header = PageHeader::from_bytes(&bytes[..PageHeader::SIZE]);
+    header.stamp().map(|stamp| (stamp.kind, stamp.version))
+}
 
 /// One thing the check found wrong
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,13 +245,24 @@ fn check_migrators_and_fixtures(substrate: &FormatSubstrate, report: &mut Releas
             if fixture.bytes.is_empty() {
                 continue;
             }
-            // A format that owns its trailer is verified by its own reader,
-            // so only the header is asked for its kind and version here
-            let header = if registration.kind.framing().migrates_whole_file() {
-                zyron_common::format::envelope::decode_header(fixture.bytes).map(|(h, _)| h)
-            } else {
-                zyron_common::format::envelope::decode(fixture.bytes).map(|parsed| parsed.header)
-            };
+            // Each framing carries its identity somewhere different. A file
+            // of its own opens with the envelope, a file that owns its
+            // trailer opens with the envelope header, and a page carries a
+            // stamp inside the page header the container checksums
+            let identity: Result<(zyron_common::format::FormatKind, FormatVersion), String> =
+                match registration.kind.framing() {
+                    zyron_common::format::Framing::Stamp => fixture_stamp(fixture.bytes)
+                        .ok_or_else(|| "the page header carries no format stamp".to_string()),
+                    zyron_common::format::Framing::OwnTrailer => {
+                        zyron_common::format::envelope::decode_header(fixture.bytes)
+                            .map(|(h, _)| (h.kind, h.version))
+                            .map_err(|e| e.to_string())
+                    }
+                    _ => zyron_common::format::envelope::decode(fixture.bytes)
+                        .map(|parsed| (parsed.header.kind, parsed.header.version))
+                        .map_err(|e| e.to_string()),
+                };
+            let header = identity.map(|(kind, version)| FixtureIdentity { kind, version });
             match header {
                 Ok(header) => {
                     if header.kind != registration.kind {

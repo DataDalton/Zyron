@@ -19,11 +19,15 @@ async fn profile_checkpoint_stages() {
     let mut btree = BTreeIndex::create(0, checkpoint_dir.clone()).await.unwrap();
 
     for i in 0..KEY_COUNT as u64 {
-        let key = i.to_be_bytes();
         let tid = RowLocator::Heap {
             page: PageId::new(0, i % 1000),
             slot: (i % 100) as u16,
         };
+        // The key an index writes, the value big-endian so the byte order the
+        // tree compares on is the numeric order, followed by the suffix naming
+        // the row it points at
+        let mut key = i.to_be_bytes().to_vec();
+        tid.append_key_suffix(&mut key);
         btree.insert_exclusive(&key, tid).unwrap();
     }
 

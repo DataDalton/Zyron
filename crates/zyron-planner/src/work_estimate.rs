@@ -230,6 +230,7 @@ mod tests {
             predicate: None,
             cost: cost(rows),
             as_of: None,
+            deferred_index: None,
         }
     }
 

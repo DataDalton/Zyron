@@ -20,12 +20,11 @@ use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::{BTreeIndex, DiskManager, HeapPage, TupleId};
 
-use crate::batch::{
-    DataBatch, build_column_to_builder_map, decode_tuple_into_builders, finalize_builders,
-};
+use crate::batch::{DataBatch, decode_tuple_into_builders, finalize_builders};
 use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
 use crate::context::ExecutionContext;
+use crate::epoch_decode::EpochDecoder;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -136,7 +135,7 @@ pub struct SeqScanOperator {
     /// Per-table-column index into `output_columns`. Built once at
     /// construction so the per-row decoder does an O(1) lookup instead of
     /// scanning the projection list.
-    column_to_builder: Vec<Option<u16>>,
+    decoder: EpochDecoder,
     predicate: Option<BoundExpr>,
     page_cursor: u64,
     /// Resume position within the current page when a previous next() call
@@ -186,7 +185,7 @@ impl SeqScanOperator {
         let num_pages = hf.num_pages_cached() as u64;
         let output_ids: Vec<zyron_catalog::ColumnId> =
             columns.iter().map(|c| c.column_id).collect();
-        let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let decoder = EpochDecoder::new(&table_entry, &output_ids);
         let (branch_append_file_id, num_append_pages) =
             branch_append_range(&ctx, branch_id, table_entry.heap_file_id);
         let io_stats = ctx.table_io_stats_for(table_id.0);
@@ -198,7 +197,7 @@ impl SeqScanOperator {
             ctx,
             table_entry,
             output_columns: columns,
-            column_to_builder,
+            decoder,
             predicate,
             page_cursor: 0,
             slot_cursor: 0,
@@ -276,6 +275,9 @@ impl Operator for SeqScanOperator {
                 self.output_columns.is_empty() && self.predicate.is_none() && !self.track_tuple_ids;
             let mut builders =
                 scan_builders(&self.output_columns, &self.table_entry.columns, batch_size);
+            // Held across the batch, so the rows that share the table's current
+            // epoch resolve their layout once rather than once each
+            let mut cursor = self.decoder.cursor();
             let mut tuple_ids: Vec<TupleId> = if self.track_tuple_ids {
                 Vec::with_capacity(batch_size)
             } else {
@@ -363,12 +365,15 @@ impl Operator for SeqScanOperator {
                     }
 
                     if !count_only {
-                        decode_tuple_into_builders(
+                        cursor.decode(
+                            hdr.schema_epoch,
                             tuple.data,
-                            &self.table_entry.columns,
-                            &self.column_to_builder,
+                            Some(zyron_common::RowLocator::Heap {
+                                page: page_id,
+                                slot: slot_id.0,
+                            }),
                             &mut builders,
-                        );
+                        )?;
 
                         if self.track_tuple_ids {
                             tuple_ids.push(TupleId::new(page_id, slot_id.0));
@@ -817,7 +822,9 @@ pub(crate) struct PageRangeScanner<'a> {
     table_entry: &'a TableEntry,
     output_columns: &'a [LogicalColumn],
     predicate: Option<&'a BoundExpr>,
-    column_to_builder: Vec<Option<u16>>,
+    /// Shared so a batch can hold a cursor into it while the scan advances
+    /// its own page state
+    decoder: Arc<EpochDecoder>,
     count_only: bool,
     page_cursor: u64,
     end_page: u64,
@@ -846,7 +853,7 @@ impl<'a> PageRangeScanner<'a> {
     ) -> Self {
         let output_ids: Vec<zyron_catalog::ColumnId> =
             output_columns.iter().map(|c| c.column_id).collect();
-        let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let decoder = Arc::new(EpochDecoder::new(&table_entry, &output_ids));
         let count_only = output_columns.is_empty() && predicate.is_none();
         let io_stats = ctx.table_io_stats_for(table_entry.id.0);
         Self {
@@ -854,7 +861,7 @@ impl<'a> PageRangeScanner<'a> {
             table_entry,
             output_columns,
             predicate,
-            column_to_builder,
+            decoder,
             count_only,
             page_cursor: start_page,
             end_page,
@@ -907,6 +914,10 @@ impl<'a> PageRangeScanner<'a> {
 
             let mut builders =
                 scan_builders(self.output_columns, &self.table_entry.columns, batch_size);
+            // Held across the batch, so the rows that share the table's current
+            // epoch resolve their layout once rather than once each
+            let decoder = Arc::clone(&self.decoder);
+            let mut cursor = decoder.cursor();
             let mut row_count = 0usize;
             // Pages fetched for this batch, folded into the table counters once
             // when the batch is done rather than once per page.
@@ -952,12 +963,15 @@ impl<'a> PageRangeScanner<'a> {
                     }
 
                     if !self.count_only {
-                        decode_tuple_into_builders(
+                        cursor.decode(
+                            hdr.schema_epoch,
                             tuple.data,
-                            &self.table_entry.columns,
-                            &self.column_to_builder,
+                            Some(zyron_common::RowLocator::Heap {
+                                page: page_id,
+                                slot: slot_id.0,
+                            }),
                             &mut builders,
-                        );
+                        )?;
                     }
 
                     row_count += 1;
@@ -1479,7 +1493,7 @@ struct IndexScanState {
     table_entry: Arc<TableEntry>,
     output_columns: Vec<LogicalColumn>,
     /// Per-table-column index into `output_columns`, precomputed once.
-    column_to_builder: Vec<Option<u16>>,
+    decoder: EpochDecoder,
     remaining_predicate: Option<BoundExpr>,
     track_tuple_ids: bool,
     /// Pre-collected row locators from the B+ tree range scan, heap entries
@@ -1534,7 +1548,7 @@ impl IndexScanOperator {
         };
         let output_ids: Vec<zyron_catalog::ColumnId> =
             columns.iter().map(|c| c.column_id).collect();
-        let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let decoder = EpochDecoder::new(&table_entry, &output_ids);
         let io_stats =
             crate::operator::IndexScanStats::open(&ctx, table_id.0, u32::MAX, locators.len());
         let branch_id = ctx.active_branch_id;
@@ -1543,7 +1557,7 @@ impl IndexScanOperator {
                 ctx,
                 table_entry,
                 output_columns: columns,
-                column_to_builder,
+                decoder,
                 // The caller already decided which rows these are, and a
                 // predicate here would be re-deciding it
                 remaining_predicate: None,
@@ -1650,7 +1664,7 @@ impl IndexScanOperator {
 
             let output_ids: Vec<zyron_catalog::ColumnId> =
                 columns.iter().map(|c| c.column_id).collect();
-            let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+            let decoder = EpochDecoder::new(&table_entry, &output_ids);
 
             // With a branch active, the main index does not cover rows the
             // branch inserted, so scan the append delta with the full predicate
@@ -1705,7 +1719,7 @@ impl IndexScanOperator {
                     ctx,
                     table_entry,
                     output_columns: columns,
-                    column_to_builder,
+                    decoder,
                     remaining_predicate: effective_remaining,
                     track_tuple_ids,
                     locators,
@@ -1847,30 +1861,34 @@ impl IndexScanState {
                         .expect("just pinned this page");
                     self.ctx.buffer_pool.unpin_page(phys_page, false);
 
-                    let visible = {
+                    let decoded: Result<bool> = {
                         let guard = frame.read_data();
                         let slot_id = zyron_storage::SlotId(slot);
                         match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
-                            None => false,
+                            None => Ok(false),
                             Some(view) => {
                                 if view.is_deleted()
                                     || !view.header.is_visible_to(&self.ctx.snapshot)
                                 {
-                                    false
+                                    Ok(false)
                                 } else {
                                     decode_tuple_into_builders(
                                         view.data,
-                                        &self.table_entry.columns,
-                                        &self.column_to_builder,
+                                        &self.decoder,
+                                        view.header.schema_epoch,
+                                        Some(loc),
                                         &mut builders,
-                                    );
-                                    true
+                                    )
+                                    .map(|()| true)
                                 }
                             }
                         }
                     };
+                    // Unpinned before the decode result is unwrapped, so a
+                    // row this operator refuses to read does not leave the
+                    // page pinned for the life of the process
                     self.ctx.buffer_pool.unpin_page(phys_page, false);
-                    visible
+                    decoded?
                 }
                 zyron_common::RowLocator::Columnar { file_id, sys_rowid } => {
                     match self

@@ -53,6 +53,8 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         replication: None,
         node_capabilities: None,
         catalog,
+        ddl_progress: std::sync::Arc::new(zyron_wire::ddl_progress::DdlProgressRegistry::new()),
+        shadow_targets: std::sync::Arc::new(scc::HashMap::new()),
         wal,
         buffer_pool: pool,
         disk_manager: disk,
@@ -335,7 +337,7 @@ async fn run_vacuum_with_floor(
         let Some(frame) = server.buffer_pool.fetch_page(page_id) else {
             continue;
         };
-        let mut dead: Vec<(u16, Vec<u8>)> = Vec::new();
+        let mut dead: Vec<(u16, u16, Vec<u8>)> = Vec::new();
         let modified = {
             let mut guard = frame.write_data();
             let data: &mut [u8] = &mut guard[..];
@@ -347,10 +349,20 @@ async fn run_vacuum_with_floor(
         };
         server.buffer_pool.unpin_page(page_id, modified);
         if !dead.is_empty() {
+            let captured: Vec<zyron_executor::operator::modify::CapturedRow> = dead
+                .iter()
+                .map(
+                    |(slot, epoch, data)| zyron_executor::operator::modify::CapturedRow {
+                        slot: *slot,
+                        schema_epoch: *epoch,
+                        data: data.clone(),
+                    },
+                )
+                .collect();
             zyron_executor::operator::modify::vacuum_index_cleanup(
                 table.as_ref(),
                 page_id,
-                &dead,
+                &captured,
                 btree,
                 &server.btree_indexes,
             );

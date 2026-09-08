@@ -826,7 +826,8 @@ impl<'a> PhysicalPlanner<'a> {
         }
 
         for index in self.catalog.get_indexes_for_table(*table_id) {
-            if index.index_type != zyron_catalog::IndexType::BTree
+            if index.state != zyron_catalog::IndexState::Ready
+                || index.index_type != zyron_catalog::IndexType::BTree
                 || index.columns.len() < wanted.len()
             {
                 continue;
@@ -1337,7 +1338,14 @@ impl<'a> PhysicalPlanner<'a> {
         // version and the answer is exact. On the heap and columnar stores a
         // delete retires the document, so rows live at a past version are no
         // longer in the index and the storage scan is what can answer
-        let indexes = self.catalog.get_indexes_for_table(table_id);
+        // A build that has not flipped to Ready covers only the rows written
+        // since it published, so choosing it would answer with fewer rows
+        // than the table holds. It is held out of every selection path here
+        // and named on the scan that runs instead
+        let all_indexes = self.catalog.get_indexes_for_table(table_id);
+        let (indexes, building): (Vec<_>, Vec<_>) = all_indexes
+            .into_iter()
+            .partition(|i| i.state == zyron_catalog::IndexState::Ready);
         let search_routable = as_of.is_none() || is_lake;
 
         // Check for full-text search predicates (MATCH AGAINST -> match_against function)
@@ -1719,6 +1727,7 @@ impl<'a> PhysicalPlanner<'a> {
                         return Ok(PhysicalPlan::SeqScan {
                             table_id,
                             columns,
+                            deferred_index: deferred_building_index(&building, &predicate),
                             predicate,
                             cost: encoded_cost,
                             as_of: as_of.clone(),
@@ -1731,6 +1740,7 @@ impl<'a> PhysicalPlanner<'a> {
         Ok(PhysicalPlan::SeqScan {
             table_id,
             columns,
+            deferred_index: deferred_building_index(&building, &predicate),
             predicate,
             cost: seq_cost,
             as_of,
@@ -2160,6 +2170,26 @@ fn gapfill_width(e: &BoundExpr) -> Option<i128> {
 // ---------------------------------------------------------------------------
 // Index matching
 // ---------------------------------------------------------------------------
+
+/// The unfinished index a scan would have used, by name.
+///
+/// Only a build whose key the predicate actually reaches is named. Naming
+/// every build on the table would put a line on plans the index was never a
+/// candidate for, which reads as a warning where there is nothing to warn
+/// about.
+fn deferred_building_index(
+    building: &[std::sync::Arc<IndexEntry>],
+    predicate: &Option<BoundExpr>,
+) -> Option<String> {
+    let pred = predicate.as_ref()?;
+    building
+        .iter()
+        .find(|index| {
+            index.index_type == zyron_catalog::IndexType::BTree
+                && match_index(pred, index).is_some()
+        })
+        .map(|index| index.name.clone())
+}
 
 /// Checks if a predicate matches an index's leading column(s).
 /// Returns (index_predicate, remaining_predicate) if a match is found.

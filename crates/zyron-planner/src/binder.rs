@@ -2385,7 +2385,7 @@ fn compute_publication_fingerprint(
             Err(_) => continue,
         };
         if t.columns.is_empty() {
-            for c in &entry.columns {
+            for c in entry.live_columns() {
                 triples.push((
                     t.table_id.0,
                     c.id.0,
@@ -2554,8 +2554,7 @@ impl<'a> Binder<'a> {
             table_id: Some(table.id),
             alias: table.name.clone(),
             columns: table
-                .columns
-                .iter()
+                .live_columns()
                 .map(|c| BoundColumnDef {
                     column_id: c.id,
                     name: c.name.clone(),
@@ -3187,8 +3186,7 @@ impl<'a> Binder<'a> {
                     let idx = self.alloc_table_idx();
 
                     let columns: Vec<BoundColumnDef> = entry
-                        .columns
-                        .iter()
+                        .live_columns()
                         .map(|c| BoundColumnDef {
                             column_id: c.id,
                             name: c.name.clone(),
@@ -5572,8 +5570,7 @@ impl<'a> Binder<'a> {
         }
 
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -5621,8 +5618,7 @@ impl<'a> Binder<'a> {
         expr: &zyron_parser::ast::Expr,
     ) -> Result<BoundExpr> {
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -5658,8 +5654,7 @@ impl<'a> Binder<'a> {
             return Ok(Vec::new());
         }
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -5715,8 +5710,7 @@ impl<'a> Binder<'a> {
             return Ok((Vec::new(), Vec::new()));
         }
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -5783,8 +5777,7 @@ impl<'a> Binder<'a> {
         }
 
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -5991,8 +5984,7 @@ impl<'a> Binder<'a> {
         // is refused
         let target_columns = if stmt.columns.is_empty() {
             entry
-                .columns
-                .iter()
+                .live_columns()
                 .filter(|c| !c.is_generated())
                 .map(|c| c.id)
                 .collect()
@@ -6015,8 +6007,7 @@ impl<'a> Binder<'a> {
         let mut ctx = BindContext::new();
         let idx = self.alloc_table_idx();
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -6127,8 +6118,7 @@ impl<'a> Binder<'a> {
         let mut ctx = BindContext::new();
         let idx = self.alloc_table_idx();
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -6273,8 +6263,7 @@ impl<'a> Binder<'a> {
         let mut ctx = BindContext::new();
         let idx = self.alloc_table_idx();
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -7044,6 +7033,8 @@ impl<'a> Binder<'a> {
                     tz_offset_secs: None,
                     element_type: None,
                     attrs: Default::default(),
+                    absent_value: None,
+                    dropped: false,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -7229,8 +7220,7 @@ impl<'a> Binder<'a> {
     fn push_single_table_scope(&mut self, ctx: &mut BindContext, entry: &Arc<TableEntry>) {
         let idx = self.alloc_table_idx();
         let columns: Vec<BoundColumnDef> = entry
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| BoundColumnDef {
                 column_id: c.id,
                 name: c.name.clone(),
@@ -7644,6 +7634,8 @@ impl<'a> Binder<'a> {
                         tz_offset_secs: None,
                         element_type: dt.declared_element_type(),
                         attrs: Default::default(),
+                        absent_value: None,
+                        dropped: false,
                     })
                     .collect();
                 let cols = if !declared.is_empty() {
@@ -7705,6 +7697,8 @@ impl<'a> Binder<'a> {
                         tz_offset_secs: None,
                         element_type: None,
                         attrs: Default::default(),
+                        absent_value: None,
+                        dropped: false,
                     })
                     .collect();
                 if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
@@ -7792,8 +7786,7 @@ impl<'a> Binder<'a> {
                     ))
                 })?;
             let right_cols: Vec<BoundColumnDef> = right_entry
-                .columns
-                .iter()
+                .live_columns()
                 .map(|c| BoundColumnDef {
                     column_id: c.id,
                     name: c.name.clone(),

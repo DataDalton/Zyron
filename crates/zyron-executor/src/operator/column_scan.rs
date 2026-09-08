@@ -43,6 +43,11 @@ struct ColPlan {
     type_id: zyron_common::types::TypeId,
     /// Fixed byte width, or 0 for the variable-length canonical layout.
     value_size: usize,
+    /// What a segment written before this column existed reads as. A segment
+    /// holds one stored column per column the table had when it was folded,
+    /// so a column added afterwards has no segment in that file and its rows
+    /// take the value recorded when it was added
+    absent: ScalarValue,
 }
 
 /// One promoted variant path a segment stores as a column of its own, for a
@@ -177,6 +182,7 @@ impl ColumnScanOperator {
                 column_id: ce.id.0 as u32,
                 type_id: ce.type_id,
                 value_size: phys.fixed_size().unwrap_or(0),
+                absent: crate::epoch_decode::absent_value_of(ce),
             });
         }
 
@@ -582,6 +588,10 @@ impl ColumnScanOperator {
                 // hold is read out of the documents instead, the same as a
                 // segment written before the path was promoted
                 None if idx >= shred_base => return Ok(()),
+                // A projected column this file does not hold is a column
+                // added after the fold wrote it, so its rows read the value
+                // recorded when the column was added
+                None if idx >= 3 => return Ok(()),
                 None => {
                     return Err(zyron_common::ZyronError::ExecutionError(
                         "columnar scan: missing segment for column".into(),
@@ -610,15 +620,24 @@ impl ColumnScanOperator {
         let (xmin_bytes, _) = take(&mut decoded[1])?;
         let (supersede_bytes, _) = take(&mut decoded[2])?;
 
+        // Which projected columns this file predates. Their rows take the
+        // column's recorded absent value rather than bytes the file never
+        // wrote
+        let mut absent_cols: Vec<bool> = vec![false; self.col_plans.len()];
         let mut decoded_cols: Vec<(Vec<u8>, Vec<u8>, bool)> =
             Vec::with_capacity(self.col_plans.len());
         for (k, p) in self.col_plans.iter().enumerate() {
-            let (bytes, nullbm) = take(&mut decoded[3 + k])?;
-            decoded_cols.push((bytes, nullbm, p.value_size == 0));
+            match decoded[3 + k].take() {
+                Some((bytes, nullbm)) => decoded_cols.push((bytes, nullbm, p.value_size == 0)),
+                None => {
+                    absent_cols[k] = true;
+                    decoded_cols.push((Vec::new(), Vec::new(), false));
+                }
+            }
         }
         let mut varlen_rows: Vec<Option<Vec<&[u8]>>> = Vec::with_capacity(decoded_cols.len());
-        for (bytes, _, is_varlen) in &decoded_cols {
-            if *is_varlen {
+        for (k, (bytes, _, is_varlen)) in decoded_cols.iter().enumerate() {
+            if *is_varlen && !absent_cols[k] {
                 varlen_rows.push(Some(varlen_slice_rows(bytes, row_count)?));
             } else {
                 varlen_rows.push(None);
@@ -663,6 +682,10 @@ impl ColumnScanOperator {
                 .iter()
                 .enumerate()
                 .filter_map(|(ci, p)| {
+                    // A column this file predates has no bytes to bound
+                    if absent_cols[ci] {
+                        return None;
+                    }
                     let signed = zyron_storage::columnar::stat_slot_is_signed(p.type_id);
                     let unsigned = matches!(
                         p.type_id,
@@ -766,6 +789,21 @@ impl ColumnScanOperator {
             }
 
             for (ci, p) in self.col_plans.iter().enumerate() {
+                if absent_cols[ci] {
+                    // A patch written after the fold still applies: the
+                    // column exists now, so an update to it lands in the
+                    // overlay even though the segment predates it
+                    let sv = self.resolve_value(
+                        overlay,
+                        p.column_id,
+                        p.type_id,
+                        p.value_size,
+                        true,
+                        None,
+                    );
+                    builders[ci].push_owned(if sv.is_null() { p.absent.clone() } else { sv });
+                    continue;
+                }
                 let (bytes, nullbm, is_varlen) = &decoded_cols[ci];
                 let is_null = !nullbm.is_empty() && (nullbm[r / 8] >> (r % 8)) & 1 == 1;
                 let base_bytes: Option<&[u8]> = if is_null {

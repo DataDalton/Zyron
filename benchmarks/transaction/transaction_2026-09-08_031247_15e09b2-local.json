@@ -1,0 +1,206 @@
+{
+  "id": "2026-09-08_031247_15e09b2-local",
+  "date": "2026-09-08 03:13:04Z",
+  "ts": 1788837184,
+  "commit": "15e09b2-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "B+Tree Split Under Concurrency": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 11.82 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 11.86 },
+      "Split insert throughput (ops/sec)": {
+        "average": 4764802.072386,
+        "runs": [5161606.68, 5141602.96, 4793145.80, 4697854.55, 4029800.37],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Concurrent B+Tree Insert": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 11.87 },
+      "util_after": { "cpu_pct": 8.0, "ram_used_gb": 11.87 },
+      "Insert throughput (ops/sec)": {
+        "average": 6451043.956242,
+        "runs": [6367424.26, 6474141.87, 6418305.01, 6575189.34, 6420159.30],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Concurrent Txns": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 11.87 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 12.00 },
+      "durable_commit_c1_txn_per_sec": {
+        "average": 9990.439150,
+        "runs": [9990.44],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "durable_commit_c16_txn_per_sec": {
+        "average": 110344.827586,
+        "runs": [110344.83],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "durable_commit_c64_txn_per_sec": {
+        "average": 394298.444493,
+        "runs": [394298.44],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "durable_commit_c256_txn_per_sec": {
+        "average": 738660.692748,
+        "runs": [738660.69],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "durable_commit_c512_txn_per_sec": {
+        "average": 776078.942993,
+        "runs": [776078.94],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "peak_durable_txn_per_sec": {
+        "average": 776078.942993,
+        "runs": [776078.94],
+        "target": 39961.756599,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "B+Tree Read Under Contention": {
+      "util_before": { "cpu_pct": 8.0, "ram_used_gb": 11.93 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 11.94 },
+      "Reader retry rate (%)": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Max read latency (us)": {
+        "average": 98.600000,
+        "runs": [98.60],
+        "target": 10.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Phase 1.5 Microbenchmarks": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 11.96 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 12.11 },
+      "durable begin()+commit() latency floor (ns/op)": {
+        "average": 81245.170000,
+        "runs": [91500.00, 83474.65, 75745.55, 73155.75, 82349.90],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "is_visible() latency (ns/op)": {
+        "average": 1.674040,
+        "runs": [1.65, 1.66, 1.73, 1.64, 1.69],
+        "target": 15.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "lock_row() latency (ns/op)": {
+        "average": 125.162000,
+        "runs": [142.31, 122.92, 119.95, 122.43, 118.21],
+        "target": 80.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Snapshot::new() latency (ns/op)": {
+        "average": 11.073400,
+        "runs": [11.00, 11.35, 11.04, 10.97, 11.01],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "snapshot capture, 1 live txn (ns/op)": {
+        "average": 28.088100,
+        "runs": [28.00, 28.07, 28.00, 28.25, 28.12],
+        "target": 250.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "snapshot capture, 64 live txns (ns/op)": {
+        "average": 77.546400,
+        "runs": [82.88, 76.27, 75.76, 76.38, 76.45],
+        "target": 400.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "snapshot capture, 1 live after 512-txn burst (ns/op)": {
+        "average": 160.407100,
+        "runs": [161.16, 159.63, 159.41, 160.46, 161.37],
+        "target": 600.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "begin()+abort() latency (ns/op)": {
+        "average": 179.550200,
+        "runs": [178.95, 178.61, 180.51, 178.85, 180.83],
+        "target": 700.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "GC sweep throughput (tuples/sec)": {
+        "average": 1795892440.335938,
+        "runs": [1800180018.00, 1778093883.36, 1800504141.16, 1800504141.16, 1800180018.00],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

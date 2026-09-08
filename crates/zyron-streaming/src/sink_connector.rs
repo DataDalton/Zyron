@@ -100,8 +100,9 @@ impl ZyronRowSink {
             }
         }
 
-        // Look up the target table to verify it still exists at insert time.
-        let _target = self
+        // Look up the target table to verify it still exists at insert time,
+        // and to read the layout its rows are stamped with.
+        let entry = self
             .catalog
             .get_table_by_id(zyron_catalog::TableId(self.target_table_id))?;
 
@@ -110,9 +111,14 @@ impl ZyronRowSink {
             .txn_manager
             .begin(zyron_storage::txn::IsolationLevel::SnapshotIsolation)?;
 
+        // Stamped with the layout the table declares. The row image was
+        // encoded against that layout upstream, and a row written without it
+        // is a row nothing can read back
         let tuples: Vec<zyron_storage::Tuple> = records
             .iter()
-            .map(|c| zyron_storage::Tuple::new(c.row_data.clone(), txn.txn_id))
+            .map(|c| {
+                zyron_storage::Tuple::with_epoch(c.row_data.clone(), txn.txn_id, entry.schema_epoch)
+            })
             .collect();
 
         // The heap insert is async. Block on a small local runtime since the

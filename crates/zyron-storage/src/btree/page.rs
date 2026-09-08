@@ -103,8 +103,11 @@ impl BTreeLeafPage {
             let slot_offset = Self::SLOT_ARRAY_START + slot_idx * Self::SLOT_SIZE;
             let entry_offset =
                 u16::from_le_bytes([self.data[slot_offset], self.data[slot_offset + 1]]) as usize;
+            let key_len =
+                u16::from_le_bytes([self.data[slot_offset + 2], self.data[slot_offset + 3]])
+                    as usize;
 
-            if let Some((entry, _)) = LeafEntry::from_bytes(&self.data[entry_offset..]) {
+            if let Some((entry, _)) = LeafEntry::from_bytes(&self.data[entry_offset..], key_len) {
                 entries.push(entry);
             }
         }
@@ -122,8 +125,12 @@ impl BTreeLeafPage {
             let slot_offset = Self::SLOT_ARRAY_START + slot_idx * Self::SLOT_SIZE;
             let entry_offset =
                 u16::from_le_bytes([self.data[slot_offset], self.data[slot_offset + 1]]) as usize;
+            let key_len =
+                u16::from_le_bytes([self.data[slot_offset + 2], self.data[slot_offset + 3]])
+                    as usize;
 
-            if let Some((view, _)) = LeafEntryView::from_bytes(&self.data[entry_offset..]) {
+            if let Some((view, _)) = LeafEntryView::from_bytes(&self.data[entry_offset..], key_len)
+            {
                 views.push(view);
             }
         }
@@ -144,8 +151,8 @@ impl BTreeLeafPage {
             let mid = low + (high - low) / 2;
             let slot_off = Self::SLOT_ARRAY_START + mid * Self::SLOT_SIZE;
             let entry_off = u16::from_le_bytes([data[slot_off], data[slot_off + 1]]) as usize;
-            let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
-            let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
+            let key_len = u16::from_le_bytes([data[slot_off + 2], data[slot_off + 3]]) as usize;
+            let entry_key = &data[entry_off..entry_off + key_len];
 
             let cmp = compare_keys(key, entry_key);
             if cmp == std::cmp::Ordering::Equal {
@@ -239,14 +246,14 @@ impl BTreeLeafPage {
             ]);
             let entry_off = (packed & 0xFFFF) as usize;
 
-            // Read key_len from entry
-            let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
-            let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
+            // The slot carries the key's length beside its offset, the entry
+            // being the key and nothing else
+            let key_len = (packed >> 16) as usize;
+            let entry_key = &data[entry_off..entry_off + key_len];
 
             let cmp = compare_keys(key, entry_key);
             if cmp == std::cmp::Ordering::Equal {
-                let payload_offset = entry_off + 2 + key_len;
-                return RowLocator::read_payload(&data[payload_offset..]);
+                return RowLocator::from_key(entry_key);
             }
             let is_less = cmp == std::cmp::Ordering::Less;
             high = if is_less { mid } else { high };
@@ -280,8 +287,21 @@ impl BTreeLeafPage {
             raw_data_end
         };
 
-        // Entry size: key_len(2) + key + locator payload
-        let entry_size = 2 + key.len() + locator.payload_len();
+        // The key ends in the suffix that names the row, so an entry that
+        // disagreed with the locator handed in beside it would be stored under
+        // one address and read back under another. Refusing here is what keeps
+        // the two from ever parting
+        if !locator.key_suffix_matches(key) {
+            return Err(ZyronError::Internal(format!(
+                "a B+tree key of {} bytes does not end in the suffix for the row it names, so the \
+                 index would point somewhere else",
+                key.len()
+            )));
+        }
+
+        // The entry is the key and nothing else. Its length is in the slot and
+        // the row it names is its own trailing suffix
+        let entry_size = key.len();
 
         // Calculate free space: between slot array end and data start
         let slot_array_end = Self::SLOT_ARRAY_START + num_slots * Self::SLOT_SIZE;
@@ -313,8 +333,8 @@ impl BTreeLeafPage {
             ]);
             let entry_off = (packed & 0xFFFF) as usize;
 
-            let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
-            let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
+            let key_len = (packed >> 16) as usize;
+            let entry_key = &data[entry_off..entry_off + key_len];
 
             let cmp = compare_keys(key, entry_key);
             if cmp == std::cmp::Ordering::Equal {
@@ -330,12 +350,7 @@ impl BTreeLeafPage {
 
         // Write entry data at the end (grows backward)
         let new_data_end = data_end - entry_size;
-        let mut write_offset = new_data_end;
-        data[write_offset..write_offset + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-        write_offset += 2;
-        data[write_offset..write_offset + key.len()].copy_from_slice(key);
-        write_offset += key.len();
-        locator.write_payload(&mut data[write_offset..]);
+        data[new_data_end..new_data_end + key.len()].copy_from_slice(key);
 
         // Shift slots forward to make room for new slot (only 4 bytes per slot)
         let insert_slot_offset = Self::SLOT_ARRAY_START + insert_slot_idx * Self::SLOT_SIZE;

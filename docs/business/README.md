@@ -4,6 +4,10 @@ Guides for running Zyron: what the database guarantees on your behalf, which of 
 
 Zyron upgrades itself, moves its own on-disk formats forward, and rotates its own signing keys. The three guides below cover what happens without you, what you can steer, and how to see it happening.
 
+## SQL
+
+- [sql/schema-changes.md](sql/schema-changes.md), what ALTER TABLE and CREATE INDEX do to a live table. Which column and type changes complete without touching a row, which run a rewrite, what a constraint enforces while it is still being checked, and how to watch a change progress.
+
 ## Storage
 
 - [storage/format-agility.md](storage/format-agility.md), what happens to files written by an older version of Zyron. Migration policies per format, how far back the running binary can read, and how to watch a migration progress.

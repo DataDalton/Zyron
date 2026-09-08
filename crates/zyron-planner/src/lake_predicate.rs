@@ -523,6 +523,8 @@ mod tests {
             tz_offset_secs: None,
             element_type: None,
             attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
         }
     }
 
@@ -593,6 +595,9 @@ mod tests {
             lake: zyron_catalog::schema::LakeConfig::lake(),
             cluster: Default::default(),
             foreign: Default::default(),
+            schema_epoch: 1,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         }
     }
 

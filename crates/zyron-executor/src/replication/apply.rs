@@ -35,10 +35,7 @@ use zyron_catalog::{TableEntry, TableId};
 use zyron_common::{Result, RowLocator, ZyronError};
 use zyron_planner::logical::LogicalColumn;
 
-use crate::batch::{
-    DataBatch, build_column_to_builder_map, create_builders, decode_tuple_into_builders,
-    encode_row_into, finalize_builders,
-};
+use crate::batch::{DataBatch, create_builders, encode_row_into, finalize_builders};
 use crate::context::ExecutionContext;
 use crate::operator::modify::{DeleteOperator, InsertOperator, index_key_upper_bound};
 use crate::operator::scan::{IndexScanOperator, SeqScanOperator};
@@ -101,15 +98,20 @@ fn check_shape(table: &TableEntry, columns: u16) -> Result<()> {
 ///
 /// The images are slices of the log record this node already holds, so the
 /// only copy is the one into the column buffers
-fn decode_rows(table: &TableEntry, rows: &[&[u8]]) -> DataBatch {
+fn decode_rows(table: &TableEntry, rows: &[&[u8]]) -> Result<DataBatch> {
     let columns = all_columns(table);
     let output_ids: Vec<zyron_catalog::ColumnId> = columns.iter().map(|c| c.column_id).collect();
-    let map = build_column_to_builder_map(&table.columns, &output_ids);
+    let decoder = crate::epoch_decode::EpochDecoder::new(table, &output_ids);
     let mut builders = create_builders(&columns, rows.len());
+    // A schema change is a barrier in the changeset, so every row that
+    // follows it was encoded by the leader against the schema this node has
+    // already applied. The epoch the leader wrote under is therefore the one
+    // this table carries now
+    let epoch = table.schema_epoch;
     for row in rows {
-        decode_tuple_into_builders(row, &table.columns, &map, &mut builders);
+        decoder.decode(epoch, row, None, &mut builders)?;
     }
-    finalize_builders(builders)
+    Ok(finalize_builders(builders))
 }
 
 /// Runs an operator to exhaustion, which is what a DML operator being driven
@@ -131,7 +133,7 @@ pub async fn apply_insert(
     }
     let table = ctx.get_table_entry(TableId(table_id))?;
     check_shape(&table, columns)?;
-    let batch = decode_rows(&table, rows);
+    let batch = decode_rows(&table, rows)?;
     let target: Vec<zyron_catalog::ColumnId> = table.columns.iter().map(|c| c.id).collect();
     let source = Box::new(PreparedBatchOperator { batch: Some(batch) }) as Box<dyn Operator>;
     // No defaults, no checks, no expectations: the row image is what the

@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use tracing::warn;
 
-use zyron_catalog::{ColumnEntry, TableId};
+use zyron_catalog::{ColumnEntry, TableEntry, TableId};
 use zyron_cdc::cdc_stream::build_sink;
 use zyron_cdc::decoder::DecodedChange;
 use zyron_cdc::{ChangeRecord, ChangeType};
 use zyron_common::TypeId;
-use zyron_executor::batch::{ColumnBuilder, decode_tuple_into_builders};
+use zyron_executor::batch::ColumnBuilder;
 use zyron_wire::connection::ServerState;
 
 pub const DEFAULT_INTERVAL_SECS: u64 = 1;
@@ -57,7 +57,9 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let columns = table.columns.clone();
+        // The whole entry, not just its columns: a row image is read through
+        // the layout the epoch in the entry names
+        let decode_table = Arc::clone(&table);
         let table_name = table.name.clone();
         let slots = Arc::clone(slots);
         let sink = build_sink(&stream);
@@ -85,7 +87,7 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
                     start_version,
                     slots.as_ref(),
                     sink.as_ref(),
-                    |rec| Ok(decode_change(rec, &table_name, &columns)),
+                    |rec| Ok(decode_change(rec, &table_name, &decode_table)),
                     // Lake change records derive from committed transaction
                     // log versions, an undecided change never appears there
                     &|_| zyron_cdc::TxnDecision::Committed,
@@ -109,7 +111,7 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
                     feed.as_ref(),
                     slots.as_ref(),
                     sink.as_ref(),
-                    |rec| Ok(decode_change(rec, &table_name, &columns)),
+                    |rec| Ok(decode_change(rec, &table_name, &decode_table)),
                     &|txn_id| {
                         if status_map.is_committed(txn_id) {
                             zyron_cdc::TxnDecision::Committed
@@ -141,8 +143,8 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
 /// against the table schema. Insert and update post-images populate new_values,
 /// delete and update pre-images populate old_values, and schema or truncate
 /// markers carry no row image.
-fn decode_change(rec: &ChangeRecord, table_name: &str, columns: &[ColumnEntry]) -> DecodedChange {
-    let pairs = decode_row_pairs(&rec.row_data, columns);
+fn decode_change(rec: &ChangeRecord, table_name: &str, table: &TableEntry) -> DecodedChange {
+    let pairs = decode_row_pairs(&rec.row_data, table);
     let (old_values, new_values) = match rec.change_type {
         ChangeType::Insert | ChangeType::UpdatePostimage => (None, Some(pairs)),
         ChangeType::Delete | ChangeType::UpdatePreimage => (Some(pairs), None),
@@ -164,13 +166,13 @@ fn decode_change(rec: &ChangeRecord, table_name: &str, columns: &[ColumnEntry]) 
 
 /// Decodes an NSM-encoded row into (column_name, string_value) pairs using the
 /// canonical tuple decoder so the layout stays in lockstep with the writer.
-fn decode_row_pairs(row_data: &[u8], columns: &[ColumnEntry]) -> Vec<(String, String)> {
-    let null_bitmap_len = (columns.len() + 7) / 8;
-    if row_data.len() < null_bitmap_len {
+fn decode_row_pairs(row_data: &[u8], table: &TableEntry) -> Vec<(String, String)> {
+    let columns: Vec<ColumnEntry> = table.live_column_list();
+    if columns.is_empty() {
         return Vec::new();
     }
-    // Identity map: every table column decodes into its own builder.
-    let column_to_builder: Vec<Option<u16>> = (0..columns.len()).map(|i| Some(i as u16)).collect();
+    let output_ids: Vec<zyron_catalog::ColumnId> = columns.iter().map(|c| c.id).collect();
+    let decoder = zyron_executor::epoch_decode::EpochDecoder::new(table, &output_ids);
     let mut builders: Vec<ColumnBuilder> = columns
         .iter()
         .map(|c| {
@@ -183,7 +185,14 @@ fn decode_row_pairs(row_data: &[u8], columns: &[ColumnEntry]) -> Vec<(String, St
         })
         .collect();
 
-    decode_tuple_into_builders(row_data, columns, &column_to_builder, &mut builders);
+    // A change record holds the row image the writer encoded, under whatever
+    // the table's layout was at the time. A record that does not span the
+    // current layout was written under an older one this feed has fallen
+    // behind, and it is reported as undecodable rather than read at offsets
+    // that would land in the middle of a column
+    if !decoder.try_decode(table.schema_epoch, row_data, &mut builders) {
+        return Vec::new();
+    }
 
     let mut pairs = Vec::with_capacity(columns.len());
     for (col, builder) in columns.iter().zip(builders) {
@@ -213,7 +222,43 @@ mod tests {
             tz_offset_secs: None,
             element_type: None,
             attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
         }
+    }
+
+    /// A table over `columns`, sealed at its first epoch, which is the layout
+    /// a change record's row image is read through.
+    fn table_of(columns: Vec<ColumnEntry>) -> TableEntry {
+        let mut entry = TableEntry {
+            id: TableId(1),
+            schema_id: zyron_catalog::SchemaId(1),
+            name: "t".to_string(),
+            heap_file_id: 1,
+            fsm_file_id: 2,
+            columns,
+            constraints: Vec::new(),
+            created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+        };
+        entry.seal_initial_epoch();
+        entry
     }
 
     /// Encodes one NSM row: null bitmap then fixed-size values inline and
@@ -246,7 +291,7 @@ mod tests {
             (false, 42i64.to_le_bytes().to_vec(), false),
             (false, b"hi".to_vec(), true),
         ]);
-        let pairs = decode_row_pairs(&row, &columns);
+        let pairs = decode_row_pairs(&row, &table_of(columns));
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("id".to_string(), "42".to_string()));
         assert_eq!(pairs[1], ("name".to_string(), "hi".to_string()));
@@ -256,7 +301,7 @@ mod tests {
     fn short_row_yields_no_pairs() {
         let columns = vec![col(0, "id", TypeId::Int64, None)];
         // Empty buffer is shorter than the 1-byte null bitmap, so decode bails.
-        assert!(decode_row_pairs(&[], &columns).is_empty());
+        assert!(decode_row_pairs(&[], &table_of(columns)).is_empty());
     }
 
     #[test]
@@ -274,7 +319,7 @@ mod tests {
             primary_key_data: Vec::new(),
             is_last_in_txn: true,
         };
-        let decoded = decode_change(&rec, "t", &columns);
+        let decoded = decode_change(&rec, "t", &table_of(columns));
         assert!(decoded.new_values.is_none());
         assert_eq!(
             decoded.old_values.unwrap()[0],

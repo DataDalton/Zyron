@@ -14,9 +14,7 @@ use zyron_common::ZyronError;
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::HeapPage;
 
-use crate::batch::{
-    build_column_to_builder_map, create_builders, decode_tuple_into_builders, finalize_builders,
-};
+use crate::batch::{create_builders, decode_tuple_into_builders, finalize_builders};
 use crate::context::ExecutionContext;
 use crate::operator::doc_fetch::DocRowFetcher;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
@@ -106,7 +104,7 @@ impl Operator for VectorScanOperator {
             let mut builders = create_builders(&self.output_columns, batch_size);
             let output_ids: Vec<zyron_catalog::ColumnId> =
                 self.output_columns.iter().map(|c| c.column_id).collect();
-            let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+            let decoder = crate::epoch_decode::EpochDecoder::new(&table_entry, &output_ids);
             let mut distances: Vec<f32> = Vec::with_capacity(batch_size);
             let mut row_count = 0usize;
             // Heap pages fetched to resolve this batch's hits, folded into
@@ -146,10 +144,11 @@ impl Operator for VectorScanOperator {
                         }
                         decode_tuple_into_builders(
                             view.data,
-                            &table_entry.columns,
-                            &column_to_builder,
+                            &decoder,
+                            view.header.schema_epoch,
+                            Some(RowLocator::Heap { page, slot }),
                             &mut builders,
-                        );
+                        )?;
                     }
                     Some(RowLocator::Columnar { file_id, sys_rowid }) => {
                         let Some(vals) = self.fetcher.columnar_row(file_id, sys_rowid) else {

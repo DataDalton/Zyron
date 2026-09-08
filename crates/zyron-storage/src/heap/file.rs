@@ -1184,6 +1184,10 @@ where
                     *data.get_unchecked(slot_base + 4),
                     *data.get_unchecked(slot_base + 5),
                 ])),
+                schema_epoch: u16::from_le_bytes([
+                    *data.get_unchecked(slot_base + 6),
+                    *data.get_unchecked(slot_base + 7),
+                ]),
                 xmin: u64::from_le_bytes([
                     *data.get_unchecked(slot_base + 8),
                     *data.get_unchecked(slot_base + 9),

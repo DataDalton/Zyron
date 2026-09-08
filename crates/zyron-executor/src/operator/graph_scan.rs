@@ -171,20 +171,21 @@ async fn load_graph_edges(
         })?;
         let weight_pos = column_pos("weight");
 
-        // Decode only the node-id (and optional weight) columns: map every other
-        // table column to None so the decoder skips it.
-        let mut col_to_builder: Vec<Option<u16>> = vec![None; table.columns.len()];
+        // Decode only the node-id (and optional weight) columns: every column
+        // the projection leaves out is walked and pushed nowhere.
+        let mut output_ids: Vec<zyron_catalog::ColumnId> = Vec::with_capacity(3);
         let mut builders: Vec<ColumnBuilder> = Vec::with_capacity(3);
-        col_to_builder[from_pos] = Some(builders.len() as u16);
+        output_ids.push(table.columns[from_pos].id);
         builders.push(ColumnBuilder::new(table.columns[from_pos].type_id, 0));
-        col_to_builder[to_pos] = Some(builders.len() as u16);
+        output_ids.push(table.columns[to_pos].id);
         builders.push(ColumnBuilder::new(table.columns[to_pos].type_id, 0));
         let weight_builder = weight_pos.map(|wp| {
             let idx = builders.len();
-            col_to_builder[wp] = Some(idx as u16);
+            output_ids.push(table.columns[wp].id);
             builders.push(ColumnBuilder::new(table.columns[wp].type_id, 0));
             idx
         });
+        let decoder = crate::epoch_decode::EpochDecoder::new(&table, &output_ids);
 
         let heap = ctx.get_heap_file(table.id).await?;
         let num_pages = heap.num_pages_cached() as u32;
@@ -207,10 +208,14 @@ async fn load_graph_edges(
                 }
                 decode_tuple_into_builders(
                     view.data,
-                    &table.columns,
-                    &col_to_builder,
+                    &decoder,
+                    view.header.schema_epoch,
+                    Some(zyron_common::RowLocator::Heap {
+                        page: page_id,
+                        slot,
+                    }),
                     &mut builders,
-                );
+                )?;
             }
         }
 

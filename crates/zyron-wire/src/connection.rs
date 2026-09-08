@@ -839,6 +839,18 @@ pub struct ServerState {
     /// held, the background worker checks it at the top of each cycle
     pub vacuum_running: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Online DDL operations running in this process, read by
+    /// zyron_sys.storage.ddl_progress. A row lives exactly as long as the
+    /// operation that registered it
+    pub ddl_progress: Arc<crate::ddl_progress::DdlProgressRegistry>,
+
+    /// Tables a shadow rewrite is copying, keyed by the source table id.
+    ///
+    /// Every insert, update and delete on a source named here applies to the
+    /// shadow as well, which is what lets the copy run without a window in
+    /// which a write is lost
+    pub shadow_targets: Arc<scc::HashMap<u32, Arc<crate::shadow_rewrite::ShadowTarget>>>,
+
     // -----------------------------------------------------------------------
     // Analytics
     // -----------------------------------------------------------------------
@@ -5347,6 +5359,11 @@ impl<T: WireTransport> Connection<T> {
             let btree = &index_snap.btree;
             let clean_indexes = !btree.is_empty();
 
+            // Every live tuple of the table is visited below, which is the one
+            // pass that can say a recorded layout is no longer carried by
+            // anything and can be retired
+            let mut census = zyron_storage::EpochCensus::default();
+
             // Per-table effective floor: keep versions still visible at a tagged
             // version or within the table's time-travel window.
             let now_us = std::time::SystemTime::now()
@@ -5375,25 +5392,36 @@ impl<T: WireTransport> Connection<T> {
                 let Some(frame) = self.server.buffer_pool.fetch_page(*page_id) else {
                     continue;
                 };
-                let mut dead: Vec<(u16, Vec<u8>)> = Vec::new();
-                let (reclaimed_on_page, modified) = {
+                let mut dead: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+                let (reclaimed_on_page, modified, page_census) = {
                     let mut guard = frame.write_data();
                     let data: &mut [u8] = &mut guard[..];
                     if HeapPage::heap_header_from_slice(data).slot_count == 0 {
-                        (0u64, false)
+                        (0u64, false, zyron_storage::EpochCensus::default())
                     } else if clean_indexes {
                         HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead)
                     } else {
                         HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted)
                     }
                 };
+                census.merge(page_census);
                 self.server.buffer_pool.unpin_page(*page_id, modified);
 
                 if clean_indexes && !dead.is_empty() {
+                    let captured: Vec<zyron_executor::operator::modify::CapturedRow> = dead
+                        .iter()
+                        .map(
+                            |(slot, epoch, data)| zyron_executor::operator::modify::CapturedRow {
+                                slot: *slot,
+                                schema_epoch: *epoch,
+                                data: data.clone(),
+                            },
+                        )
+                        .collect();
                     zyron_executor::operator::modify::vacuum_index_cleanup(
                         table.as_ref(),
                         *page_id,
-                        &dead,
+                        &captured,
                         btree,
                         &self.server.btree_indexes,
                     );
@@ -5402,6 +5430,27 @@ impl<T: WireTransport> Connection<T> {
                 if reclaimed_on_page > 0 {
                     _total_reclaimed += reclaimed_on_page;
                 }
+            }
+
+            // A layout nothing carries any more is dead weight in the entry,
+            // and epoch 0 retires with the pre-stamp column list it names
+            if let Err(e) = self
+                .server
+                .catalog
+                .retire_schema_epochs(
+                    table.id,
+                    census.min_live_epoch,
+                    census.any_unstamped,
+                    census.saw_nothing(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "zyron::ddl",
+                    table = %table.name,
+                    error = %e,
+                    "vacuum could not retire the table's spent schema epochs"
+                );
             }
 
             // Columnar analog of the heap pass: one merge collapses the
@@ -5521,25 +5570,6 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
-            // Every live row of the table, heap resident and folded alike,
-            // collected once and reused across the table's indexes. Shared with
-            // CREATE INDEX so the two cannot disagree about what is live
-            let live_rows = match crate::index_build::collect_live_rows(&self.server, table).await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    let fields = crate::messages::backend::ErrorFields {
-                        severity: "ERROR".into(),
-                        code: "XX000".into(),
-                        message: format!("REINDEX failed to read table \"{}\": {}", table.name, e),
-                        detail: None,
-                        hint: None,
-                        position: None,
-                    };
-                    let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
-                    return Ok(());
-                }
-            };
-
             for idx in &btree_indexes {
                 // The catalog stores the index column id list in key order,
                 // and the rebuilt key spans all of them
@@ -5549,31 +5579,105 @@ impl<T: WireTransport> Connection<T> {
                     continue;
                 }
 
-                // Replace the old index with a fresh empty tree and drop its
-                // stale on-disk checkpoint so recovery does not reload old keys.
-                let fresh =
-                    zyron_storage::BTreeIndex::create(idx.index_file_id, checkpoint_dir.clone())
-                        .await
-                        .map_err(ProtocolError::Database)?;
+                // The old tree keeps serving while the new one is built, so a
+                // query routed through the index during a REINDEX still gets
+                // an answer. The new tree takes a fresh file id, and the swap
+                // is what retires the old one
+                let (new_file_id, _) = self.server.catalog.alloc_heap_files();
+                let fresh = zyron_storage::BTreeIndex::create(new_file_id, checkpoint_dir.clone())
+                    .await
+                    .map_err(ProtocolError::Database)?;
                 let fresh = Arc::new(fresh);
-                let checkpoint_path =
-                    checkpoint_dir.join(format!("index_{}.zyridx", idx.index_file_id));
-                if checkpoint_path.exists() {
-                    if let Err(e) = std::fs::remove_file(&checkpoint_path) {
-                        tracing::error!(
-                            target: "zyron::ddl",
-                            index = %idx.name,
-                            "REINDEX failed to remove index checkpoint: {e}"
-                        );
+
+                let progress = self.server.ddl_progress.begin(
+                    &table.name,
+                    &idx.name,
+                    crate::ddl_progress::DdlOperation::Reindex,
+                    self.session
+                        .as_ref()
+                        .map(|s| s.user.as_str())
+                        .unwrap_or("unknown"),
+                );
+                let built = crate::index_build::scan_and_load(
+                    &self.server,
+                    table,
+                    new_file_id,
+                    &key_columns,
+                    idx.unique,
+                    &fresh,
+                    progress.progress(),
+                    crate::index_build::DEFAULT_BUILD_BATCH_ROWS,
+                )
+                .await;
+                let index_entries = match built {
+                    Ok(Ok(outcome)) => outcome.entries,
+                    Ok(Err(duplicate)) => {
+                        let fields = crate::messages::backend::ErrorFields {
+                            severity: "ERROR".into(),
+                            code: "23505".into(),
+                            message: format!(
+                                "REINDEX of \"{}\" found the same key on two live rows, at {:?} \
+                                 and at {:?}",
+                                idx.name, duplicate.first, duplicate.second
+                            ),
+                            detail: None,
+                            hint: None,
+                            position: None,
+                        };
+                        let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                        let _ = self.server.disk_manager.delete_file(new_file_id).await;
+                        return Ok(());
                     }
+                    Err(e) => {
+                        let fields = crate::messages::backend::ErrorFields {
+                            severity: "ERROR".into(),
+                            code: "XX000".into(),
+                            message: format!("REINDEX failed to rebuild \"{}\": {}", idx.name, e),
+                            detail: None,
+                            hint: None,
+                            position: None,
+                        };
+                        let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                        let _ = self.server.disk_manager.delete_file(new_file_id).await;
+                        return Ok(());
+                    }
+                };
+                drop(progress);
+
+                // One catalog update points the entry at the new file. Only
+                // after it lands does the old file stop being the index
+                let old_file_id = idx.index_file_id;
+                let mut updated = (**idx).clone();
+                updated.index_file_id = new_file_id;
+                if let Err(e) = self
+                    .server
+                    .catalog
+                    .replace_index_file(table.id, &idx.name, new_file_id)
+                    .await
+                {
+                    let fields = crate::messages::backend::ErrorFields {
+                        severity: "ERROR".into(),
+                        code: "XX000".into(),
+                        message: format!("REINDEX could not install \"{}\": {}", idx.name, e),
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                    let _ = self.server.disk_manager.delete_file(new_file_id).await;
+                    return Ok(());
+                }
+                let old_checkpoint = checkpoint_dir.join(format!("index_{old_file_id}.zyridx"));
+                if old_checkpoint.exists()
+                    && let Err(e) = std::fs::remove_file(&old_checkpoint)
+                {
+                    tracing::warn!(
+                        target: "zyron::ddl",
+                        index = %idx.name,
+                        "REINDEX left the retired index checkpoint in place: {e}"
+                    );
                 }
 
-                let index_entries = crate::index_build::fill_btree_from_live_rows(
-                    table.as_ref(),
-                    &live_rows,
-                    &key_columns,
-                    &fresh,
-                );
                 let previous_total = total_entries;
                 total_entries += index_entries;
                 // One notice per progress milestone crossed, so a rebuild of

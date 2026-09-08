@@ -778,6 +778,9 @@ pub(crate) async fn handle_create_hybrid_index(
         vector_dims: dims,
     };
 
+    // Building until the rows that predate the index have been read into both
+    // halves, so neither answers a query with less than the table holds
+    let active_at_publication = server.txn_manager.proc_array().active_txn_ids();
     let index_id = server
         .catalog
         .create_index_with_params(
@@ -788,6 +791,7 @@ pub(crate) async fn handle_create_hybrid_index(
             false,
             zyron_catalog::IndexType::Hybrid,
             Some(encode_params(&params)?),
+            zyron_catalog::IndexState::Building,
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -826,6 +830,30 @@ pub(crate) async fn handle_create_hybrid_index(
             let _ = server.catalog.drop_index(table.id, &stmt.name).await;
             return Err(ProtocolError::Database(e));
         }
+    }
+
+    let issuer = session
+        .as_ref()
+        .map(|s| s.user.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Err(e) = crate::ddl_dispatch::fill_search_index_from_rows(
+        server,
+        table.id,
+        &stmt.name,
+        &active_at_publication,
+        &crate::ddl_dispatch::transactions_held_open(session),
+        &issuer,
+    )
+    .await
+    {
+        if let Some(m) = &server.fts_manager {
+            let _ = m.drop_index(index_id.0);
+        }
+        if let Some(m) = &server.vector_manager {
+            let _ = m.drop_index(index_id.0);
+        }
+        let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+        return Err(ProtocolError::Database(e));
     }
     Ok(DdlResult::Tag("CREATE INDEX".to_string()))
 }

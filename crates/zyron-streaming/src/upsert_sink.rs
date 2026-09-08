@@ -230,6 +230,14 @@ impl ZyronUpsertSink {
         let mut applied_inserts = 0u64;
         let mut applied_updates = 0u64;
         let mut applied_deletes = 0u64;
+        // The layout every row this batch writes is stamped with. Read once
+        // per batch, because a row written without it is a row nothing can
+        // read back
+        let target_epoch = self
+            .catalog
+            .get_table_by_id(TableId(self.target_table_id))
+            .map(|t| t.schema_epoch)
+            .unwrap_or(0);
         // Apply each record while holding the map mutex so reads and writes
         // to the index are sequentially consistent within this batch.
         let result: Result<()> = (|| {
@@ -257,7 +265,11 @@ impl ZyronUpsertSink {
                             &mut rebuilt,
                         )?;
                         // Insert the new row.
-                        let tuple = zyron_storage::Tuple::new(change.row_data.clone(), txn.txn_id);
+                        let tuple = zyron_storage::Tuple::with_epoch(
+                            change.row_data.clone(),
+                            txn.txn_id,
+                            target_epoch,
+                        );
                         let new_id =
                             rt.block_on(async { self.heap.insert_batch(&[tuple]).await })?;
                         // insert_batch returns Vec<TupleId>. Use the single id.

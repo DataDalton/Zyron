@@ -341,9 +341,11 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             entry,
             as_of,
         } => {
+            // A dropped column still occupies its position in every tuple
+            // already written, which the decoder walks past. Nothing above the
+            // decoder has a name for it
             let columns: Vec<LogicalColumn> = entry
-                .columns
-                .iter()
+                .live_columns()
                 .map(|c| LogicalColumn {
                     table_idx: Some(*table_idx),
                     column_id: c.id,
@@ -1148,8 +1150,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
     const TABLE_IDX: usize = 0;
     let columns: Vec<LogicalColumn> = update
         .table_entry
-        .columns
-        .iter()
+        .live_columns()
         .map(|c| LogicalColumn {
             table_idx: Some(TABLE_IDX),
             column_id: c.id,
@@ -1191,8 +1192,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
     const TABLE_IDX: usize = 0;
     let columns: Vec<LogicalColumn> = delete
         .table_entry
-        .columns
-        .iter()
+        .live_columns()
         .map(|c| LogicalColumn {
             table_idx: Some(TABLE_IDX),
             column_id: c.id,

@@ -70,9 +70,11 @@
 pub mod arena;
 pub mod arena_index;
 pub mod buffer;
+pub mod bulk;
 pub mod checkpoint;
 pub mod constants;
 pub mod index;
+pub mod migrations;
 pub mod page;
 pub mod store;
 pub mod types;

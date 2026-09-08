@@ -162,8 +162,10 @@ impl Node {
             actor_role_id: Some(TEST_ACTOR_ROLE),
         };
         let done = self.router().begin_statement(sql, &context).await?;
+        // The originating node runs the statement in no transaction of its
+        // own, which is what zero says here
         let outcome = zyron_server::replication::DispatchedDdl::new(&self._server)
-            .run(sql, &context)
+            .run(sql, &context, 0)
             .await;
         let _ = done.send(match &outcome {
             Ok(()) => Ok(()),
@@ -347,6 +349,8 @@ pub fn build_server_state(
         ),
         node_capabilities: None,
         catalog,
+        ddl_progress: std::sync::Arc::new(zyron_wire::ddl_progress::DdlProgressRegistry::new()),
+        shadow_targets: std::sync::Arc::new(scc::HashMap::new()),
         wal,
         buffer_pool,
         disk_manager,

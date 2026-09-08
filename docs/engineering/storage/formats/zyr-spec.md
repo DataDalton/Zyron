@@ -231,7 +231,7 @@ pub const ZYR_FORMAT_VERSION_1_0: FormatVersion = FormatVersion::V1;
 pub const ZYR_READER_WINDOW: VersionWindow = VersionWindow::new(ZYR_FORMAT_VERSION_1_0, ZYR_FORMAT_VERSION);
 ```
 
-The registry entry for `ZyrColumnar` declares the migration policy eager, the migration not reversible, the binary version gate 0.12.0, and the retirement date 2027-03-01 for the 1.0 reader and its migration step.
+The registry entry for `ZyrColumnar` declares the migration policy eager, the migration not reversible, the binary version gate 0.12.0, and a retirement date for the 1.0 reader and its migration step, held in `ZYR_1_0_RETIREMENT` in `crates/zyron-storage/src/format.rs`.
 
 The migration step `zyr_1_0_to_1_1` in `crates/zyron-storage/src/columnar/migrations/v1_0_to_v1_1.rs` takes the whole file and returns the whole file. It validates the header, the index size, the trailer and the index checksum before copying a byte, then copies only the bytes a reader ever touches from each segment, pads each to 64 bytes, rebuilds the index over the new offsets, and restamps the header at 1.1. A 1.1 input is refused, and a damaged index is refused rather than repacked. The fixture `crates/zyron-storage/src/columnar/fixtures/v1_0.bin` was written by Zyron 0.11.0 and pins the 1.0 layout.
 

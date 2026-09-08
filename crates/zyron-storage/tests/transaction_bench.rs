@@ -33,6 +33,24 @@ use zyron_storage::{
 };
 use zyron_wal::{LogRecordType, WalReader, WalWriter, WalWriterConfig};
 
+/// Builds the key an index writes, the value big-endian so the byte order the
+/// tree compares on is the numeric order, followed by the suffix naming the
+/// row it points at. The tree reads the row out of that suffix, so measuring
+/// against a key without one measures a shape no index holds.
+fn keyed(value: u64, locator: RowLocator) -> Vec<u8> {
+    let mut key = value.to_be_bytes().to_vec();
+    locator.append_key_suffix(&mut key);
+    key
+}
+
+/// The row the even key `2 * k` points at in the contention measurement.
+fn even_row(k: u64) -> RowLocator {
+    RowLocator::Heap {
+        page: PageId::new(1, k),
+        slot: 0,
+    }
+}
+
 // Performance targets
 const SNAPSHOT_VISIBILITY_TARGET_NS: f64 = 15.0;
 const LOCK_ACQUIRE_TARGET_NS: f64 = 80.0;
@@ -812,16 +830,8 @@ fn test_optimistic_read_under_contention() {
     // readers scan (real reader/writer leaf contention) without ever inserting
     // a duplicate (the B+Tree rejects duplicate keys with DuplicateKey).
     {
-        let mut items: Vec<([u8; 8], RowLocator)> = (0..KEYS)
-            .map(|k| {
-                (
-                    (2 * k).to_be_bytes(),
-                    RowLocator::Heap {
-                        page: PageId::new(1, k),
-                        slot: 0,
-                    },
-                )
-            })
+        let mut items: Vec<(Vec<u8>, RowLocator)> = (0..KEYS)
+            .map(|k| (keyed(2 * k, even_row(k)), even_row(k)))
             .collect();
         index.insert_many(&mut items).unwrap();
     }
@@ -836,17 +846,15 @@ fn test_optimistic_read_under_contention() {
         let mut n = 0u64;
         let mut writes = 0u64;
         while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut batch: Vec<([u8; 8], RowLocator)> = (0..64)
+            let mut batch: Vec<(Vec<u8>, RowLocator)> = (0..64)
                 .map(|_| {
                     let key = 2 * n + 1;
                     n += 1;
-                    (
-                        key.to_be_bytes(),
-                        RowLocator::Heap {
-                            page: PageId::new(1, key),
-                            slot: 0,
-                        },
-                    )
+                    let row = RowLocator::Heap {
+                        page: PageId::new(1, key),
+                        slot: 0,
+                    };
+                    (keyed(key, row), row)
                 })
                 .collect();
             idx_w.insert_many(&mut batch).unwrap();
@@ -870,7 +878,7 @@ fn test_optimistic_read_under_contention() {
                 for _ in 0..READS_PER_READER {
                     let read_start = Instant::now();
                     let found = loop {
-                        match idx.search_attempt(&(2 * k).to_be_bytes()) {
+                        match idx.search_attempt(&keyed(2 * k, even_row(k))) {
                             Ok(r) => break r,
                             Err(()) => {
                                 retries += 1;

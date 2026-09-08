@@ -41,6 +41,32 @@ impl BTreeIndexSpec {
     }
 }
 
+/// A hidden table a shadow rewrite is copying the source into.
+///
+/// Every write to the source applies here too, which is what lets the copy run
+/// without a window in which a write reaches one heap and not the other. The
+/// row map is what a delete or an update needs: the shadow's copy of a row sits
+/// at its own address, so the source address has to resolve to it.
+#[derive(Debug, Clone)]
+pub struct ShadowSpec {
+    /// The hidden table receiving the copy
+    pub shadow_table_id: TableId,
+    /// Column whose values are cast on the way in
+    pub column_id: ColumnId,
+    /// Type the shadow's copy of that column holds
+    pub target_type: zyron_common::TypeId,
+    /// Digits below the point the shadow's column keeps
+    pub target_digits: Option<u8>,
+    /// Declared width the shadow's column keeps
+    pub target_max_length: Option<usize>,
+    /// Source row address to shadow row address, both packed. Written by the
+    /// copy and by every mirrored insert
+    pub rows: Arc<scc::HashMap<u64, u64>>,
+    /// Set when the rewrite has given up. Writers stop mirroring rather than
+    /// filling a shadow nothing will install
+    pub abandoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Pre-partitioned view of a table's indexes for fast DML hot-path lookup.
 /// One snapshot per table, rebuilt only on index DDL and atomically swapped
 /// in via `Arc` so readers take no locks.
@@ -54,6 +80,9 @@ pub struct TableIndexSnapshot {
     pub fts: Vec<IndexId>,
     /// Index ids for vector indexes.
     pub vector: Vec<IndexId>,
+    /// Shadow tables a rewrite is filling from this one. Empty except while
+    /// an incompatible type change is running
+    pub shadow: Vec<ShadowSpec>,
 }
 
 impl TableIndexSnapshot {
@@ -65,6 +94,7 @@ impl TableIndexSnapshot {
             && self.spatial.is_empty()
             && self.fts.is_empty()
             && self.vector.is_empty()
+            && self.shadow.is_empty()
     }
 }
 
@@ -117,6 +147,10 @@ pub struct CatalogCache {
     /// Per-table partitioned index snapshot, served lock-free from the DML
     /// hot path. Rebuilt on `put_index` / `invalidate_index`.
     table_index_snapshots: scc::HashMap<TableId, Arc<TableIndexSnapshot>>,
+    /// Shadow tables a rewrite is filling, per source table. Held apart from
+    /// the snapshot so index DDL rebuilding the snapshot cannot drop a
+    /// rewrite's entry
+    table_shadow_targets: scc::HashMap<TableId, Arc<Vec<ShadowSpec>>>,
 
     // Streaming job entries. The name-index keys on the job's source_schema_id
     // since streaming jobs do not have a dedicated owning schema yet.
@@ -234,6 +268,7 @@ impl CatalogCache {
             indexes: RwLock::new(HashMap::new()),
             table_indexes: RwLock::new(HashMap::new()),
             table_index_snapshots: scc::HashMap::new(),
+            table_shadow_targets: scc::HashMap::new(),
             streaming_jobs: RwLock::new(HashMap::new()),
             streaming_jobs_by_name: RwLock::new(HashMap::new()),
             external_sources: RwLock::new(HashMap::new()),
@@ -513,12 +548,36 @@ impl CatalogCache {
         empty_index_snapshot()
     }
 
+    /// Records the shadow tables a rewrite is filling from `table_id`, or
+    /// clears them when the rewrite ends.
+    ///
+    /// Kept beside the index snapshot rather than inside it, because index DDL
+    /// rebuilds the snapshot and a rewrite that lost its entry that way would
+    /// stop mirroring writes without anything saying so.
+    pub fn set_shadow_targets(&self, table_id: TableId, targets: Vec<ShadowSpec>) {
+        if targets.is_empty() {
+            let _ = self.table_shadow_targets.remove_sync(&table_id);
+        } else {
+            self.table_shadow_targets
+                .upsert_sync(table_id, Arc::new(targets));
+        }
+        self.rebuild_index_snapshot(table_id);
+    }
+
+    fn shadow_targets(&self, table_id: TableId) -> Vec<ShadowSpec> {
+        self.table_shadow_targets
+            .read_sync(&table_id, |_, v| v.as_ref().clone())
+            .unwrap_or_default()
+    }
+
     fn rebuild_index_snapshot(&self, table_id: TableId) {
+        let shadow = self.shadow_targets(table_id);
         let idx_map = self.table_indexes.read();
         let idx_store = self.indexes.read();
         let snap = match idx_map.get(&table_id) {
             Some(ids) => {
                 let mut s = TableIndexSnapshot::default();
+                s.shadow = shadow.clone();
                 for id in ids {
                     let Some(entry) = idx_store.get(id) else {
                         continue;
@@ -555,7 +614,14 @@ impl CatalogCache {
                 }
                 Arc::new(s)
             }
-            None => empty_index_snapshot(),
+            None if shadow.is_empty() => empty_index_snapshot(),
+            // A table with no indexes but a rewrite in flight still needs a
+            // snapshot of its own, because the shared empty one carries no
+            // shadow list
+            None => Arc::new(TableIndexSnapshot {
+                shadow,
+                ..Default::default()
+            }),
         };
         drop(idx_store);
         drop(idx_map);
@@ -1052,6 +1118,8 @@ mod tests {
                 tz_offset_secs: None,
                 element_type: None,
                 attrs: Default::default(),
+                absent_value: None,
+                dropped: false,
             }],
             constraints: vec![],
             created_at: 0,
@@ -1069,6 +1137,9 @@ mod tests {
             lake: Default::default(),
             cluster: Default::default(),
             foreign: Default::default(),
+            schema_epoch: 1,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
         }
     }
 
@@ -1087,6 +1158,7 @@ mod tests {
             index_file_id: 10000,
             index_type: IndexType::BTree,
             parameters: None,
+            state: crate::schema::IndexState::Ready,
         }
     }
 
