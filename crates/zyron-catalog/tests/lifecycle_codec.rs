@@ -51,6 +51,9 @@ fn table_entry_lifecycle_roundtrip() {
         lake: Default::default(),
         cluster: Default::default(),
         foreign: Default::default(),
+        schema_epoch: 0,
+        schema_epochs: Vec::new(),
+        pre_stamp_columns: Vec::new(),
     };
     let bytes = entry.to_bytes();
     let decoded = TableEntry::from_bytes(&bytes).expect("decode");
@@ -86,6 +89,9 @@ fn table_entry_backward_compatible_without_lifecycle() {
         lake: Default::default(),
         cluster: Default::default(),
         foreign: Default::default(),
+        schema_epoch: 0,
+        schema_epochs: Vec::new(),
+        pre_stamp_columns: Vec::new(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.lifecycle, LifecycleConfig::default());
@@ -164,6 +170,9 @@ fn table_entry_columnar_registry_roundtrip() {
         lake: Default::default(),
         cluster: Default::default(),
         foreign: Default::default(),
+        schema_epoch: 0,
+        schema_epochs: Vec::new(),
+        pre_stamp_columns: Vec::new(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.columnar, columnar);
@@ -204,6 +213,9 @@ fn table_entry_lake_tail_roundtrip() {
         lake: LakeConfig::lake(),
         cluster: Default::default(),
         foreign: Default::default(),
+        schema_epoch: 0,
+        schema_epochs: Vec::new(),
+        pre_stamp_columns: Vec::new(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert!(decoded.lake.is_lake());
@@ -227,8 +239,12 @@ fn table_entry_lake_tail_roundtrip() {
     // lake: format, retained-history flag, then the leader it follows as two
     // u32-prefixed strings, both empty on a table that follows nobody
     let lake_len = 1 + 1 + 4 + 4;
+    // schema epochs: the current epoch, then the count of past epochs and the
+    // count of columns stamped before the first one, both empty here. Written
+    // after foreign, so every cut below has to step over it first
+    let epoch_len = 2 + 2 + 2;
 
-    let pre_foreign = TableEntry::from_bytes(&full[..full.len() - foreign_len])
+    let pre_foreign = TableEntry::from_bytes(&full[..full.len() - epoch_len - foreign_len])
         .expect("decode pre-foreign bytes");
     assert!(
         !pre_foreign.foreign.is_foreign(),
@@ -236,15 +252,17 @@ fn table_entry_lake_tail_roundtrip() {
     );
     assert_eq!(pre_foreign.cluster.spec_id, entry.cluster.spec_id);
 
-    let pre_cluster = TableEntry::from_bytes(&full[..full.len() - foreign_len - cluster_len])
-        .expect("decode pre-clustering bytes");
+    let pre_cluster =
+        TableEntry::from_bytes(&full[..full.len() - epoch_len - foreign_len - cluster_len])
+            .expect("decode pre-clustering bytes");
     assert!(pre_cluster.cluster.keys.is_empty());
     assert_eq!(pre_cluster.cluster.spec_id, 0);
     assert!(!pre_cluster.foreign.is_foreign());
 
-    let pre_lake =
-        TableEntry::from_bytes(&full[..full.len() - foreign_len - cluster_len - lake_len])
-            .expect("decode pre-lake bytes");
+    let pre_lake = TableEntry::from_bytes(
+        &full[..full.len() - epoch_len - foreign_len - cluster_len - lake_len],
+    )
+    .expect("decode pre-lake bytes");
     assert!(!pre_lake.lake.is_lake());
 }
 
@@ -275,6 +293,9 @@ fn table_entry_cluster_tail_roundtrip() {
         lake: LakeConfig::default(),
         cluster: Default::default(),
         foreign: Default::default(),
+        schema_epoch: 0,
+        schema_epochs: Vec::new(),
+        pre_stamp_columns: Vec::new(),
     };
     entry.cluster.mode = zyron_common::ClusterMode::Hybrid.to_u8();
     entry.cluster.schedule = zyron_common::ClusteringSchedule::Continuous.to_u8();
@@ -425,6 +446,7 @@ fn constraint_entry_enforced_tail_roundtrip() {
         quarantine_table_id: Some(77),
         without_overlaps: None,
         fk_period: false,
+        validated: true,
     };
     let bytes = entry.to_bytes();
     let mut off = 0usize;
@@ -440,8 +462,8 @@ fn constraint_entry_enforced_tail_roundtrip() {
     // Bytes written before the modes existed decode as enforced and Fail,
     // which is what they meant. The tail here is enforced, on_violation, the
     // quarantine presence byte and its table id, the without-overlaps
-    // presence byte, and the period flag
-    let truncated = &bytes[..bytes.len() - 9];
+    // presence byte, the period flag, and whether the constraint was validated
+    let truncated = &bytes[..bytes.len() - 10];
     let mut off = 0usize;
     let decoded = ConstraintEntry::from_bytes(truncated, &mut off).expect("decode");
     assert!(decoded.enforced);

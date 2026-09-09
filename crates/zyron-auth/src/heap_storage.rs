@@ -481,6 +481,32 @@ impl AuthStorage for HeapAuthStorage {
         Ok(())
     }
 
+    async fn delete_grants_for_object(
+        &self,
+        object_type: ObjectType,
+        object_id: u32,
+    ) -> Result<usize> {
+        // Every match collected in one pass, then deleted. The alternative is
+        // one scan per grant, which is what dropping an object used to cost
+        let mut targets = Vec::new();
+        let guard = self.privileges_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = GrantEntry::from_bytes(view.data)
+                && entry.object_type == object_type
+                && entry.object_id == object_id
+            {
+                targets.push(tid);
+            }
+        });
+        drop(guard);
+
+        let found = targets.len();
+        for tid in targets {
+            self.privileges_heap.delete(tid).await?;
+        }
+        Ok(found)
+    }
+
     // -----------------------------------------------------------------------
     // Classifications
     // -----------------------------------------------------------------------

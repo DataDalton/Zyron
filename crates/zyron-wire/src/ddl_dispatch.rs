@@ -5134,7 +5134,40 @@ async fn drop_table_in_schema(
             TableDropMode::Purge => finalize_recycled_table(server, table.id).await.map(|_| ()),
         };
     }
+    // The row is gone rather than recycled, so the id it held is free to be
+    // issued again. A soft drop keeps both, which is why this is not on that
+    // path: an UNDROP restores the table with the grants it had
+    forget_object_privileges(server, zyron_auth::ObjectType::Table, table.id.0).await?;
     reclaim_table_storage(server, &reclaim).await
+}
+
+/// Drops every privilege recorded against an object that no longer exists.
+///
+/// An id is reissued once the row holding it is gone, so a grant left behind
+/// would decide access to whatever is numbered that next. A node with no
+/// security manager records no privileges, so there is nothing to drop
+async fn forget_object_privileges(
+    server: &Arc<ServerState>,
+    object_type: zyron_auth::ObjectType,
+    object_id: u32,
+) -> Result<(), ProtocolError> {
+    let Some(sm) = server.security_manager.as_ref() else {
+        return Ok(());
+    };
+    let dropped = sm
+        .revoke_all_on_object(object_type, object_id)
+        .await
+        .map_err(ProtocolError::Database)?;
+    if dropped > 0 {
+        tracing::info!(
+            target: "zyron::audit",
+            event = "ObjectPrivilegesForgotten",
+            object_type = ?object_type,
+            object_id,
+            grants = dropped,
+        );
+    }
+    Ok(())
 }
 
 /// Physically purges one soft-dropped table: removes its catalog rows and
@@ -5165,6 +5198,8 @@ pub async fn finalize_recycled_table(
         is_lake: entry.lake.is_lake(),
         columnar_segments: entry.columnar.segments.clone(),
     };
+    // The recycle window closed, so the row and the id go together
+    forget_object_privileges(server, zyron_auth::ObjectType::Table, entry.id.0).await?;
     reclaim_table_storage(server, &reclaim).await?;
     Ok(true)
 }
@@ -12205,8 +12240,12 @@ async fn handle_grant(
                 no_inherit: false,
                 mask_function: None,
             };
-            sm.privilege_store
-                .grant(entry)
+            // Through the manager rather than straight into the privilege
+            // store, because the store is memory. A grant written only there
+            // reports success, decides every check until the node stops, and
+            // is gone when it starts again
+            sm.grant_privilege(entry)
+                .await
                 .map_err(ProtocolError::Database)?;
         }
     }
@@ -12251,8 +12290,19 @@ async fn handle_revoke(
     for priv_ast in &stmt.privileges {
         let priv_types = map_privilege(*priv_ast);
         for pt in priv_types {
-            sm.privilege_store
-                .revoke(grantee.id, pt, zyron_auth::ObjectType::Table, table.id.0);
+            // Through the manager so the row goes with the in-memory entry.
+            // A revoke that cleared only memory would come back as a live
+            // grant on the next start. No CASCADE clause exists on the
+            // statement, so what was delegated onward is left alone
+            sm.revoke_privilege(
+                grantee.id,
+                pt,
+                zyron_auth::ObjectType::Table,
+                table.id.0,
+                false,
+            )
+            .await
+            .map_err(ProtocolError::Database)?;
         }
     }
 
@@ -13682,22 +13732,51 @@ async fn handle_create_streaming_job(
         ))
     })?;
 
-    // Reconstruct a SecurityContext for the runner thread. Use the session
-    // context when available, otherwise rehydrate from the snapshot bytes.
+    // Reconstruct a SecurityContext for the runner thread from the session's
+    // own when it has one.
+    //
+    // The session the applier builds to replay a statement carries no
+    // security context, so requiring one here would let this statement run on
+    // the node it was typed at and fail on every other member of the group.
+    // The actor the statement was agreed under is what the replayed form
+    // stands on, the same role that decides what an object this creates is
+    // owned by
     let security_ctx = {
         let session_ref = session
             .as_ref()
             .ok_or(ProtocolError::Malformed("no active session".into()))?;
-        let ctx_ref = session_ref.security_context.as_ref().ok_or_else(|| {
-            ProtocolError::Database(ZyronError::AuthenticationFailed(
-                "session has no security context".to_string(),
-            ))
-        })?;
-        let snap = zyron_auth::SecurityContextSnapshot::from_context(ctx_ref);
-        let limits = security_manager
-            .query_limits
-            .get_limits(&ctx_ref.effective_roles);
-        snap.into_context(limits)
+        match session_ref.security_context.as_ref() {
+            Some(ctx_ref) => {
+                let snap = zyron_auth::SecurityContextSnapshot::from_context(ctx_ref);
+                let limits = security_manager
+                    .query_limits
+                    .get_limits(&ctx_ref.effective_roles);
+                snap.into_context(limits)
+            }
+            None => {
+                let role = zyron_auth::RoleId(actor_role_id(session));
+                let roles = vec![role];
+                let attributes = zyron_auth::SessionAttributes {
+                    role_id: role,
+                    department: None,
+                    region: None,
+                    clearance: zyron_auth::ClassificationLevel::Public,
+                    ip_address: "127.0.0.1".to_string(),
+                    connection_time: now_secs(),
+                    custom: std::collections::HashMap::new(),
+                };
+                zyron_auth::SecurityContext::new(
+                    zyron_auth::UserId(0),
+                    role,
+                    roles.clone(),
+                    roles.clone(),
+                    zyron_auth::ClassificationLevel::Public,
+                    attributes,
+                    None,
+                    security_manager.query_limits.get_limits(&roles),
+                )
+            }
+        }
     };
 
     // Reload the entry so spawn calls see the catalog-assigned id.
@@ -17470,6 +17549,8 @@ mod nested_shape_wiring_tests {
                 nested_shape: shape,
                 ..ColumnAttributes::default()
             },
+            absent_value: None,
+            dropped: false,
         }
     }
 

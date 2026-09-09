@@ -689,6 +689,7 @@ async fn test_ddl_persistence() {
                 &["email".to_string()],
                 true,
                 IndexType::BTree,
+                IndexState::Ready,
             )
             .await
             .unwrap();
@@ -701,6 +702,7 @@ async fn test_ddl_persistence() {
                 &["name".to_string(), "age".to_string()],
                 false,
                 IndexType::BTree,
+                IndexState::Ready,
             )
             .await
             .unwrap();
@@ -1260,6 +1262,7 @@ async fn test_ddl_create_drop() {
             &["id".to_string()],
             false,
             IndexType::BTree,
+            IndexState::Ready,
         )
         .await
         .unwrap();

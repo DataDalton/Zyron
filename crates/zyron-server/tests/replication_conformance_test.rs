@@ -186,12 +186,502 @@ fn analyzed_rows(node: &Node) -> String {
     }
 }
 
+/// Every function a node holds, with the body that decides what it returns.
+///
+/// The body is in the rendering because a REPLACE rewrites it and a member
+/// that kept the old one would agree on the name and compute something else
+fn functions(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_functions()
+            .iter()
+            .map(|f| format!("{}/{}/{}", f.name, f.param_types.len(), f.body_sql))
+            .collect(),
+    )
+}
+
+/// Every aggregate a node holds, with the functions it folds through
+fn aggregates(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_aggregates()
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}/{}/{}",
+                    a.name,
+                    a.sfunc_name,
+                    a.finalfunc_name.as_deref().unwrap_or("none")
+                )
+            })
+            .collect(),
+    )
+}
+
 fn tables(node: &Node) -> String {
     render(
         node.catalog
             .list_all_tables()
             .iter()
             .map(|t| format!("{}:{}", t.name, t.columns.len()))
+            .collect(),
+    )
+}
+
+/// The security manager a node holds.
+///
+/// Roles, users and grants are not catalog objects, so the probes over them
+/// read here rather than through the node's catalog. Every node in this
+/// harness carries one, which is what makes a privilege statement legal
+fn security(node: &Node) -> &zyron_auth::SecurityManager {
+    node._server
+        .security_manager
+        .as_deref()
+        .expect("every node in this harness carries a security manager")
+}
+
+/// The roles and users the privilege cases name.
+///
+/// A fixed list rather than everything the store holds, because the harness
+/// creates principals of its own and a probe over all of them would report a
+/// difference no case caused
+const PRINCIPALS: &[&str] = &[
+    "conf_role",
+    "conf_role_rn",
+    "conf_role_rn2",
+    "conf_role_drop",
+    "conf_role_grant",
+    "conf_role_revoke",
+    "conf_role_exec",
+    "conf_role_exec_rv",
+    "conf_user",
+    "conf_user_rn",
+    "conf_user_rn2",
+    "conf_user_drop",
+];
+
+/// Which of those principals this node holds.
+///
+/// Read by name rather than by id, because an id is allocated by whichever
+/// node runs the statement and two members holding the same principal can
+/// number it differently while agreeing on everything a grant is written
+/// against. A user carries a companion role, so both kinds are rendered and a
+/// member that created one without the other reads differently here
+fn principals(node: &Node) -> String {
+    let sm = security(node);
+    let mut items = Vec::new();
+    for name in PRINCIPALS {
+        if sm.lookup_role(name).is_some() {
+            items.push(format!("role:{name}"));
+        }
+        if sm.lookup_user(name).is_some() {
+            items.push(format!("user:{name}"));
+        }
+    }
+    render(items)
+}
+
+/// Every privilege those principals hold on this node.
+///
+/// The object kind and id are in the rendering because a grant that landed on
+/// a different object than the leader recorded would agree on the privilege
+/// and open a different table. The state is in it because a DENY and a GRANT
+/// are the same entry with opposite meanings
+fn grants(node: &Node) -> String {
+    let sm = security(node);
+    let mut items = Vec::new();
+    for name in PRINCIPALS {
+        let Some(role) = sm.lookup_role(name) else {
+            continue;
+        };
+        for g in sm.privilege_store.grants_for_role(role.id) {
+            items.push(format!(
+                "{name}:{:?}:{:?}:{}:{:?}",
+                g.privilege, g.object_type, g.object_id, g.state
+            ));
+        }
+    }
+    render(items)
+}
+
+/// Every index a node holds.
+///
+/// The column list and the uniqueness are in the rendering because an index
+/// that arrived naming different columns would agree on the name and answer
+/// different rows, and a search index carries the kind it was built as
+fn indexes(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_indexes()
+            .iter()
+            .map(|i| {
+                let cols: Vec<String> = i
+                    .columns
+                    .iter()
+                    .map(|c| c.column_id.0.to_string())
+                    .collect();
+                format!("{}:{}:{}", i.name, cols.join("+"), i.unique)
+            })
+            .collect(),
+    )
+}
+
+/// Every view, with the query it stands for. A member holding the name and a
+/// different definition would answer a different table
+fn views(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_views()
+            .iter()
+            .map(|v| format!("{}:{}", v.name, v.definition_sql.len()))
+            .collect(),
+    )
+}
+
+fn mviews(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_mviews()
+            .iter()
+            .map(|v| format!("{}:{}", v.name, v.definition_sql.len()))
+            .collect(),
+    )
+}
+
+/// Every sequence with the bounds that decide what it hands out next
+fn sequences(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_sequences()
+            .iter()
+            .map(|s| format!("{}:{}:{}:{}", s.name, s.increment, s.min_value, s.max_value))
+            .collect(),
+    )
+}
+
+/// The schemas the schema cases name.
+///
+/// Named rather than listed, because a node registers the `zyron_sys` schemas
+/// its own system catalog needs as it starts and on first use, so two members
+/// list different system schemas without any statement having run
+fn schemas(node: &Node) -> String {
+    const NAMED: &[&str] = &["conf_schema", "conf_schema_drop"];
+    let held = node.catalog.list_schemas();
+    render(
+        NAMED
+            .iter()
+            .filter(|name| held.iter().any(|s| s.name == **name))
+            .map(|name| name.to_string())
+            .collect(),
+    )
+}
+
+/// Every procedure with its parameter count and body length, so a member that
+/// stored a different body fails rather than agreeing on the name
+fn procedures(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_procedures()
+            .iter()
+            .map(|p| format!("{}:{}:{}", p.name, p.param_names.len(), p.body_sql.len()))
+            .collect(),
+    )
+}
+
+/// Every trigger with when it fires and what it fires on
+fn triggers(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_triggers()
+            .iter()
+            .map(|t| format!("{}:{}:{}:{}", t.name, t.table_id, t.timing, t.events))
+            .collect(),
+    )
+}
+
+/// Every comment, which is the object it is on and the text
+fn comments(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_comments()
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}:{}:{}:{}",
+                    c.object_type, c.object_name, c.column_name, c.comment
+                )
+            })
+            .collect(),
+    )
+}
+
+fn publications(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_publications()
+            .iter()
+            .map(|p| format!("{}:{}", p.name, p.id))
+            .collect(),
+    )
+}
+
+/// Which tables each publication carries.
+///
+/// Membership lives in rows of its own, so the publication row is unchanged
+/// by an ADD TABLE and reading it alone would call the statement a no-op
+fn publication_tables(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_publications()
+            .iter()
+            .map(|p| {
+                let mut tables: Vec<String> = node
+                    .catalog
+                    .list_publication_tables(p.id)
+                    .iter()
+                    .map(|t| t.table_id.0.to_string())
+                    .collect();
+                tables.sort();
+                format!("{}:[{}]", p.name, tables.join(","))
+            })
+            .collect(),
+    )
+}
+
+/// The tags each publication carries, which is all TAG and UNTAG change
+fn publication_tags(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_publications()
+            .iter()
+            .map(|p| {
+                let mut tags = p.tags.clone();
+                tags.sort();
+                format!("{}:[{}]", p.name, tags.join(","))
+            })
+            .collect(),
+    )
+}
+
+/// The expectations each table carries, which is what an ADD or DROP
+/// EXPECTATION changes and nothing else about the table does
+fn expectations(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .flat_map(|t| {
+                t.expectations
+                    .iter()
+                    .map(|e| format!("{}:{}", t.name, e.name))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    )
+}
+
+/// The change feed flags a table carries, which is what ENABLE and DISABLE
+/// FEATURE move and nothing else on the table does
+fn table_features(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{}:{}:{}",
+                    t.name, t.cdf_enabled, t.versioning_enabled, t.lifecycle.soft_delete_enabled
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The classification each column carries.
+///
+/// Read out of the security manager rather than the column row, because that
+/// is where a classification is recorded and a probe over the catalog would
+/// call the statement a no-op
+fn column_classifications(node: &Node) -> String {
+    let sm = security(node);
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .flat_map(|t| {
+                sm.classification_store
+                    .classifications_for_table(t.id.0)
+                    .iter()
+                    .map(|c| format!("{}:{}:{:?}", t.name, c.column_id, c.level))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    )
+}
+
+/// Which tables are foreign, and where they point. A foreign table is a
+/// catalog row like any other, so what proves it is the target it names
+fn foreign_tables(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .filter(|t| t.foreign.is_foreign())
+            .map(|t| format!("{}:{}:{}", t.name, t.foreign.peer, t.foreign.table))
+            .collect(),
+    )
+}
+
+/// The branches a node holds. A branch is not a catalog object, so this
+/// reads the branch manager the server was built with
+fn branches(node: &Node) -> String {
+    let Some(mgr) = node._server.branch_manager.as_ref() else {
+        return String::new();
+    };
+    render(mgr.list_branches().iter().map(|b| b.name.clone()).collect())
+}
+
+/// The table options a SET clause writes, which live on the lifecycle and
+/// retention fields rather than on the column list
+fn table_options(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{}:{}",
+                    t.name, t.time_travel_retention_secs, t.cdf_retention_days
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The row TTL a table carries, which is the column it reads and how long
+fn table_ttl(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{}:{}:{}",
+                    t.name,
+                    t.lifecycle.ttl_column_id,
+                    t.lifecycle.ttl_seconds,
+                    t.lifecycle.ttl_action
+                )
+            })
+            .collect(),
+    )
+}
+
+/// How a table is clustered, which is the keys and the mode a CLUSTER BY sets
+fn table_clustering(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .map(|t| {
+                let keys: Vec<String> = t
+                    .cluster
+                    .keys
+                    .iter()
+                    .map(|k| k.column_id.to_string())
+                    .collect();
+                format!(
+                    "{}:{}:{}:[{}]",
+                    t.name,
+                    t.cluster.mode,
+                    t.cluster.schedule,
+                    keys.join("+")
+                )
+            })
+            .collect(),
+    )
+}
+
+fn pipelines(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_pipelines()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect(),
+    )
+}
+
+/// Every schedule with whether it is paused, which is what PAUSE and RESUME
+/// change and nothing else about the row does
+fn schedules(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_schedules()
+            .iter()
+            .map(|s| format!("{}:{}", s.name, s.paused))
+            .collect(),
+    )
+}
+
+fn event_handlers(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_event_handlers()
+            .iter()
+            .map(|h| h.name.clone())
+            .collect(),
+    )
+}
+
+fn version_tags(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_version_tags()
+            .iter()
+            .map(|v| v.name.clone())
+            .collect(),
+    )
+}
+
+fn security_maps(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_security_maps()
+            .iter()
+            .map(|m| format!("{:?}:{}:{}", m.kind, m.key, m.role_id))
+            .collect(),
+    )
+}
+
+fn streaming_jobs(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_streaming_jobs()
+            .iter()
+            .map(|j| format!("{}:{}", j.name, j.select_sql.len()))
+            .collect(),
+    )
+}
+
+/// Tables with the columns they carry, so an ALTER that changed a column
+/// reads differently from one that changed nothing.
+///
+/// Live columns only. A dropped column keeps its row and its ordinal so the
+/// rows written before the drop still decode, and a probe over every column
+/// would read a drop as having changed nothing
+fn table_columns(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .map(|t| {
+                let cols: Vec<String> = t
+                    .live_columns()
+                    .map(|c| format!("{}:{}", c.name, c.type_id as u8))
+                    .collect();
+                format!("{}[{}]", t.name, cols.join(","))
+            })
             .collect(),
     )
 }
@@ -524,6 +1014,35 @@ const CASES: &[Case] = &[
         proof: Proof::Catalog(analyzed_rows),
     },
     Case {
+        name: "CREATE FUNCTION",
+        setup: &[],
+        sql: "CREATE FUNCTION conf_fn(x BIGINT) RETURNS BIGINT AS 'x * 2' LANGUAGE SQL",
+        proof: Proof::Catalog(functions),
+    },
+    Case {
+        name: "DROP FUNCTION",
+        setup: &["CREATE FUNCTION conf_fn_drop(x BIGINT) RETURNS BIGINT AS 'x + 1' LANGUAGE SQL"],
+        sql: "DROP FUNCTION conf_fn_drop",
+        proof: Proof::Catalog(functions),
+    },
+    Case {
+        name: "CREATE AGGREGATE",
+        setup: &[
+            "CREATE FUNCTION conf_agg_add(acc INT, val INT) RETURNS INT AS 'acc + val'              LANGUAGE SQL",
+        ],
+        sql: "CREATE AGGREGATE conf_agg(val INT) (SFUNC = conf_agg_add, STYPE = INT,               INITCOND = '0')",
+        proof: Proof::Catalog(aggregates),
+    },
+    Case {
+        name: "DROP AGGREGATE",
+        setup: &[
+            "CREATE FUNCTION conf_agg_add_d(acc INT, val INT) RETURNS INT AS 'acc + val'              LANGUAGE SQL",
+            "CREATE AGGREGATE conf_agg_drop(val INT) (SFUNC = conf_agg_add_d, STYPE = INT,              INITCOND = '0')",
+        ],
+        sql: "DROP AGGREGATE conf_agg_drop",
+        proof: Proof::Catalog(aggregates),
+    },
+    Case {
         name: "CREATE TABLE",
         setup: &[],
         sql: "CREATE TABLE conf_tbl (id BIGINT PRIMARY KEY, v BIGINT)",
@@ -535,6 +1054,537 @@ const CASES: &[Case] = &[
         sql: "DROP TABLE conf_tbl_drop",
         proof: Proof::Catalog(tables),
     },
+    // Roles, users and grants.
+    //
+    // These reach a member the same way every other statement does and are
+    // read back out of the security manager rather than the catalog. A member
+    // that agreed the statement and never ran it holds no role, so a login
+    // that the leader refuses would be let through there
+    Case {
+        name: "CREATE ROLE",
+        setup: &[],
+        sql: "CREATE ROLE conf_role",
+        proof: Proof::Catalog(principals),
+    },
+    Case {
+        name: "ALTER ROLE",
+        setup: &["CREATE ROLE conf_role_rn"],
+        sql: "ALTER ROLE conf_role_rn RENAME TO conf_role_rn2",
+        proof: Proof::Catalog(principals),
+    },
+    Case {
+        name: "DROP ROLE",
+        setup: &["CREATE ROLE conf_role_drop"],
+        sql: "DROP ROLE conf_role_drop",
+        proof: Proof::Catalog(principals),
+    },
+    Case {
+        name: "CREATE USER",
+        setup: &[],
+        sql: "CREATE USER conf_user WITH PASSWORD 'conf_pw_create'",
+        proof: Proof::Catalog(principals),
+    },
+    Case {
+        name: "ALTER USER",
+        setup: &["CREATE USER conf_user_rn WITH PASSWORD 'conf_pw_rename'"],
+        sql: "ALTER USER conf_user_rn RENAME TO conf_user_rn2",
+        proof: Proof::Catalog(principals),
+    },
+    Case {
+        name: "DROP USER",
+        setup: &["CREATE USER conf_user_drop WITH PASSWORD 'conf_pw_drop'"],
+        sql: "DROP USER conf_user_drop",
+        proof: Proof::Catalog(principals),
+    },
+    Case {
+        name: "GRANT",
+        setup: &[
+            "CREATE ROLE conf_role_grant",
+            "CREATE TABLE conf_grant_t (id BIGINT PRIMARY KEY)",
+        ],
+        sql: "GRANT SELECT ON conf_grant_t TO conf_role_grant",
+        proof: Proof::Catalog(grants),
+    },
+    Case {
+        name: "REVOKE",
+        setup: &[
+            "CREATE ROLE conf_role_revoke",
+            "CREATE TABLE conf_revoke_t (id BIGINT PRIMARY KEY)",
+            "GRANT SELECT ON conf_revoke_t TO conf_role_revoke",
+        ],
+        sql: "REVOKE SELECT ON conf_revoke_t FROM conf_role_revoke",
+        proof: Proof::Catalog(grants),
+    },
+    // Indexes. A member holding the catalog row and no built index answers
+    // the same rows more slowly, so what these prove is the row; the build
+    // itself is the online DDL suite's subject
+    Case {
+        name: "CREATE INDEX",
+        setup: &["CREATE TABLE conf_ix_t (id BIGINT PRIMARY KEY, v BIGINT)"],
+        sql: "CREATE INDEX conf_ix ON conf_ix_t (v)",
+        proof: Proof::Catalog(indexes),
+    },
+    Case {
+        name: "DROP INDEX",
+        setup: &[
+            "CREATE TABLE conf_ix_d_t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE INDEX conf_ix_d ON conf_ix_d_t (v)",
+        ],
+        sql: "DROP INDEX conf_ix_d",
+        proof: Proof::Catalog(indexes),
+    },
+    Case {
+        name: "CREATE FULLTEXT INDEX",
+        setup: &["CREATE TABLE conf_ft_t (id BIGINT PRIMARY KEY, body TEXT)"],
+        sql: "CREATE FULLTEXT INDEX conf_ft ON conf_ft_t (body)",
+        proof: Proof::Catalog(indexes),
+    },
+    Case {
+        name: "CREATE VECTOR INDEX",
+        setup: &["CREATE TABLE conf_vec_t (id BIGINT PRIMARY KEY, embedding VECTOR(4))"],
+        sql: "CREATE VECTOR INDEX conf_vec ON conf_vec_t (embedding) WITH (metric = 'cosine')",
+        proof: Proof::Catalog(indexes),
+    },
+    Case {
+        name: "CREATE SPATIAL INDEX",
+        setup: &["CREATE TABLE conf_geo_t (id BIGINT PRIMARY KEY, p GEOMETRY)"],
+        sql: "CREATE SPATIAL INDEX conf_geo ON conf_geo_t (p)",
+        proof: Proof::Catalog(indexes),
+    },
+    // Views
+    Case {
+        name: "CREATE VIEW",
+        setup: &["CREATE TABLE conf_v_src (id BIGINT PRIMARY KEY, v BIGINT)"],
+        sql: "CREATE VIEW conf_v AS SELECT id, v FROM conf_v_src",
+        proof: Proof::Catalog(views),
+    },
+    Case {
+        name: "DROP VIEW",
+        setup: &[
+            "CREATE TABLE conf_v_d_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE VIEW conf_v_d AS SELECT id FROM conf_v_d_src",
+        ],
+        sql: "DROP VIEW conf_v_d",
+        proof: Proof::Catalog(views),
+    },
+    Case {
+        name: "CREATE MATERIALIZED VIEW",
+        setup: &["CREATE TABLE conf_mvc_src (id BIGINT PRIMARY KEY, v BIGINT)"],
+        sql: "CREATE MATERIALIZED VIEW conf_mvc AS SELECT id, v FROM conf_mvc_src",
+        proof: Proof::Catalog(mviews),
+    },
+    Case {
+        name: "DROP MATERIALIZED VIEW",
+        setup: &[
+            "CREATE TABLE conf_mv_d_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE MATERIALIZED VIEW conf_mv_d AS SELECT id FROM conf_mv_d_src",
+        ],
+        sql: "DROP MATERIALIZED VIEW conf_mv_d",
+        proof: Proof::Catalog(mviews),
+    },
+    // Sequences
+    Case {
+        name: "CREATE SEQUENCE",
+        setup: &[],
+        sql: "CREATE SEQUENCE conf_seq",
+        proof: Proof::Catalog(sequences),
+    },
+    Case {
+        name: "ALTER SEQUENCE",
+        setup: &["CREATE SEQUENCE conf_seq_alt"],
+        sql: "ALTER SEQUENCE conf_seq_alt MAXVALUE 500",
+        proof: Proof::Catalog(sequences),
+    },
+    Case {
+        name: "DROP SEQUENCE",
+        setup: &["CREATE SEQUENCE conf_seq_drop"],
+        sql: "DROP SEQUENCE conf_seq_drop",
+        proof: Proof::Catalog(sequences),
+    },
+    // Schemas
+    Case {
+        name: "CREATE SCHEMA",
+        setup: &[],
+        sql: "CREATE SCHEMA conf_schema",
+        proof: Proof::Catalog(schemas),
+    },
+    Case {
+        name: "DROP SCHEMA",
+        setup: &["CREATE SCHEMA conf_schema_drop"],
+        sql: "DROP SCHEMA conf_schema_drop",
+        proof: Proof::Catalog(schemas),
+    },
+    // Procedures
+    Case {
+        name: "CREATE PROCEDURE",
+        setup: &["CREATE TABLE conf_proc_t (id BIGINT PRIMARY KEY)"],
+        sql: "CREATE PROCEDURE conf_proc(v BIGINT) AS \
+              'INSERT INTO zyron_test.conf_proc_t (id) VALUES ($1)' LANGUAGE SQL",
+        proof: Proof::Catalog(procedures),
+    },
+    Case {
+        name: "DROP PROCEDURE",
+        setup: &[
+            "CREATE TABLE conf_proc_d_t (id BIGINT PRIMARY KEY)",
+            "CREATE PROCEDURE conf_proc_d(v BIGINT) AS \
+             'INSERT INTO zyron_test.conf_proc_d_t (id) VALUES ($1)' LANGUAGE SQL",
+        ],
+        sql: "DROP PROCEDURE conf_proc_d",
+        proof: Proof::Catalog(procedures),
+    },
+    // Comments
+    Case {
+        name: "COMMENT ON",
+        setup: &["CREATE TABLE conf_cmt_t (id BIGINT PRIMARY KEY, v BIGINT)"],
+        sql: "COMMENT ON TABLE conf_cmt_t IS 'what this table is for'",
+        proof: Proof::Catalog(comments),
+    },
+    // Publications
+    Case {
+        name: "CREATE PUBLICATION",
+        setup: &["CREATE TABLE conf_pub_t (id BIGINT PRIMARY KEY)"],
+        sql: "CREATE PUBLICATION conf_pub FOR TABLE conf_pub_t",
+        proof: Proof::Catalog(publications),
+    },
+    Case {
+        name: "DROP PUBLICATION",
+        setup: &[
+            "CREATE TABLE conf_pub_d_t (id BIGINT PRIMARY KEY)",
+            "CREATE PUBLICATION conf_pub_d FOR TABLE conf_pub_d_t",
+        ],
+        sql: "DROP PUBLICATION conf_pub_d",
+        proof: Proof::Catalog(publications),
+    },
+    // Table shape. `tables` counts columns and `table_columns` names them, so
+    // an ALTER that renamed one is not read as an ALTER that did nothing
+    Case {
+        name: "ALTER TABLE ADD COLUMN",
+        setup: &["CREATE TABLE conf_at_add (id BIGINT PRIMARY KEY)"],
+        sql: "ALTER TABLE conf_at_add ADD COLUMN extra BIGINT",
+        proof: Proof::Catalog(table_columns),
+    },
+    Case {
+        name: "ALTER TABLE DROP COLUMN",
+        setup: &["CREATE TABLE conf_at_drop (id BIGINT PRIMARY KEY, gone BIGINT)"],
+        sql: "ALTER TABLE conf_at_drop DROP COLUMN gone",
+        proof: Proof::Catalog(table_columns),
+    },
+    Case {
+        name: "ALTER TABLE RENAME COLUMN",
+        setup: &["CREATE TABLE conf_at_ren (id BIGINT PRIMARY KEY, before_name BIGINT)"],
+        sql: "ALTER TABLE conf_at_ren RENAME COLUMN before_name TO after_name",
+        proof: Proof::Catalog(table_columns),
+    },
+    Case {
+        name: "ALTER INDEX",
+        setup: &[
+            "CREATE TABLE conf_ix_r_t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE INDEX conf_ix_before ON conf_ix_r_t (v)",
+        ],
+        sql: "ALTER INDEX conf_ix_before RENAME TO conf_ix_after",
+        proof: Proof::Catalog(indexes),
+    },
+    Case {
+        name: "ALTER VIEW",
+        setup: &[
+            "CREATE TABLE conf_v_r_src (id BIGINT PRIMARY KEY)",
+            "CREATE VIEW conf_v_before AS SELECT id FROM conf_v_r_src",
+        ],
+        sql: "ALTER VIEW conf_v_before RENAME TO conf_v_after",
+        proof: Proof::Catalog(views),
+    },
+    // Triggers
+    // A trigger and an event handler both run a procedure rather than a
+    // function, so the thing they name is created with CREATE PROCEDURE
+    Case {
+        name: "CREATE TRIGGER",
+        setup: &[
+            "CREATE TABLE conf_trg_t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE PROCEDURE conf_trg_fn() AS \
+             'INSERT INTO zyron_test.conf_trg_t (id) VALUES (99)' LANGUAGE SQL",
+        ],
+        sql: "CREATE TRIGGER conf_trg BEFORE INSERT ON conf_trg_t \
+              FOR EACH ROW EXECUTE FUNCTION conf_trg_fn",
+        proof: Proof::Catalog(triggers),
+    },
+    Case {
+        name: "DROP TRIGGER",
+        setup: &[
+            "CREATE TABLE conf_trg_d_t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE PROCEDURE conf_trg_d_fn() AS \
+             'INSERT INTO zyron_test.conf_trg_d_t (id) VALUES (99)' LANGUAGE SQL",
+            "CREATE TRIGGER conf_trg_d BEFORE INSERT ON conf_trg_d_t \
+             FOR EACH ROW EXECUTE FUNCTION conf_trg_d_fn",
+        ],
+        sql: "DROP TRIGGER conf_trg_d ON conf_trg_d_t",
+        proof: Proof::Catalog(triggers),
+    },
+    // Schedules. PAUSE and RESUME change one field and nothing else, which is
+    // why the probe renders it
+    Case {
+        name: "CREATE SCHEDULE",
+        setup: &["CREATE TABLE conf_sch_t (id BIGINT PRIMARY KEY)"],
+        sql: "CREATE SCHEDULE conf_sch EVERY 5 MINUTES \
+              DO INSERT INTO conf_sch_t (id) VALUES (1)",
+        proof: Proof::Catalog(schedules),
+    },
+    Case {
+        name: "PAUSE SCHEDULE",
+        setup: &[
+            "CREATE TABLE conf_sch_p_t (id BIGINT PRIMARY KEY)",
+            "CREATE SCHEDULE conf_sch_p EVERY 5 MINUTES \
+             DO INSERT INTO conf_sch_p_t (id) VALUES (1)",
+        ],
+        sql: "PAUSE SCHEDULE conf_sch_p",
+        proof: Proof::Catalog(schedules),
+    },
+    Case {
+        name: "RESUME SCHEDULE",
+        setup: &[
+            "CREATE TABLE conf_sch_r_t (id BIGINT PRIMARY KEY)",
+            "CREATE SCHEDULE conf_sch_r EVERY 5 MINUTES \
+             DO INSERT INTO conf_sch_r_t (id) VALUES (1)",
+            "PAUSE SCHEDULE conf_sch_r",
+        ],
+        sql: "RESUME SCHEDULE conf_sch_r",
+        proof: Proof::Catalog(schedules),
+    },
+    Case {
+        name: "DROP SCHEDULE",
+        setup: &[
+            "CREATE TABLE conf_sch_d_t (id BIGINT PRIMARY KEY)",
+            "CREATE SCHEDULE conf_sch_d EVERY 5 MINUTES \
+             DO INSERT INTO conf_sch_d_t (id) VALUES (1)",
+        ],
+        sql: "DROP SCHEDULE conf_sch_d",
+        proof: Proof::Catalog(schedules),
+    },
+    // Pipelines
+    Case {
+        name: "CREATE PIPELINE",
+        setup: &[
+            "CREATE TABLE conf_pipec_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_pipec_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+        ],
+        sql: "CREATE PIPELINE conf_pipec AS \
+              (STAGE load (SOURCE conf_pipec_src, TARGET conf_pipec_tgt))",
+        proof: Proof::Catalog(pipelines),
+    },
+    Case {
+        name: "DROP PIPELINE",
+        setup: &[
+            "CREATE TABLE conf_piped_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_piped_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE PIPELINE conf_piped AS \
+             (STAGE load (SOURCE conf_piped_src, TARGET conf_piped_tgt))",
+        ],
+        sql: "DROP PIPELINE conf_piped",
+        proof: Proof::Catalog(pipelines),
+    },
+    // Event handlers
+    Case {
+        name: "CREATE EVENT HANDLER",
+        setup: &[
+            "CREATE TABLE conf_eh_t (id BIGINT PRIMARY KEY)",
+            "CREATE PROCEDURE conf_eh_fn() AS \
+             'INSERT INTO zyron_test.conf_eh_t (id) VALUES (1)' LANGUAGE SQL",
+        ],
+        sql: "CREATE EVENT HANDLER conf_eh WHEN PipelineCompleted EXECUTE FUNCTION conf_eh_fn",
+        proof: Proof::Catalog(event_handlers),
+    },
+    Case {
+        name: "DROP EVENT HANDLER",
+        setup: &[
+            "CREATE TABLE conf_eh_d_t (id BIGINT PRIMARY KEY)",
+            "CREATE PROCEDURE conf_eh_d_fn() AS \
+             'INSERT INTO zyron_test.conf_eh_d_t (id) VALUES (1)' LANGUAGE SQL",
+            "CREATE EVENT HANDLER conf_eh_d WHEN PipelineCompleted \
+             EXECUTE FUNCTION conf_eh_d_fn",
+        ],
+        sql: "DROP EVENT HANDLER conf_eh_d",
+        proof: Proof::Catalog(event_handlers),
+    },
+    // Version tags
+    Case {
+        name: "CREATE VERSION",
+        setup: &["CREATE TABLE conf_ver_t (id BIGINT PRIMARY KEY)"],
+        sql: "CREATE VERSION conf_ver ON conf_ver_t",
+        proof: Proof::Catalog(version_tags),
+    },
+    Case {
+        name: "DROP VERSION",
+        setup: &[
+            "CREATE TABLE conf_ver_d_t (id BIGINT PRIMARY KEY)",
+            "CREATE VERSION conf_ver_d ON conf_ver_d_t",
+        ],
+        sql: "DROP VERSION conf_ver_d",
+        proof: Proof::Catalog(version_tags),
+    },
+    // Publications beyond create and drop
+    Case {
+        name: "ALTER PUBLICATION",
+        setup: &[
+            "CREATE TABLE conf_pub_a_t (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE conf_pub_a_t2 (id BIGINT PRIMARY KEY)",
+            "CREATE PUBLICATION conf_pub_a FOR TABLE conf_pub_a_t",
+        ],
+        sql: "ALTER PUBLICATION conf_pub_a ADD TABLE conf_pub_a_t2",
+        proof: Proof::Catalog(publication_tables),
+    },
+    Case {
+        name: "TAG PUBLICATION",
+        setup: &[
+            "CREATE TABLE conf_pub_tag_t (id BIGINT PRIMARY KEY)",
+            "CREATE PUBLICATION conf_pub_tag FOR TABLE conf_pub_tag_t",
+        ],
+        sql: "TAG PUBLICATION conf_pub_tag WITH '#conf'",
+        proof: Proof::Catalog(publication_tags),
+    },
+    Case {
+        name: "UNTAG PUBLICATION",
+        setup: &[
+            "CREATE TABLE conf_pub_untag_t (id BIGINT PRIMARY KEY)",
+            "CREATE PUBLICATION conf_pub_untag FOR TABLE conf_pub_untag_t",
+            "TAG PUBLICATION conf_pub_untag WITH '#conf_gone'",
+        ],
+        sql: "UNTAG PUBLICATION conf_pub_untag '#conf_gone'",
+        proof: Proof::Catalog(publication_tags),
+    },
+    // Security maps
+    Case {
+        name: "ALTER SECURITY MAP",
+        setup: &["CREATE ROLE conf_map_role"],
+        sql: "ALTER SECURITY MAP JWT ISSUER 'https://conf' SUBJECT 'conf_subject' \
+              TO ROLE 'conf_map_role'",
+        proof: Proof::Catalog(security_maps),
+    },
+    Case {
+        name: "DROP SECURITY MAP",
+        setup: &[
+            "CREATE ROLE conf_map_d_role",
+            "ALTER SECURITY MAP JWT ISSUER 'https://conf_d' SUBJECT 'conf_subject_d' \
+             TO ROLE 'conf_map_d_role'",
+        ],
+        sql: "DROP SECURITY MAP JWT ISSUER 'https://conf_d' SUBJECT 'conf_subject_d'",
+        proof: Proof::Catalog(security_maps),
+    },
+    // Table options and shape beyond columns
+    Case {
+        name: "TRUNCATE",
+        setup: &[
+            "CREATE TABLE conf_trunc (id BIGINT PRIMARY KEY, v BIGINT)",
+            "INSERT INTO conf_trunc (id, v) VALUES (1, 10), (2, 20)",
+        ],
+        sql: "TRUNCATE TABLE conf_trunc",
+        proof: Proof::Rows("conf_trunc"),
+    },
+    Case {
+        name: "ALTER TABLE SET options",
+        setup: &["CREATE TABLE conf_opt (id BIGINT PRIMARY KEY)"],
+        sql: "ALTER TABLE conf_opt SET (time_travel_retention = '7 days')",
+        proof: Proof::Catalog(table_options),
+    },
+    Case {
+        name: "ALTER TABLE SET TTL",
+        setup: &["CREATE TABLE conf_ttl (id BIGINT PRIMARY KEY, expires_at TIMESTAMP)"],
+        sql: "ALTER TABLE conf_ttl SET TTL 15 MINUTES ON expires_at",
+        proof: Proof::Catalog(table_ttl),
+    },
+    Case {
+        name: "ALTER TABLE CLUSTER BY",
+        setup: &["CREATE TABLE conf_clus (id BIGINT PRIMARY KEY, v BIGINT)"],
+        sql: "ALTER TABLE conf_clus CLUSTER BY (v) AUTO",
+        proof: Proof::Catalog(table_clustering),
+    },
+    Case {
+        name: "ALTER TABLE ADD EXPECTATION",
+        setup: &["CREATE TABLE conf_exp (id BIGINT PRIMARY KEY, amount BIGINT)"],
+        sql: "ALTER TABLE conf_exp ADD EXPECTATION conf_exp_pos \
+              EXPECT amount > 0 ON VIOLATION WARN",
+        proof: Proof::Catalog(expectations),
+    },
+    Case {
+        name: "ALTER TABLE DROP EXPECTATION",
+        setup: &[
+            "CREATE TABLE conf_exp_d (id BIGINT PRIMARY KEY, amount BIGINT)",
+            "ALTER TABLE conf_exp_d ADD EXPECTATION conf_exp_gone \
+             EXPECT amount > 0 ON VIOLATION WARN",
+        ],
+        sql: "ALTER TABLE conf_exp_d DROP EXPECTATION conf_exp_gone",
+        proof: Proof::Catalog(expectations),
+    },
+    // Branches. Not a catalog object, so the probe reads the branch manager
+    Case {
+        name: "CREATE BRANCH",
+        setup: &[],
+        sql: "CREATE BRANCH conf_branch",
+        proof: Proof::Catalog(branches),
+    },
+    Case {
+        name: "DROP BRANCH",
+        setup: &["CREATE BRANCH conf_branch_drop"],
+        sql: "DROP BRANCH conf_branch_drop",
+        proof: Proof::Catalog(branches),
+    },
+    // Streaming jobs. The source has to be producing a change feed before a
+    // job can read one, which is what the ENABLE in the setup does
+    Case {
+        name: "CREATE STREAMING JOB",
+        setup: &[
+            "CREATE TABLE conf_sj_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_sj_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_sj_src ENABLE change_data_feed",
+        ],
+        sql: "CREATE STREAMING JOB conf_sj AS SELECT id, v FROM conf_sj_src INTO conf_sj_tgt",
+        proof: Proof::Catalog(streaming_jobs),
+    },
+    Case {
+        name: "DROP STREAMING JOB",
+        setup: &[
+            "CREATE TABLE conf_sj_d_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_sj_d_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_sj_d_src ENABLE change_data_feed",
+            "CREATE STREAMING JOB conf_sj_d AS SELECT id, v FROM conf_sj_d_src \
+             INTO conf_sj_d_tgt",
+        ],
+        sql: "DROP STREAMING JOB conf_sj_d",
+        proof: Proof::Catalog(streaming_jobs),
+    },
+    // Change feed flags
+    Case {
+        name: "ALTER TABLE ENABLE FEATURE",
+        setup: &["CREATE TABLE conf_feat (id BIGINT PRIMARY KEY, v BIGINT)"],
+        sql: "ALTER TABLE conf_feat ENABLE change_data_feed",
+        proof: Proof::Catalog(table_features),
+    },
+    Case {
+        name: "ALTER TABLE DISABLE FEATURE",
+        setup: &[
+            "CREATE TABLE conf_feat_d (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_feat_d ENABLE change_data_feed",
+        ],
+        sql: "ALTER TABLE conf_feat_d DISABLE change_data_feed",
+        proof: Proof::Catalog(table_features),
+    },
+    Case {
+        name: "ALTER TABLE ALTER COLUMN SET CLASSIFICATION",
+        setup: &["CREATE TABLE conf_class (id BIGINT PRIMARY KEY, ssn TEXT)"],
+        sql: "ALTER TABLE conf_class ALTER COLUMN ssn SET CLASSIFICATION restricted",
+        proof: Proof::Catalog(column_classifications),
+    },
+    // Graph schemas
+    Case {
+        name: "CREATE GRAPH SCHEMA",
+        setup: &[],
+        sql: "CREATE GRAPH SCHEMA conf_graph (NODE Person (id INT))",
+        proof: Proof::Catalog(tables),
+    },
+    Case {
+        name: "DROP GRAPH SCHEMA",
+        setup: &["CREATE GRAPH SCHEMA conf_graph_d (NODE Thing (id INT))"],
+        sql: "DROP GRAPH SCHEMA conf_graph_d",
+        proof: Proof::Catalog(tables),
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -543,7 +1593,7 @@ const CASES: &[Case] = &[
 
 /// What went wrong with one case, in the words a fix would need.
 struct Failure {
-    case: &'static str,
+    case: String,
     detail: String,
 }
 
@@ -572,58 +1622,20 @@ async fn every_statement_that_replicates_reaches_every_member() {
 
     let mut failures: Vec<Failure> = Vec::new();
 
+    let total = CASES.len();
     for case in CASES {
-        let mut setup_failed = None;
-        for sql in case.setup {
-            let (_, errors) = client.query(sql).await;
-            if !errors.is_empty() {
-                setup_failed = Some(format!("setup `{sql}` failed: {errors:?}"));
-                break;
-            }
-        }
-        if let Some(detail) = setup_failed {
-            failures.push(Failure {
-                case: case.name,
-                detail,
-            });
-            continue;
-        }
-        group.settle(leader, Duration::from_secs(20)).await;
-
-        let before = read_proof(&group.nodes[leader], &case.proof).await;
-        let (tags, errors) = client.query(case.sql).await;
-        if !errors.is_empty() {
-            failures.push(Failure {
-                case: case.name,
-                detail: format!("refused on the leader: {errors:?}"),
-            });
-            continue;
-        }
-        group.settle(leader, Duration::from_secs(20)).await;
-
-        // A statement that reported success and changed nothing is a silent
-        // no-op, which reads as a pass to any check that only compares members
-        let after = read_proof(&group.nodes[leader], &case.proof).await;
-        if before == after {
-            failures.push(Failure {
-                case: case.name,
-                detail: format!("answered {tags:?} and changed nothing, still `{after}`"),
-            });
-            continue;
-        }
-
-        for node in &group.nodes {
-            let seen = read_proof(node, &case.proof).await;
-            if seen != after {
-                failures.push(Failure {
-                    case: case.name,
-                    detail: format!(
-                        "the leader holds `{after}` and {} holds `{seen}`",
-                        node.name
-                    ),
-                });
-            }
-        }
+        let setup: Vec<&str> = case.setup.to_vec();
+        run_case(
+            &group,
+            leader,
+            &mut client,
+            case.name,
+            &setup,
+            case.sql,
+            &case.proof,
+            &mut failures,
+        )
+        .await;
     }
 
     client.terminate().await;
@@ -636,13 +1648,78 @@ async fn every_statement_that_replicates_reaches_every_member() {
         failures.is_empty(),
         "{} of {} statements did not reach every member:\n{}",
         failures.len(),
-        CASES.len(),
+        total,
         failures
             .iter()
             .map(|f| format!("  {}: {}", f.case, f.detail))
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Runs one statement on the leader and checks that it changed something and
+/// that every member agrees on what.
+///
+/// Written once because a case whose statement is a literal and one whose
+/// statement carries a compiled module have to be held to the same standard,
+/// and two copies of the check is how one of them ends up weaker
+#[allow(clippy::too_many_arguments)]
+async fn run_case(
+    group: &Group,
+    leader: usize,
+    client: &mut WireClient,
+    name: &str,
+    setup: &[&str],
+    sql: &str,
+    proof: &Proof,
+    failures: &mut Vec<Failure>,
+) {
+    for statement in setup {
+        let (_, errors) = client.query(statement).await;
+        if !errors.is_empty() {
+            failures.push(Failure {
+                case: name.to_string(),
+                detail: format!("setup `{statement}` failed: {errors:?}"),
+            });
+            return;
+        }
+    }
+    group.settle(leader, Duration::from_secs(20)).await;
+
+    let before = read_proof(&group.nodes[leader], proof).await;
+    let (tags, errors) = client.query(sql).await;
+    if !errors.is_empty() {
+        failures.push(Failure {
+            case: name.to_string(),
+            detail: format!("refused on the leader: {errors:?}"),
+        });
+        return;
+    }
+    group.settle(leader, Duration::from_secs(20)).await;
+
+    // A statement that reported success and changed nothing is a silent
+    // no-op, which reads as a pass to any check that only compares members
+    let after = read_proof(&group.nodes[leader], proof).await;
+    if before == after {
+        failures.push(Failure {
+            case: name.to_string(),
+            detail: format!("answered {tags:?} and changed nothing, still `{after}`"),
+        });
+        return;
+    }
+
+    for node in &group.nodes {
+        let seen = read_proof(node, proof).await;
+        if seen != after {
+            failures.push(Failure {
+                case: name.to_string(),
+                detail: format!(
+                    "the leader holds `{after}` and {} holds `{seen}`",
+                    node.name
+                ),
+            });
+        }
+    }
 }
 
 /// Nothing is refused on a node in a group any more.

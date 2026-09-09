@@ -286,6 +286,16 @@ mod tests {
 
     #[async_trait]
     impl CatalogStorage for MockStorage {
+        fn file_id_counters(&self) -> (u32, u32) {
+            (200, 10000)
+        }
+        fn raise_file_id_counters(&self, _: u32, _: u32) {}
+        async fn load_counters(&self) -> Result<Option<crate::storage::CatalogCounters>> {
+            Ok(None)
+        }
+        async fn store_counters(&self, _: crate::storage::CatalogCounters) -> Result<()> {
+            Ok(())
+        }
         async fn load_databases(&self) -> Result<Vec<DatabaseEntry>> {
             Ok(vec![])
         }

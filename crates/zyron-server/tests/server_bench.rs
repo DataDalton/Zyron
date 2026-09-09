@@ -196,6 +196,8 @@ async fn create_test_state(
         replication: None,
         node_capabilities: None,
         catalog: Arc::clone(&catalog),
+        ddl_progress: std::sync::Arc::new(zyron_wire::ddl_progress::DdlProgressRegistry::new()),
+        shadow_targets: std::sync::Arc::new(scc::HashMap::new()),
         wal: Arc::clone(&wal),
         buffer_pool: Arc::clone(&pool),
         disk_manager: Arc::clone(&disk),

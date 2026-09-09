@@ -82,12 +82,67 @@ const USER_TYPES_HEAP_FILE_ID: u32 = 186;
 const USER_TYPES_FSM_FILE_ID: u32 = 187;
 const COLLATIONS_HEAP_FILE_ID: u32 = 188;
 const COLLATIONS_FSM_FILE_ID: u32 = 189;
+const COUNTERS_HEAP_FILE_ID: u32 = 190;
+const COUNTERS_FSM_FILE_ID: u32 = 191;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
 
 /// Starting file ID for user-created index files.
 const USER_INDEX_FILE_START: u32 = 10000;
+
+/// The highest identifiers a catalog has handed out.
+///
+/// Every number here is a count of allocations rather than a property of what
+/// currently exists, which is what makes it recoverable after the object that
+/// consumed an id is gone. Held as one row so a single read at startup
+/// answers for all three
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CatalogCounters {
+    /// Next object id to hand out, covering every kind of catalog object
+    pub next_oid: u32,
+    /// Next heap file id, which is allocated in heap and free-space pairs
+    pub next_heap_file: u32,
+    /// Next index file id
+    pub next_index_file: u32,
+}
+
+/// The version this record is written at. A reader meeting a later one refuses
+/// rather than reading fields it cannot place
+const COUNTERS_RECORD_VERSION: u8 = 1;
+
+impl CatalogCounters {
+    fn to_bytes(self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(13);
+        buf.push(COUNTERS_RECORD_VERSION);
+        buf.extend_from_slice(&self.next_oid.to_le_bytes());
+        buf.extend_from_slice(&self.next_heap_file.to_le_bytes());
+        buf.extend_from_slice(&self.next_index_file.to_le_bytes());
+        buf
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < 13 {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "a catalog counters record is {} bytes where 13 are needed",
+                data.len()
+            )));
+        }
+        if data[0] != COUNTERS_RECORD_VERSION {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "a catalog counters record is version {} and this build reads version {}",
+                data[0], COUNTERS_RECORD_VERSION
+            )));
+        }
+        let word =
+            |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+        Ok(Self {
+            next_oid: word(1),
+            next_heap_file: word(5),
+            next_index_file: word(9),
+        })
+    }
+}
 
 /// Scans every tuple in a catalog heap and decodes it, returning CatalogCorrupted
 /// on the first tuple that fails to decode. A decode failure means a catalog row
@@ -273,6 +328,23 @@ pub trait CatalogStorage: Send + Sync {
     async fn store_resilience_policy(&self, entry: &ResiliencePolicyEntry) -> Result<TupleId>;
     async fn delete_resilience_policy(&self, id: u32) -> Result<bool>;
 
+    /// The highest identifiers this catalog has ever handed out, or None when
+    /// nothing has been recorded yet.
+    ///
+    /// Read once as the catalog loads. The scan over live rows gives the
+    /// highest id still in use, which is not the same number: an id stops
+    /// appearing in the rows the moment the object holding it is dropped, and
+    /// a counter rebuilt from the rows alone would hand that id out again
+    async fn load_counters(&self) -> Result<Option<CatalogCounters>>;
+
+    /// Records the highest identifiers handed out, replacing what was there.
+    ///
+    /// Written after the object that consumed an id is stored, never before.
+    /// A record written first and then lost to a crash would have this node
+    /// resume past an id its peers used, and every member allocating from the
+    /// same applied log has to reach the same number
+    async fn store_counters(&self, counters: CatalogCounters) -> Result<()>;
+
     // User type operations
     async fn load_user_types(&self) -> Result<Vec<UserTypeEntry>>;
     async fn store_user_type(&self, entry: &UserTypeEntry) -> Result<TupleId>;
@@ -381,6 +453,16 @@ pub trait CatalogStorage: Send + Sync {
     // File ID allocation for user tables and indexes
     fn next_heap_file_id(&self) -> (u32, u32);
     fn next_index_file_id(&self) -> u32;
+
+    /// The file id counters as they stand, without allocating. Read when the
+    /// catalog records what it has handed out
+    fn file_id_counters(&self) -> (u32, u32);
+
+    /// Raises the file id counters to at least these values.
+    ///
+    /// Applied when a recorded high-water mark is above what the live rows
+    /// show, which is what a file id belonging to a dropped table looks like
+    fn raise_file_id_counters(&self, next_heap_file: u32, next_index_file: u32);
 }
 
 /// Catalog storage backed by heap files (self-hosting).
@@ -420,6 +502,12 @@ pub struct HeapCatalogStorage {
     resilience_policies_heap: HeapFile,
     user_types_heap: HeapFile,
     collations_heap: HeapFile,
+    /// Holds one row, the highest identifiers handed out. Kept apart from
+    /// every other heap because it is state about the catalog rather than an
+    /// object in it
+    counters_heap: HeapFile,
+    /// Where the live counters row sits, so replacing it costs no scan
+    counters_row: parking_lot::Mutex<Option<TupleId>>,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
     init_done: std::sync::atomic::AtomicBool,
@@ -705,6 +793,14 @@ impl HeapCatalogStorage {
                 fsm_file_id: COLLATIONS_FSM_FILE_ID,
             },
         )?;
+        let counters_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: COUNTERS_HEAP_FILE_ID,
+                fsm_file_id: COUNTERS_FSM_FILE_ID,
+            },
+        )?;
 
         Ok(Self {
             databases_heap,
@@ -741,6 +837,8 @@ impl HeapCatalogStorage {
             resilience_policies_heap,
             user_types_heap,
             collations_heap,
+            counters_heap,
+            counters_row: parking_lot::Mutex::new(None),
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
             init_done: std::sync::atomic::AtomicBool::new(false),
@@ -798,7 +896,15 @@ impl HeapCatalogStorage {
             self.resilience_policies_heap.init_cache(),
             self.user_types_heap.init_cache(),
             self.collations_heap.init_cache(),
+            self.counters_heap.init_cache(),
         )?;
+        // The file id counters start at the bottom of the user range in a
+        // fresh process, so they are moved past what is already on disk here.
+        // Runs after the page counts are seeded, because it reads the table
+        // and index rows to find out. Without it a table created after a
+        // restart is handed the heap and free-space files a table created
+        // before it is already using
+        self.recover_file_id_counters().await?;
         Ok(())
     }
 
@@ -829,11 +935,38 @@ impl HeapCatalogStorage {
         }
         self.next_index_file.store(max_idx, Ordering::Relaxed);
 
+        // The scan above gives the highest file id still in use. A table that
+        // was dropped took its file ids out of that answer while the files
+        // themselves were reclaimed, so the recorded mark is what keeps a new
+        // table from being given a dropped one's numbers
+        if let Some(recorded) = self.load_counters().await? {
+            self.raise_file_id_counters(recorded.next_heap_file, recorded.next_index_file);
+        }
+
         Ok(())
     }
 }
 
 impl HeapCatalogStorage {
+    /// Writes one page to disk if the pool still holds it dirty.
+    ///
+    /// Named by page id rather than by heap, so the cost is one lookup and one
+    /// page write instead of a pass over every frame the pool holds. Not an
+    /// fsync: it puts the bytes in the file, which is what the counters row
+    /// needs to survive a process that stops without checkpointing
+    fn flush_page_through(&self, page_id: zyron_common::PageId) -> Result<()> {
+        self.pool.flush_page(page_id, |pid, data| {
+            let data_len = data.len();
+            let page: &mut [u8; zyron_common::PAGE_SIZE] =
+                data.try_into().map_err(|_| ZyronError::PageSizeMismatch {
+                    expected: zyron_common::PAGE_SIZE,
+                    actual: data_len,
+                })?;
+            self.disk.write_page_sync_no_fsync(pid, page)
+        })?;
+        Ok(())
+    }
+
     /// The heap holding one registered catalog table's rows, by the
     /// three-part name the catalog schema registry uses. None for a table
     /// whose rows live outside these heaps
@@ -999,6 +1132,8 @@ impl CatalogStorage for HeapCatalogStorage {
             USER_TYPES_FSM_FILE_ID,
             COLLATIONS_HEAP_FILE_ID,
             COLLATIONS_FSM_FILE_ID,
+            COUNTERS_HEAP_FILE_ID,
+            COUNTERS_FSM_FILE_ID,
         ]
         .into_iter()
         .collect();
@@ -1783,6 +1918,85 @@ impl CatalogStorage for HeapCatalogStorage {
         }
     }
 
+    async fn load_counters(&self) -> Result<Option<CatalogCounters>> {
+        // The heap holds one row. A node that never wrote one has none, and a
+        // node that wrote several through a torn write keeps the highest of
+        // each field, because a counter that went backwards is the one thing
+        // this record exists to prevent
+        let mut found: Option<CatalogCounters> = None;
+        let mut damaged: Option<String> = None;
+        let guard = self.counters_heap.scan()?;
+        guard.for_each(|_, row| match CatalogCounters::from_bytes(row.data) {
+            Ok(c) => {
+                found = Some(match found {
+                    None => c,
+                    Some(prev) => CatalogCounters {
+                        next_oid: prev.next_oid.max(c.next_oid),
+                        next_heap_file: prev.next_heap_file.max(c.next_heap_file),
+                        next_index_file: prev.next_index_file.max(c.next_index_file),
+                    },
+                });
+            }
+            Err(e) => damaged = Some(e.to_string()),
+        });
+        // A row that will not decode is refused rather than skipped. Reading
+        // past it would start the counter below an id already handed out,
+        // which is the failure this record is here to make impossible
+        if found.is_none()
+            && let Some(reason) = damaged
+        {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "the catalog counters row could not be read: {reason}"
+            )));
+        }
+        Ok(found)
+    }
+
+    async fn store_counters(&self, counters: CatalogCounters) -> Result<()> {
+        // Replaces rather than appends, so the heap holds one row however
+        // many times a node allocates.
+        //
+        // The row this replaces is remembered rather than looked for. This
+        // runs after every catalog store, and scanning the heap each time
+        // would put a page read on a path that already knows the answer from
+        // the write before it. The scan happens once, on the first write of a
+        // process, when there is a row from an earlier one to find
+        let mut existing = Vec::new();
+        {
+            let mut held = self.counters_row.lock();
+            match held.take() {
+                Some(tid) => existing.push(tid),
+                None => {
+                    let guard = self.counters_heap.scan()?;
+                    guard.for_each(|tid, _| existing.push(tid));
+                }
+            }
+        }
+
+        let tuple = Tuple::new(counters.to_bytes(), 0);
+        let written = self.counters_heap.insert_batch(&[tuple]).await?;
+        for tid in existing {
+            self.counters_heap.delete(tid).await?;
+        }
+
+        // Pushed to disk here rather than left for the next checkpoint. Every
+        // other catalog row has a WAL record behind it, so a crash replays it
+        // back; this row has none, and one left dirty would rewind to its last
+        // checkpoint while the rows it protects came back in full.
+        //
+        // Only the pages this row touched, by page id. `HeapFile::flush` would
+        // be the obvious call and is the wrong one here: it reaches the pool's
+        // `flush_all`, which collects every resident page into a vector and
+        // walks it, so using it would put a pass over the whole buffer pool on
+        // every schema change
+        for tid in &written {
+            self.flush_page_through(tid.page_id)?;
+        }
+        // What the next write replaces, so it needs no scan to find it
+        *self.counters_row.lock() = written.first().copied();
+        Ok(())
+    }
+
     async fn load_user_types(&self) -> Result<Vec<UserTypeEntry>> {
         scan_decode(
             &self.user_types_heap,
@@ -2400,5 +2614,19 @@ impl CatalogStorage for HeapCatalogStorage {
 
     fn next_index_file_id(&self) -> u32 {
         self.next_index_file.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn file_id_counters(&self) -> (u32, u32) {
+        (
+            self.next_heap_file.load(Ordering::Relaxed),
+            self.next_index_file.load(Ordering::Relaxed),
+        )
+    }
+
+    fn raise_file_id_counters(&self, next_heap_file: u32, next_index_file: u32) {
+        self.next_heap_file
+            .fetch_max(next_heap_file, Ordering::Relaxed);
+        self.next_index_file
+            .fetch_max(next_index_file, Ordering::Relaxed);
     }
 }

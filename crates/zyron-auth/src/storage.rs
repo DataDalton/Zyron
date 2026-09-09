@@ -43,6 +43,18 @@ pub trait AuthStorage: Send + Sync {
         object_id: u32,
     ) -> Result<()>;
 
+    /// Removes every grant recorded against one object, reporting how many.
+    ///
+    /// One pass rather than one per grant. Deleting them individually costs a
+    /// scan of every grant the node holds for each one, so an object with
+    /// fifty grants on a busy system reads the whole store fifty times, and
+    /// dropping an object is exactly when that happens
+    async fn delete_grants_for_object(
+        &self,
+        object_type: ObjectType,
+        object_id: u32,
+    ) -> Result<usize>;
+
     async fn load_classifications(&self) -> Result<Vec<ColumnClassification>>;
     async fn store_classification(&self, entry: &ColumnClassification) -> Result<()>;
 

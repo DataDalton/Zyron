@@ -808,6 +808,32 @@ impl SecurityManager {
         Ok(())
     }
 
+    /// Removes every privilege recorded against one object, rows and memory,
+    /// and reports how many there were.
+    ///
+    /// Called when an object is gone for good rather than recoverable. A
+    /// grant names its object by kind and id, the id allocator recovers from
+    /// the highest id the live rows carry, so an id stops being taken the
+    /// moment the row naming it is removed. A grant left behind would then
+    /// decide access to whatever is numbered that next
+    pub async fn revoke_all_on_object(
+        &self,
+        object_type: ObjectType,
+        object_id: u32,
+    ) -> Result<usize> {
+        // The rows go first. A crash between the two leaves grants on disk
+        // that the next start reads back, which is the state this began in,
+        // rather than memory that says allowed and disk that says nothing.
+        // One pass over the store rather than one per grant
+        let removed = self
+            .auth_storage
+            .delete_grants_for_object(object_type, object_id)
+            .await?;
+        self.privilege_store
+            .revoke_all_on_object(object_type, object_id);
+        Ok(removed)
+    }
+
     /// Sets a classification level on a column.
     pub async fn set_classification(
         &self,

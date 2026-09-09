@@ -2230,13 +2230,46 @@ impl Catalog {
             }
         }
 
+        // The scan gives the highest id still in use, which is below the
+        // highest ever handed out whenever the object holding one was dropped.
+        // The recorded mark is what keeps the next allocation from repeating
+        // an id, and a repeat is not a cosmetic problem: grants, tags,
+        // classifications and masking rules are all written against an object
+        // by kind and id, and a member that restarted would number a new
+        // object differently from one that did not
+        let recorded = self.storage.load_counters().await?;
+        if let Some(counters) = recorded {
+            max_oid = max_oid.max(counters.next_oid);
+        }
         self.oid_allocator.reset(max_oid);
+
+        // Written back so the mark covers what the scan just proved, which is
+        // what closes the window where a crash lost the write that followed an
+        // allocation and the object it numbered is dropped afterwards
+        self.persist_counters().await?;
         Ok(())
     }
 
     /// Allocates the next OID.
     pub fn next_oid(&self) -> Oid {
         self.oid_allocator.next()
+    }
+
+    /// Records the identifiers handed out so far.
+    ///
+    /// Called after the object that consumed an id is stored, never before.
+    /// Writing first and then losing the store to a crash would have this node
+    /// resume past an id that no object holds, and a member replaying the same
+    /// agreed statement has to reach the same id as every other member
+    pub async fn persist_counters(&self) -> Result<()> {
+        let (next_heap_file, next_index_file) = self.storage.file_id_counters();
+        self.storage
+            .store_counters(crate::storage::CatalogCounters {
+                next_oid: self.oid_allocator.current(),
+                next_heap_file,
+                next_index_file,
+            })
+            .await
     }
 
     /// Allocates a fresh (heap_file_id, fsm_file_id) pair. The table-rewrite
@@ -2293,6 +2326,7 @@ impl Catalog {
 
         self.log_ddl(DDL_CREATE_DATABASE, &entry.to_bytes())?;
         self.storage.store_database(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_database(entry);
         Ok(id)
     }
@@ -2390,6 +2424,7 @@ impl Catalog {
         };
         self.log_ddl(DDL_CREATE_SCHEMA, &entry.to_bytes())?;
         self.storage.store_schema(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_schema(entry);
         Ok(id)
     }
@@ -2424,6 +2459,7 @@ impl Catalog {
 
         self.log_ddl(DDL_CREATE_SCHEMA, &entry.to_bytes())?;
         self.storage.store_schema(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_schema(entry);
         Ok(id)
     }
@@ -2870,6 +2906,7 @@ impl Catalog {
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_table(entry);
         Ok(table_id)
     }
@@ -2960,6 +2997,7 @@ impl Catalog {
         entry.seal_initial_epoch();
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_table(entry);
         Ok(table_id)
     }
@@ -3291,6 +3329,7 @@ impl Catalog {
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
         self.storage.store_index(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_index(entry);
         Ok(index_id)
     }
@@ -3349,6 +3388,7 @@ impl Catalog {
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
         self.storage.store_index(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_index(entry);
         Ok(index_id)
     }
@@ -3408,6 +3448,7 @@ impl Catalog {
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
         self.storage.store_index(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_index(entry);
         Ok(index_id)
     }
@@ -3439,6 +3480,7 @@ impl Catalog {
         self.log_ddl(DDL_INDEX_STATE, &payload)?;
         self.storage.delete_index(entry.id).await?;
         self.storage.store_index(&entry).await?;
+        self.persist_counters().await?;
         self.cache.invalidate_index(entry.id);
         self.cache.put_index(entry.clone());
         Ok(Arc::new(entry))
@@ -3486,6 +3528,7 @@ impl Catalog {
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
         self.storage.delete_index(entry.id).await?;
         self.storage.store_index(&entry).await?;
+        self.persist_counters().await?;
         self.cache.invalidate_index(entry.id);
         self.cache.put_index(entry);
         Ok(())
@@ -3520,6 +3563,7 @@ impl Catalog {
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
         self.storage.delete_index(entry.id).await?;
         self.storage.store_index(&entry).await?;
+        self.persist_counters().await?;
         self.cache.invalidate_index(entry.id);
         self.cache.put_index(entry);
         Ok(())
@@ -3602,6 +3646,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_STREAMING_JOB, &entry.to_bytes())?;
         self.storage.store_streaming_job(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_streaming_job(entry);
         Ok(id)
     }
@@ -3686,6 +3731,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_SEQUENCE, &entry.to_bytes())?;
         self.storage.store_sequence(&entry).await?;
+        self.persist_counters().await?;
 
         let live = Arc::new(crate::sequence::LiveSequence::from_entry(&entry));
         self.sequences_by_name
@@ -3984,6 +4030,7 @@ impl Catalog {
                 let id = entry.id;
                 self.log_ddl(DDL_CREATE_VIEW, &entry.to_bytes())?;
                 self.storage.store_view(&entry).await?;
+                self.persist_counters().await?;
                 let e = Arc::new(entry);
                 self.views_by_name.write().insert(key, Arc::clone(&e));
                 self.views_by_id.write().insert(id, e);
@@ -4189,6 +4236,7 @@ impl Catalog {
         entry.seal_initial_epoch();
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_table(entry);
         Ok(table_id)
     }
@@ -4246,6 +4294,7 @@ impl Catalog {
         entry.seal_initial_epoch();
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_table(entry);
         Ok(table_id)
     }
@@ -4269,6 +4318,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_MVIEW, &entry.to_bytes())?;
         self.storage.store_mview(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.mviews_by_name.write().insert(key, Arc::clone(&e));
         self.mviews_by_id.write().insert(id, e);
@@ -4375,6 +4425,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_FUNCTION, &entry.to_bytes())?;
         self.storage.store_function(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.functions_by_name
             .write()
@@ -4506,6 +4557,91 @@ impl Catalog {
         None
     }
 
+    /// Every overload of a function name, in the one schema the name
+    /// resolves to.
+    ///
+    /// A qualified name reads exactly that schema, a bare name walks the
+    /// search path and stops at the first schema holding the name. Reading a
+    /// function is not calling one, so there are no argument types to pick an
+    /// overload with and all of them are returned in declaration order
+    pub fn functions_named_scoped(
+        &self,
+        db_id: DatabaseId,
+        search_path: &[String],
+        name: &str,
+    ) -> Vec<Arc<crate::schema::FunctionEntry>> {
+        let map = self.functions_by_name.read();
+        let of_schema = |overloads: &Vec<Arc<crate::schema::FunctionEntry>>, schema: SchemaId| {
+            overloads
+                .iter()
+                .filter(|f| f.schema_id == schema)
+                .map(Arc::clone)
+                .collect::<Vec<_>>()
+        };
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let Ok(schema) = self.get_schema(db_id, schema_part) else {
+                return Vec::new();
+            };
+            return match map.get(bare) {
+                Some(overloads) => of_schema(overloads, schema.id),
+                None => Vec::new(),
+            };
+        }
+        let Some(overloads) = map.get(name) else {
+            return Vec::new();
+        };
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            let hits = of_schema(overloads, schema.id);
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Every overload of an aggregate name, resolved the way
+    /// `functions_named_scoped` resolves a function name
+    pub fn aggregates_named_scoped(
+        &self,
+        db_id: DatabaseId,
+        search_path: &[String],
+        name: &str,
+    ) -> Vec<Arc<crate::schema::AggregateEntry>> {
+        let map = self.aggregates_by_name.read();
+        let of_schema = |overloads: &Vec<Arc<crate::schema::AggregateEntry>>, schema: SchemaId| {
+            overloads
+                .iter()
+                .filter(|a| a.schema_id == schema)
+                .map(Arc::clone)
+                .collect::<Vec<_>>()
+        };
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let Ok(schema) = self.get_schema(db_id, schema_part) else {
+                return Vec::new();
+            };
+            return match map.get(bare) {
+                Some(overloads) => of_schema(overloads, schema.id),
+                None => Vec::new(),
+            };
+        }
+        let Some(overloads) = map.get(name) else {
+            return Vec::new();
+        };
+        for entry in search_path {
+            let Ok(schema) = self.get_schema(db_id, entry) else {
+                continue;
+            };
+            let hits = of_schema(overloads, schema.id);
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+        Vec::new()
+    }
+
     /// Lists every registered function.
     pub fn list_functions(&self) -> Vec<Arc<crate::schema::FunctionEntry>> {
         self.functions_by_id
@@ -4541,7 +4677,7 @@ impl Catalog {
     }
 
     /// Removes a single function overload by id from storage and both maps.
-    async fn remove_function_by_id(&self, id: u32) -> Result<()> {
+    pub async fn remove_function_by_id(&self, id: u32) -> Result<()> {
         self.log_ddl(DDL_DROP_FUNCTION, &id.to_le_bytes())?;
         self.storage.delete_function(id).await?;
         let name = self
@@ -4600,6 +4736,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_AGGREGATE, &entry.to_bytes())?;
         self.storage.store_aggregate(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.aggregates_by_name
             .write()
@@ -4789,6 +4926,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_PROCEDURE, &entry.to_bytes())?;
         self.storage.store_procedure(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.procedures_by_name
             .write()
@@ -4950,6 +5088,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_SCHEDULE, &entry.to_bytes())?;
         self.storage.store_schedule(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.schedules_by_name
             .write()
@@ -4964,6 +5103,7 @@ impl Catalog {
         self.log_ddl(DDL_CREATE_SCHEDULE, &entry.to_bytes())?;
         self.storage.delete_schedule(entry.id).await?;
         self.storage.store_schedule(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.schedules_by_name
             .write()
@@ -5033,6 +5173,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_PIPELINE, &entry.to_bytes())?;
         self.storage.store_pipeline(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.pipelines_by_name
             .write()
@@ -5047,6 +5188,7 @@ impl Catalog {
         self.log_ddl(DDL_CREATE_PIPELINE, &entry.to_bytes())?;
         self.storage.delete_pipeline(entry.id).await?;
         self.storage.store_pipeline(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.pipelines_by_name
             .write()
@@ -5120,6 +5262,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_EVENT_HANDLER, &entry.to_bytes())?;
         self.storage.store_event_handler(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.event_handlers_by_name
             .write()
@@ -5187,6 +5330,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_VERSION_TAG, &entry.to_bytes())?;
         self.storage.store_version_tag(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.version_tags_by_name
             .write()
@@ -5254,6 +5398,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_ANALYZER, &entry.to_bytes())?;
         self.storage.store_analyzer(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.analyzers_by_name.write().insert(key, Arc::clone(&e));
         self.analyzers_by_id.write().insert(id, e);
@@ -5391,6 +5536,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_SYNONYM_DICTIONARY, &entry.to_bytes())?;
         self.storage.store_synonym_dictionary(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.synonym_dictionaries_by_name
             .write()
@@ -5549,6 +5695,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_RESILIENCE_POLICY, &entry.to_bytes())?;
         self.storage.store_resilience_policy(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.resilience_policies_by_name
             .write()
@@ -5664,6 +5811,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_USER_TYPE, &entry.to_bytes())?;
         self.storage.store_user_type(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.user_types_by_name.write().insert(key, Arc::clone(&e));
         self.user_types_by_id.write().insert(id, e);
@@ -5771,6 +5919,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_COLLATION, &entry.to_bytes())?;
         self.storage.store_collation(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.collations_by_name.write().insert(key, Arc::clone(&e));
         self.collations_by_id.write().insert(id, e);
@@ -5880,6 +6029,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_TRIGGER, &entry.to_bytes())?;
         self.storage.store_trigger(&entry).await?;
+        self.persist_counters().await?;
         let e = Arc::new(entry);
         self.triggers_by_table
             .write()
@@ -5978,6 +6128,7 @@ impl Catalog {
                     self.storage.delete_comment(id).await?;
                 }
                 self.storage.store_comment(&entry).await?;
+                self.persist_counters().await?;
                 self.comments.write().insert(key, Arc::new(entry));
             }
             None => {
@@ -6039,6 +6190,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_EXTERNAL_SOURCE, &entry.to_bytes())?;
         self.storage.store_external_source(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_external_source(entry);
         Ok(id)
     }
@@ -6112,6 +6264,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_EXTERNAL_SINK, &entry.to_bytes())?;
         self.storage.store_external_sink(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_external_sink(entry);
         Ok(id)
     }
@@ -6179,6 +6332,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_PUBLICATION, &entry.to_bytes())?;
         self.storage.store_publication(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_publication(entry);
         Ok(id)
     }
@@ -6197,6 +6351,18 @@ impl Catalog {
 
     pub fn list_publications(&self) -> Vec<Arc<PublicationEntry>> {
         self.cache.list_publications()
+    }
+
+    /// The tables one publication carries.
+    ///
+    /// Publication membership lives in rows of its own rather than on the
+    /// publication, so this is what says which tables a subscriber would be
+    /// sent and the publication row alone does not
+    pub fn list_publication_tables(
+        &self,
+        id: PublicationId,
+    ) -> Vec<Arc<crate::schema::PublicationTableEntry>> {
+        self.cache.get_publication_tables(id)
     }
 
     pub async fn drop_publication(&self, schema_id: SchemaId, name: &str) -> Result<()> {
@@ -6231,6 +6397,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_ADD_PUBLICATION_TABLE, &entry.to_bytes())?;
         self.storage.store_publication_table(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_publication_table(entry);
         Ok(id)
     }
@@ -6273,6 +6440,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_SUBSCRIPTION, &entry.to_bytes())?;
         self.storage.store_subscription(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_subscription(entry);
         Ok(id)
     }
@@ -6377,6 +6545,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_ENDPOINT, &entry.to_bytes())?;
         self.storage.store_endpoint(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_endpoint(entry);
         Ok(id)
     }
@@ -6445,6 +6614,7 @@ impl Catalog {
         let id = entry.id;
         self.log_ddl(DDL_CREATE_SECURITY_MAP, &entry.to_bytes())?;
         self.storage.store_security_map(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_security_map(entry);
         Ok(id)
     }
@@ -6713,6 +6883,7 @@ impl Catalog {
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.delete_table(entry.id).await?;
         self.storage.store_table(&entry).await?;
+        self.persist_counters().await?;
         self.cache.put_table(entry);
         Ok(())
     }

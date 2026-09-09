@@ -18,7 +18,6 @@ use zyron_buffer::BufferPool;
 use zyron_catalog::{Catalog, CatalogCache, HeapCatalogStorage, SYSTEM_DATABASE_ID, SchemaId};
 use zyron_common::{Result, ZyronError};
 use zyron_executor::batch::DataBatch;
-use zyron_executor::context::ExecutionContext;
 use zyron_server::config::{ClusterPeerSection, ClusterSection};
 use zyron_server::raft::{ClusterHandle, start_cluster};
 use zyron_server::replication::DdlRunner;
@@ -110,6 +109,20 @@ impl Node {
         .await
         .expect("join the group");
 
+        // Roles, users and grants live here rather than in the catalog, and
+        // each node gets its own backed by its own heap. A shared one would
+        // let a member that never applied a GRANT read the grant a different
+        // member wrote and agree with it
+        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
+            zyron_auth::HeapAuthStorage::new(Arc::clone(&disk), Arc::clone(&buffer_pool))
+                .expect("auth storage"),
+        );
+        let security_manager = Arc::new(
+            zyron_auth::SecurityManager::new(auth_storage)
+                .await
+                .expect("security manager"),
+        );
+
         // The applier carries out a schema change through the dispatcher,
         // which needs the whole server around it, exactly as it does in
         // production
@@ -121,6 +134,7 @@ impl Node {
             Arc::clone(&txn_manager),
             &data_dir,
             &cluster,
+            Arc::clone(&security_manager),
         );
         cluster
             .replication
@@ -341,6 +355,7 @@ pub fn build_server_state(
     txn_manager: Arc<TransactionManager>,
     data_dir: &std::path::Path,
     cluster: &ClusterHandle,
+    security_manager: Arc<zyron_auth::SecurityManager>,
 ) -> Arc<ServerState> {
     Arc::new(ServerState {
         raft: Some(Arc::clone(&cluster.node)),
@@ -359,7 +374,7 @@ pub fn build_server_state(
         table_io_stats: Arc::new(zyron_common::TableIOStatsRegistry::new()),
         index_io_stats: Arc::new(zyron_common::IndexIOStatsRegistry::new()),
         columnar_maintenance: None,
-        security_manager: None,
+        security_manager: Some(security_manager),
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         media_store: Arc::new(
             zyron_media::store::MediaStore::open(data_dir.to_path_buf())
@@ -377,20 +392,40 @@ pub fn build_server_state(
         cdc_slot_stats: None,
         cdc_stream_stats: None,
         cdc_ingest_stats: None,
-        cdc_registry: None,
-        slot_manager: None,
-        publication_manager: None,
-        cdc_stream_manager: None,
-        cdc_ingest_manager: None,
-        trigger_manager: None,
-        udf_registry: None,
-        uda_registry: None,
-        procedure_registry: None,
+        // The managers a statement reaches for. Built the way the server
+        // builds them, because a statement whose manager is absent is refused
+        // for a reason that has nothing to do with whether it replicates, and
+        // a conformance case cannot tell those two apart
+        cdc_registry: Some(Arc::new(zyron_cdc::CdfRegistry::new(
+            data_dir.to_path_buf(),
+        ))),
+        slot_manager: zyron_cdc::SlotManager::open(data_dir, zyron_cdc::SlotLagConfig::default())
+            .ok()
+            .map(Arc::new),
+        publication_manager: zyron_cdc::PublicationManager::open(data_dir)
+            .ok()
+            .map(Arc::new),
+        cdc_stream_manager: zyron_cdc::CdcStreamManager::new(data_dir)
+            .ok()
+            .map(Arc::new),
+        cdc_ingest_manager: zyron_cdc::CdcIngestManager::new(data_dir)
+            .ok()
+            .map(Arc::new),
+        trigger_manager: Some(Arc::new(zyron_pipeline::trigger::TriggerManager::new())),
+        udf_registry: Some(Arc::new(zyron_pipeline::udf::UdfRegistry::new())),
+        uda_registry: Some(Arc::new(zyron_pipeline::aggregate::UdaRegistry::new())),
+        procedure_registry: Some(Arc::new(
+            zyron_pipeline::stored_procedure::ProcedureRegistry::new(),
+        )),
         pipeline_manager: None,
         schedule_manager: None,
         event_dispatcher: None,
-        mv_manager: None,
-        stream_job_manager: None,
+        mv_manager: Some(Arc::new(
+            zyron_pipeline::materialized_view::MaterializedViewManager::new(),
+        )),
+        stream_job_manager: Some(Arc::new(parking_lot::Mutex::new(
+            zyron_streaming::job::StreamJobManager::new(),
+        ))),
         // Built the way the server builds it, so a branch statement runs here
         // against the same manager rather than being refused for want of one
         branch_manager: Some({
@@ -523,6 +558,68 @@ impl WireClient {
                 _ => {}
             }
         }
+    }
+
+    /// Reads until ReadyForQuery, collecting the rows an answer carried.
+    ///
+    /// Kept apart from `drain_to_ready` because most cases care only that a
+    /// statement was accepted, and a case that reads what came back needs the
+    /// cells rather than the tag
+    pub async fn drain_rows(&mut self) -> (Vec<Vec<Option<String>>>, Vec<String>) {
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            let (kind, payload) = self.read_message().await;
+            match kind {
+                b'D' => {
+                    let mut cells = Vec::new();
+                    if payload.len() >= 2 {
+                        let count = i16::from_be_bytes([payload[0], payload[1]]).max(0) as usize;
+                        let mut at = 2usize;
+                        for _ in 0..count {
+                            if at + 4 > payload.len() {
+                                break;
+                            }
+                            let len = i32::from_be_bytes([
+                                payload[at],
+                                payload[at + 1],
+                                payload[at + 2],
+                                payload[at + 3],
+                            ]);
+                            at += 4;
+                            if len < 0 {
+                                cells.push(None);
+                                continue;
+                            }
+                            let len = len as usize;
+                            if at + len > payload.len() {
+                                break;
+                            }
+                            cells.push(Some(
+                                String::from_utf8_lossy(&payload[at..at + len]).into_owned(),
+                            ));
+                            at += len;
+                        }
+                    }
+                    rows.push(cells);
+                }
+                b'E' => errors.extend(error_text(&payload)),
+                b'Z' => return (rows, errors),
+                _ => {}
+            }
+        }
+    }
+
+    /// Sends one simple Query message and reads the rows it answered with
+    pub async fn query_rows(&mut self, sql: &str) -> (Vec<Vec<Option<String>>>, Vec<String>) {
+        use tokio::io::AsyncWriteExt;
+        let mut msg = vec![b'Q'];
+        msg.extend_from_slice(&((sql.len() + 1 + 4) as i32).to_be_bytes());
+        msg.extend_from_slice(sql.as_bytes());
+        msg.push(0);
+        self.stream.write_all(&msg).await.expect("query");
+        self.stream.flush().await.expect("flush query");
+        self.drain_rows().await
     }
 
     /// Sends one simple Query message and reads its whole answer

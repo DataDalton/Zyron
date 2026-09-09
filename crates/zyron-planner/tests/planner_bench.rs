@@ -160,7 +160,15 @@ async fn create_index(
     unique: bool,
 ) -> IndexId {
     catalog
-        .create_index(table_id, schema_id, name, columns, unique, IndexType::BTree)
+        .create_index(
+            table_id,
+            schema_id,
+            name,
+            columns,
+            unique,
+            IndexType::BTree,
+            zyron_catalog::IndexState::Ready,
+        )
         .await
         .unwrap()
 }
@@ -181,6 +189,7 @@ async fn create_spatial_index(
             columns,
             false,
             IndexType::Spatial,
+            zyron_catalog::IndexState::Ready,
         )
         .await
         .unwrap()
