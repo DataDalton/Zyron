@@ -213,7 +213,7 @@ async fn exec(h: &mut Harness, sql: &str) -> Vec<DataBatch> {
             ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
         }
     }
-    ctx.active_branch_name = h.active_branch.clone();
+    ctx.active_branch_name = h.active_branch.as_deref().map(Arc::from);
     let ctx = Arc::new(ctx);
     let batches = zyron_executor::execute(plan, &ctx).await.expect("execute");
     h.server.txn_manager.commit(&mut txn).await.expect("commit");

@@ -98,6 +98,12 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
                             join_type: zyron_parser::ast::JoinType::Cross,
                             condition: None,
                         }
+                    } else if let BoundFromItem::Expand(expand) = item
+                        && expand.lateral
+                    {
+                        // A comma-separated LATERAL expansion runs over the
+                        // rows accumulated to its left
+                        build_expand_over(expand, left, false)
                     } else {
                         LogicalPlan::Join {
                             left: Arc::new(left),
@@ -381,7 +387,38 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             join_type,
             right,
             condition,
+            asof,
         } => {
+            // An ASOF join reaches for the nearest right row rather than
+            // every matching one, so it is its own node rather than a join
+            // with an extra predicate
+            if let Some(asof) = asof {
+                let equality_keys = match condition {
+                    BoundJoinCondition::On(expr) => equality_pairs(expr),
+                    _ => Vec::new(),
+                };
+                return Ok(LogicalPlan::AsofJoin {
+                    left: Arc::new(build_from_item(left)?),
+                    right: Arc::new(build_from_item(right)?),
+                    match_on: Box::new(crate::logical::AsofMatchOn {
+                        equality_keys,
+                        match_left: asof.match_left.clone(),
+                        match_right: asof.match_right.clone(),
+                        direction: asof.direction,
+                        tolerance: asof.tolerance.clone(),
+                        join_type: *join_type,
+                    }),
+                });
+            }
+            // A LATERAL expansion on the right side runs over the left's
+            // rows, NULL-extending them under a LEFT join
+            if let BoundFromItem::Expand(expand) = right.as_ref()
+                && expand.lateral
+            {
+                let left_plan = build_from_item(left)?;
+                let outer = matches!(join_type, zyron_parser::ast::JoinType::Left);
+                return Ok(build_expand_over(expand, left_plan, outer));
+            }
             // A LATERAL subquery on the right side correlates to the left, so it
             // becomes a LateralJoin (per-left-row execution) rather than a plain
             // join over two independently planned inputs.
@@ -471,6 +508,74 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             positional_args: positional.clone(),
             output_columns: output_columns.clone(),
         }),
+        BoundFromItem::Expand(expand) => {
+            // A LATERAL expansion reaching this arm is the first item in
+            // FROM, so there is nothing before it to correlate to and the
+            // binder would already have refused the reference
+            let child = match &expand.input {
+                Some(input) => build_from_item(input)?,
+                None => one_row_relation(),
+            };
+            Ok(build_expand_over(expand, child, expand.outer_input))
+        }
+    }
+}
+
+/// A single row with no columns, the input a bare UNNEST or FLATTEN expands.
+fn one_row_relation() -> LogicalPlan {
+    LogicalPlan::Values {
+        rows: vec![vec![BoundExpr::Literal {
+            value: LiteralValue::Null,
+            type_id: TypeId::Null,
+        }]],
+        schema: vec![LogicalColumn {
+            table_idx: None,
+            column_id: ColumnId(0),
+            name: String::new(),
+            type_id: TypeId::Null,
+            nullable: true,
+            fractional_digits: None,
+        }],
+    }
+}
+
+/// Builds the expansion node over the relation whose rows it expands.
+fn build_expand_over(
+    expand: &crate::binder::BoundExpand,
+    child: LogicalPlan,
+    outer: bool,
+) -> LogicalPlan {
+    LogicalPlan::ExpandRows {
+        child: Arc::new(child),
+        spec: Box::new(expand.spec.clone()),
+        carry: expand.carry.clone(),
+        output_columns: expand.output_columns.clone(),
+        outer_input: expand.outer_input || outer,
+    }
+}
+
+/// The (left, right) pairs an equality predicate names, for a join whose
+/// condition carries equalities only.
+fn equality_pairs(expr: &BoundExpr) -> Vec<(BoundExpr, BoundExpr)> {
+    use zyron_parser::ast::BinaryOperator as Op;
+    match expr {
+        BoundExpr::BinaryOp {
+            op: Op::And,
+            left,
+            right,
+            ..
+        } => {
+            let mut pairs = equality_pairs(left);
+            pairs.extend(equality_pairs(right));
+            pairs
+        }
+        BoundExpr::BinaryOp {
+            op: Op::Eq,
+            left,
+            right,
+            ..
+        } => vec![(left.as_ref().clone(), right.as_ref().clone())],
+        _ => Vec::new(),
     }
 }
 

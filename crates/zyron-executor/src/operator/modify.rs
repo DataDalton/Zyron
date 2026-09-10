@@ -33,6 +33,49 @@ use crate::context::ExecutionContext;
 use crate::expr::{evaluate, literal_to_scalar};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
+/// Writes a batch of row images to the log, unless the table is a temporary
+/// one, and returns the LSN a page holding those rows is stamped with.
+///
+/// A temporary table lives in one session on one node, is dropped when that
+/// session ends, and is cleared from disk by the next node start. A redo
+/// record for one describes a change nothing will ever replay, so writing it
+/// is a durable write in the service of nothing, and waiting on it at commit
+/// is a flush in the service of nothing.
+///
+/// The page is still stamped, with the log's current position rather than
+/// zero. An unstamped dirty page counts as dirty below every checkpoint
+/// boundary, which would hold WAL segments back for as long as a session
+/// held a temporary table. Stamping it at the current position says what is
+/// true: no log record older than now has to survive for this page.
+fn log_rows(
+    ctx: &ExecutionContext,
+    table: &zyron_catalog::TableEntry,
+    records: &[(u64, &[u8])],
+    kind: LoggedRows,
+) -> zyron_common::Result<zyron_wal::Lsn> {
+    if table.is_temporary() {
+        return Ok(ctx.wal.next_lsn());
+    }
+    let lsn = match kind {
+        LoggedRows::Insert => ctx.wal.log_insert_batch_last_lsn(records)?,
+        LoggedRows::Delete => ctx
+            .wal
+            .log_delete_batch(records)?
+            .last()
+            .copied()
+            .unwrap_or(zyron_wal::Lsn::INVALID),
+    };
+    ctx.mark_wrote_wal();
+    Ok(lsn)
+}
+
+/// Which kind of row image a log write carries.
+#[derive(Clone, Copy)]
+enum LoggedRows {
+    Insert,
+    Delete,
+}
+
 /// Encodes a row's value at the given column position into a caller-provided
 /// buffer suitable for B+Tree key comparison. Big-endian for integers (matches
 /// the literal path in extract_scan_bounds), Utf8 as raw bytes
@@ -583,6 +626,10 @@ pub(crate) async fn check_unique_constraints(
         .collect();
     let heap_file_id = table_entry.heap_file_id;
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
+    // The live tree and key columns of every unique index, resolved before the
+    // row loop so neither the catalog lookup nor the column resolution repeats
+    // per row
+    let mut unique_indexes = Vec::with_capacity(index_snap.btree.len());
     for spec in &index_snap.btree {
         if !spec.unique {
             continue;
@@ -593,7 +640,23 @@ pub(crate) async fn check_unique_constraints(
         let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let idx_id = spec.id;
+        unique_indexes.push((spec.id, btree, key_cols));
+    }
+    if unique_indexes.is_empty() {
+        return Ok(());
+    }
+    // Key values of the rows the active branch appended, filled on first use.
+    // One pass over the append file answers every row of this batch, so the
+    // check costs one decode of each appended row rather than one per row
+    // being inserted
+    let branch_key_cols: Vec<&[(usize, TypeId)]> = unique_indexes
+        .iter()
+        .map(|(_, _, key_cols)| key_cols.as_slice())
+        .collect();
+    let mut append_keys: Option<Vec<std::collections::HashSet<Vec<u8>>>> = None;
+    for (index_pos, (idx_id, btree, key_cols)) in unique_indexes.iter().enumerate() {
+        let idx_id = *idx_id;
+        let key_cols = key_cols.as_slice();
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row_idx in 0..batch.num_rows {
             if !encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
@@ -687,10 +750,15 @@ pub(crate) async fn check_unique_constraints(
             // because their locators name the branch's own file. Those rows
             // are as real as any other to a branch reader, so a uniqueness
             // check that skipped them would let one branch hold the value
-            // twice. Bounded by what the branch itself wrote
-            if branch_append_holds_value(ctx, table_entry, &key_cols, &scratch[..value_len]).await?
-            {
-                return Err(unique_violation(table_entry, &key_cols));
+            // twice
+            if append_keys.is_none() {
+                append_keys =
+                    Some(branch_append_key_sets(ctx, table_entry, &branch_key_cols).await?);
+            }
+            if let Some(sets) = &append_keys {
+                if sets[index_pos].contains(&scratch[..value_len]) {
+                    return Err(unique_violation(table_entry, key_cols));
+                }
             }
         }
     }
@@ -835,21 +903,26 @@ async fn insert_branch_batch(
     Ok(ids.len() as i64)
 }
 
-/// True when a row the active branch appended already carries this indexed
-/// value.
+/// The indexed values carried by the rows the active branch appended, one set
+/// per key shape given.
 ///
 /// Reads only the branch's append range, which holds what this branch
 /// inserted and nothing else, so the cost is the branch's own write volume
-/// rather than the table's size. Returns false immediately on the main line.
-async fn branch_append_holds_value(
+/// rather than the table's size. Every key shape is filled from the same pass,
+/// because decoding the row is the expensive part and encoding a second key
+/// from a decoded row is not. Returns empty sets immediately on the main line.
+async fn branch_append_key_sets(
     ctx: &Arc<ExecutionContext>,
     table_entry: &zyron_catalog::TableEntry,
-    key_cols: &[(usize, TypeId)],
-    value: &[u8],
-) -> zyron_common::Result<bool> {
+    key_cols: &[&[(usize, TypeId)]],
+) -> zyron_common::Result<Vec<std::collections::HashSet<Vec<u8>>>> {
+    let mut sets: Vec<std::collections::HashSet<Vec<u8>>> = key_cols
+        .iter()
+        .map(|_| std::collections::HashSet::new())
+        .collect();
     let (Some(branch_id), Some(catalog)) = (ctx.active_branch_id, ctx.branch_catalog.as_ref())
     else {
-        return Ok(false);
+        return Ok(sets);
     };
     let files = catalog.branch_files_for(branch_id, table_entry.heap_file_id);
     let pages = catalog.append_page_count(branch_id, table_entry.heap_file_id);
@@ -889,15 +962,14 @@ async fn branch_append_holds_value(
                     slot,
                 }),
             )?;
-            if !encode_btree_index_key_into(&row, 0, key_cols, &mut scratch) {
-                continue;
-            }
-            if scratch == value {
-                return Ok(true);
+            for (cols, set) in key_cols.iter().zip(sets.iter_mut()) {
+                if encode_btree_index_key_into(&row, 0, cols, &mut scratch) {
+                    set.insert(scratch.clone());
+                }
             }
         }
     }
-    Ok(false)
+    Ok(sets)
 }
 
 /// Adds B+tree index entries for a batch of newly stored rows. Each entry's key
@@ -2946,10 +3018,7 @@ pub(crate) fn enforce_vector_dimensions(
         };
         let expected = dimensions * 4;
         for row in 0..batch.num_rows.min(data.len()) {
-            if data.is_null(row) {
-                continue;
-            }
-            let crate::column::ScalarValue::Binary(bytes) = data.get_scalar(row) else {
+            let Some(bytes) = data.bytes_at(row) else {
                 continue;
             };
             if bytes.len() != expected {
@@ -3020,13 +3089,22 @@ pub(crate) fn enforce_declared_lengths(
             continue;
         };
         for row in 0..batch.num_rows.min(data.len()) {
-            if data.is_null(row) {
-                continue;
-            }
-            let length = match data.get_scalar(row) {
-                crate::column::ScalarValue::Utf8(s) if counts_characters => s.chars().count(),
-                crate::column::ScalarValue::Binary(b) if !counts_characters => b.len(),
-                _ => continue,
+            // The cell is borrowed rather than extracted, so measuring a long
+            // value does not first copy it
+            let length = if counts_characters {
+                match data.utf8_at(row) {
+                    // A character count never exceeds the byte count, so a
+                    // value inside the limit in bytes is inside it in
+                    // characters and needs no decode at all
+                    Some(s) if s.len() <= limit => continue,
+                    Some(s) => s.chars().count(),
+                    None => continue,
+                }
+            } else {
+                match data.bytes_at(row) {
+                    Some(b) => b.len(),
+                    None => continue,
+                }
             };
             if length > limit {
                 let unit = if counts_characters {
@@ -3842,9 +3920,21 @@ impl Operator for InsertOperator {
                 // common-case OLTP single-row insert does not heap-allocate
                 // a fresh Vec for the trigger payload, the WAL record list,
                 // or the dirty-page set on every call.
-                let mut batch_records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
-                for t in &tuples {
-                    batch_records.push((txn_id, t.data()));
+                //
+                // A temporary table's rows are never logged, so the record
+                // list is not built for one either: assembling a reference
+                // per row for a writer that discards them is a pass over the
+                // batch in the service of nothing
+                let logs_rows = !table_entry.is_temporary();
+                let mut batch_records: Vec<(u64, &[u8])> = if logs_rows {
+                    Vec::with_capacity(tuples.len())
+                } else {
+                    Vec::new()
+                };
+                if logs_rows {
+                    for t in &tuples {
+                        batch_records.push((txn_id, t.data()));
+                    }
                 }
 
                 // Fire BEFORE INSERT triggers if present.
@@ -3873,8 +3963,8 @@ impl Operator for InsertOperator {
                 // Use the last-LSN-only variant so the WAL writer skips its
                 // per-record Vec<Lsn> allocation, callers further down the
                 // pipeline only need the last LSN to chain to the Commit record
-                let last_lsn = self.ctx.wal.log_insert_batch_last_lsn(&batch_records)?;
-                self.ctx.mark_wrote_wal();
+                let last_lsn =
+                    log_rows(&self.ctx, &table_entry, &batch_records, LoggedRows::Insert)?;
 
                 #[cfg(feature = "profile")]
                 let _heap_span =
@@ -4973,9 +5063,12 @@ impl Operator for DeleteOperator {
                 let payloads: Vec<Vec<u8>> = tuple_ids.iter().map(tuple_id_payload).collect();
                 let batch_records: Vec<(u64, &[u8])> =
                     payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
-                let lsns = self.ctx.wal.log_delete_batch(&batch_records)?;
-                self.ctx.mark_wrote_wal();
-                let last_lsn = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
+                let last_lsn = log_rows(
+                    &self.ctx,
+                    self.ctx.get_table_entry(self.table_id)?.as_ref(),
+                    &batch_records,
+                    LoggedRows::Delete,
+                )?;
 
                 // MVCC delete: stamp xmax = this txn on each row instead of
                 // freeing the slot. Snapshot visibility hides the row once this
@@ -5942,9 +6035,8 @@ impl Operator for UpdateOperator {
                     .iter()
                     .map(|p| (txn_id, p.as_slice()))
                     .collect();
-                let del_lsns = self.ctx.wal.log_delete_batch(&delete_records)?;
-                self.ctx.mark_wrote_wal();
-                let del_last_lsn = del_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
+                let del_last_lsn =
+                    log_rows(&self.ctx, &table_entry, &delete_records, LoggedRows::Delete)?;
                 // MVCC: stamp xmax on the old image rather than freeing it, so an
                 // aborted update leaves the original row visible.
                 heap_file
@@ -5986,8 +6078,8 @@ impl Operator for UpdateOperator {
                 // Batch WAL log inserts: one CAS + commit for all.
                 let insert_records: Vec<(u64, &[u8])> =
                     new_tuples.iter().map(|t| (txn_id, t.data())).collect();
-                let ins_lsns = self.ctx.wal.log_insert_batch(&insert_records)?;
-                let ins_last_lsn = ins_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
+                let ins_last_lsn =
+                    log_rows(&self.ctx, &table_entry, &insert_records, LoggedRows::Insert)?;
                 #[cfg(feature = "profile")]
                 let _heap_span =
                     zyron_common::profile::scope(zyron_common::profile::Phase::ExecHeapInsert);

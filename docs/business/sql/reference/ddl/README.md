@@ -1,0 +1,75 @@
+# Defining Objects
+
+71 statements and constructs.
+
+- [ADD EXPECTATION](add-expectation.md), States a property rows must have, and what happens to a write that breaks it.
+- [ALTER ANALYZER](alter-analyzer.md), Changes how an analyzer breaks text into words.
+- [ALTER COLUMN CLASSIFICATION](alter-column-classification.md), Records how sensitive a column is, so rules can act on the classification.
+- [ALTER INDEX](alter-index.md), Renames an index or changes its options.
+- [ALTER ROLE](alter-role.md), Renames a role or changes its options.
+- [ALTER SECURITY MAP](alter-security-map.md), Maps an external identity onto a role inside the database.
+- [ALTER SEQUENCE](alter-sequence.md), Changes where a sequence continues from, or how it steps.
+- [ALTER SYNONYM DICTIONARY](alter-synonym-dictionary.md), Adds or removes a synonym group.
+- [ALTER TABLE](alter-table.md), Changes a table's definition in place.
+- [ALTER USER](alter-user.md), Changes a principal's password or options.
+- [ALTER VIEW](alter-view.md), Renames a view or changes its options.
+- [COMMENT ON](comment-on.md), Records a description against an object, or removes one.
+- [CREATE ABAC POLICY](create-abac-policy.md), Decides row access by a predicate over the reader's attributes, not by a grant.
+- [CREATE AGGREGATE](create-aggregate.md), Builds an aggregate from a state type and a function that folds rows into it.
+- [CREATE ANALYZER](create-analyzer.md), Says how text is broken into the words a full-text index holds.
+- [CREATE COLLATION](create-collation.md), Names a rule for ordering and comparing text.
+- [CREATE EVENT HANDLER](create-event-handler.md), Runs a function when the engine raises an event.
+- [CREATE FEATURE GROUP](create-feature-group.md), Declares a set of model inputs, keyed by an entity, computed once and read by both training and serving.
+- [CREATE FOREIGN TABLE](create-foreign-table.md), Declares a table whose rows live on another server.
+- [CREATE FULLTEXT INDEX](create-fulltext-index.md), Indexes text for searching by word rather than by value.
+- [CREATE FUNCTION](create-function.md), Names a SQL expression or query so it can be called like a built-in.
+- [CREATE GRAPH SCHEMA](create-graph-schema.md), Declares nodes and edges over existing tables, so a graph query can traverse them.
+- [CREATE HYBRID INDEX](create-hybrid-index.md), Indexes text and vectors together, so one search ranks by both.
+- [CREATE INDEX](create-index.md), Builds a B-tree index over one or more columns.
+- [CREATE MATERIALIZED VIEW](create-materialized-view.md), Stores a query's result, refreshed on demand rather than on read.
+- [CREATE MODEL](create-model.md), Trains and registers a model from data already in the database, which SQL can then call for predictions.
+- [CREATE PROCEDURE](create-procedure.md), Names a body of statements that CALL runs.
+- [CREATE ROLE](create-role.md), Creates a role that privileges are granted to.
+- [CREATE SCHEMA](create-schema.md), Creates a namespace that objects are created inside.
+- [CREATE SEQUENCE](create-sequence.md), Creates a generator of increasing numbers, for keys and counters.
+- [CREATE SPATIAL INDEX](create-spatial-index.md), Indexes geometry for searching by position and overlap.
+- [CREATE SYNONYM DICTIONARY](create-synonym-dictionary.md), Groups words that a search should treat as the same.
+- [CREATE TABLE](create-table.md), Creates a table, from a written-out column list or from a query's output.
+- [CREATE TRIGGER](create-trigger.md), Runs a function around a write to a table.
+- [CREATE TYPE](create-type.md), Names a domain over an existing type, so a column declares intent rather than a width.
+- [CREATE USER](create-user.md), Creates a principal that can connect.
+- [CREATE VECTOR INDEX](create-vector-index.md), Indexes vectors for nearest-neighbour search.
+- [CREATE VIEW](create-view.md), Names a query so it can be read like a table.
+- [DISABLE FEATURE](disable-feature.md), Turns off a per-table capability and stops paying for it.
+- [DROP AGGREGATE](drop-aggregate.md), Removes an aggregate.
+- [DROP ANALYZER](drop-analyzer.md), Removes an analyzer.
+- [DROP COLLATION](drop-collation.md), Removes a named collation.
+- [DROP EVENT HANDLER](drop-event-handler.md), Stops running a function on an event.
+- [DROP EXPECTATION](drop-expectation.md), Removes an expectation from a table.
+- [DROP FEATURE GROUP](drop-feature-group.md), Removes a feature group.
+- [DROP FOREIGN TABLE](drop-foreign-table.md), Removes a foreign table declaration.
+- [DROP FUNCTION](drop-function.md), Removes a function.
+- [DROP GRAPH SCHEMA](drop-graph-schema.md), Removes a graph schema.
+- [DROP INDEX](drop-index.md), Removes an index.
+- [DROP MATERIALIZED VIEW](drop-materialized-view.md), Removes a materialized view and the rows it stored.
+- [DROP MODEL](drop-model.md), Removes a trained model.
+- [DROP PROCEDURE](drop-procedure.md), Removes a procedure.
+- [DROP ROLE](drop-role.md), Removes a role and the privileges held through it.
+- [DROP SCHEMA](drop-schema.md), Removes a namespace, and with CASCADE everything inside it.
+- [DROP SECURITY MAP](drop-security-map.md), Removes the mapping from an external identity to a role.
+- [DROP SEQUENCE](drop-sequence.md), Removes a sequence.
+- [DROP SYNONYM DICTIONARY](drop-synonym-dictionary.md), Removes a synonym dictionary.
+- [DROP TABLE](drop-table.md), Removes a table and everything stored in it.
+- [DROP TRIGGER](drop-trigger.md), Removes a trigger from a table.
+- [DROP TYPE](drop-type.md), Removes a named type.
+- [DROP USER](drop-user.md), Removes a principal.
+- [DROP VIEW](drop-view.md), Removes a view.
+- [ENABLE FEATURE](enable-feature.md), Turns on a per-table capability that costs something to keep.
+- [EXPORT USER](export-user.md), Writes out everything held about one data subject.
+- [FORGET USER](forget-user.md), Erases one data subject's rows across every table that holds them.
+- [GRANT](grant.md), Gives a role a privilege on an object.
+- [LEGAL HOLD](legal-hold.md), Freezes rows against deletion, including by retention, with the reason recorded.
+- [REFRESH MATERIALIZED VIEW](refresh-materialized-view.md), Runs a materialized view's query again and replaces what it holds.
+- [REINDEX](reindex.md), Rebuilds an index from the rows it covers.
+- [REVOKE](revoke.md), Takes a privilege on an object back from a role.
+- [UNDROP TABLE](undrop-table.md), Brings back a dropped table, while its versions are still retained.

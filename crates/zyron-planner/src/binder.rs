@@ -1533,6 +1533,8 @@ pub enum BoundFromItem {
         join_type: JoinType,
         right: Box<BoundFromItem>,
         condition: BoundJoinCondition,
+        /// Set by ASOF JOIN. `condition` then carries the ON equalities only
+        asof: Option<Box<BoundAsofMatch>>,
     },
     Subquery {
         table_idx: usize,
@@ -1557,6 +1559,44 @@ pub enum BoundFromItem {
         positional: Vec<BoundExpr>,
         output_columns: Vec<LogicalColumn>,
     },
+    /// A row-generating FROM item: UNNEST, FLATTEN, or the expansion an
+    /// UNPIVOT lowers to. Boxed because it is by far the widest variant and
+    /// every `BoundFromItem` would otherwise pay for it
+    Expand(Box<BoundExpand>),
+}
+
+/// One bound row-generating FROM item.
+#[derive(Debug, Clone)]
+pub struct BoundExpand {
+    pub table_idx: usize,
+    pub spec: crate::logical::ExpandSpec,
+    /// The input column each carried output column comes from, in output
+    /// order. Carried by identity rather than by position, so pruning the
+    /// input does not move what a carried column points at
+    pub carry: Vec<ColumnRef>,
+    /// Every column the item outputs, the carried ones then the produced
+    /// ones
+    pub output_columns: Vec<LogicalColumn>,
+    /// The relation the expansion reads, when it was written after one. None
+    /// for a bare UNNEST or FLATTEN, whose input is a synthesized one-row
+    /// relation
+    pub input: Option<Box<BoundFromItem>>,
+    /// True when the expression the expansion reads references a preceding
+    /// FROM item, so the logical builder attaches it to what came before
+    /// rather than planning it standalone
+    pub lateral: bool,
+    /// True when an input row that produced no output row is still emitted
+    /// once with the produced columns null
+    pub outer_input: bool,
+}
+
+/// The match a bound ASOF JOIN runs on.
+#[derive(Debug, Clone)]
+pub struct BoundAsofMatch {
+    pub match_left: BoundExpr,
+    pub match_right: BoundExpr,
+    pub direction: crate::logical::AsofDirection,
+    pub tolerance: Option<crate::logical::AsofTolerance>,
 }
 
 #[derive(Debug, Clone)]
@@ -1603,6 +1643,12 @@ fn owned_from_indices(item: &BoundFromItem, set: &mut std::collections::HashSet<
         BoundFromItem::Join { left, right, .. } => {
             owned_from_indices(left, set);
             owned_from_indices(right, set);
+        }
+        BoundFromItem::Expand(expand) => {
+            set.insert(expand.table_idx);
+            if let Some(input) = &expand.input {
+                owned_from_indices(input, set);
+            }
         }
     }
 }
@@ -1653,13 +1699,27 @@ fn for_each_ref_in_from(item: &BoundFromItem, f: &mut dyn FnMut(&ColumnRef)) {
             left,
             right,
             condition,
-            ..
+            asof,
+            join_type: _,
         } => {
             for_each_ref_in_from(left, f);
             for_each_ref_in_from(right, f);
             if let BoundJoinCondition::On(e) = condition {
                 for_each_ref_in_bound_expr(e, f);
             }
+            if let Some(asof) = asof {
+                for_each_ref_in_bound_expr(&asof.match_left, f);
+                for_each_ref_in_bound_expr(&asof.match_right, f);
+                if let Some(tolerance) = &asof.tolerance {
+                    for_each_ref_in_bound_expr(&tolerance.bound, f);
+                }
+            }
+        }
+        BoundFromItem::Expand(expand) => {
+            if let Some(input) = &expand.input {
+                for_each_ref_in_from(input, f);
+            }
+            for_each_ref_in_expand_spec(&expand.spec, f);
         }
         BoundFromItem::GraphQuery { params, .. } => {
             for (_, e) in params {
@@ -1679,12 +1739,262 @@ fn for_each_ref_in_from(item: &BoundFromItem, f: &mut dyn FnMut(&ColumnRef)) {
     }
 }
 
+/// Which relation of a join an expression belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+/// The side an expression reads from, or None when it reads from both or
+/// from neither.
+fn expression_side(
+    expr: &BoundExpr,
+    left_indices: &std::collections::HashSet<usize>,
+    right_indices: &std::collections::HashSet<usize>,
+) -> Option<JoinSide> {
+    let mut saw_left = false;
+    let mut saw_right = false;
+    for_each_ref_in_bound_expr(expr, &mut |r| {
+        if left_indices.contains(&r.table_idx) {
+            saw_left = true;
+        }
+        if right_indices.contains(&r.table_idx) {
+            saw_right = true;
+        }
+    });
+    match (saw_left, saw_right) {
+        (true, false) => Some(JoinSide::Left),
+        (false, true) => Some(JoinSide::Right),
+        _ => None,
+    }
+}
+
+/// The comparison that means the same thing with its operands swapped.
+fn flip_operator(op: zyron_parser::ast::BinaryOperator) -> zyron_parser::ast::BinaryOperator {
+    use zyron_parser::ast::BinaryOperator as Op;
+    match op {
+        Op::Gt => Op::Lt,
+        Op::GtEq => Op::LtEq,
+        Op::Lt => Op::Gt,
+        Op::LtEq => Op::GtEq,
+        other => other,
+    }
+}
+
+/// True when every conjunct of a predicate is an equality, which is all an
+/// ASOF join's ON clause may carry.
+fn every_conjunct_is_equality(expr: &BoundExpr) -> bool {
+    use zyron_parser::ast::BinaryOperator as Op;
+    match expr {
+        BoundExpr::BinaryOp {
+            op: Op::And,
+            left,
+            right,
+            ..
+        } => every_conjunct_is_equality(left) && every_conjunct_is_equality(right),
+        BoundExpr::BinaryOp { op: Op::Eq, .. } => true,
+        _ => false,
+    }
+}
+
+/// True when an expression is the difference between the two columns a match
+/// condition compares, in either order.
+fn is_match_column_difference(distance: &Expr, first: &Expr, second: &Expr) -> bool {
+    use zyron_parser::ast::BinaryOperator as Op;
+    let Expr::BinaryOp {
+        left,
+        op: Op::Minus,
+        right,
+    } = distance
+    else {
+        return false;
+    };
+    (left.as_ref() == first && right.as_ref() == second)
+        || (left.as_ref() == second && right.as_ref() == first)
+}
+
+/// True for a type whose values an ASOF match can walk in order.
+fn is_asof_orderable(type_id: TypeId) -> bool {
+    type_id.is_numeric()
+        || matches!(
+            type_id,
+            TypeId::Date | TypeId::Timestamp | TypeId::TimestampTz | TypeId::Interval
+        )
+}
+
+/// The column a pivot target or an aggregate argument names, or None when it
+/// is something other than a plain column reference.
+fn column_ref_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(name) => Some(name.clone()),
+        Expr::QualifiedIdentifier { column, .. } => Some(column.clone()),
+        _ => None,
+    }
+}
+
+/// The name one pivot output column takes: its own alias, the literal's
+/// text, and the aggregate's name too when more than one aggregate makes
+/// several columns per value.
+fn pivot_output_name(
+    aggregate: &zyron_parser::ast::PivotAggregate,
+    value: &zyron_parser::ast::PivotValue,
+    several_aggregates: bool,
+) -> String {
+    let value_part = value
+        .alias
+        .clone()
+        .unwrap_or_else(|| literal_text(&value.value));
+    match (&aggregate.alias, several_aggregates) {
+        (Some(alias), true) => format!("{value_part}_{alias}"),
+        (Some(alias), false) => {
+            if value.alias.is_some() {
+                value_part
+            } else {
+                format!("{value_part}_{alias}")
+            }
+        }
+        (None, true) => format!("{value_part}_{}", aggregate.function.to_ascii_lowercase()),
+        (None, false) => value_part,
+    }
+}
+
+/// A literal's text, as it names a pivot output column.
+fn literal_text(value: &LiteralValue) -> String {
+    match value {
+        LiteralValue::String(s) => s.clone(),
+        LiteralValue::Integer(i) => i.to_string(),
+        LiteralValue::Int128(i) => i.to_string(),
+        LiteralValue::Float(f) => f.to_string(),
+        LiteralValue::Decimal { digits, scale } => format!("{digits}e-{scale}"),
+        LiteralValue::Boolean(b) => b.to_string(),
+        LiteralValue::Null => "null".to_string(),
+        LiteralValue::Interval(_) => "interval".to_string(),
+        LiteralValue::Bytes(_) => "bytes".to_string(),
+    }
+}
+
+/// The type a literal binds to.
+fn literal_type_id(value: &LiteralValue) -> TypeId {
+    match value {
+        LiteralValue::String(_) => TypeId::Varchar,
+        LiteralValue::Integer(_) => TypeId::Int64,
+        LiteralValue::Int128(_) => TypeId::Int128,
+        LiteralValue::Float(_) => TypeId::Float64,
+        LiteralValue::Decimal { .. } => TypeId::Decimal,
+        LiteralValue::Boolean(_) => TypeId::Boolean,
+        LiteralValue::Null => TypeId::Null,
+        LiteralValue::Interval(_) => TypeId::Interval,
+        LiteralValue::Bytes(_) => TypeId::Binary,
+    }
+}
+
+/// Every column a bind scope's relations expose, in the order the plan
+/// concatenates them.
+fn bound_context_columns(ctx: &BindContext) -> Vec<LogicalColumn> {
+    let mut columns = Vec::new();
+    for table in &ctx.tables {
+        for column in &table.columns {
+            columns.push(LogicalColumn {
+                table_idx: Some(table.table_idx),
+                column_id: column.column_id,
+                name: column.name.clone(),
+                type_id: column.type_id,
+                nullable: column.nullable,
+                fractional_digits: column.fractional_digits,
+            });
+        }
+    }
+    columns
+}
+
+/// The input columns a row-generating item carries through, named by the
+/// identity the child addresses them with.
+struct ExpandCarried {
+    sources: Vec<ColumnRef>,
+    columns: Vec<LogicalColumn>,
+}
+
+/// What a LATERAL expansion carries: every column of the relations written
+/// before it, in the order the plan concatenates them, because those are
+/// exactly the rows it is executed once per. A bare expansion sits on a
+/// synthesized one-row relation and carries nothing.
+fn expand_carried_columns(lateral: bool, ctx: &BindContext) -> ExpandCarried {
+    if !lateral {
+        return ExpandCarried {
+            sources: Vec::new(),
+            columns: Vec::new(),
+        };
+    }
+    let columns = bound_context_columns(ctx);
+    let sources = columns.iter().map(column_source).collect();
+    ExpandCarried { sources, columns }
+}
+
+/// The reference a plan addresses one column by.
+fn column_source(column: &LogicalColumn) -> ColumnRef {
+    ColumnRef {
+        table_idx: column.table_idx.unwrap_or(0),
+        column_id: column.column_id,
+        type_id: column.type_id,
+        nullable: column.nullable,
+        fractional_digits: column.fractional_digits,
+    }
+}
+
+/// Every column reference an expansion reads from its input.
+pub fn for_each_ref_in_expand_spec(
+    spec: &crate::logical::ExpandSpec,
+    f: &mut dyn FnMut(&ColumnRef),
+) {
+    use crate::logical::ExpandSpec;
+    match spec {
+        ExpandSpec::Unnest { arrays, .. } => {
+            for expr in arrays {
+                for_each_ref_in_bound_expr(expr, f);
+            }
+        }
+        ExpandSpec::Flatten { document, .. } => for_each_ref_in_bound_expr(document, f),
+        ExpandSpec::Unpivot { groups, labels, .. } => {
+            for group in groups {
+                for expr in group {
+                    for_each_ref_in_bound_expr(expr, f);
+                }
+            }
+            for expr in labels {
+                for_each_ref_in_bound_expr(expr, f);
+            }
+        }
+    }
+}
+
 /// Every column reference in one expression, including those inside any
 /// subquery it holds.
 ///
 /// Public because deciding which side of a correlation an expression sits
 /// on is the same question, and answering it with a second walker would be
 /// a second chance to miss a variant
+/// The first reference in these expressions that reaches a relation already
+/// in scope, which is what makes a row-generating FROM item correlated.
+///
+/// One reference is all a refusal names, so the walk stops at the first and
+/// the relations in scope are compared by index rather than gathered into a
+/// set the bare form would build and the LATERAL form would never read.
+fn first_outer_ref(ctx: &BindContext, exprs: &[BoundExpr]) -> Option<ColumnRef> {
+    let mut found: Option<ColumnRef> = None;
+    for expr in exprs {
+        for_each_ref_in_bound_expr(expr, &mut |r| {
+            if found.is_none() && ctx.tables.iter().any(|t| t.table_idx == r.table_idx) {
+                found = Some(r.clone());
+            }
+        });
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
 pub fn for_each_ref_in_bound_expr(expr: &BoundExpr, f: &mut dyn FnMut(&ColumnRef)) {
     match expr {
         BoundExpr::ColumnRef(cr) => f(cr),
@@ -2468,6 +2778,11 @@ pub struct Binder<'a> {
     // is a cache lookup or, on a miss, a heap scan. The lock is taken only
     // for the get/insert, never across the resolver await.
     table_memo: std::sync::Mutex<HashMap<(Option<String>, String), Arc<TableEntry>>>,
+    // Per-bind memo of a PIVOT input's output column names, keyed by the
+    // input as written. Learning them binds the input, and the rewritten
+    // query binds it again to run it, so a PIVOT over a PIVOT would bind the
+    // innermost relation once per level of nesting without this
+    pivot_shape_memo: std::sync::Mutex<HashMap<String, Vec<String>>>,
     // Names of views currently being expanded, used to detect a reference
     // cycle (a view that transitively selects from itself) and fail with a
     // clear error instead of recursing without bound.
@@ -2489,6 +2804,7 @@ impl<'a> Binder<'a> {
             next_table_idx: 0,
             row_security: None,
             table_memo: std::sync::Mutex::new(HashMap::new()),
+            pivot_shape_memo: std::sync::Mutex::new(HashMap::new()),
             view_stack: Vec::new(),
             function_stack: Vec::new(),
             generation_inline_depth: 0,
@@ -3258,13 +3574,38 @@ impl<'a> Binder<'a> {
                     let condition = self
                         .bind_join_condition(ctx, &join_ref.condition, &left, &right)
                         .await?;
+                    let asof = match &join_ref.asof {
+                        None => None,
+                        Some(asof) => {
+                            if !matches!(join_ref.join_type, JoinType::Inner | JoinType::Left) {
+                                return Err(ZyronError::PlanError(
+                                    "ASOF JOIN has an inner form and a LEFT form; there is no RIGHT or FULL ASOF JOIN".to_string(),
+                                ));
+                            }
+                            Some(Box::new(
+                                self.bind_asof_match(
+                                    ctx,
+                                    &asof.condition,
+                                    &left,
+                                    &right,
+                                    &condition,
+                                )
+                                .await?,
+                            ))
+                        }
+                    };
                     Ok(BoundFromItem::Join {
                         left: Box::new(left),
                         join_type: join_ref.join_type,
                         right: Box::new(right),
                         condition,
+                        asof,
                     })
                 }
+                TableRef::Unnest(unnest) => self.bind_unnest(ctx, unnest, false, None).await,
+                TableRef::Flatten(flatten) => self.bind_flatten(ctx, flatten, false, None).await,
+                TableRef::Pivot(pivot) => self.bind_pivot(ctx, pivot).await,
+                TableRef::Unpivot(unpivot) => self.bind_unpivot(ctx, unpivot).await,
                 TableRef::Subquery { query, alias } => {
                     // A plain derived table cannot see the enclosing FROM, so it
                     // binds in a fresh scope with no outer.
@@ -3320,6 +3661,13 @@ impl<'a> Binder<'a> {
                             query: Box::new(bound_query),
                             lateral: true,
                         })
+                    } else if let TableRef::Unnest(unnest) = subquery.as_ref() {
+                        // A row-generating function reads one value per row of
+                        // the items before it, so LATERAL over one is executed
+                        // as an expansion of those rows rather than refused
+                        self.bind_unnest(ctx, unnest, true, None).await
+                    } else if let TableRef::Flatten(flatten) = subquery.as_ref() {
+                        self.bind_flatten(ctx, flatten, true, None).await
                     } else {
                         // LATERAL correlation is meaningful only for a subquery.
                         // A LATERAL table function or table reference binds
@@ -3786,6 +4134,807 @@ impl<'a> Binder<'a> {
     /// single scalar (WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, projections,
     /// VALUES) route through here instead of `bind_expr` directly. This is a
     /// plain async fn, so the leaf path adds no heap allocation.
+    /// Binds `array_filter(arr, x -> predicate)` and
+    /// `array_transform(arr, x -> expr)`.
+    ///
+    /// The lambda's parameter names one element, so it binds as a column of a
+    /// one-column pseudo relation whose type is the array's element type. The
+    /// executor then evaluates the body over every element of the batch at
+    /// once, the same way it evaluates any other expression over a column.
+    async fn bind_lambda_call(
+        &mut self,
+        ctx: &BindContext,
+        name: &str,
+        args: &[FunctionArg],
+    ) -> Result<BoundExpr> {
+        let raw: Vec<&Expr> = args
+            .iter()
+            .map(|a| match a {
+                FunctionArg::Unnamed(e) => Ok(e),
+                FunctionArg::Named { value, .. } => Ok(value),
+                FunctionArg::Wildcard => Err(ZyronError::PlanError(format!(
+                    "`*` is not a valid argument to {name}"
+                ))),
+            })
+            .collect::<Result<_>>()?;
+        if raw.len() != 2 {
+            return Err(ZyronError::PlanError(format!(
+                "{name} takes an array and a lambda, written {name}(arr, x -> expr)"
+            )));
+        }
+        let array = self.bind_scalar(ctx, raw[0]).await?;
+        let element_type = self.array_element_type(ctx, &array).ok_or_else(|| {
+            ZyronError::PlanError(format!(
+                "{name} needs the element type of its array; pass a column declared T[] or an ARRAY[...] constructor"
+            ))
+        })?;
+        let Expr::Lambda { parameter, body } = raw[1] else {
+            return Err(ZyronError::PlanError(format!(
+                "{name}'s second argument is a lambda, written x -> expr"
+            )));
+        };
+
+        // The parameter is a relation of one column for the length of the
+        // body's binding, so an ordinary identifier lookup resolves it
+        let mut lambda_ctx = ctx.clone();
+        lambda_ctx.tables.push(BoundTableRef {
+            table_idx: crate::logical::LAMBDA_TABLE_IDX,
+            table_id: None,
+            alias: parameter.clone(),
+            columns: vec![BoundColumnDef {
+                column_id: ColumnId(0),
+                name: parameter.clone(),
+                type_id: element_type,
+                nullable: true,
+                ordinal: 0,
+                fractional_digits: None,
+            }],
+            entry: None,
+        });
+        let bound_body = self.bind_scalar(&lambda_ctx, body).await?;
+        if name == "array_filter" && bound_body.type_id() != TypeId::Boolean {
+            return Err(ZyronError::PlanError(format!(
+                "array_filter's lambda has to yield a boolean, this one yields {}",
+                bound_body.type_id()
+            )));
+        }
+        Ok(BoundExpr::Function {
+            name: name.to_string(),
+            args: vec![array, bound_body],
+            return_type: TypeId::Array,
+            distinct: false,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Row-generating FROM items
+    // -----------------------------------------------------------------------
+
+    /// Binds `PIVOT` by rewriting it to the grouped aggregate it means.
+    ///
+    /// One conditional aggregate per (aggregate, value) pair, grouped by
+    /// every column of the input that neither the pivot column nor an
+    /// aggregate argument names. The rewrite is what EXPLAIN shows, and the
+    /// unparser still writes the statement back as it was typed.
+    async fn bind_pivot(
+        &mut self,
+        ctx: &mut BindContext,
+        pivot: &zyron_parser::ast::PivotRef,
+    ) -> Result<BoundFromItem> {
+        use zyron_parser::ast::{
+            BinaryOperator, Expr as AstExpr, SelectItem, SelectStatement, TableRef,
+        };
+        if pivot.value_subquery {
+            return Err(ZyronError::PlanError(
+                "a PIVOT value list must be static, because the output columns are fixed before the query runs; run SELECT DISTINCT over the pivot column first, then write the values it returned into the IN list"
+                    .to_string(),
+            ));
+        }
+        if pivot.values.is_empty() {
+            return Err(ZyronError::PlanError(
+                "a PIVOT IN list names at least one value".to_string(),
+            ));
+        }
+        let pivot_column = column_ref_name(&pivot.pivot_column)
+            .ok_or_else(|| ZyronError::PlanError("PIVOT ... FOR names one column".to_string()))?;
+
+        // Every column of the input that the pivot does not consume becomes
+        // a grouping key, which is what leaves one output row per remaining
+        // combination
+        let consumed: std::collections::HashSet<String> = std::iter::once(pivot_column.clone())
+            .chain(
+                pivot
+                    .aggregates
+                    .iter()
+                    .filter_map(|a| column_ref_name(&a.argument)),
+            )
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        let input_columns = self.pivot_input_columns(&pivot.input).await?;
+        let group_keys: Vec<String> = input_columns
+            .into_iter()
+            .filter(|c| !consumed.contains(&c.to_ascii_lowercase()))
+            .collect();
+
+        let mut projections: Vec<SelectItem> = group_keys
+            .iter()
+            .map(|name| SelectItem::Expr(AstExpr::Identifier(name.clone()), None))
+            .collect();
+        let group_by: Vec<AstExpr> = group_keys
+            .iter()
+            .map(|name| AstExpr::Identifier(name.clone()))
+            .collect();
+
+        // agg(CASE WHEN pivot_column = value THEN argument END)
+        for aggregate in &pivot.aggregates {
+            for value in &pivot.values {
+                let guard = AstExpr::Case {
+                    operand: None,
+                    conditions: vec![zyron_parser::ast::WhenClause {
+                        condition: AstExpr::BinaryOp {
+                            left: Box::new(pivot.pivot_column.clone()),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(AstExpr::Literal(value.value.clone())),
+                        },
+                        result: aggregate.argument.clone(),
+                    }],
+                    else_result: None,
+                };
+                let name = pivot_output_name(aggregate, value, pivot.aggregates.len() > 1);
+                projections.push(SelectItem::Expr(
+                    AstExpr::Function {
+                        name: aggregate.function.clone(),
+                        args: vec![zyron_parser::ast::FunctionArg::Unnamed(guard)],
+                        distinct: false,
+                    },
+                    Some(name),
+                ));
+            }
+        }
+
+        let rewritten = SelectStatement {
+            with: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            projections,
+            from: vec![pivot.input.clone()],
+            where_clause: None,
+            group_by,
+            group_by_sets: None,
+            having: None,
+            qualify: None,
+            set_ops: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            fetch: None,
+            for_clause: None,
+            soft_delete_mode: zyron_parser::ast::SoftDeleteSelectMode::Default,
+            into_target: None,
+        };
+        let alias = pivot.alias.clone().unwrap_or_else(|| "pivot".to_string());
+        self.bind_table_ref(
+            ctx,
+            &TableRef::Subquery {
+                query: Box::new(rewritten),
+                alias,
+            },
+        )
+        .await
+    }
+
+    /// Binds `UNPIVOT` as an expansion of its input's rows.
+    ///
+    /// Each input row yields one row per group, carrying that group's label
+    /// and its values. The columns the groups consumed do not travel, which
+    /// is what makes the result a relation of its own.
+    async fn bind_unpivot(
+        &mut self,
+        ctx: &mut BindContext,
+        unpivot: &zyron_parser::ast::UnpivotRef,
+    ) -> Result<BoundFromItem> {
+        use zyron_parser::ast::LiteralValue;
+        if unpivot.items.is_empty() {
+            return Err(ZyronError::PlanError(
+                "an UNPIVOT IN list names at least one column".to_string(),
+            ));
+        }
+
+        // The input binds into a scope of its own, so the columns it
+        // consumed do not leak into the enclosing query under their own
+        // names. What the enclosing query sees is this item's own columns
+        let mut inner_ctx = BindContext::new();
+        let input = self.bind_table_ref(&mut inner_ctx, &unpivot.input).await?;
+        let input_columns = bound_context_columns(&inner_ctx);
+
+        // The input is indexed once by lowercased name. An UNPIVOT names one
+        // column per group per value column, so searching the input for each
+        // would be the product of the two widths
+        let mut position_by_name: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(input_columns.len());
+        for (position, column) in input_columns.iter().enumerate() {
+            position_by_name
+                .entry(column.name.to_ascii_lowercase())
+                .or_insert(position);
+        }
+        let position_of = |name: &str| -> Option<usize> {
+            position_by_name
+                .get(name)
+                .or_else(|| position_by_name.get(&name.to_ascii_lowercase()))
+                .copied()
+        };
+
+        let mut groups: Vec<Vec<BoundExpr>> = Vec::with_capacity(unpivot.items.len());
+        let mut labels: Vec<BoundExpr> = Vec::with_capacity(unpivot.items.len());
+        let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // The value columns take the type of the first group's columns, so
+        // every group has to agree with it
+        let mut value_types: Vec<(TypeId, bool)> = Vec::new();
+        for item in &unpivot.items {
+            let mut group = Vec::with_capacity(item.columns.len());
+            for (slot, name) in item.columns.iter().enumerate() {
+                let position =
+                    position_of(name).ok_or_else(|| ZyronError::ColumnNotFound(name.clone()))?;
+                consumed.insert(position);
+                let column = &input_columns[position];
+                match value_types.get(slot) {
+                    None => value_types.push((column.type_id, true)),
+                    Some((declared, _)) if *declared != column.type_id => {
+                        return Err(ZyronError::PlanError(format!(
+                            "UNPIVOT column '{}' is {} but the value column it feeds is {}; every group has to agree",
+                            name, column.type_id, declared
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                group.push(BoundExpr::ColumnRef(ColumnRef {
+                    table_idx: column.table_idx.unwrap_or(0),
+                    column_id: column.column_id,
+                    type_id: column.type_id,
+                    nullable: true,
+                    fractional_digits: column.fractional_digits,
+                }));
+            }
+            let label = item
+                .label
+                .clone()
+                .unwrap_or_else(|| LiteralValue::String(item.columns[0].clone()));
+            labels.push(BoundExpr::Literal {
+                type_id: literal_type_id(&label),
+                value: label,
+            });
+            groups.push(group);
+        }
+
+        // Every input column the groups did not consume travels through,
+        // named by the identity the input addresses it with
+        let carried_sources: Vec<usize> = (0..input_columns.len())
+            .filter(|i| !consumed.contains(i))
+            .collect();
+        let carry: Vec<ColumnRef> = carried_sources
+            .iter()
+            .map(|i| column_source(&input_columns[*i]))
+            .collect();
+
+        let table_idx = self.alloc_table_idx();
+        let mut produced: Vec<(String, TypeId, bool)> =
+            vec![(unpivot.name_column.clone(), TypeId::Varchar, false)];
+        for (i, name) in unpivot.value_columns.iter().enumerate() {
+            let (type_id, nullable) = value_types.get(i).copied().unwrap_or((TypeId::Null, true));
+            produced.push((name.clone(), type_id, nullable));
+        }
+
+        // An UNPIVOT is a relation of its own, so every column it outputs is
+        // addressed under its table index rather than the input's
+        let carried: Vec<LogicalColumn> = carried_sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| LogicalColumn {
+                table_idx: Some(table_idx),
+                column_id: ColumnId(position as u16),
+                name: input_columns[*source].name.clone(),
+                type_id: input_columns[*source].type_id,
+                nullable: input_columns[*source].nullable,
+                fractional_digits: input_columns[*source].fractional_digits,
+            })
+            .collect();
+        // The carried columns move into the output rather than being copied
+        // beside it, so each name is allocated once on the way through
+        let carried_width = carried.len();
+        let mut output_columns = carried;
+        for (i, (name, type_id, nullable)) in produced.into_iter().enumerate() {
+            output_columns.push(LogicalColumn {
+                table_idx: Some(table_idx),
+                column_id: ColumnId((carried_width + i) as u16),
+                name,
+                type_id,
+                nullable,
+                fractional_digits: None,
+            });
+        }
+        let columns: Vec<BoundColumnDef> = output_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| BoundColumnDef {
+                column_id: col.column_id,
+                name: col.name.clone(),
+                type_id: col.type_id,
+                nullable: col.nullable,
+                ordinal: i as u16,
+                fractional_digits: col.fractional_digits,
+            })
+            .collect();
+        ctx.tables.push(BoundTableRef {
+            table_idx,
+            table_id: None,
+            alias: unpivot
+                .alias
+                .clone()
+                .unwrap_or_else(|| "unpivot".to_string()),
+            columns,
+            entry: None,
+        });
+
+        Ok(BoundFromItem::Expand(Box::new(BoundExpand {
+            table_idx,
+            spec: crate::logical::ExpandSpec::Unpivot {
+                groups,
+                labels,
+                include_nulls: unpivot.include_nulls,
+            },
+            carry,
+            output_columns,
+            input: Some(Box::new(input)),
+            lateral: false,
+            outer_input: false,
+        })))
+    }
+
+    /// The column names a relation written in FROM produces, for the PIVOT
+    /// rewrite's grouping list.
+    /// The output column names of a PIVOT's input, learned once per input.
+    ///
+    /// Keyed by the input as written, which is exact: the names a relation
+    /// produces are a function of its own text and of a catalog that does not
+    /// change during one bind.
+    async fn pivot_input_columns(&mut self, item: &TableRef) -> Result<Vec<String>> {
+        // An input that cannot be written back is bound rather than
+        // memoized, so an unparse gap costs the extra bind and never a wrong
+        // answer
+        let key = zyron_parser::table_ref_to_sql(item).ok();
+        if let Some(key) = &key
+            && let Some(hit) = self
+                .pivot_shape_memo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+        {
+            return Ok(hit.clone());
+        }
+        let names = self.from_item_column_names(item).await?;
+        if let Some(key) = key {
+            self.pivot_shape_memo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, names.clone());
+        }
+        Ok(names)
+    }
+
+    fn from_item_column_names<'b>(
+        &'b mut self,
+        item: &'b TableRef,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + 'b>> {
+        Box::pin(async move {
+            match item {
+                TableRef::Table { name, .. } => {
+                    let entry = self.rel_memo(name).await?;
+                    Ok(entry.live_columns().map(|c| c.name.clone()).collect())
+                }
+                TableRef::Join(join) => {
+                    let mut names = self.from_item_column_names(&join.left).await?;
+                    names.extend(self.from_item_column_names(&join.right).await?);
+                    Ok(names)
+                }
+                other => {
+                    // Anything else has to be bound to learn its shape, which
+                    // is done in a scope of its own so nothing it registers
+                    // reaches the enclosing query twice
+                    let mut probe_ctx = BindContext::new();
+                    let bound = self.bind_table_ref(&mut probe_ctx, other).await?;
+                    let _ = bound;
+                    Ok(bound_context_columns(&probe_ctx)
+                        .into_iter()
+                        .map(|c| c.name)
+                        .collect())
+                }
+            }
+        })
+    }
+
+    /// Reads an ASOF join's MATCH_CONDITION into the direction it selects,
+    /// the two columns it compares, and the tolerance it bounds the reach by.
+    async fn bind_asof_match(
+        &mut self,
+        ctx: &BindContext,
+        condition: &Expr,
+        left: &BoundFromItem,
+        right: &BoundFromItem,
+        on: &BoundJoinCondition,
+    ) -> Result<BoundAsofMatch> {
+        use crate::logical::{AsofDirection, AsofTolerance};
+        use zyron_parser::ast::BinaryOperator;
+
+        // An ON clause on an ASOF join carries equalities only; the
+        // inequality lives in MATCH_CONDITION and nowhere else
+        if let BoundJoinCondition::On(expr) = on
+            && !every_conjunct_is_equality(expr)
+        {
+            return Err(ZyronError::PlanError(
+                "an ASOF JOIN's ON clause carries equalities only; the inequality belongs in MATCH_CONDITION".to_string(),
+            ));
+        }
+
+        let mut left_indices = std::collections::HashSet::new();
+        owned_from_indices(left, &mut left_indices);
+        let mut right_indices = std::collections::HashSet::new();
+        owned_from_indices(right, &mut right_indices);
+
+        // The condition is one comparison, optionally followed by a bound on
+        // how far the match may reach
+        let (comparison, tolerance_ast) = match condition {
+            Expr::BinaryOp {
+                left: first,
+                op: BinaryOperator::And,
+                right: second,
+            } => (first.as_ref(), Some(second.as_ref())),
+            other => (other, None),
+        };
+        let Expr::BinaryOp {
+            left: compared_left,
+            op,
+            right: compared_right,
+        } = comparison
+        else {
+            return Err(ZyronError::PlanError(
+                "MATCH_CONDITION holds one inequality between a left column and a right column, written with >=, >, <= or <".to_string(),
+            ));
+        };
+        let first = self.bind_scalar(ctx, compared_left).await?;
+        let second = self.bind_scalar(ctx, compared_right).await?;
+        let first_side = expression_side(&first, &left_indices, &right_indices);
+        let second_side = expression_side(&second, &left_indices, &right_indices);
+
+        // The condition reads left-to-right as written; when the right
+        // relation's column was written first, the operator is flipped so
+        // the direction still describes what the left row reaches for
+        let (match_left, match_right, effective_op) = match (first_side, second_side) {
+            (Some(JoinSide::Left), Some(JoinSide::Right)) => (first, second, *op),
+            (Some(JoinSide::Right), Some(JoinSide::Left)) => (second, first, flip_operator(*op)),
+            _ => {
+                return Err(ZyronError::PlanError(
+                    "MATCH_CONDITION compares one column of the left relation with one column of the right relation".to_string(),
+                ));
+            }
+        };
+        let direction = match effective_op {
+            BinaryOperator::GtEq => AsofDirection::Backward,
+            BinaryOperator::Gt => AsofDirection::BackwardStrict,
+            BinaryOperator::LtEq => AsofDirection::Forward,
+            BinaryOperator::Lt => AsofDirection::ForwardStrict,
+            other => {
+                return Err(ZyronError::PlanError(format!(
+                    "MATCH_CONDITION takes >=, >, <= or <, not {other:?}"
+                )));
+            }
+        };
+        if match_left.type_id() != match_right.type_id() {
+            return Err(ZyronError::PlanError(format!(
+                "MATCH_CONDITION compares {} with {}; both sides have to be the same orderable type",
+                match_left.type_id(),
+                match_right.type_id()
+            )));
+        }
+        if !is_asof_orderable(match_left.type_id()) {
+            return Err(ZyronError::PlanError(format!(
+                "MATCH_CONDITION orders by {}, which has no order an ASOF match can walk; it takes a numeric, DATE, TIMESTAMP, TIMESTAMPTZ or INTERVAL column",
+                match_left.type_id()
+            )));
+        }
+
+        let tolerance = match tolerance_ast {
+            None => None,
+            Some(Expr::BinaryOp {
+                left: distance,
+                op: bound_op,
+                right: bound,
+            }) => {
+                let inclusive = match bound_op {
+                    BinaryOperator::LtEq => true,
+                    BinaryOperator::Lt => false,
+                    other => {
+                        return Err(ZyronError::PlanError(format!(
+                            "a MATCH_CONDITION tolerance bounds the distance with <= or <, not {other:?}"
+                        )));
+                    }
+                };
+                if !is_match_column_difference(distance, compared_left, compared_right) {
+                    return Err(ZyronError::PlanError(
+                        "a MATCH_CONDITION tolerance bounds the difference between the two match columns, written as left.ts - right.ts <= <bound>".to_string(),
+                    ));
+                }
+                Some(AsofTolerance {
+                    bound: self.bind_scalar(ctx, bound).await?,
+                    inclusive,
+                })
+            }
+            Some(_) => {
+                return Err(ZyronError::PlanError(
+                    "what follows AND in a MATCH_CONDITION is a bound on how far the match may reach, written as left.ts - right.ts <= <bound>".to_string(),
+                ));
+            }
+        };
+
+        Ok(BoundAsofMatch {
+            match_left,
+            match_right,
+            direction,
+            tolerance,
+        })
+    }
+
+    /// Registers a row-generating item's output as a relation the enclosing
+    /// query addresses, and returns the columns under the item's own table
+    /// index.
+    fn register_expand_output(
+        &mut self,
+        ctx: &mut BindContext,
+        table_idx: usize,
+        alias: Option<&String>,
+        default_alias: &str,
+        produced: Vec<(String, TypeId, bool)>,
+        column_aliases: &[String],
+        carried: &[LogicalColumn],
+    ) -> Result<Vec<LogicalColumn>> {
+        if !column_aliases.is_empty() && column_aliases.len() != produced.len() {
+            return Err(ZyronError::PlanError(format!(
+                "{} produces {} column(s), the alias list names {}",
+                default_alias,
+                produced.len(),
+                column_aliases.len()
+            )));
+        }
+        let mut output_columns: Vec<LogicalColumn> =
+            Vec::with_capacity(carried.len() + produced.len());
+        output_columns.extend(carried.iter().cloned());
+        let first_produced = output_columns.len();
+        for (i, (name, type_id, nullable)) in produced.into_iter().enumerate() {
+            output_columns.push(LogicalColumn {
+                table_idx: Some(table_idx),
+                column_id: ColumnId(i as u16),
+                name: column_aliases.get(i).cloned().unwrap_or(name),
+                type_id,
+                nullable,
+                fractional_digits: None,
+            });
+        }
+        // Only the produced columns belong to this item's namespace; a
+        // carried column keeps the identity and the relation it already had
+        let columns: Vec<BoundColumnDef> = output_columns[first_produced..]
+            .iter()
+            .enumerate()
+            .map(|(i, col)| BoundColumnDef {
+                column_id: col.column_id,
+                name: col.name.clone(),
+                type_id: col.type_id,
+                nullable: col.nullable,
+                ordinal: i as u16,
+                fractional_digits: col.fractional_digits,
+            })
+            .collect();
+        ctx.tables.push(BoundTableRef {
+            table_idx,
+            table_id: None,
+            alias: alias.cloned().unwrap_or_else(|| default_alias.to_string()),
+            columns,
+            entry: None,
+        });
+        Ok(output_columns)
+    }
+
+    /// The table indices a row-generating item's own expressions reach into,
+    /// beyond the ones it introduces itself.
+    ///
+    /// A reference to a preceding FROM item makes the item correlated, which
+    /// is what LATERAL asks for and what a bare reference must be refused
+    /// for, so a plan is never silently correlated.
+    fn refuse_bare_correlation(
+        &self,
+        ctx: &BindContext,
+        construct: &str,
+        reference: Option<&ColumnRef>,
+    ) -> Result<()> {
+        let Some(reference) = reference else {
+            return Ok(());
+        };
+        let relation = ctx
+            .tables
+            .iter()
+            .find(|t| t.table_idx == reference.table_idx)
+            .map(|t| t.alias.clone())
+            .unwrap_or_else(|| "a preceding relation".to_string());
+        Err(ZyronError::PlanError(format!(
+            "{construct} reads a column of {relation}, which comes before it in FROM; write LATERAL {construct} so it is executed once per row of {relation}"
+        )))
+    }
+
+    /// The element type of the array an expression yields.
+    ///
+    /// A column declares one, an `ARRAY[...]` constructor takes it from the
+    /// elements written into it, and an array function takes it from the
+    /// array it reads. Nothing else carries one, and guessing would put
+    /// values into a column of the wrong type.
+    fn array_element_type(&self, ctx: &BindContext, expr: &BoundExpr) -> Option<TypeId> {
+        match expr {
+            BoundExpr::ColumnRef(reference) => {
+                let table = ctx
+                    .tables
+                    .iter()
+                    .find(|t| t.table_idx == reference.table_idx)?;
+                let entry = table.entry.as_ref()?;
+                entry
+                    .columns
+                    .iter()
+                    .find(|c| c.id == reference.column_id)
+                    .and_then(|c| c.element_type)
+            }
+            BoundExpr::Function { name, args, .. } => match name.as_str() {
+                // An empty constructor declares no element type, and an
+                // array with no elements unnests to no rows whatever type
+                // is named, so there is nothing to refuse
+                "array" => Some(
+                    args.iter()
+                        .map(|a| a.type_id())
+                        .find(|t| *t != TypeId::Null)
+                        .unwrap_or(TypeId::Null),
+                ),
+                // These hand back the elements they were given
+                "array_distinct" | "array_sort" | "array_slice" | "array_concat"
+                | "array_filter" => self.array_element_type(ctx, args.first()?),
+                // The lambda's body decides what each element becomes
+                "array_transform" => args.get(1).map(|body| body.type_id()),
+                "string_to_array" => Some(TypeId::Text),
+                _ => None,
+            },
+            BoundExpr::Cast { expr, .. } => self.array_element_type(ctx, expr),
+            _ => None,
+        }
+    }
+
+    /// Binds `UNNEST(array [, ...]) [WITH ORDINALITY]`.
+    ///
+    /// `lateral` says the item was written under LATERAL, so its expressions
+    /// may reach the FROM items before it. `input` carries the relation the
+    /// expansion sits on when one was written, which UNPIVOT uses and a bare
+    /// UNNEST does not.
+    async fn bind_unnest(
+        &mut self,
+        ctx: &mut BindContext,
+        unnest: &zyron_parser::ast::UnnestRef,
+        lateral: bool,
+        input: Option<Box<BoundFromItem>>,
+    ) -> Result<BoundFromItem> {
+        if unnest.arrays.is_empty() {
+            return Err(ZyronError::PlanError(
+                "UNNEST takes at least one array".to_string(),
+            ));
+        }
+        let mut arrays = Vec::with_capacity(unnest.arrays.len());
+        for expr in &unnest.arrays {
+            arrays.push(self.bind_scalar(ctx, expr).await?);
+        }
+
+        // Every reference into a relation that precedes this item makes the
+        // expansion correlated. LATERAL says so already, so the search runs
+        // only for the bare form it refuses, and stops at the first
+        // reference it finds because that one names the refusal
+        if !lateral {
+            self.refuse_bare_correlation(ctx, "UNNEST", first_outer_ref(ctx, &arrays).as_ref())?;
+        }
+
+        let mut produced = Vec::with_capacity(arrays.len() + 1);
+        for (i, expr) in arrays.iter().enumerate() {
+            let element_type = self.array_element_type(ctx, expr).ok_or_else(|| {
+                ZyronError::PlanError(format!(
+                    "UNNEST argument {} does not declare an element type; unnest a column declared T[] or an ARRAY[...] constructor",
+                    i + 1
+                ))
+            })?;
+            // Every element may be null, and a shorter array is padded with
+            // nulls when several are zipped
+            produced.push((format!("unnest{}", i + 1), element_type, true));
+        }
+        if unnest.with_ordinality {
+            produced.push(("ordinality".to_string(), TypeId::Int64, false));
+        }
+
+        let table_idx = self.alloc_table_idx();
+        let carried = expand_carried_columns(lateral, ctx);
+        let output_columns = self.register_expand_output(
+            ctx,
+            table_idx,
+            unnest.alias.as_ref(),
+            "UNNEST",
+            produced,
+            &unnest.column_aliases,
+            &carried.columns,
+        )?;
+        Ok(BoundFromItem::Expand(Box::new(BoundExpand {
+            table_idx,
+            spec: crate::logical::ExpandSpec::Unnest {
+                arrays,
+                with_ordinality: unnest.with_ordinality,
+            },
+            carry: carried.sources,
+            output_columns,
+            input,
+            lateral,
+            outer_input: false,
+        })))
+    }
+
+    /// Binds `FLATTEN(document [, path => ...] [, outer => ...]
+    /// [, recursive => ...])`.
+    async fn bind_flatten(
+        &mut self,
+        ctx: &mut BindContext,
+        flatten: &zyron_parser::ast::FlattenRef,
+        lateral: bool,
+        input: Option<Box<BoundFromItem>>,
+    ) -> Result<BoundFromItem> {
+        let document = self.bind_scalar(ctx, &flatten.input).await?;
+        if !lateral {
+            let found = first_outer_ref(ctx, std::slice::from_ref(&document));
+            self.refuse_bare_correlation(ctx, "FLATTEN", found.as_ref())?;
+        }
+
+        // The six columns a walk produces, in the order the documentation
+        // lists them. Only seq is never null: every other column is absent
+        // for one kind of member or another
+        let produced = vec![
+            ("seq".to_string(), TypeId::Int64, false),
+            ("key".to_string(), TypeId::Text, true),
+            ("path".to_string(), TypeId::Text, true),
+            ("index".to_string(), TypeId::Int64, true),
+            ("value".to_string(), TypeId::Variant, true),
+            ("this".to_string(), TypeId::Variant, true),
+        ];
+        let table_idx = self.alloc_table_idx();
+        let carried = expand_carried_columns(lateral, ctx);
+        let output_columns = self.register_expand_output(
+            ctx,
+            table_idx,
+            flatten.alias.as_ref(),
+            "FLATTEN",
+            produced,
+            &flatten.column_aliases,
+            &carried.columns,
+        )?;
+        Ok(BoundFromItem::Expand(Box::new(BoundExpand {
+            table_idx,
+            spec: crate::logical::ExpandSpec::Flatten {
+                document,
+                path: flatten.path.clone(),
+                recursive: flatten.recursive,
+            },
+            carry: carried.sources,
+            output_columns,
+            input,
+            lateral,
+            outer_input: flatten.outer,
+        })))
+    }
+
     async fn bind_scalar(&mut self, ctx: &BindContext, expr: &Expr) -> Result<BoundExpr> {
         match self.bind_atom(ctx, expr) {
             Some(r) => r,
@@ -3865,6 +5014,13 @@ impl<'a> Binder<'a> {
                 };
             }
             match expr {
+                // A lambda is bound by the function that declares it takes
+                // one, where the parameter's type is known. Reaching it
+                // anywhere else means one was written where no function
+                // asked for it
+                Expr::Lambda { parameter, .. } => Err(ZyronError::PlanError(format!(
+                    "'{parameter} -> ...' is a lambda, which reads only as an argument to array_filter or array_transform"
+                ))),
                 Expr::Identifier(name) => {
                     let cr = self.resolve_column(ctx, name)?;
                     if let Some(generation_sql) = Self::virtual_generation_sql(ctx, &cr) {
@@ -4066,6 +5222,9 @@ impl<'a> Binder<'a> {
                     // never needs the catalog and the wrapped operation stays
                     // unevaluated until admission or retry logic runs it
                     let lower_name = name.to_lowercase();
+                    if zyron_parser::parser::takes_lambda_argument(&lower_name) {
+                        return self.bind_lambda_call(ctx, &lower_name, args).await;
+                    }
                     if matches!(
                         lower_name.as_str(),
                         "bulkhead_call" | "with_retry" | "fallback_chain" | "cache_aside"
@@ -6692,6 +7851,7 @@ impl<'a> Binder<'a> {
             fetch: None,
             for_clause: None,
             soft_delete_mode: SoftDeleteSelectMode::Default,
+            into_target: None,
         }
     }
 
@@ -9056,6 +10216,12 @@ fn collect_from_item_table_idxs(item: &BoundFromItem, out: &mut Vec<usize>) {
             collect_from_item_table_idxs(left, out);
             collect_from_item_table_idxs(right, out);
         }
+        BoundFromItem::Expand(expand) => {
+            if let Some(input) = &expand.input {
+                collect_from_item_table_idxs(input, out);
+            }
+            out.push(expand.table_idx);
+        }
     }
 }
 
@@ -9256,6 +10422,13 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
         "coalesce" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "nullif" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "greatest" | "least" => arg_types.first().copied().unwrap_or(TypeId::Null),
+        // Array functions. The ones that hand an array back keep the ARRAY
+        // type, so their result goes into UNNEST or another array function
+        "array_length" | "array_position" => TypeId::Int64,
+        "array_contains" => TypeId::Boolean,
+        "array_distinct" | "array_sort" | "array_slice" | "array_concat" | "string_to_array"
+        | "array_filter" | "array_transform" => TypeId::Array,
+        "array_to_string" => TypeId::Varchar,
         _ => {
             // Delegate to zyron-types registry for extended scalar functions
             if let Some(t) = zyron_types::infer_types_scalar_return_type(&lower, arg_types) {

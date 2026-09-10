@@ -58,6 +58,10 @@ pub struct ServerMeshNode {
     /// Pages another node asked this one to warm, drained by the prefetch
     /// task the server runs
     prefetch_queue: Arc<parking_lot::Mutex<Vec<u64>>>,
+    /// The node's temporary tables, so a relocation refusal can name them
+    /// when they are what is holding a session here. None before the catalog
+    /// is open, which is before any session exists to relocate
+    temp_tables: parking_lot::RwLock<Option<Arc<zyron_catalog::TempTableRegistry>>>,
 }
 
 impl ServerMeshNode {
@@ -77,7 +81,14 @@ impl ServerMeshNode {
             drain_sequence: AtomicU64::new(0),
             data_dir,
             prefetch_queue: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            temp_tables: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Gives the node the temporary table registry, so a relocation refusal
+    /// names them when they are what pins a session here.
+    pub fn set_temp_tables(&self, registry: Arc<zyron_catalog::TempTableRegistry>) {
+        *self.temp_tables.write() = Some(registry);
     }
 
     /// Pages the mesh has asked this node to warm, taken by whatever reads
@@ -250,7 +261,25 @@ impl MeshNode for ServerMeshNode {
         // prepared statements, and its cursors, none of which have a
         // representation that survives a move. What a drain can do is let it
         // finish, which is what ending it after the work in flight completes
-        // means
+        // means.
+        //
+        // A temporary table is named on its own because it is the one piece
+        // of that state with files on this node's disk, so an operator
+        // reading the refusal knows there is data here and not only session
+        // bookkeeping
+        let holds_temp_tables = self
+            .temp_tables
+            .read()
+            .as_ref()
+            .is_some_and(|registry| registry.any_held());
+        if holds_temp_tables {
+            return Ok(RelocationOutcome::Pinned {
+                reason: "temp_tables: a session holds temporary tables, whose files are on this \
+                         node's disk and have no representation that survives a move; the \
+                         session ends when its work finishes"
+                    .into(),
+            });
+        }
         Ok(RelocationOutcome::Pinned {
             reason: "a session holds transaction and cursor state that does not move; it ends \
                      when its work finishes"

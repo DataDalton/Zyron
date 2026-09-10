@@ -215,6 +215,13 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         // elsewhere would find no branch to merge
         | S::MergeBranch(_) => Rows,
 
+        // A temporary table is node-local by design: its definition lives in
+        // the session that created it, its files live under this node's tmp
+        // directory, and it is dropped when the session ends. Sending the
+        // statement to the group would create a table on every member that
+        // no session there could ever resolve or reclaim
+        S::CreateTable(s) if s.temporary => Local,
+
         // Catalog work
         S::CreateTable(_)
         | S::DropTable(_)
@@ -479,7 +486,10 @@ pub(crate) async fn analyze_tables(
 
     let tables = server.catalog.list_all_tables();
     let target_tables: Vec<_> = if let Some(name) = table_name {
-        tables.into_iter().filter(|t| t.name == name).collect()
+        tables
+            .into_iter()
+            .filter(|t| crate::ddl_dispatch::table_matches_name(t, name, &server.catalog))
+            .collect()
     } else {
         tables
     };
@@ -2972,6 +2982,19 @@ impl<T: WireTransport> Connection<T> {
         &mut self,
         stmt: zyron_parser::Statement,
     ) -> Result<(), ProtocolError> {
+        // A temporary table written since it was last read has its
+        // statistics collected here, so the planner has a cardinality
+        // for it on the first read after a write
+        crate::temp_table_dispatch::refresh_statistics(&self.server, &self.session).await;
+        // What a write against a temporary table changes is recorded after
+        // it runs, so the row count is carried forward by the number of rows
+        // the statement reported rather than recovered by a scan
+        let temp_written = self
+            .session
+            .as_ref()
+            .and_then(|s| s.temp_tables.as_ref())
+            .and_then(|_| crate::temp_table_dispatch::write_target(&stmt))
+            .map(|(name, kind)| (name.to_string(), kind));
         // Copy session values before mutable borrow. Take the security context
         // temporarily so it can be moved into the ExecutionContext. It is returned
         // to the session after execution completes.
@@ -3000,13 +3023,14 @@ impl<T: WireTransport> Connection<T> {
         // never waits on a running query and a query never sees the mesh
         // change under it mid-plan
         let peerFacts = self.server.peer_facts();
-        let plan = zyron_planner::plan_with_security(
+        let plan = zyron_planner::plan_for_session(
             &self.server.catalog,
             db_id,
             search_path,
             stmt,
             row_security,
             Some(&peerFacts),
+            self.session.as_ref().and_then(|s| s.temp_tables.clone()),
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -3037,7 +3061,7 @@ impl<T: WireTransport> Connection<T> {
         ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
         // The heap routes copy-on-write pages by branch id, the lake opens a
         // branch head by name, and both come from this one session branch
-        ctx.active_branch_name = self.active_branch.clone();
+        ctx.active_branch_name = self.active_branch.as_deref().map(Arc::from);
         if let Some(mgr) = &self.server.branch_manager {
             ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
             if let Some(name) = &self.active_branch {
@@ -3061,6 +3085,9 @@ impl<T: WireTransport> Connection<T> {
             .await
             .map_err(ProtocolError::Database)?;
         self.note_ctx_writes(&ctx);
+        if let Some((name, kind)) = &temp_written {
+            crate::temp_table_dispatch::mark_written(&self.session, name, *kind, &batches);
+        }
 
         // Return the security context to the session so subsequent queries
         // can reuse the cached privilege decisions.
@@ -3332,13 +3359,14 @@ impl<T: WireTransport> Connection<T> {
         // never waits on a running query and a query never sees the mesh
         // change under it mid-plan
         let peerFacts = self.server.peer_facts();
-        let plan = match zyron_planner::plan_with_security(
+        let plan = match zyron_planner::plan_for_session(
             &self.server.catalog,
             db_id,
             search_path,
             stmt,
             row_security,
             Some(&peerFacts),
+            self.session.as_ref().and_then(|s| s.temp_tables.clone()),
         )
         .await
         {
@@ -3397,7 +3425,7 @@ impl<T: WireTransport> Connection<T> {
         ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
         // The heap routes copy-on-write pages by branch id, the lake opens a
         // branch head by name, and both come from this one session branch
-        ctx.active_branch_name = self.active_branch.clone();
+        ctx.active_branch_name = self.active_branch.as_deref().map(Arc::from);
         if let Some(mgr) = &self.server.branch_manager {
             ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
             if let Some(name) = &self.active_branch {
@@ -3489,13 +3517,14 @@ impl<T: WireTransport> Connection<T> {
         // never waits on a running query and a query never sees the mesh
         // change under it mid-plan
         let peerFacts = self.server.peer_facts();
-        let (plan, options) = zyron_planner::plan_for_explain(
+        let (plan, options) = zyron_planner::plan_for_explain_for_session(
             &self.server.catalog,
             db_id,
             search_path,
             inner_stmt,
             options,
             Some(&peerFacts),
+            self.session.as_ref().and_then(|s| s.temp_tables.clone()),
         )
         .await
         .map_err(ProtocolError::Database)?;
@@ -3924,7 +3953,7 @@ impl<T: WireTransport> Connection<T> {
         if let Some(ref sec_mgr) = self.server.security_manager {
             ctx_owned.set_security_manager(Arc::clone(sec_mgr));
         }
-        ctx_owned.active_branch_name = self.active_branch.clone();
+        ctx_owned.active_branch_name = self.active_branch.as_deref().map(Arc::from);
         if let Some(mgr) = &self.server.branch_manager {
             ctx_owned.branch_catalog =
                 Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
@@ -4373,6 +4402,30 @@ impl<T: WireTransport> Connection<T> {
         Ok((resolved_stmt, Cow::Owned(resolved_sql)))
     }
 
+    /// True when a statement names a temporary table this session holds.
+    ///
+    /// Only a bare name can be one, so a qualified name is never reported
+    /// here: it always addresses a permanent table.
+    fn statement_targets_temp_table(&self, stmt: &zyron_parser::Statement) -> bool {
+        use zyron_parser::Statement as S;
+        let Some(namespace) = self.session.as_ref().and_then(|s| s.temp_tables.as_ref()) else {
+            return false;
+        };
+        let name = match stmt {
+            S::CreateTable(s) => &s.name,
+            S::DropTable(s) => &s.name,
+            S::Truncate(s) => &s.table,
+            S::Insert(s) => &s.table,
+            S::Update(s) => &s.table,
+            S::Delete(s) => &s.table,
+            S::Merge(s) => &s.target,
+            S::CreateIndex(s) => &s.table,
+            S::AlterTable(s) => &s.name,
+            _ => return false,
+        };
+        !name.contains('.') && namespace.contains(name)
+    }
+
     /// Puts a schema change to the group before it runs here.
     ///
     /// Returns None on a node in no group, or for a statement that is not
@@ -4388,6 +4441,14 @@ impl<T: WireTransport> Connection<T> {
         sql: &str,
     ) -> Option<Result<StatementTurn, ZyronError>> {
         let router = self.server.replication.as_ref()?;
+        // A statement naming one of this session's temporary tables acts on
+        // a table only this node has. The classifier sees the text alone and
+        // cannot tell, so the session is asked here: DROP TABLE, TRUNCATE and
+        // every other statement over a bare name that resolves to one stays
+        // where the table is
+        if self.statement_targets_temp_table(stmt) {
+            return None;
+        }
         match replication_class(stmt) {
             ReplicationClass::Statement => {}
             ReplicationClass::Unsupported { reason } => {
@@ -4657,6 +4718,13 @@ impl<T: WireTransport> Connection<T> {
                                 session.set_transaction_state(TransactionState::Idle);
                             }
                             self.finalize_cursors_on_commit(staged, true);
+                            // A temporary table declared ON COMMIT
+                            // DELETE ROWS is emptied here and one
+                            // declared ON COMMIT DROP is removed,
+                            // after the commit is durable so a
+                            // failed commit leaves both alone
+                            crate::temp_table_dispatch::on_commit(&self.server, &self.session)
+                                .await;
                             Some(Ok("COMMIT".into()))
                         }
                         Err(e) => {
@@ -5310,7 +5378,10 @@ impl<T: WireTransport> Connection<T> {
 
         let tables = self.server.catalog.list_all_tables();
         let target_tables: Vec<_> = if let Some(name) = table_name {
-            tables.into_iter().filter(|t| t.name == name).collect()
+            tables
+                .into_iter()
+                .filter(|t| crate::ddl_dispatch::table_matches_name(t, name, &self.server.catalog))
+                .collect()
         } else {
             tables
         };
@@ -5506,7 +5577,10 @@ impl<T: WireTransport> Connection<T> {
     ) -> Result<(), ProtocolError> {
         let tables = self.server.catalog.list_all_tables();
         let target_tables: Vec<_> = if let Some(name) = table_name {
-            let matched: Vec<_> = tables.into_iter().filter(|t| t.name == name).collect();
+            let matched: Vec<_> = tables
+                .into_iter()
+                .filter(|t| crate::ddl_dispatch::table_matches_name(t, name, &self.server.catalog))
+                .collect();
             if matched.is_empty() {
                 let fields = crate::messages::backend::ErrorFields {
                     severity: "ERROR".into(),
@@ -5781,12 +5855,10 @@ impl<T: WireTransport> Connection<T> {
         // live reader that started before it committed still sees its rows
         let prune_horizon = self.server.txn_manager.prune_horizon();
 
-        let table = self
-            .server
-            .catalog
-            .list_all_tables()
-            .into_iter()
-            .find(|t| t.name == table_name);
+        let table =
+            self.server.catalog.list_all_tables().into_iter().find(|t| {
+                crate::ddl_dispatch::table_matches_name(t, table_name, &self.server.catalog)
+            });
         let table = match table {
             Some(t) => t,
             None => {
@@ -6222,6 +6294,10 @@ impl<T: WireTransport> Connection<T> {
                         return Err(ProtocolError::Database(e));
                     }
                 }
+                // Every commit acts on the session's temporary
+                // tables, whether the transaction was written out by
+                // an explicit COMMIT or ended here
+                crate::temp_table_dispatch::on_commit(&self.server, &self.session).await;
             }
         }
         Ok(())
@@ -7443,25 +7519,7 @@ fn is_query_plan(plan: &PhysicalPlan) -> bool {
 /// would always yield `1`, which is why multi-row INSERTs must read the cell
 /// instead.
 fn count_affected_rows(batches: &[DataBatch]) -> usize {
-    let mut total: i64 = 0;
-    for batch in batches {
-        let Some(col) = batch.columns.first() else {
-            continue;
-        };
-        match &col.data {
-            zyron_executor::column::ColumnData::Int64(values) => {
-                if let Some(v) = values.first() {
-                    total = total.saturating_add(*v);
-                }
-            }
-            _ => {
-                // Shape mismatch: fall back to row count so a misbehaving
-                // operator still produces a sensible tag instead of zero.
-                total = total.saturating_add(batch.num_rows as i64);
-            }
-        }
-    }
-    if total < 0 { 0 } else { total as usize }
+    crate::temp_table_dispatch::affected_rows(batches) as usize
 }
 
 /// Converts an AST expression to its string representation for SET commands.

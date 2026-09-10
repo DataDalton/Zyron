@@ -12,6 +12,8 @@ path = "src/main.rs"
 zyron-server = { path = "../../crates/zyron-server" }
 zyron-common = { path = "../../crates/zyron-common" }
 zyron-tpc = { path = "../../crates/zyron-tpc" }
+zyron-parser = { path = "../../crates/zyron-parser" }
+zyron-wire = { path = "../../crates/zyron-wire" }
 
 [dev-dependencies]
 tempfile = "3"

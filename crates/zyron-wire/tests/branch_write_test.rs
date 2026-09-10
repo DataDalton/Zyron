@@ -683,3 +683,77 @@ async fn two_branches_do_not_see_each_other() {
         "branch a sees its own update and insert, not branch b's"
     );
 }
+
+/// A multi-row insert on a branch is checked against the branch's own appends
+/// and against the other rows of the same statement.
+///
+/// The branch's appended values are read once for the whole batch, because the
+/// uniqueness check runs before any row of the batch is written, so the append
+/// range cannot move while the batch is being checked. A per-row rescan of that
+/// range made inserting n rows into a branch holding m appends cost n times m.
+#[tokio::test]
+async fn a_multi_row_branch_insert_is_checked_against_the_branch_and_itself() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(&mut h, "INSERT INTO p VALUES (1)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+    exec(&mut h, "INSERT INTO p VALUES (7), (8)").await;
+
+    // A later row of the batch collides with an earlier branch append
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (20), (8)").await;
+    assert!(
+        err.contains("nique"),
+        "a row colliding with an earlier branch append was accepted: {err}"
+    );
+    // The refusal is whole, so the row ahead of the duplicate did not land
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(
+        total_rows(&rows),
+        3,
+        "the refused batch left rows behind: 1 on main plus 7 and 8 on the branch"
+    );
+
+    // Two rows of one batch colliding with each other
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (30), (30)").await;
+    assert!(
+        err.contains("nique"),
+        "a batch holding the same value twice was accepted: {err}"
+    );
+
+    // A batch that collides with nothing is accepted whole
+    exec(&mut h, "INSERT INTO p VALUES (40), (41), (42)").await;
+    assert_eq!(total_rows(&exec(&mut h, "SELECT k FROM p").await), 6);
+}
+
+/// Two unique indexes on one table are both enforced against a branch's
+/// appended rows.
+///
+/// The append range is read once and every index's key is taken from the same
+/// decoded row, so a second index must not be left unchecked.
+#[tokio::test]
+async fn every_unique_index_is_checked_against_a_branch_s_appends() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL, j INT NOT NULL)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_j_ux ON p (j)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+    exec(&mut h, "INSERT INTO p VALUES (1, 100)").await;
+
+    // Colliding on the first index only
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (1, 200)").await;
+    assert!(err.contains("nique"), "first index not enforced: {err}");
+
+    // Colliding on the second index only, which is the one a single shared
+    // pass could have skipped
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (2, 100)").await;
+    assert!(err.contains("nique"), "second index not enforced: {err}");
+
+    // Colliding on neither
+    exec(&mut h, "INSERT INTO p VALUES (2, 200)").await;
+    assert_eq!(total_rows(&exec(&mut h, "SELECT k FROM p").await), 2);
+}

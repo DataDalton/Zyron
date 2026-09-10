@@ -1,0 +1,51 @@
+# suite:   asof_join
+# run:     2026-09-09_204159_d19cc60-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== ASOF Join Merge Rate, Pre-sorted ===
+Left rows: 10000000, right rows: 1000000, keys: 1000
+  Run 1/5: 34,113,067 left rows/sec (293.1428ms)
+  Run 2/5: 33,750,307 left rows/sec (296.2936ms)
+  Run 3/5: 33,824,430 left rows/sec (295.6443ms)
+  Run 4/5: 34,310,873 left rows/sec (291.4528ms)
+  Run 5/5: 33,705,521 left rows/sec (296.6873ms)
+  ASOF pre-sorted [PASS/OK]:
+    Runs: [34,113,067 left rows/s, 33,750,307 left rows/s, 33,824,430 left rows/s, 34,310,873 left rows/s, 33,705,521 left rows/s]
+    Average: 33,940,840 left rows/s >= 20,000,000 left rows/s (target)
+    Min/Max: 33,705,521 left rows/s / 34,310,873 left rows/s, StdDev: 233,159 left rows/s
+
+=== ASOF Join Over Unsorted Inputs ===
+Left rows: 1000000, right rows: 100000
+  Run 1/5: sorts 118.3087ms, whole join 163.2188ms
+  Run 2/5: sorts 128.6007ms, whole join 167.0294ms
+  Run 3/5: sorts 127.5733ms, whole join 163.1182ms
+  Run 4/5: sorts 121.3737ms, whole join 165.1678ms
+  Run 5/5: sorts 125.7499ms, whole join 162.1364ms
+  two sorts alone:
+    Runs: [118.3087ms, 128.6007ms, 127.5733ms, 121.3737ms, 125.7499ms]
+    Average: 124.3213ms (no target set)
+    Min/Max: 118.3087ms / 128.6007ms, StdDev: 3.8928ms
+  sorts plus merge:
+    Runs: [163.2188ms, 167.0294ms, 163.1182ms, 165.1678ms, 162.1364ms]
+    Average: 164.1341ms (no target set)
+    Min/Max: 162.1364ms / 167.0294ms, StdDev: 1.7500ms
+  The whole join costs 1.320x the sorts alone (limit 2.00x)
+  join over sorts:
+    Runs: [1.3202x]
+    Average: 1.3202x (no target set)
+
+=== ASOF Join Peak Memory ===
+  One batch holds 24,576 bytes, so the budget is 98,304 bytes
+  1,000,000 left rows: peak 89,208 bytes, 1.81 batches per side
+  10,000,000 left rows: peak 89,208 bytes, 1.81 batches per side
+  ASOF batches per side [PASS/OK]:
+    Runs: [1.8149 batches, 1.8149 batches]
+    Average: 1.8149 batches <= 2 batches (target)
+    Min/Max: 1.8149 batches / 1.8149 batches, StdDev: 0 batches
+  Ten times the left rows cost 1.000x the peak
+  peak growth over 10x rows:
+    Runs: [1x]
+    Average: 1x (no target set)

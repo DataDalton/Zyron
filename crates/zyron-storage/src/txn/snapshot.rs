@@ -22,7 +22,13 @@ pub struct Snapshot {
     /// Transaction ID of the owning transaction.
     pub txn_id: u64,
     /// Sorted list of transaction IDs that were active at snapshot time.
-    active_txn_ids: Vec<u64>,
+    ///
+    /// Shared rather than owned, because a snapshot is cloned into every
+    /// nested execution a statement starts: a correlated subquery's per-row
+    /// context, a LATERAL inner plan, a trigger body. Owning the list made
+    /// each of those clones allocate and copy one entry per transaction the
+    /// server had in flight
+    active_txn_ids: Arc<[u64]>,
     /// Shared transaction commit-status map (cheap Arc clone per snapshot).
     status: Arc<TxnStatusMap>,
     /// Every transaction below this id is committed and ended before this
@@ -54,7 +60,7 @@ impl Snapshot {
         let frozen_below = status.frozen_below(oldest_active);
         Self {
             txn_id,
-            active_txn_ids: active_txns,
+            active_txn_ids: Arc::from(active_txns),
             status,
             frozen_below,
             proc_array: None,

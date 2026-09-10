@@ -388,6 +388,12 @@ impl Server {
             ))
         })?;
 
+        // Temporary tables belong to sessions, and a crash leaves their
+        // files behind with no session to own them. The tree goes before
+        // anything opens a file, so the first connection after a restart
+        // sees nothing of what the last run held
+        zyron_wire::temp_table_dispatch::clear_on_start(data_dir)?;
+
         // 2. Create DiskManager
         // One parse function owns the vocabulary. The validator already
         // rejected "off" and unknown values, so the only defensive fallback
@@ -1395,6 +1401,10 @@ impl Server {
             Arc::clone(&self.control),
         );
         if let Some(mesh_node) = mesh_node.clone() {
+            // A session holding a temporary table cannot be moved, because
+            // the table's files are on this node's disk. The mesh reads the
+            // registry to say so in the refusal
+            mesh_node.set_temp_tables(Arc::clone(catalog.temp_tables()));
             // The health listener is where the mesh paths are served, for the
             // same reason /pressure and the hot set are there: they are about
             // the node rather than about data

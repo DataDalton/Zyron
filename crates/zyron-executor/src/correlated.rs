@@ -264,6 +264,7 @@ fn map_refs_in_from(item: &mut BoundFromItem, f: &dyn Fn(&ColumnRef) -> Option<B
             left,
             right,
             condition,
+            asof,
             ..
         } => {
             map_refs_in_from(left, f);
@@ -271,6 +272,19 @@ fn map_refs_in_from(item: &mut BoundFromItem, f: &dyn Fn(&ColumnRef) -> Option<B
             if let BoundJoinCondition::On(e) = condition {
                 map_refs_in_expr(e, f);
             }
+            if let Some(asof) = asof {
+                map_refs_in_expr(&mut asof.match_left, f);
+                map_refs_in_expr(&mut asof.match_right, f);
+                if let Some(tolerance) = &mut asof.tolerance {
+                    map_refs_in_expr(&mut tolerance.bound, f);
+                }
+            }
+        }
+        BoundFromItem::Expand(expand) => {
+            if let Some(input) = &mut expand.input {
+                map_refs_in_from(input, f);
+            }
+            map_refs_in_expand_spec(&mut expand.spec, f);
         }
         BoundFromItem::GraphQuery { params, .. } => {
             for (_, e) in params {
@@ -285,6 +299,34 @@ fn map_refs_in_from(item: &mut BoundFromItem, f: &dyn Fn(&ColumnRef) -> Option<B
             }
             for e in positional {
                 map_refs_in_expr(e, f);
+            }
+        }
+    }
+}
+
+/// Rewrites the references a row-generating item reads from its input, so a
+/// LATERAL expansion inside a correlated subquery reaches the outer row the
+/// same way every other expression does.
+fn map_refs_in_expand_spec(
+    spec: &mut zyron_planner::logical::ExpandSpec,
+    f: &dyn Fn(&ColumnRef) -> Option<BoundExpr>,
+) {
+    use zyron_planner::logical::ExpandSpec;
+    match spec {
+        ExpandSpec::Unnest { arrays, .. } => {
+            for expr in arrays {
+                map_refs_in_expr(expr, f);
+            }
+        }
+        ExpandSpec::Flatten { document, .. } => map_refs_in_expr(document, f),
+        ExpandSpec::Unpivot { groups, labels, .. } => {
+            for group in groups {
+                for expr in group {
+                    map_refs_in_expr(expr, f);
+                }
+            }
+            for expr in labels {
+                map_refs_in_expr(expr, f);
             }
         }
     }
@@ -734,10 +776,18 @@ async fn eval_rows(
         sub_key_cols.push(keys);
     }
 
+    // The output expressions read one row at a time, because the parameter set
+    // they read alongside it differs per row. Both the row they read and the
+    // parameter set are built once here and refilled, rather than sliced and
+    // copied fresh for every row
+    let mut row_batch = batch.row_view();
+    let mut full_params: Vec<ScalarValue> = Vec::with_capacity(base_params.len() + subs.len());
+
     for row in 0..n {
         // Run each correlated subquery for this row and place its scalar result
         // in the slot region of the parameter set.
-        let mut full_params = base_params.to_vec();
+        full_params.clear();
+        full_params.extend_from_slice(base_params);
         for (i, s) in subs.iter().enumerate() {
             let value = match (&s.agg, &sub_key_cols[i]) {
                 // A NULL key equals nothing, so its group is empty and the
@@ -755,7 +805,11 @@ async fn eval_rows(
                     }
                 }
                 _ => {
-                    let mut child_params = base_params.to_vec();
+                    // The child context owns its parameter set, so this vector
+                    // is built for it rather than reused
+                    let mut child_params =
+                        Vec::with_capacity(base_params.len() + sub_outer_cols[i].len());
+                    child_params.extend_from_slice(base_params);
                     for col in &sub_outer_cols[i] {
                         child_params.push(bind_param_scalar(col, row));
                     }
@@ -767,7 +821,7 @@ async fn eval_rows(
             full_params.push(value);
         }
 
-        let row_batch = batch.slice(row, 1);
+        batch.load_row(row, &mut row_batch);
         for (e, b) in exprs.iter().zip(builders.iter_mut()) {
             let col = evaluate(e, &row_batch, input_schema, &full_params)?;
             b.push(&col.get_scalar(0));
@@ -931,7 +985,11 @@ fn in_membership(probe: &ScalarValue, values: &[ScalarValue], negated: bool) -> 
 /// families so an Int32 probe matches an Int64 subquery value. Returns None when
 /// either side is NULL. Falls back to per-variant comparison for non-numeric
 /// types; mismatched non-numeric variants compare unequal.
-fn scalar_eq(a: &ScalarValue, b: &ScalarValue) -> Option<bool> {
+///
+/// Shared with the array functions, where an element stored at one width is
+/// searched for with a literal bound at another, and a byte comparison would
+/// answer that the value is absent.
+pub(crate) fn scalar_eq(a: &ScalarValue, b: &ScalarValue) -> Option<bool> {
     use ScalarValue::*;
     if matches!(a, Null) || matches!(b, Null) {
         return None;
@@ -1358,17 +1416,21 @@ impl Operator for LateralJoinOperator {
 
                     let mut matched = 0usize;
                     for rb in &right_batches {
+                        // One joined row for this right batch, refilled per
+                        // pair. Slicing a left row and a right row into a
+                        // fresh batch per pair allocated a buffer and a null
+                        // bitmap for every column of every pair considered
+                        let mut joined = self.condition.as_ref().map(|_| {
+                            let mut cols = lb.row_view().columns;
+                            cols.extend(rb.row_view().columns);
+                            DataBatch::new(cols)
+                        });
                         for rr in 0..rb.num_rows {
-                            if let Some(cond) = &self.condition {
-                                let mut cols = lb.slice(row, 1).columns;
-                                cols.extend(rb.slice(rr, 1).columns);
-                                let joined = DataBatch::new(cols);
-                                let mask_col = evaluate(
-                                    cond,
-                                    &joined,
-                                    &self.joined_schema,
-                                    &self.base_params,
-                                )?;
+                            if let (Some(cond), Some(joined)) = (&self.condition, joined.as_mut()) {
+                                lb.load_row_at(row, joined, 0);
+                                rb.load_row_at(rr, joined, self.left_len);
+                                let mask_col =
+                                    evaluate(cond, joined, &self.joined_schema, &self.base_params)?;
                                 if !column_to_mask(&mask_col).first().copied().unwrap_or(false) {
                                     continue;
                                 }

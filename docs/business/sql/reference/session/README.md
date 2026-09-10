@@ -1,0 +1,42 @@
+# Session State
+
+38 statements and constructs.
+
+- [ACKNOWLEDGE UPGRADE REWRITES](acknowledge-upgrade-rewrites.md), Accepts the rewrites an upgrade would apply to user-authored objects.
+- [ALTER CLUSTER](alter-cluster.md), Adds a member to the consensus group, or takes one out.
+- [ALTER SYSTEM SET](alter-system-set.md), Changes a node setting durably, so it survives a restart.
+- [ANALYZE](analyze.md), Collects the statistics the planner estimates with.
+- [CANCEL](cancel.md), Stops the statement another connection is running.
+- [CHECKPOINT](checkpoint.md), Flushes dirty pages, so recovery has less log to replay.
+- [CLOSE](close.md), Closes a cursor and releases what it held.
+- [CREATE BULKHEAD](create-bulkhead.md), Bounds how much of the node one kind of work may take at once.
+- [CREATE PEER](create-peer.md), Names another Zyron cluster that this one exchanges data with.
+- [CREATE RETRY POLICY](create-retry-policy.md), Says how often and how patiently a failed operation is retried.
+- [CREATE SCHEDULE](create-schedule.md), Runs a statement on a repeating schedule.
+- [CREATE TEMPORARY TABLE](create-temporary-table.md), Creates a table that belongs to one session on one node and is dropped when the session ends.
+- [DEALLOCATE](deallocate.md), Forgets a prepared statement.
+- [DECLARE](declare.md), Opens a cursor over a query, to be read a batch at a time.
+- [DROP BULKHEAD](drop-bulkhead.md), Removes a bulkhead, so the work it bounded is unbounded again.
+- [DROP PEER](drop-peer.md), Removes a named peer cluster.
+- [DROP RETRY POLICY](drop-retry-policy.md), Removes a retry policy.
+- [DROP SCHEDULE](drop-schedule.md), Removes a schedule.
+- [EXECUTE](execute.md), Runs a prepared statement with parameters.
+- [EXPLAIN](explain.md), Shows the plan a statement would run as, and with ANALYZE what running it cost.
+- [EXPLAIN REWRITE](explain-rewrite.md), Says what an upgrade would rewrite in one user-authored object.
+- [FETCH](fetch.md), Reads rows from a cursor.
+- [LIST REGISTRY](list-registry.md), Reads one of the registries that describe what this build knows.
+- [LISTEN](listen.md), Subscribes the session to a notification channel.
+- [NOTIFY](notify.md), Sends a notification to every session listening on a channel.
+- [ON COMMIT](on-commit.md), What a commit does to a temporary table's rows.
+- [PAUSE SCHEDULE](pause-schedule.md), Stops a schedule from firing, keeping its definition.
+- [PREPARE](prepare.md), Parses and plans a statement once, to be run many times with different parameters.
+- [RESUME SCHEDULE](resume-schedule.md), Lets a paused schedule fire again.
+- [ROTATE SERVICE PRINCIPAL KEY](rotate-service-principal-key.md), Issues a new signing key for a principal, keeping the old one valid during an overlap.
+- [ROTATE SIGNATURE SCHEME](rotate-signature-scheme.md), Moves one artifact kind to a new signing algorithm, keeping the old one verifiable.
+- [SELECT INTO](select-into.md), Creates a table from a query's output and fills it in the same statement.
+- [SET](set.md), Changes a setting for this session, or for the open transaction.
+- [SET SIGNATURE SCHEME](set-signature-scheme.md), Chooses the algorithm one kind of signed artifact is signed with.
+- [SHOW](show.md), Reads a setting's current value.
+- [SHOW UPGRADE](show-upgrade.md), Reads where an upgrade has reached.
+- [TRIGGER UPGRADE](trigger-upgrade.md), Starts an upgrade to a named version now rather than waiting for its window.
+- [VACUUM](vacuum.md), Reclaims the space rows no longer visible to anyone were holding.

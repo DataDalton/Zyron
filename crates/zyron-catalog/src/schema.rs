@@ -1798,6 +1798,18 @@ impl ColumnarRegistry {
 }
 
 impl TableEntry {
+    /// True when this table lives in a session rather than the catalog.
+    ///
+    /// Decided by the id, because that is the one thing every layer already
+    /// has: a temporary table's ids come from a node-local allocator counting
+    /// down from the top of the space, and no catalog id ever reaches there.
+    /// The rows of one never enter a changeset and its definition is never
+    /// stored, so this is what keeps both true wherever only an entry is in
+    /// hand.
+    pub fn is_temporary(&self) -> bool {
+        self.id.0 > crate::temp_tables::TEMP_OID_FLOOR
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
         write_u32(&mut buf, self.id.0);

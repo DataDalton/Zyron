@@ -9,10 +9,52 @@ pub mod variant_paths;
 
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
 use crate::cost::PlanCost;
-use crate::logical::{AggregateExpr, AsOfTarget, LogicalColumn};
+use crate::logical::{
+    AggregateExpr, AsOfTarget, AsofDirection, AsofTolerance, ExpandSpec, LogicalColumn,
+};
 use std::sync::Arc;
 use zyron_catalog::{ColumnId, IndexEntry, IndexId, TableId};
 use zyron_parser::ast::{JoinType, SetOpType};
+
+/// Everything an ASOF join operator needs beyond its two inputs.
+#[derive(Debug, Clone)]
+pub struct AsofJoinSpec {
+    /// The ON clause's equalities, as (left side, right side) pairs. Empty
+    /// when the join has no ON, which makes the whole input one group
+    pub equality_keys: Vec<(BoundExpr, BoundExpr)>,
+    /// The two sides of the match condition's inequality
+    pub match_left: BoundExpr,
+    pub match_right: BoundExpr,
+    pub direction: AsofDirection,
+    /// How far a match may reach. None leaves the reach unbounded
+    pub tolerance: Option<AsofTolerance>,
+    /// Inner drops an unmatched left row, Left keeps it NULL-extended
+    pub join_type: JoinType,
+    pub left_schema: Vec<LogicalColumn>,
+    pub right_schema: Vec<LogicalColumn>,
+    /// True when that input already arrives ordered by (equality keys, match
+    /// column), so the builder planted no sort over it
+    pub left_sorted: bool,
+    pub right_sorted: bool,
+}
+
+/// Everything an expansion operator needs beyond its input.
+#[derive(Debug, Clone)]
+pub struct ExpandPhysical {
+    pub spec: ExpandSpec,
+    /// Input column positions that travel through, in output order, ahead of
+    /// the produced columns
+    pub carry: Vec<usize>,
+    /// Every column the operator outputs, the carried ones then the produced
+    /// ones
+    pub output_columns: Vec<LogicalColumn>,
+    /// True when an input row producing no output row is still emitted once
+    /// with the produced columns null
+    pub outer_input: bool,
+    /// The input's own schema, so the operator resolves the expressions it
+    /// evaluates per input row
+    pub input_schema: Vec<LogicalColumn>,
+}
 
 /// One aggregate answered from columnar segment metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +332,26 @@ pub enum PhysicalPlan {
         condition: Option<BoundExpr>,
         left_schema: Vec<LogicalColumn>,
         right_schema: Vec<LogicalColumn>,
+        cost: PlanCost,
+    },
+
+    /// ASOF join. One pass over both inputs, already ordered by (equality
+    /// keys, match column), holding one right row per equality group.
+    AsofJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        /// Boxed so the match expressions and the two schemas do not set the
+        /// width of every plan node in the tree
+        spec: Box<AsofJoinSpec>,
+        cost: PlanCost,
+    },
+
+    /// Expands each input row into zero or more output rows: UNNEST over
+    /// arrays, FLATTEN over a VARIANT document, UNPIVOT over column groups.
+    ExpandRows {
+        child: Box<PhysicalPlan>,
+        /// Boxed for the same reason `AsofJoin` boxes its spec
+        spec: Box<ExpandPhysical>,
         cost: PlanCost,
     },
 
@@ -625,6 +687,11 @@ impl PhysicalPlan {
                 f(right);
             }
             PhysicalPlan::LateralJoin { left, .. } => f(left),
+            PhysicalPlan::AsofJoin { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            PhysicalPlan::ExpandRows { child, .. } => f(child),
             PhysicalPlan::HashJoin { left, right, .. } => {
                 f(left);
                 f(right);
@@ -678,6 +745,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Project { cost, .. }
             | PhysicalPlan::NestedLoopJoin { cost, .. }
             | PhysicalPlan::LateralJoin { cost, .. }
+            | PhysicalPlan::AsofJoin { cost, .. }
+            | PhysicalPlan::ExpandRows { cost, .. }
             | PhysicalPlan::HashJoin { cost, .. }
             | PhysicalPlan::MergeJoin { cost, .. }
             | PhysicalPlan::HashAggregate { cost, .. }
@@ -759,6 +828,18 @@ impl PhysicalPlan {
                 schema.extend(right_schema.clone());
                 schema
             }
+            PhysicalPlan::AsofJoin { spec, .. } => {
+                let mut schema = spec.left_schema.clone();
+                let force_nullable = matches!(spec.join_type, JoinType::Left);
+                for col in spec.right_schema.iter() {
+                    schema.push(LogicalColumn {
+                        nullable: col.nullable || force_nullable,
+                        ..col.clone()
+                    });
+                }
+                schema
+            }
+            PhysicalPlan::ExpandRows { spec, .. } => spec.output_columns.clone(),
             PhysicalPlan::HashAggregate {
                 group_by,
                 aggregates,
@@ -889,11 +970,13 @@ impl PhysicalPlan {
             | PhysicalPlan::Repartition { child, .. }
             | PhysicalPlan::Broadcast { child, .. }
             | PhysicalPlan::GapFill { child, .. }
+            | PhysicalPlan::ExpandRows { child, .. }
             | PhysicalPlan::Window { child, .. } => child.total_cost(),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. }
             | PhysicalPlan::MergeJoin { left, right, .. }
             | PhysicalPlan::SetOp { left, right, .. }
+            | PhysicalPlan::AsofJoin { left, right, .. }
             | PhysicalPlan::ParallelHashJoin { left, right, .. } => {
                 left.total_cost().add(&right.total_cost())
             }

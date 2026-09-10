@@ -62,6 +62,13 @@ pub fn try_handle_ddl_utility<'a>(
         s.open_txn_id = txn.as_ref().map(|t| t.txn_id);
     }
 
+    // Nothing durable may name a temporary table, and no operation over
+    // stored versions applies to one. Checked once here rather than inside
+    // each handler, because it is one rule about one kind of table
+    if let Err(e) = crate::temp_table_dispatch::refuse_statement(stmt, session, active_branch) {
+        return Box::pin(async move { Some(Err(ProtocolError::Database(e))) });
+    }
+
     match stmt {
         // The currency rates system table is file backed, so its DML is
         // handled here instead of the planner
@@ -654,13 +661,15 @@ async fn handle_create_abac_policy(
 ) -> Result<DdlResult, ProtocolError> {
     use zyron_parser::ast::AbacPolicyTarget;
 
-    let (_db_id, schema_id) = get_session_schema(session, server, None)?;
+    // The policy attaches to the named object, so a qualified name decides
+    // the schema rather than the session's search path
+    let (schema_id, target_name) = resolve_qualified_name(&stmt.target_name, server, session)?;
 
     let (object_id, target, object_type) = match stmt.target {
         AbacPolicyTarget::Table => {
             let table = server
                 .catalog
-                .get_table(schema_id, &stmt.target_name)
+                .get_table(schema_id, &target_name)
                 .map_err(ProtocolError::Database)?;
             (
                 table.id.0,
@@ -671,7 +680,7 @@ async fn handle_create_abac_policy(
         AbacPolicyTarget::Publication => {
             let publication = server
                 .catalog
-                .get_publication(schema_id, &stmt.target_name)
+                .get_publication(schema_id, &target_name)
                 .ok_or_else(|| {
                     ProtocolError::Database(ZyronError::Internal(format!(
                         "publication '{}' does not exist",
@@ -791,11 +800,11 @@ async fn handle_alter_table(
     use zyron_catalog::schema::ConstraintType;
     use zyron_parser::ast::AlterTableOperation as Op;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.name, server, session)?;
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.name)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     check_ddl_privilege(
@@ -1136,10 +1145,10 @@ async fn handle_add_expectation(
     use zyron_catalog::schema::{ExpectationAction, ExpectationEntry};
     use zyron_parser::ast::ViolationAction;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
     check_ddl_privilege(
         server,
@@ -1207,10 +1216,10 @@ async fn handle_drop_expectation(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
     check_ddl_privilege(
         server,
@@ -3085,6 +3094,29 @@ async fn handle_create_table(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
+    // A temporary table lives in the session rather than the catalog, so it
+    // takes its own path: no privilege on a schema, no catalog write, no
+    // consensus log entry. Any principal that may connect may create one
+    if stmt.temporary {
+        if stmt.as_query.is_some() {
+            return handle_create_temp_table_as_select(stmt, server, session).await;
+        }
+        let tag = crate::temp_table_dispatch::create(stmt, server, session)
+            .await
+            .map_err(ProtocolError::Database)?;
+        return Ok(DdlResult::Tag(tag));
+    }
+
+    // A permanent table's layout is agreed by the group before any row is
+    // written, so it is declared rather than taken from a query that each
+    // member would run against its own copy at its own moment
+    if stmt.as_query.is_some() {
+        return Err(ProtocolError::Database(ZyronError::ConfigError(format!(
+            "CREATE TABLE \"{}\" AS SELECT is not the form a permanent table takes: declare its columns with CREATE TABLE, then fill it with INSERT INTO ... SELECT. CREATE TEMPORARY TABLE ... AS SELECT does take a query, because a temporary table is this session's alone",
+            stmt.name
+        ))));
+    }
+
     // `schema.table` creates in exactly that schema; a bare name lands in
     // the session's first user schema.
     let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
@@ -3157,6 +3189,177 @@ async fn handle_create_table(
             Ok(DdlResult::Tag("CREATE TABLE".to_string()))
         }
         Err(e) => Err(ProtocolError::Database(e)),
+    }
+}
+
+/// `CREATE TEMPORARY TABLE name AS SELECT ...`, and the `SELECT ... INTO
+/// TEMP name` form the parser lifts into the same statement.
+///
+/// The column layout comes from the query's own output schema, so the table
+/// is declared with exactly the columns the query produces and then filled by
+/// an ordinary insert through the planner and the executor.
+async fn handle_create_temp_table_as_select(
+    stmt: &zyron_parser::ast::CreateTableStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    use zyron_parser::ast::{ColumnDef, DataType};
+
+    let Some(query) = &stmt.as_query else {
+        return Err(ProtocolError::Database(ZyronError::Internal(
+            "a create-as-select reached the handler with no query".to_string(),
+        )));
+    };
+    let db_id = get_session_database(session)?;
+    let search_path = session
+        .as_ref()
+        .map(|s| s.search_path.clone())
+        .unwrap_or_default();
+    let temp_tables = session.as_ref().and_then(|s| s.temp_tables.clone());
+
+    // The query is planned first, because its output schema is the table's
+    // column list and a query that does not plan creates nothing
+    let plan = zyron_planner::plan_for_session(
+        &server.catalog,
+        db_id,
+        search_path.clone(),
+        zyron_parser::Statement::Select(query.clone()),
+        None,
+        Some(&server.peer_facts()),
+        temp_tables,
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+
+    let mut columns: Vec<ColumnDef> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, column) in plan.output_schema().iter().enumerate() {
+        let mut name = column.name.clone();
+        if name.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+            name = format!("col{}", i + 1);
+            seen.insert(name.to_ascii_lowercase());
+        }
+        columns.push(ColumnDef {
+            name,
+            data_type: DataType::from_type_id(column.type_id).ok_or_else(|| {
+                ProtocolError::Database(ZyronError::ConfigError(format!(
+                    "the query's column \"{}\" is {}, which has no declaration a table can carry",
+                    column.name, column.type_id
+                )))
+            })?,
+            nullable: Some(true),
+            default: None,
+            constraints: Vec::new(),
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
+        });
+    }
+    if columns.is_empty() {
+        return Err(ProtocolError::Database(ZyronError::ConfigError(format!(
+            "the query behind CREATE TEMPORARY TABLE \"{}\" produces no columns",
+            stmt.name
+        ))));
+    }
+
+    let declared = zyron_parser::ast::CreateTableStatement {
+        columns,
+        as_query: None,
+        ..stmt.clone()
+    };
+    crate::temp_table_dispatch::create(&declared, server, session)
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    // Filling it goes through the ordinary insert path, so the rows are
+    // written, indexed and made visible exactly as any other insert's are
+    let insert = zyron_parser::Statement::Insert(Box::new(zyron_parser::ast::InsertStatement {
+        table: stmt.name.clone(),
+        columns: Vec::new(),
+        source: zyron_parser::ast::InsertSource::Query(query.clone()),
+        on_conflict: None,
+        returning: None,
+    }));
+    let temp_tables = session.as_ref().and_then(|s| s.temp_tables.clone());
+    if let Err(e) = execute_temp_write_stmt(server, db_id, search_path, insert, temp_tables).await {
+        // A table that could not be filled is not left half made
+        let _ = crate::temp_table_dispatch::drop_table(&stmt.name, server, session).await;
+        return Err(e);
+    }
+    mark_temp_written(session, &stmt.name);
+    Ok(DdlResult::Tag("CREATE TABLE".to_string()))
+}
+
+/// Runs one write statement that may address a temporary table, so the plan
+/// resolves the session's own namespace.
+async fn execute_temp_write_stmt(
+    server: &Arc<ServerState>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: Vec<String>,
+    stmt: zyron_parser::Statement,
+    temp_tables: Option<Arc<zyron_catalog::SessionTempTables>>,
+) -> Result<(), ProtocolError> {
+    use zyron_executor::context::ExecutionContext;
+
+    let plan = zyron_planner::plan_for_session(
+        &server.catalog,
+        db_id,
+        search_path,
+        stmt,
+        None,
+        Some(&server.peer_facts()),
+        temp_tables,
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .map_err(ProtocolError::Database)?;
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id;
+    let mut ctx = ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn_id,
+        snapshot,
+    );
+    ctx.heap_files = Some(Arc::clone(&server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+    let ctx = Arc::new(ctx);
+
+    match zyron_executor::execute(plan, &ctx).await {
+        Ok(_) => {
+            server
+                .txn_manager
+                .commit(&mut txn)
+                .await
+                .map_err(ProtocolError::Database)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = server.txn_manager.abort(&mut txn);
+            Err(ProtocolError::Database(e))
+        }
+    }
+}
+
+/// Records that a temporary table's rows changed, so statistics are
+/// collected before the next read of it.
+pub(crate) fn mark_temp_written(session: &Option<Session>, table: &str) {
+    if let Some(namespace) = session.as_ref().and_then(|s| s.temp_tables.as_ref())
+        && let Some(held) = namespace.get(table)
+    {
+        held.mark_written();
     }
 }
 
@@ -3424,10 +3627,10 @@ async fn handle_set_using(
     use zyron_catalog::schema::LakeConfig;
     use zyron_parser::ast::{TableFormat, TableOptionValue};
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
     // Converting rewrites every row of the table, so it takes the same
     // privilege creating one does
@@ -3952,7 +4155,7 @@ fn lake_log_for_clustering(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<std::sync::Arc<zyron_lake::TransactionLog>, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let entry = server
         .catalog
         .get_table(schema_id, table_name)
@@ -4140,10 +4343,10 @@ async fn handle_cluster_by(
 ) -> Result<DdlResult, ProtocolError> {
     use zyron_parser::ast::ClusterMode;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
     let (keys, names) = resolve_cluster_keys(&stmt.clause, &stmt.table, &table.columns)?;
 
@@ -4233,7 +4436,7 @@ async fn handle_show_clustering(
             stmt.name
         ))));
     }
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, table_name)
@@ -4462,7 +4665,7 @@ async fn handle_create_foreign_table(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
     check_ddl_privilege(
         server,
         session,
@@ -4480,11 +4683,11 @@ async fn handle_create_foreign_table(
     }
     // An unnamed remote is the local name. Recording it resolved keeps the
     // request builder free of a fallback that would have to re-derive it
-    let remote = stmt.remote_table.as_deref().unwrap_or(&stmt.name);
+    let remote = stmt.remote_table.as_deref().unwrap_or(&name);
 
     match server
         .catalog
-        .create_foreign_table(schema_id, &stmt.name, &stmt.columns, &stmt.server, remote)
+        .create_foreign_table(schema_id, &name, &stmt.columns, &stmt.server, remote)
         .await
     {
         Ok(_) => {
@@ -4518,8 +4721,8 @@ async fn handle_drop_foreign_table(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
-    let table = match server.catalog.get_table(schema_id, &stmt.name) {
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.name, server, session)?;
+    let table = match server.catalog.get_table(schema_id, &table_name) {
         Ok(t) => t,
         Err(_) if stmt.if_exists => return Ok(DdlResult::Tag("DROP FOREIGN TABLE".to_string())),
         Err(e) => return Err(ProtocolError::Database(e)),
@@ -4540,7 +4743,7 @@ async fn handle_drop_foreign_table(
     )?;
     server
         .catalog
-        .drop_table(schema_id, &stmt.name)
+        .drop_table(schema_id, &table_name)
         .await
         .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("DROP FOREIGN TABLE".to_string()))
@@ -4561,10 +4764,10 @@ async fn handle_alter_table_follow(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
     if !table.lake.is_lake() {
         return Err(ProtocolError::Database(ZyronError::ConfigError(format!(
@@ -4783,10 +4986,10 @@ async fn handle_clustering_schedule(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
     if !table.lake.is_lake() {
         set_heap_cluster_policy(server, &table, None, None, Some(stmt.schedule)).await?;
@@ -5209,11 +5412,21 @@ async fn handle_drop_table(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // A bare name reaches the session's own temporary table first, the same
+    // way a query does, so DROP TABLE drops what a SELECT of that name reads
+    if !stmt.name.contains('.')
+        && crate::temp_table_dispatch::drop_table(&stmt.name, server, session)
+            .await
+            .map_err(ProtocolError::Database)?
+    {
+        return Ok(DdlResult::Tag("DROP TABLE".to_string()));
+    }
+
+    let (schema_id, name) = resolve_qualified_name(&stmt.name, server, session)?;
 
     // Check DROP privilege on the table if it exists. If the table does not
     // exist and IF EXISTS is set, skip the privilege check entirely.
-    if let Ok(table) = server.catalog.get_table(schema_id, &stmt.name) {
+    if let Ok(table) = server.catalog.get_table(schema_id, &name) {
         check_ddl_privilege(
             server,
             session,
@@ -5223,7 +5436,7 @@ async fn handle_drop_table(
         )?;
     }
 
-    match drop_table_in_schema(server, schema_id, &stmt.name, TableDropMode::Statement).await {
+    match drop_table_in_schema(server, schema_id, &name, TableDropMode::Statement).await {
         Ok(()) => {
             fire_event(
                 server,
@@ -5247,12 +5460,12 @@ async fn handle_truncate(
     session: &mut Option<Session>,
     active_branch: &Option<String>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     // Verify table exists
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // Check TRUNCATE privilege on the table
@@ -5448,11 +5661,33 @@ async fn handle_create_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // An index on a temporary table is session-local too: nothing about it
+    // is stored, logged or replicated, and its file sits beside the table's.
+    // Resolved before the catalog is consulted, because the catalog does not
+    // hold the table
+    if let Some(temp) = session
+        .as_ref()
+        .and_then(|s| s.temp_tables.as_ref())
+        .filter(|_| !stmt.table.contains('.'))
+        .and_then(|namespace| namespace.resolve(&stmt.table))
+    {
+        let key_columns = index_key_columns(stmt, &temp)?;
+        if let Some(tag) =
+            crate::temp_table_dispatch::create_index(stmt, &key_columns, server, session)
+                .await
+                .map_err(ProtocolError::Database)?
+        {
+            return Ok(DdlResult::Tag(tag));
+        }
+    }
+
+    // The index is created in the table's own schema, so the table name
+    // decides it rather than the session's search path
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // Check CREATE privilege on the schema for index creation
@@ -5464,62 +5699,8 @@ async fn handle_create_index(
         schema_id.0,
     )?;
 
-    // Each key column carries its declared sort direction. `asc: None` is
-    // the unwritten default, which is ascending
-    let mut key_columns: Vec<(String, bool)> = Vec::with_capacity(stmt.columns.len());
-    for c in &stmt.columns {
-        match &c.expr {
-            zyron_parser::ast::Expr::Identifier(name) => {
-                if table
-                    .columns
-                    .iter()
-                    .any(|col| col.name == *name && col.is_encrypted())
-                {
-                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
-                        format!(
-                            "column {name} is ENCRYPTED, its ciphertext is not orderable so it cannot be indexed"
-                        ),
-                    )));
-                }
-                key_columns.push((name.clone(), c.asc == Some(false)));
-            }
-            other => {
-                return Err(ProtocolError::Database(ZyronError::PlanError(format!(
-                    "expression indexes are not supported, use column names (got: {:?})",
-                    other
-                ))));
-            }
-        }
-    }
-    // A key column's stored bytes run in one direction for the whole key, so
-    // an index can be declared entirely ascending or entirely descending but
-    // not both. A uniform declaration is served either way by walking the
-    // index forward or backward, which is why both spellings are accepted.
-    // Mixed directions would have to be flattened to one of them, and an
-    // index that silently sorts differently from its own declaration is worse
-    // than one the statement refuses to create
-    if key_columns.iter().any(|(_, d)| *d) && key_columns.iter().any(|(_, d)| !*d) {
-        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
-            "index '{}' mixes ASC and DESC key columns, which one index cannot store, declare every column in the same direction or build one index per ordering",
-            stmt.name
-        ))));
-    }
+    let key_columns = index_key_columns(stmt, &table)?;
     let column_names: Vec<String> = key_columns.iter().map(|(n, _)| n.clone()).collect();
-
-    // The B+tree compares keys as unsigned bytes, so every key column needs
-    // an order-preserving byte encoding. A type without one would build a
-    // tree the maintenance path can never insert into, and every scan the
-    // planner routes through it would return no rows
-    for (name, _) in &key_columns {
-        if let Some(col) = table.columns.iter().find(|c| &c.name == name)
-            && !col.physical_type_id().btree_index_encodable()
-        {
-            return Err(ProtocolError::Database(ZyronError::PlanError(format!(
-                "column '{}' of type {:?} cannot be a B+tree index key, the type has no order-preserving key encoding",
-                name, col.type_id
-            ))));
-        }
-    }
 
     // A lake table's index is a lake artifact committed into its own
     // transaction log, not a B+tree over heap addresses. It is versioned with
@@ -5608,6 +5789,73 @@ async fn handle_create_index(
 /// Only the session that issued the statement waits. Every other session reads
 /// and writes the table throughout.
 #[allow(clippy::too_many_arguments)]
+/// The key columns a CREATE INDEX declares, checked against the table it is
+/// declared on.
+///
+/// One function for every table, temporary or not, so a key an index cannot
+/// store is refused the same way wherever the table lives.
+fn index_key_columns(
+    stmt: &zyron_parser::ast::CreateIndexStatement,
+    table: &zyron_catalog::TableEntry,
+) -> Result<Vec<(String, bool)>, ProtocolError> {
+    // Each key column carries its declared sort direction. `asc: None` is
+    // the unwritten default, which is ascending
+    let mut key_columns: Vec<(String, bool)> = Vec::with_capacity(stmt.columns.len());
+    for c in &stmt.columns {
+        match &c.expr {
+            zyron_parser::ast::Expr::Identifier(name) => {
+                if table
+                    .columns
+                    .iter()
+                    .any(|col| col.name == *name && col.is_encrypted())
+                {
+                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                        format!(
+                            "column {name} is ENCRYPTED, its ciphertext is not orderable so it cannot be indexed"
+                        ),
+                    )));
+                }
+                key_columns.push((name.clone(), c.asc == Some(false)));
+            }
+            other => {
+                return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                    "expression indexes are not supported, use column names (got: {:?})",
+                    other
+                ))));
+            }
+        }
+    }
+    // A key column's stored bytes run in one direction for the whole key, so
+    // an index can be declared entirely ascending or entirely descending but
+    // not both. A uniform declaration is served either way by walking the
+    // index forward or backward, which is why both spellings are accepted.
+    // Mixed directions would have to be flattened to one of them, and an
+    // index that silently sorts differently from its own declaration is worse
+    // than one the statement refuses to create
+    if key_columns.iter().any(|(_, d)| *d) && key_columns.iter().any(|(_, d)| !*d) {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "index '{}' mixes ASC and DESC key columns, which one index cannot store, declare every column in the same direction or build one index per ordering",
+            stmt.name
+        ))));
+    }
+
+    // The B+tree compares keys as unsigned bytes, so every key column needs
+    // an order-preserving byte encoding. A type without one would build a
+    // tree the maintenance path can never insert into, and every scan the
+    // planner routes through it would return no rows
+    for (name, _) in &key_columns {
+        if let Some(col) = table.columns.iter().find(|c| &c.name == name)
+            && !col.physical_type_id().btree_index_encodable()
+        {
+            return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                "column '{}' of type {:?} cannot be a B+tree index key, the type has no order-preserving key encoding",
+                name, col.type_id
+            ))));
+        }
+    }
+    Ok(key_columns)
+}
+
 pub async fn build_heap_btree_index(
     server: &Arc<ServerState>,
     schema_id: zyron_catalog::SchemaId,
@@ -5947,7 +6195,9 @@ async fn handle_drop_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // An index lives in a schema, so a qualified name names the schema to
+    // search rather than a table to look up
+    let (schema_id, index_name) = resolve_qualified_name(&stmt.name, server, session)?;
 
     // Find the table that owns this index by scanning all tables in the
     // schema. Index names are unique within a schema, so the first match
@@ -5956,7 +6206,7 @@ async fn handle_drop_index(
     let mut found_table_id = None;
     for table in &tables {
         let indexes = server.catalog.get_indexes_for_table(table.id);
-        if indexes.iter().any(|idx| idx.name == stmt.name) {
+        if indexes.iter().any(|idx| idx.name == index_name) {
             found_table_id = Some(table.id);
             break;
         }
@@ -5975,7 +6225,7 @@ async fn handle_drop_index(
 
             // Identify index type before dropping so we can clean up the right manager.
             let indexes = server.catalog.get_indexes_for_table(table_id);
-            let matched = indexes.iter().find(|idx| idx.name == stmt.name);
+            let matched = indexes.iter().find(|idx| idx.name == index_name);
             let fts_index_id = matched
                 .filter(|idx| idx.index_type == zyron_catalog::IndexType::Fulltext)
                 .map(|idx| idx.id.0);
@@ -6009,7 +6259,7 @@ async fn handle_drop_index(
                     )
                 });
 
-            match server.catalog.drop_index(table_id, &stmt.name).await {
+            match server.catalog.drop_index(table_id, &index_name).await {
                 Ok(()) => {
                     if let Some(columns) = lake_columns
                         && let Ok(table) = server.catalog.get_table_by_id(table_id)
@@ -6064,7 +6314,9 @@ async fn handle_alter_index(
 ) -> Result<DdlResult, ProtocolError> {
     use zyron_parser::ast::AlterIndexOperation as Op;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // An index lives in a schema, so a qualified name names the schema to
+    // search rather than a table to look up
+    let (schema_id, index_name) = resolve_qualified_name(&stmt.name, server, session)?;
 
     let tables = server.catalog.list_tables(schema_id);
     let mut owning_table = None;
@@ -6073,7 +6325,7 @@ async fn handle_alter_index(
             .catalog
             .get_indexes_for_table(table.id)
             .iter()
-            .any(|idx| idx.name == stmt.name)
+            .any(|idx| idx.name == index_name)
         {
             owning_table = Some(table.id);
             break;
@@ -6094,7 +6346,7 @@ async fn handle_alter_index(
         Op::Rename { new_name } => {
             server
                 .catalog
-                .rename_index(table_id, &stmt.name, new_name)
+                .rename_index(table_id, &index_name, new_name)
                 .await
                 .map_err(ProtocolError::Database)?;
         }
@@ -6264,6 +6516,41 @@ async fn handle_drop_schema(
 /// Resolves a possibly schema-qualified object name to (schema_id, bare name).
 /// `schema.name` resolves the named schema; a bare name uses the session's
 /// default schema.
+/// Tells whether a catalog table is the one a possibly qualified name means.
+///
+/// The maintenance statements match against the whole table list rather than
+/// resolving through a schema, because they also accept no name at all and run
+/// over everything. A bare name matches by name alone, the way it always has.
+/// A qualified one also has to sit in the schema it names, so two schemas
+/// holding a table of the same name are told apart.
+pub(crate) fn table_matches_name(
+    table: &zyron_catalog::schema::TableEntry,
+    name: &str,
+    catalog: &zyron_catalog::Catalog,
+) -> bool {
+    let (catalog_part, schema_part, object) = zyron_catalog::resolver::split_relation_name(name);
+    if table.name != object {
+        return false;
+    }
+    let Some(schema_part) = schema_part else {
+        return true;
+    };
+    let Ok(schema) = catalog.get_schema_by_id(table.schema_id) else {
+        return false;
+    };
+    if schema.name != schema_part {
+        return false;
+    }
+    // A three part name also names the database, and matching on the schema
+    // alone would accept a name addressing another one
+    match catalog_part {
+        Some(database) => catalog
+            .get_database(database)
+            .is_ok_and(|db| db.id == schema.database_id),
+        None => true,
+    }
+}
+
 pub(crate) fn resolve_qualified_name(
     name: &str,
     server: &Arc<ServerState>,
@@ -6277,7 +6564,7 @@ pub(crate) fn resolve_qualified_name(
             .map_err(ProtocolError::Database)?;
         Ok((schema.id, obj_part.to_string()))
     } else {
-        let (_, schema_id) = get_session_schema(session, server, None)?;
+        let (_, schema_id) = get_session_schema(session, server)?;
         Ok((schema_id, name.to_string()))
     }
 }
@@ -6600,9 +6887,19 @@ async fn handle_comment_on(
 ) -> Result<DdlResult, ProtocolError> {
     use zyron_parser::ast::CommentObjectType;
 
+    // A qualified name names the schema whose privilege is required, so the
+    // check is against the schema holding the object rather than the session's
+    // first search path entry. A SCHEMA comment names the schema itself, which
+    // is not a name inside one
+    let (schema_id, object_name) = if stmt.object_type == CommentObjectType::Schema {
+        let (_, schema_id) = get_session_schema(session, server)?;
+        (schema_id, stmt.name.clone())
+    } else {
+        resolve_qualified_name(&stmt.name, server, session)?
+    };
+
     // Setting a comment mutates catalog metadata, so require the schema-level
     // create privilege like the other metadata DDL handlers.
-    let (_, schema_id) = get_session_schema(session, server, None)?;
     check_ddl_privilege(
         server,
         session,
@@ -6621,9 +6918,12 @@ async fn handle_comment_on(
         CommentObjectType::View => 5,
     };
     let column = stmt.column.clone().unwrap_or_default();
+    // Stored under the object's own name, which is what the catalog calls it
+    // and what the purge on DROP TABLE matches, so a comment set through a
+    // qualified name is the same comment a bare name reads back
     server
         .catalog
-        .set_comment(object_type, &stmt.name, &column, stmt.comment.clone())
+        .set_comment(object_type, &object_name, &column, stmt.comment.clone())
         .await
         .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("COMMENT".to_string()))
@@ -7103,7 +7403,7 @@ async fn handle_lake_procedure(
         )))
     })?;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let entry = server
         .catalog
         .get_table(schema_id, &table_name)
@@ -7594,7 +7894,9 @@ async fn handle_create_trigger(
     use zyron_catalog::TriggerEntry;
     use zyron_parser::ast::{TriggerEvent, TriggerGranularity, TriggerTiming};
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // The trigger belongs to the table it watches, so the table's schema is
+    // the trigger's schema
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     let reject = |msg: &str| {
         Err(ProtocolError::Database(ZyronError::Internal(
@@ -7633,8 +7935,8 @@ async fn handle_create_trigger(
 
     let (timing, target_id) = match stmt.timing {
         TriggerTiming::Before | TriggerTiming::After => {
-            let table = server.catalog.get_table(schema_id, &stmt.table).map_err(|e| {
-                if server.catalog.get_view(schema_id, &stmt.table).is_some() {
+            let table = server.catalog.get_table(schema_id, &table_name).map_err(|e| {
+                if server.catalog.get_view(schema_id, &table_name).is_some() {
                     ProtocolError::Database(ZyronError::Internal(format!(
                         "'{}' is a view; BEFORE and AFTER triggers require a table, use INSTEAD OF for a view",
                         stmt.table
@@ -7650,8 +7952,8 @@ async fn handle_create_trigger(
             (timing, table.id.0)
         }
         TriggerTiming::InsteadOf => {
-            let Some(view) = server.catalog.get_view(schema_id, &stmt.table) else {
-                if server.catalog.get_table(schema_id, &stmt.table).is_ok() {
+            let Some(view) = server.catalog.get_view(schema_id, &table_name) else {
+                if server.catalog.get_table(schema_id, &table_name).is_ok() {
                     return reject(&format!(
                         "'{}' is a table; INSTEAD OF triggers require a view",
                         stmt.table
@@ -7732,13 +8034,15 @@ async fn handle_drop_trigger(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // The trigger belongs to the table it watches, so the table's schema is
+    // the trigger's schema
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     // The ON target is a table for BEFORE/AFTER triggers and a view for
     // INSTEAD OF triggers. Both key the trigger map by their catalog id.
-    let target_id = match server.catalog.get_table(schema_id, &stmt.table) {
+    let target_id = match server.catalog.get_table(schema_id, &table_name) {
         Ok(table) => table.id,
-        Err(table_err) => match server.catalog.get_view(schema_id, &stmt.table) {
+        Err(table_err) => match server.catalog.get_view(schema_id, &table_name) {
             Some(view) => zyron_catalog::TableId(view.id),
             None => return Err(ProtocolError::Database(table_err)),
         },
@@ -8510,6 +8814,7 @@ fn empty_select() -> zyron_parser::ast::SelectStatement {
         fetch: None,
         for_clause: None,
         soft_delete_mode: SoftDeleteSelectMode::Default,
+        into_target: None,
     }
 }
 
@@ -9338,7 +9643,7 @@ fn check_branch_privilege(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<(), ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     check_ddl_privilege(
         server,
         session,
@@ -9623,7 +9928,7 @@ fn lake_log_for_branch_ddl(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<std::sync::Arc<zyron_lake::TransactionLog>, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let entry = server
         .catalog
         .get_table(schema_id, table_name)
@@ -10369,7 +10674,7 @@ async fn handle_create_cdc_stream(
     use zyron_cdc::cdc_stream::{CdcOutputStream, CdcSinkConfig, OutputFormat, StreamRetryPolicy};
     use zyron_cdc::decoder::DecoderPlugin;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table_name, server, session)?;
     let mgr = server.cdc_stream_manager.as_ref().ok_or_else(|| {
         ProtocolError::Database(ZyronError::CdcStreamError(
             "CDC streaming is not enabled on this server".into(),
@@ -10383,7 +10688,7 @@ async fn handle_create_cdc_stream(
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table_name)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     check_ddl_privilege(
@@ -10518,7 +10823,7 @@ async fn handle_create_cdc_ingest(
     use zyron_cdc::cdc_stream::OutputFormat;
     use zyron_cdc::decoder::DecoderPlugin;
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let mgr = server.cdc_ingest_manager.as_ref().ok_or_else(|| {
         ProtocolError::Database(ZyronError::CdcIngestError(
             "CDC ingestion is not enabled on this server".into(),
@@ -10679,7 +10984,7 @@ async fn handle_create_replication_slot(
     let table_filter = if stmt.table_filter.is_empty() {
         None
     } else {
-        let (_, schema_id) = get_session_schema(session, server, None)?;
+        let (_, schema_id) = get_session_schema(session, server)?;
         let mut ids = Vec::with_capacity(stmt.table_filter.len());
         for name in &stmt.table_filter {
             let table = server
@@ -11399,7 +11704,7 @@ async fn set_table_feature(
     feature: &str,
     enable: bool,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, table_name)
@@ -12210,10 +12515,10 @@ async fn handle_grant(
         .ok_or_else(|| ProtocolError::Database(ZyronError::RoleNotFound(stmt.to.clone())))?;
 
     // Resolve the target table to get its catalog ID
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.on_table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.on_table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // The grantor is the session's current role, recorded so the privilege
@@ -12280,10 +12585,10 @@ async fn handle_revoke(
         .ok_or_else(|| ProtocolError::Database(ZyronError::RoleNotFound(stmt.from.clone())))?;
 
     // Resolve the target table to get its catalog ID
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.on_table, server, session)?;
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.on_table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // Revoke each privilege on the table
@@ -12458,7 +12763,6 @@ async fn handle_values_query(
 pub(crate) fn get_session_schema(
     session: &Option<Session>,
     server: &Arc<ServerState>,
-    _override_schema: Option<&str>,
 ) -> Result<(zyron_catalog::DatabaseId, zyron_catalog::SchemaId), ProtocolError> {
     let session = session
         .as_ref()
@@ -12534,11 +12838,13 @@ async fn handle_create_fulltext_index(
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     // Resolve the schema from the session search_path.
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // The index is created in the table's own schema, so the table name
+    // decides it rather than the session's search path
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // Privilege check: require CREATE on the table (index is table-scoped)
@@ -12644,11 +12950,13 @@ async fn handle_create_vector_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // The index is created in the table's own schema, so the table name
+    // decides it rather than the session's search path
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // Privilege check: require CREATE on the table
@@ -12796,11 +13104,13 @@ async fn handle_create_spatial_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    // The index is created in the table's own schema, so the table name
+    // decides it rather than the session's search path
+    let (schema_id, table_name) = resolve_qualified_name(&stmt.table, server, session)?;
 
     let table = server
         .catalog
-        .get_table(schema_id, &stmt.table)
+        .get_table(schema_id, &table_name)
         .map_err(ProtocolError::Database)?;
 
     // IF NOT EXISTS: short-circuit if an index of this name already exists.
@@ -12963,7 +13273,7 @@ async fn handle_create_graph_schema(
         )));
     }
 
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     check_ddl_privilege(
         server,
         session,
@@ -13105,7 +13415,7 @@ async fn handle_drop_graph_schema(
     // Resolve the session schema before the irreversible drop so a missing
     // search_path fails the statement instead of leaving the backing tables
     // orphaned after the schema is already gone.
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     check_ddl_privilege(
         server,
         session,
@@ -14855,7 +15165,7 @@ async fn handle_drop_streaming_job(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
 
     let job = match server.catalog.get_streaming_job(schema_id, name) {
         Some(j) => j,
@@ -14910,7 +15220,7 @@ async fn handle_alter_streaming_job(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
 
     let job = server
         .catalog
@@ -16356,7 +16666,7 @@ async fn handle_drop_publication(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_db_id, schema_id) = get_session_schema(session, server, None)?;
+    let (_db_id, schema_id) = get_session_schema(session, server)?;
     let current = match server.catalog.get_publication(schema_id, &stmt.name) {
         Some(p) => p,
         None => {
@@ -16410,7 +16720,7 @@ async fn handle_tag_publication(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_db_id, schema_id) = get_session_schema(session, server, None)?;
+    let (_db_id, schema_id) = get_session_schema(session, server)?;
     let current = server
         .catalog
         .get_publication(schema_id, &stmt.name)
@@ -16455,7 +16765,7 @@ async fn handle_untag_publication(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_db_id, schema_id) = get_session_schema(session, server, None)?;
+    let (_db_id, schema_id) = get_session_schema(session, server)?;
     let current = server
         .catalog
         .get_publication(schema_id, &stmt.name)
@@ -16803,7 +17113,7 @@ async fn handle_drop_endpoint(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_db_id, schema_id) = get_session_schema(session, server, None)?;
+    let (_db_id, schema_id) = get_session_schema(session, server)?;
     let current = match server.catalog.get_endpoint(schema_id, &stmt.name) {
         Some(e) => e,
         None => {
@@ -17618,7 +17928,7 @@ pub(crate) async fn resolve_refreshed_source_columns(
     ) {
         return Ok(None);
     }
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let entry = server
         .catalog
         .get_external_source(schema_id, &stmt.name)

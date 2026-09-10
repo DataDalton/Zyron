@@ -72,6 +72,22 @@ pub struct Session {
     /// means the server default applies, Some(None) is an explicit SET to
     /// zero disabling the deadline, Some(Some(d)) is a session override.
     pub statement_timeout_override: Option<Option<std::time::Duration>>,
+    /// This session's temporary tables. None until the session creates one,
+    /// because a session that never does costs nothing for the feature.
+    ///
+    /// A bare name resolves here before the search path, so a temporary
+    /// table shadows a permanent one of the same name for this session and
+    /// for no other, and a qualified name always reaches the permanent one
+    pub temp_tables: Option<std::sync::Arc<zyron_catalog::SessionTempTables>>,
+    /// Names this session's temporary namespace and its directory. Taken
+    /// when the session is built, so every session has one whatever opened
+    /// it and no transport has to know the namespace is keyed on anything.
+    pub session_key: zyron_catalog::SessionKey,
+    /// Frees the tables above when this session is dropped. Set beside
+    /// temp_tables when the session creates its first one, so the release is
+    /// a property of the session's lifetime and reaches every holder of a
+    /// session rather than only the wire connection.
+    pub(crate) temp_table_guard: Option<crate::temp_table_dispatch::TempTableGuard>,
 }
 
 impl Session {
@@ -129,7 +145,18 @@ impl Session {
             replicated_actor: None,
             apply_txn_id: None,
             open_txn_id: None,
+            temp_tables: None,
+            temp_table_guard: None,
+            session_key: zyron_catalog::SessionKey::next(),
         }
+    }
+
+    /// True when this session holds at least one temporary table.
+    ///
+    /// A temporary table's files are on this node only, so a session holding
+    /// one cannot be moved to another and stays pinned where it is.
+    pub fn holds_temp_tables(&self) -> bool {
+        self.temp_tables.as_ref().is_some_and(|t| !t.is_empty())
     }
 
     /// Stable hash of the session's effective identity for plan-cache

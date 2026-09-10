@@ -66,7 +66,13 @@ pub fn operator_kind_of(plan: &PhysicalPlan) -> Option<OperatorKind> {
         }
         PhysicalPlan::MergeJoin { .. }
         | PhysicalPlan::NestedLoopJoin { .. }
+        // An ASOF join is one merge pass over two ordered inputs, the same
+        // shape a merge join walks
+        | PhysicalPlan::AsofJoin { .. }
         | PhysicalPlan::LateralJoin { .. } => Some(OperatorKind::HashJoinBuild),
+        // An expansion evaluates one expression per input row and writes the
+        // result out, which is what a projection does
+        PhysicalPlan::ExpandRows { .. } => Some(OperatorKind::Project),
         PhysicalPlan::HashAggregate { .. }
         | PhysicalPlan::SortAggregate { .. }
         | PhysicalPlan::GapFill { .. }

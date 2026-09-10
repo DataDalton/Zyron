@@ -597,6 +597,7 @@ pub async fn query_system_view(
 fn build_stat_view(object: &str, server: &ServerState) -> Result<ViewRows, ZyronError> {
     Ok(match object {
         "activity" => build_stat_activity(server),
+        "temp_tables" => build_stat_temp_tables(server),
         "tables" => build_stat_tables(server),
         "indexes" => build_stat_indexes(server),
         "wal" => build_stat_wal(server),
@@ -1002,6 +1003,59 @@ fn build_stat_activity(server: &ServerState) -> ViewRows {
         Vec::new()
     };
     (fields, rows)
+}
+
+/// Every temporary table on this node, per session.
+///
+/// The figures are what the last statistics collection measured, which runs
+/// on the first read after a write, so `stale` says whether rows have changed
+/// since. An operator watching a node's temporary storage reads it here
+/// because a temporary table is in no catalog listing by design.
+fn build_stat_temp_tables(server: &ServerState) -> ViewRows {
+    let fields = vec![
+        make_field("session_id", PG_INT4_OID, 4),
+        // Names the session's directory under <data_dir>/tmp/
+        make_field("session_key", PG_INT8_OID, 8),
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("table_id", PG_INT8_OID, 8),
+        make_field("bytes", PG_INT8_OID, 8),
+        make_field("rows", PG_INT8_OID, 8),
+        make_field("on_commit", PG_TEXT_OID, -1),
+        make_field("stale", PG_TEXT_OID, -1),
+    ];
+    let rows = server
+        .catalog
+        .temp_tables()
+        .report()
+        .into_iter()
+        .map(|t| {
+            vec![
+                Some(t.session_id.to_string().into_bytes()),
+                Some(t.session_key.get().to_string().into_bytes()),
+                Some(t.name.into_bytes()),
+                Some(t.table_id.0.to_string().into_bytes()),
+                Some(t.bytes.to_string().into_bytes()),
+                Some(t.rows.to_string().into_bytes()),
+                Some(on_commit_text(t.on_commit).as_bytes().to_vec()),
+                Some(if t.stale {
+                    b"true".to_vec()
+                } else {
+                    b"false".to_vec()
+                }),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// How a commit action reads in the view.
+fn on_commit_text(action: zyron_parser::ast::OnCommitAction) -> &'static str {
+    use zyron_parser::ast::OnCommitAction;
+    match action {
+        OnCommitAction::PreserveRows => "preserve rows",
+        OnCommitAction::DeleteRows => "delete rows",
+        OnCommitAction::Drop => "drop",
+    }
 }
 
 /// Renders a u64 counter as the view's text representation.

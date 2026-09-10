@@ -325,25 +325,25 @@ A few more numbers not shown in the charts above:
 | Temporal | Picosecond timestamp decode | ~966M rows/sec |
 | Versioning | Time-travel scan overhead | ~24% |
 | Wire | QUIC PostgreSQL handshake | ~5 us |
-| Transactions | Durable commit floor (device write) | ~66.4 us |
+| Transactions | Durable commit floor (device write) | ~81.2 us |
 | Lake | Commit rate (insert) | ~2389 commits/sec |
 | Lake | Commit latency (insert) | ~2.39 ms |
 | Lake | Commit rate (delete predicate) | ~2043 commits/sec |
 | Lake | Derived clustering expression files pruned | ~93% |
 | Lake | Load with clustering expression | ~752K rows/sec |
-| Consensus | Leader election after a kill | ~213 ms |
+| Consensus | Leader election after a kill | ~233 ms |
 | Consensus | Single log append | ~0.20 us |
-| Consensus | Snapshot 1GB, create | ~0.79 s |
-| Consensus | Snapshot 1GB, transfer | ~2.40 s |
+| Consensus | Snapshot 1GB, create | ~0.93 s |
+| Consensus | Snapshot 1GB, transfer | ~2.66 s |
 | Replication | Follower keep-up vs leader | ~99.8% |
-| Replication | Worst follower lag | ~103 entries |
-| Transactions | Durable group-commit peak | ~741K txn/sec |
-| Transactions | Group-commit amplification (c=1 to c=512) | ~78.0x |
+| Replication | Worst follower lag | ~113 entries |
+| Transactions | Durable group-commit peak | ~776K txn/sec |
+| Transactions | Group-commit amplification (c=1 to c=512) | ~77.7x |
 | Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~0.8x (heap wins indexed points) |
 | Cross-format | Bulk load to queryable, lake vs heap | ~1.4x (heap wins large batches) |
 | Cross-format | Trickle load to queryable, lake vs heap | ~10.0x (heap wins tiny commits) |
 
-40 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+45 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started

@@ -6,10 +6,12 @@
 
 pub mod aggregate;
 pub mod analytics_table_fn;
+pub mod asof_join;
 pub mod branch_write;
 pub mod column_scan;
 pub mod distinct;
 pub mod doc_fetch;
+pub mod expand_rows;
 pub mod filter;
 pub mod fk;
 pub mod foreign_scan;

@@ -747,7 +747,7 @@ impl TxnChangeset {
         &self,
         table: &TableEntry,
         identity: &ReplicaIdentity,
-        images: &[Vec<u8>],
+        images: &[&[u8]],
     ) -> Result<()> {
         if images.is_empty() {
             return Ok(());
@@ -779,7 +779,7 @@ impl TxnChangeset {
         &self,
         table: &TableEntry,
         identity: &ReplicaIdentity,
-        old_images: &[Vec<u8>],
+        old_images: &[&[u8]],
         new_batch: &DataBatch,
     ) -> Result<()> {
         if old_images.is_empty() {
@@ -1001,18 +1001,18 @@ impl TxnChangeset {
 /// identically are adjacent only by luck, so this is a map rather than a run
 /// length pass. The common case is every image distinct, which costs one hash
 /// per row and no allocation past the map itself
-fn fold(images: &[Vec<u8>]) -> Vec<(&[u8], u32)> {
-    let mut out: Vec<(&[u8], u32)> = Vec::with_capacity(images.len());
-    let mut seen: hashbrown::HashMap<&[u8], usize> =
+fn fold<'a>(images: &[&'a [u8]]) -> Vec<(&'a [u8], u32)> {
+    let mut out: Vec<(&'a [u8], u32)> = Vec::with_capacity(images.len());
+    let mut seen: hashbrown::HashMap<&'a [u8], usize> =
         hashbrown::HashMap::with_capacity(images.len());
     for image in images {
-        match seen.entry_ref(image.as_slice()) {
+        match seen.entry_ref(*image) {
             hashbrown::hash_map::EntryRef::Occupied(slot) => {
                 out[*slot.get()].1 += 1;
             }
             hashbrown::hash_map::EntryRef::Vacant(slot) => {
                 slot.insert(out.len());
-                out.push((image.as_slice(), 1));
+                out.push((*image, 1));
             }
         }
     }
@@ -1100,13 +1100,7 @@ mod tests {
 
     #[test]
     fn identical_images_fold_into_one_entry_with_a_count() {
-        let images = [
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"a".to_vec(),
-            b"a".to_vec(),
-            b"c".to_vec(),
-        ];
+        let images: [&[u8]; 5] = [b"a", b"b", b"a", b"a", b"c"];
         let folded = fold(&images);
         assert_eq!(folded.len(), 3);
         assert_eq!(folded[0], (&b"a"[..], 3));

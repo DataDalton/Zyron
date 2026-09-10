@@ -1,0 +1,188 @@
+# suite:   parser
+# run:     2026-09-10_034904_d19cc60-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Expression - Arithmetic Precedence ===
+  a + b * c = a + (b * c): PASS
+
+=== DELETE Statement ===
+  DELETE FROM WHERE: PASS
+
+=== DROP TABLE Statement ===
+  DROP TABLE: PASS
+  DROP TABLE IF EXISTS: PASS
+
+=== Error Recovery Performance Test ===
+  Bad queries: 5, 100,000 iterations per run
+  Validation runs: 5
+  Run 1: 1.806 us/error
+  Run 2: 2.121 us/error
+  Run 3: 2.120 us/error
+  Run 4: 2.107 us/error
+  Run 5: 2.126 us/error
+  Latency (us/error) [NOT MEASURED, unoptimized build]:
+    Runs: [1.8062, 2.1208, 2.1204, 2.1066, 2.1256]
+    Average: 2.0559 (target <= 2, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Error Handling ===
+  SELECT FROM (missing cols): PASS - Parse error: Expected expression, found FROM at line 1, column 18
+  Leftover tokens after typo: PASS - Parse error: Expected a statement, found FORM at line 1, column 31
+  Incomplete WHERE: PASS - Parse error: Expected expression, found end of input at line 1, column 26
+  Unterminated string: PASS - Parse error: Unterminated string literal starting at line 1, column 8
+
+=== INSERT Statement ===
+  Multi-row INSERT: PASS
+
+=== Expression - Functions ===
+  COUNT(*): PASS
+  SUM(amount): PASS
+  COALESCE(a, b, c): PASS
+
+=== Expression - BETWEEN, IN, LIKE ===
+  BETWEEN: PASS
+  IN list: PASS
+  LIKE: PASS
+  IS NULL: PASS
+  IS NOT NULL: PASS
+
+=== Lexer - Comments ===
+  Single-line: PASS
+  Block comment: PASS
+  Nested block: PASS
+
+=== Lexer Throughput Performance Test ===
+  Workload: 12300 bytes, 1000 iterations per run
+  Validation runs: 5
+  Run 1: 8.3 MB/sec
+  Run 2: 8.3 MB/sec
+  Run 3: 8.3 MB/sec
+  Run 4: 8.3 MB/sec
+  Run 5: 8.3 MB/sec
+  Throughput (MB/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [8.3061, 8.3144, 8.2769, 8.3248, 8.2781]
+    Average: 8.3001 (target >= 200, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Expression - Boolean Precedence ===
+  AND before OR: PASS
+  NOT before AND: PASS
+
+=== Lexer - Numbers ===
+  Integer: PASS
+  Float: PASS
+  Scientific: PASS
+  Negative (unary): PASS
+
+=== Memory per Parse Performance Test ===
+  Statement enum: 16 bytes
+  SelectStatement: 336 bytes
+  Expr enum: 64 bytes
+  TableRef enum: 56 bytes
+  Estimated per-parse (bytes) [NOT MEASURED, unoptimized build]: 888 (target <= 1,024, not applied)
+
+=== Lexer - Quoted Identifiers ===
+  Spaces in ident: PASS
+  Escaped quote: PASS
+
+=== Parser Batch Throughput Performance Test ===
+  Query mix: 5 types, 500,000 total per run
+  Validation runs: 5
+  Run 1: 162227 stmts/sec
+  Run 2: 161882 stmts/sec
+  Run 3: 161990 stmts/sec
+  Run 4: 161305 stmts/sec
+  Run 5: 162107 stmts/sec
+  Throughput (stmts/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [162,227, 161,882, 161,990, 161,305, 162,107]
+    Average: 161,902 (target >= 1,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+============================================
+  Parser: SQL Parser - All Tests Complete
+============================================
+  Lexer:       6 correctness tests
+  Expressions: 4 correctness tests
+  SELECT:      4 correctness tests
+  DML:         3 correctness tests
+  DDL:         3 correctness tests
+  Errors:      1 correctness test (4 cases)
+  Round-trip:  1 test (29 statements)
+  Benchmarks:  6 performance tests
+============================================
+
+=== Lexer - String Escapes ===
+  Single escape: PASS
+  Empty string: PASS
+  Multiple escapes: PASS
+
+=== Lexer - Tokenize SELECT ===
+  Token sequence: PASS
+  Token types: PASS
+  Span tracking: PASS
+
+=== SELECT - Basic ===
+  SELECT a, b FROM t: PASS
+
+=== Parser Complex Query Performance Test ===
+  Iterations per run: 10,000
+  Validation runs: 5
+  Run 1: 112.64 us/parse
+  Run 2: 112.50 us/parse
+  Run 3: 112.72 us/parse
+  Run 4: 112.65 us/parse
+  Run 5: 112.70 us/parse
+  Latency (us/parse) [NOT MEASURED, unoptimized build]:
+    Runs: [112.6440, 112.4959, 112.7242, 112.6495, 112.6956]
+    Average: 112.6418 (target <= 20, not applied)
+    Re-run with --release for a number worth comparing
+
+=== CREATE/DROP INDEX Statement ===
+  CREATE INDEX: PASS
+  DROP INDEX: PASS
+
+=== Round-trip Test ===
+  Round-trip: 23/23 passed
+
+=== CREATE TABLE Statement ===
+  CREATE TABLE with constraints: PASS
+
+=== Parser Simple Query Performance Test ===
+  Query: SELECT id, name FROM users WHERE active = TRUE
+  Iterations per run: 100,000
+  Validation runs: 5
+  Run 1: 11169 ns/parse
+  Run 2: 11182 ns/parse
+  Run 3: 11145 ns/parse
+  Run 4: 11115 ns/parse
+  Run 5: 11171 ns/parse
+  Latency (ns/parse) [NOT MEASURED, unoptimized build]:
+    Runs: [11,169, 11,182, 11,145, 11,115, 11,171]
+    Average: 11,156 (target <= 1,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== SELECT - GROUP BY, HAVING, ORDER BY ===
+  GROUP BY + HAVING: PASS
+  ORDER BY DESC NULLS LAST LIMIT OFFSET: PASS
+
+=== SELECT - JOINs ===
+  INNER JOIN ON: PASS
+  LEFT JOIN USING: PASS
+
+=== SELECT - Qualified Wildcard ===
+  t.* wildcard: PASS
+  u.name qualified: PASS
+  Implicit join (FROM t, u): PASS
+
+=== UPDATE Statement ===
+  UPDATE SET WHERE: PASS

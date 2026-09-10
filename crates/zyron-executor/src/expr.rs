@@ -1184,10 +1184,7 @@ impl InSet {
             }
             let found = match (self, text) {
                 (InSet::Strings(set), Some(v)) => set.contains(v[row].as_str()),
-                (InSet::Ints(set), None) => col
-                    .get_scalar(row)
-                    .to_i128()
-                    .is_some_and(|v| set.contains(&v)),
+                (InSet::Ints(set), None) => col.data.i128_at(row).is_some_and(|v| set.contains(&v)),
                 _ => false,
             };
             if found {
@@ -1371,8 +1368,8 @@ fn evaluate_case(
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
 
-    // Start with else branch or null, in the type the whole CASE produces
-    let mut result = if let Some(else_expr) = else_result {
+    // The else branch, or null, in the type the whole CASE produces
+    let else_col = if let Some(else_expr) = else_result {
         let col = evaluate(else_expr, batch, schema, params)?;
         coerce_case_branch(col, result_type)?
     } else {
@@ -1384,8 +1381,13 @@ fn evaluate_case(
         None => None,
     };
 
-    // Process conditions in reverse so first match wins.
-    for when in conditions.iter().rev() {
+    // Every branch's mask and value column, collected before any row is
+    // written. Folding one branch into a running result rebuilt the whole
+    // output per branch, so a ten branch CASE over text copied every cell
+    // ten times to keep one of them
+    let mut masks: Vec<Vec<bool>> = Vec::with_capacity(conditions.len());
+    let mut branches: Vec<Column> = Vec::with_capacity(conditions.len() + 1);
+    for when in conditions {
         let condition_bool = if let Some(ref op_col) = operand_col {
             // The operand pairs with each WHEN value like a standalone
             // equality: timestamp normalization, then numeric width
@@ -1415,55 +1417,69 @@ fn evaluate_case(
             evaluate(&when.condition, batch, schema, params)?
         };
 
+        masks.push(column_to_mask(&condition_bool));
+
         let then_col = evaluate(&when.result, batch, schema, params)?;
-        // The branch coerces to the CASE's declared type, not the running
-        // result's physical type. When the declared type is Decimal the
-        // running result can still be an integer column (the conversion to
-        // a decimal needs a scale only a decimal branch carries), and
-        // casting this branch down to that integer would round its value.
-        // The alignment below then puts both sides on the common scale
-        let mut then_col = coerce_case_branch(then_col, result_type)?;
-        // A decimal branch meets the running result on a common scale, the
-        // wider of the two, because the type alone does not say where the
-        // point sits and merging two scales would move it
-        if let Some((aligned_result, aligned_then)) =
-            compute::align_decimal_operands(&result, &then_col)?
-        {
-            result = aligned_result;
-            then_col = aligned_then;
-        }
-        let mask = column_to_mask(&condition_bool);
+        // The branch coerces to the CASE's declared type, not to the type
+        // another branch happens to carry. When the declared type is Decimal
+        // a branch can still be an integer column (the conversion to a
+        // decimal needs a scale only a decimal branch carries), and casting
+        // this branch down to that integer would round its value. The
+        // alignment below then puts every branch on the common scale
+        branches.push(coerce_case_branch(then_col, result_type)?);
+    }
+    // The else branch sits last, which is what a row with no true condition
+    // takes
+    branches.push(else_col);
 
-        // Use typed push_from to build result without ScalarValue. Both
-        // start empty because the loop below appends every row: seeding the
-        // bitmap at `num_rows` left it twice the data's length, and every
-        // read of it landed in the seeded half, so a CASE that produced a
-        // null reported a value instead.
-        let mut new_data = ColumnData::with_capacity(result.type_id, num_rows);
-        let mut new_nulls = NullBitmap::empty();
-
-        for i in 0..num_rows {
-            if mask[i] {
-                new_nulls.push_from(&then_col.nulls, i);
-                new_data.push_from(&then_col.data, i);
-            } else {
-                new_nulls.push_from(&result.nulls, i);
-                new_data.push_from(&result.data, i);
+    // A decimal branch meets the others on one scale, the widest of them,
+    // because the type alone does not say where the point sits and merging
+    // two scales would move it. Branches already sharing a scale are left
+    // as they are rather than recast into copies of themselves
+    let mut scale = branches[branches.len() - 1].fractional_digits;
+    let widest = branches
+        .iter()
+        .filter(|c| c.type_id == TypeId::Decimal)
+        .map(|c| c.fractional_digits.unwrap_or(0))
+        .max();
+    if let Some(target) = widest {
+        let already_aligned = branches
+            .iter()
+            .all(|c| c.type_id == TypeId::Decimal && c.fractional_digits.unwrap_or(0) == target);
+        if !already_aligned {
+            for branch in branches.iter_mut() {
+                *branch = compute::cast_column_to_decimal(branch, target)?;
             }
         }
-
-        // The merged column keeps the running scale. Dropping
-        // fractional_digits here would make the next iteration's decimal
-        // alignment read the already-scaled values as scale zero and
-        // rescale them again, and a picosecond timestamp would lose its
-        // precision marker the same way
-        let merged_scale = result.fractional_digits;
-        let mut merged = Column::with_nulls(new_data, new_nulls, result.type_id);
-        merged.fractional_digits = merged_scale;
-        result = merged;
+        scale = Some(target);
     }
 
-    Ok(result)
+    // Each row reads the first branch whose condition held, the else branch
+    // when none did, and is written exactly once. Typed push_from copies the
+    // cell without building a ScalarValue. Both buffers start empty because
+    // the loop appends every row: seeding the bitmap at `num_rows` left it
+    // twice the data's length, and every read of it landed in the seeded
+    // half, so a CASE that produced a null reported a value instead
+    let else_idx = branches.len() - 1;
+    let merged_type = branches[else_idx].type_id;
+    let mut data = ColumnData::with_capacity(merged_type, num_rows);
+    let mut nulls = NullBitmap::empty();
+    for i in 0..num_rows {
+        let pick = masks
+            .iter()
+            .position(|m| m.get(i).copied().unwrap_or(false))
+            .unwrap_or(else_idx);
+        nulls.push_from(&branches[pick].nulls, i);
+        data.push_from(&branches[pick].data, i);
+    }
+
+    // The column keeps the common scale. Dropping fractional_digits would
+    // read the already-scaled values as scale zero wherever the result is
+    // compared next, and a picosecond timestamp would lose its precision
+    // marker the same way
+    let mut merged = Column::with_nulls(data, nulls, merged_type);
+    merged.fractional_digits = scale;
+    Ok(merged)
 }
 
 /// Puts one CASE branch into the result type, leaving it alone when it
@@ -1637,20 +1653,22 @@ fn evaluate_function(
             let n = col.len();
             let mut data = ColumnData::with_capacity(col.type_id, n);
             let mut nulls = NullBitmap::none(n);
-            let mut last: Option<ScalarValue> = None;
+            // The row the carried value sits in, not the value itself. Holding
+            // the value meant a text or binary cell was cloned out of the
+            // column and cloned again into the buffer, twice per row
+            let mut last: Option<usize> = None;
             for i in 0..n {
                 if col.is_null(i) {
-                    match &last {
-                        Some(v) => data.push_scalar(v),
+                    match last {
+                        Some(src) => data.push_from(&col.data, src),
                         None => {
                             data.push_scalar(&ScalarValue::Null);
                             nulls.set_null(i);
                         }
                     }
                 } else {
-                    let v = col.data.get_scalar(i);
-                    data.push_scalar(&v);
-                    last = Some(v);
+                    data.push_from(&col.data, i);
+                    last = Some(i);
                 }
             }
             Ok(Column::with_nulls_ts(
@@ -1690,8 +1708,6 @@ fn evaluate_function(
             };
             let known: Vec<(usize, f64)> =
                 (0..n).filter_map(|i| as_f64(i).map(|v| (i, v))).collect();
-            let mut data = ColumnData::with_capacity(col.type_id, n);
-            let mut nulls = NullBitmap::none(n);
             let int_like = matches!(
                 col.type_id,
                 TypeId::Int8
@@ -1702,45 +1718,66 @@ fn evaluate_function(
                     | TypeId::Timestamp
                     | TypeId::TimestampTz
             );
+
+            // Each null row that sits between two known points, with the value
+            // it takes. The known points are walked with one cursor over the
+            // ascending rows rather than searched from both ends per row, which
+            // is what a column of mostly nulls turned into a quadratic scan
+            let mut filled: Vec<(usize, f64)> = Vec::new();
+            let mut cursor = 0usize;
             for i in 0..n {
                 if !col.is_null(i) {
-                    data.push_scalar(&col.data.get_scalar(i));
                     continue;
                 }
-                // Find bracketing known points.
-                let before = known.iter().rev().find(|(k, _)| *k < i).copied();
-                let after = known.iter().find(|(k, _)| *k > i).copied();
-                match (before, after) {
-                    (Some((i0, v0)), Some((i1, v1))) => {
-                        let t = (i - i0) as f64 / (i1 - i0) as f64;
-                        let v = v0 + (v1 - v0) * t;
-                        let sv = if int_like {
-                            ScalarValue::Int64(v.round() as i64)
-                        } else {
-                            ScalarValue::Float64(v)
-                        };
-                        // Coerce to the column's variant via push_scalar's
-                        // typed path by casting through a single-row column.
-                        let tmp = crate::compute::cast_column(
-                            &Column::new(
-                                if int_like {
-                                    ColumnData::Int64(vec![match sv {
-                                        ScalarValue::Int64(x) => x,
-                                        _ => 0,
-                                    }])
-                                } else {
-                                    ColumnData::Float64(vec![v])
-                                },
-                                if int_like {
-                                    TypeId::Int64
-                                } else {
-                                    TypeId::Float64
-                                },
-                            ),
-                            col.type_id,
-                        )?;
-                        data.push_scalar(&tmp.data.get_scalar(0));
+                while cursor < known.len() && known[cursor].0 < i {
+                    cursor += 1;
+                }
+                // A known point never sits on a null row, so the one at the
+                // cursor is strictly after i and the one before it strictly
+                // before
+                let before = cursor.checked_sub(1).map(|p| known[p]);
+                let after = known.get(cursor).copied();
+                if let (Some((i0, v0)), Some((i1, v1))) = (before, after) {
+                    let t = (i - i0) as f64 / (i1 - i0) as f64;
+                    filled.push((i, v0 + (v1 - v0) * t));
+                }
+            }
+
+            // One cast puts every interpolated value in the column's own
+            // variant. Casting through a throwaway one row column per row
+            // allocated three times for each value it produced
+            let interpolated = if filled.is_empty() {
+                None
+            } else {
+                let source = if int_like {
+                    Column::new(
+                        ColumnData::Int64(filled.iter().map(|(_, v)| v.round() as i64).collect()),
+                        TypeId::Int64,
+                    )
+                } else {
+                    Column::new(
+                        ColumnData::Float64(filled.iter().map(|(_, v)| *v).collect()),
+                        TypeId::Float64,
+                    )
+                };
+                Some(crate::compute::cast_column(&source, col.type_id)?)
+            };
+
+            let mut data = ColumnData::with_capacity(col.type_id, n);
+            let mut nulls = NullBitmap::none(n);
+            let mut next_fill = 0usize;
+            for i in 0..n {
+                if !col.is_null(i) {
+                    data.push_from(&col.data, i);
+                    continue;
+                }
+                match (&interpolated, filled.get(next_fill)) {
+                    (Some(values), Some((row, _))) if *row == i => {
+                        data.push_from(&values.data, next_fill);
+                        next_fill += 1;
                     }
+                    // A null outside the known points, which no pair of them
+                    // brackets, stays null
                     _ => {
                         data.push_scalar(&ScalarValue::Null);
                         nulls.set_null(i);
@@ -1852,6 +1889,9 @@ fn evaluate_function(
         "date_trunc" => eval_date_trunc(args, batch, schema, params),
         "array" => eval_array(args, batch, schema, params),
         "array_subscript" => eval_array_subscript(args, batch, schema, params),
+        n if crate::array_functions::is_array_function(n) => {
+            crate::array_functions::evaluate_array_function(n, args, batch, schema, params)
+        }
         // Search predicates evaluated row by row. The planner routes these to
         // an index operator when one covers the table and the read is of the
         // current state; otherwise the storage scan evaluates them here, so
@@ -1918,26 +1958,40 @@ fn eval_array(
 
     let width = element_type.fixed_size().unwrap_or(0);
     let mut out = Vec::with_capacity(rows);
-    let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns.len());
+    // One buffer holds the row's elements end to end and one vector names
+    // them by range. Encoding each element into a buffer of its own and then
+    // gathering borrows of those was an allocation per element plus one per
+    // row, all of it freed before the next row started
+    let mut payload: Vec<u8> = Vec::new();
+    let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(columns.len());
     for row in 0..rows {
-        payloads.clear();
+        payload.clear();
+        spans.clear();
         for column in &columns {
             let scalar = if row < column.len() {
                 column.get_scalar(row)
             } else {
                 ScalarValue::Null
             };
-            payloads.push(match scalar {
-                ScalarValue::Null => None,
-                other => Some(crate::batch::encode_scalar_value(
-                    element_type,
-                    &other,
-                    width,
-                )),
-            });
+            match scalar {
+                ScalarValue::Null => spans.push(None),
+                other => {
+                    let start = payload.len();
+                    crate::batch::encode_scalar_value_into(
+                        &mut payload,
+                        element_type,
+                        &other,
+                        width,
+                    );
+                    spans.push(Some((start, payload.len())));
+                }
+            }
         }
-        let borrowed: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.as_deref()).collect();
-        out.push(zyron_common::array_value::encode(element_type, &borrowed));
+        out.push(zyron_common::array_value::encode_spans(
+            element_type,
+            &payload,
+            &spans,
+        ));
     }
     Ok(Column::new(ColumnData::Binary(out), TypeId::Array))
 }
@@ -1977,8 +2031,10 @@ fn eval_array_subscript(
     let mut nulls = crate::column::NullBitmap::empty();
     for row in 0..rows {
         let scalar = subscript_one(&arrays, &indexes, row, element_type);
+        // The decoded element is moved into the buffer. Pushing it by
+        // reference cloned a text or binary element a second time
         nulls.push(scalar.is_null());
-        data.push_scalar(&scalar);
+        data.push_scalar_owned(scalar);
     }
     Ok(Column::with_nulls(data, nulls, element_type))
 }
@@ -2064,7 +2120,8 @@ fn eval_match_against(
     };
     // Phonetic mode compares metaphone codes of the analyzed terms instead
     // of the terms themselves, so spelling variants still match
-    let query_codes: Vec<String> = if phonetic {
+    // Held as a set because every token of every row is tested against it
+    let query_codes: std::collections::HashSet<String> = if phonetic {
         zyron_search::Analyzer::analyze(&analyzer, &query_text)
             .iter()
             .map(|t| {
@@ -2077,7 +2134,7 @@ fn eval_match_against(
             .map(|(primary, _)| primary)
             .collect()
     } else {
-        Vec::new()
+        std::collections::HashSet::new()
     };
 
     let text_columns: Vec<Column> = column_args
@@ -2087,6 +2144,10 @@ fn eval_match_against(
 
     let mut scores = Vec::with_capacity(batch.num_rows);
     let mut document = String::with_capacity(256);
+    // Analysis writes into one buffer reused across rows. Taking a fresh
+    // token vector per row allocated a string for every term of every
+    // document, which is the bulk of the work on an unindexed match
+    let mut tokens = zyron_search::AnalysisBuffer::new();
     for row in 0..batch.num_rows {
         // One document per row, the matched columns joined the way the index
         // concatenates them at write time
@@ -2104,18 +2165,18 @@ fn eval_match_against(
                 document.push_str(s);
             }
         }
-        let tokens = zyron_search::Analyzer::analyze(&analyzer, &document);
+        zyron_search::Analyzer::analyze_into(&analyzer, &document, &mut tokens);
         let matched = if phonetic {
             !query_codes.is_empty()
-                && tokens.iter().any(|t| {
+                && (0..tokens.len()).any(|t| {
                     let (code, _) = zyron_search::PhoneticFilter::encode(
                         zyron_search::PhoneticAlgorithm::Metaphone,
-                        &t.term,
+                        tokens.term_at(t),
                     );
-                    !code.is_empty() && query_codes.iter().any(|q| *q == code)
+                    !code.is_empty() && query_codes.contains(&code)
                 })
         } else {
-            let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+            let terms: Vec<&str> = (0..tokens.len()).map(|t| tokens.term_at(t)).collect();
             match &query {
                 Some(q) => q.matches_terms(&terms, &analyzer),
                 None => false,
@@ -2299,10 +2360,14 @@ fn scalar_to_cache_key(scalar: ScalarValue) -> String {
         ScalarValue::Utf8(s) => s,
         ScalarValue::Null => "\u{0}null".to_string(),
         ScalarValue::Binary(b) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut key = String::with_capacity(b.len() * 2 + 2);
             key.push_str("\u{0}b");
+            // Nibbles go in directly. Formatting each byte allocated a string
+            // per byte of every key, on the path that builds one key per row
             for byte in b {
-                key.push_str(&format!("{byte:02x}"));
+                key.push(HEX[(byte >> 4) as usize] as char);
+                key.push(HEX[(byte & 0x0f) as usize] as char);
             }
             key
         }
@@ -2510,7 +2575,15 @@ fn vector_side(
     {
         let mut values = Vec::with_capacity(args.len());
         for a in args {
-            let column = evaluate(a, batch, schema, params)?;
+            // A literal or parameter element is read one row wide. Evaluating
+            // it against the batch wrote a column of the batch's height for
+            // every component of the query vector, to read one value out of
+            // each
+            let column = if is_scalar_expr(a) {
+                evaluate_scalar_operand(a, params)?
+            } else {
+                evaluate(a, batch, schema, params)?
+            };
             let v = match column.get_scalar(0) {
                 ScalarValue::Float32(f) => f as f64,
                 ScalarValue::Float64(f) => f,
@@ -2608,7 +2681,7 @@ fn eval_predict(
                 any_null = true;
                 break;
             }
-            row[j] = scalar_to_f64(&col.data.get_scalar(i));
+            row[j] = col.data.f64_at(i);
         }
         if any_null {
             nulls.push(true);
@@ -2660,7 +2733,7 @@ fn eval_propensity(
     let n = batch.num_rows;
     let mut treatment = Vec::with_capacity(n);
     for i in 0..n {
-        treatment.push(scalar_to_f64(&treatment_col.data.get_scalar(i)));
+        treatment.push(treatment_col.data.f64_at(i));
     }
     let mut covariates: Vec<f64> = Vec::with_capacity(n * p);
     let cov_cols: Vec<Column> = args[1..]
@@ -2669,17 +2742,13 @@ fn eval_propensity(
         .collect::<Result<Vec<_>>>()?;
     for i in 0..n {
         for c in &cov_cols {
-            covariates.push(scalar_to_f64(&c.data.get_scalar(i)));
+            covariates.push(c.data.f64_at(i));
         }
     }
     let scores = zyron_analytics::propensityScore(&treatment, &covariates, p)?;
-    let mut data = ColumnData::with_capacity(TypeId::Float64, scores.len());
-    let mut nulls = NullBitmap::empty();
-    for s in scores {
-        nulls.push(false);
-        data.push_scalar(&ScalarValue::Float64(s));
-    }
-    Ok(Column::with_nulls(data, nulls, TypeId::Float64))
+    // The scores are already the column's physical form, so they become its
+    // buffer rather than being pushed back through the scalar path
+    Ok(Column::new(ColumnData::Float64(scores), TypeId::Float64))
 }
 
 fn eval_did(
@@ -2776,7 +2845,7 @@ fn collect_causal_inputs(
         .collect::<Result<Vec<_>>>()?;
     for i in 0..n {
         for c in &cov_cols {
-            covariates.push(scalar_to_f64(&c.data.get_scalar(i)));
+            covariates.push(c.data.f64_at(i));
         }
     }
     Ok((outcome, treatment, covariates, p))
@@ -2795,7 +2864,7 @@ fn collect_column_f64(
         if col.is_null(i) {
             out.push(f64::NAN);
         } else {
-            out.push(scalar_to_f64(&col.data.get_scalar(i)));
+            out.push(col.data.f64_at(i));
         }
     }
     Ok(out)
@@ -2814,45 +2883,19 @@ fn collect_column_u64(
         if col.is_null(i) {
             out.push(0);
         } else {
-            out.push(scalar_to_f64(&col.data.get_scalar(i)).max(0.0) as u64);
+            out.push(col.data.f64_at(i).max(0.0) as u64);
         }
     }
     Ok(out)
 }
 
+/// One value repeated over every row, filled as a buffer rather than pushed a
+/// row at a time through the scalar path
 fn broadcast_f64(value: f64, n: usize) -> Result<Column> {
-    let mut data = ColumnData::with_capacity(TypeId::Float64, n);
-    let mut nulls = NullBitmap::empty();
-    for _ in 0..n {
-        nulls.push(false);
-        data.push_scalar(&ScalarValue::Float64(value));
-    }
-    Ok(Column::with_nulls(data, nulls, TypeId::Float64))
-}
-
-fn scalar_to_f64(v: &ScalarValue) -> f64 {
-    match v {
-        ScalarValue::Null => f64::NAN,
-        ScalarValue::Boolean(b) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        ScalarValue::Int8(x) => *x as f64,
-        ScalarValue::Int16(x) => *x as f64,
-        ScalarValue::Int32(x) => *x as f64,
-        ScalarValue::Int64(x) => *x as f64,
-        ScalarValue::Int128(x) => *x as f64,
-        ScalarValue::UInt8(x) => *x as f64,
-        ScalarValue::UInt16(x) => *x as f64,
-        ScalarValue::UInt32(x) => *x as f64,
-        ScalarValue::UInt64(x) => *x as f64,
-        ScalarValue::Float32(f) => *f as f64,
-        ScalarValue::Float64(f) => *f,
-        _ => 0.0,
-    }
+    Ok(Column::new(
+        ColumnData::Float64(vec![value; n]),
+        TypeId::Float64,
+    ))
 }
 
 fn literal_string(expr: &BoundExpr) -> Option<String> {
@@ -3039,29 +3082,35 @@ fn eval_coalesce(
         },
     };
 
-    let mut result = cols.pop().ok_or_else(|| {
+    let last = cols.len().checked_sub(1).ok_or_else(|| {
         ZyronError::ExecutionError("coalesce requires at least 1 argument".to_string())
     })?;
+    let result_type = cols[last].type_id;
     // The merge buffer takes the physical form the cells are in, which
     // for a p>6 timestamp is the 16 byte i128, not its logical type's 8
-    let merge_type = TypeId::timestamp_physical_type_id(result.type_id, digits);
-    for arg_col in cols.iter().rev() {
-        let mut new_data = ColumnData::with_capacity(merge_type, num_rows);
-        let mut new_nulls = NullBitmap::empty();
+    let merge_type = TypeId::timestamp_physical_type_id(result_type, digits);
 
-        for i in 0..num_rows {
-            if !arg_col.is_null(i) {
-                new_nulls.push_from(&arg_col.nulls, i);
-                new_data.push_from(&arg_col.data, i);
-            } else {
-                new_nulls.push_from(&result.nulls, i);
-                new_data.push_from(&result.data, i);
+    // Each row takes its first non-null argument in one pass. Folding an
+    // argument at a time rebuilt the whole column once per argument, so a
+    // three argument coalesce over text copied every cell three times
+    let mut new_data = ColumnData::with_capacity(merge_type, num_rows);
+    let mut new_nulls = NullBitmap::empty();
+    for i in 0..num_rows {
+        match cols.iter().position(|c| !c.is_null(i)) {
+            Some(pos) => {
+                new_nulls.push(false);
+                new_data.push_from(&cols[pos].data, i);
+            }
+            // Every argument is null here, so the result is the null the
+            // last argument carries, value included
+            None => {
+                new_nulls.push(true);
+                new_data.push_from(&cols[last].data, i);
             }
         }
-
-        result = Column::with_nulls(new_data, new_nulls, result.type_id);
     }
 
+    let mut result = Column::with_nulls(new_data, new_nulls, result_type);
     result.fractional_digits = digits;
     Ok(result)
 }
@@ -3422,11 +3471,6 @@ fn eval_round_trunc(
                     }
                 }
             }
-            for i in 0..n {
-                if col.is_null(i) {
-                    nulls.set_null(i);
-                }
-            }
             Ok(Column::with_nulls(
                 ColumnData::$variant(out),
                 nulls,
@@ -3448,11 +3492,6 @@ fn eval_round_trunc(
                     }
                 }
             }
-            for i in 0..n {
-                if col.is_null(i) {
-                    nulls.set_null(i);
-                }
-            }
             Ok(Column::with_nulls(
                 ColumnData::Float64(out),
                 nulls,
@@ -3471,11 +3510,6 @@ fn eval_round_trunc(
                         out.push(0.0);
                         nulls.set_null(i);
                     }
-                }
-            }
-            for i in 0..n {
-                if col.is_null(i) {
-                    nulls.set_null(i);
                 }
             }
             Ok(Column::with_nulls(
@@ -3505,11 +3539,6 @@ fn eval_round_trunc(
                         out.push(0);
                         nulls.set_null(i);
                     }
-                }
-            }
-            for i in 0..n {
-                if col.is_null(i) {
-                    nulls.set_null(i);
                 }
             }
             Ok(Column::with_nulls_ts(
@@ -3546,12 +3575,27 @@ fn eval_trim(
     }
     let col = evaluate(&args[0], batch, schema, params)?;
     utf8_or_err(&col, "trim")?;
+    // A charset written as a literal stays one row wide rather than being
+    // broadcast into a column of identical strings
     let charset = if args.len() == 2 {
-        let c = evaluate(&args[1], batch, schema, params)?;
+        let c = if is_scalar_expr(&args[1]) {
+            evaluate_scalar_operand(&args[1], params)?
+        } else {
+            evaluate(&args[1], batch, schema, params)?
+        };
         utf8_or_err(&c, "trim")?;
         Some(c)
     } else {
         None
+    };
+    // One charset for every row means one set of characters, built here
+    // instead of rebuilt for each row trimmed
+    let constant_set: Option<Vec<char>> = match &charset {
+        Some(c) if c.len() == 1 && !c.is_null(0) => match &c.data {
+            ColumnData::Utf8(v) => Some(v[0].chars().collect()),
+            _ => None,
+        },
+        _ => None,
     };
     let strings = match &col.data {
         ColumnData::Utf8(v) => v,
@@ -3566,6 +3610,9 @@ fn eval_trim(
             nulls.set_null(i);
             continue;
         }
+        // Holds this row's charset when the charset varies per row, and is
+        // never built at all when one constant set serves every row
+        let row_set: Vec<char>;
         // SQL trim strips spaces by default, an explicit charset strips any
         // of its characters
         let trimmed = match &charset {
@@ -3575,14 +3622,22 @@ fn eval_trim(
                 TrimSide::Trailing => s.trim_end_matches(' '),
             },
             Some(c) => {
-                if c.is_null(i) {
+                // A one row charset is the same value for every row
+                let cs_row = if c.len() == 1 { 0 } else { i };
+                if c.is_null(cs_row) {
                     out.push(String::new());
                     nulls.set_null(i);
                     continue;
                 }
-                let set: Vec<char> = match &c.data {
-                    ColumnData::Utf8(v) => v[i].chars().collect(),
-                    _ => unreachable!(),
+                let set: &[char] = match &constant_set {
+                    Some(set) => set.as_slice(),
+                    None => {
+                        row_set = match &c.data {
+                            ColumnData::Utf8(v) => v[cs_row].chars().collect(),
+                            _ => unreachable!(),
+                        };
+                        row_set.as_slice()
+                    }
                 };
                 let pred = |ch: char| set.contains(&ch);
                 match side {
@@ -3750,7 +3805,18 @@ fn eval_concat(
     }
     let mut out: Vec<String> = Vec::with_capacity(n);
     for i in 0..n {
-        let mut s = String::new();
+        // The row's width is known from the arguments it draws on, so the
+        // string is allocated once at that size rather than regrown as each
+        // argument is appended
+        let width: usize = cols
+            .iter()
+            .filter(|c| i < c.len() && !c.is_null(i))
+            .filter_map(|c| match &c.data {
+                ColumnData::Utf8(v) => Some(v[i].len()),
+                _ => None,
+            })
+            .sum();
+        let mut s = String::with_capacity(width);
         for c in &cols {
             if i < c.len() && !c.is_null(i) {
                 if let ColumnData::Utf8(v) = &c.data {
@@ -3780,6 +3846,49 @@ fn civil_from_epoch_days(days: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// The calendar or clock field an `EXTRACT` call reads.
+#[derive(Copy, Clone)]
+enum ExtractField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    Microsecond,
+    Quarter,
+    DayOfWeek,
+    DayOfYear,
+    Epoch,
+    Decade,
+    Century,
+    Millennium,
+}
+
+/// Resolves an `EXTRACT` field name, already lowercased, to the field it
+/// names. None for a name no field answers to.
+fn parse_extract_field(name: &str) -> Option<ExtractField> {
+    Some(match name {
+        "year" => ExtractField::Year,
+        "month" => ExtractField::Month,
+        "day" => ExtractField::Day,
+        "hour" => ExtractField::Hour,
+        "minute" => ExtractField::Minute,
+        "second" => ExtractField::Second,
+        "millisecond" => ExtractField::Millisecond,
+        "microsecond" => ExtractField::Microsecond,
+        "quarter" => ExtractField::Quarter,
+        "dow" | "dayofweek" => ExtractField::DayOfWeek,
+        "doy" | "dayofyear" => ExtractField::DayOfYear,
+        "epoch" => ExtractField::Epoch,
+        "decade" => ExtractField::Decade,
+        "century" => ExtractField::Century,
+        "millennium" => ExtractField::Millennium,
+        _ => return None,
+    })
+}
+
 /// `EXTRACT(field FROM source)`, also reachable as `date_part`.
 ///
 /// A DATE is stored as days since the epoch and a TIMESTAMP as microseconds,
@@ -3799,13 +3908,20 @@ fn eval_extract(
         )));
     }
     let field_col = evaluate(&args[0], batch, schema, params)?;
-    let field = match field_col.data {
+    let field_name = match field_col.data {
         ColumnData::Utf8(ref v) if !v.is_empty() => v[0].to_ascii_lowercase(),
         _ => {
             return Err(ZyronError::ExecutionError(
                 "extract needs a constant field name, like EXTRACT(YEAR FROM ts)".to_string(),
             ));
         }
+    };
+    // The field is one constant for the whole call, so it resolves here
+    // rather than matching its text again for every row
+    let Some(field) = parse_extract_field(&field_name) else {
+        return Err(ZyronError::ExecutionError(format!(
+            "extract does not know the field '{field_name}'"
+        )));
     };
     let source = evaluate(&args[1], batch, schema, params)?;
 
@@ -3840,28 +3956,23 @@ fn eval_extract(
         let days = micros.div_euclid(86_400_000_000);
         let time_of_day = micros.rem_euclid(86_400_000_000);
         let (year, month, day) = civil_from_epoch_days(days);
-        let value = match field.as_str() {
-            "year" => year,
-            "month" => month,
-            "day" => day,
-            "hour" => time_of_day / 3_600_000_000,
-            "minute" => time_of_day / 60_000_000 % 60,
-            "second" => time_of_day / 1_000_000 % 60,
-            "millisecond" => time_of_day / 1_000 % 60_000,
-            "microsecond" => time_of_day % 60_000_000,
-            "quarter" => (month - 1) / 3 + 1,
+        let value = match field {
+            ExtractField::Year => year,
+            ExtractField::Month => month,
+            ExtractField::Day => day,
+            ExtractField::Hour => time_of_day / 3_600_000_000,
+            ExtractField::Minute => time_of_day / 60_000_000 % 60,
+            ExtractField::Second => time_of_day / 1_000_000 % 60,
+            ExtractField::Millisecond => time_of_day / 1_000 % 60_000,
+            ExtractField::Microsecond => time_of_day % 60_000_000,
+            ExtractField::Quarter => (month - 1) / 3 + 1,
             // The epoch fell on a Thursday, so day zero is weekday four
-            "dow" | "dayofweek" => (days + 4).rem_euclid(7),
-            "doy" | "dayofyear" => days - crate::expr::epoch_days_from_civil(year, 1, 1) + 1,
-            "epoch" => micros / 1_000_000,
-            "decade" => year / 10,
-            "century" => (year - 1) / 100 + 1,
-            "millennium" => (year - 1) / 1000 + 1,
-            other => {
-                return Err(ZyronError::ExecutionError(format!(
-                    "extract does not know the field '{other}'"
-                )));
-            }
+            ExtractField::DayOfWeek => (days + 4).rem_euclid(7),
+            ExtractField::DayOfYear => days - crate::expr::epoch_days_from_civil(year, 1, 1) + 1,
+            ExtractField::Epoch => micros / 1_000_000,
+            ExtractField::Decade => year / 10,
+            ExtractField::Century => (year - 1) / 100 + 1,
+            ExtractField::Millennium => (year - 1) / 1000 + 1,
         };
         out.push(value);
         nulls.push(false);

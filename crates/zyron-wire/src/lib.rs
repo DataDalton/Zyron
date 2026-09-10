@@ -48,6 +48,7 @@ pub mod system_format_views;
 pub mod system_retention_views;
 pub mod system_streaming_views;
 pub mod system_views;
+pub mod temp_table_dispatch;
 pub mod tls;
 pub mod transport;
 pub mod types;

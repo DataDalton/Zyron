@@ -5,6 +5,7 @@
 
 pub mod ast;
 pub mod expr_sql;
+pub mod grammar;
 pub mod lexer;
 pub mod merge_desugar;
 pub mod parser;
@@ -18,7 +19,7 @@ pub use expr_sql::expr_to_sql;
 pub use lexer::Lexer;
 pub use parser::Parser;
 pub use token::{Keyword, Span, SpannedToken, Token};
-pub use unparse::{UnparseError, statement_to_sql};
+pub use unparse::{UnparseError, statement_to_sql, table_ref_to_sql};
 
 /// Parses a SQL string into a list of semicolon-separated statements.
 pub fn parse(sql: &str) -> zyron_common::Result<Vec<Statement>> {

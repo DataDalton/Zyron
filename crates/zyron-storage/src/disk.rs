@@ -79,6 +79,14 @@ pub struct DiskManager {
     files: scc::HashMap<u32, std::sync::Arc<FileEntry>>,
     /// Page reads issued, drives the Sampled verification policy.
     reads_issued: AtomicU64,
+    /// Directories that hold a file rather than the data directory, keyed by
+    /// file id.
+    ///
+    /// A temporary table's files live under `<data_dir>/tmp/<session>/` so a
+    /// session's storage is one tree to remove, and a crash leaves one tree
+    /// to clear. Consulted only when a file is opened or deleted, never on a
+    /// page read or write, so it costs nothing on the IO path
+    file_dirs: scc::HashMap<u32, PathBuf>,
 }
 
 /// An open data file.
@@ -148,6 +156,7 @@ impl DiskManager {
             config,
             files: scc::HashMap::new(),
             reads_issued: AtomicU64::new(0),
+            file_dirs: scc::HashMap::new(),
         })
     }
 
@@ -259,7 +268,44 @@ impl DiskManager {
 
     /// Generates the file path for a given file ID.
     fn file_path(&self, file_id: u32) -> PathBuf {
-        self.config.data_dir.join(format!("{:08}.dat", file_id))
+        let name = format!("{:08}.dat", file_id);
+        match self.file_dirs.read_sync(&file_id, |_, dir| dir.clone()) {
+            Some(dir) => dir.join(name),
+            None => self.config.data_dir.join(name),
+        }
+    }
+
+    /// Places a file in a directory of its own rather than the data
+    /// directory.
+    ///
+    /// Registered before the file is first opened, because the path is read
+    /// at open and an already open file keeps the handle it was opened with.
+    /// The directory is the caller's to create: one owner makes it once,
+    /// where creating it here would be a filesystem call per file placed
+    pub fn place_file_in(&self, file_id: u32, dir: &std::path::Path) {
+        let _ = self.file_dirs.insert_sync(file_id, dir.to_path_buf());
+    }
+
+    /// Forgets where a file was placed, after it has been deleted.
+    pub fn forget_file_placement(&self, file_id: u32) {
+        let _ = self.file_dirs.remove_sync(&file_id);
+    }
+
+    /// Releases a file's handle without flushing it, for a file whose bytes
+    /// are about to be unlinked.
+    ///
+    /// `close_file` extends the file to its page count and fsyncs it, so the
+    /// bytes on disk are what the page count claims. Both are for a file
+    /// something will read again. A temporary table's files are unlinked in
+    /// the same breath, so flushing them writes bytes that are deleted
+    /// before anything could read them, and on a session holding a gigabyte
+    /// that is a durable write per file for nothing.
+    ///
+    /// The handle still has to be released: an open file cannot be unlinked
+    /// on every platform, so the removal that follows would fail.
+    pub async fn discard_file(&self, file_id: u32) {
+        let _ = self.files.remove_async(&file_id).await;
+        let _ = self.file_dirs.remove_sync(&file_id);
     }
 
     /// Reads a page from disk.
@@ -452,6 +498,16 @@ impl DiskManager {
     /// Returns the number of pages in a file.
     pub async fn num_pages(&self, file_id: u32) -> Result<u64> {
         Ok(self.entry(file_id)?.num_pages.load(Ordering::Acquire))
+    }
+
+    /// The pages a file holds when it is already open, without opening it.
+    ///
+    /// `num_pages` goes through `entry`, which creates the file when it is
+    /// not open. A caller measuring what a file holds wants the size of a
+    /// file that exists, not a new empty one, so this answers None instead.
+    pub fn pages_if_open(&self, file_id: u32) -> Option<u64> {
+        self.files
+            .read_sync(&file_id, |_, e| e.num_pages.load(Ordering::Acquire))
     }
 
     /// Synchronous page write for the background writer thread.

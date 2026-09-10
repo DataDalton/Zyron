@@ -14,7 +14,7 @@ use std::sync::Arc;
 use zyron_catalog::TableEntry;
 use zyron_common::Result;
 
-use crate::batch::{DataBatch, encode_row};
+use crate::batch::{DataBatch, encode_row_into};
 use crate::context::ExecutionContext;
 use crate::operator::modify::{encode_btree_index_key_into, index_key_columns};
 
@@ -27,21 +27,80 @@ use super::changeset::ReplicaIdentity;
 /// rows unfindable by a key probe. They are named by their whole image
 /// instead, in an operation of their own, rather than being dropped or
 /// silently mismatched
+///
+/// Every key and image is written end to end into one buffer and named by
+/// range, because a vector per row is an allocation per row on the write path
+/// and the consumer reads them as slices either way
 pub struct IdentityImages {
-    /// Encoded index keys, one per row that the identity index covers
-    pub keyed: Vec<Vec<u8>>,
-    /// Row positions the keys belong to, aligned with `keyed`
+    /// Encoded keys and row images, one after another
+    payload: Vec<u8>,
+    /// Range in `payload` per row the identity index covers
+    keyed_spans: Vec<(u32, u32)>,
+    /// Row positions the keys belong to, aligned with `keyed_spans`
     pub keyed_rows: Vec<usize>,
-    /// Whole row encodings for rows the identity index does not cover
-    pub imaged: Vec<Vec<u8>>,
-    /// Row positions the images belong to, aligned with `imaged`
+    /// Range in `payload` per row the identity index does not cover
+    imaged_spans: Vec<(u32, u32)>,
+    /// Row positions the images belong to, aligned with `imaged_spans`
     pub imaged_rows: Vec<usize>,
 }
 
 impl IdentityImages {
+    fn new() -> Self {
+        Self {
+            payload: Vec::new(),
+            keyed_spans: Vec::new(),
+            keyed_rows: Vec::new(),
+            imaged_spans: Vec::new(),
+            imaged_rows: Vec::new(),
+        }
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.keyed.is_empty() && self.imaged.is_empty()
+        self.keyed_spans.is_empty() && self.imaged_spans.is_empty()
+    }
+
+    #[inline]
+    pub fn has_keyed(&self) -> bool {
+        !self.keyed_spans.is_empty()
+    }
+
+    #[inline]
+    pub fn has_imaged(&self) -> bool {
+        !self.imaged_spans.is_empty()
+    }
+
+    /// The encoded index keys, in row order.
+    pub fn keyed(&self) -> Vec<&[u8]> {
+        self.slices(&self.keyed_spans)
+    }
+
+    /// The whole row encodings, in row order.
+    pub fn imaged(&self) -> Vec<&[u8]> {
+        self.slices(&self.imaged_spans)
+    }
+
+    fn slices(&self, spans: &[(u32, u32)]) -> Vec<&[u8]> {
+        spans
+            .iter()
+            .map(|&(from, to)| &self.payload[from as usize..to as usize])
+            .collect()
+    }
+
+    /// Records what was just written to the end of `payload` as one row's key.
+    #[inline]
+    fn push_keyed(&mut self, from: usize, row: usize) {
+        self.keyed_spans
+            .push((from as u32, self.payload.len() as u32));
+        self.keyed_rows.push(row);
+    }
+
+    /// Records what was just written to the end of `payload` as one row's image.
+    #[inline]
+    fn push_imaged(&mut self, from: usize, row: usize) {
+        self.imaged_spans
+            .push((from as u32, self.payload.len() as u32));
+        self.imaged_rows.push(row);
     }
 }
 
@@ -57,12 +116,7 @@ pub fn identity_images(
     identity: &ReplicaIdentity,
     batch: &DataBatch,
 ) -> IdentityImages {
-    let mut out = IdentityImages {
-        keyed: Vec::new(),
-        keyed_rows: Vec::new(),
-        imaged: Vec::new(),
-        imaged_rows: Vec::new(),
-    };
+    let mut out = IdentityImages::new();
     match identity {
         ReplicaIdentity::Key { columns, .. } => {
             let ids: Vec<zyron_catalog::ColumnId> = columns
@@ -74,16 +128,18 @@ pub fn identity_images(
                 // key cannot be built and every row falls back to its image
                 return whole_images(table, batch);
             };
-            out.keyed.reserve(batch.num_rows);
+            out.payload.reserve(batch.num_rows * 32);
+            out.keyed_spans.reserve(batch.num_rows);
             out.keyed_rows.reserve(batch.num_rows);
             let mut key = Vec::with_capacity(64);
             for row in 0..batch.num_rows {
+                let from = out.payload.len();
                 if encode_btree_index_key_into(batch, row, &key_cols, &mut key) {
-                    out.keyed.push(key.clone());
-                    out.keyed_rows.push(row);
+                    out.payload.extend_from_slice(&key);
+                    out.push_keyed(from, row);
                 } else {
-                    out.imaged.push(encode_row(batch, row, &table.columns));
-                    out.imaged_rows.push(row);
+                    encode_row_into(&mut out.payload, batch, row, &table.columns);
+                    out.push_imaged(from, row);
                 }
             }
         }
@@ -93,21 +149,29 @@ pub fn identity_images(
 }
 
 fn whole_images(table: &TableEntry, batch: &DataBatch) -> IdentityImages {
-    let mut imaged = Vec::with_capacity(batch.num_rows);
-    let mut imaged_rows = Vec::with_capacity(batch.num_rows);
+    let mut out = IdentityImages::new();
+    out.imaged_spans.reserve(batch.num_rows);
+    out.imaged_rows.reserve(batch.num_rows);
     for row in 0..batch.num_rows {
-        imaged.push(encode_row(batch, row, &table.columns));
-        imaged_rows.push(row);
+        let from = out.payload.len();
+        encode_row_into(&mut out.payload, batch, row, &table.columns);
+        out.push_imaged(from, row);
     }
-    IdentityImages {
-        keyed: Vec::new(),
-        keyed_rows: Vec::new(),
-        imaged,
-        imaged_rows,
-    }
+    out
 }
 
 /// The identity a table replicates by, resolved from the live catalog.
+/// True when a table's rows have nowhere to replicate to.
+///
+/// A temporary table lives in one session on one node: no other member has
+/// the table, and the id it would be addressed by is node-local, so a row of
+/// one reaching the changeset would be an instruction no follower could
+/// carry out.
+#[inline]
+fn is_session_local(table: &TableEntry) -> bool {
+    table.is_temporary()
+}
+
 pub fn identity_of(ctx: &ExecutionContext, table: &TableEntry) -> ReplicaIdentity {
     let indexes = ctx.catalog.index_snapshot(table.id);
     ReplicaIdentity::of(table, &indexes)
@@ -119,6 +183,9 @@ pub fn identity_of(ctx: &ExecutionContext, table: &TableEntry) -> ReplicaIdentit
 /// on the write path down to one `Option` test
 #[inline]
 pub fn capture_insert(ctx: &ExecutionContext, table: &TableEntry, batch: &DataBatch) -> Result<()> {
+    if is_session_local(table) {
+        return Ok(());
+    }
     let Some(set) = ctx.replication.as_ref() else {
         return Ok(());
     };
@@ -133,6 +200,9 @@ pub fn capture_insert(ctx: &ExecutionContext, table: &TableEntry, batch: &DataBa
 /// Records rows leaving a table.
 #[inline]
 pub fn capture_delete(ctx: &ExecutionContext, table: &TableEntry, batch: &DataBatch) -> Result<()> {
+    if is_session_local(table) {
+        return Ok(());
+    }
     let Some(set) = ctx.replication.as_ref() else {
         return Ok(());
     };
@@ -141,11 +211,11 @@ pub fn capture_delete(ctx: &ExecutionContext, table: &TableEntry, batch: &DataBa
     }
     let identity = identity_of(ctx, table);
     let images = identity_images(table, &identity, batch);
-    if !images.keyed.is_empty() {
-        set.capture_delete(table, &identity, &images.keyed)?;
+    if images.has_keyed() {
+        set.capture_delete(table, &identity, &images.keyed())?;
     }
-    if !images.imaged.is_empty() {
-        set.capture_delete(table, &ReplicaIdentity::FullImage, &images.imaged)?;
+    if images.has_imaged() {
+        set.capture_delete(table, &ReplicaIdentity::FullImage, &images.imaged())?;
     }
     Ok(())
 }
@@ -159,6 +229,9 @@ pub fn capture_update(
     old_batch: &DataBatch,
     new_batch: &DataBatch,
 ) -> Result<()> {
+    if is_session_local(table) {
+        return Ok(());
+    }
     let Some(set) = ctx.replication.as_ref() else {
         return Ok(());
     };
@@ -173,16 +246,16 @@ pub fn capture_update(
     }
     let identity = identity_of(ctx, table);
     let images = identity_images(table, &identity, old_batch);
-    if !images.keyed.is_empty() {
+    if images.has_keyed() {
         let rows: Vec<u32> = images.keyed_rows.iter().map(|r| *r as u32).collect();
-        set.capture_update(table, &identity, &images.keyed, &new_batch.take(&rows))?;
+        set.capture_update(table, &identity, &images.keyed(), &new_batch.take(&rows))?;
     }
-    if !images.imaged.is_empty() {
+    if images.has_imaged() {
         let rows: Vec<u32> = images.imaged_rows.iter().map(|r| *r as u32).collect();
         set.capture_update(
             table,
             &ReplicaIdentity::FullImage,
-            &images.imaged,
+            &images.imaged(),
             &new_batch.take(&rows),
         )?;
     }

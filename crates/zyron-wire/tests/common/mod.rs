@@ -28,7 +28,7 @@ pub async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::Temp
 pub async fn create_test_server_in_mode(
     mode: zyron_common::DeploymentMode,
 ) -> (Arc<ServerState>, SchemaId, tempfile::TempDir) {
-    let (server, schema, _, tmp) = create_test_server_configured(mode, None, false).await;
+    let (server, schema, _, tmp) = create_test_server_configured(mode, None, false, false).await;
     (server, schema, tmp)
 }
 
@@ -42,7 +42,8 @@ pub async fn create_test_server_with_security() -> (
     tempfile::TempDir,
 ) {
     let (server, schema, sm, tmp) =
-        create_test_server_configured(zyron_common::DeploymentMode::Unified, None, true).await;
+        create_test_server_configured(zyron_common::DeploymentMode::Unified, None, true, false)
+            .await;
     (server, schema, sm.expect("security manager built"), tmp)
 }
 
@@ -57,8 +58,27 @@ pub async fn create_test_server_with_pool_frames(
     frames: usize,
 ) -> (Arc<ServerState>, SchemaId, tempfile::TempDir) {
     let (server, schema, _, tmp) =
-        create_test_server_configured(zyron_common::DeploymentMode::Unified, Some(frames), false)
-            .await;
+        create_test_server_configured(
+            zyron_common::DeploymentMode::Unified,
+            Some(frames),
+            false,
+            false,
+        )
+        .await;
+    (server, schema, tmp)
+}
+
+/// A server with the branch manager installed, for a suite whose subject is a
+/// write under an active branch. A branch routes heap pages through a
+/// copy-on-write overlay, so nothing reaches that path without this.
+pub async fn create_test_server_with_branches() -> (Arc<ServerState>, SchemaId, tempfile::TempDir) {
+    let (server, schema, _, tmp) = create_test_server_configured(
+        zyron_common::DeploymentMode::Unified,
+        None,
+        false,
+        true,
+    )
+    .await;
     (server, schema, tmp)
 }
 
@@ -66,6 +86,7 @@ async fn create_test_server_configured(
     mode: zyron_common::DeploymentMode,
     pool_frames: Option<usize>,
     with_security: bool,
+    with_branches: bool,
 ) -> (
     Arc<ServerState>,
     SchemaId,
@@ -177,7 +198,11 @@ async fn create_test_server_configured(
         event_dispatcher: None,
         mv_manager: None,
         stream_job_manager: None,
-        branch_manager: None,
+        branch_manager: with_branches.then(|| {
+            Arc::new(zyron_versioning::BranchManager::new(
+                tmp.path().to_path_buf(),
+            ))
+        }),
         // The search managers the server builds, so a suite can exercise a
         // fulltext, vector or spatial index rather than only the two formats'
         // heap paths. Each gets its own directory under the run's temp root,
@@ -871,7 +896,7 @@ pub async fn run_on_branch(
     ctx.table_io_stats = Some(Arc::clone(&server.table_io_stats));
     ctx.index_io_stats = Some(Arc::clone(&server.index_io_stats));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
-    ctx.active_branch_name = Some(branch.to_string());
+    ctx.active_branch_name = Some(std::sync::Arc::from(branch));
     if let Some(mgr) = &server.fts_manager {
         ctx.set_fts_manager(Arc::clone(mgr));
     }

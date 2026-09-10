@@ -318,6 +318,38 @@ impl EncodingPushdown {
                     None
                 }
             }
+            LogicalPlan::AsofJoin {
+                left,
+                right,
+                match_on,
+            } => {
+                let new_left = self.transform(left);
+                let new_right = self.transform(right);
+                if new_left.is_some() || new_right.is_some() {
+                    Some(LogicalPlan::AsofJoin {
+                        left: Arc::new(new_left.unwrap_or_else(|| left.as_ref().clone())),
+                        right: Arc::new(new_right.unwrap_or_else(|| right.as_ref().clone())),
+                        match_on: match_on.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            LogicalPlan::ExpandRows {
+                child,
+                spec,
+                carry,
+                output_columns,
+                outer_input,
+            } => self
+                .transform(child)
+                .map(|new_child| LogicalPlan::ExpandRows {
+                    child: Arc::new(new_child),
+                    spec: spec.clone(),
+                    carry: carry.clone(),
+                    output_columns: output_columns.clone(),
+                    outer_input: *outer_input,
+                }),
             // DML nodes: recurse into child/source
             LogicalPlan::Insert {
                 table_id,

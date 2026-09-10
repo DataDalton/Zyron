@@ -440,6 +440,18 @@ pub struct SelectStatement {
     pub for_clause: Option<ForClause>,
     /// Soft-delete visibility modifier: trailing INCLUDING DELETED / ONLY DELETED.
     pub soft_delete_mode: SoftDeleteSelectMode,
+    /// `INTO [TEMPORARY|TEMP] name` written between the projection list and
+    /// FROM. The statement parser lifts it into a CREATE TABLE ... AS, so a
+    /// select that reaches the binder still carrying one is nested, which the
+    /// binder refuses
+    pub into_target: Option<SelectIntoTarget>,
+}
+
+/// The table a `SELECT ... INTO` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectIntoTarget {
+    pub name: String,
+    pub temporary: bool,
 }
 
 /// Trailing soft-delete visibility modifier on a SELECT.
@@ -542,6 +554,31 @@ pub struct CreateTableStatement {
     /// source's schema, layout and file set rather than declaring columns
     /// of its own, so `columns` is empty when this is set
     pub clone_of: Option<CloneSource>,
+    /// Set by TEMPORARY or TEMP. The table lives in the creating session's
+    /// own namespace on this node only
+    pub temporary: bool,
+    /// What a commit does to a temporary table's rows. None on a permanent
+    /// table
+    pub on_commit: Option<OnCommitAction>,
+    /// `OR REPLACE`, which drops an existing table of the same name before
+    /// creating this one
+    pub or_replace: bool,
+    /// `CREATE TABLE name AS SELECT ...` and `SELECT ... INTO name`. The
+    /// column layout comes from the query rather than from a declaration,
+    /// so `columns` is empty when this is set
+    pub as_query: Option<Box<SelectStatement>>,
+}
+
+/// What a commit does to a temporary table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCommitAction {
+    /// The rows outlive the transaction, which is the default
+    #[default]
+    PreserveRows,
+    /// Every commit empties the table, the definition stays
+    DeleteRows,
+    /// The first commit drops the table
+    Drop,
 }
 
 /// The table a `CREATE TABLE ... CLONE OF` copies, and the version of it.
@@ -2628,6 +2665,14 @@ pub enum Expr {
         conditions: Vec<WhenClause>,
         else_result: Option<Box<Expr>>,
     },
+    /// `x -> expr`, an expression over one named element.
+    ///
+    /// Written only in the argument position of a function that takes one,
+    /// which is what keeps `->` reading as JSON access everywhere else.
+    Lambda {
+        parameter: String,
+        body: Box<Expr>,
+    },
     /// Parenthesized expression.
     Nested(Box<Expr>),
     /// Scalar subquery: (SELECT ...)
@@ -2727,6 +2772,9 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_subquery(left) || expr_contains_subquery(right)
         }
+        // A lambda's body is an expression over one element of an array, so
+        // a subquery inside it is reached the same way as in any other
+        Expr::Lambda { body, .. } => expr_contains_subquery(body),
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
@@ -2949,6 +2997,118 @@ pub enum TableRef {
     /// inline sink `CREATE STREAMING JOB` already accepts after INTO.
     /// Boxed for the same reason `TableFunction` is
     ExternalInline(Box<ExternalInlineRef>),
+    /// `UNNEST(array_expr [, ...]) [WITH ORDINALITY] [AS alias (col, ...)]`.
+    /// Boxed for the same reason `TableFunction` is
+    Unnest(Box<UnnestRef>),
+    /// `FLATTEN(variant_expr [, path => ...] [, outer => ...]
+    /// [, recursive => ...]) [AS alias (col, ...)]`
+    Flatten(Box<FlattenRef>),
+    /// `<rel> PIVOT (agg(col) FOR pivot_col IN (...)) [AS alias]`
+    Pivot(Box<PivotRef>),
+    /// `<rel> UNPIVOT [INCLUDE|EXCLUDE NULLS] (value FOR name IN (...))
+    /// [AS alias]`
+    Unpivot(Box<UnpivotRef>),
+}
+
+/// `UNNEST(...)` in a FROM clause.
+///
+/// One array yields one column, several arrays yield several columns zipped
+/// to the longest with the shorter padded with NULL, and WITH ORDINALITY
+/// appends a BIGINT position starting at 1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnnestRef {
+    pub arrays: Vec<Expr>,
+    pub with_ordinality: bool,
+    pub alias: Option<String>,
+    /// Names for the produced columns, in order, including the ordinality
+    /// column when one is produced. Empty when no column list was written
+    pub column_aliases: Vec<String>,
+}
+
+/// `FLATTEN(...)` in a FROM clause.
+///
+/// Walks a VARIANT document and yields one row per member reached, with the
+/// six columns seq, key, path, index, value and this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlattenRef {
+    pub input: Expr,
+    /// `path => 'a.b[*]'`, the document position the walk starts from. None
+    /// starts at the document root
+    pub path: Option<String>,
+    /// `outer => true` yields one row carrying a null value for an empty or
+    /// null input rather than no rows at all
+    pub outer: bool,
+    /// `recursive => true` walks nested arrays and objects depth first
+    pub recursive: bool,
+    pub alias: Option<String>,
+    pub column_aliases: Vec<String>,
+}
+
+/// `<rel> PIVOT (...)`. The binder rewrites this to a grouped aggregate with
+/// one conditional aggregate per (aggregate, value) pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PivotRef {
+    pub input: TableRef,
+    pub aggregates: Vec<PivotAggregate>,
+    /// The column whose values become output columns
+    pub pivot_column: Expr,
+    pub values: Vec<PivotValue>,
+    /// True when the IN list was written as a subquery. The binder refuses
+    /// it, and holding the fact here keeps the refusal message in one place
+    pub value_subquery: bool,
+    pub alias: Option<String>,
+}
+
+/// One aggregate inside a PIVOT list: `agg_fn(value_col) [AS name]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PivotAggregate {
+    pub function: String,
+    pub argument: Expr,
+    pub alias: Option<String>,
+}
+
+/// One entry of a PIVOT `IN` list: `literal [AS alias]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PivotValue {
+    pub value: LiteralValue,
+    pub alias: Option<String>,
+}
+
+/// `<rel> UNPIVOT (...)`. The binder rewrites this to a LATERAL VALUES list
+/// over the named columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnpivotRef {
+    pub input: TableRef,
+    /// True for INCLUDE NULLS. EXCLUDE NULLS and an absent modifier both
+    /// drop rows whose every value column is null
+    pub include_nulls: bool,
+    /// The output columns holding the values. More than one unpivots
+    /// several columns together, and every IN group then carries that many
+    pub value_columns: Vec<String>,
+    /// The output column holding each group's label
+    pub name_column: String,
+    pub items: Vec<UnpivotItem>,
+    pub alias: Option<String>,
+}
+
+/// One entry of an UNPIVOT `IN` list: `col [AS literal]`, or
+/// `(col, col) [AS literal]` when several value columns unpivot together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnpivotItem {
+    pub columns: Vec<String>,
+    /// The label this group takes in the name column. None uses the first
+    /// column's name
+    pub label: Option<LiteralValue>,
+}
+
+/// The `MATCH_CONDITION (...)` an ASOF JOIN carries.
+///
+/// Held as written so the binder decides the direction and the tolerance
+/// from the same expression grammar every other predicate goes through, and
+/// the unparser writes it back unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsofMatch {
+    pub condition: Expr,
 }
 
 /// Table-valued function call data, extracted so `TableRef::TableFunction` can
@@ -2984,6 +3144,10 @@ pub struct JoinTableRef {
     pub join_type: JoinType,
     pub right: TableRef,
     pub condition: JoinCondition,
+    /// Set by `ASOF [LEFT] JOIN`. join_type is Inner for the plain form and
+    /// Left for ASOF LEFT JOIN, and `condition` holds the optional ON, which
+    /// carries equalities only
+    pub asof: Option<Box<AsofMatch>>,
 }
 
 impl TableRef {
@@ -3836,6 +4000,7 @@ mod tests {
             fetch: None,
             for_clause: None,
             soft_delete_mode: SoftDeleteSelectMode::Default,
+            into_target: None,
         }));
         assert!(matches!(select, Statement::Select(_)));
 
@@ -3947,6 +4112,7 @@ mod tests {
                     column: "a_id".to_string(),
                 }),
             })),
+            asof: None,
         }));
         assert!(matches!(
             join,

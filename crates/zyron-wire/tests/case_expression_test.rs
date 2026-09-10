@@ -237,3 +237,195 @@ async fn test_the_first_matching_arm_wins() {
         .collect();
     assert_eq!(values, vec!["low", "mid", "high"]);
 }
+
+/// Branches carrying decimals of different scales land on the widest one,
+/// whichever branch it came from.
+///
+/// The scale says where the point sits, so a value merged at one scale and
+/// read at another is a different number. Aligning the branches pairwise as
+/// each was folded in meant the widest scale had to propagate backwards
+/// through the branches already merged, which is the part a single pass has
+/// to get right: every branch is moved onto the widest scale before any row
+/// is picked.
+#[tokio::test]
+async fn test_decimal_branches_of_different_scales_keep_their_values() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE t (k INT, two DECIMAL(12,2), four DECIMAL(12,4))",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO t VALUES (1, 1.25, 9.8765), (2, 2.50, 1.2345), (3, 4.00, 0.0001)",
+    )
+    .await;
+
+    // The wide branch is the last WHEN, so the scale it forces has to reach
+    // the branches written before it
+    let rows = query_values(
+        &server,
+        "SELECT CASE WHEN k = 1 THEN two WHEN k = 2 THEN four ELSE 0 END FROM t ORDER BY k",
+    )
+    .await;
+    let values: Vec<String> = scalars(&rows)
+        .iter()
+        .map(|v| match v {
+            ScalarValue::Int128(raw) => zyron_common::format_decimal(*raw, 4),
+            other => panic!("expected a decimal, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec!["1.2500", "1.2345", "0.0000"],
+        "a branch was read on a scale other than the one it was written on"
+    );
+
+    // And with the wide branch first, which is the order the old fold
+    // handled without any propagation
+    let rows = query_values(
+        &server,
+        "SELECT CASE WHEN k = 1 THEN four WHEN k = 2 THEN two ELSE 0 END FROM t ORDER BY k",
+    )
+    .await;
+    let values: Vec<String> = scalars(&rows)
+        .iter()
+        .map(|v| match v {
+            ScalarValue::Int128(raw) => zyron_common::format_decimal(*raw, 4),
+            other => panic!("expected a decimal, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec!["9.8765", "2.5000", "0.0000"]);
+}
+
+/// A CASE of many branches picks each row's first true condition.
+///
+/// One pass over the rows reads the branches rather than folding them, so
+/// this pins the ordering with more arms than a fold would have merged in
+/// one step, and with a null-producing arm in the middle.
+#[tokio::test]
+async fn test_many_branches_each_pick_the_first_true_condition() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(&server, &mut session, "CREATE TABLE t (k INT)")
+        .await
+        .expect("create");
+    exec_dml(&server, "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6)").await;
+
+    let rows = query_values(
+        &server,
+        "SELECT CASE \
+           WHEN k = 1 THEN 'a' \
+           WHEN k = 2 THEN NULL \
+           WHEN k = 3 THEN 'c' \
+           WHEN k < 5 THEN 'd' \
+           WHEN k < 6 THEN 'e' \
+           ELSE 'z' END FROM t ORDER BY k",
+    )
+    .await;
+    let values: Vec<Option<String>> = scalars(&rows)
+        .iter()
+        .map(|v| match v {
+            ScalarValue::Utf8(s) => Some(s.clone()),
+            ScalarValue::Null => None,
+            other => panic!("expected text or null, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Some("a".to_string()),
+            None,
+            Some("c".to_string()),
+            Some("d".to_string()),
+            Some("e".to_string()),
+            Some("z".to_string()),
+        ],
+        "a row read a branch other than its first true one"
+    );
+}
+
+/// COALESCE returns the first non-null argument, and null only when every
+/// argument is null.
+///
+/// Each row is written once from the argument it picked rather than by
+/// folding one argument at a time, so the pick order is pinned here with
+/// more than two arguments and with a row where all of them are null.
+#[tokio::test]
+async fn test_coalesce_picks_the_first_non_null_argument() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE t (k INT, a TEXT, b TEXT, c TEXT)",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO t VALUES \
+           (1, 'first', 'second', 'third'), \
+           (2, NULL, 'second', 'third'), \
+           (3, NULL, NULL, 'third'), \
+           (4, NULL, NULL, NULL)",
+    )
+    .await;
+
+    let rows = query_values(&server, "SELECT COALESCE(a, b, c) FROM t ORDER BY k").await;
+    let values: Vec<Option<String>> = scalars(&rows)
+        .iter()
+        .map(|v| match v {
+            ScalarValue::Utf8(s) => Some(s.clone()),
+            ScalarValue::Null => None,
+            other => panic!("expected text or null, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Some("first".to_string()),
+            Some("second".to_string()),
+            Some("third".to_string()),
+            None,
+        ],
+        "a row took an argument other than its first non-null one"
+    );
+}
+
+/// COALESCE over decimals of different scales reads every argument on the
+/// widest scale.
+#[tokio::test]
+async fn test_coalesce_aligns_decimal_scales() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE t (k INT, two DECIMAL(12,2), four DECIMAL(12,4))",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO t VALUES (1, NULL, 9.8765), (2, 2.50, NULL)",
+    )
+    .await;
+
+    let rows = query_values(&server, "SELECT COALESCE(two, four) FROM t ORDER BY k").await;
+    let values: Vec<String> = scalars(&rows)
+        .iter()
+        .map(|v| match v {
+            ScalarValue::Int128(raw) => zyron_common::format_decimal(*raw, 4),
+            other => panic!("expected a decimal, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec!["9.8765", "2.5000"],
+        "an argument was read on a scale other than the one it was written on"
+    );
+}

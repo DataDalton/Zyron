@@ -40,13 +40,38 @@ fn bitmap_bytes(count: usize) -> usize {
 /// `Some(bytes)` for its payload in the element type's own encoding. A fixed
 /// width type is written without an offset table; every other type gets one.
 pub fn encode(element_type: TypeId, elements: &[Option<&[u8]>]) -> Vec<u8> {
-    let count = elements.len();
+    encode_from(element_type, elements.len(), |i| elements[i])
+}
+
+/// Builds the canonical encoding from elements named as ranges into one
+/// buffer.
+///
+/// A caller that has already written every element of a row end to end into a
+/// single buffer names them by range rather than gathering a vector of slices
+/// first. That vector is one allocation per row, and a row is the unit these
+/// callers work in, so it is one allocation per row of the input.
+pub fn encode_spans(
+    element_type: TypeId,
+    payload: &[u8],
+    spans: &[Option<(usize, usize)>],
+) -> Vec<u8> {
+    encode_from(element_type, spans.len(), |i| {
+        spans[i].map(|(from, to)| &payload[from..to])
+    })
+}
+
+/// The encoder both public forms share, reading each element through a
+/// closure so neither has to materialize the elements as a slice of slices.
+fn encode_from<'a, F>(element_type: TypeId, count: usize, element_at: F) -> Vec<u8>
+where
+    F: Fn(usize) -> Option<&'a [u8]>,
+{
     let bitmap_len = bitmap_bytes(count);
     let fixed = element_type
         .fixed_size()
         .filter(|w| *w > 0 && *w <= u16::MAX as usize);
 
-    let payload_len: usize = elements.iter().flatten().map(|b| b.len()).sum();
+    let payload_len: usize = (0..count).filter_map(&element_at).map(|b| b.len()).sum();
     let body_len = match fixed {
         Some(width) => count * width,
         None => (count + 1) * 4 + payload_len,
@@ -60,16 +85,16 @@ pub fn encode(element_type: TypeId, elements: &[Option<&[u8]>]) -> Vec<u8> {
 
     let bitmap_at = out.len();
     out.resize(bitmap_at + bitmap_len, 0);
-    for (i, element) in elements.iter().enumerate() {
-        if element.is_some() {
+    for i in 0..count {
+        if element_at(i).is_some() {
             out[bitmap_at + i / 8] |= 1 << (i % 8);
         }
     }
 
     match fixed {
         Some(width) => {
-            for element in elements {
-                match element {
+            for i in 0..count {
+                match element_at(i) {
                     // A null element still occupies its slot, so the payload
                     // stays addressable by index alone
                     None => out.resize(out.len() + width, 0),
@@ -88,15 +113,17 @@ pub fn encode(element_type: TypeId, elements: &[Option<&[u8]>]) -> Vec<u8> {
             out.resize(offsets_at + (count + 1) * 4, 0);
             let mut end = 0u32;
             out[offsets_at..offsets_at + 4].copy_from_slice(&end.to_le_bytes());
-            for (i, element) in elements.iter().enumerate() {
-                if let Some(bytes) = element {
+            for i in 0..count {
+                if let Some(bytes) = element_at(i) {
                     end += bytes.len() as u32;
                 }
                 let at = offsets_at + (i + 1) * 4;
                 out[at..at + 4].copy_from_slice(&end.to_le_bytes());
             }
-            for element in elements.iter().flatten() {
-                out.extend_from_slice(element);
+            for i in 0..count {
+                if let Some(bytes) = element_at(i) {
+                    out.extend_from_slice(bytes);
+                }
             }
         }
     }
@@ -363,6 +390,99 @@ mod tests {
             "an empty element is not a null element"
         );
         assert_eq!(view.get(3), Some(Some(&b"omega"[..])));
+    }
+
+    /// The bytes an array occupies on disk, pinned.
+    ///
+    /// Every array in a heap page, a lake file and a changeset record is in
+    /// this layout, and nothing reads it through a version. A round trip
+    /// proves the encoder and the reader agree with each other, which they
+    /// would go on doing if both moved together; only the bytes themselves
+    /// prove that data already written still reads.
+    #[test]
+    fn the_encoded_layout_is_the_one_already_on_disk() {
+        let encoded = encode(TypeId::Int32, &[Some(&1i32.to_le_bytes()), None]);
+        assert_eq!(
+            encoded,
+            vec![
+                // element type, then the fixed-width flag
+                TypeId::Int32 as u8,
+                FLAG_FIXED_WIDTH,
+                // element width, little endian u16
+                4,
+                0,
+                // element count, little endian u32
+                2,
+                0,
+                0,
+                0,
+                // presence bitmap: the first element is set, the second is not
+                0b0000_0001,
+                // the first element's four bytes, then the null element's
+                // slot, which is held open so an index still addresses it
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+
+        let text = encode(TypeId::Text, &[Some(b"ab"), None]);
+        assert_eq!(
+            text,
+            vec![
+                TypeId::Text as u8,
+                // no fixed-width flag, so an offset table addresses elements
+                0,
+                // width zero for a variable-width element
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0b0000_0001,
+                // offsets, one per element plus a final end, little endian u32
+                0,
+                0,
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                // the payload, with nothing written for the null element
+                b'a',
+                b'b',
+            ]
+        );
+    }
+
+    /// The span form writes the same bytes as the slice form.
+    ///
+    /// Both are the same encoder reached two ways, and a caller picks between
+    /// them on how it happens to hold its elements, never on what it wants
+    /// written.
+    #[test]
+    fn spans_and_slices_encode_alike() {
+        let payload = b"alphaomega";
+        let spans = [Some((0usize, 5usize)), None, Some((5, 10))];
+        assert_eq!(
+            encode_spans(TypeId::Text, payload, &spans),
+            encode(TypeId::Text, &[Some(b"alpha"), None, Some(b"omega")])
+        );
+        assert_eq!(
+            encode_spans(TypeId::Int64, &[], &[]),
+            encode(TypeId::Int64, &[])
+        );
     }
 
     #[test]

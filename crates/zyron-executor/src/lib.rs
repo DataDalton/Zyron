@@ -1,3 +1,4 @@
+pub mod array_functions;
 pub mod batch;
 pub mod calibrate;
 pub mod column;

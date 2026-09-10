@@ -236,6 +236,26 @@ pub enum Keyword {
     // LATERAL
     Lateral,
 
+    // Row-generating FROM items
+    Unnest,
+    Ordinality,
+    Flatten,
+    Path,
+
+    // PIVOT and UNPIVOT
+    Pivot,
+    Unpivot,
+    Exclude,
+
+    // ASOF JOIN
+    Asof,
+    MatchCondition,
+
+    // Temporary tables
+    Temporary,
+    Temp,
+    Preserve,
+
     // Array
     Array,
     Any,
@@ -651,7 +671,12 @@ pub enum Keyword {
 
 impl std::fmt::Display for Keyword {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", format!("{self:?}").to_uppercase())
+        // A keyword whose SQL spelling holds an underscore does not survive
+        // uppercasing its variant name, so those are spelled out here
+        match self {
+            Keyword::MatchCondition => f.write_str("MATCH_CONDITION"),
+            _ => write!(f, "{}", format!("{self:?}").to_uppercase()),
+        }
     }
 }
 
@@ -1014,6 +1039,18 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
 
         // LATERAL
         "LATERAL" => Some(Keyword::Lateral),
+        "UNNEST" => Some(Keyword::Unnest),
+        "ORDINALITY" => Some(Keyword::Ordinality),
+        "FLATTEN" => Some(Keyword::Flatten),
+        "PATH" => Some(Keyword::Path),
+        "PIVOT" => Some(Keyword::Pivot),
+        "UNPIVOT" => Some(Keyword::Unpivot),
+        "EXCLUDE" => Some(Keyword::Exclude),
+        "ASOF" => Some(Keyword::Asof),
+        "MATCH_CONDITION" => Some(Keyword::MatchCondition),
+        "TEMPORARY" => Some(Keyword::Temporary),
+        "TEMP" => Some(Keyword::Temp),
+        "PRESERVE" => Some(Keyword::Preserve),
 
         // Array
         "ARRAY" => Some(Keyword::Array),

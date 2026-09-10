@@ -1,0 +1,137 @@
+# suite:   sql_surface
+# run:     2026-09-09_220720_d19cc60-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Temporary Table Drop At Session End ===
+  Run 1/5: 3.0ms to drop 1,079,508,992 bytes across 16 tables
+  Run 2/5: 4.7ms to drop 1,079,508,992 bytes across 16 tables
+  Run 3/5: 3.1ms to drop 1,079,508,992 bytes across 16 tables
+  Run 4/5: 4.4ms to drop 1,079,508,992 bytes across 16 tables
+  Run 5/5: 3.5ms to drop 1,079,508,992 bytes across 16 tables
+  drop at session end [PASS/OK]:
+    Runs: [2.9950ms, 4.7379ms, 3.1220ms, 4.3720ms, 3.4547ms]
+    Average: 3.7363ms <= 100ms (target)
+    Min/Max: 2.9950ms / 4.7379ms, StdDev: 0.6948ms
+
+=== UNNEST Element Throughput ===
+Rows: 10000000, elements per row: 10
+  Run 1/5: 124,280,169 elements/sec (804.6336ms)
+  Run 2/5: 123,912,098 elements/sec (807.0237ms)
+  Run 3/5: 123,972,516 elements/sec (806.6304ms)
+  Run 4/5: 123,788,482 elements/sec (807.8296ms)
+  Run 5/5: 122,501,295 elements/sec (816.3179ms)
+  UNNEST elements [PASS/OK]:
+    Runs: [124,280,169 elements/s, 123,912,098 elements/s, 123,972,516 elements/s, 123,788,482 elements/s, 122,501,295 elements/s]
+    Average: 123,690,912 elements/s >= 100,000,000 elements/s (target)
+    Min/Max: 122,501,295 elements/s / 124,280,169 elements/s, StdDev: 616,467 elements/s
+
+=== array_transform Lambda Throughput ===
+Rows: 10000000, elements per row: 10
+  Run 1/5: 69,788,580 elements/sec (1.4328992s)
+  Run 2/5: 69,632,850 elements/sec (1.4361038s)
+  Run 3/5: 69,879,244 elements/sec (1.4310401s)
+  Run 4/5: 69,998,296 elements/sec (1.4286062s)
+  Run 5/5: 70,133,186 elements/sec (1.4258585s)
+  array_transform elements [PASS/OK]:
+    Runs: [69,788,580 elements/s, 69,632,850 elements/s, 69,879,244 elements/s, 69,998,296 elements/s, 70,133,186 elements/s]
+    Average: 69,886,431 elements/s >= 50,000,000 elements/s (target)
+    Min/Max: 69,632,850 elements/s / 70,133,186 elements/s, StdDev: 171,658 elements/s
+
+=== CREATE TEMP TABLE Latency ===
+Tables per run: 200
+  Run 1/5: 153.7us per table (30.7312ms for 200)
+  Run 2/5: 176.1us per table (35.2283ms for 200)
+  Run 3/5: 156.5us per table (31.3079ms for 200)
+  Run 4/5: 152.3us per table (30.4541ms for 200)
+  Run 5/5: 152.0us per table (30.4003ms for 200)
+  CREATE TEMP TABLE latency [PASS/OK]:
+    Runs: [153.6560us, 176.1415us, 156.5395us, 152.2705us, 152.0015us]
+    Average: 158.1218us <= 200us (target)
+    Min/Max: 152.0015us / 176.1415us, StdDev: 9.1526us
+
+=== FLATTEN Leaf Throughput ===
+Documents: 1000000, leaves each: 20
+  Run 1/5: 5,354,547 leaves/sec (3.7351431s)
+  Run 2/5: 5,354,623 leaves/sec (3.7350902s)
+  Run 3/5: 5,355,718 leaves/sec (3.7343268s)
+  Run 4/5: 5,356,904 leaves/sec (3.7334999s)
+  Run 5/5: 5,342,679 leaves/sec (3.7434403s)
+  FLATTEN leaves [PASS/OK]:
+    Runs: [5,354,547 leaves/s, 5,354,623 leaves/s, 5,355,718 leaves/s, 5,356,904 leaves/s, 5,342,679 leaves/s]
+    Average: 5,352,894 leaves/s >= 5,000,000 leaves/s (target)
+    Min/Max: 5,342,679 leaves/s / 5,356,904 leaves/s, StdDev: 5,179 leaves/s
+
+=== PIVOT Against a Hand-Written Conditional Aggregate ===
+Rows: 10000000, 4 regions x 4 quarters
+  Run 1/5: pivot 314.2691ms, hand-written 294.1515ms
+  Run 2/5: pivot 288.384ms, hand-written 295.9383ms
+  Run 3/5: pivot 287.3244ms, hand-written 286.891ms
+  Run 4/5: pivot 288.9305ms, hand-written 289.9398ms
+  Run 5/5: pivot 295.108ms, hand-written 305.9628ms
+  PIVOT:
+    Runs: [314.2691ms, 288.3840ms, 287.3244ms, 288.9305ms, 295.1080ms]
+    Average: 294.8032ms (no target set)
+    Min/Max: 287.3244ms / 314.2691ms, StdDev: 10.1059ms
+  hand-written aggregate:
+    Runs: [294.1515ms, 295.9383ms, 286.8910ms, 289.9398ms, 305.9628ms]
+    Average: 294.5767ms (no target set)
+    Min/Max: 286.8910ms / 305.9628ms, StdDev: 6.5153ms
+  PIVOT costs 1.0008x the hand-written form (limit 1.02x)
+  PIVOT over hand-written:
+    Runs: [1.0008x]
+    Average: 1.0008x (no target set)
+
+=== UNPIVOT Output Row Throughput ===
+Rows: 1000000, columns unpivoted: 12
+  Run 1/5: 59,717,655 rows/sec (200.9456ms)
+  Run 2/5: 59,800,893 rows/sec (200.6659ms)
+  Run 3/5: 61,319,692 rows/sec (195.6957ms)
+  Run 4/5: 61,068,298 rows/sec (196.5013ms)
+  Run 5/5: 60,483,932 rows/sec (198.3998ms)
+  UNPIVOT output rows [PASS/OK]:
+    Runs: [59,717,655 rows/s, 59,800,893 rows/s, 61,319,692 rows/s, 61,068,298 rows/s, 60,483,932 rows/s]
+    Average: 60,478,094 rows/s >= 20,000,000 rows/s (target)
+    Min/Max: 59,717,655 rows/s / 61,319,692 rows/s, StdDev: 647,075 rows/s
+
+=== Temporary INSERT Against a Permanent Heap ===
+Rows: 1000000, rows per statement: 1000
+  Run 1/5: temporary 5,781,674 rows/sec, permanent 2,831,926 rows/sec
+  Run 2/5: temporary 5,727,459 rows/sec, permanent 2,859,874 rows/sec
+  Run 3/5: temporary 6,085,890 rows/sec, permanent 2,788,335 rows/sec
+  Run 4/5: temporary 6,143,476 rows/sec, permanent 2,622,998 rows/sec
+  Run 5/5: temporary 5,957,931 rows/sec, permanent 2,787,224 rows/sec
+  temporary table:
+    Runs: [5,781,674 rows/s, 5,727,459 rows/s, 6,085,890 rows/s, 6,143,476 rows/s, 5,957,931 rows/s]
+    Average: 5,939,286 rows/s (no target set)
+    Min/Max: 5,727,459 rows/s / 6,143,476 rows/s, StdDev: 163,246 rows/s
+  permanent heap:
+    Runs: [2,831,926 rows/s, 2,859,874 rows/s, 2,788,335 rows/s, 2,622,998 rows/s, 2,787,224 rows/s]
+    Average: 2,778,071 rows/s (no target set)
+    Min/Max: 2,622,998 rows/s / 2,859,874 rows/s, StdDev: 82,254 rows/s
+  A temporary table takes inserts 2.14x as fast with no log to write
+  temporary over permanent, no group:
+    Runs: [2.1379x]
+    Average: 2.1379x (no target set)
+
+=== LATERAL UNNEST Overhead ===
+Rows: 2000000, elements per row: 10
+  Run 1/5: bare 130,916,098 elements/sec, lateral 127,433,502 elements/sec
+  Run 2/5: bare 131,983,755 elements/sec, lateral 127,020,257 elements/sec
+  Run 3/5: bare 132,648,161 elements/sec, lateral 127,187,789 elements/sec
+  Run 4/5: bare 132,434,720 elements/sec, lateral 126,129,967 elements/sec
+  Run 5/5: bare 132,300,770 elements/sec, lateral 126,343,665 elements/sec
+  bare UNNEST:
+    Runs: [130,916,098 elements/s, 131,983,755 elements/s, 132,648,161 elements/s, 132,434,720 elements/s, 132,300,770 elements/s]
+    Average: 132,056,701 elements/s (no target set)
+    Min/Max: 130,916,098 elements/s / 132,648,161 elements/s, StdDev: 609,687 elements/s
+  LATERAL UNNEST:
+    Runs: [127,433,502 elements/s, 127,020,257 elements/s, 127,187,789 elements/s, 126,129,967 elements/s, 126,343,665 elements/s]
+    Average: 126,823,036 elements/s (no target set)
+    Min/Max: 126,129,967 elements/s / 127,433,502 elements/s, StdDev: 500,949 elements/s
+  LATERAL costs 1.041x the bare form (limit 1.10x)
+  LATERAL over bare:
+    Runs: [1.0413x]
+    Average: 1.0413x (no target set)

@@ -81,12 +81,17 @@ impl IndexAdvisor {
             | LogicalPlan::Delete { child, .. } => {
                 self.walk_and_record(child);
             }
-            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::SetOp { left, right, .. }
+            | LogicalPlan::AsofJoin { left, right, .. } => {
                 self.walk_and_record(left);
                 self.walk_and_record(right);
             }
             LogicalPlan::LateralJoin { left, .. } => {
                 self.walk_and_record(left);
+            }
+            LogicalPlan::ExpandRows { child, .. } => {
+                self.walk_and_record(child);
             }
         }
     }

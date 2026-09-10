@@ -14,14 +14,14 @@
   <line x1="70" y1="60.0" x2="930" y2="60.0" stroke="#30363d" stroke-width="1"/>
   <text x="62" y="64.0" text-anchor="end" fill="#8b949e" font-size="11">180</text>
   <text x="62" y="52" text-anchor="end" fill="#8b949e" font-size="11">M ops/sec</text>
-  <rect x="93.8" y="282.6" width="48.0" height="67.4" fill="#1f6feb" rx="2"/>
-  <text x="117.8" y="278.6" text-anchor="middle" fill="#e6edf3" font-size="10">41.8</text>
+  <rect x="93.8" y="284.1" width="48.0" height="65.9" fill="#1f6feb" rx="2"/>
+  <text x="117.8" y="280.1" text-anchor="middle" fill="#e6edf3" font-size="10">40.9</text>
   <text x="117.8" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">B+tree insert</text>
-  <rect x="189.3" y="305.9" width="48.0" height="44.1" fill="#1f6feb" rx="2"/>
-  <text x="213.3" y="301.9" text-anchor="middle" fill="#e6edf3" font-size="10">27.4</text>
+  <rect x="189.3" y="303.7" width="48.0" height="46.3" fill="#1f6feb" rx="2"/>
+  <text x="213.3" y="299.7" text-anchor="middle" fill="#e6edf3" font-size="10">28.8</text>
   <text x="213.3" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">B+tree delete</text>
-  <rect x="284.9" y="105.1" width="48.0" height="244.9" fill="#1f6feb" rx="2"/>
-  <text x="308.9" y="101.1" text-anchor="middle" fill="#e6edf3" font-size="10">152.0</text>
+  <rect x="284.9" y="99.8" width="48.0" height="250.2" fill="#1f6feb" rx="2"/>
+  <text x="308.9" y="95.8" text-anchor="middle" fill="#e6edf3" font-size="10">155.3</text>
   <text x="308.9" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Hash join build</text>
   <rect x="380.4" y="97.7" width="48.0" height="252.3" fill="#1f6feb" rx="2"/>
   <text x="404.4" y="93.7" text-anchor="middle" fill="#e6edf3" font-size="10">156.6</text>
@@ -32,8 +32,8 @@
   <rect x="571.6" y="321.7" width="48.0" height="28.3" fill="#1f6feb" rx="2"/>
   <text x="595.6" y="317.7" text-anchor="middle" fill="#e6edf3" font-size="10">17.5</text>
   <text x="595.6" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">Row serialize</text>
-  <rect x="667.1" y="346.1" width="48.0" height="3.9" fill="#1f6feb" rx="2"/>
-  <text x="691.1" y="342.1" text-anchor="middle" fill="#e6edf3" font-size="10">2.4</text>
+  <rect x="667.1" y="349.7" width="48.0" height="0.3" fill="#1f6feb" rx="2"/>
+  <text x="691.1" y="345.7" text-anchor="middle" fill="#e6edf3" font-size="10">0.2</text>
   <text x="691.1" y="370" text-anchor="middle" fill="#e6edf3" font-size="12">SQL parse</text>
   <rect x="762.7" y="340.8" width="48.0" height="9.2" fill="#1f6feb" rx="2"/>
   <text x="786.7" y="336.8" text-anchor="middle" fill="#e6edf3" font-size="10">5.7</text>

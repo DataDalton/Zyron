@@ -177,6 +177,84 @@ impl DataBatch {
         }
     }
 
+    /// Builds an empty batch shaped like this one, to be filled one row at a
+    /// time by [`DataBatch::load_row`].
+    ///
+    /// An expression that has to be evaluated per row needs a batch to read,
+    /// and slicing a fresh one row batch per row allocated a buffer and a null
+    /// bitmap for every column of every row. One view built here and refilled
+    /// in place allocates on the first row and reuses those buffers for the
+    /// rest of the batch.
+    pub fn row_view(&self) -> Self {
+        // A zero length slice carries the column's physical variant, which the
+        // logical type alone does not name: a p>6 timestamp is i128 under a
+        // Timestamp type id, and a view built from the type id would be i64
+        Self {
+            columns: self
+                .columns
+                .iter()
+                .map(|c| {
+                    Column::with_nulls_ts(
+                        c.data.slice(0, 0),
+                        NullBitmap::empty(),
+                        c.type_id,
+                        c.fractional_digits,
+                    )
+                })
+                .collect(),
+            num_rows: 0,
+            resolved: self
+                .resolved
+                .iter()
+                .map(|r| ResolvedPath {
+                    table_idx: r.table_idx,
+                    column_id: r.column_id,
+                    path: r.path.clone(),
+                    values: Column::with_nulls_ts(
+                        r.values.data.slice(0, 0),
+                        NullBitmap::empty(),
+                        r.values.type_id,
+                        r.values.fractional_digits,
+                    ),
+                })
+                .collect(),
+        }
+    }
+
+    /// Replaces a view's contents with one row of this batch.
+    ///
+    /// The view has to have come from [`DataBatch::row_view`] on this batch, so
+    /// that its columns line up with these in both count and type.
+    pub fn load_row(&self, row: usize, view: &mut Self) {
+        self.load_row_at(row, view, 0);
+        for (dst, src) in view.resolved.iter_mut().zip(self.resolved.iter()) {
+            dst.values.data.truncate(0);
+            dst.values.data.push_from(&src.values.data, row);
+            dst.values.nulls.clear();
+            dst.values.nulls.push_from(&src.values.nulls, row);
+        }
+    }
+
+    /// Writes one row of this batch into a view's columns starting at `at`.
+    ///
+    /// A joined row is assembled from two batches, so each side fills its own
+    /// span of one view rather than each producing a batch of its own for the
+    /// two to be concatenated. Only the columns are written, so a view filled
+    /// this way carries no resolved variant paths, which is what a freshly
+    /// concatenated joined batch carried as well.
+    pub fn load_row_at(&self, row: usize, view: &mut Self, at: usize) {
+        for (offset, src) in self.columns.iter().enumerate() {
+            let Some(dst) = view.columns.get_mut(at + offset) else {
+                break;
+            };
+            dst.data.truncate(0);
+            dst.data.push_from(&src.data, row);
+            dst.nulls.clear();
+            dst.nulls.push_from(&src.nulls, row);
+        }
+        view.num_rows = 1;
+    }
+
     /// Applies one row transform to every resolved path, skipping the work
     /// for the batches that carry none
     fn map_resolved(&self, f: impl Fn(&Column) -> Column) -> Vec<ResolvedPath> {

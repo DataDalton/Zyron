@@ -22,6 +22,10 @@ pub struct NameResolver {
     /// a schema that does not exist. Skips one cache lookup + name hash
     /// per search path entry on the resolve hot path
     search_path_ids: RwLock<Vec<Option<SchemaId>>>,
+    /// The session's own temporary tables, searched before the search path
+    /// for a bare name. None for a resolver built outside a session, which
+    /// has no temporary namespace to search
+    temp_tables: Option<Arc<crate::temp_tables::SessionTempTables>>,
 }
 
 impl NameResolver {
@@ -39,7 +43,18 @@ impl NameResolver {
             cache,
             storage,
             search_path_ids: RwLock::new(vec![None; len]),
+            temp_tables: None,
         }
+    }
+
+    /// Gives the resolver the session's temporary namespace, which a bare
+    /// name is then searched in first.
+    pub fn with_temp_tables(
+        mut self,
+        temp_tables: Option<Arc<crate::temp_tables::SessionTempTables>>,
+    ) -> Self {
+        self.temp_tables = temp_tables;
+        self
     }
 
     /// Resolves a possibly-qualified table name to a TableEntry.
@@ -76,6 +91,16 @@ impl NameResolver {
                 .find_table_in_schema(schema_entry.id, table_name)
                 .await
                 .map_err(|_| Self::missing_relation(Some(schema), table_name));
+        }
+
+        // A bare name reaches the session's own temporary tables before the
+        // search path, so a temporary table shadows a permanent one of the
+        // same name for that session. A qualified name never gets here, which
+        // is what keeps the permanent one always reachable
+        if let Some(temp) = &self.temp_tables
+            && let Some(table) = temp.resolve(table_name)
+        {
+            return Ok(table);
         }
 
         // No qualifier and empty search path is a programming or user error.

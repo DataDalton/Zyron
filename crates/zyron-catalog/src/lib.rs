@@ -20,6 +20,7 @@ pub mod statistics;
 pub mod stats;
 pub mod storage;
 pub mod system_catalog;
+pub mod temp_tables;
 
 pub use cache::{BTreeIndexSpec, CatalogCache, ShadowSpec, TableIndexSnapshot};
 pub use catalog::{Catalog, DropOutcome};
@@ -51,4 +52,8 @@ pub use storage::{CatalogCounters, CatalogStorage, HeapCatalogStorage};
 pub use system_catalog::{
     DEFAULT_SEARCH_PATH, SYSTEM_CATALOG_NAME, SYSTEM_OBJECTS, SYSTEM_SCHEMAS, SystemCatalog,
     SystemObject, SystemObjectKind, default_search_path,
+};
+pub use temp_tables::{
+    DEFAULT_TEMP_TABLE_BYTES_FRACTION, DEFAULT_TEMP_TABLE_MAX_COUNT, SessionKey, SessionTempTables,
+    TempTable, TempTableInfo, TempTableRegistry, temp_root,
 };

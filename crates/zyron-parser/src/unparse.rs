@@ -65,6 +65,16 @@ pub fn select_to_sql(query: &SelectStatement) -> Result<String, UnparseError> {
 }
 
 /// Renders an expression as SQL
+/// Writes one FROM item back as SQL.
+///
+/// A caller keying a per-bind memo on a relation as written uses this: two
+/// items that unparse alike name the same relation.
+pub fn table_ref_to_sql(table: &TableRef) -> Result<String, UnparseError> {
+    let mut out = String::new();
+    write_table_ref(&mut out, table)?;
+    Ok(out)
+}
+
 pub fn expr_to_sql(expr: &Expr) -> Result<String, UnparseError> {
     let mut out = String::new();
     write_expr(&mut out, expr)?;
@@ -271,6 +281,11 @@ pub(crate) fn write_expr(out: &mut String, expr: &Expr) -> Out {
             write_ident(out, column);
         }
         Expr::Literal(literal) => write_literal(out, literal)?,
+        Expr::Lambda { parameter, body } => {
+            write_ident(out, parameter);
+            out.push_str(" -> ");
+            write_expr(out, body)?;
+        }
         Expr::Collate { expr, collation } => {
             write_expr(out, expr)?;
             out.push_str(" COLLATE ");
@@ -893,6 +908,23 @@ fn write_table_ref(out: &mut String, table: &TableRef) -> Out {
             if join.condition == JoinCondition::Natural {
                 out.push_str(" NATURAL");
             }
+            // An ASOF join is written back in its own spelling, so stored SQL
+            // round-trips as the statement that was typed
+            if let Some(asof) = &join.asof {
+                out.push_str(match join.join_type {
+                    JoinType::Left => " ASOF LEFT JOIN ",
+                    _ => " ASOF JOIN ",
+                });
+                write_table_ref(out, &join.right)?;
+                out.push_str(" MATCH_CONDITION (");
+                write_expr(out, &asof.condition)?;
+                out.push(')');
+                if let JoinCondition::On(expr) = &join.condition {
+                    out.push_str(" ON ");
+                    write_expr(out, expr)?;
+                }
+                return Ok(());
+            }
             out.push_str(match join.join_type {
                 JoinType::Inner => " INNER JOIN ",
                 JoinType::Left => " LEFT JOIN ",
@@ -965,8 +997,109 @@ fn write_table_ref(out: &mut String, table: &TableRef) -> Out {
             }
             write_alias(out, &external.alias);
         }
+        TableRef::Unnest(unnest) => {
+            out.push_str("UNNEST(");
+            write_list(out, &unnest.arrays, write_expr)?;
+            out.push(')');
+            if unnest.with_ordinality {
+                out.push_str(" WITH ORDINALITY");
+            }
+            write_rows_function_alias(out, &unnest.alias, &unnest.column_aliases);
+        }
+        TableRef::Flatten(flatten) => {
+            out.push_str("FLATTEN(");
+            write_expr(out, &flatten.input)?;
+            if let Some(path) = &flatten.path {
+                out.push_str(", path => ");
+                write_string(out, path);
+            }
+            if flatten.outer {
+                out.push_str(", outer => TRUE");
+            }
+            if flatten.recursive {
+                out.push_str(", recursive => TRUE");
+            }
+            out.push(')');
+            write_rows_function_alias(out, &flatten.alias, &flatten.column_aliases);
+        }
+        TableRef::Pivot(pivot) => {
+            write_table_ref(out, &pivot.input)?;
+            out.push_str(" PIVOT (");
+            write_list(out, &pivot.aggregates, |out, agg| {
+                out.push_str(&agg.function);
+                out.push('(');
+                write_expr(out, &agg.argument)?;
+                out.push(')');
+                if let Some(alias) = &agg.alias {
+                    out.push_str(" AS ");
+                    write_ident(out, alias);
+                }
+                Ok(())
+            })?;
+            out.push_str(" FOR ");
+            write_expr(out, &pivot.pivot_column)?;
+            out.push_str(" IN (");
+            write_list(out, &pivot.values, |out, value| {
+                write_literal(out, &value.value)?;
+                if let Some(alias) = &value.alias {
+                    out.push_str(" AS ");
+                    write_ident(out, alias);
+                }
+                Ok(())
+            })?;
+            out.push_str("))");
+            write_alias(out, &pivot.alias);
+        }
+        TableRef::Unpivot(unpivot) => {
+            write_table_ref(out, &unpivot.input)?;
+            out.push_str(if unpivot.include_nulls {
+                " UNPIVOT INCLUDE NULLS ("
+            } else {
+                " UNPIVOT EXCLUDE NULLS ("
+            });
+            if unpivot.value_columns.len() == 1 {
+                write_ident(out, &unpivot.value_columns[0]);
+            } else {
+                out.push('(');
+                write_ident_list(out, &unpivot.value_columns);
+                out.push(')');
+            }
+            out.push_str(" FOR ");
+            write_ident(out, &unpivot.name_column);
+            out.push_str(" IN (");
+            write_list(out, &unpivot.items, |out, item| {
+                if item.columns.len() == 1 {
+                    write_ident(out, &item.columns[0]);
+                } else {
+                    out.push('(');
+                    write_ident_list(out, &item.columns);
+                    out.push(')');
+                }
+                if let Some(label) = &item.label {
+                    out.push_str(" AS ");
+                    write_literal(out, label)?;
+                }
+                Ok(())
+            })?;
+            out.push_str("))");
+            write_alias(out, &unpivot.alias);
+        }
     }
     Ok(())
+}
+
+/// `[AS alias [(col, ...)]]` on UNNEST or FLATTEN.
+fn write_rows_function_alias(out: &mut String, alias: &Option<String>, columns: &[String]) {
+    let Some(alias) = alias else {
+        return;
+    };
+    out.push_str(" AS ");
+    write_ident(out, alias);
+    if !columns.is_empty() {
+        out.push_str(" (");
+        write_ident_list(out, columns);
+        out.push(')');
+    }
 }
 
 // ---------------------------------------------------------------------------

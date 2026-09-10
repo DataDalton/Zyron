@@ -5,7 +5,9 @@
 //! analyze, vacuum, compaction, configuration validation, and benchmarks.
 
 mod bench;
+mod docs_cmd;
 mod format_cmd;
+mod function_index;
 mod remote;
 
 use std::path::{Path, PathBuf};
@@ -99,6 +101,12 @@ enum Subcommand {
         category: String,
     },
 
+    DocsGenerate {
+        root: PathBuf,
+    },
+    DocsCheck {
+        root: PathBuf,
+    },
     DeprecationReport,
     DeprecationGuide {
         item: String,
@@ -471,6 +479,7 @@ fn parseArgs() -> Option<(GlobalFlags, Subcommand)> {
         "format" => parseFormat(&args, &mut i),
         "upgrade" => parseUpgrade(&args, &mut i),
         "deprecation" => parseDeprecation(&args, &mut i),
+        "docs" => parseDocs(&args, &mut i),
         "release" => parseRelease(&args, &mut i),
 
         other => {
@@ -1254,6 +1263,9 @@ fn main() {
             executeRemote(&flags, &format_cmd::statements::acknowledge(category))
         }
 
+        Subcommand::DocsGenerate { ref root } => handleDocsGenerate(root),
+        Subcommand::DocsCheck { ref root } => handleDocsCheck(root),
+
         Subcommand::DeprecationReport => {
             executeRemote(&flags, format_cmd::statements::DEPRECATION_REPORT)
         }
@@ -1308,4 +1320,76 @@ fn main() {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// SQL statement reference
+// ---------------------------------------------------------------------------
+
+/// The default reference root, relative to the repository.
+const DOCS_REFERENCE_ROOT: &str = "docs/business/sql/reference";
+
+/// Reads `docs generate` and `docs check`.
+fn parseDocs(args: &[String], i: &mut usize) -> Subcommand {
+    // The subcommand word itself is still under the cursor
+    *i += 1;
+    if *i >= args.len() {
+        eprintln!("Usage: zyron-ctl docs <generate|check> [--root <path>]");
+        process::exit(1);
+    }
+    let action = args[*i].clone();
+    *i += 1;
+    let mut root = PathBuf::from(DOCS_REFERENCE_ROOT);
+    while *i < args.len() {
+        match args[*i].as_str() {
+            "--root" => root = PathBuf::from(flagValue(args, i, "--root")),
+            _ => break,
+        }
+        *i += 1;
+    }
+    match action.as_str() {
+        "generate" => Subcommand::DocsGenerate { root },
+        "check" => Subcommand::DocsCheck { root },
+        other => {
+            eprintln!("Unknown docs action: {other}. Use generate or check.");
+            process::exit(1);
+        }
+    }
+}
+
+/// Writes the reference tree from the grammar registry.
+fn handleDocsGenerate(root: &Path) -> Result<(), String> {
+    let count = docs_cmd::generate(root)
+        .map_err(|e| format!("writing the reference to {} failed: {e}", root.display()))?;
+    println!("Wrote {} page(s) to {}", count, root.display());
+    Ok(())
+}
+
+/// Compares the tree on disk against what the registry writes now.
+fn handleDocsCheck(root: &Path) -> Result<(), String> {
+    let findings = docs_cmd::check(root)
+        .map_err(|e| format!("reading the reference under {} failed: {e}", root.display()))?;
+    if findings.is_empty() {
+        println!(
+            "The reference under {} is what the registry writes",
+            root.display()
+        );
+        return Ok(());
+    }
+    let mut message = format!(
+        "the reference under {} is not what the registry writes:",
+        root.display()
+    );
+    for finding in &findings {
+        message.push_str(
+            "
+  ",
+        );
+        message.push_str(finding);
+    }
+    message.push_str(
+        "
+Run `zyron-ctl docs generate` to rewrite it.",
+    );
+    Err(message)
 }

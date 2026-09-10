@@ -45,6 +45,15 @@ pub const WINDOW_TABLE_IDX: usize = usize::MAX - 1;
 /// never alias.
 pub const SET_OP_TABLE_IDX: usize = usize::MAX - 2;
 
+/// Synthetic `table_idx` a lambda's parameter binds under.
+///
+/// `array_transform(arr, x -> x * 2)` names one element, which is not a
+/// column of any relation the query reads. Binding it as a column of a
+/// one-column pseudo relation lets the executor evaluate the body over a
+/// batch of elements through the same evaluator every other expression uses.
+/// Distinct from the three above so the four never alias.
+pub const LAMBDA_TABLE_IDX: usize = usize::MAX - 3;
+
 /// A column in the output schema of a logical plan node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalColumn {
@@ -252,6 +261,149 @@ pub enum LogicalPlan {
         positional_args: Vec<BoundExpr>,
         output_columns: Vec<LogicalColumn>,
     },
+
+    /// Expands each input row into zero or more output rows.
+    ///
+    /// UNNEST walks arrays, FLATTEN walks a VARIANT document and UNPIVOT
+    /// walks a fixed list of column groups. All three repeat the input row's
+    /// columns beside what they produce, so one node serves them and the
+    /// executor builds an output batch from a repeat vector rather than
+    /// copying a row per produced row.
+    ExpandRows {
+        child: Arc<LogicalPlan>,
+        /// Boxed for the reason `AsofJoin`'s match is: the widest spec arm
+        /// would otherwise set the width of every node in the tree
+        spec: Box<ExpandSpec>,
+        /// The child column each carried output column comes from, in output
+        /// order, ahead of the produced columns.
+        ///
+        /// Carried by identity rather than by position, because projection
+        /// pushdown prunes the child and every position after a pruned
+        /// column would shift. Empty when the input is a synthesized one-row
+        /// relation with nothing to carry
+        carry: Vec<crate::binder::ColumnRef>,
+        /// Every column the node outputs, the carried ones then the produced
+        /// ones, already carrying the identity an enclosing query addresses
+        /// them by
+        output_columns: Vec<LogicalColumn>,
+        /// True when an input row that produced no output row is still
+        /// emitted once with the produced columns null. LEFT JOIN LATERAL
+        /// asks for this, and so does FLATTEN's `outer => true`
+        outer_input: bool,
+    },
+
+    /// Joins each left row to the nearest right row in one direction along
+    /// an ordered column, within the equality group the ON clause names.
+    ///
+    /// Both inputs arrive sorted by (equality keys, match column); the
+    /// physical builder elides a sort whose input already holds that order.
+    AsofJoin {
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+        /// Boxed so the match expressions and the equality keys do not set
+        /// the width of every node in the tree. The optimizer rebuilds the
+        /// whole logical plan by value on each rule pass, so this variant's
+        /// width is paid by every node of every rebuild
+        match_on: Box<AsofMatchOn>,
+    },
+}
+
+/// What one `AsofJoin` matches on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsofMatchOn {
+    /// The ON clause's equalities, as (left side, right side) pairs
+    pub equality_keys: Vec<(BoundExpr, BoundExpr)>,
+    /// The two sides of the match condition's inequality
+    pub match_left: BoundExpr,
+    pub match_right: BoundExpr,
+    pub direction: AsofDirection,
+    /// How far a match may reach, as the bound written after AND in the
+    /// match condition. None leaves the reach unbounded
+    pub tolerance: Option<AsofTolerance>,
+    /// Inner drops an unmatched left row, Left keeps it with the right
+    /// columns null
+    pub join_type: JoinType,
+}
+
+/// What one `ExpandRows` node expands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExpandSpec {
+    /// One column per array, zipped to the longest with the shorter padded
+    /// with NULL, plus a BIGINT position column when `with_ordinality`
+    Unnest {
+        arrays: Vec<BoundExpr>,
+        with_ordinality: bool,
+    },
+    /// The six columns seq, key, path, index, value and this, one row per
+    /// member the walk reaches
+    Flatten {
+        document: BoundExpr,
+        /// The document position the walk starts from. None starts at the
+        /// root
+        path: Option<String>,
+        /// True walks nested arrays and objects depth first
+        recursive: bool,
+    },
+    /// One row per group, carrying the group's label and its values
+    Unpivot {
+        /// One entry per group, each holding one expression per value column
+        groups: Vec<Vec<BoundExpr>>,
+        /// The label each group takes in the name column
+        labels: Vec<BoundExpr>,
+        /// False drops a group whose every value is null
+        include_nulls: bool,
+    },
+}
+
+/// How far back or forward an ASOF match may reach.
+///
+/// The bound is compared against the distance between the two match columns,
+/// so a left row whose nearest right row lies further away than this is left
+/// unmatched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsofTolerance {
+    pub bound: BoundExpr,
+    /// True when the bound was written with `<=`, so a distance exactly
+    /// equal to it still matches
+    pub inclusive: bool,
+}
+
+/// Which way an ASOF join reaches for its match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsofDirection {
+    /// `left >= right`, the greatest right value at or below the left value
+    Backward,
+    /// `left > right`, the greatest right value strictly below it
+    BackwardStrict,
+    /// `left <= right`, the least right value at or above the left value
+    Forward,
+    /// `left < right`, the least right value strictly above it
+    ForwardStrict,
+}
+
+impl AsofDirection {
+    /// True when the match reaches toward smaller right values.
+    pub fn is_backward(self) -> bool {
+        matches!(
+            self,
+            AsofDirection::Backward | AsofDirection::BackwardStrict
+        )
+    }
+
+    /// True when a right value equal to the left value matches.
+    pub fn allows_equal(self) -> bool {
+        matches!(self, AsofDirection::Backward | AsofDirection::Forward)
+    }
+
+    /// The operator the match condition was written with.
+    pub fn operator(self) -> &'static str {
+        match self {
+            AsofDirection::Backward => ">=",
+            AsofDirection::BackwardStrict => ">",
+            AsofDirection::Forward => "<=",
+            AsofDirection::ForwardStrict => "<",
+        }
+    }
 }
 
 /// Holds a LATERAL subquery's bound plan inside a LogicalPlan node. BoundSelect
@@ -407,6 +559,25 @@ impl LogicalPlan {
             LogicalPlan::ViewTriggerWrite { .. } => Vec::new(),
             LogicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
             LogicalPlan::AnalyticsTableFunction { output_columns, .. } => output_columns.clone(),
+            LogicalPlan::ExpandRows { output_columns, .. } => output_columns.clone(),
+            LogicalPlan::AsofJoin {
+                left,
+                right,
+                match_on,
+            } => {
+                let join_type = &match_on.join_type;
+                let mut schema = left.output_schema();
+                // An unmatched left row carries NULLs on the right side, so
+                // the right columns are nullable under the LEFT form
+                let force_nullable = matches!(join_type, JoinType::Left);
+                for col in right.output_schema() {
+                    schema.push(LogicalColumn {
+                        nullable: col.nullable || force_nullable,
+                        ..col
+                    });
+                }
+                schema
+            }
         }
     }
 
@@ -427,8 +598,11 @@ impl LogicalPlan {
             | LogicalPlan::Insert { source: child, .. }
             | LogicalPlan::ViewTriggerWrite { source: child, .. }
             | LogicalPlan::Update { child, .. }
-            | LogicalPlan::Delete { child, .. } => vec![child],
-            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            | LogicalPlan::Delete { child, .. }
+            | LogicalPlan::ExpandRows { child, .. } => vec![child],
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::SetOp { left, right, .. }
+            | LogicalPlan::AsofJoin { left, right, .. } => {
                 vec![left, right]
             }
             // The lateral subquery is not a LogicalPlan child; it is planned at
@@ -569,5 +743,20 @@ mod tests {
             child: Arc::new(scan),
         };
         assert_eq!(filter.children().len(), 1);
+    }
+
+    /// The logical tree is rebuilt by value on every optimizer rule pass, so
+    /// the widest variant's width is paid by every node of every rebuild and
+    /// by every Arc allocation the rebuild makes. It reached 448 bytes while
+    /// `AsofJoin` held three `BoundExpr` inline, which is wider than the
+    /// physical node it becomes. Raising this is a real cost, so it is pinned
+    /// rather than left to drift
+    #[test]
+    fn a_logical_plan_node_stays_narrow() {
+        let width = std::mem::size_of::<LogicalPlan>();
+        assert!(
+            width <= 256,
+            "LogicalPlan grew to {width} bytes, over the 256 byte budget.              Box the widest field of the variant that grew rather than              widening every plan node in the tree"
+        );
     }
 }

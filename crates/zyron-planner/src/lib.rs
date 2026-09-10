@@ -131,7 +131,35 @@ pub async fn plan_with_security(
     security: Option<Arc<dyn RowSecurityProvider>>,
     peers: Option<&zyron_common::PeerRegistry>,
 ) -> Result<PhysicalPlan> {
-    let resolver = catalog.resolver(database_id, search_path);
+    plan_for_session(
+        catalog,
+        database_id,
+        search_path,
+        stmt,
+        security,
+        peers,
+        None,
+    )
+    .await
+}
+
+/// Plans a statement for one session, so a bare name reaches that session's
+/// temporary tables before the search path.
+///
+/// Every internal planning path passes None for `temp_tables`: a view, a
+/// materialized view or a pipeline is defined once and read by whoever runs
+/// it, so resolving one through some session's temporary namespace would
+/// give two sessions different definitions of the same object.
+pub async fn plan_for_session(
+    catalog: &Catalog,
+    database_id: DatabaseId,
+    search_path: Vec<String>,
+    stmt: Statement,
+    security: Option<Arc<dyn RowSecurityProvider>>,
+    peers: Option<&zyron_common::PeerRegistry>,
+    temp_tables: Option<Arc<zyron_catalog::SessionTempTables>>,
+) -> Result<PhysicalPlan> {
+    let resolver = catalog.resolver_for_session(database_id, search_path, temp_tables);
     let mut binder = Binder::new(resolver, catalog);
     if let Some(sec) = security {
         binder.set_row_security(sec);
@@ -153,7 +181,31 @@ pub async fn plan_for_explain(
     options: ExplainOptions,
     peers: Option<&zyron_common::PeerRegistry>,
 ) -> Result<(PhysicalPlan, ExplainOptions)> {
-    let resolver = catalog.resolver(database_id, search_path);
+    plan_for_explain_for_session(
+        catalog,
+        database_id,
+        search_path,
+        stmt,
+        options,
+        peers,
+        None,
+    )
+    .await
+}
+
+/// Plans a statement for EXPLAIN in one session, so a bare name reaches that
+/// session's temporary tables before the search path.
+#[allow(clippy::too_many_arguments)]
+pub async fn plan_for_explain_for_session(
+    catalog: &Catalog,
+    database_id: DatabaseId,
+    search_path: Vec<String>,
+    stmt: Statement,
+    options: ExplainOptions,
+    peers: Option<&zyron_common::PeerRegistry>,
+    temp_tables: Option<Arc<zyron_catalog::SessionTempTables>>,
+) -> Result<(PhysicalPlan, ExplainOptions)> {
+    let resolver = catalog.resolver_for_session(database_id, search_path, temp_tables);
     let mut binder = Binder::new(resolver, catalog);
     let bound = binder.bind(stmt).await?;
     let logical = logical::builder::build_logical_plan(&bound)?;

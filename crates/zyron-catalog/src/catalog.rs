@@ -210,6 +210,10 @@ pub struct Catalog {
     cache: Arc<CatalogCache>,
     wal: Arc<WalWriter>,
     oid_allocator: OidAllocator,
+    /// Temporary tables, which live in the sessions that created them rather
+    /// than here. Held so an id resolves through `get_table_by_id`, which is
+    /// how every layer below the planner addresses a table
+    temp_tables: Arc<crate::temp_tables::TempTableRegistry>,
     // Read-mostly: written only by the background stats refresh, read on
     // every cardinality estimate. The value is an Arc so a read is a single
     // refcount bump, not a deep clone of TableStats + Vec<ColumnStats>; the
@@ -332,6 +336,7 @@ impl Catalog {
             cache,
             wal,
             oid_allocator: OidAllocator::new(USER_OID_START),
+            temp_tables: Arc::new(crate::temp_tables::TempTableRegistry::default()),
             stats: RwLock::new(HashMap::new()),
             schema_version: std::sync::atomic::AtomicU64::new(1),
             sequences_by_name: RwLock::new(HashMap::new()),
@@ -2289,6 +2294,23 @@ impl Catalog {
         )
     }
 
+    /// A resolver that searches one session's temporary tables before the
+    /// search path, so a bare name reaches the session's own table first.
+    ///
+    /// Passing None gives the same resolver `resolver` does, which is what
+    /// every internal path wants: a view, a materialized view or a pipeline
+    /// is defined once and read by whoever runs it, so it must never resolve
+    /// through some session's temporary namespace.
+    pub fn resolver_for_session(
+        &self,
+        database_id: DatabaseId,
+        search_path: Vec<String>,
+        temp_tables: Option<Arc<crate::temp_tables::SessionTempTables>>,
+    ) -> NameResolver {
+        self.resolver(database_id, search_path)
+            .with_temp_tables(temp_tables)
+    }
+
     // -----------------------------------------------------------------------
     // Database operations
     // -----------------------------------------------------------------------
@@ -3245,10 +3267,90 @@ impl Catalog {
             .ok_or_else(|| ZyronError::TableNotFound(name.to_string()))
     }
 
+    /// The table an id names.
+    ///
+    /// A temporary table's definition is not in the catalog, so it is looked
+    /// up here after the cache: every layer below the planner addresses a
+    /// table by id, and a temporary table is a heap table those layers read
+    /// the same way as any other. Only the by-id lookup consults it, so no
+    /// catalog listing ever shows one.
     pub fn get_table_by_id(&self, id: TableId) -> Result<Arc<TableEntry>> {
-        self.cache
-            .get_table(id)
-            .ok_or_else(|| ZyronError::TableNotFound(format!("id={}", id.0)))
+        if let Some(entry) = self.cache.get_table(id) {
+            return Ok(entry);
+        }
+        if let Some(entry) = self.temp_tables.by_id(id) {
+            return Ok(entry);
+        }
+        Err(ZyronError::TableNotFound(format!("id={}", id.0)))
+    }
+
+    /// The node's temporary table registry.
+    pub fn temp_tables(&self) -> &Arc<crate::temp_tables::TempTableRegistry> {
+        &self.temp_tables
+    }
+
+    /// Builds a temporary table's entry without recording it anywhere.
+    ///
+    /// The ids come from the node-local allocator rather than the catalog's,
+    /// because the catalog's is a function of the applied consensus log and
+    /// moving it for a table only this node has would renumber every later
+    /// object on this member alone.
+    ///
+    /// The caller registers the entry in the creating session's namespace,
+    /// which is what makes it resolvable, and nothing here is logged, stored
+    /// or cached.
+    pub fn build_temp_table_entry(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+        column_defs: &[ColumnDef],
+        table_constraints: &[TableConstraint],
+    ) -> Result<TableEntry> {
+        let mut seen_names = std::collections::HashSet::new();
+        for def in column_defs {
+            if !seen_names.insert(&def.name) {
+                return Err(ZyronError::Internal(format!(
+                    "duplicate column name: {}",
+                    def.name
+                )));
+            }
+        }
+        let table_id = TableId(self.temp_tables.next_oid()?);
+        // Two file ids per table, the heap and its free space map, taken from
+        // the same descending node-local space as the table id
+        let heap_file_id = self.temp_tables.next_oid()?;
+        let fsm_file_id = self.temp_tables.next_oid()?;
+        let columns = convert_column_defs(table_id, column_defs)?;
+        let constraints = convert_table_constraints(table_constraints, &columns)?;
+        let mut entry = TableEntry {
+            id: table_id,
+            schema_id,
+            name: name.to_string(),
+            heap_file_id,
+            fsm_file_id,
+            columns,
+            constraints,
+            created_at: current_timestamp(),
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+        };
+        entry.seal_initial_epoch();
+        Ok(entry)
     }
 
     pub fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<SchemaEntry>> {
@@ -3391,6 +3493,85 @@ impl Catalog {
         self.persist_counters().await?;
         self.cache.put_index(entry);
         Ok(index_id)
+    }
+
+    /// Registers an index on a temporary table.
+    ///
+    /// Nothing is stored, logged or replicated, and the ids come from the
+    /// node-local allocator, for the same reason the table's do: the table
+    /// exists on this node in this session only, so an index on it does too.
+    ///
+    /// The entry goes in the cache, which is what `get_indexes_for_table`
+    /// reads, so the planner and the write path maintain it exactly as they
+    /// maintain any other B+tree.
+    pub fn create_temp_btree_index(
+        &self,
+        table_id: TableId,
+        schema_id: SchemaId,
+        name: &str,
+        columns: &[(String, bool)],
+        unique: bool,
+    ) -> Result<IndexEntry> {
+        for existing in self.cache.get_indexes_for_table(table_id) {
+            if existing.name == name {
+                return Err(ZyronError::IndexAlreadyExists(name.to_string()));
+            }
+        }
+        let table = self.get_table_by_id(table_id)?;
+        let index_id = IndexId(self.temp_tables.next_oid()?);
+        let index_file_id = self.temp_tables.next_oid()?;
+
+        let mut resolved = Vec::with_capacity(columns.len());
+        for (ordinal, (col_name, descending)) in columns.iter().enumerate() {
+            let col = table
+                .columns
+                .iter()
+                .find(|c| c.name == *col_name)
+                .ok_or_else(|| ZyronError::ColumnNotFound(col_name.clone()))?;
+            resolved.push(IndexColumnEntry {
+                column_id: col.id,
+                ordinal: ordinal as u16,
+                descending: *descending,
+            });
+        }
+        let entry = IndexEntry {
+            id: index_id,
+            table_id,
+            schema_id,
+            name: name.to_string(),
+            columns: resolved,
+            unique,
+            index_file_id,
+            index_type: IndexType::BTree,
+            parameters: None,
+            state: IndexState::Ready,
+        };
+        self.cache.put_index(entry.clone());
+        Ok(entry)
+    }
+
+    /// Forgets every index on a temporary table, which is all there is to
+    /// undo because nothing about them was written.
+    ///
+    /// Returns the file ids so the caller unlinks what each index held.
+    /// Takes back one temporary index the cache already holds.
+    ///
+    /// A temporary index is published before its file is built, because the
+    /// session that owns it is its only reader. A build that fails has to
+    /// take the entry back, or the write path maintains an index whose file
+    /// was never created.
+    pub fn forget_temp_index(&self, index_id: crate::ids::IndexId) {
+        self.cache.invalidate_index(index_id);
+    }
+
+    pub fn forget_temp_indexes(&self, table_id: TableId) -> Vec<u32> {
+        let held = self.cache.get_indexes_for_table(table_id);
+        let mut files = Vec::with_capacity(held.len());
+        for index in held {
+            files.push(index.index_file_id);
+            self.cache.invalidate_index(index.id);
+        }
+        files
     }
 
     /// Like create_index, but also stores the opaque parameters blob on the

@@ -125,6 +125,56 @@ fn push_projections(
                 output_table_idx: *output_table_idx,
             }
         }
+        LogicalPlan::ExpandRows {
+            child,
+            spec,
+            carry,
+            output_columns,
+            outer_input,
+        } => {
+            // The expansion carries input columns through to its output. One
+            // nothing above reads is dropped here rather than gathered once
+            // per produced row, which for a ten element array is ten copies
+            // of a value with no reader
+            let carried = carry.len();
+            let (kept_carry, kept_columns): (Vec<crate::binder::ColumnRef>, Vec<LogicalColumn>) =
+                match needed {
+                    None => (carry.clone(), output_columns.clone()),
+                    Some(needed_cols) => {
+                        let mut sources = Vec::with_capacity(carried);
+                        let mut columns = Vec::with_capacity(output_columns.len());
+                        for (i, column) in output_columns.iter().take(carried).enumerate() {
+                            let wanted = column
+                                .table_idx
+                                .map(|ti| needed_cols.contains(&(ti, column.column_id)))
+                                .unwrap_or(true);
+                            if wanted {
+                                sources.push(carry[i].clone());
+                                columns.push(column.clone());
+                            }
+                        }
+                        columns.extend(output_columns.iter().skip(carried).cloned());
+                        (sources, columns)
+                    }
+                };
+            // What the expansion itself reads is needed below it, whatever
+            // the query above asked for, and so is every column it still
+            // carries
+            let mut child_needed = HashSet::new();
+            crate::binder::for_each_ref_in_expand_spec(spec, &mut |r| {
+                child_needed.insert((r.table_idx, r.column_id));
+            });
+            for reference in &kept_carry {
+                child_needed.insert((reference.table_idx, reference.column_id));
+            }
+            LogicalPlan::ExpandRows {
+                child: Arc::new(push_projections(child, Some(&child_needed), catalog)),
+                spec: spec.clone(),
+                carry: kept_carry,
+                output_columns: kept_columns,
+                outer_input: *outer_input,
+            }
+        }
         LogicalPlan::Filter { predicate, child } => {
             let mut child_needed = needed.cloned().unwrap_or_default();
             // A conjunct the scan answers itself reads its columns off the

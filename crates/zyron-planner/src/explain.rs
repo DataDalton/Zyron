@@ -235,6 +235,27 @@ pub struct ExplainNode {
 /// figure the plan was costed against is part of the plan: it is node state
 /// that changes, and a plan that did not say would be two different plans
 /// wearing the same text.
+/// What EXPLAIN says about one ASOF input's ordering.
+fn sort_note(already_sorted: bool) -> &'static str {
+    if already_sorted {
+        "elided, input already ordered"
+    } else {
+        "sorted"
+    }
+}
+
+/// Names the source an expansion reads. A column is named by the table index
+/// and column id the plan addresses it with; anything else is an expression
+/// computed per row and has no name to give.
+fn expr_label(expr: &crate::binder::BoundExpr) -> String {
+    match expr {
+        crate::binder::BoundExpr::ColumnRef(reference) => {
+            format!("t{}.c{}", reference.table_idx, reference.column_id.0)
+        }
+        _ => "expression".to_string(),
+    }
+}
+
 fn push_spill(details: &mut Vec<(String, String)>, working_rows: f64) {
     let budget =
         zyron_pressure::pressure_control::PressureController::global().working_memory_bytes();
@@ -596,6 +617,92 @@ impl ExplainNode {
                 // child plan, so only the left input shows as a child.
                 children: vec![Self::from_physical_plan(left)],
             },
+            PhysicalPlan::AsofJoin {
+                left,
+                right,
+                spec,
+                cost,
+            } => Self {
+                operator_name: "AsofJoin".to_string(),
+                details: vec![
+                    ("join_type".to_string(), format!("{:?}", spec.join_type)),
+                    (
+                        "match".to_string(),
+                        format!(
+                            "left {} right, {}",
+                            spec.direction.operator(),
+                            if spec.direction.is_backward() {
+                                "nearest at or before"
+                            } else {
+                                "nearest at or after"
+                            }
+                        ),
+                    ),
+                    (
+                        "tolerance".to_string(),
+                        match &spec.tolerance {
+                            Some(_) => "bounded".to_string(),
+                            None => "unbounded".to_string(),
+                        },
+                    ),
+                    (
+                        "left_sort".to_string(),
+                        sort_note(spec.left_sorted).to_string(),
+                    ),
+                    (
+                        "right_sort".to_string(),
+                        sort_note(spec.right_sorted).to_string(),
+                    ),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: vec![
+                    Self::from_physical_plan(left),
+                    Self::from_physical_plan(right),
+                ],
+            },
+            PhysicalPlan::ExpandRows { child, spec, cost } => {
+                use crate::logical::ExpandSpec;
+                let (name, source) = match &spec.spec {
+                    ExpandSpec::Unnest { arrays, .. } => (
+                        "Unnest",
+                        arrays.iter().map(expr_label).collect::<Vec<_>>().join(", "),
+                    ),
+                    ExpandSpec::Flatten { document, .. } => ("Flatten", expr_label(document)),
+                    ExpandSpec::Unpivot { groups, .. } => {
+                        ("Unpivot", format!("{} group(s)", groups.len()))
+                    }
+                };
+                let mut details = vec![("source".to_string(), source)];
+                if let ExpandSpec::Unnest {
+                    with_ordinality: true,
+                    ..
+                } = &spec.spec
+                {
+                    details.push(("ordinality".to_string(), "yes".to_string()));
+                }
+                if let ExpandSpec::Flatten {
+                    path, recursive, ..
+                } = &spec.spec
+                {
+                    if let Some(path) = path {
+                        details.push(("path".to_string(), path.clone()));
+                    }
+                    if *recursive {
+                        details.push(("recursive".to_string(), "yes".to_string()));
+                    }
+                }
+                if spec.outer_input {
+                    details.push(("outer".to_string(), "yes".to_string()));
+                }
+                Self {
+                    operator_name: name.to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: vec![Self::from_physical_plan(child)],
+                }
+            }
             PhysicalPlan::HashJoin {
                 left,
                 right,

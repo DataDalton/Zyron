@@ -122,6 +122,15 @@ impl NullBitmap {
         self.len += 1;
     }
 
+    /// Drops every indicator, keeping the word buffer for refilling.
+    ///
+    /// A bitmap refilled row by row keeps its allocation across refills, which
+    /// is what lets a one row view be loaded per row without allocating.
+    pub fn clear(&mut self) {
+        self.words.clear();
+        self.len = 0;
+    }
+
     /// Appends `count` values that are all present.
     ///
     /// Every bit stays clear, so the words are grown in one step rather
@@ -699,6 +708,87 @@ impl ColumnData {
         }
     }
 
+    /// Borrows the text at a row rather than owning a copy of it.
+    ///
+    /// `get_scalar` owns what it returns, so reading a cell to measure it or
+    /// to look at a prefix copies the whole value. Returns None for every
+    /// variant that holds no text, which is the same answer a caller gets
+    /// from a `ScalarValue::Utf8` pattern that does not match.
+    #[inline]
+    pub fn utf8_at(&self, row: usize) -> Option<&str> {
+        match self {
+            ColumnData::Utf8(v) => Some(v[row].as_str()),
+            _ => None,
+        }
+    }
+
+    /// Borrows the bytes at a row rather than owning a copy of them.
+    ///
+    /// A vector, a geometry and a media reference all travel as binary, and an
+    /// embedding is four bytes per component, so a check that reads only a
+    /// length reads it here instead of copying the cell through `get_scalar`.
+    #[inline]
+    pub fn bytes_at(&self, row: usize) -> Option<&[u8]> {
+        match self {
+            ColumnData::Binary(v) => Some(v[row].as_slice()),
+            ColumnData::FixedBinary16(v) => Some(&v[row][..]),
+            _ => None,
+        }
+    }
+
+    /// Reads a row as i128 when the column holds an integer, None for every
+    /// other variant, which is the same answer `ScalarValue::to_i128` gives.
+    ///
+    /// Reading through `get_scalar` built a value per row to match it again.
+    #[inline]
+    pub fn i128_at(&self, row: usize) -> Option<i128> {
+        match self {
+            ColumnData::Int8(v) => Some(v[row] as i128),
+            ColumnData::Int16(v) => Some(v[row] as i128),
+            ColumnData::Int32(v) => Some(v[row] as i128),
+            ColumnData::Int64(v) => Some(v[row] as i128),
+            ColumnData::Int128(v) => Some(v[row]),
+            ColumnData::UInt8(v) => Some(v[row] as i128),
+            ColumnData::UInt16(v) => Some(v[row] as i128),
+            ColumnData::UInt32(v) => Some(v[row] as i128),
+            ColumnData::UInt64(v) => Some(v[row] as i128),
+            _ => None,
+        }
+    }
+
+    /// Reads a row as f64, which is the form the analytics and model paths
+    /// work in. A column holding neither a number nor a boolean reads as 0.0,
+    /// the value those paths treat as absent.
+    ///
+    /// Going through `get_scalar` built a value per row and matched it a
+    /// second time, and for a text column cloned the whole cell to produce a
+    /// number it then discarded.
+    #[inline]
+    pub fn f64_at(&self, row: usize) -> f64 {
+        match self {
+            ColumnData::Boolean(v) => {
+                if v[row] {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ColumnData::Int8(v) => v[row] as f64,
+            ColumnData::Int16(v) => v[row] as f64,
+            ColumnData::Int32(v) => v[row] as f64,
+            ColumnData::Int64(v) => v[row] as f64,
+            ColumnData::Int128(v) => v[row] as f64,
+            ColumnData::UInt8(v) => v[row] as f64,
+            ColumnData::UInt16(v) => v[row] as f64,
+            ColumnData::UInt32(v) => v[row] as f64,
+            ColumnData::UInt64(v) => v[row] as f64,
+            ColumnData::Float32(v) => v[row] as f64,
+            ColumnData::Float64(v) => v[row],
+            ColumnData::Utf8(_) | ColumnData::Binary(_) => 0.0,
+            ColumnData::FixedBinary16(_) | ColumnData::Interval(_) => 0.0,
+        }
+    }
+
     /// Appends a scalar value. Pushes a zero/empty default if the type does not match.
     /// Appends a value this buffer owns outright.
     ///
@@ -1155,6 +1245,26 @@ impl Column {
         } else {
             self.data.get_scalar(row)
         }
+    }
+
+    /// Borrows the text at a row, None for a null or a column holding
+    /// something other than text. See [`ColumnData::utf8_at`].
+    #[inline]
+    pub fn utf8_at(&self, row: usize) -> Option<&str> {
+        if self.nulls.is_null(row) {
+            return None;
+        }
+        self.data.utf8_at(row)
+    }
+
+    /// Borrows the bytes at a row, None for a null or a column holding
+    /// something other than bytes. See [`ColumnData::bytes_at`].
+    #[inline]
+    pub fn bytes_at(&self, row: usize) -> Option<&[u8]> {
+        if self.nulls.is_null(row) {
+            return None;
+        }
+        self.data.bytes_at(row)
     }
 
     /// Extracts the boolean value at a row. Panics if not a boolean column.

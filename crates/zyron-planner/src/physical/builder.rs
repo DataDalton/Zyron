@@ -102,6 +102,18 @@ impl<'a> PhysicalPlanner<'a> {
                 join_type,
                 condition,
             } => self.plan_lateral_join(left, subquery, subquery_table_idx, join_type, condition),
+            LogicalPlan::AsofJoin {
+                left,
+                right,
+                match_on,
+            } => self.plan_asof_join(left, right, match_on),
+            LogicalPlan::ExpandRows {
+                child,
+                spec,
+                carry,
+                output_columns,
+                outer_input,
+            } => self.plan_expand_rows(child, spec, carry, output_columns, outer_input),
             LogicalPlan::Aggregate {
                 group_by,
                 aggregates,
@@ -387,6 +399,227 @@ impl<'a> PhysicalPlanner<'a> {
             left_schema,
             right_schema,
             cost,
+        })
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_asof_join(
+        &self,
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+        match_on: Box<crate::logical::AsofMatchOn>,
+    ) -> Result<PhysicalPlan> {
+        let crate::logical::AsofMatchOn {
+            equality_keys,
+            match_left,
+            match_right,
+            direction,
+            tolerance,
+            join_type,
+        } = *match_on;
+        let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
+        let right_plan = self.plan(Arc::unwrap_or_clone(right))?;
+
+        // Both sides walk in (equality keys, match column) order. A sort is
+        // planted only over an input that does not already hold that order
+        let left_order = asof_sort_keys(&equality_keys, &match_left, true);
+        let right_order = asof_sort_keys(&equality_keys, &match_right, false);
+        let left_sorted = self.provides_order(&left_plan, &left_order);
+        let right_sorted = self.provides_order(&right_plan, &right_order);
+
+        let left_schema = left_plan.output_schema();
+        let right_schema = right_plan.output_schema();
+        let left_cost = *left_plan.cost();
+        let right_cost = *right_plan.cost();
+
+        let left_input = self.sorted_input(left_plan, left_order, left_sorted);
+        let right_input = self.sorted_input(right_plan, right_order, right_sorted);
+
+        // One left row matches at most one right row. The LEFT form keeps
+        // every left row, the inner form keeps the ones that matched
+        let row_count = match join_type {
+            JoinType::Left => left_cost.row_count,
+            _ => (left_cost.row_count * 0.9).max(1.0),
+        };
+        let cost = PlanCost {
+            io_cost: 0.0,
+            // One merge step per row of each input
+            cpu_cost: (left_cost.row_count + right_cost.row_count)
+                * self.cost_model.cpu_operator_cost,
+            row_count,
+        };
+        Ok(PhysicalPlan::AsofJoin {
+            left: Box::new(left_input),
+            right: Box::new(right_input),
+            spec: Box::new(crate::physical::AsofJoinSpec {
+                equality_keys,
+                match_left,
+                match_right,
+                direction,
+                tolerance,
+                join_type,
+                left_schema,
+                right_schema,
+                left_sorted,
+                right_sorted,
+            }),
+            cost,
+        })
+    }
+
+    /// The input as the merge reads it: unchanged when it already holds the
+    /// order, sorted otherwise.
+    fn sorted_input(
+        &self,
+        plan: PhysicalPlan,
+        order_by: Vec<crate::binder::BoundOrderBy>,
+        already_sorted: bool,
+    ) -> PhysicalPlan {
+        if already_sorted {
+            return plan;
+        }
+        let child_cost = *plan.cost();
+        let sort_cost = self.cost_model.cost_sort(&child_cost);
+        PhysicalPlan::Sort {
+            order_by,
+            child: Box::new(plan),
+            limit: None,
+            cost: PlanCost {
+                io_cost: 0.0,
+                cpu_cost: sort_cost.cpu_cost - child_cost.cpu_cost,
+                row_count: child_cost.row_count,
+            },
+        }
+    }
+
+    /// True when a plan already emits rows in the requested order, so no sort
+    /// is planted over it.
+    ///
+    /// Three shapes provide one: a sort that already ran, an index walked
+    /// forward whose key columns lead the requested ones, and a lake scan of
+    /// a table laid out on those columns. A filter above any of them keeps
+    /// the order, because it only drops rows.
+    fn provides_order(&self, plan: &PhysicalPlan, wanted: &[crate::binder::BoundOrderBy]) -> bool {
+        if wanted.is_empty() {
+            return true;
+        }
+        // Every requested term must be a plain column read ascending, which
+        // is the only order a scan or a layout is ever known to hold
+        let mut columns = Vec::with_capacity(wanted.len());
+        for term in wanted {
+            if !term.asc {
+                return false;
+            }
+            let BoundExpr::ColumnRef(reference) = &term.expr else {
+                return false;
+            };
+            columns.push(reference.column_id);
+        }
+        match plan {
+            PhysicalPlan::Filter { child, .. } => self.provides_order(child, wanted),
+            PhysicalPlan::Sort { order_by, .. } => {
+                order_by.len() >= wanted.len()
+                    && order_by
+                        .iter()
+                        .zip(wanted)
+                        .all(|(had, want)| had.expr == want.expr && had.asc == want.asc)
+            }
+            PhysicalPlan::IndexScan {
+                index,
+                scan_direction,
+                ..
+            } => {
+                *scan_direction == crate::physical::ScanDirection::Forward
+                    && index.columns.len() >= columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(&columns)
+                        .all(|(had, want)| had.column_id == *want && !had.descending)
+            }
+            PhysicalPlan::LakeScan { table_id, .. } => {
+                let Ok(te) = self.catalog.get_table_by_id(*table_id) else {
+                    return false;
+                };
+                let keys = te.cluster.effective_keys();
+                keys.len() >= columns.len()
+                    && keys
+                        .iter()
+                        .zip(&columns)
+                        .all(|(had, want)| had.column_id == want.0 as u32)
+            }
+            _ => false,
+        }
+    }
+
+    /// One arm of `plan`, see that function for why the arms are not
+    /// written inline
+    #[inline(never)]
+    fn plan_expand_rows(
+        &self,
+        child: Arc<LogicalPlan>,
+        spec: Box<crate::logical::ExpandSpec>,
+        carry: Vec<crate::binder::ColumnRef>,
+        output_columns: Vec<LogicalColumn>,
+        outer_input: bool,
+    ) -> Result<PhysicalPlan> {
+        // The fanout is read off the logical child, where a column reference
+        // still resolves to the scan whose statistics record the mean length
+        let fanout = self
+            .cost_model
+            .expansion_fanout(&spec, child.as_ref(), self.catalog);
+        let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+        let child_cost = *child_plan.cost();
+        let input_schema = child_plan.output_schema();
+        // Each carried column is resolved against the schema the child
+        // actually produces, so pruning below the expansion moves nothing.
+        // The schema is indexed once rather than searched per carried
+        // column, because a LATERAL expansion carries most of what its input
+        // produces and searching would be quadratic in the input's width
+        let mut at_of: std::collections::HashMap<(usize, ColumnId), usize> =
+            std::collections::HashMap::with_capacity(input_schema.len());
+        for (position, column) in input_schema.iter().enumerate() {
+            if let Some(table_idx) = column.table_idx {
+                at_of
+                    .entry((table_idx, column.column_id))
+                    .or_insert(position);
+            }
+        }
+        let mut positions = Vec::with_capacity(carry.len());
+        for reference in &carry {
+            let at = at_of
+                .get(&(reference.table_idx, reference.column_id))
+                .copied()
+                .ok_or_else(|| {
+                    ZyronError::PlanError(format!(
+                        "an expansion carries column {} of relation {}, which its input does not produce",
+                        reference.column_id.0, reference.table_idx
+                    ))
+                })?;
+            positions.push(at);
+        }
+        let carry = positions;
+        let row_count = if outer_input {
+            (child_cost.row_count * fanout).max(child_cost.row_count)
+        } else {
+            (child_cost.row_count * fanout).max(1.0)
+        };
+        Ok(PhysicalPlan::ExpandRows {
+            child: Box::new(child_plan),
+            spec: Box::new(crate::physical::ExpandPhysical {
+                spec: *spec,
+                carry,
+                output_columns,
+                outer_input,
+                input_schema,
+            }),
+            cost: PlanCost {
+                io_cost: 0.0,
+                cpu_cost: row_count * self.cost_model.cpu_operator_cost,
+                row_count,
+            },
         })
     }
 
@@ -3038,6 +3271,38 @@ fn columnar_tier_io_weight(segments: &[zyron_catalog::schema::ColumnarSegmentEnt
 
 /// What a table's layout does for a lowered predicate.
 ///
+/// The order one side of an ASOF join walks in: its equality keys first, so
+/// a group's rows are contiguous, then its match column, so the merge steps
+/// through the group in one direction.
+///
+/// Both sides are ordered ascending whichever way the match reaches, because
+/// the merge holds the nearest candidate and replaces it as it advances,
+/// which works from either end.
+fn asof_sort_keys(
+    equality_keys: &[(BoundExpr, BoundExpr)],
+    match_column: &BoundExpr,
+    left_side: bool,
+) -> Vec<crate::binder::BoundOrderBy> {
+    let mut keys: Vec<crate::binder::BoundOrderBy> = equality_keys
+        .iter()
+        .map(|(left, right)| crate::binder::BoundOrderBy {
+            expr: if left_side {
+                left.clone()
+            } else {
+                right.clone()
+            },
+            asc: true,
+            nulls_first: false,
+        })
+        .collect();
+    keys.push(crate::binder::BoundOrderBy {
+        expr: match_column.clone(),
+        asc: true,
+        nulls_first: false,
+    });
+    keys
+}
+
 /// Judged against the keys a clustering pass accepted, not the declared
 /// ones: under Auto a declared key is a request and measurement may run a
 /// different set, and a plan judged against a key no file is sorted by

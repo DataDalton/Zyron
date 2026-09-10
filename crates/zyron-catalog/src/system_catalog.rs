@@ -377,6 +377,13 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
     },
     SystemObject {
         schema: "stat",
+        object: "temp_tables",
+        kind: SystemObjectKind::View,
+        doc: "Temporary tables per session with their bytes and row counts, which no catalog \
+              listing shows because a temporary table lives in the session that created it",
+    },
+    SystemObject {
+        schema: "stat",
         object: "tables",
         kind: SystemObjectKind::View,
         doc: "Per-table tuple and IO counters accumulated since startup",

@@ -1,0 +1,38 @@
+# suite:   branch_write
+# run:     2026-09-10_190240_d19cc60-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Branch Insert Against The Main Line ===
+  insert of 800 rows on a branch:
+    Runs: [732.5000us, 670us, 619.7000us, 726.1000us, 734.8000us]
+    Average: 696.6200us (no target set)
+    Min/Max: 619.7000us / 734.8000us, StdDev: 45.2537us
+  insert of 800 rows on the main line:
+    Runs: [914.7000us, 861.8000us, 588.4000us, 703.1000us, 875us]
+    Average: 788.6000us (no target set)
+    Min/Max: 588.4000us / 914.7000us, StdDev: 123.3813us
+  branch insert over the main line:
+    Runs: [0.8834x]
+    Average: 0.8834x (no target set)
+  A branch insert costs 0.88x the main line (limit 3.00x)
+
+=== Branch Uniqueness Against Existing Appends ===
+  Rows inserted per measurement: 800
+  Branch appends compared: 800 against 1600
+  insert of 800 rows, branch holding 800 appends:
+    Runs: [750us, 665us, 692.4000us, 838.9000us, 654.8000us]
+    Average: 720.2200us (no target set)
+    Min/Max: 654.8000us / 838.9000us, StdDev: 67.9334us
+  insert of 800 rows, branch holding 1600 appends:
+    Runs: [924.3000us, 982.7000us, 829.4000us, 828.6000us, 790.6000us]
+    Average: 871.1200us (no target set)
+    Min/Max: 790.6000us / 982.7000us, StdDev: 71.1480us
+  insert cost growth when the branch's appends double:
+    Runs: [1.2095x]
+    Average: 1.2095x (no target set)
+  Appends 800 to 1600: the insert grows 1.21x. Recorded only, both shapes grow here
+  800 rows is one batch of 1024, so the range is read once: 1600 tuple decodes against 1280000 for a read per row
+  A decode costs 0.189us at the margin, so a read per row would put this insert near 241.4ms against the 0.871ms measured

@@ -341,7 +341,33 @@ impl<'a> Parser<'a> {
 
     /// Parses SELECT ... as a statement (wraps in Statement::Select).
     fn parse_select_statement(&mut self, with: Option<WithClause>) -> Result<Statement> {
-        let select = self.parse_select_body(with)?;
+        let mut select = self.parse_select_body(with)?;
+        // SELECT ... INTO name is a table creation whose layout comes from
+        // the query, so it becomes the statement it means and nothing
+        // downstream carries a second spelling of the same thing
+        if let Some(target) = select.into_target.take() {
+            if target.temporary && target.name.contains('.') {
+                return Err(self.error(&format!(
+                    "a temporary table takes a bare name, '{}' names a schema; a temporary table lives in the session's own namespace and a qualified name always reaches a permanent table",
+                    target.name
+                )));
+            }
+            return Ok(Statement::CreateTable(Box::new(CreateTableStatement {
+                name: target.name,
+                if_not_exists: false,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                options: Vec::new(),
+                ttl: None,
+                using: None,
+                cluster_by: None,
+                clone_of: None,
+                temporary: target.temporary,
+                on_commit: target.temporary.then_some(OnCommitAction::PreserveRows),
+                or_replace: false,
+                as_query: Some(Box::new(select)),
+            })));
+        }
         Ok(Statement::Select(Box::new(select)))
     }
 
@@ -488,6 +514,19 @@ impl<'a> Parser<'a> {
 
         let projections = self.parse_comma_separated(|p| p.parse_select_item())?;
 
+        // INTO [TEMPORARY|TEMP] name, which sits between the projection list
+        // and FROM
+        let into_target = if self.consume_keyword(Keyword::Into)? {
+            let temporary =
+                self.consume_keyword(Keyword::Temporary)? || self.consume_keyword(Keyword::Temp)?;
+            Some(SelectIntoTarget {
+                name: self.parse_qualified_name()?,
+                temporary,
+            })
+        } else {
+            None
+        };
+
         // FROM clause (optional for expressions like SELECT 1)
         let from = if self.consume_keyword(Keyword::From)? {
             self.parse_comma_separated(|p| p.parse_table_ref())?
@@ -586,6 +625,7 @@ impl<'a> Parser<'a> {
             fetch: None,
             for_clause: None,
             soft_delete_mode,
+            into_target,
         })
     }
 
@@ -689,6 +729,45 @@ impl<'a> Parser<'a> {
                 false
             };
 
+            // ASOF [LEFT] JOIN carries its own match condition, so it is read
+            // whole here rather than falling through the ordinary join
+            // shapes. The word leads one only when JOIN follows it, directly
+            // or after LEFT, so a relation named `asof` still reads as one
+            if self.at_keyword(Keyword::Asof)
+                && (self.peek.token == Token::Keyword(Keyword::Join)
+                    || (self.peek.token == Token::Keyword(Keyword::Left)
+                        && self.peek2.token == Token::Keyword(Keyword::Join)))
+            {
+                if natural {
+                    return Err(self.error("NATURAL does not apply to an ASOF JOIN"));
+                }
+                self.advance()?; // ASOF
+                let join_type = if self.consume_keyword(Keyword::Left)? {
+                    JoinType::Left
+                } else {
+                    JoinType::Inner
+                };
+                self.expect_keyword(Keyword::Join)?;
+                let right = self.parse_base_table_ref()?;
+                self.expect_keyword(Keyword::MatchCondition)?;
+                self.expect_token(&Token::LParen)?;
+                let condition = self.parse_expr()?;
+                self.expect_token(&Token::RParen)?;
+                let on = if self.consume_keyword(Keyword::On)? {
+                    JoinCondition::On(Box::new(self.parse_expr()?))
+                } else {
+                    JoinCondition::None
+                };
+                left = TableRef::Join(Box::new(JoinTableRef {
+                    left,
+                    join_type,
+                    right,
+                    condition: on,
+                    asof: Some(Box::new(AsofMatch { condition })),
+                }));
+                continue;
+            }
+
             let join_type = match &self.current.token {
                 Token::Keyword(Keyword::Inner) => {
                     self.advance()?;
@@ -756,13 +835,353 @@ impl<'a> Parser<'a> {
                 join_type: jt,
                 right,
                 condition,
+                asof: None,
             }));
         }
 
         Ok(left)
     }
 
+    /// A base table reference plus any PIVOT or UNPIVOT written after it.
+    ///
+    /// Both are postfix operators over a relation, so they chain: a PIVOT may
+    /// be unpivoted again and either may be aliased.
     fn parse_base_table_ref(&mut self) -> Result<TableRef> {
+        let mut item = self.parse_unpivoted_table_ref()?;
+        loop {
+            if self.at_keyword(Keyword::Pivot) && self.peek.token == Token::LParen {
+                self.advance()?;
+                item = self.parse_pivot_body(item)?;
+            } else if self.at_keyword(Keyword::Unpivot)
+                && matches!(
+                    self.peek.token,
+                    Token::LParen
+                        | Token::Keyword(Keyword::Include)
+                        | Token::Keyword(Keyword::Exclude)
+                )
+            {
+                self.advance()?;
+                item = self.parse_unpivot_body(item)?;
+            } else {
+                return Ok(item);
+            }
+        }
+    }
+
+    /// `PIVOT (agg(col) [AS name] [, ...] FOR pivot_col IN (lit [AS alias]
+    /// [, ...])) [AS alias]`, with the leading PIVOT already consumed.
+    fn parse_pivot_body(&mut self, input: TableRef) -> Result<TableRef> {
+        self.expect_token(&Token::LParen)?;
+        let mut aggregates = Vec::new();
+        loop {
+            let function = self.parse_ident()?;
+            self.expect_token(&Token::LParen)?;
+            let argument = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            let alias = if self.consume_keyword(Keyword::As)? {
+                Some(self.parse_ident()?)
+            } else if matches!(&self.current.token, Token::Ident(_)) {
+                Some(self.parse_ident()?)
+            } else {
+                None
+            };
+            aggregates.push(PivotAggregate {
+                function,
+                argument,
+                alias,
+            });
+            if !self.at_token(&Token::Comma) {
+                break;
+            }
+            self.advance()?;
+        }
+        self.expect_keyword(Keyword::For)?;
+        // The pivot target is a column, read as one rather than through the
+        // expression grammar, which would take the IN list that follows as
+        // an IN predicate over it
+        let pivot_column = self.parse_column_ref_expr()?;
+        self.expect_keyword(Keyword::In)?;
+        self.expect_token(&Token::LParen)?;
+
+        // A subquery here is recorded rather than parsed into values, so the
+        // binder refuses it with the message that names the two statements
+        let mut value_subquery = false;
+        let mut values = Vec::new();
+        if self.at_keyword(Keyword::Select) || self.at_keyword(Keyword::With) {
+            value_subquery = true;
+            let mut depth = 1usize;
+            while depth > 0 {
+                match &self.current.token {
+                    Token::LParen => depth += 1,
+                    Token::RParen => depth -= 1,
+                    Token::Eof => return Err(self.error("Unclosed IN list in PIVOT")),
+                    _ => {}
+                }
+                if depth > 0 {
+                    self.advance()?;
+                }
+            }
+        } else {
+            loop {
+                let value = self.parse_literal_value()?;
+                let alias = if self.consume_keyword(Keyword::As)? {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                values.push(PivotValue { value, alias });
+                if !self.at_token(&Token::Comma) {
+                    break;
+                }
+                self.advance()?;
+            }
+        }
+        self.expect_token(&Token::RParen)?; // closes IN (...)
+        self.expect_token(&Token::RParen)?; // closes PIVOT (...)
+        let alias = self.parse_relation_alias()?;
+        Ok(TableRef::Pivot(Box::new(PivotRef {
+            input,
+            aggregates,
+            pivot_column,
+            values,
+            value_subquery,
+            alias,
+        })))
+    }
+
+    /// `UNPIVOT [INCLUDE NULLS | EXCLUDE NULLS] (value_col FOR name_col IN
+    /// (col [AS literal] [, ...])) [AS alias]`, with the leading UNPIVOT
+    /// already consumed.
+    fn parse_unpivot_body(&mut self, input: TableRef) -> Result<TableRef> {
+        let include_nulls = if self.consume_keyword(Keyword::Include)? {
+            self.expect_keyword(Keyword::Nulls)?;
+            true
+        } else if self.consume_keyword(Keyword::Exclude)? {
+            self.expect_keyword(Keyword::Nulls)?;
+            false
+        } else {
+            false
+        };
+        self.expect_token(&Token::LParen)?;
+
+        // One value column, or a parenthesized tuple of them when several
+        // columns unpivot together
+        let value_columns = if self.at_token(&Token::LParen) {
+            self.advance()?;
+            let cols = self.parse_comma_separated(|p| p.parse_ident())?;
+            self.expect_token(&Token::RParen)?;
+            cols
+        } else {
+            vec![self.parse_ident()?]
+        };
+        self.expect_keyword(Keyword::For)?;
+        let name_column = self.parse_ident()?;
+        self.expect_keyword(Keyword::In)?;
+        self.expect_token(&Token::LParen)?;
+        let arity = value_columns.len();
+        let mut items = Vec::new();
+        loop {
+            let columns = if self.at_token(&Token::LParen) {
+                self.advance()?;
+                let cols = self.parse_comma_separated(|p| p.parse_ident())?;
+                self.expect_token(&Token::RParen)?;
+                cols
+            } else {
+                vec![self.parse_ident()?]
+            };
+            if columns.len() != arity {
+                return Err(self.error(&format!(
+                    "UNPIVOT group ({}) lists {} column(s), the value list declares {}",
+                    columns.join(", "),
+                    columns.len(),
+                    arity
+                )));
+            }
+            let label = if self.consume_keyword(Keyword::As)? {
+                Some(self.parse_literal_value()?)
+            } else {
+                None
+            };
+            items.push(UnpivotItem { columns, label });
+            if !self.at_token(&Token::Comma) {
+                break;
+            }
+            self.advance()?;
+        }
+        self.expect_token(&Token::RParen)?; // closes IN (...)
+        self.expect_token(&Token::RParen)?; // closes UNPIVOT (...)
+        let alias = self.parse_relation_alias()?;
+        Ok(TableRef::Unpivot(Box::new(UnpivotRef {
+            input,
+            include_nulls,
+            value_columns,
+            name_column,
+            items,
+            alias,
+        })))
+    }
+
+    /// A trailing `[AS] alias` on a relation, stopping at any word that opens
+    /// the next clause.
+    fn parse_relation_alias(&mut self) -> Result<Option<String>> {
+        if self.consume_keyword(Keyword::As)? {
+            return Ok(Some(self.parse_ident()?));
+        }
+        if matches!(&self.current.token, Token::Ident(_)) && !self.is_clause_keyword() {
+            return Ok(Some(self.parse_ident()?));
+        }
+        Ok(None)
+    }
+
+    /// `FLATTEN(...)` with the leading FLATTEN already consumed.
+    ///
+    /// The first argument is the document. The rest are named, and OUTER is a
+    /// keyword the identifier map does not carry, so the name is read from
+    /// the token rather than through the ordinary function-argument path.
+    fn parse_flatten_body(&mut self) -> Result<TableRef> {
+        self.expect_token(&Token::LParen)?;
+        let input = self.parse_expr()?;
+        let mut path = None;
+        let mut outer = false;
+        let mut recursive = false;
+        while self.at_token(&Token::Comma) {
+            self.advance()?;
+            let name = match &self.current.token {
+                Token::Keyword(Keyword::Outer) => "outer".to_string(),
+                Token::Keyword(kw) => keyword_to_ident_str(*kw)
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        self.error(
+                            "FLATTEN takes path, outer and recursive as named arguments after the document",
+                        )
+                    })?,
+                Token::Ident(name) => name.to_ascii_lowercase(),
+                _ => {
+                    return Err(self.error(&format!(
+                        "Expected an argument name after ',' in FLATTEN, found {}",
+                        self.current.token
+                    )));
+                }
+            };
+            self.advance()?;
+            self.expect_token(&Token::FatArrow)?;
+            match name.as_str() {
+                "path" => match self.parse_literal_value()? {
+                    LiteralValue::String(s) => path = Some(s),
+                    other => {
+                        return Err(self.error(&format!(
+                            "FLATTEN path must be a string literal, found {other:?}"
+                        )));
+                    }
+                },
+                "outer" => outer = self.parse_bool_literal("outer")?,
+                "recursive" => recursive = self.parse_bool_literal("recursive")?,
+                other => {
+                    return Err(self.error(&format!(
+                        "FLATTEN has no argument named '{other}'; it takes path, outer and recursive"
+                    )));
+                }
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        let (alias, column_aliases) = self.parse_rows_function_alias()?;
+        Ok(TableRef::Flatten(Box::new(FlattenRef {
+            input,
+            path,
+            outer,
+            recursive,
+            alias,
+            column_aliases,
+        })))
+    }
+
+    /// `column` or `table.column`, for the grammar positions that name a
+    /// column and would read the words after it wrongly through the
+    /// expression grammar.
+    fn parse_column_ref_expr(&mut self) -> Result<Expr> {
+        let first = self.parse_ident()?;
+        if self.at_token(&Token::Dot) {
+            self.advance()?;
+            let column = self.parse_ident()?;
+            return Ok(Expr::QualifiedIdentifier {
+                table: first,
+                column,
+            });
+        }
+        Ok(Expr::Identifier(first))
+    }
+
+    /// TRUE or FALSE for a named boolean argument.
+    fn parse_bool_literal(&mut self, argument: &str) -> Result<bool> {
+        match self.parse_literal_value()? {
+            LiteralValue::Boolean(b) => Ok(b),
+            other => Err(self.error(&format!(
+                "FLATTEN {argument} takes TRUE or FALSE, found {other:?}"
+            ))),
+        }
+    }
+
+    /// One literal, for the grammar positions that take a fixed value rather
+    /// than an expression. A leading minus is folded into the number so a
+    /// negative value in a PIVOT list reads as the value it spells.
+    fn parse_literal_value(&mut self) -> Result<LiteralValue> {
+        let negate = if self.at_token(&Token::Minus) {
+            self.advance()?;
+            true
+        } else {
+            if self.at_token(&Token::Plus) {
+                self.advance()?;
+            }
+            false
+        };
+        let value = match &self.current.token {
+            Token::Integer(i) => LiteralValue::Integer(if negate { -*i } else { *i }),
+            Token::BigInteger(magnitude) => {
+                let m = *magnitude;
+                if negate {
+                    if m > (i128::MAX as u128) + 1 {
+                        return Err(self.error("whole number literal is too wide for INT128"));
+                    }
+                    LiteralValue::Int128((m as i128).wrapping_neg())
+                } else {
+                    if m > i128::MAX as u128 {
+                        return Err(self.error("whole number literal is too wide for INT128"));
+                    }
+                    LiteralValue::Int128(m as i128)
+                }
+            }
+            Token::Float(f) => LiteralValue::Float(if negate { -*f } else { *f }),
+            Token::Decimal(digits, scale) => LiteralValue::Decimal {
+                digits: if negate { -*digits } else { *digits },
+                scale: *scale,
+            },
+            Token::String(s) if !negate => LiteralValue::String(s.clone()),
+            Token::Keyword(Keyword::True) if !negate => LiteralValue::Boolean(true),
+            Token::Keyword(Keyword::False) if !negate => LiteralValue::Boolean(false),
+            Token::Keyword(Keyword::Null) if !negate => LiteralValue::Null,
+            other => {
+                return Err(self.error(&format!("Expected a literal value, found {other}")));
+            }
+        };
+        self.advance()?;
+        Ok(value)
+    }
+
+    /// `[AS] alias [(col, ...)]` on a row-generating FROM item.
+    fn parse_rows_function_alias(&mut self) -> Result<(Option<String>, Vec<String>)> {
+        let alias = self.parse_relation_alias()?;
+        let columns = if alias.is_some() && self.at_token(&Token::LParen) {
+            self.advance()?;
+            let cols = self.parse_comma_separated(|p| p.parse_ident())?;
+            self.expect_token(&Token::RParen)?;
+            cols
+        } else {
+            Vec::new()
+        };
+        Ok((alias, columns))
+    }
+
+    fn parse_unpivoted_table_ref(&mut self) -> Result<TableRef> {
         // LATERAL subquery or table function
         if self.at_keyword(Keyword::Lateral) {
             self.advance()?;
@@ -770,6 +1189,39 @@ impl<'a> Parser<'a> {
             return Ok(TableRef::Lateral {
                 subquery: Box::new(inner),
             });
+        }
+
+        // UNNEST(array [, ...]) [WITH ORDINALITY] [AS alias (col, ...)].
+        // The word opens one only when '(' follows, so a relation named
+        // `unnest` still reads as one
+        if self.at_keyword(Keyword::Unnest) && self.peek.token == Token::LParen {
+            self.advance()?;
+            self.expect_token(&Token::LParen)?;
+            let arrays = self.parse_comma_separated(|p| p.parse_expr())?;
+            self.expect_token(&Token::RParen)?;
+            let with_ordinality = if self.at_keyword(Keyword::With)
+                && self.peek.token == Token::Keyword(Keyword::Ordinality)
+            {
+                self.advance()?;
+                self.advance()?;
+                true
+            } else {
+                false
+            };
+            let (alias, column_aliases) = self.parse_rows_function_alias()?;
+            return Ok(TableRef::Unnest(Box::new(UnnestRef {
+                arrays,
+                with_ordinality,
+                alias,
+                column_aliases,
+            })));
+        }
+
+        // FLATTEN(variant [, path => ...] [, outer => ...]
+        // [, recursive => ...]) [AS alias (col, ...)]
+        if self.at_keyword(Keyword::Flatten) && self.peek.token == Token::LParen {
+            self.advance()?;
+            return self.parse_flatten_body();
         }
 
         // Subquery in FROM: (SELECT ...) [AS] alias
@@ -1168,7 +1620,7 @@ impl<'a> Parser<'a> {
             return self.parse_create_index(true);
         }
 
-        // CREATE OR REPLACE VIEW/FUNCTION/PROCEDURE
+        // CREATE OR REPLACE VIEW/FUNCTION/PROCEDURE/TEMPORARY TABLE
         if self.at_keyword(Keyword::Or) {
             self.advance()?;
             self.expect_keyword(Keyword::Replace)?;
@@ -1176,17 +1628,34 @@ impl<'a> Parser<'a> {
                 Token::Keyword(Keyword::View) => self.parse_create_view(true),
                 Token::Keyword(Keyword::Function) => self.parse_create_function(true),
                 Token::Keyword(Keyword::Procedure) => self.parse_create_procedure(true),
+                Token::Keyword(Keyword::Temporary | Keyword::Temp) => {
+                    self.advance()?;
+                    self.parse_create_table(true, true)
+                }
+                Token::Keyword(Keyword::Table) => self.parse_create_table(false, true),
                 _ => Err(self.error(&format!(
-                    "Expected VIEW, FUNCTION, or PROCEDURE after CREATE OR REPLACE, found {}",
+                    "Expected VIEW, FUNCTION, PROCEDURE, TABLE, or TEMPORARY TABLE after CREATE OR REPLACE, found {}",
                     self.current.token
                 ))),
             };
         }
 
+        // CREATE TEMPORARY | TEMP TABLE. The word only leads a temporary
+        // table when TABLE follows it, so a relation named `temp` still
+        // reads as one
+        if matches!(
+            self.current.token,
+            Token::Keyword(Keyword::Temporary | Keyword::Temp)
+        ) && self.peek.token == Token::Keyword(Keyword::Table)
+        {
+            self.advance()?;
+            return self.parse_create_table(true, false);
+        }
+
         match &self.current.token {
             Token::Keyword(Keyword::Peer) => self.parse_create_peer(),
             Token::Keyword(Keyword::Foreign) => self.parse_create_foreign_table(),
-            Token::Keyword(Keyword::Table) => self.parse_create_table(),
+            Token::Keyword(Keyword::Table) => self.parse_create_table(false, false),
             Token::Keyword(Keyword::Index) => self.parse_create_index(false),
             Token::Keyword(Keyword::View) => self.parse_create_view(false),
             Token::Keyword(Keyword::Schema) => self.parse_create_schema(),
@@ -1235,7 +1704,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_create_table(&mut self) -> Result<Statement> {
+    fn parse_create_table(&mut self, temporary: bool, or_replace: bool) -> Result<Statement> {
         self.expect_keyword(Keyword::Table)?;
 
         let if_not_exists = if self.consume_keyword(Keyword::If)? {
@@ -1247,12 +1716,20 @@ impl<'a> Parser<'a> {
         };
 
         let name = self.parse_qualified_name()?;
+        // A temporary table lives in the session's own namespace, which has
+        // no schema to qualify it with. Refusing the qualifier here is what
+        // keeps a qualified reference always reaching the permanent table
+        if temporary && name.contains('.') {
+            return Err(self.error(&format!(
+                "a temporary table takes a bare name, '{name}' names a schema; a temporary table lives in the session's own namespace and a qualified name always reaches a permanent table"
+            )));
+        }
 
         // `CLONE OF <table> [AT VERSION <n>]` takes the source's shape, so
         // it stands in place of a column list rather than beside one
         if self.consume_keyword(Keyword::Clone)? {
             self.expect_keyword(Keyword::Of)?;
-            let source = self.parse_ident()?;
+            let source = self.parse_qualified_name()?;
             let at_version = if self.consume_keyword(Keyword::At)? {
                 self.expect_keyword(Keyword::Version)?;
                 Some(self.parse_u64_literal("CLONE ... AT VERSION")?)
@@ -1272,6 +1749,43 @@ impl<'a> Parser<'a> {
                     table: source,
                     at_version,
                 }),
+                temporary,
+                on_commit: None,
+                or_replace,
+                as_query: None,
+            })));
+        }
+
+        // CREATE [TEMPORARY] TABLE name AS SELECT ..., whose column layout
+        // comes from the query rather than a declaration
+        if self.at_keyword(Keyword::As)
+            && matches!(
+                self.peek.token,
+                Token::Keyword(Keyword::Select | Keyword::With)
+            )
+        {
+            self.advance()?;
+            let query = if self.at_keyword(Keyword::With) {
+                let with_clause = self.parse_with_clause()?;
+                self.parse_select_body(Some(with_clause))?
+            } else {
+                self.parse_select_body(None)?
+            };
+            let on_commit = self.parse_on_commit_action(temporary)?;
+            return Ok(Statement::CreateTable(Box::new(CreateTableStatement {
+                name,
+                if_not_exists,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                options: Vec::new(),
+                ttl: None,
+                using: None,
+                cluster_by: None,
+                clone_of: None,
+                temporary,
+                on_commit,
+                or_replace,
+                as_query: Some(Box::new(query)),
             })));
         }
 
@@ -1334,6 +1848,8 @@ impl<'a> Parser<'a> {
             ttl = Some(self.parse_ttl_clause_body()?);
         }
 
+        let on_commit = self.parse_on_commit_action(temporary)?;
+
         Ok(Statement::CreateTable(Box::new(CreateTableStatement {
             name,
             if_not_exists,
@@ -1344,7 +1860,49 @@ impl<'a> Parser<'a> {
             using,
             cluster_by,
             clone_of: None,
+            temporary,
+            on_commit,
+            or_replace,
+            as_query: None,
         })))
+    }
+
+    /// `ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP`.
+    ///
+    /// Reads only on a temporary table, and a permanent one that carries the
+    /// clause is refused rather than having it dropped, because a commit does
+    /// nothing to a permanent table's rows and accepting the words would say
+    /// otherwise. A temporary table with no clause preserves its rows
+    fn parse_on_commit_action(&mut self, temporary: bool) -> Result<Option<OnCommitAction>> {
+        if !(self.at_keyword(Keyword::On) && self.peek.token == Token::Keyword(Keyword::Commit)) {
+            return Ok(if temporary {
+                Some(OnCommitAction::PreserveRows)
+            } else {
+                None
+            });
+        }
+        if !temporary {
+            return Err(self.error(
+                "ON COMMIT reads only on a temporary table; a commit leaves a permanent table's rows as they are",
+            ));
+        }
+        self.advance()?; // ON
+        self.advance()?; // COMMIT
+        let action = if self.consume_keyword(Keyword::Preserve)? {
+            self.expect_keyword(Keyword::Rows)?;
+            OnCommitAction::PreserveRows
+        } else if self.consume_keyword(Keyword::Delete)? {
+            self.expect_keyword(Keyword::Rows)?;
+            OnCommitAction::DeleteRows
+        } else if self.consume_keyword(Keyword::Drop)? {
+            OnCommitAction::Drop
+        } else {
+            return Err(self.error(&format!(
+                "Expected PRESERVE ROWS, DELETE ROWS, or DROP after ON COMMIT, found {}",
+                self.current.token
+            )));
+        };
+        Ok(Some(action))
     }
 
     /// A non-negative whole number literal, for the places the grammar
@@ -1438,7 +1996,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Index)?;
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         self.expect_token(&Token::LParen)?;
         let columns = self.parse_comma_separated(|p| p.parse_order_by_expr())?;
         self.expect_token(&Token::RParen)?;
@@ -1511,7 +2069,7 @@ impl<'a> Parser<'a> {
             false
         };
 
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         Ok(Statement::DropTable(Box::new(DropTableStatement {
             name,
@@ -1529,7 +2087,7 @@ impl<'a> Parser<'a> {
             false
         };
 
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         Ok(Statement::DropIndex(Box::new(DropIndexStatement {
             name,
@@ -1608,7 +2166,7 @@ impl<'a> Parser<'a> {
 
     fn parse_alter_table(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Table)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
 
         // ALTER TABLE t MOVE {WHERE expr | PARTITION 'k=v'} TO TIER 'tier' [DRY RUN]
         if self.consume_keyword(Keyword::Move)? {
@@ -1933,7 +2491,7 @@ impl<'a> Parser<'a> {
     fn parse_truncate(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Truncate)?;
         self.consume_keyword(Keyword::Table)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         Ok(Statement::Truncate(Box::new(TruncateStatement { table })))
     }
 
@@ -2240,7 +2798,7 @@ impl<'a> Parser<'a> {
                 constraints.push(ColumnConstraint::Check(expr));
             } else if self.at_keyword(Keyword::References) {
                 self.advance()?;
-                let table = self.parse_ident()?;
+                let table = self.parse_qualified_name()?;
                 self.expect_token(&Token::LParen)?;
                 let column = self.parse_ident()?;
                 self.expect_token(&Token::RParen)?;
@@ -2370,7 +2928,7 @@ impl<'a> Parser<'a> {
             let columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
             self.expect_keyword(Keyword::References)?;
-            let ref_table = self.parse_ident()?;
+            let ref_table = self.parse_qualified_name()?;
             self.expect_token(&Token::LParen)?;
             let ref_columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
@@ -3346,6 +3904,21 @@ impl<'a> Parser<'a> {
         Ok(Expr::Identifier(name))
     }
 
+    /// True when the argument at the cursor is `x -> expr`.
+    fn at_lambda_start(&self) -> bool {
+        matches!(&self.current.token, Token::Ident(_)) && self.peek.token == Token::Arrow
+    }
+
+    /// `x -> expr`, one named element and an expression over it.
+    fn parse_lambda(&mut self) -> Result<Expr> {
+        let parameter = self.parse_ident()?;
+        self.expect_token(&Token::Arrow)?;
+        Ok(Expr::Lambda {
+            parameter,
+            body: Box::new(self.parse_expr()?),
+        })
+    }
+
     fn parse_function_call(&mut self, name: String) -> Result<Expr> {
         // Two functions the standard spells with keywords in their argument
         // list rather than commas. Both desugar to the ordinary call the
@@ -3392,7 +3965,16 @@ impl<'a> Parser<'a> {
             return Ok(func_expr);
         }
 
-        let args = self.parse_comma_separated(|p| p.parse_function_arg())?;
+        // A function declared to take a lambda reads `x -> expr` in its
+        // argument list. Everywhere else `->` stays the JSON access
+        // operator, so the two never contend
+        let takes_lambda = takes_lambda_argument(&name);
+        let args = self.parse_comma_separated(|p| {
+            if takes_lambda && p.at_lambda_start() {
+                return Ok(FunctionArg::Unnamed(p.parse_lambda()?));
+            }
+            p.parse_function_arg()
+        })?;
         self.expect_token(&Token::RParen)?;
         let func_expr = Expr::Function {
             name,
@@ -3975,7 +4557,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         Ok(Statement::DropView(Box::new(DropViewStatement {
             name,
             if_exists,
@@ -4064,7 +4646,7 @@ impl<'a> Parser<'a> {
             return Ok(GrantObject::Endpoint(name));
         }
         self.consume_keyword(Keyword::Table)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         Ok(GrantObject::Table(name))
     }
 
@@ -4237,7 +4819,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         Ok(Statement::DropSequence(Box::new(DropSequenceStatement {
             name,
             if_exists,
@@ -4251,7 +4833,7 @@ impl<'a> Parser<'a> {
     fn parse_vacuum(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Vacuum)?;
         let table = if self.current.token != Token::Eof && self.current.token != Token::Semicolon {
-            Some(self.parse_ident()?)
+            Some(self.parse_qualified_name()?)
         } else {
             None
         };
@@ -4261,7 +4843,7 @@ impl<'a> Parser<'a> {
     fn parse_analyze(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Analyze)?;
         let table = if self.current.token != Token::Eof && self.current.token != Token::Semicolon {
-            Some(self.parse_ident()?)
+            Some(self.parse_qualified_name()?)
         } else {
             None
         };
@@ -4271,10 +4853,10 @@ impl<'a> Parser<'a> {
     fn parse_reindex(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Reindex)?;
         let target = if self.consume_keyword(Keyword::Index)? {
-            ReindexTarget::Index(self.parse_ident()?)
+            ReindexTarget::Index(self.parse_qualified_name()?)
         } else {
             self.consume_keyword(Keyword::Table)?;
-            ReindexTarget::Table(self.parse_ident()?)
+            ReindexTarget::Table(self.parse_qualified_name()?)
         };
         Ok(Statement::Reindex(Box::new(ReindexStatement { target })))
     }
@@ -4513,7 +5095,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         self.expect_token(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
@@ -4571,7 +5153,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         Ok(Statement::DropForeignTable(Box::new(
             DropForeignTableStatement { name, if_exists },
         )))
@@ -4662,7 +5244,7 @@ impl<'a> Parser<'a> {
             let declared_columns = self.parse_optional_copy_columns()?;
             if self.consume_keyword(Keyword::Into)? {
                 self.expect_keyword(Keyword::Table)?;
-                let table = self.parse_ident()?;
+                let table = self.parse_qualified_name()?;
                 let columns = if self.at_token(&Token::LParen) {
                     self.advance()?;
                     let cols = self.parse_comma_separated(|p| p.parse_ident())?;
@@ -4698,7 +5280,7 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword(Keyword::Table) {
             self.advance()?;
-            let table = self.parse_ident()?;
+            let table = self.parse_qualified_name()?;
             let columns = if self.at_token(&Token::LParen) {
                 self.advance()?;
                 let cols = self.parse_comma_separated(|p| p.parse_ident())?;
@@ -4746,7 +5328,7 @@ impl<'a> Parser<'a> {
 
         // Shorthand table-anchored form. The identifier is the Zyron table,
         // optionally followed by a column list.
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         let columns = if self.at_token(&Token::LParen) {
             self.advance()?;
             let cols = self.parse_comma_separated(|p| p.parse_ident())?;
@@ -4985,7 +5567,7 @@ impl<'a> Parser<'a> {
         }
 
         self.expect_keyword(Keyword::Into)?;
-        let target = self.parse_ident()?;
+        let target = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::Using)?;
         let source = self.parse_base_table_ref()?;
         self.expect_keyword(Keyword::On)?;
@@ -5253,21 +5835,33 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Comment)?;
         self.expect_keyword(Keyword::On)?;
         let (object_type, name, column) = if self.consume_keyword(Keyword::Table)? {
-            (CommentObjectType::Table, self.parse_ident()?, None)
+            (CommentObjectType::Table, self.parse_qualified_name()?, None)
         } else if self.at_keyword(Keyword::Column) {
             self.advance()?;
-            let table = self.parse_ident()?;
-            self.expect_token(&Token::Dot)?;
-            let col = self.parse_ident()?;
-            (CommentObjectType::Column, table, Some(col))
+            // The column ends the dotted name, so the whole path is read and
+            // the last label taken as the column. Reading the table on its own
+            // first would take the column as part of a qualified table name
+            let path = self.parse_qualified_name()?;
+            let Some((table, col)) = path.rsplit_once('.') else {
+                return Err(self.error("Expected a column as table.column after COMMENT ON COLUMN"));
+            };
+            (
+                CommentObjectType::Column,
+                table.to_string(),
+                Some(col.to_string()),
+            )
         } else if self.consume_keyword(Keyword::Index)? {
-            (CommentObjectType::Index, self.parse_ident()?, None)
+            (CommentObjectType::Index, self.parse_qualified_name()?, None)
         } else if self.consume_keyword(Keyword::Schema)? {
             (CommentObjectType::Schema, self.parse_ident()?, None)
         } else if self.consume_keyword(Keyword::Sequence)? {
-            (CommentObjectType::Sequence, self.parse_ident()?, None)
+            (
+                CommentObjectType::Sequence,
+                self.parse_qualified_name()?,
+                None,
+            )
         } else if self.consume_keyword(Keyword::View)? {
-            (CommentObjectType::View, self.parse_ident()?, None)
+            (CommentObjectType::View, self.parse_qualified_name()?, None)
         } else {
             return Err(self.error(
                 "Expected TABLE, COLUMN, INDEX, SCHEMA, SEQUENCE, or VIEW after COMMENT ON",
@@ -5298,7 +5892,7 @@ impl<'a> Parser<'a> {
 
     fn parse_alter_index(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Index)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::Rename)?;
         self.expect_keyword(Keyword::To)?;
         let new_name = self.parse_ident()?;
@@ -5310,7 +5904,7 @@ impl<'a> Parser<'a> {
 
     fn parse_alter_sequence(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Sequence)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         let mut increment = None;
         let mut min_value = None;
         let mut max_value = None;
@@ -5372,7 +5966,7 @@ impl<'a> Parser<'a> {
 
     fn parse_alter_view(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::View)?;
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::Rename)?;
         self.expect_keyword(Keyword::To)?;
         let new_name = self.parse_ident()?;
@@ -5417,7 +6011,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         Ok(Statement::DropMaterializedView(Box::new(
             DropMaterializedViewStatement { name, if_exists },
         )))
@@ -5437,7 +6031,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let name = self.parse_qualified_name()?;
         Ok(Statement::RefreshMaterializedView(Box::new(
             RefreshMaterializedViewStatement { name, concurrently },
         )))
@@ -5610,7 +6204,7 @@ impl<'a> Parser<'a> {
     fn parse_optimize_table(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Optimize)?;
         self.consume_keyword(Keyword::Table)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         let mut cluster = false;
         let mut delete = false;
         if self.at_keyword(Keyword::Cluster) || self.at_keyword(Keyword::Delete) {
@@ -6540,7 +7134,7 @@ impl<'a> Parser<'a> {
     fn parse_archive_table(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Archive)?;
         self.expect_keyword(Keyword::Table)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         let where_clause = if self.consume_keyword(Keyword::Where)? {
             Some(Box::new(self.parse_expr()?))
         } else {
@@ -6799,7 +7393,7 @@ impl<'a> Parser<'a> {
     fn parse_undrop_table(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Undrop)?;
         self.expect_keyword(Keyword::Table)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         Ok(Statement::UndropTable(Box::new(UndropTableStatement {
             table,
         })))
@@ -6995,7 +7589,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Stream)?;
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
-        let table_name = self.parse_ident()?;
+        let table_name = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::To)?;
         let sink_type = self.parse_ident()?;
         let mut options = vec![];
@@ -7957,7 +8551,7 @@ impl<'a> Parser<'a> {
     /// Parses a single entry in a publication table list.
     /// Accepts `<table> [ ( col1, col2, ... ) ] [ WHERE <expr> ]`.
     fn parse_publication_table_ref(&mut self) -> Result<PublicationTableRef> {
-        let table_name = self.parse_ident()?;
+        let table_name = self.parse_qualified_name()?;
         let mut columns = Vec::new();
         if self.at_token(&Token::LParen) {
             self.advance()?;
@@ -8064,7 +8658,7 @@ impl<'a> Parser<'a> {
         }
 
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
 
         // Optional REFERENCING clause
         let referencing = if self.consume_keyword(Keyword::Referencing)? {
@@ -8178,7 +8772,7 @@ impl<'a> Parser<'a> {
         };
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         let drop_behavior = self.parse_optional_drop_behavior()?;
         Ok(Statement::DropTrigger(Box::new(DropTriggerStatement {
             name,
@@ -8654,7 +9248,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Index)?;
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         self.expect_token(&Token::LParen)?;
         let columns = self.parse_comma_separated(|p| p.parse_ident())?;
         self.expect_token(&Token::RParen)?;
@@ -8680,7 +9274,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Index)?;
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         self.expect_token(&Token::LParen)?;
         let column = self.parse_ident()?;
         self.expect_token(&Token::RParen)?;
@@ -8712,7 +9306,7 @@ impl<'a> Parser<'a> {
         };
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_ident()?;
+        let table = self.parse_qualified_name()?;
         self.expect_token(&Token::LParen)?;
         let column = self.parse_ident()?;
         self.expect_token(&Token::RParen)?;
@@ -9354,7 +9948,7 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.error("Expected TABLE or PUBLICATION after ON in CREATE ABAC POLICY"));
         };
-        let target_name = self.parse_ident()?;
+        let target_name = self.parse_qualified_name()?;
         self.expect_keyword(Keyword::Where)?;
         // Capture the predicate's verbatim source text between the start of the
         // expression and the token that follows it. The policy is enforced by
@@ -9399,6 +9993,21 @@ fn parse_lsn_reset_spec(literal: &str) -> Option<LsnResetSpec> {
 
 /// Maps keywords that can be used as identifiers in non-keyword position.
 /// Returns the string representation, or None if the keyword cannot be used as an identifier.
+/// The functions whose argument list reads `x -> expr`.
+///
+/// Listed rather than inferred, because `->` is the JSON access operator
+/// everywhere else and a lambda read where one was not written would change
+/// what a query means.
+pub fn takes_lambda_argument(name: &str) -> bool {
+    // Every function call in every statement reaches this, so it compares the
+    // bytes already in hand. Folding the name to a new String would put one
+    // allocation on the parse of each call for the sake of these two
+    const LAMBDA_TAKING: [&str; 2] = ["array_filter", "array_transform"];
+    LAMBDA_TAKING
+        .iter()
+        .any(|candidate| candidate.len() == name.len() && candidate.eq_ignore_ascii_case(name))
+}
+
 pub(crate) fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
     match kw {
         // Data type keywords commonly used as identifiers
@@ -9539,6 +10148,22 @@ pub(crate) fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Percent => Some("percent"),
         // LATERAL
         Keyword::Lateral => Some("lateral"),
+        // Every word this phase added stays usable as an identifier. The
+        // grammar positions that need them look at the token directly and,
+        // where the word could also start a table name, require the token
+        // that follows before taking the keyword reading
+        Keyword::Unnest => Some("unnest"),
+        Keyword::Ordinality => Some("ordinality"),
+        Keyword::Flatten => Some("flatten"),
+        Keyword::Path => Some("path"),
+        Keyword::Pivot => Some("pivot"),
+        Keyword::Unpivot => Some("unpivot"),
+        Keyword::Exclude => Some("exclude"),
+        Keyword::Asof => Some("asof"),
+        Keyword::MatchCondition => Some("match_condition"),
+        Keyword::Temporary => Some("temporary"),
+        Keyword::Temp => Some("temp"),
+        Keyword::Preserve => Some("preserve"),
         // Array
         Keyword::Array => Some("array"),
         Keyword::Any => Some("any"),

@@ -1042,6 +1042,16 @@ fn table_ref_to_sql(tr: &TableRef) -> String {
             Some(a) => format!("'{}' AS {}", r.uri, a),
             None => format!("'{}'", r.uri),
         },
+        TableRef::Unnest(u) => match &u.alias {
+            Some(a) => format!("UNNEST(...) AS {}", a),
+            None => "UNNEST(...)".into(),
+        },
+        TableRef::Flatten(f) => match &f.alias {
+            Some(a) => format!("FLATTEN(...) AS {}", a),
+            None => "FLATTEN(...)".into(),
+        },
+        TableRef::Pivot(p) => format!("{} PIVOT (...)", table_ref_to_sql(&p.input)),
+        TableRef::Unpivot(u) => format!("{} UNPIVOT (...)", table_ref_to_sql(&u.input)),
     }
 }
 

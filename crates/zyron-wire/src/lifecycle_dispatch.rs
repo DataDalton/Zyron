@@ -519,7 +519,7 @@ pub async fn handle_alter_table_ttl(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, &stmt.table)
@@ -581,7 +581,7 @@ pub async fn handle_alter_table_options(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, &stmt.table)
@@ -748,7 +748,7 @@ pub async fn handle_legal_hold(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     match &stmt.operation {
         lc_ast::LegalHoldOperation::Create {
             name,
@@ -1075,7 +1075,7 @@ pub async fn handle_alter_table_move(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, &stmt.table)
@@ -1432,7 +1432,7 @@ pub async fn handle_alter_column_classification(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, &stmt.table)
@@ -1479,7 +1479,7 @@ pub async fn handle_restore_soft_delete(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (_, schema_id) = get_session_schema(session, server)?;
     let table = server
         .catalog
         .get_table(schema_id, &stmt.table)
@@ -1560,7 +1560,7 @@ pub async fn handle_run_retention_job(
     // TTL/retention policy configured.
     let tables: Vec<std::sync::Arc<zyron_catalog::schema::TableEntry>> = match &stmt.table {
         Some(name) => {
-            let (_, schema_id) = get_session_schema(session, server, None)?;
+            let (_, schema_id) = get_session_schema(session, server)?;
             vec![
                 server
                     .catalog
@@ -1704,10 +1704,11 @@ pub async fn handle_undrop_table(
         zyron_auth::PrivilegeType::ManageDataLifecycle,
         0,
     )?;
-    let (_, schema_id) = get_session_schema(session, server, None)?;
+    let (schema_id, table_name) =
+        crate::ddl_dispatch::resolve_qualified_name(&stmt.table, server, session)?;
     server
         .catalog
-        .undrop_table(schema_id, &stmt.table)
+        .undrop_table(schema_id, &table_name)
         .await
         .map_err(ProtocolError::Database)?;
     audit(server, 11, &stmt.table, 0, "undrop table").await?;

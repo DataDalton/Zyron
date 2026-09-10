@@ -36,6 +36,59 @@ pub const ASSUMED_ROW_BYTES: f64 = AVG_COLUMN_BYTES * 4.0;
 /// Bytes a page holds, for turning spilled bytes into page reads and writes.
 const SPILL_PAGE_BYTES: f64 = 8192.0;
 
+/// Rows one input row expands into when nothing recorded a length. Applies
+/// to an array column with no statistics and to every document walk, whose
+/// shape no statistic describes.
+const DEFAULT_EXPANSION_FANOUT: f64 = 4.0;
+
+/// Bytes an encoded array spends before its first element: the type id, the
+/// flags, the element width and the element count.
+const ARRAY_HEADER_BYTES: f64 = 8.0;
+
+/// The share of left rows an ASOF join matches when neither match column has
+/// a histogram. A time series joined to its own quotes matches nearly always,
+/// so assuming most rows match is closer than assuming half do.
+const DEFAULT_ASOF_MATCH_PROBABILITY: f64 = 0.9;
+
+/// The table and element type behind a column reference, found by walking to
+/// the scan that produces it. None when the reference does not resolve to a
+/// base table below this plan.
+fn scan_column_source(
+    plan: &LogicalPlan,
+    reference: &crate::binder::ColumnRef,
+) -> Option<(zyron_catalog::TableId, zyron_common::TypeId)> {
+    if let LogicalPlan::Scan {
+        table_id,
+        table_idx,
+        columns,
+        ..
+    } = plan
+        && *table_idx == reference.table_idx
+    {
+        let column = columns
+            .iter()
+            .find(|c| c.column_id == reference.column_id)?;
+        return Some((*table_id, column.type_id));
+    }
+    plan.children()
+        .into_iter()
+        .find_map(|child| scan_column_source(child, reference))
+}
+
+/// How far apart two encoded values are, read as a big-endian magnitude over
+/// the leading bytes. Only the ratio between two spans is used, so reading a
+/// prefix is enough to order and to size them.
+fn byte_span(low: &[u8], high: &[u8]) -> f64 {
+    let read = |bytes: &[u8]| -> f64 {
+        let mut value = 0.0f64;
+        for i in 0..8 {
+            value = value * 256.0 + bytes.get(i).copied().unwrap_or(0) as f64;
+        }
+        value
+    };
+    (read(high) - read(low)).max(0.0)
+}
+
 // ---------------------------------------------------------------------------
 // Plan cost
 // ---------------------------------------------------------------------------
@@ -604,6 +657,122 @@ impl CostModel {
         }
     }
 
+    /// How many output rows one input row expands into.
+    ///
+    /// An array column's mean length is derived from the column's recorded
+    /// mean encoded width: the encoding is a fixed header, a presence bitmap
+    /// and one slot per element, so for a fixed-width element type the count
+    /// follows from the width. Without statistics, or for an element type
+    /// whose width varies, the estimate is 4.
+    pub(crate) fn expansion_fanout(
+        &self,
+        spec: &crate::logical::ExpandSpec,
+        child: &LogicalPlan,
+        catalog: &Catalog,
+    ) -> f64 {
+        use crate::logical::ExpandSpec;
+        match spec {
+            // A group list is fixed, so the fanout is exact
+            ExpandSpec::Unpivot { groups, .. } => groups.len() as f64,
+            ExpandSpec::Unnest { arrays, .. } => {
+                // Several arrays zip to the longest, so the fanout is the
+                // largest of their mean lengths
+                arrays
+                    .iter()
+                    .map(|a| self.mean_array_length(a, child, catalog))
+                    .fold(0.0f64, f64::max)
+                    .max(1.0)
+            }
+            // A document walk has no length recorded anywhere, and a
+            // recursive walk reaches more than a shallow one
+            ExpandSpec::Flatten { recursive, .. } => {
+                if *recursive {
+                    DEFAULT_EXPANSION_FANOUT * DEFAULT_EXPANSION_FANOUT
+                } else {
+                    DEFAULT_EXPANSION_FANOUT
+                }
+            }
+        }
+    }
+
+    /// The mean number of elements in the array a column holds, from that
+    /// column's recorded mean width, or the default when nothing recorded it.
+    fn mean_array_length(&self, expr: &BoundExpr, child: &LogicalPlan, catalog: &Catalog) -> f64 {
+        let BoundExpr::ColumnRef(reference) = expr else {
+            return DEFAULT_EXPANSION_FANOUT;
+        };
+        let Some((table_id, element_type)) = scan_column_source(child, reference) else {
+            return DEFAULT_EXPANSION_FANOUT;
+        };
+        let Some(recorded) = catalog.get_stats(table_id) else {
+            return DEFAULT_EXPANSION_FANOUT;
+        };
+        let Some(stats) = recorded
+            .1
+            .iter()
+            .find(|c| c.column_id == reference.column_id)
+        else {
+            return DEFAULT_EXPANSION_FANOUT;
+        };
+        // Header, then a presence bit per element, then one slot per element
+        let Some(width) = element_type.fixed_size().filter(|w| *w > 0) else {
+            return DEFAULT_EXPANSION_FANOUT;
+        };
+        let payload = (stats.avg_width as f64) - ARRAY_HEADER_BYTES;
+        if payload <= 0.0 {
+            return DEFAULT_EXPANSION_FANOUT;
+        }
+        // Each element costs its width plus one eighth of a byte of bitmap
+        (payload / (width as f64 + 0.125)).max(1.0)
+    }
+
+    /// The share of left rows that find a right row, from how far the two
+    /// match columns' recorded ranges overlap. Without a histogram on both
+    /// sides the estimate is that most left rows match.
+    fn match_probability(
+        &self,
+        match_left: &BoundExpr,
+        match_right: &BoundExpr,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        catalog: &Catalog,
+    ) -> f64 {
+        let bounds = |expr: &BoundExpr, plan: &LogicalPlan| -> Option<(Vec<u8>, Vec<u8>)> {
+            let BoundExpr::ColumnRef(reference) = expr else {
+                return None;
+            };
+            let (table_id, _) = scan_column_source(plan, reference)?;
+            let recorded = catalog.get_stats(table_id)?;
+            let stats = recorded
+                .1
+                .iter()
+                .find(|c| c.column_id == reference.column_id)?;
+            let histogram = stats.histogram.as_ref()?;
+            let low = histogram.bounds.first()?.clone();
+            let high = histogram.bounds.last()?.clone();
+            Some((low, high))
+        };
+        let (Some((left_low, left_high)), Some((right_low, right_high))) =
+            (bounds(match_left, left), bounds(match_right, right))
+        else {
+            return DEFAULT_ASOF_MATCH_PROBABILITY;
+        };
+        // The comparison is over the columns' own encoded bytes, which the
+        // histogram stores and which order the same way the values do for
+        // every orderable type an ASOF match accepts
+        let overlap_low = left_low.clone().max(right_low);
+        let overlap_high = left_high.clone().min(right_high);
+        if overlap_high < overlap_low {
+            // The ranges do not meet, so almost nothing matches
+            return 0.01;
+        }
+        let span = byte_span(&left_low, &left_high);
+        if span <= 0.0 {
+            return DEFAULT_ASOF_MATCH_PROBABILITY;
+        }
+        (byte_span(&overlap_low, &overlap_high) / span).clamp(0.01, 1.0)
+    }
+
     /// Estimates the total cost of a logical plan tree.
     pub fn estimate_plan_cost(&self, plan: &LogicalPlan, catalog: &Catalog) -> PlanCost {
         match plan {
@@ -668,6 +837,65 @@ impl CostModel {
                     io_cost: left_cost.io_cost,
                     cpu_cost: left_cost.cpu_cost + left_cost.row_count * per_row,
                     row_count: left_cost.row_count,
+                }
+            }
+            LogicalPlan::ExpandRows {
+                child,
+                spec,
+                outer_input,
+                ..
+            } => {
+                let child_cost = self.estimate_plan_cost(child, catalog);
+                let fanout = self.expansion_fanout(spec, child, catalog);
+                // An outer expansion emits a row for an input row that
+                // produced none, so it never falls below the input count
+                let rows = if *outer_input {
+                    (child_cost.row_count * fanout).max(child_cost.row_count)
+                } else {
+                    (child_cost.row_count * fanout).max(1.0)
+                };
+                PlanCost {
+                    io_cost: child_cost.io_cost,
+                    cpu_cost: child_cost.cpu_cost + rows * self.cpu_operator_cost,
+                    row_count: rows,
+                }
+            }
+            LogicalPlan::AsofJoin {
+                left,
+                right,
+                match_on,
+            } => {
+                let crate::logical::AsofMatchOn {
+                    match_left,
+                    match_right,
+                    join_type,
+                    ..
+                } = match_on.as_ref();
+                let left_cost = self.estimate_plan_cost(left, catalog);
+                let right_cost = self.estimate_plan_cost(right, catalog);
+                // One left row matches at most one right row, so the left
+                // cardinality is the ceiling. The LEFT form keeps every left
+                // row; the inner form keeps the share that finds a match,
+                // which the two match columns' range overlap estimates
+                let rows = match join_type {
+                    JoinType::Left => left_cost.row_count,
+                    _ => {
+                        let probability =
+                            self.match_probability(match_left, match_right, left, right, catalog);
+                        (left_cost.row_count * probability).max(1.0)
+                    }
+                };
+                // Two sorts plus one merge pass over both inputs
+                let sort_cost = self.cost_sort(&left_cost).cpu_cost.max(left_cost.cpu_cost)
+                    + self
+                        .cost_sort(&right_cost)
+                        .cpu_cost
+                        .max(right_cost.cpu_cost);
+                PlanCost {
+                    io_cost: left_cost.io_cost + right_cost.io_cost,
+                    cpu_cost: sort_cost
+                        + (left_cost.row_count + right_cost.row_count) * self.cpu_operator_cost,
+                    row_count: rows,
                 }
             }
             LogicalPlan::Aggregate {

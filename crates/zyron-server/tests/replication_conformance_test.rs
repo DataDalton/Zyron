@@ -2077,6 +2077,112 @@ async fn a_branch_merged_into_main_reaches_every_member() {
     group.shutdown().await;
 }
 
+/// A temporary table created on the leader is absent on every follower.
+///
+/// The only case here whose proof is an absence, and it is the point of the
+/// feature rather than a gap in it: a temporary table lives in the session
+/// that created it, on the node that session is connected to, so a statement
+/// about one classifies Local and reaches no other member. What this checks
+/// is that none of it leaks: not the definition, not the rows, and not a
+/// catalog entry on any node including the one that ran it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_temporary_table_stays_on_the_node_that_created_it() {
+    let group = Group::start(3).await;
+    let leader = group.leader(Duration::from_secs(10)).await;
+    let addr = group.nodes[leader].serve_wire().await;
+
+    let mut client = WireClient::connect(addr).await;
+    for sql in [
+        "SET search_path = zyron_test",
+        // A permanent table beside it, so the group is proven to be
+        // replicating at all rather than quietly doing nothing
+        "CREATE TABLE conf_permanent (id BIGINT PRIMARY KEY)",
+        "INSERT INTO conf_permanent (id) VALUES (1)",
+        "CREATE TEMP TABLE conf_scratch (id BIGINT)",
+        "INSERT INTO conf_scratch (id) VALUES (1), (2), (3)",
+    ] {
+        let (_, errors) = client.query(sql).await;
+        assert!(errors.is_empty(), "`{sql}` failed: {errors:?}");
+    }
+    group.settle(leader, Duration::from_secs(20)).await;
+
+    // The permanent table reached every member, so the group is working
+    for node in &group.nodes {
+        assert_eq!(
+            node.count("conf_permanent").await,
+            1,
+            "{} did not get the permanent table's row",
+            node.name
+        );
+    }
+
+    // The temporary table reached none of them, the leader included: its
+    // definition is in the session, not in any catalog
+    for node in &group.nodes {
+        assert!(
+            !node
+                .catalog
+                .list_all_tables()
+                .iter()
+                .any(|t| t.name == "conf_scratch"),
+            "{} has a catalog entry for a temporary table",
+            node.name
+        );
+        assert!(
+            node.catalog.get_table(node.schema, "conf_scratch").is_err(),
+            "{} resolves a temporary table by schema and name",
+            node.name
+        );
+    }
+
+    // A follower cannot read it under any name
+    let follower = (leader + 1) % group.nodes.len();
+    let follower_addr = group.nodes[follower].serve_wire().await;
+    let mut other = WireClient::connect(follower_addr).await;
+    let (_, errors) = other.query("SET search_path = zyron_test").await;
+    assert!(
+        errors.is_empty(),
+        "could not set the search path: {errors:?}"
+    );
+    let (_, errors) = other.query("SELECT id FROM conf_scratch").await;
+    assert!(
+        !errors.is_empty(),
+        "a follower answered a query against a temporary table it should not have"
+    );
+    other.terminate().await;
+
+    // A second session on the leader does not see it either, because the
+    // namespace belongs to the connection rather than to the node
+    let mut second = WireClient::connect(addr).await;
+    let (_, errors) = second.query("SET search_path = zyron_test").await;
+    assert!(
+        errors.is_empty(),
+        "could not set the search path: {errors:?}"
+    );
+    let (_, errors) = second.query("SELECT id FROM conf_scratch").await;
+    assert!(
+        !errors.is_empty(),
+        "another session on the same node saw a temporary table that is not its own"
+    );
+    second.terminate().await;
+
+    // Dropping it is Local too, so it is not proposed to the group either
+    let (_, errors) = client.query("DROP TABLE conf_scratch").await;
+    assert!(errors.is_empty(), "the drop was refused: {errors:?}");
+    group.settle(leader, Duration::from_secs(20)).await;
+    for node in &group.nodes {
+        assert_eq!(
+            node.count("conf_permanent").await,
+            1,
+            "{} lost rows while a temporary table was dropped",
+            node.name
+        );
+    }
+
+    client.terminate().await;
+    group.shutdown().await;
+}
+
 /// A notification issued on one member reaches a listener on another.
 ///
 /// A test of its own because what it proves is delivery rather than catalog

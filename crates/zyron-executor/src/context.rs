@@ -246,10 +246,15 @@ pub struct ExecutionContext {
     pub security_context: Option<Arc<zyron_auth::SecurityContext>>,
     /// Live B+ tree index instances keyed by IndexId. Registered by the
     /// server layer so the index scan operator can perform actual tree lookups.
-    indexes: HashMap<IndexId, Arc<BTreeIndex>>,
+    ///
+    /// Shared with every child context rather than copied into it. A
+    /// correlated subquery builds one child per outer row, and an owned map
+    /// made each of those rebuild the table and copy every entry
+    indexes: Arc<HashMap<IndexId, Arc<BTreeIndex>>>,
     /// Live full-text search index instances keyed by IndexId. Registered by
-    /// the server layer after creating or loading fulltext indexes.
-    fts_indexes: HashMap<IndexId, Arc<zyron_search::InvertedIndex>>,
+    /// the server layer after creating or loading fulltext indexes. Shared
+    /// with child contexts for the same reason as `indexes`
+    fts_indexes: Arc<HashMap<IndexId, Arc<zyron_search::InvertedIndex>>>,
     /// FTS manager reference for DML index maintenance. DML operators use this
     /// to look up which FTS indexes exist for a table and update them.
     pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
@@ -307,7 +312,9 @@ pub struct ExecutionContext {
     /// which is what routes copy-on-write pages, while a lake branch is an
     /// alternate log head addressed by name. Both come from one USE BRANCH,
     /// so the session carries both and each store reads the one it uses.
-    pub active_branch_name: Option<String>,
+    /// Shared rather than owned so a child context built per outer row of a
+    /// correlated subquery carries the name without reallocating it
+    pub active_branch_name: Option<Arc<str>>,
     /// Shared intent-lock table for key-level conflict detection. When present,
     /// unique-index inserts take a key lock on the indexed value so concurrent
     /// transactions inserting the same value serialize (first locker wins, the
@@ -391,8 +398,8 @@ impl ExecutionContext {
             params: Vec::new(),
             planning_database: zyron_catalog::DatabaseId(1),
             security_context: None,
-            indexes: HashMap::new(),
-            fts_indexes: HashMap::new(),
+            indexes: Arc::new(HashMap::new()),
+            fts_indexes: Arc::new(HashMap::new()),
             fts_manager: None,
             key_store: None,
             media_store: None,
@@ -475,8 +482,8 @@ impl ExecutionContext {
             params,
             planning_database: self.planning_database,
             security_context: self.security_context.clone(),
-            indexes: self.indexes.clone(),
-            fts_indexes: self.fts_indexes.clone(),
+            indexes: Arc::clone(&self.indexes),
+            fts_indexes: Arc::clone(&self.fts_indexes),
             fts_manager: self.fts_manager.clone(),
             key_store: self.key_store.clone(),
             media_store: self.media_store.clone(),
@@ -888,7 +895,7 @@ impl ExecutionContext {
     /// Registers a live B+ tree index instance for use by index scan operators.
     /// Called by the server layer after creating or loading an index.
     pub fn register_index(&mut self, index_id: IndexId, btree: Arc<BTreeIndex>) {
-        self.indexes.insert(index_id, btree);
+        Arc::make_mut(&mut self.indexes).insert(index_id, btree);
     }
 
     /// Returns the B+ tree index instance for the given IndexId. Consults
@@ -906,7 +913,7 @@ impl ExecutionContext {
 
     /// Registers a live full-text search index instance for use by FTS scan operators.
     pub fn register_fts_index(&mut self, index_id: IndexId, fts: Arc<zyron_search::InvertedIndex>) {
-        self.fts_indexes.insert(index_id, fts);
+        Arc::make_mut(&mut self.fts_indexes).insert(index_id, fts);
     }
 
     /// Returns the FTS index instance for the given IndexId.

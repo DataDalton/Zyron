@@ -169,6 +169,9 @@ impl Renamer<'_> {
             TableRef::Join(join) => {
                 self.table_ref(&mut join.left);
                 self.table_ref(&mut join.right);
+                if let Some(asof) = join.asof.as_mut() {
+                    self.expr(&mut asof.condition);
+                }
                 match &mut join.condition {
                     crate::ast::JoinCondition::On(on) => self.expr(on),
                     crate::ast::JoinCondition::Using(columns) => {
@@ -192,6 +195,36 @@ impl Renamer<'_> {
                 }
             }
             TableRef::ExternalInline(_) => {}
+            TableRef::Unnest(unnest) => {
+                for array in unnest.arrays.iter_mut() {
+                    self.expr(array);
+                }
+            }
+            TableRef::Flatten(flatten) => self.expr(&mut flatten.input),
+            TableRef::Pivot(pivot) => {
+                self.table_ref(&mut pivot.input);
+                for agg in pivot.aggregates.iter_mut() {
+                    if self.target == RenameTarget::Function {
+                        self.replace(&mut agg.function);
+                    }
+                    self.expr(&mut agg.argument);
+                }
+                self.expr(&mut pivot.pivot_column);
+            }
+            TableRef::Unpivot(unpivot) => {
+                self.table_ref(&mut unpivot.input);
+                if self.target == RenameTarget::Column {
+                    for column in unpivot.value_columns.iter_mut() {
+                        self.replace(column);
+                    }
+                    self.replace(&mut unpivot.name_column);
+                    for item in unpivot.items.iter_mut() {
+                        for column in item.columns.iter_mut() {
+                            self.replace(column);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -216,6 +249,9 @@ impl Renamer<'_> {
                 RenameTarget::Function => {}
             },
             Expr::Literal(_) | Expr::Parameter(_) => {}
+            // The parameter names one element rather than a column of a
+            // relation, so a column rename does not reach it
+            Expr::Lambda { body, .. } => self.expr(body),
             Expr::Collate { expr, .. } => self.expr(expr),
             Expr::BinaryOp { left, right, .. } => {
                 self.expr(left);

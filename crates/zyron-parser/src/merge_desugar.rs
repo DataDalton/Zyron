@@ -54,6 +54,7 @@ fn bare_select(
         fetch: None,
         for_clause: None,
         soft_delete_mode: SoftDeleteSelectMode::Default,
+        into_target: None,
     }
 }
 

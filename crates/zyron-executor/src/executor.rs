@@ -413,6 +413,14 @@ fn build_operator_tree(
             ctx,
         )),
 
+        PhysicalPlan::AsofJoin {
+            left, right, spec, ..
+        } => Box::pin(build_asof_join(left, right, spec, analyze, ctx)),
+
+        PhysicalPlan::ExpandRows { child, spec, .. } => {
+            Box::pin(build_expand_rows(child, spec, analyze, ctx))
+        }
+
         PhysicalPlan::HashJoin {
             left,
             right,
@@ -2030,6 +2038,58 @@ async fn build_parallel_hash_join(
     join_op.set_spill(ctx.spill.clone(), ctx.spill_threshold_bytes());
     let br = BuildResult::new(Box::new(join_op));
     Ok(br.with_metrics("ParallelHashJoin", analyze, child_m))
+}
+
+/// One arm of `build_operator_tree`, see that function for why the arms
+/// are not written inline
+#[inline(never)]
+async fn build_asof_join(
+    left: Box<zyron_planner::physical::PhysicalPlan>,
+    right: Box<zyron_planner::physical::PhysicalPlan>,
+    spec: Box<zyron_planner::physical::AsofJoinSpec>,
+    analyze: bool,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<BuildResult> {
+    let left_br = build_operator_tree(*left, ctx).await?;
+    let right_br = build_operator_tree(*right, ctx).await?;
+    let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+    let op = crate::operator::asof_join::AsofJoinOperator::new(
+        crate::operator::CancelPollOperator::wrap(left_br.op, ctx),
+        crate::operator::CancelPollOperator::wrap(right_br.op, ctx),
+        spec,
+        Arc::clone(ctx),
+    );
+    Ok(BuildResult::new(Box::new(op)).with_metrics("AsofJoin", analyze, child_m))
+}
+
+/// One arm of `build_operator_tree`, see that function for why the arms
+/// are not written inline
+#[inline(never)]
+async fn build_expand_rows(
+    child: Box<zyron_planner::physical::PhysicalPlan>,
+    spec: Box<zyron_planner::physical::ExpandPhysical>,
+    analyze: bool,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<BuildResult> {
+    let child_br = build_operator_tree(*child, ctx).await?;
+    let child_m = collect_metrics(&[&child_br.metrics]);
+    let name = match spec.spec {
+        zyron_planner::logical::ExpandSpec::Unnest { .. } => "Unnest",
+        zyron_planner::logical::ExpandSpec::Flatten { .. } => "Flatten",
+        zyron_planner::logical::ExpandSpec::Unpivot { .. } => "Unpivot",
+    };
+    let spec = *spec;
+    let op = crate::operator::expand_rows::ExpandRowsOperator::new(
+        child_br.op,
+        spec.spec,
+        spec.carry,
+        spec.output_columns,
+        spec.input_schema,
+        spec.outer_input,
+        ctx.params.clone(),
+        Arc::clone(ctx),
+    );
+    Ok(BuildResult::new(Box::new(op)).with_metrics(name, analyze, child_m))
 }
 
 /// One arm of `build_operator_tree`, see that function for why the arms
