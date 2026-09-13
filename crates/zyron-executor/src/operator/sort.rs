@@ -671,7 +671,11 @@ impl SortOperator {
         let mut builders: Vec<ColumnData> = Vec::with_capacity(width);
         let mut types: Vec<(zyron_common::TypeId, Option<u8>)> = Vec::with_capacity(width);
         for column in &template.columns {
-            builders.push(ColumnData::with_capacity(column.type_id, MERGE_BATCH_ROWS));
+            builders.push(ColumnData::with_capacity_for(
+                column.type_id,
+                column.fractional_digits,
+                MERGE_BATCH_ROWS,
+            ));
             types.push((column.type_id, column.fractional_digits));
         }
         let mut null_flags: Vec<Vec<bool>> = vec![Vec::with_capacity(MERGE_BATCH_ROWS); width];
@@ -875,9 +879,11 @@ fn concat_columns(columns: &[Column]) -> Column {
     }
 
     let type_id = columns[0].type_id;
+    let fractional_digits = columns[0].fractional_digits;
     let total_len: usize = columns.iter().map(|c| c.len()).sum();
 
-    let mut data = crate::column::ColumnData::with_capacity(type_id, total_len);
+    let mut data =
+        crate::column::ColumnData::with_capacity_for(type_id, fractional_digits, total_len);
     let mut nulls = crate::column::NullBitmap::empty();
 
     for col in columns {
@@ -885,7 +891,7 @@ fn concat_columns(columns: &[Column]) -> Column {
         nulls.extend_from(&col.nulls);
     }
 
-    Column::with_nulls(data, nulls, type_id)
+    Column::with_nulls_ts(data, nulls, type_id, fractional_digits)
 }
 
 #[cfg(test)]

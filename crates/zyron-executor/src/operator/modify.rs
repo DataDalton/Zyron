@@ -9,7 +9,6 @@ use std::sync::Arc;
 use zyron_common::{TypeId, ZyronError};
 use zyron_planner::binder::{BoundAssignment, BoundExpr};
 use zyron_planner::logical::LogicalColumn;
-use zyron_storage::TupleId;
 
 use crate::batch::{
     DataBatch, batch_to_tuples, create_builders, encode_scalar_value, finalize_builders,
@@ -33,47 +32,20 @@ use crate::context::ExecutionContext;
 use crate::expr::{evaluate, literal_to_scalar};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
-/// Writes a batch of row images to the log, unless the table is a temporary
-/// one, and returns the LSN a page holding those rows is stamped with.
+/// Notes that a statement wrote rows of `table`, so its transaction commits
+/// with a record and waits for the log.
 ///
-/// A temporary table lives in one session on one node, is dropped when that
-/// session ends, and is cleared from disk by the next node start. A redo
-/// record for one describes a change nothing will ever replay, so writing it
-/// is a durable write in the service of nothing, and waiting on it at commit
-/// is a flush in the service of nothing.
-///
-/// The page is still stamped, with the log's current position rather than
-/// zero. An unstamped dirty page counts as dirty below every checkpoint
-/// boundary, which would hold WAL segments back for as long as a session
-/// held a temporary table. Stamping it at the current position says what is
-/// true: no log record older than now has to survive for this page.
-fn log_rows(
-    ctx: &ExecutionContext,
-    table: &zyron_catalog::TableEntry,
-    records: &[(u64, &[u8])],
-    kind: LoggedRows,
-) -> zyron_common::Result<zyron_wal::Lsn> {
-    if table.is_temporary() {
-        return Ok(ctx.wal.next_lsn());
+/// The heap logged each page it changed as it changed it. A temporary
+/// table's heap logs nothing. The table lives in one session on one node,
+/// is dropped when that session ends, and is cleared from disk by the next
+/// node start, so a record of it would describe a change nothing will ever
+/// replay and waiting on it at commit would be a flush in the service of
+/// nothing
+#[inline]
+fn note_rows_written(ctx: &ExecutionContext, table: &zyron_catalog::TableEntry) {
+    if !table.is_temporary() {
+        ctx.mark_wrote_wal();
     }
-    let lsn = match kind {
-        LoggedRows::Insert => ctx.wal.log_insert_batch_last_lsn(records)?,
-        LoggedRows::Delete => ctx
-            .wal
-            .log_delete_batch(records)?
-            .last()
-            .copied()
-            .unwrap_or(zyron_wal::Lsn::INVALID),
-    };
-    ctx.mark_wrote_wal();
-    Ok(lsn)
-}
-
-/// Which kind of row image a log write carries.
-#[derive(Clone, Copy)]
-enum LoggedRows {
-    Insert,
-    Delete,
 }
 
 /// Encodes a row's value at the given column position into a caller-provided
@@ -890,6 +862,25 @@ async fn insert_branch_batch(
     let ids =
         crate::operator::branch_write::branch_insert(ctx, branch_id, heap_file_id, &tuples).await?;
 
+    // The branch's changes are recorded in the branch's own feed, at the log
+    // position the write reached, so a stream on the branch reads them and
+    // a stream on the table does not
+    if let Some(capture) = ctx.change_capture(ctx.wal.next_lsn().0) {
+        let refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
+        capture
+            .hook
+            .on_insert(
+                table_id.0,
+                &refs,
+                capture.version,
+                capture.timestamp,
+                txn_id,
+                true,
+                capture.branch,
+            )
+            .map_err(|e| ZyronError::ExecutionError(format!("CDC insert hook failed: {e}")))?;
+    }
+
     crate::trigger::fire_row_triggers(
         ctx,
         table_id,
@@ -1447,15 +1438,6 @@ pub fn extract_column_bytes<'a>(
 // recovery in zyron-server can call the same logic. See
 // zyron_types::spatial_index::mbr_from_geometry.
 
-/// Serializes a TupleId into bytes for WAL payload.
-fn tuple_id_payload(tid: &TupleId) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(14);
-    buf.extend_from_slice(&tid.page_id.file_id.to_le_bytes());
-    buf.extend_from_slice(&tid.page_id.page_num.to_le_bytes());
-    buf.extend_from_slice(&tid.slot_id.to_le_bytes());
-    buf
-}
-
 // ---------------------------------------------------------------------------
 // Helper: build a single-row batch with the affected row count
 // ---------------------------------------------------------------------------
@@ -1818,23 +1800,9 @@ async fn write_quarantine(
     ));
 
     let tuples = batch_to_tuples(&q_batch, &q_entry.columns, txn_id, q_entry.schema_epoch);
-    let mut records: Vec<(u64, &[u8])> = Vec::with_capacity(tuples.len());
-    for t in &tuples {
-        records.push((txn_id, t.data()));
-    }
-    let last_lsn = ctx.wal.log_insert_batch_last_lsn(&records)?;
-    ctx.mark_wrote_wal();
-    let tuple_ids = q_heap.insert_batch(&tuples).await?;
-    if let Some(first) = tuple_ids.first() {
-        let mut prev_page = first.page_id;
-        ctx.buffer_pool.mark_dirty_with_lsn(prev_page, last_lsn.0);
-        for tid in tuple_ids.iter().skip(1) {
-            if tid.page_id != prev_page {
-                ctx.buffer_pool.mark_dirty_with_lsn(tid.page_id, last_lsn.0);
-                prev_page = tid.page_id;
-            }
-        }
-    }
+    // The heap logs each page it appends to and stamps it as it goes
+    q_heap.insert_batch(&tuples).await?;
+    note_rows_written(ctx, &q_entry);
     Ok(())
 }
 
@@ -3423,7 +3391,9 @@ pub(crate) fn enforce_not_null(
     table_columns: &[zyron_catalog::ColumnEntry],
 ) -> zyron_common::Result<()> {
     for (ci, col_entry) in table_columns.iter().enumerate() {
-        if col_entry.nullable {
+        // A dropped column holds NULL in every row written after the drop,
+        // whatever it was declared as while it was live
+        if col_entry.nullable || col_entry.dropped {
             continue;
         }
         let Some(column) = batch.columns.get(ci) else {
@@ -3916,27 +3886,6 @@ impl Operator for InsertOperator {
                     table_entry.schema_epoch,
                 );
 
-                // Reused scratch lives outside the inner alloc paths so the
-                // common-case OLTP single-row insert does not heap-allocate
-                // a fresh Vec for the trigger payload, the WAL record list,
-                // or the dirty-page set on every call.
-                //
-                // A temporary table's rows are never logged, so the record
-                // list is not built for one either: assembling a reference
-                // per row for a writer that discards them is a pass over the
-                // batch in the service of nothing
-                let logs_rows = !table_entry.is_temporary();
-                let mut batch_records: Vec<(u64, &[u8])> = if logs_rows {
-                    Vec::with_capacity(tuples.len())
-                } else {
-                    Vec::new()
-                };
-                if logs_rows {
-                    for t in &tuples {
-                        batch_records.push((txn_id, t.data()));
-                    }
-                }
-
                 // Fire BEFORE INSERT triggers if present.
                 if let Some(ref hook) = self.ctx.dml_hook {
                     let mut tuple_refs: Vec<&[u8]> = Vec::with_capacity(tuples.len());
@@ -3959,19 +3908,16 @@ impl Operator for InsertOperator {
                 )
                 .await?;
 
-                // Batch WAL log: one CAS + commit for all inserts in this batch
-                // Use the last-LSN-only variant so the WAL writer skips its
-                // per-record Vec<Lsn> allocation, callers further down the
-                // pipeline only need the last LSN to chain to the Commit record
-                let last_lsn =
-                    log_rows(&self.ctx, &table_entry, &batch_records, LoggedRows::Insert)?;
-
+                // The heap logs each page it appends to, one record per
+                // burst carrying the rows and where they went, and stamps
+                // the page with the record before the append's lock drops
                 #[cfg(feature = "profile")]
                 let _heap_span =
                     zyron_common::profile::scope(zyron_common::profile::Phase::ExecHeapInsert);
                 let tuple_ids = heap_file.insert_batch(&tuples).await?;
                 #[cfg(feature = "profile")]
                 drop(_heap_span);
+                note_rows_written(&self.ctx, &table_entry);
 
                 // A rewrite copying this table into a shadow needs the same
                 // rows. Mirroring here rather than after the statement means
@@ -3991,26 +3937,6 @@ impl Operator for InsertOperator {
                 // algorithm rebuilds from current data.
                 if let Some(gm) = &self.ctx.graph_manager {
                     gm.invalidate_for_table(self.table_id.0);
-                }
-
-                // Stamp dirty pages with WAL LSN for checkpoint ordering.
-                // Walk tuple_ids in order and emit one mark_dirty per distinct
-                // page, since insert_batch writes to consecutive heap pages
-                // and the buffer-pool dirty stamp is a per-page atomic. This
-                // turns an O(rows) hash lookup into O(unique pages).
-                if let Some(first) = tuple_ids.first() {
-                    let mut prev_page = first.page_id;
-                    self.ctx
-                        .buffer_pool
-                        .mark_dirty_with_lsn(prev_page, last_lsn.0);
-                    for tid in tuple_ids.iter().skip(1) {
-                        if tid.page_id != prev_page {
-                            self.ctx
-                                .buffer_pool
-                                .mark_dirty_with_lsn(tid.page_id, last_lsn.0);
-                            prev_page = tid.page_id;
-                        }
-                    }
                 }
 
                 total_inserted += tuples.len() as i64;
@@ -4058,19 +3984,27 @@ impl Operator for InsertOperator {
                 // leads one
                 crate::replication::capture_insert(&self.ctx, &table_entry, &exec_batch.batch)?;
 
-                // Notify CDC hook if present.
-                if let Some(ref hook) = self.ctx.cdc_hook {
+                // Notify CDC hook if present. The change is dated at the
+                // log's position once the rows are written, which is at or
+                // past every record the heap wrote for them
+                if let Some(capture) = self.ctx.change_capture(self.ctx.wal.next_lsn().0) {
                     let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as i64;
                     // A hook failure fails the statement: the change feed
                     // must carry every committed row, and a silent gap is
                     // undetectable downstream. Failing here aborts the
                     // transaction, so any records the hook did append are
                     // filtered out by delivery's commit check
-                    hook.on_insert(self.table_id.0, &tuple_refs, last_lsn.0, now, txn_id, true)
+                    capture
+                        .hook
+                        .on_insert(
+                            self.table_id.0,
+                            &tuple_refs,
+                            capture.version,
+                            capture.timestamp,
+                            txn_id,
+                            true,
+                            capture.branch,
+                        )
                         .map_err(|e| {
                             ZyronError::ExecutionError(format!("CDC insert hook failed: {e}"))
                         })?;
@@ -4138,8 +4072,14 @@ impl Operator for InsertOperator {
                     // The heap path notifies per batch under the WAL LSN it
                     // wrote. A lake append is one commit for the whole
                     // statement, so the feed gets one notification carrying
-                    // the log version the rows landed under
-                    if let Some(ref hook) = self.ctx.cdc_hook {
+                    // the log version the rows landed under. The images
+                    // are encoded for the hook alone, so a hook that
+                    // records none of this table's rows gets none
+                    if let Some(capture) = self.ctx.change_capture(outcome.version)
+                        && capture
+                            .hook
+                            .records_rows_of(self.table_id.0, capture.branch)
+                    {
                         let mut encoded: Vec<Vec<u8>> = Vec::new();
                         for batch in &lake_batches {
                             for r in 0..batch.num_rows {
@@ -4151,11 +4091,17 @@ impl Operator for InsertOperator {
                             }
                         }
                         let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as i64;
-                        hook.on_insert(self.table_id.0, &refs, outcome.version, now, txn_id, true)
+                        capture
+                            .hook
+                            .on_insert(
+                                self.table_id.0,
+                                &refs,
+                                capture.version,
+                                capture.timestamp,
+                                txn_id,
+                                true,
+                                capture.branch,
+                            )
                             .map_err(|e| {
                                 ZyronError::ExecutionError(format!("CDC insert hook failed: {e}"))
                             })?;
@@ -4321,10 +4267,18 @@ fn append_lake_batches(
     let rows: usize = batches.iter().map(|b| b.num_rows).sum();
     let materialize =
         zyron_common::profile::scope(zyron_common::profile::Phase::ExecLakeMaterialize);
-    let mut columns: Vec<zyron_lake::ColumnData> = table_entry
+    // A batch is shaped like the table's column list, and a dropped column
+    // holds its position there with nothing to store, so the live columns
+    // are taken from their positions and the lake sees those alone
+    let live: Vec<(usize, &zyron_catalog::ColumnEntry)> = table_entry
         .columns
         .iter()
-        .map(|c| {
+        .enumerate()
+        .filter(|(_, c)| !c.dropped)
+        .collect();
+    let mut columns: Vec<zyron_lake::ColumnData> = live
+        .iter()
+        .map(|(_, c)| {
             zyron_lake::ColumnData::with_capacity(
                 c.id.0 as u32,
                 c.physical_type_id().fixed_size().unwrap_or(0),
@@ -4334,12 +4288,12 @@ fn append_lake_batches(
         .collect();
     let mut scratch: Vec<u8> = Vec::new();
     for batch in batches {
-        for (ci, col_entry) in table_entry.columns.iter().enumerate() {
+        for (li, (ci, col_entry)) in live.iter().enumerate() {
             let value_size = col_entry.physical_type_id().fixed_size().unwrap_or(0);
-            let column = &batch.columns[ci];
+            let column = &batch.columns[*ci];
             for r in 0..batch.num_rows {
                 match column.get_scalar(r) {
-                    ScalarValue::Null => columns[ci].push(None),
+                    ScalarValue::Null => columns[li].push(None),
                     ref v => {
                         scratch.clear();
                         crate::batch::encode_scalar_value_into(
@@ -4348,7 +4302,7 @@ fn append_lake_batches(
                             v,
                             value_size,
                         );
-                        columns[ci].push(Some(&scratch));
+                        columns[li].push(Some(&scratch));
                     }
                 }
             }
@@ -4376,7 +4330,6 @@ fn append_lake_batches(
     // holds collides and a key only main holds does not
     let head = crate::operator::lake_scan::effective_head(ctx, None);
     let log = crate::operator::lake_scan::open_lake_write_head(&paths, &table_entry.name, head)?;
-    let root = log.registry_key();
     let unique_probe =
         zyron_common::profile::scope(zyron_common::profile::Phase::ExecLakeUniqueProbe);
     let probe = enforce_lake_unique(&log, table_entry, &columns, None)?;
@@ -4403,14 +4356,10 @@ fn append_lake_batches(
         deadline: ctx.deadline(),
     };
     let append = zyron_common::profile::scope(zyron_common::profile::Phase::ExecLakeAppend);
+    // The commit registers its version with the pending registry the
+    // transaction's end publishes from
     let out = zyron_lake::append_rows(&log, attempt, table_entry.id.0 as u64, &columns)?;
     drop(append);
-    zyron_lake::register_txn_pending(
-        ctx.disk_manager.data_dir(),
-        ctx.lake_txn_id(),
-        root,
-        out.version,
-    );
     Ok(Some(out))
 }
 
@@ -4679,6 +4628,152 @@ async fn ensure_locked_rows_unchanged(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Row images over every column of the table
+// ---------------------------------------------------------------------------
+
+/// The shape a write path reads a row image in, one column per entry of the
+/// table's column list, a dropped column included.
+///
+/// A scan produces the live columns alone, and every read a write path
+/// makes by position, a constraint's key columns, a trigger's OLD and NEW
+/// rows, a CHECK, the tuple encoder, is against the table's whole column
+/// list, in which a dropped column keeps its position. A batch that lacks
+/// the dropped columns takes a NULL column at each of their positions
+/// before any of those reads, and the schema the batch is evaluated under
+/// takes the column's description at the same position
+pub(crate) struct TableShape {
+    /// Each dropped column's position in the table's column list and the
+    /// type its NULL column carries, ascending
+    dropped: Vec<(usize, TypeId)>,
+    /// How many columns the table carries, live and dropped
+    width: usize,
+}
+
+impl TableShape {
+    /// The shape of `table`, none when every column of the table is live
+    /// and a scanned batch already has it
+    pub(crate) fn of(table: &zyron_catalog::TableEntry) -> Option<Self> {
+        let dropped: Vec<(usize, TypeId)> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.dropped)
+            .map(|(at, c)| (at, c.type_id))
+            .collect();
+        if dropped.is_empty() {
+            return None;
+        }
+        Some(Self {
+            dropped,
+            width: table.columns.len(),
+        })
+    }
+
+    /// How many columns the table's live rows have
+    fn live_width(&self) -> usize {
+        self.width - self.dropped.len()
+    }
+
+    /// Widens a batch holding the live columns alone to the table's width,
+    /// leaving a batch already that wide as it is. A batch of any other
+    /// width is not a row image of this table, and it is refused rather
+    /// than read at the wrong positions
+    pub(crate) fn widen(
+        &self,
+        batch: &mut DataBatch,
+        table_name: &str,
+    ) -> zyron_common::Result<()> {
+        if batch.columns.len() == self.width {
+            return Ok(());
+        }
+        if batch.columns.len() != self.live_width() {
+            return Err(ZyronError::Internal(format!(
+                "a row image of table \"{table_name}\" has {} columns where the table's live \
+                 columns number {}",
+                batch.columns.len(),
+                self.live_width()
+            )));
+        }
+        self.fill_dropped(batch, table_name)
+    }
+
+    /// Puts a NULL column at each dropped column's position of a batch
+    /// whose first columns are the live columns, whatever follows them
+    /// keeping its place after the table's columns. For the rows a schema
+    /// answered `widen_schema` about
+    pub(crate) fn fill_dropped(
+        &self,
+        batch: &mut DataBatch,
+        table_name: &str,
+    ) -> zyron_common::Result<()> {
+        if batch.columns.len() < self.live_width() {
+            return Err(ZyronError::Internal(format!(
+                "a row image of table \"{table_name}\" has {} columns where the table's live \
+                 columns number {}",
+                batch.columns.len(),
+                self.live_width()
+            )));
+        }
+        let rows = batch.num_rows;
+        for &(at, type_id) in &self.dropped {
+            batch.columns.insert(at, Column::null_column(type_id, rows));
+        }
+        Ok(())
+    }
+
+    /// Widens a schema that begins with the table's live columns in table
+    /// order to one that begins with every column of the table, leaving a
+    /// schema that already does as it is. Whatever follows the table's own
+    /// columns, such as the values an apply carries beside the old image,
+    /// keeps its place after them. A schema shaped any other way is refused,
+    /// because a row read through it would land at the wrong positions.
+    ///
+    /// Answers whether the rows read through the schema arrive as the live
+    /// columns, which `fill_dropped` then widens, rather than already
+    /// carrying every column
+    pub(crate) fn widen_schema(
+        &self,
+        schema: &mut Vec<LogicalColumn>,
+        table: &zyron_catalog::TableEntry,
+    ) -> zyron_common::Result<bool> {
+        let whole = schema.len() >= self.width
+            && schema
+                .iter()
+                .zip(table.columns.iter())
+                .all(|(l, c)| l.column_id == c.id);
+        if whole {
+            return Ok(false);
+        }
+        let live = schema.len() >= self.live_width()
+            && schema
+                .iter()
+                .zip(table.live_columns())
+                .all(|(l, c)| l.column_id == c.id);
+        if !live {
+            return Err(ZyronError::Internal(format!(
+                "the rows written to table \"{}\" are not read through its columns",
+                table.name
+            )));
+        }
+        for &(at, _) in &self.dropped {
+            let column = &table.columns[at];
+            schema.insert(
+                at,
+                LogicalColumn {
+                    table_idx: Some(0),
+                    column_id: column.id,
+                    name: column.name.clone(),
+                    type_id: column.type_id,
+                    nullable: true,
+                    fractional_digits: column.fractional_digits,
+                },
+            );
+        }
+        Ok(true)
+    }
+}
+
 /// Pulls rows with tuple IDs from a child scan, logs deletions to WAL,
 /// deletes from the heap, and returns the row count.
 pub struct DeleteOperator {
@@ -4712,10 +4807,14 @@ impl Operator for DeleteOperator {
             self.finished = true;
 
             self.ctx.ensure_writable("DELETE")?;
-            self.ctx.ensure_heap_branch_resolved(
-                "DELETE",
-                &self.ctx.get_table_entry(self.table_id)?.name,
-            )?;
+            let entry = self.ctx.get_table_entry(self.table_id)?;
+            let table_name = entry.name.clone();
+            self.ctx
+                .ensure_heap_branch_resolved("DELETE", &table_name)?;
+            // The rows arrive as the live columns, and every read below is
+            // by position in the table's whole column list
+            let shape = TableShape::of(&entry);
+            drop(entry);
 
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_deleted: i64 = 0;
@@ -4724,9 +4823,12 @@ impl Operator for DeleteOperator {
             loop {
                 self.ctx.check_cancelled()?;
                 let input = self.child.next().await?;
-                let Some(exec_batch) = input else {
+                let Some(mut exec_batch) = input else {
                     break;
                 };
+                if let Some(shape) = &shape {
+                    shape.widen(&mut exec_batch.batch, &table_name)?;
+                }
 
                 // Take exclusive row locks before any mutation so a held
                 // FOR UPDATE/SHARE lock blocks this delete and two writers
@@ -4823,7 +4925,7 @@ impl Operator for DeleteOperator {
 
                     // Capture old tuples for the CDC hook before the rows are
                     // superseded.
-                    let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
+                    let old_tuples_for_cdc = if self.ctx.captures_changes() {
                         Some(batch_to_tuples(
                             &exec_batch.batch,
                             &te.columns,
@@ -4925,14 +5027,20 @@ impl Operator for DeleteOperator {
                     crate::replication::capture_delete(&self.ctx, &te, &exec_batch.batch)?;
 
                     // Notify CDC hook if present.
-                    if let Some(ref hook) = self.ctx.cdc_hook {
+                    if let Some(capture) = self.ctx.change_capture(last_lsn) {
                         if let Some(ref old_tuples) = old_tuples_for_cdc {
                             let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as i64;
-                            hook.on_delete(self.table_id.0, &refs, last_lsn, now, txn_id, true)
+                            capture
+                                .hook
+                                .on_delete(
+                                    self.table_id.0,
+                                    &refs,
+                                    capture.version,
+                                    capture.timestamp,
+                                    txn_id,
+                                    true,
+                                    capture.branch,
+                                )
                                 .map_err(|e| {
                                     ZyronError::ExecutionError(format!(
                                         "CDC delete hook failed: {e}"
@@ -5016,6 +5124,33 @@ impl Operator for DeleteOperator {
                     .await?;
                     {
                         let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                        // The branch's feed records the rows the branch
+                        // removed, as the images the scan read
+                        if let Some(capture) = self.ctx.change_capture(self.ctx.wal.next_lsn().0) {
+                            let old_tuples = batch_to_tuples(
+                                &exec_batch.batch,
+                                &table_entry.columns,
+                                txn_id,
+                                table_entry.schema_epoch,
+                            );
+                            let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                            capture
+                                .hook
+                                .on_delete(
+                                    self.table_id.0,
+                                    &refs,
+                                    capture.version,
+                                    capture.timestamp,
+                                    txn_id,
+                                    true,
+                                    capture.branch,
+                                )
+                                .map_err(|e| {
+                                    ZyronError::ExecutionError(format!(
+                                        "CDC delete hook failed: {e}"
+                                    ))
+                                })?;
+                        }
                         crate::operator::fk::enforce_parent_delete(
                             &self.ctx,
                             &table_entry,
@@ -5047,7 +5182,7 @@ impl Operator for DeleteOperator {
                 );
 
                 // Capture old tuples for CDC hook (batch data is from the scan).
-                let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
+                let old_tuples_for_cdc = if self.ctx.captures_changes() {
                     let table_entry = self.ctx.get_table_entry(self.table_id)?;
                     Some(batch_to_tuples(
                         &exec_batch.batch,
@@ -5059,29 +5194,16 @@ impl Operator for DeleteOperator {
                     None
                 };
 
-                // Batch WAL log: one CAS + commit for all deletes in this batch.
-                let payloads: Vec<Vec<u8>> = tuple_ids.iter().map(tuple_id_payload).collect();
-                let batch_records: Vec<(u64, &[u8])> =
-                    payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
-                let last_lsn = log_rows(
-                    &self.ctx,
-                    self.ctx.get_table_entry(self.table_id)?.as_ref(),
-                    &batch_records,
-                    LoggedRows::Delete,
-                )?;
-
                 // MVCC delete: stamp xmax = this txn on each row instead of
                 // freeing the slot. Snapshot visibility hides the row once this
                 // txn commits; an aborted delete leaves it visible, and vacuum
                 // reclaims the space later. B+tree entries are intentionally
                 // kept: an index scan rechecks visibility and the key on fetch,
                 // so a stale entry can neither resurrect a deleted row nor
-                // mismatch a vacuumed-and-reused slot.
-                let retain_history = self
-                    .ctx
-                    .get_table_entry(self.table_id)
-                    .map(|t| t.time_travel_retention_secs != 0)
-                    .unwrap_or(false);
+                // mismatch a vacuumed-and-reused slot. The heap logs each
+                // page it stamps and stamps the page with the record
+                let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                let retain_history = table_entry.time_travel_retention_secs != 0;
                 let deleted = heap_file
                     .mark_deleted_batch(
                         &tuple_ids,
@@ -5091,6 +5213,7 @@ impl Operator for DeleteOperator {
                         retain_history,
                     )
                     .await?;
+                note_rows_written(&self.ctx, &table_entry);
 
                 // A rewrite copying this table needs the delete too, or the
                 // swap would install a table still holding the row
@@ -5118,14 +5241,6 @@ impl Operator for DeleteOperator {
                         crate::operator::fk::FkPhase::AfterWrite,
                     )
                     .await?;
-                }
-
-                // Stamp dirty pages with WAL LSN for checkpoint ordering.
-                // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0.
-                for tid in &tuple_ids {
-                    self.ctx
-                        .buffer_pool
-                        .mark_dirty_with_lsn(tid.page_id, last_lsn.0);
                 }
 
                 total_deleted += deleted as i64;
@@ -5194,15 +5309,22 @@ impl Operator for DeleteOperator {
                     crate::replication::capture_delete(&self.ctx, &table_entry, &exec_batch.batch)?;
                 }
 
-                // Notify CDC hook if present.
-                if let Some(ref hook) = self.ctx.cdc_hook {
+                // Notify CDC hook if present, dated at the log's position
+                // once the stamps are written
+                if let Some(capture) = self.ctx.change_capture(self.ctx.wal.next_lsn().0) {
                     if let Some(ref old_tuples) = old_tuples_for_cdc {
                         let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as i64;
-                        hook.on_delete(self.table_id.0, &refs, last_lsn.0, now, txn_id, true)
+                        capture
+                            .hook
+                            .on_delete(
+                                self.table_id.0,
+                                &refs,
+                                capture.version,
+                                capture.timestamp,
+                                txn_id,
+                                true,
+                                capture.branch,
+                            )
                             .map_err(|e| {
                                 ZyronError::ExecutionError(format!("CDC delete hook failed: {e}"))
                             })?;
@@ -5325,6 +5447,14 @@ impl Operator for UpdateOperator {
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
             self.ctx
                 .ensure_heap_branch_resolved("UPDATE", &table_entry.name)?;
+            // Every read below is by position in the table's whole column
+            // list, the assignments and the correlated values included, so
+            // rows that arrive as the live columns are widened to it
+            let shape = TableShape::of(&table_entry);
+            let fill = match &shape {
+                Some(shape) => shape.widen_schema(&mut self.input_schema, &table_entry)?,
+                None => false,
+            };
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_updated: i64 = 0;
             let txn_id = self.ctx.txn_id;
@@ -5346,9 +5476,12 @@ impl Operator for UpdateOperator {
             loop {
                 self.ctx.check_cancelled()?;
                 let input = self.child.next().await?;
-                let Some(exec_batch) = input else {
+                let Some(mut exec_batch) = input else {
                     break;
                 };
+                if fill && let Some(shape) = &shape {
+                    shape.fill_dropped(&mut exec_batch.batch, &table_entry.name)?;
+                }
 
                 // Take exclusive row locks before any mutation so a held
                 // FOR UPDATE/SHARE lock blocks this update and two writers
@@ -5763,7 +5896,7 @@ impl Operator for UpdateOperator {
                     )?;
 
                     // Notify CDC hook if present.
-                    if let Some(ref hook) = self.ctx.cdc_hook {
+                    if let Some(capture) = self.ctx.change_capture(last_lsn) {
                         let old_tuples = batch_to_tuples(
                             &exec_batch.batch,
                             &table_entry.columns,
@@ -5778,22 +5911,21 @@ impl Operator for UpdateOperator {
                         );
                         let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                         let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as i64;
-                        hook.on_update(
-                            self.table_id.0,
-                            &old_refs,
-                            &new_refs,
-                            last_lsn,
-                            now,
-                            txn_id,
-                            true,
-                        )
-                        .map_err(|e| {
-                            ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
-                        })?;
+                        capture
+                            .hook
+                            .on_update(
+                                self.table_id.0,
+                                &old_refs,
+                                &new_refs,
+                                capture.version,
+                                capture.timestamp,
+                                txn_id,
+                                true,
+                                capture.branch,
+                            )
+                            .map_err(|e| {
+                                ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
+                            })?;
                     }
 
                     // Fire AFTER UPDATE row/statement triggers (NEW image).
@@ -6007,6 +6139,33 @@ impl Operator for UpdateOperator {
                         &new_tuples,
                     )
                     .await?;
+                    // The branch's feed records the rows before and after
+                    // the branch changed them
+                    if let Some(capture) = self.ctx.change_capture(self.ctx.wal.next_lsn().0) {
+                        let old_tuples = batch_to_tuples(
+                            &exec_batch.batch,
+                            &table_entry.columns,
+                            txn_id,
+                            table_entry.schema_epoch,
+                        );
+                        let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                        let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
+                        capture
+                            .hook
+                            .on_update(
+                                self.table_id.0,
+                                &old_refs,
+                                &new_refs,
+                                capture.version,
+                                capture.timestamp,
+                                txn_id,
+                                true,
+                                capture.branch,
+                            )
+                            .map_err(|e| {
+                                ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
+                            })?;
+                    }
                     crate::operator::fk::enforce_parent_update(
                         &self.ctx,
                         &table_entry,
@@ -6028,17 +6187,9 @@ impl Operator for UpdateOperator {
                     continue;
                 }
 
-                // Batch WAL log deletes: one CAS + commit for all.
-                let delete_payloads: Vec<Vec<u8>> =
-                    tuple_ids.iter().map(tuple_id_payload).collect();
-                let delete_records: Vec<(u64, &[u8])> = delete_payloads
-                    .iter()
-                    .map(|p| (txn_id, p.as_slice()))
-                    .collect();
-                let del_last_lsn =
-                    log_rows(&self.ctx, &table_entry, &delete_records, LoggedRows::Delete)?;
                 // MVCC: stamp xmax on the old image rather than freeing it, so an
-                // aborted update leaves the original row visible.
+                // aborted update leaves the original row visible. The heap
+                // logs each page it stamps and stamps the page with the record
                 heap_file
                     .mark_deleted_batch(
                         &tuple_ids,
@@ -6048,6 +6199,7 @@ impl Operator for UpdateOperator {
                         table_entry.time_travel_retention_secs != 0,
                     )
                     .await?;
+                note_rows_written(&self.ctx, &table_entry);
 
                 if let Some(gm) = &self.ctx.graph_manager {
                     gm.invalidate_for_table(self.table_id.0);
@@ -6067,19 +6219,7 @@ impl Operator for UpdateOperator {
                     }
                 }
 
-                // Stamp deleted pages with WAL LSN for checkpoint ordering.
-                // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0.
-                for tid in &tuple_ids {
-                    self.ctx
-                        .buffer_pool
-                        .mark_dirty_with_lsn(tid.page_id, del_last_lsn.0);
-                }
-
-                // Batch WAL log inserts: one CAS + commit for all.
-                let insert_records: Vec<(u64, &[u8])> =
-                    new_tuples.iter().map(|t| (txn_id, t.data())).collect();
-                let ins_last_lsn =
-                    log_rows(&self.ctx, &table_entry, &insert_records, LoggedRows::Insert)?;
+                // The new images, logged by the heap page by page as they land
                 #[cfg(feature = "profile")]
                 let _heap_span =
                     zyron_common::profile::scope(zyron_common::profile::Phase::ExecHeapInsert);
@@ -6097,13 +6237,6 @@ impl Operator for UpdateOperator {
                             *tid,
                         );
                     }
-                }
-
-                // Stamp inserted pages with WAL LSN for checkpoint ordering.
-                for tid in &new_tuple_ids {
-                    self.ctx
-                        .buffer_pool
-                        .mark_dirty_with_lsn(tid.page_id, ins_last_lsn.0);
                 }
 
                 total_updated += tuple_ids.len() as i64;
@@ -6255,8 +6388,9 @@ impl Operator for UpdateOperator {
                     &updated_batch,
                 )?;
 
-                // Notify CDC hook if present.
-                if let Some(ref hook) = self.ctx.cdc_hook {
+                // Notify CDC hook if present, dated at the log's position
+                // once both halves of the update are written
+                if let Some(capture) = self.ctx.change_capture(self.ctx.wal.next_lsn().0) {
                     let old_tuples = batch_to_tuples(
                         &exec_batch.batch,
                         &table_entry.columns,
@@ -6265,22 +6399,21 @@ impl Operator for UpdateOperator {
                     );
                     let old_slices: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
                     let new_refs_data: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as i64;
-                    hook.on_update(
-                        self.table_id.0,
-                        &old_slices,
-                        &new_refs_data,
-                        ins_last_lsn.0,
-                        now,
-                        txn_id,
-                        true,
-                    )
-                    .map_err(|e| {
-                        ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
-                    })?;
+                    capture
+                        .hook
+                        .on_update(
+                            self.table_id.0,
+                            &old_slices,
+                            &new_refs_data,
+                            capture.version,
+                            capture.timestamp,
+                            txn_id,
+                            true,
+                            capture.branch,
+                        )
+                        .map_err(|e| {
+                            ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
+                        })?;
                 }
 
                 // Fire AFTER UPDATE row/statement triggers (NEW image) in txn.

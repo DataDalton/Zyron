@@ -1,6 +1,6 @@
 # DROP CDC STREAM
 
-Stops the stream. Changes committed after it is dropped are not sent, and the table is otherwise untouched.
+Stops the stream. Changes committed after it is dropped are not sent, and the table is otherwise untouched. A change stream created with the outbound stream is dropped with it. One named with FROM CHANGE STREAM stays.
 
 ## Syntax
 

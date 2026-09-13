@@ -1,10 +1,12 @@
 //! Background CDC writer.
 //!
 //! Every cycle forces appended change data feed records to durable
-//! storage, appends themselves only flush to the OS. On a longer cadence
-//! it enforces each feed's age retention window, floored at the slowest
-//! consumer's confirmed position so a lagging replication slot or
-//! subscriber never loses changes it has not confirmed.
+//! storage, appends themselves only flush to the OS, and forgets the
+//! transactions each feed still counts as open once they have ended, so a
+//! feed nothing reads stays bounded. On a longer cadence it enforces each
+//! feed's age retention window, floored at the slowest consumer's
+//! confirmed position so a lagging replication slot or subscriber never
+//! loses changes it has not confirmed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -15,6 +17,9 @@ use tracing::{debug, error, info};
 use zyron_catalog::Catalog;
 use zyron_cdc::{CdcRetentionManager, CdfRegistry, SlotManager};
 
+/// Answers whether a transaction has ended, committed or aborted
+pub type TxnEnded = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
 /// Configuration for the CDC writer worker.
 #[derive(Debug, Clone)]
 pub struct CdcWriterConfig {
@@ -22,6 +27,12 @@ pub struct CdcWriterConfig {
     pub interval_secs: u64,
     /// Interval between age retention passes in seconds (default 3600).
     pub retention_interval_secs: u64,
+    /// The longest retention any feed is enforced at, in microseconds. Zero
+    /// leaves each feed's own window in force
+    pub max_retention_micros: i64,
+    /// Bytes a feed may hold before its oldest changes are purged ahead of
+    /// their retention. Zero sets no cap
+    pub max_bytes_per_table: u64,
 }
 
 impl Default for CdcWriterConfig {
@@ -29,6 +40,8 @@ impl Default for CdcWriterConfig {
         Self {
             interval_secs: 5,
             retention_interval_secs: 3600,
+            max_retention_micros: 0,
+            max_bytes_per_table: 0,
         }
     }
 }
@@ -52,16 +65,18 @@ impl CdcWriter {
 
     /// Starts the CDC writer thread.
     pub fn start(config: CdcWriterConfig) -> Self {
-        Self::start_with_registry(config, None, None, None)
+        Self::start_with_registry(config, None, None, None, None)
     }
 
     /// Starts the CDC writer thread. The slot manager and catalog supply
-    /// the consumer positions that floor the retention purge.
+    /// the consumer positions that floor the retention purge, and `ended`
+    /// says which transactions are over so each feed forgets them
     pub fn start_with_registry(
         config: CdcWriterConfig,
         registry: Option<Arc<CdfRegistry>>,
         slot_manager: Option<Arc<SlotManager>>,
         catalog: Option<Arc<Catalog>>,
+        ended: Option<TxnEnded>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
@@ -79,6 +94,7 @@ impl CdcWriter {
                     registry.as_ref(),
                     slot_manager.as_ref(),
                     catalog.as_ref(),
+                    ended.as_ref(),
                 );
             })
             .expect("failed to spawn CDC writer thread");
@@ -90,18 +106,23 @@ impl CdcWriter {
         }
     }
 
-    /// Main writer loop. Syncs feeds every interval and enforces retention
-    /// on the longer retention interval.
+    /// Main writer loop. Syncs feeds and forgets their ended transactions
+    /// every interval and enforces retention on the longer retention
+    /// interval.
     fn writer_loop(
         config: &CdcWriterConfig,
         shutdown: &AtomicBool,
         registry: Option<&Arc<CdfRegistry>>,
         slot_manager: Option<&Arc<SlotManager>>,
         catalog: Option<&Arc<Catalog>>,
+        ended: Option<&TxnEnded>,
     ) {
         let interval = Duration::from_secs(config.interval_secs);
         let retention_interval = Duration::from_secs(config.retention_interval_secs.max(60));
-        let retention_manager = registry.map(|reg| CdcRetentionManager::new(Arc::clone(reg)));
+        let retention_manager = registry.map(|reg| {
+            CdcRetentionManager::new(Arc::clone(reg))
+                .with_caps(config.max_retention_micros, config.max_bytes_per_table)
+        });
         let mut last_retention = Instant::now();
 
         loop {
@@ -117,6 +138,12 @@ impl CdcWriter {
 
             if let Some(reg) = registry {
                 Self::sync_feeds(reg);
+                if let Some(ended) = ended {
+                    let open = reg.prune_in_flight(ended.as_ref());
+                    if open > 0 {
+                        debug!("CDC feeds hold records of {} open transactions", open);
+                    }
+                }
 
                 if let Some(mgr) = retention_manager.as_ref() {
                     if last_retention.elapsed() >= retention_interval {
@@ -126,11 +153,16 @@ impl CdcWriter {
                         for (table_id, err) in &failures {
                             error!("CDC retention failed for table {}: {}", table_id, err);
                         }
-                        if stats.records_purged > 0 || stats.records_compacted > 0 {
+                        if stats.records_purged > 0
+                            || stats.records_compacted > 0
+                            || stats.records_capped > 0
+                        {
                             info!(
-                                "CDC retention purged {} records, compacted {}, reclaimed {} bytes across {} tables",
+                                "CDC retention purged {} records, compacted {}, took {} ahead of                                  retention at a byte cap on {} tables, reclaimed {} bytes across                                  {} tables",
                                 stats.records_purged,
                                 stats.records_compacted,
+                                stats.records_capped,
+                                stats.tables_capped,
                                 stats.bytes_reclaimed,
                                 stats.tables_processed
                             );
@@ -212,6 +244,7 @@ mod tests {
         let config = CdcWriterConfig {
             interval_secs: 1,
             retention_interval_secs: 3600,
+            ..CdcWriterConfig::default()
         };
         let mut worker = CdcWriter::start(config);
         assert!(worker.thread.is_some());

@@ -1648,7 +1648,8 @@ fn finalize_groups(
     let mut columns: Vec<Column> = Vec::with_capacity(output_schema.len());
     for (i, col_def) in output_schema.iter().enumerate().take(num_group_cols) {
         let store_col = &state.group_key_store[i];
-        let mut data = ColumnData::with_capacity(col_def.type_id, num_groups);
+        let mut data =
+            ColumnData::with_capacity_for(col_def.type_id, col_def.fractional_digits, num_groups);
         let mut nulls = NullBitmap::empty();
         for gidx in 0..num_groups {
             nulls.push(store_col.is_null(gidx));
@@ -2937,7 +2938,7 @@ impl GroupAccumulatorState {
         if self.group_key_store.is_empty() {
             for gc in &group_cols {
                 self.group_key_store.push(Column::new_ts(
-                    ColumnData::with_capacity(gc.type_id, 64),
+                    ColumnData::with_capacity_for(gc.type_id, gc.fractional_digits, 64),
                     gc.type_id,
                     gc.fractional_digits,
                 ));
@@ -3030,9 +3031,10 @@ impl GroupAccumulatorState {
         }
         if self.group_key_store.is_empty() {
             for c in &other.group_key_store {
-                self.group_key_store.push(Column::new(
-                    ColumnData::with_capacity(c.type_id, 64),
+                self.group_key_store.push(Column::new_ts(
+                    ColumnData::with_capacity_for(c.type_id, c.fractional_digits, 64),
                     c.type_id,
+                    c.fractional_digits,
                 ));
             }
         }
@@ -3788,6 +3790,7 @@ mod tests {
                 size_bytes: rows_per_file * 8,
                 row_count: rows_per_file,
                 added_version: 1,
+                schema_id: 1,
                 cluster_spec_id: 0,
                 column_stats: std::sync::Arc::new(vec![zyron_lake::ColumnStatsEntry {
                     column_id: 0,
@@ -3821,6 +3824,7 @@ mod tests {
             properties: std::collections::BTreeMap::new(),
             indexes: Vec::new(),
             index_files: Vec::new(),
+            type_history: Vec::new(),
         }
     }
 

@@ -584,7 +584,7 @@ fn count_matching_rows(
     file: &PartitionEntry,
     predicate: &LakePredicate,
 ) -> Result<u64, ZyronError> {
-    let reader = LakeFileReader::open(log.paths(), file.partition_id)?;
+    let reader = LakeFileReader::open_in(base, log.paths(), file.partition_id)?;
     let row_count = reader.row_count();
     if row_count == 0 {
         return Ok(0);
@@ -830,7 +830,7 @@ pub fn delete_all(
                 rows_matched += file.row_count;
                 continue;
             }
-            let reader = LakeFileReader::open(log.paths(), file.partition_id)?;
+            let reader = LakeFileReader::open_in(base, log.paths(), file.partition_id)?;
             let keep = reader.delete_survivors(&base.schema, base, file)?;
             rows_matched += keep.iter().map(|b| b.count_ones() as u64).sum::<u64>();
         }
@@ -1157,7 +1157,7 @@ pub fn backfill_derived(
         // One file at a time, so a table larger than memory backfills in the
         // footprint of its widest file rather than of the whole table
         for input in &base.entries {
-            let reader = LakeFileReader::open(log.paths(), input.partition_id)?;
+            let reader = LakeFileReader::open_in(base, log.paths(), input.partition_id)?;
             let keep = reader.delete_survivors(&base.schema, base, input)?;
             let decoded: Vec<_> = base
                 .schema
@@ -1309,7 +1309,7 @@ pub fn optimize(
             })
             .collect();
         for input in &inputs {
-            let reader = LakeFileReader::open(log.paths(), input.partition_id)?;
+            let reader = LakeFileReader::open_in(base, log.paths(), input.partition_id)?;
             let keep = reader.delete_survivors(&base.schema, base, input)?;
             let decoded: Vec<_> = base
                 .schema

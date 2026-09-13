@@ -4,6 +4,7 @@
 
 pub mod admission;
 pub mod array_value;
+pub mod change_kind;
 pub mod checksum;
 pub mod cluster;
 pub mod config;
@@ -30,6 +31,11 @@ pub mod zerocopy;
 
 pub use admission::{Admission, InFlightCounts, InFlightGuard};
 pub use array_value::ArrayView;
+pub use change_kind::{
+    CHANGE_TYPE_CODES, CHANGE_TYPE_DELETE, CHANGE_TYPE_INSERT, CHANGE_TYPE_SCHEMA_CHANGE,
+    CHANGE_TYPE_TRUNCATE, CHANGE_TYPE_UPDATE_POSTIMAGE, CHANGE_TYPE_UPDATE_PREIMAGE,
+    change_type_bit, change_type_code, change_type_label,
+};
 pub use checksum::{
     ALGORITHM_VERSION, FX_K, HASH_GOLDEN, Hasher, HotHasher, IdentityBuildHasher, IdentityHasher,
     PreHashMap, ZyBuildHasher, ZyBuildHasherSeeded, fnv1a_64, fx_mix, hash_combine, hash_fold,

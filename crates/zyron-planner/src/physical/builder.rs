@@ -77,6 +77,10 @@ impl<'a> PhysicalPlanner<'a> {
                 as_of,
                 ..
             } => self.plan_scan(table_id, columns, None, encoding_hints, as_of, None),
+            LogicalPlan::ChangeScan {
+                spec,
+                output_columns,
+            } => self.plan_change_scan(spec, output_columns),
             LogicalPlan::Filter { predicate, child } => self.plan_filter(predicate, child),
             LogicalPlan::Project {
                 expressions,
@@ -556,6 +560,68 @@ impl<'a> PhysicalPlanner<'a> {
 
     /// One arm of `plan`, see that function for why the arms are not
     /// written inline
+    /// Lowers a change scan, whose windows the binder already resolved.
+    ///
+    /// The row count comes from the feeds' per-version counters rather than
+    /// from table statistics. What a change scan returns is the changes
+    /// recorded in a window, which has nothing to do with how many rows the
+    /// table holds now
+    #[inline(never)]
+    fn plan_change_scan(
+        &self,
+        mut spec: Box<crate::logical::ChangeScanSpec>,
+        output_columns: Vec<LogicalColumn>,
+    ) -> Result<PhysicalPlan> {
+        // Predicate pushdown may have tightened the windows and projection
+        // pushdown may have pruned the columns since the binder resolved
+        // them, so what the scan opens and what it is refused for are both
+        // decided against the final shape
+        let facts = crate::change_feed_facts_for(self.catalog);
+        for window in spec.windows.iter_mut() {
+            let table = self.catalog.get_table_by_id(window.table_id)?;
+            let own: Vec<LogicalColumn> =
+                crate::change_scan::columns_on(&table, &spec.data_columns)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            crate::change_scan::check_recorded_columns(facts.as_deref(), &table, &own)?;
+            // A predicate over a column the feed does not record would
+            // compare against NULL for every row and silently drop them all
+            let own: Vec<LogicalColumn> =
+                crate::change_scan::columns_on(&table, &spec.filter_columns)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            crate::change_scan::check_recorded_columns(facts.as_deref(), &table, &own)?;
+            crate::change_scan::check_before_image(facts.as_deref(), &table, window.change_types)?;
+            if let Some(facts) = facts.as_deref() {
+                let (opened, pruned) = facts.files_for_window(
+                    window.table_id.0,
+                    window.from_exclusive,
+                    window.to_inclusive,
+                );
+                window.files_opened = opened;
+                window.files_pruned = pruned;
+                window.estimated_rows = facts.rows_in_window(
+                    window.table_id.0,
+                    window.from_exclusive,
+                    window.to_inclusive,
+                );
+            }
+        }
+        let rows = spec.estimated_rows().max(1) as f64;
+        let cost = PlanCost {
+            io_cost: spec.files_opened() as f64 * self.cost_model.seq_page_cost,
+            cpu_cost: rows * self.cost_model.cpu_tuple_cost,
+            row_count: rows,
+        };
+        Ok(PhysicalPlan::ChangeScan {
+            spec,
+            columns: output_columns,
+            cost,
+        })
+    }
+
     #[inline(never)]
     fn plan_expand_rows(
         &self,
@@ -1355,9 +1421,10 @@ impl<'a> PhysicalPlanner<'a> {
             .map(|p| crate::lake_predicate::render_sql(p, &te.columns))
             .unwrap_or_else(|| "TRUE".to_string());
 
-        // The new row image needs every column, so the scan is rebuilt
-        // over the full projection rather than the narrower one the
-        // logical plan asked for
+        // The new row image needs every live column, so the scan is rebuilt
+        // over that projection rather than the narrower one the logical
+        // plan asked for. A dropped column is not in the lake schema, and
+        // the update operator widens the image to the table's column list
         let table_idx = match child {
             PhysicalPlan::LakeScan { columns, .. } => {
                 columns.first().and_then(|c| c.table_idx).unwrap_or(0)
@@ -1365,8 +1432,7 @@ impl<'a> PhysicalPlanner<'a> {
             _ => 0,
         };
         let columns: Vec<crate::logical::LogicalColumn> = te
-            .columns
-            .iter()
+            .live_columns()
             .map(|c| crate::logical::LogicalColumn {
                 table_idx: Some(table_idx),
                 column_id: c.id,

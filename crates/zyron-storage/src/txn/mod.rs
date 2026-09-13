@@ -17,6 +17,7 @@ mod proc_array;
 mod retention_clock;
 mod snapshot;
 mod status_map;
+mod stream_position;
 mod undo;
 
 pub use deadlock::WaitForGraph;
@@ -29,6 +30,7 @@ pub use proc_array::ProcArray;
 pub use retention_clock::RetentionClock;
 pub use snapshot::Snapshot;
 pub use status_map::{TxnStatus, TxnStatusMap};
+pub use stream_position::StreamPositionLocks;
 pub use undo::{TxnUndoLog, UndoEntry};
 
 use std::sync::Arc;
@@ -115,6 +117,10 @@ pub struct Transaction {
     intent_locks: Arc<IntentLockTable>,
     wait_for_graph: Arc<WaitForGraph>,
     status_map: Arc<TxnStatusMap>,
+    /// Change stream positions this transaction holds. Released here when
+    /// the transaction is dropped active, so a consumer whose connection
+    /// vanished mid-read does not hold the stream for the life of the process
+    stream_positions: Arc<StreamPositionLocks>,
 }
 
 impl Drop for Transaction {
@@ -136,6 +142,7 @@ impl Drop for Transaction {
         self.undo_log.clear();
         self.lock_table.unlock_all(self.txn_id);
         self.intent_locks.unlock_all(self.txn_id);
+        self.stream_positions.unlock_all(self.txn_id);
         self.wait_for_graph.remove_transaction(self.txn_id);
         self.status_map.record_aborted(self.txn_id);
         self.proc_array.release(self.slot_idx);
@@ -285,6 +292,11 @@ pub struct TransactionManager {
     /// executor can take key locks (e.g. to serialize unique-index inserts of
     /// the same value); released by commit/abort via `unlock_all`.
     intent_locks: Arc<IntentLockTable>,
+    /// Exclusive locks over change stream positions. A transactional consume
+    /// holds one per stream it read until the transaction ends, so two
+    /// consumers never take the same changes. Released by commit/abort via
+    /// `unlock_all`
+    stream_positions: Arc<StreamPositionLocks>,
     /// Wait-for graph for deadlock detection. Shared into every transaction so
     /// a dropped-while-active transaction removes its edges.
     wait_for_graph: Arc<WaitForGraph>,
@@ -310,12 +322,14 @@ impl TransactionManager {
         // feed, the manager shares it so commit/abort clear a txn's edges
         let lock_table = Arc::new(LockTable::new());
         let wait_for_graph = Arc::clone(lock_table.wait_graph());
+        let stream_positions = Arc::new(StreamPositionLocks::new(Arc::clone(&wait_for_graph)));
         Self {
             next_txn_id: AtomicU64::new(1),
             proc_array: Arc::new(ProcArray::new()),
             wal,
             lock_table,
             intent_locks: Arc::new(IntentLockTable::new()),
+            stream_positions,
             wait_for_graph,
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
@@ -329,12 +343,14 @@ impl TransactionManager {
         let durability = Self::register_durability(&wal);
         let lock_table = Arc::new(LockTable::new());
         let wait_for_graph = Arc::clone(lock_table.wait_graph());
+        let stream_positions = Arc::new(StreamPositionLocks::new(Arc::clone(&wait_for_graph)));
         Self {
             next_txn_id: AtomicU64::new(start_txn_id),
             proc_array: Arc::new(ProcArray::new()),
             wal,
             lock_table,
             intent_locks: Arc::new(IntentLockTable::new()),
+            stream_positions,
             wait_for_graph,
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
@@ -460,6 +476,7 @@ impl TransactionManager {
             intent_locks: Arc::clone(&self.intent_locks),
             wait_for_graph: Arc::clone(&self.wait_for_graph),
             status_map: Arc::clone(&self.status_map),
+            stream_positions: Arc::clone(&self.stream_positions),
         })
     }
 
@@ -536,6 +553,11 @@ impl TransactionManager {
             .contention()
             .record_commit();
 
+        // A change stream position this transaction holds is not released
+        // here. The advance it recorded is installed in the catalog after
+        // the commit, and the lock is released by that installation, so a
+        // consumer that was waiting reads the position this one left rather
+        // than the one it started from
         {
             let _s = profile::scope(Phase::LockRelease);
             self.lock_table.unlock_all(txn.txn_id);
@@ -681,6 +703,7 @@ impl TransactionManager {
 
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
+        self.stream_positions.unlock_all(txn.txn_id);
         self.wait_for_graph.remove_transaction(txn.txn_id);
 
         self.proc_array.release(txn.slot_idx);
@@ -743,6 +766,15 @@ impl TransactionManager {
     /// same value); the locks are released by this transaction's commit/abort.
     pub fn intent_locks(&self) -> &Arc<IntentLockTable> {
         &self.intent_locks
+    }
+
+    /// Returns the change stream position locks.
+    ///
+    /// A transactional consume takes one before it reads, and commit and abort
+    /// release it, which is what makes a rolled back consume leave the position
+    /// where it was
+    pub fn stream_positions(&self) -> &Arc<StreamPositionLocks> {
+        &self.stream_positions
     }
 
     /// Returns a reference to the wait-for graph for deadlock detection.

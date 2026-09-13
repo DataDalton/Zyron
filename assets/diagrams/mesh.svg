@@ -81,9 +81,9 @@
 
   <!-- Object-store cylinder -->
   <g>
-    <ellipse cx="480" cy="530" rx="140" ry="14" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
-    <path d="M 340,530 L 340,570 A 140,14 0 0 0 620,570 L 620,530" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+    <ellipse cx="480" cy="530" rx="140" ry="12" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+    <path d="M 340,530 L 340,590 A 140,12 0 0 0 620,590 L 620,530" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
     <text x="480" y="556" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="600">Shared object store</text>
-    <text x="480" y="572" text-anchor="middle" fill="#8b949e" font-size="11">.zyr files · Transaction log</text>
+    <text x="480" y="573" text-anchor="middle" fill="#8b949e" font-size="11">.zyr files · Transaction log</text>
   </g>
 </svg>

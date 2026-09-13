@@ -212,12 +212,58 @@ pub fn capture_delete(ctx: &ExecutionContext, table: &TableEntry, batch: &DataBa
     let identity = identity_of(ctx, table);
     let images = identity_images(table, &identity, batch);
     if images.has_keyed() {
-        set.capture_delete(table, &identity, &images.keyed())?;
+        if feed_records_rows(table) {
+            require_feed_images(set, table)?;
+            let whole = keyed_row_images(table, batch, &images.keyed_rows);
+            let whole_refs: Vec<&[u8]> = whole.iter().map(|v| v.as_slice()).collect();
+            set.capture_delete_imaged(table, &identity, &images.keyed(), &whole_refs)?;
+        } else {
+            set.capture_delete(table, &identity, &images.keyed())?;
+        }
     }
     if images.has_imaged() {
         set.capture_delete(table, &ReplicaIdentity::FullImage, &images.imaged())?;
     }
     Ok(())
+}
+
+/// Whether the table's change data feed records the rows a write removes,
+/// which is when a delete or an update has to carry the whole old row to
+/// every member rather than the key alone
+#[inline]
+fn feed_records_rows(table: &TableEntry) -> bool {
+    table.cdf_enabled
+}
+
+/// Refuses a write the group cannot yet carry the row images of.
+///
+/// A member on an earlier release refuses the operation tag and stops
+/// applying, and a key shipped in place of the image would leave every
+/// member's feed without the row, so the write waits for the group rather
+/// than being recorded short
+fn require_feed_images(set: &super::changeset::TxnChangeset, table: &TableEntry) -> Result<()> {
+    if set.carries_feed_images() {
+        return Ok(());
+    }
+    Err(zyron_common::ZyronError::UpgradeRefused(format!(
+        "a delete or update on \"{}\" cannot be replicated until every member of the group \
+         runs {} or later, because its change data feed records the rows the write removes \
+         and a member on an earlier release does not read them off the entry",
+        table.name,
+        super::changeset::FEED_IMAGES_INTRODUCED_IN
+    )))
+}
+
+/// The whole image of each of `rows`, in that order, the row the feed
+/// records beside the key the applier probes
+fn keyed_row_images(table: &TableEntry, batch: &DataBatch, rows: &[usize]) -> Vec<Vec<u8>> {
+    rows.iter()
+        .map(|row| {
+            let mut image = Vec::with_capacity(64);
+            encode_row_into(&mut image, batch, *row, &table.columns);
+            image
+        })
+        .collect()
 }
 
 /// Records rows changing, carrying both the identity of the old row and the
@@ -248,7 +294,20 @@ pub fn capture_update(
     let images = identity_images(table, &identity, old_batch);
     if images.has_keyed() {
         let rows: Vec<u32> = images.keyed_rows.iter().map(|r| *r as u32).collect();
-        set.capture_update(table, &identity, &images.keyed(), &new_batch.take(&rows))?;
+        if feed_records_rows(table) {
+            require_feed_images(set, table)?;
+            let whole = keyed_row_images(table, old_batch, &images.keyed_rows);
+            let whole_refs: Vec<&[u8]> = whole.iter().map(|v| v.as_slice()).collect();
+            set.capture_update_imaged(
+                table,
+                &identity,
+                &images.keyed(),
+                &whole_refs,
+                &new_batch.take(&rows),
+            )?;
+        } else {
+            set.capture_update(table, &identity, &images.keyed(), &new_batch.take(&rows))?;
+        }
     }
     if images.has_imaged() {
         let rows: Vec<u32> = images.imaged_rows.iter().map(|r| *r as u32).collect();

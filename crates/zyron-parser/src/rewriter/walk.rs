@@ -10,7 +10,9 @@
 //! GROUP BY, HAVING, QUALIFY, ORDER BY, window partitions and frames, set
 //! operation branches, and CTEs
 
-use crate::ast::{Expr, FunctionArg, SelectItem, SelectStatement, Statement, TableRef};
+use crate::ast::{
+    Expr, FunctionArg, SelectItem, SelectStatement, Statement, TableOption, TableRef,
+};
 
 /// What a walk is renaming
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,30 @@ pub fn rename(statement: &mut Statement, target: RenameTarget, from: &str, to: &
         from,
         to,
         changed: 0,
+        bind: None,
+    };
+    walker.statement(statement);
+    walker.changed
+}
+
+/// Binds a relation name to a change stream read. Every FROM item naming
+/// `name` reads `stream` instead, under `name` as its alias, with `options`
+/// written after it. Returns how many places were bound.
+///
+/// A qualifier on a column keeps naming `name`, which is now the alias, so
+/// the rest of the statement reads as written
+pub fn bind_relation(
+    statement: &mut Statement,
+    name: &str,
+    stream: &str,
+    options: &[TableOption],
+) -> usize {
+    let mut walker = Renamer {
+        target: RenameTarget::Relation,
+        from: name,
+        to: stream,
+        changed: 0,
+        bind: Some(options.to_vec()),
     };
     walker.statement(statement);
     walker.changed
@@ -62,6 +88,9 @@ struct Renamer<'a> {
     from: &'a str,
     to: &'a str,
     changed: usize,
+    /// Set when the walk binds a relation to a stream read rather than
+    /// renaming it, holding the options the read carries
+    bind: Option<Vec<TableOption>>,
 }
 
 impl Renamer<'_> {
@@ -79,7 +108,9 @@ impl Renamer<'_> {
 
     /// Replaces a name, keeping any schema qualifier it carried
     fn replace(&mut self, name: &mut String) {
-        if !self.matches(name) {
+        // A binding changes the FROM item alone, the name lives on as the
+        // alias everything else in the statement refers to
+        if self.bind.is_some() || !self.matches(name) {
             return;
         }
         match name.rsplit_once('.') {
@@ -94,6 +125,47 @@ impl Renamer<'_> {
     fn statement(&mut self, statement: &mut Statement) {
         if let Some(query) = query_of(statement) {
             self.select(query);
+            return;
+        }
+        match statement {
+            Statement::Merge(merge) => {
+                self.table_ref(&mut merge.source);
+                self.expr(&mut merge.on);
+                for clause in merge.clauses.iter_mut() {
+                    let (crate::ast::MergeClause::WhenMatched { condition, action }
+                    | crate::ast::MergeClause::WhenNotMatched { condition, action }) = clause;
+                    if let Some(condition) = condition.as_mut() {
+                        self.expr(condition);
+                    }
+                    match action {
+                        crate::ast::MergeAction::Update(assignments) => {
+                            for assignment in assignments.iter_mut() {
+                                self.expr(&mut assignment.value);
+                            }
+                        }
+                        crate::ast::MergeAction::Insert { values, .. } => {
+                            for value in values.iter_mut() {
+                                self.expr(value);
+                            }
+                        }
+                        crate::ast::MergeAction::Delete | crate::ast::MergeAction::DoNothing => {}
+                    }
+                }
+            }
+            Statement::Update(update) => {
+                for assignment in update.assignments.iter_mut() {
+                    self.expr(&mut assignment.value);
+                }
+                if let Some(predicate) = update.where_clause.as_mut() {
+                    self.expr(predicate);
+                }
+            }
+            Statement::Delete(delete) => {
+                if let Some(predicate) = delete.where_clause.as_mut() {
+                    self.expr(predicate);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -161,9 +233,27 @@ impl Renamer<'_> {
 
     fn table_ref(&mut self, table: &mut TableRef) {
         match table {
-            TableRef::Table { name, .. } => {
-                if self.target == RenameTarget::Relation {
-                    self.replace(name);
+            TableRef::Table {
+                name,
+                alias,
+                options,
+                ..
+            } => {
+                if self.target != RenameTarget::Relation {
+                    return;
+                }
+                match &self.bind {
+                    Some(bound) => {
+                        if name.eq_ignore_ascii_case(self.from) {
+                            if alias.is_none() {
+                                *alias = Some(name.clone());
+                            }
+                            *name = self.to.to_string();
+                            *options = bound.clone();
+                            self.changed += 1;
+                        }
+                    }
+                    None => self.replace(name),
                 }
             }
             TableRef::Join(join) => {
@@ -472,5 +562,48 @@ mod tests {
             0
         );
         assert_eq!(before, format!("{stmt:?}"));
+    }
+
+    /// A bound relation reads the stream under its own name as the alias,
+    /// with the read's options, wherever the statement names it, and a
+    /// column qualified by that name keeps reading as written
+    #[test]
+    fn a_relation_binds_to_a_stream_read_in_every_statement_kind() {
+        let options = vec![TableOption {
+            key: "max_rows".to_string(),
+            value: crate::ast::TableOptionValue::Integer(100),
+        }];
+        let cases = [
+            (
+                "INSERT INTO silver SELECT changes.id, total FROM changes WHERE _change_type <> 'delete'",
+                "INSERT INTO silver SELECT changes.id, total FROM orders_stream AS changes WITH (max_rows = 100) WHERE _change_type <> 'delete'",
+            ),
+            (
+                "MERGE INTO dim USING changes ON dim.id = changes.id WHEN MATCHED THEN UPDATE SET total = changes.total WHEN NOT MATCHED THEN INSERT (id, total) VALUES (changes.id, changes.total)",
+                "MERGE INTO dim USING orders_stream AS changes WITH (max_rows = 100) ON dim.id = changes.id WHEN MATCHED THEN UPDATE SET total = changes.total WHEN NOT MATCHED THEN INSERT (id, total) VALUES (changes.id, changes.total)",
+            ),
+            (
+                "DELETE FROM dim WHERE id IN (SELECT id FROM changes WHERE _change_type = 'delete')",
+                "DELETE FROM dim WHERE id IN (SELECT id FROM orders_stream AS changes WITH (max_rows = 100) WHERE _change_type = 'delete')",
+            ),
+            (
+                "INSERT INTO silver SELECT c.id FROM changes AS c JOIN dim ON dim.id = c.id",
+                "INSERT INTO silver SELECT c.id FROM orders_stream AS c WITH (max_rows = 100) JOIN dim ON dim.id = c.id",
+            ),
+        ];
+        for (sql, expected) in cases {
+            let mut stmt = only(sql);
+            assert_eq!(
+                bind_relation(&mut stmt, "changes", "orders_stream", &options),
+                1,
+                "{sql}"
+            );
+            assert_eq!(stmt, only(expected), "{sql}");
+        }
+        let mut untouched = only("INSERT INTO silver SELECT id FROM other");
+        assert_eq!(
+            bind_relation(&mut untouched, "changes", "orders_stream", &options),
+            0
+        );
     }
 }

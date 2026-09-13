@@ -164,6 +164,12 @@ pub fn clone_table(
     }
 
     let mut entries = vec![LogEntry::SchemaChange(manifest.schema.clone())];
+    // The shapes the source's columns had under the schema ids its files
+    // carry, so a file written before a column widened reads in the clone
+    // the way it reads in the source
+    if !manifest.type_history.is_empty() {
+        entries.push(LogEntry::TypeHistory(manifest.type_history.clone()));
+    }
     if !manifest.cluster_spec.keys.is_empty() {
         entries.push(LogEntry::SetClusterSpec(manifest.cluster_spec.clone()));
     }

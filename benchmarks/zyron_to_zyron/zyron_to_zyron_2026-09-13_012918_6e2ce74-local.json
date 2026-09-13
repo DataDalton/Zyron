@@ -1,0 +1,136 @@
+{
+  "id": "2026-09-13_012918_6e2ce74-local",
+  "date": "2026-09-13 01:29:32Z",
+  "ts": 1789262972,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "INSERT VALUES encode": {
+      "rows/sec at batch=1000": {
+        "average": 43658618.939054,
+        "runs": [43673271.52, 43893146.52, 43361561.71, 43519888.59, 43845226.35],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "COPY BINARY encode": {
+      "rows/sec at batch=1000": {
+        "average": 314164307.718141,
+        "runs": [315159155.37, 309578354.28, 315576874.53, 315149223.16, 315357931.25],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Credential Seal": {
+      "seal_credentials throughput (ops/sec)": {
+        "average": 2692894.544284,
+        "runs": [2825928.46, 2874372.67, 2613040.12, 3058047.86, 2093083.61],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Credential Open": {
+      "open_credentials throughput (ops/sec)": {
+        "average": 3145661.723013,
+        "runs": [3144258.58, 3149725.34, 3141631.01, 3144713.42, 3147980.26],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Pool Acquire Primitive": {
+      "Semaphore(4) acquire+release (ops/sec)": {
+        "average": 24410335.934386,
+        "runs": [24186136.51, 24506800.64, 24425989.25, 24500796.28, 24431957.00],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Publication Retention Sweep": {
+      "decisions/sec": {
+        "average": 521786411.473969,
+        "runs": [521942461.06, 521007002.33, 518650678.40, 524570901.00, 522761014.57],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Snapshot Chunk Distribution": {
+      "compute_chunks ops/sec": {
+        "average": 128270619.070752,
+        "runs": [126507014.81, 129279139.52, 128389482.33, 128787976.35, 128389482.33],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Subscription Control": {
+      "Y+W+A+j encode throughput (ops/sec)": {
+        "average": 323707075.665915,
+        "runs": [320579607.93, 325034128.58, 325557924.89, 327573499.30, 319790217.62],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Subscription X Encode": {
+      "ChangeBatch encode (100 rows, ops/sec)": {
+        "average": 2568005.776769,
+        "runs": [2564441.86, 2573832.97, 2562942.01, 2561493.78, 2577318.26],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Subscription X Decode": {
+      "ChangeBatch decode (100 rows, ops/sec)": {
+        "average": 324059.948794,
+        "runs": [324007.39, 323828.47, 323566.17, 323882.97, 325014.75],
+        "target": 200000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "URI Parse": {
+      "parse_zyron_uri throughput (ops/sec)": {
+        "average": 6212071.063168,
+        "runs": [6146606.40, 6374538.56, 6240798.72, 6177625.26, 6120786.37],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

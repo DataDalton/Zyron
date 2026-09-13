@@ -124,7 +124,7 @@ pub fn read_all_rows(
         .collect();
 
     for entry in &manifest.entries {
-        let reader = crate::reader::LakeFileReader::open(paths, entry.partition_id)?;
+        let reader = crate::reader::LakeFileReader::open_in(&manifest, paths, entry.partition_id)?;
         let rows = reader.row_count();
         if rows == 0 {
             continue;

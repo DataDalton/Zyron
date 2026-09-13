@@ -434,6 +434,35 @@ async fn test_a_column_added_after_a_drop_still_decodes_every_epoch() {
 }
 
 #[tokio::test]
+async fn test_a_table_with_a_dropped_column_still_takes_updates_and_deletes() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    ddl(&server, "CREATE TABLE t (id INT, gone TEXT, keep INT)").await;
+    exec_dml(
+        &server,
+        "INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30)",
+    )
+    .await;
+    ddl(&server, "ALTER TABLE t DROP COLUMN gone").await;
+
+    // The write paths encode a row from the live columns the scan reads,
+    // so a placeholder in the entry shifts nothing
+    exec_dml(&server, "UPDATE t SET keep = keep + 1 WHERE id = 1").await;
+    exec_dml(&server, "DELETE FROM t WHERE id = 2").await;
+    exec_dml(&server, "INSERT INTO t VALUES (4, 40)").await;
+    exec_dml(&server, "UPDATE t SET keep = keep * 2 WHERE id = 4").await;
+
+    let rows = query_values(&server, "SELECT id, keep FROM t ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![ScalarValue::Int32(1), ScalarValue::Int32(11)],
+            vec![ScalarValue::Int32(3), ScalarValue::Int32(30)],
+            vec![ScalarValue::Int32(4), ScalarValue::Int32(80)],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_dropping_the_last_column_is_refused() {
     let (server, _schema, _tmp) = create_test_server().await;
     ddl(&server, "CREATE TABLE one (only INT)").await;
@@ -790,6 +819,7 @@ async fn test_vacuum_retires_the_layouts_nothing_carries() {
             census.min_live_epoch,
             census.any_unstamped,
             census.saw_nothing(),
+            None,
         )
         .await
         .expect("retire");
@@ -813,7 +843,7 @@ async fn test_retirement_never_drops_the_layout_writes_are_using() {
     // A pass over an empty table saw no tuple at all, so it says nothing
     server
         .catalog
-        .retire_schema_epochs(table.id, u16::MAX, false, true)
+        .retire_schema_epochs(table.id, u16::MAX, false, true, None)
         .await
         .expect("retire");
     let after = server.catalog.get_table(schema, "t").expect("table");

@@ -94,7 +94,6 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         publication_manager: None,
         cdc_stream_manager: None,
         cdc_ingest_manager: Some(ingest_mgr),
-        trigger_manager: None,
         udf_registry: None,
         uda_registry: None,
         procedure_registry: None,

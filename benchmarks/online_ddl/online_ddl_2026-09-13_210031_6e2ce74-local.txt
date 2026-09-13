@@ -1,0 +1,111 @@
+# suite:   online_ddl
+# run:     2026-09-13_210031_6e2ce74-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== bulk_build_sorted against sequential insert ===
+  bulk_build_sorted, 10,000,000 keys:
+    Runs: [0.8301s, 0.8051s, 0.8043s, 0.7992s, 0.7991s]
+    Average: 0.8076s (no target set)
+    Min/Max: 0.7991s / 0.8301s, StdDev: 0.0116s
+  sequential insert, 10,000,000 keys:
+    Runs: [6.3892s, 6.3489s, 6.3456s, 6.3485s, 6.3290s]
+    Average: 6.3522s (no target set)
+    Min/Max: 6.3290s / 6.3892s, StdDev: 0.0199s
+  speedup against sequential insert [PASS]: 7.8660x >= 5x (target)
+
+=== Catalog-only column changes ===
+  seeded 10,000,000 rows in 9.8s
+  ADD COLUMN, 10,000,000 rows [PASS/OK]:
+    Runs: [1.3002ms, 0.1996ms, 0.1753ms, 0.1183ms, 0.1816ms]
+    Average: 0.3950ms <= 50ms (target)
+    Min/Max: 0.1183ms / 1.3002ms, StdDev: 0.4534ms
+  DROP COLUMN, 10,000,000 rows [PASS/OK]:
+    Runs: [0.2217ms, 0.2266ms, 0.1086ms, 0.0735ms, 0.0817ms]
+    Average: 0.1424ms <= 50ms (target)
+    Min/Max: 0.0735ms / 0.2266ms, StdDev: 0.0678ms
+  compatible SET TYPE, 10,000,000 rows [PASS/OK]:
+    Runs: [0.1198ms, 0.1074ms, 0.5544ms, 0.1239ms, 0.1147ms]
+    Average: 0.2040ms <= 50ms (target)
+    Min/Max: 0.1074ms / 0.5544ms, StdDev: 0.1753ms
+
+=== Epoch-aware decode ===
+  current epoch, plan resolved once:
+    Runs: [28.1340ns, 28.6853ns, 28.3072ns, 28.1627ns, 28.2482ns]
+    Average: 28.3075ns (no target set)
+    Min/Max: 28.1340ns / 28.6853ns, StdDev: 0.1987ns
+  current epoch, epoch resolved per row:
+    Runs: [27.8807ns, 27.7807ns, 27.7752ns, 27.7427ns, 27.7616ns]
+    Average: 27.7882ns (no target set)
+    Min/Max: 27.7427ns / 27.8807ns, StdDev: 0.0481ns
+  epoch lookup adds 0.0000ns per row at the current epoch
+  current epoch overhead against the resolved plan [PASS]: 0ns <= 1ns (target)
+  older epoch, 2 absent columns:
+    Runs: [28.1177ns, 27.9805ns, 28.2460ns, 28.2175ns, 28.1106ns]
+    Average: 28.1345ns (no target set)
+    Min/Max: 27.9805ns / 28.2460ns, StdDev: 0.0937ns
+  older epoch overhead, 2 absent columns [PASS]: 0ns <= 20ns (target)
+
+=== Index build ===
+  seeded 10,000,000 rows in 10.2s
+  throughput, 10,000,000 rows, 8-byte key [PASS/OK]:
+    Runs: [3,877,651 rows/s, 3,768,332 rows/s, 3,822,272 rows/s, 3,811,635 rows/s, 3,678,806 rows/s]
+    Average: 3,791,739 rows/s >= 2,000,000 rows/s (target)
+    Min/Max: 3,678,806 rows/s / 3,877,651 rows/s, StdDev: 66,349 rows/s
+  peak RSS growth [PASS/OK]:
+    Runs: [38,297,600 bytes, 39,272,448 bytes, 28,020,736 bytes, 289,628,160 bytes, 295,223,296 bytes]
+    Average: 138,088,448 bytes <= 335,544,320 bytes (target)
+    Min/Max: 28,020,736 bytes / 295,223,296 bytes, StdDev: 126,089,937 bytes
+
+=== Foreground OLTP during a build ===
+  point read p99, no build:
+    Runs: [0.4840ms, 0.1432ms, 0.1522ms, 0.1509ms, 0.1478ms]
+    Average: 0.2156ms (no target set)
+    Min/Max: 0.1432ms / 0.4840ms, StdDev: 0.1342ms
+  point read p99, build running:
+    Runs: [0.1426ms, 0.1490ms, 0.1452ms, 0.1431ms, 0.1435ms]
+    Average: 0.1447ms (no target set)
+    Min/Max: 0.1426ms / 0.1490ms, StdDev: 0.0023ms
+  p99 degradation [PASS]: 0% <= 10% (target)
+
+=== Progress view and epoch retirement ===
+  ddl_progress read [PASS/OK]:
+    Runs: [0.0007ms, 0.0007ms, 0.0007ms, 0.0007ms, 0.0007ms]
+    Average: 0.0007ms <= 1ms (target)
+    Min/Max: 0.0007ms / 0.0007ms, StdDev: 0.0000ms
+  vacuum epoch retirement check, per table [PASS/OK]:
+    Runs: [0.0432us, 0.0432us, 0.0433us, 0.0431us, 0.0432us]
+    Average: 0.0432us <= 10us (target)
+    Min/Max: 0.0431us / 0.0433us, StdDev: 0.0001us
+
+=== Publish and wait ===
+  publish to writers maintaining [PASS/OK]:
+    Runs: [0.1628ms, 0.0900ms, 0.0767ms, 0.1604ms, 0.1186ms]
+    Average: 0.1217ms <= 1ms (target)
+    Min/Max: 0.0767ms / 0.1628ms, StdDev: 0.0353ms
+  wait for old transactions, none active [PASS/OK]:
+    Runs: [0.0014ms, 0.0014ms, 0.0013ms, 0.0013ms, 0.0013ms]
+    Average: 0.0013ms <= 1ms (target)
+    Min/Max: 0.0013ms / 0.0014ms, StdDev: 0.0000ms
+
+=== Shadow rewrite ===
+  run 0: rewrote 1,000,000 rows in 0.38s while a writer added 4,617
+  run 1: rewrote 1,000,000 rows in 0.36s while a writer added 4,274
+  run 2: rewrote 1,000,000 rows in 0.36s while a writer added 4,395
+  run 3: rewrote 1,000,000 rows in 0.41s while a writer added 4,279
+  run 4: rewrote 1,000,000 rows in 0.37s while a writer added 4,384
+  throughput, 1,000,000 rows, TEXT to INT [PASS/OK]:
+    Runs: [2,665,384 rows/s, 2,744,571 rows/s, 2,747,775 rows/s, 2,421,849 rows/s, 2,715,001 rows/s]
+    Average: 2,658,916 rows/s >= 1,000,000 rows/s (target)
+    Min/Max: 2,421,849 rows/s / 2,747,775 rows/s, StdDev: 122,165 rows/s
+  insert with no shadow:
+    Runs: [88.3418us, 75.7686us, 76.4034us, 94.3644us, 105.3010us]
+    Average: 88.0358us (no target set)
+    Min/Max: 75.7686us / 105.3010us, StdDev: 11.1717us
+  insert while the shadow is filling:
+    Runs: [80.7674us, 84.7592us, 82.3331us, 96.0150us, 83.5182us]
+    Average: 85.4786us (no target set)
+    Min/Max: 80.7674us / 96.0150us, StdDev: 5.4307us
+  dual-write hook overhead per row [PASS]: 0us <= 2us (target)

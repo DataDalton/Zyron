@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="100%" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-label="Zyron write path from client to lake">
+  <title>Zyron write path from client to lake</title>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="540" fill="#0d1117" rx="6"/>
+
+  <!-- Title -->
+  <text x="480" y="32" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="600">Write path · One fsync per commit · Columnar in the background · One operator for reads</text>
+
+  <!-- Read arrows (drawn first so the spine boxes cover their heads) -->
+  <g stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,4" fill="none" marker-end="url(#arrow)">
+    <line x1="700" y1="347" x2="342" y2="266"/>
+    <line x1="700" y1="362" x2="342" y2="362"/>
+    <line x1="700" y1="377" x2="342" y2="458"/>
+  </g>
+
+  <!-- Spine arrows -->
+  <g stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arrow)">
+    <line x1="210" y1="104" x2="210" y2="140"/>
+    <line x1="210" y1="200" x2="210" y2="236"/>
+    <line x1="210" y1="296" x2="210" y2="332"/>
+    <line x1="210" y1="392" x2="210" y2="428"/>
+    <line x1="800" y1="294" x2="800" y2="332"/>
+  </g>
+
+  <!-- Spine transition labels -->
+  <text x="224" y="126" fill="#8b949e" font-size="11">INSERT · UPDATE · DELETE</text>
+  <text x="224" y="216" fill="#8b949e" font-size="11">Acknowledged after the WAL fsync</text>
+  <text x="224" y="230" fill="#8b949e" font-size="11">Dirty pages flushed later by a background writer</text>
+  <text x="224" y="318" fill="#8b949e" font-size="11">Background compaction of committed rows</text>
+  <text x="224" y="414" fill="#8b949e" font-size="11">Publish as a lake version</text>
+  <text x="812" y="318" fill="#8b949e" font-size="11">SELECT</text>
+
+  <!-- Spine: Client -->
+  <rect x="80" y="60" width="260" height="44" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="210" y="87" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Client</text>
+
+  <!-- Spine: WAL -->
+  <rect x="80" y="140" width="260" height="60" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="210" y="164" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Write-ahead log</text>
+  <text x="210" y="186" text-anchor="middle" fill="#a371f7" font-size="12">Ring buffer · Group commit · Fsync</text>
+
+  <!-- Spine: Row heap + B+tree -->
+  <rect x="80" y="236" width="260" height="60" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="210" y="260" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Row heap + B+tree</text>
+  <text x="210" y="282" text-anchor="middle" fill="#a371f7" font-size="12">MVCC · Tuple slots · Index in RAM</text>
+
+  <!-- Spine: .zyr segments -->
+  <rect x="80" y="332" width="260" height="60" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="210" y="356" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">.zyr segments</text>
+  <text x="210" y="378" text-anchor="middle" fill="#a371f7" font-size="12">Column encoding · Zone maps · Bloom filters</text>
+
+  <!-- Spine: ZyronLake -->
+  <rect x="80" y="428" width="260" height="60" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="210" y="452" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">ZyronLake</text>
+  <text x="210" y="474" text-anchor="middle" fill="#a371f7" font-size="12">Transaction log · Manifest · Object store</text>
+
+  <!-- Grouped-node note beside the WAL -->
+  <line x1="340" y1="170" x2="410" y2="170" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <rect x="410" y="140" width="240" height="60" rx="8" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="420" y="156" fill="#8b949e" font-size="11">On a grouped node</text>
+  <text x="530" y="180" text-anchor="middle" fill="#a371f7" font-size="12">Raft log · Quorum · One fsync per ack</text>
+
+  <!-- Read side: Client -->
+  <rect x="700" y="250" width="200" height="44" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="800" y="277" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Client</text>
+
+  <!-- Read side: HybridScan -->
+  <rect x="700" y="332" width="200" height="60" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="800" y="356" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">HybridScan</text>
+  <text x="800" y="378" text-anchor="middle" fill="#a371f7" font-size="12">One operator · Heap + .zyr + Lake</text>
+</svg>

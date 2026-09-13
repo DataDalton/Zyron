@@ -1,0 +1,46 @@
+{
+  "id": "2026-09-13_013311_6e2ce74-local",
+  "date": "2026-09-13 01:33:16Z",
+  "ts": 1789263196,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Temporary INSERT on a group": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 10.22 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 12.16 },
+      "temporary table": {
+        "average": 1858007.891083,
+        "runs": [1366446.90, 2154940.20, 2192405.51, 1884872.02, 1691374.83],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "permanent heap through the group": {
+        "average": 549807.770538,
+        "runs": [457035.26, 609596.26, 571797.79, 577502.25, 533107.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "temporary over permanent": {
+        "average": 3.379377,
+        "runs": [3.38],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

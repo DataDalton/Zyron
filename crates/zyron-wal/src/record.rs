@@ -98,12 +98,45 @@ pub enum LogRecordType {
     Commit = 2,
     /// Transaction abort/rollback.
     Abort = 3,
-    /// Page insert operation.
+    /// A catalog row written, as the entry's own encoding behind its kind
+    /// byte. Replayed by the catalog against its storage, which skips a row
+    /// already present
     Insert = 10,
-    /// Page update operation.
+    /// A logical update record, kept for the record chain
     Update = 11,
-    /// Page delete operation.
+    /// A logical delete record, kept for the record chain
     Delete = 12,
+    /// Rows appended to a heap page, at the slots and the data offset the
+    /// append claimed. Payload: page id, first slot, data end, count, then
+    /// each row's header fields and bytes. Replayed onto the page image
+    HeapAppend = 13,
+    /// Transaction stamps set on heap rows in place. Payload: page id,
+    /// count, then (slot, xmax) pairs. Zero clears a stamp
+    HeapXmax = 14,
+    /// Heap slots emptied and the page compacted. Payload: page id, count,
+    /// then the slots
+    HeapPrune = 15,
+    /// Heap slots emptied in place, their bytes left for compaction.
+    /// Payload: page id, count, then the slots
+    HeapFree = 16,
+    /// A heap row rewritten in place. Payload: page id, slot, then the
+    /// row's header fields and bytes
+    HeapUpdate = 17,
+    /// A heap file emptied. Payload: the file's id as a page id naming its
+    /// first page. Replayed by emptying the file at the same point in the
+    /// log, so the pages the earlier records put back go and the ones the
+    /// later records put back land in an empty file
+    HeapTruncate = 18,
+    /// Bytes appended to a change data feed's open segment, at the offset
+    /// the append claimed. Payload: table id, branch id or zero for the
+    /// table's own feed, segment sequence, byte offset, then the bytes.
+    /// Written after the bytes are in the segment's file and before the
+    /// transaction's commit record, so a commit acknowledged over a segment
+    /// the device had not taken yet is put back from the log. Replayed onto
+    /// the segment file before the feed reopens, from every transaction the
+    /// log holds, since the segment held the bytes whatever the transaction
+    /// did and a reader answers to the transaction's status
+    ChangeFeedFrames = 19,
     /// Full page image (for recovery).
     FullPage = 20,
     /// Checkpoint begin marker.
@@ -138,6 +171,68 @@ pub enum LogRecordType {
     BranchMerge = 62,
 }
 
+impl LogRecordType {
+    /// Whether the record describes a change to one heap page image, which
+    /// recovery replays onto the page rather than handing to the catalog
+    #[inline]
+    pub fn is_page_change(self) -> bool {
+        matches!(
+            self,
+            LogRecordType::HeapAppend
+                | LogRecordType::HeapXmax
+                | LogRecordType::HeapPrune
+                | LogRecordType::HeapFree
+                | LogRecordType::HeapUpdate
+                | LogRecordType::HeapTruncate
+        )
+    }
+}
+
+/// One `ChangeFeedFrames` record decoded, the feed it names and the bytes
+/// it lays at an offset of one segment's file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeFeedFrames<'a> {
+    pub table_id: u32,
+    /// Zero for the table's own feed, otherwise the branch whose feed on
+    /// the table took the bytes
+    pub branch_id: u64,
+    pub seq: u64,
+    pub offset: u64,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> ChangeFeedFrames<'a> {
+    /// Bytes of the fixed fields ahead of the frame bytes
+    pub const PREFIX: usize = 4 + 8 + 8 + 8;
+
+    /// Decodes a `ChangeFeedFrames` record's payload. A payload shorter
+    /// than its fixed fields is refused rather than read as an empty run
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        if payload.len() < Self::PREFIX {
+            return Err(ZyronError::WalCorrupted {
+                lsn: 0,
+                reason: format!(
+                    "change feed frames record holds {} bytes, fewer than its {} byte prefix",
+                    payload.len(),
+                    Self::PREFIX
+                ),
+            });
+        }
+        let word = |at: usize| -> u64 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&payload[at..at + 8]);
+            u64::from_le_bytes(buf)
+        };
+        Ok(Self {
+            table_id: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+            branch_id: word(4),
+            seq: word(12),
+            offset: word(20),
+            bytes: &payload[Self::PREFIX..],
+        })
+    }
+}
+
 impl TryFrom<u8> for LogRecordType {
     type Error = ZyronError;
 
@@ -150,6 +245,13 @@ impl TryFrom<u8> for LogRecordType {
             10 => Ok(LogRecordType::Insert),
             11 => Ok(LogRecordType::Update),
             12 => Ok(LogRecordType::Delete),
+            13 => Ok(LogRecordType::HeapAppend),
+            14 => Ok(LogRecordType::HeapXmax),
+            15 => Ok(LogRecordType::HeapPrune),
+            16 => Ok(LogRecordType::HeapFree),
+            17 => Ok(LogRecordType::HeapUpdate),
+            18 => Ok(LogRecordType::HeapTruncate),
+            19 => Ok(LogRecordType::ChangeFeedFrames),
             20 => Ok(LogRecordType::FullPage),
             30 => Ok(LogRecordType::CheckpointBegin),
             31 => Ok(LogRecordType::CheckpointEnd),
@@ -899,14 +1001,54 @@ pub unsafe fn serialize_raw_deferred(
     record_version: u8,
     payload: &[u8],
 ) -> usize {
+    unsafe {
+        serialize_raw_deferred_split(
+            buf,
+            lsn,
+            prev_lsn,
+            txn_id,
+            record_type,
+            record_version,
+            &[],
+            payload,
+        )
+    }
+}
+
+/// Serializes a WAL record whose payload is two pieces, without computing
+/// the checksum.
+///
+/// `head` then `tail` land next to each other in the record, so a caller
+/// that frames bytes it already holds names them where they are rather
+/// than joining the two in a buffer of its own first. Every other rule of
+/// `serialize_raw_deferred` holds, including the zeroed checksum the flush
+/// thread backfills.
+///
+/// Returns the number of bytes written (HEADER_SIZE + head + tail + CHECKSUM_SIZE).
+///
+/// # Safety
+/// Caller must ensure `buf` has at least
+/// `record_size_for_payload(head.len() + tail.len())` bytes available.
+#[inline]
+pub unsafe fn serialize_raw_deferred_split(
+    buf: *mut u8,
+    lsn: Lsn,
+    prev_lsn: Lsn,
+    txn_id: u64,
+    record_type: u8,
+    record_version: u8,
+    head: &[u8],
+    tail: &[u8],
+) -> usize {
+    let payload = head.len() + tail.len();
     debug_assert!(
-        payload.len() <= MAX_PAYLOAD_SIZE,
+        payload <= MAX_PAYLOAD_SIZE,
         "payload {} bytes exceeds MAX_PAYLOAD_SIZE {}",
-        payload.len(),
+        payload,
         MAX_PAYLOAD_SIZE,
     );
 
-    let payload_len = payload.len() as u16;
+    let payload_len = payload as u16;
 
     // Direct unaligned writes from registers skip the intermediate
     // PackedHeader stack allocation + copy_from_slice that the previous
@@ -921,16 +1063,23 @@ pub unsafe fn serialize_raw_deferred(
         std::ptr::write_unaligned(buf.add(26) as *mut u16, payload_len.to_le());
 
         // Payload copy. Nonoverlapping because `buf` is writer-owned space in
-        // the ring buffer and `payload` is caller-provided input.
-        if !payload.is_empty() {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(28), payload.len());
+        // the ring buffer and both pieces are caller-provided input.
+        if !head.is_empty() {
+            std::ptr::copy_nonoverlapping(head.as_ptr(), buf.add(HEADER_SIZE), head.len());
+        }
+        if !tail.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                tail.as_ptr(),
+                buf.add(HEADER_SIZE + head.len()),
+                tail.len(),
+            );
         }
 
         // Zero checksum placeholder (filled by backfill_checksums in flush thread).
-        std::ptr::write_unaligned(buf.add(HEADER_SIZE + payload.len()) as *mut u32, 0u32);
+        std::ptr::write_unaligned(buf.add(HEADER_SIZE + payload) as *mut u32, 0u32);
     }
 
-    HEADER_SIZE + payload.len() + CHECKSUM_SIZE
+    HEADER_SIZE + payload + CHECKSUM_SIZE
 }
 
 /// Walks a contiguous buffer of serialized WAL records and computes + writes

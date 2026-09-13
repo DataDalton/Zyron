@@ -33,9 +33,11 @@ use zyron_common::format::{FormatKind, FormatVersion};
 use crate::codec::{Cursor, corrupt};
 use crate::index::{IndexFileEntry, LakeIndexSpec};
 use crate::manifest::{
-    ClusterSpec, DeletePredicate, FileStats, ManifestFile, PartitionEntry, decode_delete_predicate,
-    decode_index_file, decode_index_spec, decode_partition_entry, encode_delete_predicate,
-    encode_index_file, encode_index_spec, encode_partition_entry,
+    ClusterSpec, DeletePredicate, MIN_PRIOR_TYPE, ManifestFile, PartitionEntry, PriorColumnType,
+    decode_delete_predicate, decode_index_file, decode_index_file_recorded, decode_index_spec,
+    decode_partition_entry, decode_partition_entry_recorded, decode_prior_type,
+    encode_delete_predicate, encode_index_file, encode_index_file_recorded, encode_index_spec,
+    encode_partition_entry, encode_partition_entry_recorded, encode_prior_type,
 };
 use crate::paths::{LakePaths, VersionFileKind, discard_staged_file, parse_version_file_name};
 use crate::predicate::{LakePredicate, PruneDecision};
@@ -236,7 +238,10 @@ impl CommitInfo {
 /// One state transition inside a commit
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogEntry {
-    /// New data file. `added_version` is stamped by the log at apply time
+    /// New data file. `added_version` is stamped by the log at apply time,
+    /// and so is `schema_id` when the entry carries none, which a freshly
+    /// written file never does. A file a clone, a merge or a restore adds
+    /// carries the id it was written under, so it keeps the shape it holds
     AddFile(PartitionEntry),
     RemoveFile {
         partition_id: u64,
@@ -261,17 +266,29 @@ pub enum LogEntry {
     DropIndex {
         index_id: u32,
     },
-    /// New index file. `added_version` is stamped by the log at apply time
+    /// New index file. `added_version` is stamped by the log at apply time,
+    /// and `schema_id` the same way a data file's is
     AddIndexFile(IndexFileEntry),
     RemoveIndexFile {
         index_id: u32,
         partition_id: u64,
     },
+    /// The shapes columns had under earlier schema ids, carried by a clone
+    /// or a merge beside files written under those ids, so the files read
+    /// in the shape they hold. Absorbed into the manifest's type history
+    TypeHistory(Vec<PriorColumnType>),
 }
 
 impl LogEntry {
     fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), ZyronError> {
         match self {
+            // A file carrying the schema id it was written under goes under
+            // the tag whose record holds one, and a fresh file under the tag
+            // the log stamps at apply
+            LogEntry::AddFile(entry) if entry.schema_id != 0 => {
+                buf.push(12);
+                encode_partition_entry_recorded(entry, buf);
+            }
             LogEntry::AddFile(entry) => {
                 buf.push(1);
                 encode_partition_entry(entry, buf);
@@ -319,6 +336,10 @@ impl LogEntry {
                 buf.push(9);
                 buf.extend_from_slice(&index_id.to_le_bytes());
             }
+            LogEntry::AddIndexFile(file) if file.file.schema_id != 0 => {
+                buf.push(13);
+                encode_index_file_recorded(file, buf);
+            }
             LogEntry::AddIndexFile(file) => {
                 buf.push(10);
                 encode_index_file(file, buf);
@@ -330,6 +351,18 @@ impl LogEntry {
                 buf.push(11);
                 buf.extend_from_slice(&index_id.to_le_bytes());
                 buf.extend_from_slice(&partition_id.to_le_bytes());
+            }
+            LogEntry::TypeHistory(history) => {
+                buf.push(14);
+                if history.len() > u32::MAX as usize {
+                    return Err(ZyronError::Internal(
+                        "a type history exceeds encodable length".into(),
+                    ));
+                }
+                buf.extend_from_slice(&(history.len() as u32).to_le_bytes());
+                for prior in history {
+                    encode_prior_type(prior, buf);
+                }
             }
         }
         Ok(())
@@ -368,6 +401,17 @@ fn decode_entry_stream<'a>(r: &mut Cursor<'a>, ctx: &'a str) -> Result<LogEntry,
             index_id: r.u32()?,
             partition_id: r.u64()?,
         },
+        12 => LogEntry::AddFile(decode_partition_entry_recorded(r)?),
+        13 => LogEntry::AddIndexFile(decode_index_file_recorded(r)?),
+        14 => {
+            let count = r.u32()? as usize;
+            r.check_count(count, MIN_PRIOR_TYPE, "type history record")?;
+            let mut history = Vec::with_capacity(count);
+            for _ in 0..count {
+                history.push(decode_prior_type(r)?);
+            }
+            LogEntry::TypeHistory(history)
+        }
         v => return Err(r.corrupt(format!("unknown log entry tag {}", v))),
     })
 }
@@ -398,6 +442,13 @@ pub struct CommitHeader {
     /// Offset and length of the audit block, zero offset when absent
     pub audit_off: u32,
     pub audit_len: u32,
+    /// The database transaction a commit made under an intent belongs to,
+    /// zero for a commit made under a database transaction itself, for a
+    /// standalone commit, and for an intent commit written before the
+    /// owner was recorded. A change reader groups a transaction's commits
+    /// across tables by this, so the grouping outlives the process that
+    /// opened the intent
+    pub owner_txn_id: u64,
 }
 
 impl CommitHeader {
@@ -425,6 +476,7 @@ impl CommitHeader {
         h[105..109].copy_from_slice(&entry_section_crc.to_le_bytes());
         h[109..113].copy_from_slice(&self.audit_off.to_le_bytes());
         h[113..117].copy_from_slice(&self.audit_len.to_le_bytes());
+        h[117..125].copy_from_slice(&self.owner_txn_id.to_le_bytes());
         let crc = crc32fast::hash(&h);
         h[8..12].copy_from_slice(&crc.to_le_bytes());
         h
@@ -451,13 +503,14 @@ impl CommitHeader {
                 format!("expected a lake commit record, found a {kind} record"),
             ));
         }
-        if version != LOG_FORMAT_VERSION {
+        if !crate::format::LAKE_LOG_READER_WINDOW.contains(version) {
             return Err(corrupt(
                 ctx,
                 format!(
-                    "commit record is at format version {version}, this binary writes and \
-                     reads {LOG_FORMAT_VERSION}. Upgrade through a release that still reads \
-                     {version} to replay this log"
+                    "commit record is at format version {version}, this binary writes \
+                     {LOG_FORMAT_VERSION} and reads {}. Upgrade through a release that still \
+                     reads {version} to replay this log",
+                    crate::format::LAKE_LOG_READER_WINDOW
                 ),
             ));
         }
@@ -477,11 +530,9 @@ impl CommitHeader {
                 ),
             ));
         }
-        let mut r = Cursor::new(&bytes[6..COMMIT_HEADER_LEN], ctx);
-        let flags = r.u16()?;
-        if flags != 0 {
-            return Err(corrupt(ctx, format!("unknown log flags {:#06x}", flags)));
-        }
+        // The four bytes after the magic are the envelope version peek
+        // read above, major then minor, and the header crc follows them
+        let mut r = Cursor::new(&bytes[8..COMMIT_HEADER_LEN], ctx);
         let _crc_field = r.u32()?;
         let version = r.u64()?;
         let read_version = r.u64()?;
@@ -502,6 +553,7 @@ impl CommitHeader {
         let entry_section_crc = r.u32()?;
         let audit_off = r.u32()?;
         let audit_len = r.u32()?;
+        let owner_txn_id = r.u64()?;
         Ok((
             Self {
                 version,
@@ -520,6 +572,7 @@ impl CommitHeader {
                 read_predicate_hash,
                 audit_off,
                 audit_len,
+                owner_txn_id,
             },
             entry_section_crc,
         ))
@@ -658,6 +711,7 @@ fn apply_entries(
                             properties: BTreeMap::new(),
                             indexes: Vec::new(),
                             index_files: Vec::new(),
+                            type_history: Vec::new(),
                         });
                     }
                     Some(m) => {
@@ -667,6 +721,14 @@ fn apply_entries(
                                 schema.schema_id, m.schema.schema_id
                             )));
                         }
+                        // A column this change retypes keeps its old shape
+                        // in every file written so far, so what the shape
+                        // was is recorded against the schema id those
+                        // files carry before the schema moves on, and the
+                        // constants of every delete predicate on the column
+                        // move to the scale the column declares from here
+                        m.rescale_predicates_for(schema)?;
+                        m.record_type_changes(schema);
                         m.schema = schema.clone();
                     }
                 }
@@ -682,6 +744,19 @@ fn apply_entries(
             LogEntry::AddFile(file) => {
                 let mut file = file.clone();
                 file.added_version = version;
+                // A fresh file was encoded against the schema in force when
+                // it committed, which is the schema this state holds. A file
+                // that carries the id it was written under keeps it, and
+                // that id has to name a schema this table has reached
+                if file.schema_id == 0 {
+                    file.schema_id = m.schema.schema_id;
+                } else if file.schema_id > m.schema.schema_id {
+                    return Err(ZyronError::Internal(format!(
+                        "added partition {:#x} was written under schema id {}, which is past \
+                         the table's schema id {}",
+                        file.partition_id, file.schema_id, m.schema.schema_id
+                    )));
+                }
                 match m
                     .entries
                     .binary_search_by_key(&file.partition_id, |e| e.partition_id)
@@ -723,11 +798,16 @@ fn apply_entries(
                     }
                     Err(pos) => pos,
                 };
-                // Disjoint field borrows: the schema types the bloom probe
-                // while the entries take their predicate id
+                // Disjoint field borrows: the schema and the type history
+                // shape the probe while the entries take their predicate
+                // id. A file holding a column in an older shape is judged
+                // in that shape, or a delete would skip files it covers
                 let schema = &m.schema;
+                let history = &m.type_history;
                 for file in &mut m.entries {
-                    if del.predicate.prune(&FileStats::new(&*file, schema))
+                    if del
+                        .predicate
+                        .prune(&ManifestFile::file_stats_in(schema, history, &*file))
                         != PruneDecision::CannotMatch
                     {
                         file.delete_predicate_ids.push(del.id);
@@ -802,6 +882,9 @@ fn apply_entries(
                 // ever left pointing at a declaration that is gone
                 m.index_files.retain(|f| f.index_id != *index_id);
             }
+            LogEntry::TypeHistory(history) => {
+                m.absorb_type_history(history);
+            }
             LogEntry::AddIndexFile(file) => {
                 if m.index_by_id(file.index_id).is_none() {
                     return Err(ZyronError::Internal(format!(
@@ -811,6 +894,15 @@ fn apply_entries(
                 }
                 let mut file = file.clone();
                 file.file.added_version = version;
+                if file.file.schema_id == 0 {
+                    file.file.schema_id = m.schema.schema_id;
+                } else if file.file.schema_id > m.schema.schema_id {
+                    return Err(ZyronError::Internal(format!(
+                        "index file {:#x} was written under schema id {}, which is past the \
+                         table's schema id {}",
+                        file.file.partition_id, file.file.schema_id, m.schema.schema_id
+                    )));
+                }
                 let key = (file.index_id, file.file.partition_id);
                 match m
                     .index_files
@@ -926,6 +1018,32 @@ impl StagedPartition<'_> {
 }
 
 impl Drop for StagedPartition<'_> {
+    fn drop(&mut self) {
+        let _ = self.log.staging.remove_sync(&self.partition_id);
+    }
+}
+
+/// The same registration as [`StagedPartition`], holding the log itself
+/// rather than borrowing it, for a holder whose life is not a stack frame.
+///
+/// A replicated commit writes the files a version names before the version
+/// applies, and the transaction carrying both may span several log entries.
+/// The registration lives in that transaction's state and is dropped when it
+/// commits or is abandoned, so a vacuum running between the file landing and
+/// the version naming it leaves the file alone
+pub struct OwnedStagedPartition {
+    log: Arc<TransactionLog>,
+    partition_id: u64,
+}
+
+impl OwnedStagedPartition {
+    /// The id this guard is holding
+    pub fn partition_id(&self) -> u64 {
+        self.partition_id
+    }
+}
+
+impl Drop for OwnedStagedPartition {
     fn drop(&mut self) {
         let _ = self.log.staging.remove_sync(&self.partition_id);
     }
@@ -1250,13 +1368,18 @@ pub fn register_txn_pending(
 
 /// Publishes every lake version the transaction wrote, in version order,
 /// called after the transaction's commit record is durable. A transaction
-/// that wrote no lake versions is one lock-free lookup
+/// that wrote no lake versions is one lock-free lookup.
+///
+/// The registration is forgotten only once every version is published, so
+/// a transaction found registered here still has a commit readers cannot
+/// see, and one found unregistered has none. A change reader relies on
+/// that to hand over a transaction's writes to every table at once
 pub fn publish_txn(
     data_dir: &std::path::Path,
     db_txn_id: u64,
 ) -> Result<Vec<Arc<TransactionLog>>, ZyronError> {
-    let Some((_, mut list)) = txn_pending().remove_sync(&(data_dir.to_path_buf(), db_txn_id))
-    else {
+    let key = (data_dir.to_path_buf(), db_txn_id);
+    let Some(mut list) = txn_pending().read_sync(&key, |_, list| list.clone()) else {
         return Ok(Vec::new());
     };
     let _publish = zyron_common::profile::scope(zyron_common::profile::Phase::LakePublish);
@@ -1275,6 +1398,7 @@ pub fn publish_txn(
             published.push(log);
         }
     }
+    let _ = txn_pending().remove_sync(&key);
     Ok(published)
 }
 
@@ -1402,7 +1526,8 @@ impl TransactionLog {
         apply_entries(&mut state, 1, attempt.timestamp_us, &entries)?;
         let manifest = state
             .ok_or_else(|| ZyronError::Internal("table creation produced no manifest".into()))?;
-        let bytes = encode_version_file(1, 0, &attempt, &entries, &manifest)?;
+        let owner_txn_id = crate::crosstable::intent_owner_of(&log.paths, attempt.db_txn_id);
+        let bytes = encode_version_file(1, 0, &attempt, owner_txn_id, &entries, &manifest)?;
         let path = log.paths.version_file(1);
         let mut file = match fs::OpenOptions::new()
             .write(true)
@@ -1427,8 +1552,38 @@ impl TransactionLog {
             log.published.store(1, Ordering::Release);
         } else {
             let _ = log.pending.insert_sync(1, attempt.db_txn_id);
+            log.register_pending_under(attempt.db_txn_id, 1)?;
         }
         Ok(log)
+    }
+
+    /// Records a version committed under a database transaction with the
+    /// process-wide registry the transaction's end publishes or abandons
+    /// from, keyed by the database the log sits under and the entry this
+    /// head occupies in the open-log registry.
+    ///
+    /// Done here, in the one place every commit passes through, so append,
+    /// delete, update, maintenance, a branch merge and a replicated apply
+    /// all register the same way and none of them can be forgotten. The
+    /// registry publishes through the open-log registry, so a head a caller
+    /// holds directly rather than through it is that caller's to publish,
+    /// which is what a cross-table intent's direct participants are
+    fn register_pending_under(&self, db_txn_id: u64, version: u64) -> Result<(), ZyronError> {
+        let key = self.registry_key();
+        let shared = Self::lookup_registered(&key)
+            .is_some_and(|registered| std::ptr::eq(Arc::as_ptr(&registered), self));
+        if !shared {
+            return Ok(());
+        }
+        let Some(database_dir) = self.paths.database_dir() else {
+            return Err(ZyronError::Internal(format!(
+                "a lake log at {} is not under a database directory, so a version committed \
+                 under a transaction has nowhere to register",
+                self.paths.root().display()
+            )));
+        };
+        register_txn_pending(database_dir, db_txn_id, key, version);
+        Ok(())
     }
 
     /// Opens an existing log, verifying every version file after the
@@ -1536,6 +1691,17 @@ impl TransactionLog {
         }
     }
 
+    /// Registers a partition id the way `stage_partition` does, with a
+    /// guard that owns its reference to the log, for a holder that outlives
+    /// the call that staged it
+    pub fn stage_partition_owned(self: &Arc<Self>, partition_id: u64) -> OwnedStagedPartition {
+        let _ = self.staging.insert_sync(partition_id);
+        OwnedStagedPartition {
+            log: Arc::clone(self),
+            partition_id,
+        }
+    }
+
     /// Whether a data file for this partition is being written right now,
     /// which is what tells the vacuum to leave it alone
     pub fn is_staging(&self, partition_id: u64) -> bool {
@@ -1552,6 +1718,22 @@ impl TransactionLog {
         self.created_head.load(Ordering::Acquire)
     }
 
+    /// The versions created and not yet published, each with the
+    /// transaction it was committed under, ascending by version.
+    ///
+    /// A change reader asks this to know which transactions have a commit
+    /// of this table that readers cannot see yet, so it hands over neither
+    /// that commit nor the transaction's other writes until both are visible
+    pub fn pending_versions(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        self.pending.iter_sync(|version, txn| {
+            out.push((*version, *txn));
+            true
+        });
+        out.sort_unstable();
+        out
+    }
+
     /// Times a commit lost the version race and retried
     pub fn commit_retries(&self) -> u64 {
         self.commit_retries.load(Ordering::Relaxed)
@@ -1565,6 +1747,45 @@ impl TransactionLog {
     /// Manifest at the newest published version
     pub fn latest_manifest(&self) -> Result<Arc<ManifestFile>, ZyronError> {
         self.manifest_at(self.latest_version())
+    }
+
+    /// The oldest version a manifest can still be rebuilt at, None when
+    /// the log holds no published version.
+    ///
+    /// A checkpoint stands on its own, and a version is rebuilt from the
+    /// newest checkpoint at or below it plus every version file after
+    /// that, so the answer is the oldest checkpoint, or the first version
+    /// when its file and every one after it up to a checkpoint survive.
+    /// One directory listing, rather than one rebuild per version the
+    /// retention sweep has reclaimed
+    pub fn oldest_readable_version(&self) -> Result<Option<u64>, ZyronError> {
+        let head = self.latest_version();
+        if head == 0 {
+            return Ok(None);
+        }
+        let mut oldest_checkpoint: Option<u64> = None;
+        let mut versions: Vec<u64> = Vec::new();
+        for dirent in fs::read_dir(self.paths.log_dir())? {
+            let dirent = dirent?;
+            let name = dirent.file_name();
+            let Some(name) = name.to_str() else { continue };
+            match parse_version_file_name(name) {
+                Some((v, VersionFileKind::Checkpoint)) => {
+                    oldest_checkpoint = Some(oldest_checkpoint.map_or(v, |c| c.min(v)));
+                }
+                Some((v, VersionFileKind::Version)) if v <= head => versions.push(v),
+                _ => {}
+            }
+        }
+        versions.sort_unstable();
+        let from_first = versions.first() == Some(&1)
+            && versions.windows(2).all(|pair| pair[1] == pair[0] + 1)
+            && oldest_checkpoint.is_none_or(|c| versions.last().is_some_and(|last| *last + 1 >= c));
+        Ok(match (from_first, oldest_checkpoint) {
+            (true, _) => Some(1),
+            (false, Some(checkpoint)) => Some(checkpoint.min(head)),
+            (false, None) => None,
+        })
     }
 
     /// Manifest at any existing version, reconstructing from the nearest
@@ -1733,6 +1954,13 @@ impl TransactionLog {
         // branch anyone can merge
         log.manifest_at(head)?;
         Ok(log)
+    }
+
+    /// The commit header of one version, resolved through this head so a
+    /// branch reads its own version files after the fork point. Costs one
+    /// read of the header's bytes, whether or not the version is published
+    pub fn commit_header(&self, version: u64) -> Result<CommitHeader, ZyronError> {
+        read_commit_header(&self.version_path(version))
     }
 
     /// The file one version lives in. A branch keeps its own versions
@@ -1937,7 +2165,15 @@ impl TransactionLog {
                     ));
                 }
             };
-            let bytes = encode_version_file(version, base_version, &attempt, &entries, &base)?;
+            let owner_txn_id = crate::crosstable::intent_owner_of(&self.paths, attempt.db_txn_id);
+            let bytes = encode_version_file(
+                version,
+                base_version,
+                &attempt,
+                owner_txn_id,
+                &entries,
+                &base,
+            )?;
             drop(encode_span);
             let _write_span =
                 zyron_common::profile::scope(zyron_common::profile::Phase::LakeVersionWrite);
@@ -1998,6 +2234,7 @@ impl TransactionLog {
                         // it, and only the pending entry tells them its
                         // transaction has not resolved yet
                         let _ = self.pending.insert_sync(version, attempt.db_txn_id);
+                        self.register_pending_under(attempt.db_txn_id, version)?;
                         #[cfg(test)]
                         stall_visibility_gap();
                         self.created_head.fetch_max(version, Ordering::AcqRel);
@@ -2497,11 +2734,14 @@ fn is_possible_partial_write(e: &ZyronError) -> bool {
 }
 
 /// Serializes one version file. Statistics in the header are derived from
-/// the entries against the base manifest the commit built on
+/// the entries against the base manifest the commit built on, and
+/// `owner_txn_id` is the database transaction an intent commit belongs to,
+/// zero for every other commit
 fn encode_version_file(
     version: u64,
     read_version: u64,
     attempt: &CommitAttempt<'_>,
+    owner_txn_id: u64,
     entries: &[LogEntry],
     base: &ManifestFile,
 ) -> Result<Vec<u8>, ZyronError> {
@@ -2570,6 +2810,7 @@ fn encode_version_file(
             .unwrap_or(0),
         audit_off,
         audit_len,
+        owner_txn_id,
     };
     let entry_crc = crc32fast::hash(&body);
     let mut out = Vec::with_capacity(COMMIT_HEADER_LEN + body.len());
@@ -2586,6 +2827,42 @@ mod tests {
     use crate::schema::LakeColumn;
     use std::thread;
     use zyron_common::TypeId;
+
+    /// The header names the database transaction an intent commit belongs
+    /// to, and the name survives the encode, the checksum and the decode
+    #[test]
+    fn test_commit_header_round_trips_the_intent_owner() {
+        let header = CommitHeader {
+            version: 9,
+            read_version: 8,
+            db_txn_id: crate::crosstable::INTENT_TXN_FLAG | 5,
+            commit_lsn: 77,
+            timestamp_us: 1_000,
+            operation: OperationKind::Append,
+            entry_count: 1,
+            files_added: 1,
+            files_removed: 0,
+            rows_added: 10,
+            rows_removed: 0,
+            bytes_added: 100,
+            removed_partition_bloom: 0,
+            read_predicate_hash: 0,
+            audit_off: 0,
+            audit_len: 0,
+            owner_txn_id: 4_242,
+        };
+        let bytes = header.encode(0xdead_beef);
+        let (decoded, entry_crc) = CommitHeader::decode(&bytes, "test").expect("decodes");
+        assert_eq!(decoded, header);
+        assert_eq!(entry_crc, 0xdead_beef);
+        // A header written without an owner reads as one
+        let unowned = CommitHeader {
+            owner_txn_id: 0,
+            ..header
+        };
+        let (decoded, _) = CommitHeader::decode(&unowned.encode(1), "test").expect("decodes");
+        assert_eq!(decoded.owner_txn_id, 0);
+    }
 
     fn schema() -> LakeSchema {
         LakeSchema::new(
@@ -2610,6 +2887,7 @@ mod tests {
             size_bytes: rows * 8,
             row_count: rows,
             added_version: 0,
+            schema_id: 0,
             cluster_spec_id: 0,
             column_stats: std::sync::Arc::new(vec![ColumnStatsEntry {
                 ndv: Some(rows),
@@ -2710,6 +2988,151 @@ mod tests {
             &BTreeMap::from([("target_file_size".to_string(), "268435456".to_string())]),
         )
         .expect("create")
+    }
+
+    /// A commit record the 1.0 writer laid down, an append of one file and
+    /// a property, still reads under the current window, and its file is
+    /// stamped at apply the way every 1.0 file is, since that layout
+    /// carried no schema id
+    #[test]
+    fn test_a_1_0_commit_record_still_decodes() {
+        let data = VersionFileData::decode(crate::format::LAKE_LOG_FIXTURE_1_0, "fixture")
+            .expect("the 1.0 fixture decodes");
+        assert_eq!(data.header.version, 2);
+        assert_eq!(data.entries.len(), 2);
+        match &data.entries[0] {
+            LogEntry::AddFile(file) => {
+                assert_eq!(file.partition_id, 0x900);
+                assert_eq!(file.row_count, 100);
+                assert_eq!(file.schema_id, 0, "a 1.0 record carries no schema id");
+            }
+            other => panic!("expected the appended file first, found {other:?}"),
+        }
+        assert!(matches!(
+            &data.entries[1],
+            LogEntry::SetProperty { key, value } if key == "owner" && value == "fixture"
+        ));
+    }
+
+    /// A file added with the schema id it was written under keeps it
+    /// through the log, and one added without is stamped with the schema
+    /// in force, so a clone, a merge or a restore keeps every file's shape
+    #[test]
+    fn test_a_carried_schema_id_survives_the_log_and_a_missing_one_is_stamped() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let log = new_log(dir.path());
+        let first = log
+            .commit(attempt(OperationKind::Append), |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0x10, 0, 9, 10))])
+            })
+            .expect("append");
+        let mut evolved = schema();
+        evolved.schema_id = 2;
+        evolved.columns[0].type_id = TypeId::Int64;
+        log.commit(attempt(OperationKind::SchemaChange), |_| {
+            Ok(vec![LogEntry::SchemaChange(evolved.clone())])
+        })
+        .expect("schema change");
+        let mut carried = data_file(0x20, 0, 9, 10);
+        carried.schema_id = 1;
+        let version = log
+            .commit(attempt(OperationKind::Append), |_| {
+                Ok(vec![
+                    LogEntry::AddFile(carried.clone()),
+                    LogEntry::AddFile(data_file(0x30, 0, 9, 10)),
+                ])
+            })
+            .expect("append with a carried id");
+        let manifest = log.manifest_at(version).expect("manifest");
+        assert_eq!(manifest.entry_for(0x10).expect("first").schema_id, 1);
+        assert_eq!(
+            manifest.entry_for(0x20).expect("carried").schema_id,
+            1,
+            "the carried id names the shape the file holds"
+        );
+        assert_eq!(
+            manifest.entry_for(0x30).expect("stamped").schema_id,
+            2,
+            "a file with no id is written under the schema in force"
+        );
+        let _ = first;
+        let mut ahead = data_file(0x40, 0, 9, 10);
+        ahead.schema_id = 9;
+        let refused = log.commit(attempt(OperationKind::Append), |_| {
+            Ok(vec![LogEntry::AddFile(ahead.clone())])
+        });
+        assert!(
+            refused.is_err(),
+            "a schema id the table has not reached names no shape"
+        );
+    }
+
+    /// A schema change that widens a column's instants to picoseconds
+    /// moves the constants of every recorded delete predicate on it to the
+    /// same scale, so the rows the predicate deleted stay deleted in files
+    /// written at the new width
+    #[test]
+    fn test_widening_a_column_rescales_the_delete_predicates_on_it() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut base = schema();
+        base.columns[0].type_id = TypeId::Timestamp;
+        base.columns[0].fractional_digits = Some(6);
+        let log = TransactionLog::create(
+            LakePaths::new(dir.path(), 8),
+            attempt(OperationKind::SchemaChange),
+            &base,
+            None,
+            &BTreeMap::new(),
+        )
+        .expect("create");
+        log.commit(attempt(OperationKind::Delete), |_| {
+            Ok(vec![LogEntry::AddDeletePredicate(DeletePredicate {
+                id: 1,
+                sql: "ts < 5".to_string(),
+                predicate: LakePredicate::And(vec![
+                    LakePredicate::Compare {
+                        column_id: 0,
+                        op: CompareOp::Lt,
+                        value: LakeValue::Int(5),
+                    },
+                    LakePredicate::In {
+                        column_id: 0,
+                        values: vec![LakeValue::Int(1), LakeValue::Int(2)],
+                    },
+                ]),
+                created_version: 0,
+                pending_rows: 0,
+            })])
+        })
+        .expect("delete");
+        let mut wide = base.clone();
+        wide.schema_id = 2;
+        wide.columns[0].fractional_digits = Some(9);
+        let version = log
+            .commit(attempt(OperationKind::SchemaChange), |_| {
+                Ok(vec![LogEntry::SchemaChange(wide.clone())])
+            })
+            .expect("widen");
+        let manifest = log.manifest_at(version).expect("manifest");
+        let predicate = &manifest.delete_predicates[0].predicate;
+        assert_eq!(
+            *predicate,
+            LakePredicate::And(vec![
+                LakePredicate::Compare {
+                    column_id: 0,
+                    op: CompareOp::Lt,
+                    value: LakeValue::Int128(5_000_000),
+                },
+                LakePredicate::In {
+                    column_id: 0,
+                    values: vec![LakeValue::Int128(1_000_000), LakeValue::Int128(2_000_000)],
+                },
+            ])
+        );
+        assert_eq!(
+            manifest.delete_predicates[0].sql, "ts < 5",
+            "the text stays what was typed"
+        );
     }
 
     #[test]

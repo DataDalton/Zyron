@@ -177,12 +177,18 @@ fn the_catalog_schema_registry_loads_with_every_table() {
     );
     for name in zyron_catalog::catalog_schema::table_names() {
         let table = registry.table(name).unwrap_or_else(|| panic!("{name}"));
+        let version = zyron_catalog::catalog_schema::table_version(name)
+            .unwrap_or_else(|| panic!("{name} has no version"));
+        assert_eq!(table.registration.current_schema_version, version);
+        assert!(version >= zyron_catalog::catalog_schema::CATALOG_SCHEMA_VERSION);
+        // A table still at the shared version plans an empty chain from it,
+        // and one reshaped since plans the steps that reshaped it
+        let chain = table.plan(FormatVersion::V1).expect("plans");
         assert_eq!(
-            table.registration.current_schema_version,
-            zyron_catalog::catalog_schema::CATALOG_SCHEMA_VERSION
+            chain.is_empty(),
+            version == zyron_catalog::catalog_schema::CATALOG_SCHEMA_VERSION,
+            "{name}"
         );
-        // Nothing has been bumped yet, so every table plans an empty chain
-        assert!(table.plan(FormatVersion::V1).expect("plans").is_empty());
     }
 }
 

@@ -142,7 +142,7 @@ A NULL array gives NULL from every one of them. An empty array gives an empty ar
 
 ## Lambdas
 
-`array_filter` and `array_transform` take an expression over one element, written `x -> expr`. The name is yours; it stands for one element and is typed as the array's element type.
+`array_filter` and `array_transform` take an expression over one element, written `x -> expr`. The name is yours, and it stands for one element, typed as the array's element type.
 
 ```sql
 SELECT array_transform(prices, p -> p * 2) FROM baskets;

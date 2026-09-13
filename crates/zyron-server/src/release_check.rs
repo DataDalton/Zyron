@@ -247,15 +247,22 @@ fn check_migrators_and_fixtures(substrate: &FormatSubstrate, report: &mut Releas
             }
             // Each framing carries its identity somewhere different. A file
             // of its own opens with the envelope, a file that owns its
-            // trailer opens with the envelope header, and a page carries a
-            // stamp inside the page header the container checksums
+            // trailer opens with the envelope header, a record inside a
+            // stream opens with the magic and version prefix its own reader
+            // peeks at, and a page carries a stamp inside the page header
+            // the container checksums
             let identity: Result<(zyron_common::format::FormatKind, FormatVersion), String> =
                 match registration.kind.framing() {
                     zyron_common::format::Framing::Stamp => fixture_stamp(fixture.bytes)
                         .ok_or_else(|| "the page header carries no format stamp".to_string()),
-                    zyron_common::format::Framing::OwnTrailer => {
+                    zyron_common::format::Framing::OwnTrailer
+                    | zyron_common::format::Framing::EnvelopeChain => {
                         zyron_common::format::envelope::decode_header(fixture.bytes)
                             .map(|(h, _)| (h.kind, h.version))
+                            .map_err(|e| e.to_string())
+                    }
+                    zyron_common::format::Framing::RecordTag => {
+                        zyron_common::format::envelope::peek(fixture.bytes)
                             .map_err(|e| e.to_string())
                     }
                     _ => zyron_common::format::envelope::decode(fixture.bytes)

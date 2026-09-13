@@ -114,6 +114,11 @@ pub async fn mirror_insert(
             ctx.txn_id,
             shadow_entry.schema_epoch,
         );
+        // The shadow's heap is the instance the rewrite opened before it
+        // published the shadow, which records nothing until the swap
+        // attaches the log. The pages are dropped whole if this node
+        // restarts before the swap, and the swap flushes them before the
+        // catalog names the shadow's files as the table's
         let heap = ctx.get_heap_file(spec.shadow_table_id).await?;
         let written = heap.insert_batch(&tuples).await?;
         for (i, shadow_id) in written.iter().enumerate() {
@@ -123,11 +128,6 @@ pub async fn mirror_insert(
                 // filling at the same time
                 let _ = spec.rows.insert_sync(pack(*source_id), pack(*shadow_id));
             }
-            // The shadow's pages are dropped whole if this node restarts
-            // before the swap, so they carry the WAL position the write
-            // happened at rather than a record of their own
-            ctx.buffer_pool
-                .mark_dirty_with_lsn(shadow_id.page_id, ctx.wal.next_lsn().0);
         }
     }
     Ok(())
@@ -155,11 +155,6 @@ pub async fn mirror_delete(
             };
             let shadow_id = unpack(word, shadow_entry.heap_file_id);
             heap.set_xmax(shadow_id, ctx.txn_id).await?;
-            // The shadow's pages are dropped whole if this node restarts
-            // before the swap, so they carry the WAL position the write
-            // happened at rather than a record of their own
-            ctx.buffer_pool
-                .mark_dirty_with_lsn(shadow_id.page_id, ctx.wal.next_lsn().0);
         }
     }
     Ok(())

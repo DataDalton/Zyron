@@ -97,7 +97,6 @@ async fn create_harness() -> Harness {
         publication_manager: None,
         cdc_stream_manager: None,
         cdc_ingest_manager: None,
-        trigger_manager: None,
         udf_registry: None,
         uda_registry: None,
         procedure_registry: None,

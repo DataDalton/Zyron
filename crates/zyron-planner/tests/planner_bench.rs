@@ -277,7 +277,8 @@ fn logical_op_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GraphAlgorithm { .. } => "GraphAlgorithm",
         LogicalPlan::AnalyticsTableFunction { .. } => "AnalyticsTableFunction",
         LogicalPlan::AsofJoin { .. } => "AsofJoin",
-        LogicalPlan::ExpandRows { spec, .. } => match spec {
+        LogicalPlan::ChangeScan { .. } => "ChangeScan",
+        LogicalPlan::ExpandRows { spec, .. } => match spec.as_ref() {
             zyron_planner::logical::ExpandSpec::Unnest { .. } => "Unnest",
             zyron_planner::logical::ExpandSpec::Flatten { .. } => "Flatten",
             zyron_planner::logical::ExpandSpec::Unpivot { .. } => "Unpivot",

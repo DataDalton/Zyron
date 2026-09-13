@@ -54,6 +54,7 @@ fn table_entry_lifecycle_roundtrip() {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
     let bytes = entry.to_bytes();
     let decoded = TableEntry::from_bytes(&bytes).expect("decode");
@@ -92,6 +93,7 @@ fn table_entry_backward_compatible_without_lifecycle() {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.lifecycle, LifecycleConfig::default());
@@ -173,6 +175,7 @@ fn table_entry_columnar_registry_roundtrip() {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.columnar, columnar);
@@ -216,6 +219,7 @@ fn table_entry_lake_tail_roundtrip() {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert!(decoded.lake.is_lake());
@@ -225,9 +229,12 @@ fn table_entry_lake_tail_roundtrip() {
     assert!(!heap.lake.is_lake());
 
     // Bytes written before a tail section existed decode to that section's
-    // default. Each cut is measured rather than counted by hand, so adding a
-    // later tail section does not silently move the earlier cuts and turn
-    // this into a test of nothing
+    // default. Every length below is the encoded size of one tail section on
+    // this fixture, counted from what its writer emits, and the cuts run from
+    // the end inward in the reverse of the order the sections are written. A
+    // section added without a length here moves every cut into the middle of
+    // it, and the last assertion below fails rather than passing on bytes
+    // that mean something else
     let full = entry.to_bytes();
     // foreign: two u32-prefixed strings, both empty on a local table
     let foreign_len = 4 + 4;
@@ -240,11 +247,16 @@ fn table_entry_lake_tail_roundtrip() {
     // u32-prefixed strings, both empty on a table that follows nobody
     let lake_len = 1 + 1 + 4 + 4;
     // schema epochs: the current epoch, then the count of past epochs and the
-    // count of columns stamped before the first one, both empty here. Written
-    // after foreign, so every cut below has to step over it first
+    // count of columns stamped before the first one, both empty here
     let epoch_len = 2 + 2 + 2;
+    // change data feed, written last: retention, the count of column sets
+    // with none on this table, the before-image flag, the compression byte
+    // and the first version the feed carries
+    let cdf_len = 8 + 4 + 1 + 1 + 8;
+    // Written after foreign, so every cut below steps over both first
+    let after_foreign = cdf_len + epoch_len;
 
-    let pre_foreign = TableEntry::from_bytes(&full[..full.len() - epoch_len - foreign_len])
+    let pre_foreign = TableEntry::from_bytes(&full[..full.len() - after_foreign - foreign_len])
         .expect("decode pre-foreign bytes");
     assert!(
         !pre_foreign.foreign.is_foreign(),
@@ -253,17 +265,28 @@ fn table_entry_lake_tail_roundtrip() {
     assert_eq!(pre_foreign.cluster.spec_id, entry.cluster.spec_id);
 
     let pre_cluster =
-        TableEntry::from_bytes(&full[..full.len() - epoch_len - foreign_len - cluster_len])
+        TableEntry::from_bytes(&full[..full.len() - after_foreign - foreign_len - cluster_len])
             .expect("decode pre-clustering bytes");
     assert!(pre_cluster.cluster.keys.is_empty());
     assert_eq!(pre_cluster.cluster.spec_id, 0);
     assert!(!pre_cluster.foreign.is_foreign());
 
     let pre_lake = TableEntry::from_bytes(
-        &full[..full.len() - epoch_len - foreign_len - cluster_len - lake_len],
+        &full[..full.len() - after_foreign - foreign_len - cluster_len - lake_len],
     )
     .expect("decode pre-lake bytes");
     assert!(!pre_lake.lake.is_lake());
+
+    // The oldest shape decodes every tail section at its default. This is
+    // what a length left out of the arithmetic above breaks, so it is the
+    // assertion that keeps the counts honest
+    assert!(!pre_lake.foreign.is_foreign());
+    assert!(pre_lake.cluster.keys.is_empty());
+    assert_eq!(pre_lake.schema_epoch, 0);
+    assert!(pre_lake.schema_epochs.is_empty());
+    assert_eq!(pre_lake.cdf.retention_micros, 0);
+    assert!(pre_lake.cdf.column_sets.is_empty());
+    assert_eq!(pre_lake.cdf.first_version, 0);
 }
 
 /// The clustering policy is what the fold tier reads to lay out a heap
@@ -296,6 +319,7 @@ fn table_entry_cluster_tail_roundtrip() {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
     entry.cluster.mode = zyron_common::ClusterMode::Hybrid.to_u8();
     entry.cluster.schedule = zyron_common::ClusteringSchedule::Continuous.to_u8();

@@ -10,14 +10,21 @@
 //! Three things can differ between the layout a row was written under and the
 //! table as it stands now. A column the row predates is filled from the value
 //! recorded when it was added. A column since dropped still occupies its
-//! position, so the cursor walks it and pushes nothing. A column whose type
-//! widened is decoded at the width the bytes carry and widened on the way into
-//! the builder.
+//! position, so the cursor walks it and pushes nothing, or NULL when the
+//! projection still names the column, which a write path reading a row image
+//! over the table's whole column list does. A column whose type widened is
+//! decoded at the width the bytes carry and widened on the way into the
+//! builder.
 //!
 //! The work of deciding all three is done once per (table, epoch, projection)
 //! and kept as a plan, so the per-row path is a table lookup and a walk.
+//!
+//! A change data feed configured with a column subset records each row
+//! narrowed to the subset in force at its epoch, and flags the record. Such a
+//! record decodes through the epoch's layout narrowed the same way, which is
+//! a second set of plans over the same epochs
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zyron_catalog::{ColumnEntry, ColumnId, PhysicalColumn, TableEntry};
 use zyron_common::{Result, RowLocator, TypeId, ZyronError};
@@ -28,7 +35,7 @@ use crate::column::ScalarValue;
 /// How a value read at the epoch's width becomes a value of the column's
 /// current type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Widen {
+pub(crate) enum Widen {
     /// The bytes already carry the current type
     None,
     /// A signed integer read at a narrower width, sign extended into the
@@ -45,7 +52,7 @@ enum Widen {
 
 /// What the decoder does with one physical column of an epoch's layout.
 #[derive(Debug, Clone)]
-enum Step {
+pub(crate) enum Step {
     /// Read the value and push it into a builder
     Take {
         builder: u16,
@@ -62,6 +69,16 @@ enum Step {
     /// Walk the value to keep the cursor aligned and push nothing, which is
     /// what a column dropped since this epoch was written leaves behind
     Discard { physical: TypeId },
+}
+
+impl Step {
+    /// The type the bytes of this column carry
+    pub(crate) fn physical(&self) -> TypeId {
+        match self {
+            Step::Take { physical, .. } => *physical,
+            Step::Discard { physical } => *physical,
+        }
+    }
 }
 
 /// Everything needed to read one epoch's rows into one projection.
@@ -88,6 +105,19 @@ pub struct EpochPlan {
 }
 
 impl EpochPlan {
+    /// One step per physical column of the layout, in encoded order, which
+    /// is what a reader holding the columns apart rather than in rows
+    /// follows
+    pub(crate) fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+
+    /// The builders whose column the layout does not carry, with the value
+    /// every row of the layout reads for them
+    pub(crate) fn absent(&self) -> &[(u16, ScalarValue)] {
+        &self.absent
+    }
+
     /// Whether `data` spans a whole row of this layout without running past
     /// its end. Mirrors the cursor advancement in `decode_into`, so a row
     /// that passes here decodes without an out-of-bounds index.
@@ -220,7 +250,7 @@ impl EpochPlan {
 
 /// Widens one decoded value into the type its column now declares.
 #[inline]
-fn apply_widen(widen: Widen, scalar: ScalarValue) -> ScalarValue {
+pub(crate) fn apply_widen(widen: Widen, scalar: ScalarValue) -> ScalarValue {
     let as_i128 = |s: &ScalarValue| -> Option<i128> {
         match s {
             ScalarValue::Int8(v) => Some(*v as i128),
@@ -436,6 +466,17 @@ impl EpochDecoder {
     /// projection that skips a column produces a plan that walks its bytes
     /// and pushes nothing.
     pub fn new(table: &TableEntry, output_ids: &[ColumnId]) -> Self {
+        Self::build(table, output_ids, false)
+    }
+
+    /// A decoder that also fills a dropped column the projection names, from
+    /// the rows that still carry it. A change read that renders each record
+    /// in the shape it was written under asks for this
+    pub fn new_with_dropped(table: &TableEntry, output_ids: &[ColumnId]) -> Self {
+        Self::build(table, output_ids, true)
+    }
+
+    fn build(table: &TableEntry, output_ids: &[ColumnId], include_dropped: bool) -> Self {
         let mut builder_of: HashMap<ColumnId, u16> = HashMap::with_capacity(output_ids.len());
         for (b, id) in output_ids.iter().enumerate() {
             builder_of.insert(*id, b as u16);
@@ -454,15 +495,24 @@ impl EpochDecoder {
         if !table.pre_stamp_columns.is_empty() {
             plans[0] = Some(build_plan(
                 &table.pre_stamp_columns,
+                &carried_by(&table.pre_stamp_columns),
                 &by_id,
                 &builder_of,
                 table,
+                include_dropped,
             ));
         }
         for recorded in &table.schema_epochs {
             let slot = recorded.epoch as usize;
             if slot < plans.len() {
-                plans[slot] = Some(build_plan(&recorded.columns, &by_id, &builder_of, table));
+                plans[slot] = Some(build_plan(
+                    &recorded.columns,
+                    &carried_by(&recorded.columns),
+                    &by_id,
+                    &builder_of,
+                    table,
+                    include_dropped,
+                ));
             }
         }
 
@@ -551,12 +601,208 @@ impl EpochDecoder {
     }
 }
 
+/// What a projected change record of one epoch decodes through
+#[derive(Debug, Clone)]
+enum ProjectedPlan {
+    /// The plan over the columns the feed recorded at the epoch
+    Plan(EpochPlan),
+    /// The projection asks for something no record of this epoch holds, and
+    /// the first such record fails with this rather than reading NULL for a
+    /// value the table had
+    Refused(String),
+}
+
+/// Every plan one table's projected change records need for one projection.
+///
+/// A change data feed configured with a column subset records each row
+/// narrowed to the subset in force at its epoch and flags the record. The
+/// epoch names both the table's layout and the subset, so the plan for an
+/// epoch walks that layout narrowed to that subset. A column the subset left
+/// out is not absent the way a column added later is. The table had a value
+/// the feed never recorded, so a projection asking for it is refused on the
+/// first record of that epoch rather than answered NULL
+#[derive(Debug, Clone)]
+pub struct ProjectedEpochDecoder {
+    /// Indexed by epoch. A None slot is an epoch this table never wrote
+    plans: Vec<Option<ProjectedPlan>>,
+    table_id: u32,
+    table_name: String,
+}
+
+impl ProjectedEpochDecoder {
+    /// Builds the plans for `table`'s projected records, filling the
+    /// builders that `output_ids` describes in that order. `include_dropped`
+    /// also fills a dropped column the projection names from the records
+    /// that carry it
+    pub fn new(table: &TableEntry, output_ids: &[ColumnId], include_dropped: bool) -> Self {
+        let mut builder_of: HashMap<ColumnId, u16> = HashMap::with_capacity(output_ids.len());
+        for (b, id) in output_ids.iter().enumerate() {
+            builder_of.insert(*id, b as u16);
+        }
+        let by_id: HashMap<ColumnId, &ColumnEntry> =
+            table.columns.iter().map(|c| (c.id, c)).collect();
+        let highest = table
+            .schema_epochs
+            .iter()
+            .map(|e| e.epoch)
+            .max()
+            .unwrap_or(table.schema_epoch);
+        let mut plans: Vec<Option<ProjectedPlan>> = vec![None; highest as usize + 1];
+
+        let epochs = std::iter::once((0u16, table.pre_stamp_columns.as_slice()))
+            .filter(|(_, layout)| !layout.is_empty())
+            .chain(
+                table
+                    .schema_epochs
+                    .iter()
+                    .map(|recorded| (recorded.epoch, recorded.columns.as_slice())),
+            );
+        for (epoch, layout) in epochs {
+            let slot = epoch as usize;
+            if slot >= plans.len() {
+                continue;
+            }
+            plans[slot] = Some(Self::plan_for(
+                table,
+                epoch,
+                layout,
+                &by_id,
+                &builder_of,
+                include_dropped,
+            ));
+        }
+        Self {
+            plans,
+            table_id: table.id.0,
+            table_name: table.name.clone(),
+        }
+    }
+
+    /// The plan one epoch's projected records decode through, or the refusal
+    /// every such record meets
+    fn plan_for(
+        table: &TableEntry,
+        epoch: u16,
+        layout: &[PhysicalColumn],
+        by_id: &HashMap<ColumnId, &ColumnEntry>,
+        builder_of: &HashMap<ColumnId, u16>,
+        include_dropped: bool,
+    ) -> ProjectedPlan {
+        let recorded = table.cdf.columns_at(epoch);
+        if recorded.is_empty() {
+            return ProjectedPlan::Refused(format!(
+                "table \"{}\" (id {}) has a change record stamped with schema epoch {epoch} that \
+                 carries a column subset, and no subset was in force at that epoch, so the \
+                 record cannot be decoded",
+                table.name, table.id.0
+            ));
+        }
+        // A column the layout carries and the subset left out was never
+        // recorded, and a projection asking for it is refused by name
+        let carried = carried_by(layout);
+        let mut wanted: Vec<(&ColumnId, &u16)> = builder_of.iter().collect();
+        wanted.sort_by_key(|(_, builder)| **builder);
+        for (id, _) in wanted {
+            if carried.contains(id) && !recorded.contains(id) {
+                let name = by_id
+                    .get(id)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("<unknown>");
+                return ProjectedPlan::Refused(format!(
+                    "column '{name}' is outside the change data feed's cdf_columns list that \
+                     was in force on table '{}' at schema epoch {epoch}, so the feed holds no \
+                     value for it in the changes written under that list. Read a later \
+                     version range or leave the column out of the query",
+                    table.name
+                ));
+            }
+        }
+        let projected: Vec<PhysicalColumn> = layout
+            .iter()
+            .filter(|column| recorded.contains(&column.column_id))
+            .enumerate()
+            .map(|(ordinal, column)| PhysicalColumn {
+                column_id: column.column_id,
+                physical_type: column.physical_type,
+                fractional_digits: column.fractional_digits,
+                ordinal: ordinal as u16,
+            })
+            .collect();
+        ProjectedPlan::Plan(build_plan(
+            &projected,
+            &carried,
+            by_id,
+            builder_of,
+            table,
+            include_dropped,
+        ))
+    }
+
+    /// The plan one epoch's projected records decode through, reporting an
+    /// epoch the table never wrote or a column the feed never recorded at
+    /// that epoch
+    pub(crate) fn plan(&self, epoch: u16) -> Result<&EpochPlan> {
+        match self.plans.get(epoch as usize).and_then(|p| p.as_ref()) {
+            Some(ProjectedPlan::Plan(plan)) => Ok(plan),
+            Some(ProjectedPlan::Refused(message)) => {
+                Err(ZyronError::CdcDecoderError(message.clone()))
+            }
+            None => Err(ZyronError::CatalogCorrupted(format!(
+                "table \"{}\" (id {}) has a change record stamped with schema epoch {epoch},                  which names no layout the table ever wrote. The record cannot be decoded,                  because every column after the null bitmap would be read at the wrong offset",
+                self.table_name, self.table_id
+            ))),
+        }
+    }
+
+    /// Decodes one projected record, reporting an epoch the table never
+    /// wrote or a column the feed never recorded at that epoch
+    #[inline]
+    pub fn decode(&self, epoch: u16, data: &[u8], builders: &mut [ColumnBuilder]) -> Result<()> {
+        match self.plans.get(epoch as usize).and_then(|p| p.as_ref()) {
+            Some(ProjectedPlan::Plan(plan)) => {
+                if !plan.spans(data) {
+                    return Err(ZyronError::CdcDecoderError(format!(
+                        "table \"{}\" (id {}) has a change record of {} bytes stamped with \
+                         schema epoch {epoch} that is shorter than the column subset recorded \
+                         at that epoch",
+                        self.table_name,
+                        self.table_id,
+                        data.len()
+                    )));
+                }
+                plan.decode_into(data, builders);
+                Ok(())
+            }
+            Some(ProjectedPlan::Refused(message)) => {
+                Err(ZyronError::CdcDecoderError(message.clone()))
+            }
+            None => Err(ZyronError::CatalogCorrupted(format!(
+                "table \"{}\" (id {}) has a change record stamped with schema epoch {epoch}, \
+                 which names no layout the table ever wrote. The record cannot be decoded, \
+                 because every column after the null bitmap would be read at the wrong offset",
+                self.table_name, self.table_id
+            ))),
+        }
+    }
+}
+
+/// The column ids a layout carries
+fn carried_by(layout: &[PhysicalColumn]) -> HashSet<ColumnId> {
+    layout.iter().map(|p| p.column_id).collect()
+}
+
 /// Builds one epoch's plan from its recorded layout.
+///
+/// `carried` names the columns the epoch's full layout holds, which is the
+/// layout itself for a whole row and the full layout for a projected one, so
+/// a column the projection left out is not mistaken for one added later
 fn build_plan(
     layout: &[PhysicalColumn],
+    carried: &HashSet<ColumnId>,
     by_id: &HashMap<ColumnId, &ColumnEntry>,
     builder_of: &HashMap<ColumnId, u16>,
     table: &TableEntry,
+    include_dropped: bool,
 ) -> EpochPlan {
     let mut steps = Vec::with_capacity(layout.len());
     for physical in layout {
@@ -564,14 +810,17 @@ fn build_plan(
             by_id.get(&physical.column_id),
             builder_of.get(&physical.column_id),
         ) {
-            // The column still exists and this projection wants it
-            (Some(column), Some(builder)) if !column.dropped => steps.push(Step::Take {
-                builder: *builder,
-                physical: physical.physical_type,
-                logical: column.type_id,
-                widen: widening_for(physical, column),
-                encrypted: column.is_encrypted(),
-            }),
+            // The column still exists and this projection wants it, or it
+            // was dropped and the projection asked for the dropped ones too
+            (Some(column), Some(builder)) if !column.dropped || include_dropped => {
+                steps.push(Step::Take {
+                    builder: *builder,
+                    physical: physical.physical_type,
+                    logical: column.type_id,
+                    widen: widening_for(physical, column),
+                    encrypted: column.is_encrypted(),
+                })
+            }
             // Either the column was dropped, or this projection skips it.
             // Both walk the bytes and push nothing
             _ => steps.push(Step::Discard {
@@ -581,16 +830,25 @@ fn build_plan(
     }
 
     // A column the layout does not carry is a column added after this epoch,
-    // so every row of the epoch reads the value recorded when it was added
-    let carried: std::collections::HashSet<ColumnId> = layout.iter().map(|p| p.column_id).collect();
+    // so every row of the epoch reads the value recorded when it was added.
+    // A dropped column the projection asked for and this layout never held
+    // reads the same way when the projection wants the dropped ones, and a
+    // dropped column the projection names without wanting them reads NULL
+    // from every row, whether the layout carried its bytes, which the plan
+    // walks past, or not
     let mut absent = Vec::new();
     for column in &table.columns {
-        if column.dropped || carried.contains(&column.id) {
+        let Some(builder) = builder_of.get(&column.id) else {
+            continue;
+        };
+        if column.dropped && !include_dropped {
+            absent.push((*builder, ScalarValue::Null));
             continue;
         }
-        if let Some(builder) = builder_of.get(&column.id) {
-            absent.push((*builder, absent_scalar(column)));
+        if carried.contains(&column.id) {
+            continue;
         }
+        absent.push((*builder, absent_scalar(column)));
     }
     // Pushed in builder order so a projection that lists several added
     // columns fills them in the order its own schema names
@@ -678,6 +936,7 @@ mod tests {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         entry.seal_initial_epoch();
         entry
@@ -791,6 +1050,56 @@ mod tests {
     }
 
     #[test]
+    fn test_a_dropped_column_the_projection_names_reads_null_from_every_row() {
+        let mut t = table(vec![
+            column(0, "a", TypeId::Int32, 0),
+            column(1, "gone", TypeId::Text, 1),
+            column(2, "c", TypeId::Int32, 2),
+        ]);
+        t.columns[1].dropped = true;
+
+        // The projection is the table's whole column list, the shape a write
+        // path reads a row image in, so the dropped column has a builder
+        let ids = vec![ColumnId(0), ColumnId(1), ColumnId(2)];
+        let decoder = EpochDecoder::new(&t, &ids);
+        let row = encode(
+            &[
+                Some(ScalarValue::Int32(1)),
+                Some(ScalarValue::Utf8("written before the drop".into())),
+                Some(ScalarValue::Int32(9)),
+            ],
+            &[TypeId::Int32, TypeId::Text, TypeId::Int32],
+        );
+        let mut builders = builders_for(3, &[TypeId::Int32, TypeId::Text, TypeId::Int32]);
+        decoder
+            .decode(1, &row, None, &mut builders)
+            .expect("decodes");
+        let a = builders.remove(0).finish();
+        let gone = builders.remove(0).finish();
+        let c = builders.remove(0).finish();
+        assert_eq!(a.get_scalar(0), ScalarValue::Int32(1));
+        assert_eq!(
+            gone.len(),
+            1,
+            "the dropped column has a row like every other"
+        );
+        assert_eq!(gone.get_scalar(0), ScalarValue::Null);
+        assert_eq!(c.get_scalar(0), ScalarValue::Int32(9));
+
+        // The same row read as the record wrote it keeps the value
+        let with_dropped = EpochDecoder::new_with_dropped(&t, &ids);
+        let mut builders = builders_for(3, &[TypeId::Int32, TypeId::Text, TypeId::Int32]);
+        with_dropped
+            .decode(1, &row, None, &mut builders)
+            .expect("decodes");
+        let gone = builders.remove(1).finish();
+        assert_eq!(
+            gone.get_scalar(0),
+            ScalarValue::Utf8("written before the drop".into())
+        );
+    }
+
+    #[test]
     fn test_a_narrower_integer_widens_on_the_way_in() {
         let mut t = table(vec![column(0, "a", TypeId::Int32, 0)]);
         // The column is BIGINT now, and epoch 1 wrote it as INT
@@ -825,6 +1134,97 @@ mod tests {
         assert!(text.contains("page 42"), "{text}");
         assert!(text.contains("slot 3"), "{text}");
         assert!(text.contains("epoch 9"), "{text}");
+    }
+
+    /// A table whose feed records `recorded` from epoch 1 on, with a key
+    fn narrowed_table(recorded: &[u16]) -> TableEntry {
+        let mut t = table(vec![
+            column(0, "id", TypeId::Int32, 0),
+            column(1, "amount", TypeId::Int32, 1),
+            column(2, "note", TypeId::Text, 2),
+        ]);
+        t.cdf.column_sets.push(zyron_catalog::CdfColumnSet {
+            from_epoch: 1,
+            columns: recorded.iter().map(|id| ColumnId(*id)).collect(),
+        });
+        t
+    }
+
+    #[test]
+    fn test_a_projected_record_decodes_through_the_narrowed_layout() {
+        let t = narrowed_table(&[0, 2]);
+        let decoder = ProjectedEpochDecoder::new(&t, &[ColumnId(0), ColumnId(2)], false);
+        // The record holds the key and the note, in the layout's order,
+        // with a bitmap sized to the two of them
+        let row = encode(
+            &[
+                Some(ScalarValue::Int32(7)),
+                Some(ScalarValue::Utf8("hi".into())),
+            ],
+            &[TypeId::Int32, TypeId::Text],
+        );
+        let mut builders = builders_for(2, &[TypeId::Int32, TypeId::Text]);
+        decoder.decode(1, &row, &mut builders).expect("decodes");
+        let id = builders.remove(0).finish();
+        let note = builders.remove(0).finish();
+        assert_eq!(id.get_scalar(0), ScalarValue::Int32(7));
+        assert_eq!(note.get_scalar(0), ScalarValue::Utf8("hi".into()));
+    }
+
+    #[test]
+    fn test_a_column_the_subset_left_out_is_refused_by_name() {
+        let t = narrowed_table(&[0, 2]);
+        let decoder = ProjectedEpochDecoder::new(&t, &[ColumnId(0), ColumnId(1)], false);
+        let row = encode(
+            &[
+                Some(ScalarValue::Int32(7)),
+                Some(ScalarValue::Utf8("hi".into())),
+            ],
+            &[TypeId::Int32, TypeId::Text],
+        );
+        let mut builders = builders_for(2, &[TypeId::Int32, TypeId::Int32]);
+        let text = decoder
+            .decode(1, &row, &mut builders)
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("'amount'"), "{text}");
+        assert!(text.contains("epoch 1"), "{text}");
+    }
+
+    #[test]
+    fn test_a_column_added_after_a_projected_record_reads_its_absent_value() {
+        let mut t = narrowed_table(&[0, 2]);
+        let mut added = column(3, "late", TypeId::Int32, 3);
+        added.absent_value = Some(9i32.to_le_bytes().to_vec());
+        t.columns.push(added);
+        t.push_schema_epoch(t.current_physical_columns());
+        let decoder = ProjectedEpochDecoder::new(&t, &[ColumnId(0), ColumnId(3)], false);
+        let row = encode(
+            &[
+                Some(ScalarValue::Int32(7)),
+                Some(ScalarValue::Utf8("hi".into())),
+            ],
+            &[TypeId::Int32, TypeId::Text],
+        );
+        let mut builders = builders_for(2, &[TypeId::Int32, TypeId::Int32]);
+        decoder.decode(1, &row, &mut builders).expect("decodes");
+        let id = builders.remove(0).finish();
+        let late = builders.remove(0).finish();
+        assert_eq!(id.get_scalar(0), ScalarValue::Int32(7));
+        assert_eq!(late.get_scalar(0), ScalarValue::Int32(9));
+    }
+
+    #[test]
+    fn test_a_projected_record_at_an_epoch_with_no_subset_is_refused() {
+        let t = table(vec![column(0, "id", TypeId::Int32, 0)]);
+        let decoder = ProjectedEpochDecoder::new(&t, &[ColumnId(0)], false);
+        let row = encode(&[Some(ScalarValue::Int32(7))], &[TypeId::Int32]);
+        let mut builders = builders_for(1, &[TypeId::Int32]);
+        let text = decoder
+            .decode(1, &row, &mut builders)
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("no subset was in force"), "{text}");
     }
 
     #[test]

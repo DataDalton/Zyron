@@ -311,7 +311,7 @@ impl IpManager {
 
     /// Adds a trusted IP entry.
     pub fn add_trusted(&self, entry: TrustedIpEntry) {
-        self.trusted.update(|v| v.push(entry));
+        self.trusted.update(|v| v.push(entry.clone()));
     }
 
     /// Removes a trusted IP entry by its IP or CIDR string. Returns true if found.

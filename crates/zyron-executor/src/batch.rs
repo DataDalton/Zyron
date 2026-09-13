@@ -316,10 +316,55 @@ impl ColumnBuilder {
         }
     }
 
+    /// A builder shaped like an existing column, the same logical type,
+    /// physical buffer and fractional precision, so rows copied from that
+    /// column land in a buffer of their own width
+    pub fn shaped_like(column: &Column, capacity: usize) -> Self {
+        Self {
+            data: ColumnData::with_capacity_for(column.type_id, column.fractional_digits, capacity),
+            nulls: NullBitmap::empty(),
+            type_id: column.type_id,
+            fractional_digits: column.fractional_digits,
+        }
+    }
+
     pub fn push(&mut self, scalar: &ScalarValue) {
         let is_null = scalar.is_null();
         self.nulls.push(is_null);
         self.data.push_scalar(scalar);
+    }
+
+    /// Appends one row of another column. A column of the same physical
+    /// buffer as this builder's, which `shaped_like` gives, costs no scalar
+    /// in between, and any other goes through the scalar
+    #[inline]
+    pub fn push_row_from(&mut self, other: &Column, idx: usize) {
+        if other.nulls.is_null(idx) {
+            self.push_null();
+            return;
+        }
+        if self.data.try_push_from(&other.data, idx) {
+            self.nulls.push(false);
+        } else {
+            self.push(&other.data.get_scalar(idx));
+        }
+    }
+
+    /// Appends the rows `indices` names, in that order, from another
+    /// column.
+    ///
+    /// The pair of buffers is resolved once for the whole run rather than
+    /// once per row, which is what separates this from a loop of
+    /// `push_row_from`. Answers false, having appended nothing, when the
+    /// two buffers are not the same kind, and the caller falls back to the
+    /// row path
+    pub fn gather_rows_from(&mut self, other: &Column, indices: &[u32]) -> bool {
+        if std::mem::discriminant(&self.data) != std::mem::discriminant(&other.data) {
+            return false;
+        }
+        self.nulls.gather_from(&other.nulls, indices);
+        self.data.gather_from(&other.data, indices);
+        true
     }
 
     /// Appends a value the caller is done with, moving a text or binary
@@ -480,6 +525,80 @@ impl ColumnBuilder {
                 run!(v, 8, |b| f64::from_le_bytes(b.try_into().unwrap()), 0.0)
             }
             _ => false,
+        }
+    }
+
+    /// Appends `rows` present cells of a fixed width type by letting `fill`
+    /// write their little-endian bytes straight into the column's own
+    /// storage, so a decoder that produces the bytes, a block decompressor,
+    /// lands them once rather than into a buffer the builder copies from.
+    ///
+    /// Answers None, having appended nothing, for a pairing whose storage
+    /// is not the bytes' own layout, a boolean, an interval, or a type the
+    /// column does not carry, and on a target whose integers are not
+    /// little-endian in memory, and the caller takes the cell by cell path.
+    /// A fill that fails leaves the column as it was
+    pub fn extend_fixed_filled(
+        &mut self,
+        physical: TypeId,
+        rows: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Option<Result<()>> {
+        if cfg!(not(target_endian = "little")) {
+            return None;
+        }
+        macro_rules! fill_into {
+            ($buf:expr, $ty:ty) => {{
+                let buf: &mut Vec<$ty> = $buf;
+                let width = std::mem::size_of::<$ty>();
+                buf.reserve(rows);
+                let len = buf.len();
+                // SAFETY: the reserved tail holds room for `rows` more
+                // elements, every bit pattern is a valid value of the plain
+                // integer, float or byte array type, and on this
+                // little-endian target the bytes the fill writes are the
+                // element's in-memory layout. The length is raised only
+                // once the fill has written all of them
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        buf.as_mut_ptr().add(len) as *mut u8,
+                        rows * width,
+                    )
+                };
+                match fill(bytes) {
+                    Ok(()) => {
+                        // SAFETY: the fill wrote every byte of the `rows`
+                        // elements past `len`
+                        unsafe { buf.set_len(len + rows) };
+                        self.nulls.extend_valid(rows);
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }};
+        }
+        match (&mut self.data, physical) {
+            (ColumnData::Int8(v), TypeId::Int8) => fill_into!(v, i8),
+            (ColumnData::Int16(v), TypeId::Int16) => fill_into!(v, i16),
+            (ColumnData::Int32(v), TypeId::Int32 | TypeId::Date) => fill_into!(v, i32),
+            (
+                ColumnData::Int64(v),
+                TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz,
+            ) => fill_into!(v, i64),
+            (
+                ColumnData::Int128(v),
+                TypeId::Int128 | TypeId::Decimal | TypeId::Hlc | TypeId::UInt128,
+            ) => fill_into!(v, i128),
+            (ColumnData::UInt8(v), TypeId::UInt8) => fill_into!(v, u8),
+            (ColumnData::UInt16(v), TypeId::UInt16) => fill_into!(v, u16),
+            (ColumnData::UInt32(v), TypeId::UInt32 | TypeId::Color) => fill_into!(v, u32),
+            (ColumnData::UInt64(v), TypeId::UInt64 | TypeId::SemVer | TypeId::Bitfield) => {
+                fill_into!(v, u64)
+            }
+            (ColumnData::Float32(v), TypeId::Float32) => fill_into!(v, f32),
+            (ColumnData::Float64(v), TypeId::Float64) => fill_into!(v, f64),
+            (ColumnData::FixedBinary16(v), TypeId::Uuid) => fill_into!(v, [u8; 16]),
+            _ => None,
         }
     }
 
@@ -967,6 +1086,7 @@ mod row_filter_tests {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         entry.seal_initial_epoch();
         entry
@@ -1100,6 +1220,53 @@ mod row_filter_tests {
 #[cfg(test)]
 mod extend_fixed_tests {
     use super::*;
+
+    #[test]
+    fn a_filled_append_lands_the_bytes_a_decoder_writes() {
+        let mut builder = ColumnBuilder::new(TypeId::Int64, 4);
+        builder.push_owned(ScalarValue::Int64(-1));
+        let values: Vec<i64> = vec![7, -8, i64::MAX, 0];
+        let outcome = builder.extend_fixed_filled(TypeId::Int64, values.len(), |out| {
+            for (cell, value) in out.chunks_exact_mut(8).zip(&values) {
+                cell.copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        });
+        assert!(matches!(outcome, Some(Ok(()))));
+        let column = builder.finish();
+        assert_eq!(column.len(), 5);
+        assert_eq!(column.get_scalar(0), ScalarValue::Int64(-1));
+        assert_eq!(column.get_scalar(1), ScalarValue::Int64(7));
+        assert_eq!(column.get_scalar(3), ScalarValue::Int64(i64::MAX));
+        assert!(!column.is_null(4));
+
+        // A fill that fails leaves the column as it was
+        let mut builder = ColumnBuilder::new(TypeId::Int32, 4);
+        let outcome = builder.extend_fixed_filled(TypeId::Int32, 3, |_| {
+            Err(zyron_common::ZyronError::Internal("no bytes".into()))
+        });
+        assert!(matches!(outcome, Some(Err(_))));
+        assert_eq!(builder.finish().len(), 0);
+
+        // A boolean's storage is not its bytes, so the pairing declines
+        let mut builder = ColumnBuilder::new(TypeId::Boolean, 4);
+        assert!(
+            builder
+                .extend_fixed_filled(TypeId::Boolean, 2, |_| Ok(()))
+                .is_none()
+        );
+        // A uuid's is
+        let mut builder = ColumnBuilder::new(TypeId::Uuid, 4);
+        let outcome = builder.extend_fixed_filled(TypeId::Uuid, 1, |out| {
+            out.copy_from_slice(&[9u8; 16]);
+            Ok(())
+        });
+        assert!(matches!(outcome, Some(Ok(()))));
+        assert_eq!(
+            builder.finish().get_scalar(0),
+            ScalarValue::FixedBinary16([9u8; 16])
+        );
+    }
 
     /// Every fixed-width physical type a lake column can decode to.
     const FIXED_TYPES: &[TypeId] = &[

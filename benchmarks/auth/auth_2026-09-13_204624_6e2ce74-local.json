@@ -1,0 +1,715 @@
+{
+  "id": "2026-09-13_204624_6e2ce74-local",
+  "date": "2026-09-13 20:46:29Z",
+  "ts": 1789332389,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "abac_evaluate": {
+      "latency_ns": {
+        "run_1": {
+          "average": 67.612300,
+          "runs": [67.61],
+          "target": 2000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 67.612300,
+          "runs": [67.61],
+          "target": 2000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "api_key_correctness": {
+      "lookup_ns": {
+        "run_1": {
+          "average": 37.120600,
+          "runs": [37.12],
+          "target": 50000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 37.120600,
+          "runs": [37.12],
+          "target": 50000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "api_key_throughput": {
+      "combined_ops_sec": {
+        "run_1": {
+          "average": 12495314.257154,
+          "runs": [12495314.26],
+          "target": 100000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 12495314.257154,
+          "runs": [12495314.26],
+          "target": 100000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "credential_cache_lookup": {
+      "ops_per_sec": {
+        "average": 9132828.774986,
+        "runs": [9132828.77],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "credential_seal": {
+      "ops_per_sec": {
+        "average": 2753774.047332,
+        "runs": [2753774.05],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "credential_open": {
+      "ops_per_sec": {
+        "average": 3253270.350019,
+        "runs": [3253270.35],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "jwt_encode_verify": {
+      "ops_per_sec": {
+        "average": 1495790.098767,
+        "runs": [1495790.10],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "mtls_fingerprint_verify": {
+      "ops_per_sec": {
+        "average": 2450115.645458,
+        "runs": [2450115.65],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "security_map_resolve": {
+      "ops_per_sec": {
+        "average": 18823564.844357,
+        "runs": [18823564.84],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "balloon_hash_timing": {
+      "hash_time_us": {
+        "average": 76.000000,
+        "runs": [76.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "memory_hard_minimum": {
+        "average": 76.000000,
+        "runs": [76.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "challenge_response": {
+      "verify_latency_ms": {
+        "run_1": {
+          "average": 0.073500,
+          "runs": [0.07],
+          "target": 200.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 0.073500,
+          "runs": [0.07],
+          "target": 200.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "classification_check": {
+      "ops_sec": {
+        "run_1": {
+          "average": 42154073.137317,
+          "runs": [42154073.14],
+          "target": 10000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 42154073.137317,
+          "runs": [42154073.14],
+          "target": 10000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "column_mask_partial": {
+      "ops_per_sec": {
+        "run_1": {
+          "average": 31753491.296368,
+          "runs": [31753491.30],
+          "target": 30000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 31753491.296368,
+          "runs": [31753491.30],
+          "target": 30000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "column_mask_hash": {
+      "ops_per_sec": {
+        "run_1": {
+          "average": 23986970.277745,
+          "runs": [23986970.28],
+          "target": 15000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 23986970.277745,
+          "runs": [23986970.28],
+          "target": 15000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "concurrent_auth": {
+      "auth_per_sec": {
+        "run_1": {
+          "average": 160632.248530,
+          "runs": [160632.25],
+          "target": 1000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 160632.248530,
+          "runs": [160632.25],
+          "target": 1000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "concurrent_privilege": {
+      "scaling_factor": {
+        "run_1": {
+          "average": 6.212929,
+          "runs": [6.21],
+          "target": 2.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 6.212929,
+          "runs": [6.21],
+          "target": 2.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "data_mask": {
+      "email_ops_sec": {
+        "run_1": {
+          "average": 55300558.535641,
+          "runs": [55300558.54],
+          "target": 1000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 55300558.535641,
+          "runs": [55300558.54],
+          "target": 1000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "authenticated_encrypt": {
+      "gb_per_sec": {
+        "run_1": {
+          "average": 5.114144,
+          "runs": [5.11],
+          "target": 4.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 5.114144,
+          "runs": [5.11],
+          "target": 4.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "authenticated_decrypt": {
+      "gb_per_sec": {
+        "run_1": {
+          "average": 4.907552,
+          "runs": [4.91],
+          "target": 4.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 4.907552,
+          "runs": [4.91],
+          "target": 4.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "governance_usage": {
+      "record_ops_sec": {
+        "run_1": {
+          "average": 20124247.101605,
+          "runs": [20124247.10],
+          "target": 5000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 20124247.101605,
+          "runs": [20124247.10],
+          "target": 5000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "jwt_correctness": {
+      "verify_latency_us": {
+        "run_1": {
+          "average": 0.271043,
+          "runs": [0.27],
+          "target": 200.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 0.271043,
+          "runs": [0.27],
+          "target": 200.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "jwt_throughput": {
+      "combined_ops_sec": {
+        "run_1": {
+          "average": 3781361.668337,
+          "runs": [3781361.67],
+          "target": 50000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 3781361.668337,
+          "runs": [3781361.67],
+          "target": 50000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "password_auth": {
+      "hash_time_ms": {
+        "run_1": {
+          "average": 253.851200,
+          "runs": [253.85],
+          "target": 80.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 253.851200,
+          "runs": [253.85],
+          "target": 80.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      },
+      "verify_time_ms": {
+        "run_1": {
+          "average": 258.915500,
+          "runs": [258.92],
+          "target": 80.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 258.915500,
+          "runs": [258.92],
+          "target": 80.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "privilege_latency": {
+      "per_check_ns": {
+        "run_1": {
+          "average": 35.205600,
+          "runs": [35.21],
+          "target": 80.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 35.205600,
+          "runs": [35.21],
+          "target": 80.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "privilege_check": {
+      "ops_sec": {
+        "run_1": {
+          "average": 29114539.509886,
+          "runs": [29114539.51],
+          "target": 1000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 29114539.509886,
+          "runs": [29114539.51],
+          "target": 1000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "privilege_deny_wins": {
+      "deny_ops_sec": {
+        "run_1": {
+          "average": 29743138.258004,
+          "runs": [29743138.26],
+          "target": 1000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 29743138.258004,
+          "runs": [29743138.26],
+          "target": 1000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "rls_predicate_inject": {
+      "latency_ns": {
+        "run_1": {
+          "average": 209.667000,
+          "runs": [209.67],
+          "target": 1000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 209.667000,
+          "runs": [209.67],
+          "target": 1000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "role_hierarchy_correctness": {
+      "traversal_ns": {
+        "run_1": {
+          "average": 173.935000,
+          "runs": [173.94],
+          "target": 200.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 173.935000,
+          "runs": [173.94],
+          "target": 200.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "role_hierarchy": {
+      "traversal_us": {
+        "run_1": {
+          "average": 0.457697,
+          "runs": [0.46],
+          "target": 10.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 0.457697,
+          "runs": [0.46],
+          "target": 10.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "security_label_check": {
+      "latency_ns": {
+        "run_1": {
+          "average": 73.915400,
+          "runs": [73.92],
+          "target": 100.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 73.915400,
+          "runs": [73.92],
+          "target": 100.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "time_window": {
+      "eval_ops_sec": {
+        "run_1": {
+          "average": 820681165.367255,
+          "runs": [820681165.37],
+          "target": 10000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 820681165.367255,
+          "runs": [820681165.37],
+          "target": 10000000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "totp_correctness": {
+      "verify_ns": {
+        "run_1": {
+          "average": 159.597100,
+          "runs": [159.60],
+          "target": 500000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 159.597100,
+          "runs": [159.60],
+          "target": 500000.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "totp_throughput": {
+      "combined_ops_sec": {
+        "run_1": {
+          "average": 8170935.980717,
+          "runs": [8170935.98],
+          "target": 500000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 8170935.980717,
+          "runs": [8170935.98],
+          "target": 500000.000000,
+          "passed": true,
+          "higher_is_better": true,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    },
+    "webhook_signature_verify": {
+      "latency_us": {
+        "run_1": {
+          "average": 0.143096,
+          "runs": [0.14],
+          "target": 20.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        },
+        "run_2": {
+          "average": 0.143096,
+          "runs": [0.14],
+          "target": 20.000000,
+          "passed": true,
+          "higher_is_better": false,
+          "calibration_us": null,
+          "storage_calibration_us": null
+        }
+      }
+    }
+  }
+}

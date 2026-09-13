@@ -25,6 +25,10 @@ struct CountingHook {
 }
 
 impl CdcHook for CountingHook {
+    fn records_rows_of(&self, _table_id: u32, _branch: Option<u64>) -> bool {
+        true
+    }
+
     fn on_insert(
         &self,
         _table_id: u32,
@@ -33,6 +37,7 @@ impl CdcHook for CountingHook {
         _timestamp: i64,
         _txn_id: u64,
         _is_last_in_txn: bool,
+        _branch: Option<u64>,
     ) -> zyron_common::Result<()> {
         self.inserts.fetch_add(tuples.len(), Ordering::SeqCst);
         self.insert_bytes
@@ -50,8 +55,20 @@ impl CdcHook for CountingHook {
         _timestamp: i64,
         _txn_id: u64,
         _is_last_in_txn: bool,
+        _branch: Option<u64>,
     ) -> zyron_common::Result<()> {
         self.deletes.fetch_add(old_data.len(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn on_truncate(
+        &self,
+        _table_id: u32,
+        _version: u64,
+        _timestamp: i64,
+        _txn_id: u64,
+        _branch: Option<u64>,
+    ) -> zyron_common::Result<()> {
         Ok(())
     }
 
@@ -64,6 +81,7 @@ impl CdcHook for CountingHook {
         _timestamp: i64,
         _txn_id: u64,
         _is_last_in_txn: bool,
+        _branch: Option<u64>,
     ) -> zyron_common::Result<()> {
         assert_eq!(
             old_data.len(),

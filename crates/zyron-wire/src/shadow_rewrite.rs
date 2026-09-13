@@ -129,6 +129,12 @@ pub async fn run(
     )
     .await?;
 
+    // The shadow's heap is opened here, with no log attached, before any
+    // writer can be told to mirror into it, so the instance the writers find
+    // in the cache is the unlogged one the fill runs through
+    let shadow_entry = server.catalog.get_table_by_id(shadow_id)?;
+    crate::index_build::shadow_heap_file(server, &shadow_entry).await?;
+
     let abandoned = Arc::new(AtomicBool::new(false));
     let rows_map = Arc::new(scc::HashMap::new());
     let spec = ShadowSpec {
@@ -571,6 +577,18 @@ async fn swap_in_shadow(
 ) -> Result<(), ZyronError> {
     let old_heap = source.heap_file_id;
     let old_fsm = source.fsm_file_id;
+
+    // The fill ran with no log attached. From here every page change is
+    // recorded, and every page the fill left dirty goes to disk and is
+    // synced, so once the catalog names these files as the table's each row
+    // is either on disk or in the log. The log is attached first, so a row
+    // a writer mirrors while the flush runs is recorded rather than left on
+    // a page the flush already copied
+    let heap = crate::index_build::shadow_heap_file(server, shadow).await?;
+    heap.attach_wal(&server.wal);
+    heap.flush().await?;
+    server.disk_manager.fsync_file(shadow.heap_file_id)?;
+    server.disk_manager.fsync_file(shadow.fsm_file_id)?;
 
     let mut entry = server.catalog.get_table_by_id(source.id)?.as_ref().clone();
     entry.heap_file_id = shadow.heap_file_id;

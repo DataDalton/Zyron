@@ -251,6 +251,7 @@ const PRINCIPALS: &[&str] = &[
     "conf_role_rn2",
     "conf_role_drop",
     "conf_role_grant",
+    "conf_role_grant_cs",
     "conf_role_revoke",
     "conf_role_exec",
     "conf_role_exec_rv",
@@ -660,6 +661,53 @@ fn streaming_jobs(node: &Node) -> String {
             .list_streaming_jobs()
             .iter()
             .map(|j| format!("{}:{}", j.name, j.select_sql.len()))
+            .collect(),
+    )
+}
+
+/// Change streams with the count each has consumed per source, which is
+/// the form of a position that reads the same on every member, plus the
+/// columns and the flags a reset or a column change moves
+fn change_streams(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_change_streams()
+            .iter()
+            .map(|s| {
+                let consumed: Vec<String> = s
+                    .position
+                    .iter()
+                    .map(|p| format!("{}={}", p.table_id, p.consumed))
+                    .collect();
+                format!(
+                    "{}:{}:{:?}:{}:{}",
+                    s.name,
+                    consumed.join("+"),
+                    s.columns.as_ref().map(|c| c.len()),
+                    s.stale,
+                    s.needs_attention
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Tables with the feed settings a SET (cdf_...) moves
+fn feed_settings(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .filter(|t| t.cdf_enabled)
+            .map(|t| {
+                format!(
+                    "{}:{}:{}:{}",
+                    t.name,
+                    t.cdf.retention_micros,
+                    t.cdf.before_image,
+                    t.cdf.recorded_columns().len()
+                )
+            })
             .collect(),
     )
 }
@@ -1565,6 +1613,184 @@ const CASES: &[Case] = &[
         ],
         sql: "ALTER TABLE conf_feat_d DISABLE change_data_feed",
         proof: Proof::Catalog(table_features),
+    },
+    // Change streams. The position replicates as the count each stream has
+    // consumed, so a consume on the leader reads as the same count on every
+    // member, and a stage or an apply that reads a stream moves it in the
+    // commit that carried its rows
+    Case {
+        name: "CREATE CHANGE STREAM",
+        setup: &[
+            "CREATE TABLE conf_cs_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_src SET (change_data_feed = true)",
+            "INSERT INTO conf_cs_src (id, v) VALUES (1, 10), (2, 20)",
+        ],
+        sql: "CREATE CHANGE STREAM conf_cs ON TABLE conf_cs_src",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "CREATE CHANGE STREAM ON TABLES",
+        setup: &[
+            "CREATE TABLE conf_cs_a (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_cs_b (id BIGINT PRIMARY KEY, w TEXT)",
+            "ALTER TABLE conf_cs_a SET (change_data_feed = true)",
+            "ALTER TABLE conf_cs_b SET (change_data_feed = true)",
+        ],
+        sql: "CREATE CHANGE STREAM conf_cs_ab ON TABLES (conf_cs_a, conf_cs_b) AT VERSION 0",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "ALTER CHANGE STREAM RESET TO POSITION",
+        setup: &[
+            "CREATE TABLE conf_cs_r_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_r_src SET (change_data_feed = true)",
+            "INSERT INTO conf_cs_r_src (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+            "CREATE CHANGE STREAM conf_cs_r ON TABLE conf_cs_r_src",
+        ],
+        sql: "ALTER CHANGE STREAM conf_cs_r RESET TO POSITION 1",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "ALTER CHANGE STREAM RESET TO VERSION",
+        setup: &[
+            "CREATE TABLE conf_cs_v_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_v_src SET (change_data_feed = true)",
+            "INSERT INTO conf_cs_v_src (id, v) VALUES (1, 10), (2, 20)",
+            "CREATE CHANGE STREAM conf_cs_v ON TABLE conf_cs_v_src",
+        ],
+        sql: "ALTER CHANGE STREAM conf_cs_v RESET TO VERSION 0",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "ALTER CHANGE STREAM SET COLUMNS",
+        setup: &[
+            "CREATE TABLE conf_cs_c_src (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)",
+            "ALTER TABLE conf_cs_c_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_cs_c ON TABLE conf_cs_c_src",
+        ],
+        sql: "ALTER CHANGE STREAM conf_cs_c SET COLUMNS (id, v)",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "DROP CHANGE STREAM",
+        setup: &[
+            "CREATE TABLE conf_cs_d_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_d_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_cs_d ON TABLE conf_cs_d_src",
+        ],
+        sql: "DROP CHANGE STREAM conf_cs_d",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "GRANT ON CHANGE STREAM",
+        setup: &[
+            "CREATE ROLE conf_role_grant_cs",
+            "CREATE TABLE conf_cs_g_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_g_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_cs_g ON TABLE conf_cs_g_src",
+        ],
+        sql: "GRANT SELECT ON CHANGE STREAM conf_cs_g TO conf_role_grant_cs",
+        proof: Proof::Catalog(grants),
+    },
+    Case {
+        name: "ALTER TABLE SET (cdf options)",
+        setup: &[
+            "CREATE TABLE conf_cdf_opt (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)",
+            "ALTER TABLE conf_cdf_opt SET (change_data_feed = true)",
+        ],
+        sql: "ALTER TABLE conf_cdf_opt SET (cdf_retention = '2 days', cdf_before_image = false, cdf_columns = 'v')",
+        proof: Proof::Catalog(feed_settings),
+    },
+    Case {
+        name: "ALTER TABLE ALTER COLUMN TYPE ACKNOWLEDGE STREAM BREAK",
+        setup: &[
+            "CREATE TABLE conf_cs_brk (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_brk SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_cs_brk_s ON TABLE conf_cs_brk",
+        ],
+        sql: "ALTER TABLE conf_cs_brk ALTER COLUMN v TYPE INT ACKNOWLEDGE STREAM BREAK",
+        proof: Proof::Catalog(change_streams),
+    },
+    // A consume moves the position in the commit that carried its rows, and
+    // the count it consumed is what every member reads
+    Case {
+        name: "consume a change stream (position)",
+        setup: &[
+            "CREATE TABLE conf_cs_k_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_cs_k_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_k_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_cs_k ON TABLE conf_cs_k_src",
+            "INSERT INTO conf_cs_k_src (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+        ],
+        sql: "INSERT INTO conf_cs_k_tgt (id, v) SELECT id, v FROM conf_cs_k",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "consume a change stream (rows)",
+        setup: &[
+            "CREATE TABLE conf_cs_w_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_cs_w_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_cs_w_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_cs_w ON TABLE conf_cs_w_src",
+            "INSERT INTO conf_cs_w_src (id, v) VALUES (1, 10), (2, 20)",
+        ],
+        sql: "INSERT INTO conf_cs_w_tgt (id, v) SELECT id, v FROM conf_cs_w",
+        proof: Proof::Rows("conf_cs_w_tgt"),
+    },
+    Case {
+        name: "APPLY CHANGES",
+        setup: &[
+            "CREATE TABLE conf_ap_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_ap_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_ap_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_ap ON TABLE conf_ap_src",
+            "INSERT INTO conf_ap_src (id, v) VALUES (1, 10), (2, 20)",
+            "UPDATE conf_ap_src SET v = 21 WHERE id = 2",
+        ],
+        sql: "APPLY CHANGES INTO conf_ap_tgt FROM conf_ap KEYS (id) SEQUENCE BY _commit_version",
+        proof: Proof::Rows("conf_ap_tgt"),
+    },
+    Case {
+        name: "CREATE PIPELINE (change stream stages)",
+        setup: &[
+            "CREATE TABLE conf_pl_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_pl_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_pl_cs ON TABLE conf_pl_src",
+        ],
+        sql: "CREATE PIPELINE conf_pl_cdc ON CHANGE DATA FROM conf_pl_cs MIN ROWS 100 AS (STAGE land (CONSUME CHANGES FROM conf_pl_cs INTO conf_pl_bronze))",
+        proof: Proof::Catalog(pipelines),
+    },
+    Case {
+        name: "RUN PIPELINE (consume stage)",
+        setup: &[
+            "CREATE TABLE conf_pl_r_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "CREATE TABLE conf_pl_r_tgt (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_pl_r_src SET (change_data_feed = true)",
+            "CREATE CHANGE STREAM conf_pl_r_cs ON TABLE conf_pl_r_src",
+            "CREATE PIPELINE conf_pl_r AS (STAGE load (CONSUME CHANGES FROM conf_pl_r_cs AS (INSERT INTO conf_pl_r_tgt SELECT id, v FROM changes)))",
+            "INSERT INTO conf_pl_r_src (id, v) VALUES (1, 10), (2, 20)",
+        ],
+        sql: "RUN PIPELINE conf_pl_r",
+        proof: Proof::Rows("conf_pl_r_tgt"),
+    },
+    Case {
+        name: "CREATE CDC STREAM (implicit change stream)",
+        setup: &[
+            "CREATE TABLE conf_ob_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_ob_src SET (change_data_feed = true)",
+        ],
+        sql: "CREATE CDC STREAM conf_ob ON TABLE conf_ob_src TO webhook WITH (url = 'http://127.0.0.1:9/changes')",
+        proof: Proof::Catalog(change_streams),
+    },
+    Case {
+        name: "DROP CDC STREAM (implicit change stream)",
+        setup: &[
+            "CREATE TABLE conf_ob_d_src (id BIGINT PRIMARY KEY, v BIGINT)",
+            "ALTER TABLE conf_ob_d_src SET (change_data_feed = true)",
+            "CREATE CDC STREAM conf_ob_d ON TABLE conf_ob_d_src TO webhook WITH (url = 'http://127.0.0.1:9/changes')",
+        ],
+        sql: "DROP CDC STREAM conf_ob_d",
+        proof: Proof::Catalog(change_streams),
     },
     Case {
         name: "ALTER TABLE ALTER COLUMN SET CLASSIFICATION",

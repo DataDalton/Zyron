@@ -54,10 +54,12 @@ impl ReaderPath {
 
 /// What a migration produced and whether it has to be written back
 #[derive(Debug, Clone)]
-pub struct MigratedBody {
+pub struct MigratedBody<'a> {
     /// The body at the current writer version, or the whole file for a
-    /// format that owns its trailer
-    pub body: Vec<u8>,
+    /// format that owns its trailer. Borrowed from the input when no step
+    /// rewrote it, which is what a version bump with no body change is, so
+    /// opening such a file costs no copy of it
+    pub body: Cow<'a, [u8]>,
     pub from: FormatVersion,
     pub to: FormatVersion,
     /// True when every step could be undone, which decides downgrade
@@ -107,19 +109,19 @@ impl OpenedFile<'_> {
     /// returned whole with the format's own checksums in place
     pub fn reencode(&self) -> Vec<u8> {
         match self.framing {
-            Framing::OwnTrailer => self.body.to_vec(),
+            Framing::OwnTrailer | Framing::EnvelopeChain => self.body.to_vec(),
             _ => envelope::encode(self.kind, self.current_version, &self.body),
         }
     }
 }
 
 /// Runs the chain that takes a body from one version to another
-pub fn migrate_body(
+pub fn migrate_body<'a>(
     entry: &FormatEntry,
     from: FormatVersion,
     to: FormatVersion,
-    body: &[u8],
-) -> Result<MigratedBody, MigrationError> {
+    body: &'a [u8],
+) -> Result<MigratedBody<'a>, MigrationError> {
     let chain = entry
         .plan(from, to)
         .map_err(|e| MigrationError::Planning(e.to_string()))?;
@@ -131,17 +133,18 @@ pub fn migrate_body(
 /// A caller that resolved the reader path already holds the chain, and
 /// planning it a second time allocates another vector and rescans the
 /// migrator list for the same answer
-pub fn migrate_body_with_chain(
+pub fn migrate_body_with_chain<'a>(
     entry: &FormatEntry,
     chain: &[FormatMigrator],
     from: FormatVersion,
     to: FormatVersion,
-    body: &[u8],
-) -> Result<MigratedBody, MigrationError> {
-    // Borrowed until a step actually rewrites the body. Copying up front
-    // costs a full body memcpy that the first rewriting step throws away,
-    // because `forward` allocates its own output from a borrowed input
-    let mut current: Cow<'_, [u8]> = Cow::Borrowed(body);
+    body: &'a [u8],
+) -> Result<MigratedBody<'a>, MigrationError> {
+    // Borrowed until a step actually rewrites the body, and handed back
+    // borrowed when none does. Copying up front costs a full body memcpy
+    // that the first rewriting step throws away, because `forward`
+    // allocates its own output from a borrowed input
+    let mut current: Cow<'a, [u8]> = Cow::Borrowed(body);
     let mut reversible = true;
     for step in chain {
         if !step.no_body_change {
@@ -158,7 +161,7 @@ pub fn migrate_body_with_chain(
         reversible &= step.no_body_change || step.reversible;
     }
     Ok(MigratedBody {
-        body: current.into_owned(),
+        body: current,
         from,
         to,
         reversible,
@@ -166,16 +169,16 @@ pub fn migrate_body_with_chain(
 }
 
 /// Runs the chain backwards, which is what a downgrade does
-pub fn migrate_body_backward(
+pub fn migrate_body_backward<'a>(
     entry: &FormatEntry,
     from: FormatVersion,
     to: FormatVersion,
-    body: &[u8],
-) -> Result<MigratedBody, MigrationError> {
+    body: &'a [u8],
+) -> Result<MigratedBody<'a>, MigrationError> {
     let chain = entry
         .plan(to, from)
         .map_err(|e| MigrationError::Planning(e.to_string()))?;
-    let mut current: Cow<'_, [u8]> = Cow::Borrowed(body);
+    let mut current: Cow<'a, [u8]> = Cow::Borrowed(body);
     for step in chain.iter().rev() {
         if step.no_body_change {
             continue;
@@ -196,7 +199,7 @@ pub fn migrate_body_backward(
         })?);
     }
     Ok(MigratedBody {
-        body: current.into_owned(),
+        body: current,
         from,
         to,
         reversible: true,
@@ -366,9 +369,10 @@ fn open_parsed<'a>(
     let body = match &path {
         ReaderPath::Current => Cow::Borrowed(body),
         // The chain was planned resolving the path, so it is handed straight
-        // to the runner rather than planned a second time
+        // to the runner rather than planned a second time, and a chain that
+        // rewrote nothing hands the file's own bytes back
         ReaderPath::Migrate { from, to, chain } => {
-            Cow::Owned(migrate_body_with_chain(entry, chain, *from, *to, body)?.body)
+            migrate_body_with_chain(entry, chain, *from, *to, body)?.body
         }
     };
     Ok(OpenedFile {
@@ -712,7 +716,7 @@ mod tests {
         let back =
             migrate_body_backward(entry, FormatVersion::new(1, 1), FormatVersion::V1, b"body2")
                 .expect("undoes");
-        assert_eq!(back.body, b"body");
+        assert_eq!(back.body.as_ref(), b"body");
     }
 
     #[test]

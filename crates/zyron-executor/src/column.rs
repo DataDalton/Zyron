@@ -555,6 +555,22 @@ impl ColumnData {
     }
 
     /// Creates an empty column with pre-allocated capacity.
+    /// An empty buffer of the physical shape a column of `type_id` with
+    /// `fractional_digits` holds its values in.
+    ///
+    /// A timestamp declared past microsecond precision keeps sixteen byte
+    /// picosecond values rather than the eight byte instants its logical
+    /// type names, so an operator rebuilding a column from its logical type
+    /// alone would hand a wider column a buffer its values do not fit.
+    /// Every operator that accumulates a column it did not decode itself
+    /// sizes the buffer through here
+    pub fn with_capacity_for(type_id: TypeId, fractional_digits: Option<u8>, cap: usize) -> Self {
+        Self::with_capacity(
+            TypeId::timestamp_physical_type_id(type_id, fractional_digits),
+            cap,
+        )
+    }
+
     pub fn with_capacity(type_id: TypeId, cap: usize) -> Self {
         match type_id {
             TypeId::Boolean => ColumnData::Boolean(Vec::with_capacity(cap)),
@@ -874,6 +890,16 @@ impl ColumnData {
     /// No ScalarValue intermediary.
     #[inline]
     pub fn push_from(&mut self, other: &ColumnData, idx: usize) {
+        if !self.try_push_from(other, idx) {
+            panic!("ColumnData::push_from: type mismatch");
+        }
+    }
+
+    /// Appends a row of another buffer of the same variant, answering
+    /// false and pushing nothing when the variants differ, so a caller
+    /// that cannot know the two agree pushes the scalar instead
+    #[inline]
+    pub fn try_push_from(&mut self, other: &ColumnData, idx: usize) -> bool {
         match (self, other) {
             (ColumnData::Boolean(v), ColumnData::Boolean(o)) => v.push(o[idx]),
             (ColumnData::Int8(v), ColumnData::Int8(o)) => v.push(o[idx]),
@@ -890,8 +916,10 @@ impl ColumnData {
             (ColumnData::Utf8(v), ColumnData::Utf8(o)) => v.push(o[idx].clone()),
             (ColumnData::Binary(v), ColumnData::Binary(o)) => v.push(o[idx].clone()),
             (ColumnData::FixedBinary16(v), ColumnData::FixedBinary16(o)) => v.push(o[idx]),
-            _ => panic!("ColumnData::push_from: type mismatch"),
+            (ColumnData::Interval(v), ColumnData::Interval(o)) => v.push(o[idx]),
+            _ => return false,
         }
+        true
     }
 
     /// Appends values at the given indices from another ColumnData.
@@ -1174,6 +1202,21 @@ impl Column {
         }
     }
 
+    /// An all-null column carrying its declared digits, with its buffer in
+    /// the physical shape those digits give the type, so the values a
+    /// later batch appends fit it
+    pub fn null_column_ts(type_id: TypeId, fractional_digits: Option<u8>, len: usize) -> Self {
+        Self {
+            data: ColumnData::null_fill(
+                TypeId::timestamp_physical_type_id(type_id, fractional_digits),
+                len,
+            ),
+            nulls: NullBitmap::all_null(len),
+            type_id,
+            fractional_digits,
+        }
+    }
+
     /// Appends all rows from another column. No ScalarValue intermediary.
     pub fn extend_from(&mut self, other: &Column) {
         self.data.extend_from(&other.data);
@@ -1265,6 +1308,17 @@ impl Column {
             return None;
         }
         self.data.bytes_at(row)
+    }
+
+    /// Reads a row as i128 when the column holds an integer, None for a
+    /// null or a column holding something other than an integer. See
+    /// [`ColumnData::i128_at`].
+    #[inline]
+    pub fn i128_at(&self, row: usize) -> Option<i128> {
+        if self.nulls.is_null(row) {
+            return None;
+        }
+        self.data.i128_at(row)
     }
 
     /// Extracts the boolean value at a row. Panics if not a boolean column.

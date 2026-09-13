@@ -56,9 +56,14 @@ impl Operator for HashDistinctOperator {
                         .columns
                         .iter()
                         .map(|c| {
-                            Column::new(
-                                crate::column::ColumnData::with_capacity(c.type_id, 64),
+                            Column::new_ts(
+                                crate::column::ColumnData::with_capacity_for(
+                                    c.type_id,
+                                    c.fractional_digits,
+                                    64,
+                                ),
                                 c.type_id,
+                                c.fractional_digits,
                             )
                         })
                         .collect();

@@ -88,7 +88,6 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         publication_manager: None,
         cdc_stream_manager: None,
         cdc_ingest_manager: None,
-        trigger_manager: None,
         udf_registry: None,
         uda_registry: None,
         procedure_registry: None,
@@ -239,15 +238,7 @@ fn col_i64(batches: &[DataBatch], idx: usize) -> Vec<i64> {
 const FAR_FUTURE: i64 = 10_000_000_000_000_000; // ~year 2286 in epoch micros
 
 async fn sweep(server: &Arc<ServerState>, now: i64) -> zyron_wire::ddl_dispatch::ScheduleRunReport {
-    zyron_wire::ddl_dispatch::run_due_schedules(
-        &server.catalog,
-        &server.txn_manager,
-        &server.wal,
-        &server.buffer_pool,
-        &server.disk_manager,
-        now,
-    )
-    .await
+    zyron_wire::ddl_dispatch::run_due_schedules(server, now).await
 }
 
 #[tokio::test]

@@ -322,6 +322,44 @@ impl HeapAuthStorage {
         })
     }
 
+    /// Every heap this storage writes
+    fn heaps(&self) -> [&HeapFile; 23] {
+        [
+            &self.roles_heap,
+            &self.memberships_heap,
+            &self.privileges_heap,
+            &self.auth_rules_heap,
+            &self.classifications_heap,
+            &self.abac_policies_heap,
+            &self.object_tags_heap,
+            &self.masking_rules_heap,
+            &self.row_ownership_heap,
+            &self.delegation_edges_heap,
+            &self.users_heap,
+            &self.user_memberships_heap,
+            &self.ip_blocks_heap,
+            &self.trusted_ips_heap,
+            &self.auth_attempts_heap,
+            &self.brute_force_policies_heap,
+            &self.rls_policies_heap,
+            &self.masking_policies_heap,
+            &self.abac_rules_heap,
+            &self.column_encryption_heap,
+            &self.security_labels_heap,
+            &self.subject_labels_heap,
+            &self.webauthn_credentials_heap,
+        ]
+    }
+
+    /// Attaches the log every page change is recorded in, so a role, a
+    /// grant or a user written since the last checkpoint survives the
+    /// process dying before its page reached disk
+    pub fn attach_wal(&self, wal: &Arc<zyron_wal::WalWriter>) {
+        for heap in self.heaps() {
+            heap.attach_wal(wal);
+        }
+    }
+
     /// Initializes page count caches for all auth system table heap files.
     pub async fn init_cache(&self) -> Result<()> {
         tokio::try_join!(

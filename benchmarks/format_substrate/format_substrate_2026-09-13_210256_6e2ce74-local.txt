@@ -1,0 +1,138 @@
+# suite:   format_substrate
+# run:     2026-09-13_210256_6e2ce74-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Catalog Schema Migration, 100K rows ===
+  100K rows, one table [PASS/OK]:
+    Runs: [3.0671ms, 2.3963ms, 2.3534ms, 2.2412ms, 2.3704ms]
+    Average: 2.4857ms <= 30,000ms (target)
+    Min/Max: 2.2412ms / 3.0671ms, StdDev: 0.2955ms
+
+=== Compatibility Gate, 10K user objects ===
+  10K objects [PASS/OK]:
+    Runs: [69.2573ms, 69.2495ms, 68.8987ms, 69.0655ms, 68.9188ms]
+    Average: 69.0780ms <= 120,000ms (target)
+    Min/Max: 68.8987ms / 69.2573ms, StdDev: 0.1544ms
+
+=== Deprecation Scan on the Statement Path ===
+  statement with no deprecated item:
+    Runs: [119.6315ns, 120.2505ns, 120.8320ns, 119.9890ns, 120.0925ns]
+    Average: 120.1591ns (no target set)
+    Min/Max: 119.6315ns / 120.8320ns, StdDev: 0.3932ns
+
+=== Discord Embed Encode and URL Validation ===
+  one event [PASS/OK]:
+    Runs: [1.3272us, 1.3209us, 1.3223us, 1.3265us, 1.3273us]
+    Average: 1.3248us <= 10us (target)
+    Min/Max: 1.3209us / 1.3273us, StdDev: 0.0027us
+  one address [PASS/OK]:
+    Runs: [0.0097us, 0.0098us, 0.0098us, 0.0098us, 0.0097us]
+    Average: 0.0097us <= 5us (target)
+    Min/Max: 0.0097us / 0.0098us, StdDev: 0.0001us
+
+=== Discord Delivery Through a 1s Rate Limit ===
+  one event [PASS/OK]:
+    Runs: [1,015ms, 1,008ms, 1,004ms, 1,005ms, 1,010ms]
+    Average: 1,008ms <= 1,200ms (target)
+    Min/Max: 1,004ms / 1,015ms, StdDev: 3.9013ms
+
+=== Envelope Parse (hot path) ===
+  peek [PASS/OK]:
+    Runs: [1.7386ns, 1.6173ns, 1.5433ns, 1.4608ns, 1.4604ns]
+    Average: 1.5641ns <= 100ns (target)
+    Min/Max: 1.4604ns / 1.7386ns, StdDev: 0.1050ns
+  full decode, 4 KiB body:
+    Runs: [73.0860ns, 73.0430ns, 73.2615ns, 73.0065ns, 72.9805ns]
+    Average: 73.0755ns (no target set)
+    Min/Max: 72.9805ns / 73.2615ns, StdDev: 0.0995ns
+
+=== Format Documentation Query ===
+  one read [PASS/OK]:
+    Runs: [0.0032ms, 0.0032ms, 0.0032ms, 0.0032ms, 0.0032ms]
+    Average: 0.0032ms <= 20ms (target)
+    Min/Max: 0.0032ms / 0.0032ms, StdDev: 0.0000ms
+  format_registry read:
+    Runs: [0.0049ms, 0.0048ms, 0.0048ms, 0.0050ms, 0.0048ms]
+    Average: 0.0049ms (no target set)
+    Min/Max: 0.0048ms / 0.0050ms, StdDev: 0.0001ms
+
+=== Migration Overhead Per File ===
+  open a current file, 16 KiB:
+    Runs: [199.9000ns, 198.4600ns, 197.8100ns, 199.3100ns, 198.0650ns]
+    Average: 198.7090ns (no target set)
+    Min/Max: 197.8100ns / 199.9000ns, StdDev: 0.7829ns
+  open a file one version behind, 16 KiB:
+    Runs: [328.6700ns, 333.9850ns, 331.2050ns, 329.5750ns, 326.1650ns]
+    Average: 329.9200ns (no target set)
+    Min/Max: 326.1650ns / 333.9850ns, StdDev: 2.6060ns
+  overhead over a current read [FAIL]: 66.0317% <= 20% (target)
+
+=== Deprecation Warning Rate-Limit Check ===
+  allow [PASS/OK]:
+    Runs: [36.0326ns, 35.8452ns, 35.9332ns, 35.7828ns, 35.9510ns]
+    Average: 35.9090ns <= 2,000ns (target)
+    Min/Max: 35.7828ns / 36.0326ns, StdDev: 0.0867ns
+
+=== Reader Dispatch ===
+  resolve [PASS/OK]:
+    Runs: [5.5271ns, 5.5492ns, 5.5265ns, 5.6262ns, 5.5048ns]
+    Average: 5.5468ns <= 50ns (target)
+    Min/Max: 5.5048ns / 5.6262ns, StdDev: 0.0421ns
+
+=== Format Registry Lookup ===
+  get [PASS/OK]:
+    Runs: [0.8055ns, 0.8902ns, 0.9202ns, 0.8199ns, 0.8038ns]
+    Average: 0.8479ns <= 500ns (target)
+    Min/Max: 0.8038ns / 0.9202ns, StdDev: 0.0481ns
+
+=== Signature Dispatch and Verify ===
+  resolve and verify [FAIL/REGR!]:
+    Runs: [21.4343us, 21.3615us, 21.3375us, 21.3442us, 21.4442us]
+    Average: 21.3844us <= 1us (target)
+    Min/Max: 21.3375us / 21.4442us, StdDev: 0.0456us
+  registry resolve only:
+    Runs: [16.0446ns, 16.0192ns, 15.8820ns, 15.8634ns, 15.8626ns]
+    Average: 15.9344ns (no target set)
+    Min/Max: 15.8626ns / 16.0446ns, StdDev: 0.0803ns
+
+=== Service Principal Key Rotation ===
+  rotate one principal [PASS/OK]:
+    Runs: [0.0104ms, 0.0101ms, 0.0104ms, 0.0102ms, 0.0101ms]
+    Average: 0.0102ms <= 1,000ms (target)
+    Min/Max: 0.0101ms / 0.0104ms, StdDev: 0.0001ms
+
+=== Substrate Load at Startup ===
+  load and verify every registration [PASS/OK]:
+    Runs: [0.0458ms, 0.0283ms, 0.0131ms, 0.0089ms, 0.0066ms]
+    Average: 0.0205ms <= 100ms (target)
+    Min/Max: 0.0066ms / 0.0458ms, StdDev: 0.0147ms
+  Formats registered: 33 (4 reserved)
+  resolve every system object [PASS/OK]:
+    Runs: [0.0313ms, 0.0179ms, 0.0167ms, 0.0119ms, 0.0108ms]
+    Average: 0.0177ms <= 30ms (target)
+    Min/Max: 0.0108ms / 0.0313ms, StdDev: 0.0073ms
+  System objects: 102 across 61 schemas
+
+=== Eager Sweep Overhead ===
+  read and rewrite 500 files:
+    Runs: [76.1161ms, 74.3618ms, 78.4849ms, 85.0654ms, 85.6642ms]
+    Average: 79.9385ms (no target set)
+    Min/Max: 74.3618ms / 85.6642ms, StdDev: 4.6237ms
+  sweep 500 files:
+    Runs: [184.0638ms, 176.2842ms, 225.3677ms, 183.9474ms, 198.2374ms]
+    Average: 193.5801ms (no target set)
+    Min/Max: 176.2842ms / 225.3677ms, StdDev: 17.4048ms
+  overhead over raw I/O [FAIL]: 142.1613% <= 20% (target)
+
+=== User-Object Rewriter, 1000 objects ===
+  1000 objects [PASS/OK]:
+    Runs: [9.7151ms, 9.5111ms, 9.5335ms, 9.4935ms, 9.5112ms]
+    Average: 9.5529ms <= 60,000ms (target)
+    Min/Max: 9.4935ms / 9.7151ms, StdDev: 0.0821ms
+  dry run, 1000 objects:
+    Runs: [6.7988ms, 6.7176ms, 6.7092ms, 6.7019ms, 6.6748ms]
+    Average: 6.7205ms (no target set)
+    Min/Max: 6.6748ms / 6.7988ms, StdDev: 0.0417ms

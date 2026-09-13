@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 636" width="100%" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-label="Zyron replication and follower read sequence">
+  <title>Zyron replication and follower read sequence</title>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="636" fill="#0d1117" rx="6"/>
+
+  <!-- Title -->
+  <text x="480" y="32" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="600">Replication · Quorum commit · Every member runs the same applier · Linearizable follower reads</text>
+
+  <!-- Lifelines -->
+  <g stroke="#30363d" stroke-width="1" stroke-dasharray="4,4">
+    <line x1="100" y1="100" x2="100" y2="620"/>
+    <line x1="360" y1="100" x2="360" y2="620"/>
+    <line x1="620" y1="100" x2="620" y2="620"/>
+    <line x1="860" y1="100" x2="860" y2="620"/>
+  </g>
+
+  <!-- Column headers -->
+  <rect x="30" y="56" width="140" height="44" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="100" y="83" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Client</text>
+  <rect x="290" y="56" width="140" height="44" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="360" y="83" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Leader</text>
+  <rect x="550" y="56" width="140" height="44" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="620" y="83" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Follower</text>
+  <rect x="790" y="56" width="140" height="44" rx="6" fill="#0d1117" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="860" y="83" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">Follower</text>
+
+  <!-- Write: client to leader -->
+  <text x="230" y="132" text-anchor="middle" fill="#e6edf3" font-size="12">INSERT · UPDATE · DDL</text>
+  <line x1="100" y1="140" x2="358" y2="140" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- Write: leader seals and proposes -->
+  <rect x="290" y="158" width="140" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="360" y="173" text-anchor="middle" fill="#a371f7" font-size="11">Seal changeset · Propose</text>
+
+  <!-- Write: append entries to both followers, pipelined -->
+  <text x="490" y="204" text-anchor="middle" fill="#e6edf3" font-size="12">AppendEntries · Pipelined</text>
+  <line x1="360" y1="212" x2="618" y2="212" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="360" y1="226" x2="858" y2="226" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.6"/>
+
+  <!-- Write: every member fsyncs once -->
+  <rect x="330" y="246" width="60" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="360" y="261" text-anchor="middle" fill="#a371f7" font-size="11">Fsync</text>
+  <rect x="590" y="246" width="60" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="620" y="261" text-anchor="middle" fill="#a371f7" font-size="11">Fsync</text>
+  <rect x="830" y="246" width="60" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="860" y="261" text-anchor="middle" fill="#a371f7" font-size="11">Fsync</text>
+
+  <!-- Write: acks back to the leader -->
+  <text x="490" y="292" text-anchor="middle" fill="#e6edf3" font-size="12">Ack</text>
+  <line x1="620" y1="300" x2="362" y2="300" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="860" y1="314" x2="362" y2="314" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.6"/>
+
+  <!-- Write: quorum reached -->
+  <rect x="270" y="334" width="180" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="360" y="349" text-anchor="middle" fill="#a371f7" font-size="11">Quorum · Commit index advances</text>
+
+  <!-- Write: applier on every member, feed at the raft index -->
+  <rect x="266" y="374" width="188" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="360" y="389" text-anchor="middle" fill="#a371f7" font-size="11">Applier · Change feed at raft index</text>
+  <rect x="526" y="374" width="188" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="620" y="389" text-anchor="middle" fill="#a371f7" font-size="11">Applier · Change feed at raft index</text>
+  <rect x="766" y="374" width="188" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="860" y="389" text-anchor="middle" fill="#a371f7" font-size="11">Applier · Change feed at raft index</text>
+
+  <!-- Write: ack to client -->
+  <text x="230" y="420" text-anchor="middle" fill="#e6edf3" font-size="12">Ack after quorum</text>
+  <line x1="360" y1="428" x2="102" y2="428" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- Divider -->
+  <line x1="30" y1="460" x2="930" y2="460" stroke="#30363d" stroke-width="1" stroke-dasharray="4,4"/>
+  <rect x="400" y="450" width="160" height="20" fill="#0d1117"/>
+  <text x="480" y="464" text-anchor="middle" fill="#8b949e" font-size="11">Linearizable follower read</text>
+
+  <!-- Read: client to follower -->
+  <text x="360" y="490" text-anchor="middle" fill="#e6edf3" font-size="12">SELECT</text>
+  <line x1="100" y1="498" x2="618" y2="498" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- Read: ReadIndex round trip -->
+  <text x="490" y="520" text-anchor="middle" fill="#e6edf3" font-size="12">ReadIndex</text>
+  <line x1="620" y1="528" x2="362" y2="528" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="360" y1="542" x2="618" y2="542" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.6"/>
+
+  <!-- Read: follower waits for local apply, answers -->
+  <rect x="540" y="556" width="160" height="22" rx="11" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="620" y="571" text-anchor="middle" fill="#a371f7" font-size="11">Wait for local apply · Answer</text>
+  <text x="360" y="598" text-anchor="middle" fill="#e6edf3" font-size="12">Rows</text>
+  <line x1="620" y1="606" x2="102" y2="606" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow)"/>
+</svg>

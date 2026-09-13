@@ -2,6 +2,14 @@
 //!
 //! All page I/O is routed through the buffer pool for caching. Pages are fetched
 //! from the pool, modified in memory, marked dirty, and written back lazily.
+//!
+//! A heap with a log attached writes a record of every change it makes to a
+//! page, from inside the page's frame lock, as the exact bytes and slots it
+//! wrote. The record exists before the lock is released and so before any
+//! flush can copy the page, and the page is stamped with the record's
+//! position, which is what recovery replays the record against. A heap with
+//! no log attached is a session's own table, whose pages are cleared at the
+//! next start and need no record
 
 use crate::disk::DiskManager;
 use crate::freespace::{
@@ -9,11 +17,13 @@ use crate::freespace::{
 };
 use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_SLOT_SIZE};
 use crate::heap::page::{HeapPage, SlotId};
+use crate::heap::redo::{self, PageChange};
 use crate::tuple::{Tuple, TupleFlags, TupleHeader, TupleId, TupleView};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zyron_buffer::BufferPool;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
+use zyron_wal::writer::WalWriter;
 
 /// Configuration for HeapFile.
 #[derive(Debug, Clone)]
@@ -170,6 +180,10 @@ pub struct HeapFile {
     /// threads uses K tail pages: adaptive, with no waste for cold or
     /// single-writer tables.
     insert_shards: Box<[CachePaddedU32]>,
+    /// The log every page change is recorded in, attached once by the owner
+    /// that holds the writer. A heap with none attached changes its pages
+    /// without a record, which only a session's own table may do
+    log: OnceLock<Arc<WalWriter>>,
 }
 
 /// Cache-line-aligned AtomicU32 so per-shard insertion pointers written by
@@ -221,7 +235,32 @@ impl HeapFile {
                     .map(|_| CachePaddedU32(AtomicU32::new(u32::MAX)))
                     .collect()
             },
+            log: OnceLock::new(),
         })
+    }
+
+    /// Attaches the log every page change is recorded in. The first
+    /// attachment is the one kept
+    pub fn attach_wal(&self, wal: &Arc<WalWriter>) {
+        let _ = self.log.set(Arc::clone(wal));
+    }
+
+    /// Whether this heap records its page changes
+    pub fn is_logged(&self) -> bool {
+        self.log.get().is_some()
+    }
+
+    /// Records one page change under `txn_id` and stamps the page with the
+    /// record's position, both under the caller's frame guard, so no copy
+    /// of the page can carry the change without the stamp that names its
+    /// record. A heap with no log attached records nothing
+    #[inline]
+    fn record(&self, page_id: PageId, txn_id: u64, change: &PageChange) -> Result<()> {
+        if let Some(wal) = self.log.get() {
+            let lsn = redo::log_page_change(wal, txn_id, change)?;
+            self.pool.mark_dirty_with_lsn(page_id, lsn.0);
+        }
+        Ok(())
     }
 
     /// Initializes page count caches from disk (call once at startup).
@@ -387,20 +426,28 @@ impl HeapFile {
             }
         };
 
-        let (deleted, usable) = {
+        // The page stays dirty whether or not its record could be written,
+        // so a frame holding a change is never dropped as clean
+        let (deleted, outcome) = {
             let mut guard = frame.write_data();
             let data: &mut [u8] = &mut guard[..];
-            let deleted = HeapPage::delete_tuple_in_slice(data, SlotId(tuple_id.slot_id));
-            let usable = if deleted {
-                Some(HeapPage::total_usable_space_in_slice(data))
+            if HeapPage::delete_tuple_in_slice(data, SlotId(tuple_id.slot_id)) {
+                let usable = HeapPage::total_usable_space_in_slice(data);
+                let recorded = self.record(
+                    page_id,
+                    0,
+                    &PageChange::Free {
+                        page_id,
+                        slots: vec![tuple_id.slot_id],
+                    },
+                );
+                (true, recorded.map(|()| Some(usable)))
             } else {
-                None
-            };
-            (deleted, usable)
+                (false, Ok(None))
+            }
         };
         self.pool.unpin_page(page_id, deleted);
-
-        if let Some(usable) = usable {
+        if let Some(usable) = outcome? {
             // Defer FSM update for batched processing
             self.defer_fsm_update(page_id.page_num as u32, usable);
         }
@@ -445,26 +492,33 @@ impl HeapFile {
                 }
             };
 
-            let (page_modified, usable) = {
+            let (page_modified, outcome) = {
                 let mut guard = frame.write_data();
                 let data: &mut [u8] = &mut guard[..];
-                let mut page_modified = false;
+                let mut freed = Vec::with_capacity(slot_ids.len());
                 for slot_id in slot_ids {
                     if HeapPage::delete_tuple_in_slice(data, SlotId(slot_id)) {
-                        deleted_count += 1;
-                        page_modified = true;
+                        freed.push(slot_id);
                     }
                 }
-                let usable = if page_modified {
-                    Some(HeapPage::total_usable_space_in_slice(data))
+                if freed.is_empty() {
+                    (false, Ok(None))
                 } else {
-                    None
-                };
-                (page_modified, usable)
+                    deleted_count += freed.len();
+                    let usable = HeapPage::total_usable_space_in_slice(data);
+                    let recorded = self.record(
+                        page_id,
+                        0,
+                        &PageChange::Free {
+                            page_id,
+                            slots: freed,
+                        },
+                    );
+                    (true, recorded.map(|()| Some(usable)))
+                }
             };
             self.pool.unpin_page(page_id, page_modified);
-
-            if let Some(usable) = usable {
+            if let Some(usable) = outcome? {
                 self.defer_fsm_update(page_id.page_num as u32, usable);
             }
         }
@@ -525,14 +579,27 @@ impl HeapFile {
 
             let mut page_modified = false;
             let mut reclaimed_free: Option<usize> = None;
+            let mut recorded: Result<()> = Ok(());
             {
                 let mut guard = frame.write_data();
                 let data: &mut [u8] = &mut guard[..];
+                let mut stamped = Vec::with_capacity(slot_ids.len());
                 for slot_id in slot_ids {
                     if HeapPage::set_tuple_xmax_in_slice(data, SlotId(slot_id), xmax) {
-                        marked += 1;
-                        page_modified = true;
+                        stamped.push((slot_id, xmax));
                     }
+                }
+                if !stamped.is_empty() {
+                    marked += stamped.len();
+                    page_modified = true;
+                    recorded = self.record(
+                        page_id,
+                        xmax,
+                        &PageChange::Xmax {
+                            page_id,
+                            stamps: stamped,
+                        },
+                    );
                 }
                 // On-access pruning: the page is already locked, so reclaim any
                 // versions dead to every live snapshot (a committed delete below
@@ -540,6 +607,7 @@ impl HeapFile {
                 // MVCC-updated heaps compact without waiting for the vacuum cycle.
                 if let Some(status) = status
                     && prune_horizon > 0
+                    && recorded.is_ok()
                 {
                     let is_dead = |xmin: u64, x: u64| {
                         // Aborted insert: never visible at any version, always
@@ -556,13 +624,23 @@ impl HeapFile {
                                 && (x as u64) < prune_horizon
                                 && status.version_reclaimable(x as u64))
                     };
-                    if HeapPage::prune_dead_in_slice(data, &is_dead) {
+                    let pruned = HeapPage::prune_dead_in_slice(data, &is_dead);
+                    if !pruned.is_empty() {
                         page_modified = true;
                         reclaimed_free = Some(HeapPage::free_space_in_slice(data));
+                        recorded = self.record(
+                            page_id,
+                            xmax,
+                            &PageChange::Prune {
+                                page_id,
+                                slots: pruned,
+                            },
+                        );
                     }
                 }
             }
             self.pool.unpin_page(page_id, page_modified);
+            recorded?;
 
             // Publish reclaimed free space so the insert path reuses this page
             // instead of growing the heap.
@@ -611,15 +689,30 @@ impl HeapFile {
             }
         };
 
-        let changed = {
+        let (changed, recorded) = {
             let mut guard = frame.write_data();
             let data: &mut [u8] = &mut guard[..];
-            match xmax {
+            let changed = match xmax {
                 Some(x) => HeapPage::set_tuple_xmax_in_slice(data, SlotId(tuple_id.slot_id), x),
                 None => HeapPage::clear_tuple_xmax_in_slice(data, SlotId(tuple_id.slot_id)),
+            };
+            if changed {
+                let stamped = xmax.unwrap_or(0);
+                let recorded = self.record(
+                    page_id,
+                    stamped,
+                    &PageChange::Xmax {
+                        page_id,
+                        stamps: vec![(tuple_id.slot_id, stamped)],
+                    },
+                );
+                (true, recorded)
+            } else {
+                (false, Ok(()))
             }
         };
         self.pool.unpin_page(page_id, changed);
+        recorded?;
         Ok(changed)
     }
 
@@ -639,13 +732,27 @@ impl HeapFile {
             }
         };
 
-        let result = {
+        let (rewritten, result) = {
             let mut guard = frame.write_data();
             let data: &mut [u8] = &mut guard[..];
-            HeapPage::update_tuple_in_slice(data, SlotId(tuple_id.slot_id), tuple)
-                .map(|()| HeapPage::free_space_in_slice(data))
+            match HeapPage::update_tuple_in_slice(data, SlotId(tuple_id.slot_id), tuple) {
+                Ok(()) => {
+                    let free = HeapPage::free_space_in_slice(data);
+                    let recorded = self.record(
+                        page_id,
+                        tuple.header().xmin,
+                        &PageChange::Update {
+                            page_id,
+                            slot: tuple_id.slot_id,
+                            tuple: tuple.clone(),
+                        },
+                    );
+                    (true, recorded.map(|()| free))
+                }
+                Err(e) => (false, Err(e)),
+            }
         };
-        self.pool.unpin_page(page_id, result.is_ok());
+        self.pool.unpin_page(page_id, rewritten);
         let free = result?;
 
         self.update_fsm_for_page(page_id.page_num as u32, free)
@@ -930,7 +1037,7 @@ impl HeapFile {
                 self.pool.load_page(page_id, &disk_data)?;
             }
 
-            let inserted = unsafe {
+            let placed = unsafe {
                 let frame = self
                     .pool
                     .fetch_page(page_id)
@@ -941,18 +1048,42 @@ impl HeapFile {
                 // Appenders share this lock and write disjoint regions claimed
                 // via the header CAS; the delete/prune path takes the exclusive
                 // lock, so compaction can never move tuples out from under an
-                // in-flight append.
+                // in-flight append. A flush copies the page under the
+                // exclusive lock too, so the record and the stamp below land
+                // before any copy can carry these rows
                 let _shared = frame.read_data();
                 let raw: *mut [u8; PAGE_SIZE] = frame.data_ptr_mut();
-                HeapPage::insert_tuples_burst(
+                let placed = HeapPage::insert_tuples_burst_placed(
                     raw as *mut u8,
                     page_id,
                     &tuples[cursor..],
                     &mut results,
-                )
+                );
+                if placed.count > 0
+                    && let Some(wal) = self.log.get()
+                {
+                    let rows = &tuples[cursor..cursor + placed.count];
+                    let stamp = redo::log_append(
+                        wal,
+                        rows[0].header().xmin,
+                        page_id,
+                        placed.first_slot,
+                        placed.data_end,
+                        rows,
+                    );
+                    match stamp {
+                        Ok(lsn) => self.pool.mark_dirty_with_lsn(page_id, lsn.0),
+                        Err(e) => {
+                            drop(_shared);
+                            self.pool.unpin_page(page_id, true);
+                            return Err(e);
+                        }
+                    }
+                }
+                placed
             };
 
-            if inserted == 0 {
+            if placed.count == 0 {
                 self.pool.unpin_page(page_id, false);
                 if !is_fresh {
                     let _ = self
@@ -963,7 +1094,7 @@ impl HeapFile {
             }
 
             self.pool.unpin_page(page_id, true);
-            cursor += inserted;
+            cursor += placed.count;
             last_used_page = Some(page_id.page_num as u32);
         }
 
@@ -1492,7 +1623,7 @@ mod tests {
         let mut ids: Vec<TupleId> = Vec::with_capacity(rows);
         for chunk_start in (0..rows).step_by(200) {
             let batch: Vec<Tuple> = (chunk_start..(chunk_start + 200).min(rows))
-                .map(|i| Tuple::new(payload.clone(), 1))
+                .map(|_| Tuple::new(payload.clone(), 1))
                 .collect();
             ids.extend(heap.insert_batch(&batch).await.unwrap());
         }

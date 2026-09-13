@@ -1,8 +1,9 @@
 //! Outbound CDC streams that deliver change events to external sinks.
 //!
-//! Each stream is backed by a replication slot and a configurable sink
-//! (Kafka, S3, or Webhook). Changes are batched in memory until batch_size
-//! or batch_interval triggers a flush to the sink.
+//! Each stream consumes a change stream, which holds its delivery position,
+//! and writes to a configurable sink (Kafka, S3, or Webhook). Changes are
+//! batched in memory until batch_size or batch_interval triggers a flush to
+//! the sink
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -53,19 +54,6 @@ pub enum CdcSinkConfig {
 }
 
 // ---------------------------------------------------------------------------
-// SinkCheckpoint
-// ---------------------------------------------------------------------------
-
-/// Tracks delivery progress for exactly-once semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SinkCheckpoint {
-    pub stream_name: String,
-    pub last_confirmed_lsn: u64,
-    pub sink_specific_offset: Option<String>,
-    pub last_flush_timestamp: i64,
-}
-
-// ---------------------------------------------------------------------------
 // StreamRetryPolicy
 // ---------------------------------------------------------------------------
 
@@ -90,40 +78,23 @@ impl Default for StreamRetryPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// StreamStatus
-// ---------------------------------------------------------------------------
-
-/// Runtime status of a CDC stream.
-#[derive(Debug, Clone)]
-pub struct StreamStatus {
-    pub name: String,
-    pub active: bool,
-    pub last_lsn: u64,
-    pub records_sent: u64,
-    pub last_error: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // CdcSink trait
 // ---------------------------------------------------------------------------
 
 /// Trait for CDC sink implementations that receive change batches.
+///
+/// A sink holds no position of its own. Where an outbound stream has got to
+/// is the change stream it consumes, whose position the driver moves once a
+/// batch is confirmed delivered, so there is one place progress is recorded
+/// and it is the one `zyron_sys.cdc.change_streams` shows
 pub trait CdcSink: Send + Sync {
     /// Writes a batch of serialized changes to the sink. Returns an error when
-    /// delivery is not confirmed so the driver does not advance its checkpoint
-    /// past undelivered data.
+    /// delivery is not confirmed so the driver does not move the stream past
+    /// undelivered data
     fn write_batch(&self, changes: &[Bytes]) -> Result<()>;
 
     /// Flushes any buffered data.
     fn flush(&self) -> Result<()>;
-
-    /// Records the LSN of the last batch the driver confirmed delivered. The
-    /// LSN is not carried in write_batch, so the driving stream calls this
-    /// after a successful write to make the checkpoint reflect real progress.
-    fn set_confirmed_lsn(&self, _lsn: u64) {}
-
-    /// Returns the current checkpoint (delivery progress).
-    fn checkpoint(&self) -> Result<SinkCheckpoint>;
 }
 
 /// Builds a JSON array body from already-serialized JSON change records.
@@ -145,27 +116,12 @@ fn json_array_body(changes: &[Bytes]) -> Vec<u8> {
 // Sink implementations
 // ---------------------------------------------------------------------------
 
-fn checkpoint_now(stream_name: &str, last_lsn: u64, offset: Option<String>) -> SinkCheckpoint {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
-    SinkCheckpoint {
-        stream_name: stream_name.to_string(),
-        last_confirmed_lsn: last_lsn,
-        sink_specific_offset: offset,
-        last_flush_timestamp: ts,
-    }
-}
-
 /// Kafka sink. Produces each change as one record to the configured topic via
 /// the pure-Rust rskafka client. Records go to partition 0 to preserve total
 /// ordering of the change stream.
 pub struct KafkaSink {
     pub config: CdcSinkConfig,
     stream_name: String,
-    last_lsn: AtomicU64,
-    last_offset: parking_lot::Mutex<Option<i64>>,
 }
 
 impl KafkaSink {
@@ -173,9 +129,12 @@ impl KafkaSink {
         Self {
             config,
             stream_name,
-            last_lsn: AtomicU64::new(0),
-            last_offset: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The stream this sink delivers for
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
     }
 }
 
@@ -204,7 +163,7 @@ impl CdcSink for KafkaSink {
         }
         let values: Vec<Vec<u8>> = changes.iter().map(|c| c.to_vec()).collect();
 
-        let last_offset = crate::sink_io::block_on_io(async move {
+        crate::sink_io::block_on_io(async move {
             use rskafka::client::ClientBuilder;
             use rskafka::client::partition::{Compression, UnknownTopicHandling};
             use rskafka::record::Record;
@@ -229,32 +188,17 @@ impl CdcSink for KafkaSink {
                     timestamp: now,
                 })
                 .collect();
-            let offsets = partition
+            partition
                 .produce(records, Compression::NoCompression)
                 .await
                 .map_err(|e| ZyronError::CdcStreamError(format!("Kafka produce failed: {e}")))?;
-            Ok::<Option<i64>, ZyronError>(offsets.last().copied())
+            Ok::<(), ZyronError>(())
         })?;
-
-        *self.last_offset.lock() = last_offset;
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn set_confirmed_lsn(&self, lsn: u64) {
-        self.last_lsn.store(lsn, Ordering::Relaxed);
-    }
-
-    fn checkpoint(&self) -> Result<SinkCheckpoint> {
-        let offset = self.last_offset.lock().map(|o| o.to_string());
-        Ok(checkpoint_now(
-            &self.stream_name,
-            self.last_lsn.load(Ordering::Relaxed),
-            offset,
-        ))
     }
 }
 
@@ -262,9 +206,7 @@ impl CdcSink for KafkaSink {
 pub struct S3Sink {
     pub config: CdcSinkConfig,
     stream_name: String,
-    last_lsn: AtomicU64,
     seq: AtomicU64,
-    last_key: parking_lot::Mutex<Option<String>>,
 }
 
 impl S3Sink {
@@ -272,9 +214,7 @@ impl S3Sink {
         Self {
             config,
             stream_name,
-            last_lsn: AtomicU64::new(0),
             seq: AtomicU64::new(0),
-            last_key: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -331,25 +271,11 @@ impl CdcSink for S3Sink {
         key.push_str(&format!("{}-{ts_micros}-{seq}.{ext}", self.stream_name));
 
         crate::sink_io::s3_put(&bucket, &region, &key, body, content_type)?;
-        *self.last_key.lock() = Some(key);
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn set_confirmed_lsn(&self, lsn: u64) {
-        self.last_lsn.store(lsn, Ordering::Relaxed);
-    }
-
-    fn checkpoint(&self) -> Result<SinkCheckpoint> {
-        let offset = self.last_key.lock().clone();
-        Ok(checkpoint_now(
-            &self.stream_name,
-            self.last_lsn.load(Ordering::Relaxed),
-            offset,
-        ))
     }
 }
 
@@ -358,7 +284,6 @@ impl CdcSink for S3Sink {
 pub struct WebhookSink {
     pub config: CdcSinkConfig,
     stream_name: String,
-    last_lsn: AtomicU64,
 }
 
 impl WebhookSink {
@@ -366,8 +291,12 @@ impl WebhookSink {
         Self {
             config,
             stream_name,
-            last_lsn: AtomicU64::new(0),
         }
+    }
+
+    /// The stream this sink delivers for
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
     }
 }
 
@@ -390,18 +319,6 @@ impl CdcSink for WebhookSink {
 
     fn flush(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn set_confirmed_lsn(&self, lsn: u64) {
-        self.last_lsn.store(lsn, Ordering::Relaxed);
-    }
-
-    fn checkpoint(&self) -> Result<SinkCheckpoint> {
-        Ok(checkpoint_now(
-            &self.stream_name,
-            self.last_lsn.load(Ordering::Relaxed),
-            None,
-        ))
     }
 }
 
@@ -426,7 +343,7 @@ pub fn build_sink(stream: &CdcOutputStream) -> Box<dyn CdcSink> {
 /// Change records land in the feed at execution time, before their
 /// transaction decides, so delivery consults this per record: only a
 /// committed transaction's changes reach the sink, an aborted one's are
-/// skipped, and an undecided one holds the pass so the slot never advances
+/// skipped, and an undecided one holds the pass so the position never moves
 /// past a change that could still roll back
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnDecision {
@@ -435,11 +352,20 @@ pub enum TxnDecision {
     InFlight,
 }
 
-/// Drives one delivery pass for a stream: reads change records committed after
-/// the slot's confirmed version, decodes each into the stream's output format,
-/// delivers them to the sink in batches of `batch_size`, and advances the slot
-/// plus the sink checkpoint after each confirmed batch. Returns the number of
-/// records delivered.
+/// What one delivery pass did. How many records reached the sink and the
+/// highest commit version every record of which is delivered or skipped,
+/// which is where the change stream's position moves to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryPass {
+    pub delivered: u64,
+    pub complete_version: u64,
+}
+
+/// Drives one delivery pass for a stream. Reads change records committed
+/// after the change stream's position, decodes each into the stream's output
+/// format and delivers them to the sink in batches of `batch_size`. Answers
+/// with the version the stream's position moves to, which the caller writes
+/// into the catalog once the pass is done.
 ///
 /// The decode closure converts a raw CDF record into a DecodedChange. It is
 /// injected so this crate stays free of the catalog and executor: the server
@@ -448,48 +374,40 @@ pub enum TxnDecision {
 pub fn drive_stream_once<F>(
     stream: &CdcOutputStream,
     feed: &crate::change_feed::ChangeDataFeed,
-    slot_mgr: &crate::replication_slot::SlotManager,
+    start_version: u64,
     sink: &dyn CdcSink,
     decode: F,
     txn_decision: &dyn Fn(u64) -> TxnDecision,
-) -> Result<u64>
+) -> Result<DeliveryPass>
 where
     F: Fn(&crate::change_feed::ChangeRecord) -> Result<crate::decoder::DecodedChange>,
 {
-    let slot = slot_mgr.get_slot(&stream.slot_name)?;
-    let start_version = slot.confirmed_lsn;
     let changes = feed.query_changes(start_version + 1, u64::MAX)?;
-    drive_stream_changes(
-        stream,
-        changes,
-        start_version,
-        slot_mgr,
-        sink,
-        decode,
-        txn_decision,
-    )
+    drive_stream_changes(stream, changes, start_version, sink, decode, txn_decision)
 }
 
 /// Delivers change records a caller already has.
 ///
 /// A lake table keeps no change file: its transaction log is the change
 /// record, so the pump derives the records from the log and drives the
-/// stream through here. Batching, sink delivery and slot advance are
-/// identical either way, so a stream behaves the same on both formats.
+/// stream through here. Batching and sink delivery are identical either
+/// way, so a stream behaves the same on both formats
 pub fn drive_stream_changes<F>(
     stream: &CdcOutputStream,
     changes: Vec<crate::change_feed::ChangeRecord>,
     start_version: u64,
-    slot_mgr: &crate::replication_slot::SlotManager,
     sink: &dyn CdcSink,
     decode: F,
     txn_decision: &dyn Fn(u64) -> TxnDecision,
-) -> Result<u64>
+) -> Result<DeliveryPass>
 where
     F: Fn(&crate::change_feed::ChangeRecord) -> Result<crate::decoder::DecodedChange>,
 {
     if changes.is_empty() {
-        return Ok(0);
+        return Ok(DeliveryPass {
+            delivered: 0,
+            complete_version: start_version,
+        });
     }
 
     let decoder = crate::decoder::create_decoder(stream.decoder_plugin);
@@ -497,19 +415,17 @@ where
     let batch_cap = stream.batch_size.max(1);
     let mut batch: Vec<Bytes> = Vec::with_capacity(batch_cap);
     // The highest commit version whose records are all enqueued or skipped.
-    // The slot only ever advances to such a boundary: a statement's records
+    // The position only ever moves to such a boundary. A statement's records
     // all share one version, so a crash between flushes redelivers a partial
     // version instead of silently losing its tail, and an undecided
     // transaction stops the pass before its version begins
     let mut last_complete_version = start_version;
 
-    let flush = |sink: &dyn CdcSink, batch: &mut Vec<Bytes>, complete_version: u64| -> Result<()> {
+    let flush = |sink: &dyn CdcSink, batch: &mut Vec<Bytes>| -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
         sink.write_batch(batch)?;
-        sink.set_confirmed_lsn(complete_version);
-        slot_mgr.advance_slot(&stream.slot_name, zyron_wal::Lsn(complete_version))?;
         batch.clear();
         Ok(())
     };
@@ -547,27 +463,40 @@ where
 
         if batch.len() >= batch_cap {
             let n = batch.len() as u64;
-            flush(sink, &mut batch, last_complete_version)?;
+            flush(sink, &mut batch)?;
             delivered += n;
         }
     }
     let remaining = batch.len() as u64;
-    flush(sink, &mut batch, last_complete_version)?;
+    flush(sink, &mut batch)?;
     delivered += remaining;
 
-    Ok(delivered)
+    Ok(DeliveryPass {
+        delivered,
+        complete_version: last_complete_version,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // CdcOutputStream
 // ---------------------------------------------------------------------------
 
+/// The change stream an outbound stream created without FROM CHANGE STREAM
+/// consumes, one named after it, so there is one position model rather than
+/// a private checkpoint beside the visible one
+pub fn implicit_change_stream_name(stream_name: &str) -> String {
+    format!("__cdc_{stream_name}")
+}
+
 /// An outbound CDC stream definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdcOutputStream {
     pub name: String,
     pub table_id: u32,
-    pub slot_name: String,
+    /// The change stream this outbound stream consumes. Its position is
+    /// where delivery has got to, the one `zyron_sys.cdc.change_streams`
+    /// shows, and the only place it is recorded
+    pub change_stream: String,
     pub sink: CdcSinkConfig,
     pub decoder_plugin: crate::decoder::DecoderPlugin,
     pub filter: Option<String>,
@@ -610,20 +539,29 @@ impl CdcStreamManager {
                         state_file.display()
                     ))
                 })?;
-                if parsed.header.version != crate::format::CDC_CHECKPOINT_FORMAT_VERSION {
-                    return Err(ZyronError::CdcStreamError(format!(
-                        "stream checkpoint is at format version {}, this binary writes and \
-                         reads {}. Upgrade through a release that still reads {} to move it \
-                         forward first",
-                        parsed.header.version,
-                        crate::format::CDC_CHECKPOINT_FORMAT_VERSION,
-                        parsed.header.version
-                    )));
-                }
-                let list: Vec<CdcOutputStream> =
-                    serde_json::from_slice(parsed.body).map_err(|e| {
-                        ZyronError::CdcStreamError(format!("failed to parse stream state: {e}"))
-                    })?;
+                let body: std::borrow::Cow<'_, [u8]> = match parsed.header.version {
+                    v if v == crate::format::CDC_CHECKPOINT_FORMAT_VERSION => {
+                        std::borrow::Cow::Borrowed(parsed.body)
+                    }
+                    v if v == crate::format::CDC_CHECKPOINT_FORMAT_VERSION_1 => {
+                        std::borrow::Cow::Owned(
+                            crate::format::cdc_streams_1_0_to_1_1(parsed.body)
+                                .map_err(ZyronError::CdcStreamError)?,
+                        )
+                    }
+                    other => {
+                        return Err(ZyronError::CdcStreamError(format!(
+                            "stream state is at format version {other}, this binary writes {} \
+                             and reads {} through it. Upgrade through a release that still \
+                             reads {other} to move it forward first",
+                            crate::format::CDC_CHECKPOINT_FORMAT_VERSION,
+                            crate::format::CDC_CHECKPOINT_FORMAT_VERSION_1,
+                        )));
+                    }
+                };
+                let list: Vec<CdcOutputStream> = serde_json::from_slice(&body).map_err(|e| {
+                    ZyronError::CdcStreamError(format!("failed to parse stream state: {e}"))
+                })?;
                 for stream in list {
                     let _ = streams.insert_sync(stream.name.clone(), stream);
                 }
@@ -737,7 +675,7 @@ mod tests {
         CdcOutputStream {
             name: "test_stream".into(),
             table_id: 42,
-            slot_name: "test_slot".into(),
+            change_stream: "test_stream".into(),
             sink: CdcSinkConfig::Kafka {
                 brokers: "localhost:9092".into(),
                 topic: "cdc_events".into(),
@@ -833,8 +771,7 @@ mod tests {
         );
         kafka.write_batch(&[]).unwrap();
         kafka.flush().unwrap();
-        let cp = kafka.checkpoint().unwrap();
-        assert_eq!(cp.stream_name, "test");
+        assert_eq!(kafka.stream_name(), "test");
 
         let s3 = S3Sink::new(
             CdcSinkConfig::S3 {
@@ -857,6 +794,34 @@ mod tests {
             "wh_test".into(),
         );
         wh.write_batch(&[]).unwrap();
+        assert_eq!(wh.stream_name(), "wh_test");
+    }
+
+    #[test]
+    fn test_a_version_1_state_file_reads_forward() {
+        let (kind, version) =
+            zyron_common::format::envelope::peek(crate::format::STREAM_STATE_FIXTURE_1)
+                .expect("peeks");
+        assert_eq!(
+            kind,
+            zyron_common::format::FormatKind::StreamingCdcCheckpoint
+        );
+        assert_eq!(version, crate::format::CDC_CHECKPOINT_FORMAT_VERSION_1);
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".zystreams"),
+            crate::format::STREAM_STATE_FIXTURE_1,
+        )
+        .expect("writes the fixture as the state file");
+        let mgr = CdcStreamManager::new(tmp.path()).expect("reads the older state");
+        let streams = mgr.list_streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].name, "orders_to_kafka");
+        assert_eq!(
+            streams[0].change_stream,
+            implicit_change_stream_name("orders_to_kafka"),
+            "the slot the old writer recorded is replaced by the stream named after it"
+        );
     }
 
     #[test]

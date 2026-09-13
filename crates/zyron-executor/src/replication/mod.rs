@@ -15,6 +15,7 @@ pub use capture::{
     capture_update, changeset, identity_images, identity_of,
 };
 pub use changeset::{
-    ChangesetChunk, ChangesetHeader, ChangesetOp, ChangesetReader, ChangesetSink, FLAG_ABORT,
-    FLAG_BARRIER, FLAG_LAST, Origin, ReplicaIdentity, RowImage, StatementContext, TxnChangeset,
+    ChangesetChunk, ChangesetHeader, ChangesetOp, ChangesetReader, ChangesetSink,
+    FEED_IMAGES_INTRODUCED_IN, FLAG_ABORT, FLAG_BARRIER, FLAG_LAST, LAKE_FILES_INTRODUCED_IN,
+    Origin, ReplicaIdentity, RowImage, SCHEDULE_RUNS_INTRODUCED_IN, StatementContext, TxnChangeset,
 };

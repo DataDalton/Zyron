@@ -13,6 +13,11 @@
 //!     `DELETE ... HARD`, which bypasses the soft-delete rewrite.
 //!  4. Records a retention job row and a tamper-evident compliance entry.
 //!
+//! On a group the leader runs the expiring steps and commits each delete
+//! through the group, so every member expires the same rows in the same
+//! entry. Age tiering moves a node's own columnar segments between its own
+//! tiers and changes no visible data, so every member runs it for itself.
+//!
 //! Legal-hold / WORM violations surface as errors from the DML hook; the
 //! worker logs and skips that table without aborting the whole cycle.
 
@@ -23,11 +28,9 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use zyron_buffer::BufferPool;
-use zyron_catalog::Catalog;
-use zyron_storage::DiskManager;
-use zyron_storage::txn::{IsolationLevel, TransactionManager};
-use zyron_wal::WalWriter;
+use zyron_lifecycle::legal_hold::LegalHoldRegistry;
+use zyron_storage::txn::IsolationLevel;
+use zyron_wire::connection::ServerState;
 
 use crate::hooks::LegalHoldDmlHook;
 
@@ -51,7 +54,7 @@ pub struct RetentionStats {
 }
 
 impl RetentionStats {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             cycles_completed: AtomicU64::new(0),
             rows_deleted: AtomicU64::new(0),
@@ -61,43 +64,32 @@ impl RetentionStats {
     }
 }
 
+impl Default for RetentionStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct RetentionWorker {
     shutdown: Arc<AtomicBool>,
     waker: Arc<OnceLock<thread::Thread>>,
     thread: Option<JoinHandle<()>>,
     stats: Arc<RetentionStats>,
     /// Installed once the server state exists, which is after the workers
-    /// start. The age-tiering pass drives the wire relocation and needs it,
-    /// cycles before installation skip that pass
-    server_state: Arc<OnceLock<Arc<zyron_wire::connection::ServerState>>>,
-}
-
-struct WorkerCtx {
-    catalog: Arc<Catalog>,
-    txn_manager: Arc<TransactionManager>,
-    wal: Arc<WalWriter>,
-    buffer_pool: Arc<BufferPool>,
-    disk_manager: Arc<DiskManager>,
-    legal_holds: Arc<zyron_lifecycle::legal_hold::LegalHoldRegistry>,
-    server_state: Arc<OnceLock<Arc<zyron_wire::connection::ServerState>>>,
+    /// start. Every pass writes and reads through it, cycles before
+    /// installation run nothing
+    server_state: Arc<OnceLock<Arc<ServerState>>>,
 }
 
 impl RetentionWorker {
-    #[allow(clippy::too_many_arguments)]
     pub fn start(
-        catalog: Arc<Catalog>,
-        txn_manager: Arc<TransactionManager>,
-        wal: Arc<WalWriter>,
-        buffer_pool: Arc<BufferPool>,
-        disk_manager: Arc<DiskManager>,
         config: RetentionWorkerConfig,
         authority: crate::background::authority::WriteAuthority,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
         let stats = Arc::new(RetentionStats::new());
-        let server_state: Arc<OnceLock<Arc<zyron_wire::connection::ServerState>>> =
-            Arc::new(OnceLock::new());
+        let server_state: Arc<OnceLock<Arc<ServerState>>> = Arc::new(OnceLock::new());
 
         let t_shutdown = Arc::clone(&shutdown);
         let t_waker = Arc::clone(&waker);
@@ -118,28 +110,27 @@ impl RetentionWorker {
                         return;
                     }
                 };
-                let wc = WorkerCtx {
-                    catalog,
-                    txn_manager,
-                    wal,
-                    buffer_pool,
-                    disk_manager,
-                    legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
-                    server_state: t_server_state,
-                };
+                let legal_holds = Arc::new(LegalHoldRegistry::new());
                 let interval = Duration::from_secs(config.interval_secs.max(1));
                 loop {
                     thread::park_timeout(interval);
                     if t_shutdown.load(Ordering::Acquire) {
                         return;
                     }
-                    // Expiring rows is a write that nothing captures for the
-                    // rest of a group, so a member expires nothing rather
-                    // than holding a different table from the others
-                    if !authority.may_write() {
+                    // Every pass writes through the server's registries and
+                    // records the rows it expires for the tables' feeds, so
+                    // a cycle that runs before the server state is installed
+                    // waits for the next one
+                    let Some(server) = t_server_state.get() else {
+                        debug!("retention: the server state is not installed yet, cycle skipped");
                         continue;
-                    }
-                    runtime.block_on(Self::run_cycle(&wc, &t_stats));
+                    };
+                    // Expiring rows is a write the leader of a group commits
+                    // through the group, so a follower expires nothing and
+                    // applies what the leader expired. Tiering is every
+                    // member's own
+                    let expires = authority.may_write();
+                    runtime.block_on(run_retention_cycle(server, &legal_holds, &t_stats, expires));
                 }
             })
             .expect("failed to spawn retention worker thread");
@@ -153,9 +144,9 @@ impl RetentionWorker {
         }
     }
 
-    /// Installs the server state once it exists, enabling the age-tiering
-    /// pass from the next cycle on
-    pub fn install_server_state(&self, state: Arc<zyron_wire::connection::ServerState>) {
+    /// Installs the server state once it exists, enabling every pass from
+    /// the next cycle on
+    pub fn install_server_state(&self, state: Arc<ServerState>) {
         let _ = self.server_state.set(state);
     }
 
@@ -172,15 +163,42 @@ impl RetentionWorker {
             let _ = h.join();
         }
     }
+}
 
-    async fn run_cycle(wc: &WorkerCtx, stats: &RetentionStats) {
+/// What one cycle runs against, the server every pass writes and reads
+/// through, and the holds the DML hook enforces
+struct CycleCtx<'a> {
+    server: &'a Arc<ServerState>,
+    legal_holds: &'a Arc<LegalHoldRegistry>,
+}
+
+/// One retention cycle against `server`. `expires` says whether this node
+/// may expire rows this cycle, which the leader of a group and a node in no
+/// group may. The worker drives this on its interval, and a test drives it
+/// directly to prove what a cycle leaves on every member of a group
+pub async fn run_retention_cycle(
+    server: &Arc<ServerState>,
+    legal_holds: &Arc<LegalHoldRegistry>,
+    stats: &RetentionStats,
+    expires: bool,
+) {
+    let cx = CycleCtx {
+        server,
+        legal_holds,
+    };
+    let catalog = &server.catalog;
+    let now_us = now_micros();
+    let mut deleted_total = 0u64;
+    let mut archived_total = 0u64;
+
+    if expires {
         // Reload holds from the catalog (source of truth) so the DML hook
         // enforces the current state this cycle.
-        if let Ok(holds) = wc.catalog.load_legal_holds().await {
-            wc.legal_holds.reload(&holds);
+        if let Ok(holds) = catalog.load_legal_holds().await {
+            legal_holds.reload(&holds);
         }
 
-        let policies = match wc.catalog.load_retention_policies().await {
+        let policies = match catalog.load_retention_policies().await {
             Ok(p) => p,
             Err(e) => {
                 debug!("retention: load policies failed: {e}");
@@ -188,15 +206,8 @@ impl RetentionWorker {
             }
         };
 
-        let now_us = now_micros();
-        let mut deleted_total = 0u64;
-        let mut archived_total = 0u64;
-
         for pol in policies.iter().filter(|p| p.kind == 0) {
-            let table = match wc
-                .catalog
-                .get_table_by_id(zyron_catalog::TableId(pol.table_id))
-            {
+            let table = match catalog.get_table_by_id(zyron_catalog::TableId(pol.table_id)) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
@@ -223,9 +234,9 @@ impl RetentionWorker {
 
             // Archive action: copy matching rows out before deleting.
             if pol.action == 1 && !lc.archive_destination.is_empty() {
-                match Self::archive_matching(
-                    wc,
-                    Self::table_ns(wc, table.schema_id),
+                match archive_matching(
+                    &cx,
+                    table_ns(&cx, table.schema_id),
                     &table.name,
                     &predicate,
                     &lc.archive_destination,
@@ -241,10 +252,12 @@ impl RetentionWorker {
             }
 
             let sql = format!("DELETE FROM \"{}\" WHERE {}", table.name, predicate);
-            match Self::run_dml(wc, Self::table_ns(wc, table.schema_id), &sql).await {
+            match run_dml(&cx, table_ns(&cx, table.schema_id), &sql).await {
                 Ok(n) => {
-                    deleted_total += n;
-                    Self::record_job(wc, pol.table_id, 0, n, "ttl delete").await;
+                    if n > 0 {
+                        deleted_total += n;
+                        record_job(&cx, pol.table_id, 0, n, "ttl delete").await;
+                    }
                 }
                 Err(e) => {
                     // Legal hold / WORM violations land here; skip, do not abort.
@@ -252,266 +265,278 @@ impl RetentionWorker {
                 }
             }
         }
+    }
 
-        // Age tiering: cold_after and archive_after are declarations, so
-        // they run every cycle rather than waiting for a manual
-        // RUN RETENTION JOB. The relocation drives the same wire pass the
-        // manual job does, and it needs the server state, which is
-        // installed shortly after startup, so the first cycle or two may
-        // skip it
-        if let Some(server) = wc.server_state.get() {
-            for t in wc.catalog.list_all_tables() {
-                let lc = &t.lifecycle;
-                if lc.cold_after_seconds <= 0 && lc.archive_after_seconds <= 0 {
-                    continue;
-                }
-                match zyron_wire::lifecycle_dispatch::run_age_tiering(server, &t, now_us, false)
-                    .await
-                {
-                    Ok((segments, rows)) if segments > 0 => {
-                        info!(
-                            table = %t.name,
-                            segments,
-                            rows,
-                            "age tiering relocated segments"
-                        );
-                        Self::record_job(wc, t.id.0, 2, rows, "age tiering").await;
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!("age tiering for '{}' failed: {e}", t.name),
-                }
-            }
+    // Age tiering runs every cycle rather than waiting for a manual RUN
+    // RETENTION JOB, because cold_after and archive_after are declarations.
+    // The relocation moves this node's own segments between its own tiers
+    // and changes no visible data, so every member of a group runs it for
+    // itself
+    for t in catalog.list_all_tables() {
+        let lc = &t.lifecycle;
+        if lc.cold_after_seconds <= 0 && lc.archive_after_seconds <= 0 {
+            continue;
         }
-
-        // Soft-delete purge: physically remove tombstoned rows past the grace.
-        let purged = Self::purge_soft_deleted(wc, now_us).await;
-
-        stats.cycles_completed.fetch_add(1, Ordering::Relaxed);
-        stats
-            .rows_deleted
-            .fetch_add(deleted_total, Ordering::Relaxed);
-        stats
-            .rows_archived
-            .fetch_add(archived_total, Ordering::Relaxed);
-        stats.rows_purged.fetch_add(purged, Ordering::Relaxed);
-        if deleted_total + archived_total + purged > 0 {
-            info!(
-                "retention cycle: {} deleted, {} archived, {} purged",
-                deleted_total, archived_total, purged
-            );
+        match zyron_wire::lifecycle_dispatch::run_age_tiering(server, &t, now_us, false).await {
+            Ok((segments, rows)) if segments > 0 => {
+                info!(
+                    table = %t.name,
+                    segments,
+                    rows,
+                    "age tiering relocated segments"
+                );
+                record_job(&cx, t.id.0, 2, rows, "age tiering").await;
+            }
+            Ok(_) => {}
+            Err(e) => warn!("age tiering for '{}' failed: {e}", t.name),
         }
     }
 
-    /// Purges soft-deleted rows whose deleted_at is older than the table's
-    /// purge grace window, using HARD delete (bypasses the soft-delete
-    /// rewrite). Recycle window and legal holds are still enforced.
-    async fn purge_soft_deleted(wc: &WorkerCtx, now_us: i64) -> u64 {
-        let tables = wc.catalog.list_all_tables();
-        let mut purged = 0u64;
-        for t in &tables {
-            let lc = &t.lifecycle;
-            if !lc.soft_delete_enabled {
-                continue;
-            }
-            let grace = lc.purge_grace_seconds.max(lc.recycle_window_seconds);
-            if grace <= 0 {
-                continue;
-            }
-            let is_del = match t
-                .columns
-                .iter()
-                .find(|c| c.id.0 as u32 == lc.soft_delete_is_deleted_col_id)
-            {
-                Some(c) => c.name.clone(),
-                None => continue,
-            };
-            let del_at = match t
-                .columns
-                .iter()
-                .find(|c| c.id.0 as u32 == lc.soft_delete_deleted_at_col_id)
-            {
-                Some(c) => c.name.clone(),
-                None => continue,
-            };
-            let cutoff = now_us - grace.saturating_mul(1_000_000);
-            let sql = format!(
-                "DELETE FROM \"{}\" WHERE \"{}\" = true AND \"{}\" < {} HARD",
-                t.name, is_del, del_at, cutoff
-            );
-            match Self::run_dml(wc, Self::table_ns(wc, t.schema_id), &sql).await {
-                Ok(n) => {
-                    if n > 0 {
-                        purged += n;
-                        Self::record_job(wc, t.id.0, 3, n, "soft-delete purge").await;
-                    }
-                }
-                Err(e) => warn!("purge for '{}' skipped: {e}", t.name),
-            }
-        }
-        purged
-    }
+    // Soft-delete purge, removing tombstoned rows past the grace
+    let purged = if expires {
+        purge_soft_deleted(&cx, now_us).await
+    } else {
+        0
+    };
 
-    /// Selects rows matching `predicate`, serializes them to newline records,
-    /// and writes them to the archive object store. Returns rows archived.
-    async fn archive_matching(
-        wc: &WorkerCtx,
-        ns: (zyron_catalog::DatabaseId, Vec<String>),
-        table: &str,
-        predicate: &str,
-        destination: &str,
-    ) -> Result<u64, String> {
+    stats.cycles_completed.fetch_add(1, Ordering::Relaxed);
+    stats
+        .rows_deleted
+        .fetch_add(deleted_total, Ordering::Relaxed);
+    stats
+        .rows_archived
+        .fetch_add(archived_total, Ordering::Relaxed);
+    stats.rows_purged.fetch_add(purged, Ordering::Relaxed);
+    if deleted_total + archived_total + purged > 0 {
+        info!(
+            "retention cycle: {} deleted, {} archived, {} purged",
+            deleted_total, archived_total, purged
+        );
+    }
+}
+
+/// Purges soft-deleted rows whose deleted_at is older than the table's
+/// purge grace window, using HARD delete (bypasses the soft-delete
+/// rewrite). Recycle window and legal holds are still enforced
+async fn purge_soft_deleted(cx: &CycleCtx<'_>, now_us: i64) -> u64 {
+    let tables = cx.server.catalog.list_all_tables();
+    let mut purged = 0u64;
+    for t in &tables {
+        let lc = &t.lifecycle;
+        if !lc.soft_delete_enabled {
+            continue;
+        }
+        let grace = lc.purge_grace_seconds.max(lc.recycle_window_seconds);
+        if grace <= 0 {
+            continue;
+        }
+        let is_del = match t
+            .columns
+            .iter()
+            .find(|c| c.id.0 as u32 == lc.soft_delete_is_deleted_col_id)
+        {
+            Some(c) => c.name.clone(),
+            None => continue,
+        };
+        let del_at = match t
+            .columns
+            .iter()
+            .find(|c| c.id.0 as u32 == lc.soft_delete_deleted_at_col_id)
+        {
+            Some(c) => c.name.clone(),
+            None => continue,
+        };
+        let cutoff = now_us - grace.saturating_mul(1_000_000);
         let sql = format!(
-            "SELECT * FROM \"{}\" WHERE {} INCLUDING DELETED",
-            table, predicate
+            "DELETE FROM \"{}\" WHERE \"{}\" = true AND \"{}\" < {} HARD",
+            t.name, is_del, del_at, cutoff
         );
-        let batches = Self::run_query(wc, ns, &sql).await?;
-        let mut rows: Vec<Vec<u8>> = Vec::new();
-        for b in &batches {
-            for r in 0..b.num_rows {
-                let mut fields: Vec<String> = Vec::with_capacity(b.columns.len());
-                for c in 0..b.columns.len() {
-                    fields.push(format!("{:?}", b.column(c).get_scalar(r)));
+        match run_dml(cx, table_ns(cx, t.schema_id), &sql).await {
+            Ok(n) => {
+                if n > 0 {
+                    purged += n;
+                    record_job(cx, t.id.0, 3, n, "soft-delete purge").await;
                 }
-                rows.push(fields.join("\u{1f}").into_bytes());
             }
-        }
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let n = rows.len() as u64;
-        zyron_lifecycle::archive::archive_rows(destination, &rows)
-            .await
-            .map_err(|e| format!("archive write: {e}"))?;
-        Ok(n)
-    }
-
-    /// The namespace that resolves a retention target: the table's own
-    /// schema, never an implicit default.
-    fn table_ns(
-        wc: &WorkerCtx,
-        schema_id: zyron_catalog::SchemaId,
-    ) -> (zyron_catalog::DatabaseId, Vec<String>) {
-        match wc.catalog.get_schema_by_id(schema_id) {
-            Ok(s) => (s.database_id, vec![s.name.clone()]),
-            Err(_) => (
-                zyron_catalog::DatabaseId(1),
-                zyron_catalog::default_search_path(),
-            ),
+            Err(e) => warn!("purge for '{}' skipped: {e}", t.name),
         }
     }
+    purged
+}
 
-    /// Plans and executes a DML statement in its own transaction with the
-    /// legal-hold / WORM enforcement hook attached. Returns rows affected.
-    async fn run_dml(
-        wc: &WorkerCtx,
-        ns: (zyron_catalog::DatabaseId, Vec<String>),
-        sql: &str,
-    ) -> Result<u64, String> {
-        let stmts = zyron_parser::parse(sql).map_err(|e| format!("parse: {e}"))?;
-        let stmt = stmts.into_iter().next().ok_or("empty statement")?;
-        let plan = zyron_planner::plan(&wc.catalog, ns.0, ns.1, stmt, None)
-            .await
-            .map_err(|e| format!("plan: {e}"))?;
-
-        let mut txn = wc
-            .txn_manager
-            .begin(IsolationLevel::ReadCommitted)
-            .map_err(|e| format!("begin: {e}"))?;
-        let snapshot = txn.snapshot.clone();
-        let txn_id = txn.txn_id;
-
-        let mut ctx = zyron_executor::context::ExecutionContext::new(
-            Arc::clone(&wc.catalog),
-            Arc::clone(&wc.wal),
-            Arc::clone(&wc.buffer_pool),
-            Arc::clone(&wc.disk_manager),
-            txn_id,
-            snapshot,
-        );
-        ctx.dml_hook = Some(Arc::new(LegalHoldDmlHook::new(
-            Arc::clone(&wc.legal_holds),
-            Arc::clone(&wc.catalog),
-        )) as Arc<dyn zyron_executor::context::DmlHook>);
-        let ctx = Arc::new(ctx);
-
-        let result = zyron_executor::execute(plan, &ctx).await;
-        match result {
-            Ok(batches) => {
-                wc.txn_manager
-                    .commit(&mut txn)
-                    .await
-                    .map_err(|e| format!("commit: {e}"))?;
-                let affected: u64 = batches.iter().map(|b| b.num_rows as u64).sum();
-                Ok(affected)
+/// Selects rows matching `predicate`, serializes them to newline records,
+/// and writes them to the archive object store. Returns rows archived
+async fn archive_matching(
+    cx: &CycleCtx<'_>,
+    ns: (zyron_catalog::DatabaseId, Vec<String>),
+    table: &str,
+    predicate: &str,
+    destination: &str,
+) -> Result<u64, String> {
+    let sql = format!(
+        "SELECT * FROM \"{}\" WHERE {} INCLUDING DELETED",
+        table, predicate
+    );
+    let batches = run_query(cx, ns, &sql).await?;
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    for b in &batches {
+        for r in 0..b.num_rows {
+            let mut fields: Vec<String> = Vec::with_capacity(b.columns.len());
+            for c in 0..b.columns.len() {
+                fields.push(format!("{:?}", b.column(c).get_scalar(r)));
             }
-            Err(e) => {
-                let _ = wc.txn_manager.abort(&mut txn);
-                Err(format!("execute: {e}"))
-            }
+            rows.push(fields.join("\u{1f}").into_bytes());
         }
     }
-
-    /// Plans and executes a read-only query in an aborted transaction.
-    async fn run_query(
-        wc: &WorkerCtx,
-        ns: (zyron_catalog::DatabaseId, Vec<String>),
-        sql: &str,
-    ) -> Result<Vec<zyron_executor::batch::DataBatch>, String> {
-        let stmts = zyron_parser::parse(sql).map_err(|e| format!("parse: {e}"))?;
-        let stmt = stmts.into_iter().next().ok_or("empty statement")?;
-        let plan = zyron_planner::plan(&wc.catalog, ns.0, ns.1, stmt, None)
-            .await
-            .map_err(|e| format!("plan: {e}"))?;
-        let mut txn = wc
-            .txn_manager
-            .begin(IsolationLevel::ReadCommitted)
-            .map_err(|e| format!("begin: {e}"))?;
-        let snapshot = txn.snapshot.clone();
-        let txn_id = txn.txn_id;
-        let ctx = Arc::new(zyron_executor::context::ExecutionContext::new(
-            Arc::clone(&wc.catalog),
-            Arc::clone(&wc.wal),
-            Arc::clone(&wc.buffer_pool),
-            Arc::clone(&wc.disk_manager),
-            txn_id,
-            snapshot,
-        ));
-        let result = zyron_executor::execute(plan, &ctx).await;
-        let _ = wc.txn_manager.abort(&mut txn);
-        result.map_err(|e| format!("execute: {e}"))
+    if rows.is_empty() {
+        return Ok(0);
     }
+    let n = rows.len() as u64;
+    zyron_lifecycle::archive::archive_rows(destination, &rows)
+        .await
+        .map_err(|e| format!("archive write: {e}"))?;
+    Ok(n)
+}
 
-    async fn record_job(wc: &WorkerCtx, table_id: u32, kind: u8, rows: u64, detail: &str) {
-        let now = now_micros();
-        let _ = wc
-            .catalog
-            .store_retention_job(&zyron_catalog::schema::RetentionJobEntry {
-                job_id: now as u64,
-                table_id,
-                kind,
-                scheduled_at: now,
-                started_at: now,
-                finished_at: now,
-                rows_affected: rows,
-                status: 2,
-                detail: detail.to_string(),
-            })
-            .await;
-        let _ = wc
-            .catalog
-            .append_compliance_log(zyron_catalog::schema::ComplianceLogEntry {
-                event_id: 0,
-                event_type: if kind == 3 { 10 } else { 0 },
-                subject: format!("table:{table_id}"),
-                table_id,
-                ts: now,
-                detail: format!("{detail}: {rows} rows"),
-                prev_hash: 0,
-                entry_hash: 0,
-                record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
-            })
-            .await;
+/// The namespace that resolves a retention target, the table's own
+/// schema, never an implicit default
+fn table_ns(
+    cx: &CycleCtx<'_>,
+    schema_id: zyron_catalog::SchemaId,
+) -> (zyron_catalog::DatabaseId, Vec<String>) {
+    match cx.server.catalog.get_schema_by_id(schema_id) {
+        Ok(s) => (s.database_id, vec![s.name.clone()]),
+        Err(_) => (
+            zyron_catalog::DatabaseId(1),
+            zyron_catalog::default_search_path(),
+        ),
     }
+}
+
+/// Plans and executes a DML statement in its own transaction with the
+/// legal-hold / WORM enforcement hook attached, committing through the
+/// group when this node leads one. Returns rows affected
+async fn run_dml(
+    cx: &CycleCtx<'_>,
+    ns: (zyron_catalog::DatabaseId, Vec<String>),
+    sql: &str,
+) -> Result<u64, String> {
+    let server = cx.server;
+    let stmts = zyron_parser::parse(sql).map_err(|e| format!("parse: {e}"))?;
+    let stmt = stmts.into_iter().next().ok_or("empty statement")?;
+    let plan = zyron_planner::plan(&server.catalog, ns.0, ns.1, stmt, None)
+        .await
+        .map_err(|e| format!("plan: {e}"))?;
+
+    let mut txn = server
+        .txn_manager
+        .begin(IsolationLevel::ReadCommitted)
+        .map_err(|e| format!("begin: {e}"))?;
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id;
+
+    // The rows retention expires are the table's changes, recorded for its
+    // feed, landed through the same registries a client's own DELETE runs
+    // against, and captured for the group the same way
+    let mut ctx = server.statement_context(txn_id, snapshot);
+    ctx.dml_hook = Some(Arc::new(LegalHoldDmlHook::new(
+        Arc::clone(cx.legal_holds),
+        Arc::clone(&server.catalog),
+    )) as Arc<dyn zyron_executor::context::DmlHook>);
+    let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
+    ctx.replication = changeset.clone();
+    let ctx = Arc::new(ctx);
+
+    let result = zyron_executor::execute(plan, &ctx).await;
+    if ctx.wrote_wal() {
+        txn.mark_wrote_data();
+    }
+    match result {
+        Ok(batches) => {
+            zyron_wire::ddl_dispatch::commit_generated(server, txn, changeset, &[])
+                .await
+                .map_err(|e| format!("commit: {e}"))?;
+            Ok(affected_rows(&batches))
+        }
+        Err(e) => {
+            zyron_wire::ddl_dispatch::abandon_generated(server, &mut txn, changeset.as_deref());
+            Err(format!("execute: {e}"))
+        }
+    }
+}
+
+/// The rows a write statement affected, read off the count it answers with.
+/// A write answers one row holding the count, so the row count of the
+/// answer is not the number of rows written
+fn affected_rows(batches: &[zyron_executor::batch::DataBatch]) -> u64 {
+    batches
+        .iter()
+        .filter(|b| b.num_rows > 0)
+        .filter_map(|b| b.columns.first())
+        .map(|column| match column.data.get_scalar(0) {
+            zyron_executor::column::ScalarValue::Int64(count) => count.max(0) as u64,
+            zyron_executor::column::ScalarValue::Int32(count) => count.max(0) as u64,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Plans and executes a read-only query in an aborted transaction
+async fn run_query(
+    cx: &CycleCtx<'_>,
+    ns: (zyron_catalog::DatabaseId, Vec<String>),
+    sql: &str,
+) -> Result<Vec<zyron_executor::batch::DataBatch>, String> {
+    let server = cx.server;
+    let stmts = zyron_parser::parse(sql).map_err(|e| format!("parse: {e}"))?;
+    let stmt = stmts.into_iter().next().ok_or("empty statement")?;
+    let plan = zyron_planner::plan(&server.catalog, ns.0, ns.1, stmt, None)
+        .await
+        .map_err(|e| format!("plan: {e}"))?;
+    let mut txn = server
+        .txn_manager
+        .begin(IsolationLevel::ReadCommitted)
+        .map_err(|e| format!("begin: {e}"))?;
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id;
+    let ctx = Arc::new(server.statement_context(txn_id, snapshot));
+    let result = zyron_executor::execute(plan, &ctx).await;
+    let _ = server.txn_manager.abort(&mut txn);
+    result.map_err(|e| format!("execute: {e}"))
+}
+
+/// Records what a pass did in this node's own job history and its
+/// compliance log. The history is the record of the node that ran the
+/// pass, so it is written where the pass ran
+async fn record_job(cx: &CycleCtx<'_>, table_id: u32, kind: u8, rows: u64, detail: &str) {
+    let now = now_micros();
+    let catalog = &cx.server.catalog;
+    let _ = catalog
+        .store_retention_job(&zyron_catalog::schema::RetentionJobEntry {
+            job_id: now as u64,
+            table_id,
+            kind,
+            scheduled_at: now,
+            started_at: now,
+            finished_at: now,
+            rows_affected: rows,
+            status: 2,
+            detail: detail.to_string(),
+        })
+        .await;
+    let _ = catalog
+        .append_compliance_log(zyron_catalog::schema::ComplianceLogEntry {
+            event_id: 0,
+            event_type: if kind == 3 { 10 } else { 0 },
+            subject: format!("table:{table_id}"),
+            table_id,
+            ts: now,
+            detail: format!("{detail}: {rows} rows"),
+            prev_hash: 0,
+            entry_hash: 0,
+            record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
+        })
+        .await;
 }
 
 fn now_micros() -> i64 {

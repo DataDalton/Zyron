@@ -8,6 +8,6 @@ One page per statement and construct, written from the parser's own grammar regi
 - [Transactions](transactions/README.md), 5 entries.
 - [Session State](session/README.md), 38 entries.
 - [ZyronLake](lake/README.md), 19 entries.
-- [Streaming](streaming/README.md), 27 entries.
+- [Streaming](streaming/README.md), 33 entries.
 - [Built-in Functions](functions/README.md), 481 entries.
 - [Built-in Functions](functions/README.md), 481 functions.

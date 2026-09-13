@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use zyron_buffer::BufferPool;
 use zyron_catalog::Catalog;
@@ -174,6 +174,34 @@ struct StagedTxn {
     /// Next chunk number expected, so a gap is refused rather than applied
     /// around
     next_chunk: u32,
+    /// Change stream entries this transaction's advances produce, installed
+    /// once it commits
+    stream_advances: Vec<zyron_catalog::ChangeStreamEntry>,
+    /// Lake files this transaction has landed or is landing, held so a
+    /// vacuum leaves them alone until the version naming them applies, and
+    /// so an abandoned transaction takes its half written files with it
+    lake_files: Vec<StagedLakeFile>,
+}
+
+/// One file a replicated lake commit carries, as far as it has arrived
+struct StagedLakeFile {
+    /// Where the pieces accumulate until the file is whole
+    partial: PathBuf,
+    /// Where the whole file lives, under the table's data directory
+    landed: PathBuf,
+    /// Bytes written so far, which the next piece must start at
+    received: u64,
+    /// The partial file, open for as long as pieces are arriving, so each
+    /// piece appends without reopening it. None once the file is whole
+    writer: Option<std::fs::File>,
+    /// True when the file was already whole under its final name as its
+    /// first piece arrived, which is what a replay after a restart finds.
+    /// Every piece of such a file is passed over, its bytes being what they
+    /// were
+    whole: bool,
+    /// Registered with the table's log for as long as the transaction is
+    /// open, so the file is never reclaimed before its version names it
+    _staged: zyron_lake::OwnedStagedPartition,
 }
 
 /// What the applier needs from the server around it.
@@ -200,7 +228,17 @@ pub trait DdlRunner: Send + Sync {
         sql: &'a str,
         context: &'a zyron_executor::replication::StatementContext,
         apply_txn_id: u64,
+        entry: (u64, i64),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+    /// The version of this node's own change feed on `table_id` at which
+    /// `consumed` records have been recorded, which is how a replicated
+    /// stream position, carried as a count, is re-addressed here
+    fn change_feed_version_at(&self, table_id: u32, consumed: u64) -> u64;
+
+    /// Where a change is recorded on this node, None when this node records
+    /// no change feeds
+    fn change_hook(&self) -> Option<Arc<dyn zyron_executor::context::CdcHook>>;
 }
 
 /// Applies changesets and finishes locally originated transactions.
@@ -332,7 +370,11 @@ impl ChangesetMachine {
                 if self.pending.contains(&origin) {
                     // The transaction is still running in this process and
                     // its writes are already here, so the chunk asks nothing
-                    // of the applier until the entry that completes it
+                    // of the applier but the changes it records, the
+                    // statement recorded none, and this is their place in
+                    // the log's order
+                    self.record_local_changes(origin.txn, index, header, reader)
+                        .await?;
                     return Ok(());
                 }
                 // The transaction died without finishing, a step-down failed
@@ -342,7 +384,7 @@ impl ChangesetMachine {
             }
             match self.pending.take(&origin) {
                 Some(PendingCommit::Commit { txn, done }) => {
-                    return self.finish_local(index, header, txn, done).await;
+                    return self.finish_local(index, header, txn, done, reader).await;
                 }
                 Some(PendingCommit::Statement { turn }) => {
                     let (done, answered) = tokio::sync::oneshot::channel();
@@ -503,8 +545,25 @@ impl ChangesetMachine {
         header: ChangesetHeader,
         mut txn: Transaction,
         done: tokio::sync::oneshot::Sender<Result<Transaction>>,
+        reader: ChangesetReader<'_>,
     ) -> Result<()> {
         let txn_id = txn.txn_id();
+        // The connection recorded nothing as it wrote, so the entry's
+        // changes reach the feed here, in the log's order, before the
+        // transaction becomes visible. A schedule run the entry carries is
+        // recorded here as well, ahead of the commit record, so a restart
+        // that finds the record finds the run recorded, and one that
+        // replays the entry records the run with the rows
+        if let Err(e) = self
+            .record_local_changes(txn_id, index, header, reader)
+            .await
+        {
+            let reason = e.to_string();
+            let _ = done.send(Err(e));
+            return Err(ZyronError::Internal(format!(
+                "a committed transaction's changes could not be recorded locally: {reason}"
+            )));
+        }
         let stamp = self.agreed_stamp(index, header.origin);
         let outcome = self.engine.txn_manager.commit_agreed(&mut txn, &stamp);
         let answer = match outcome {
@@ -530,6 +589,151 @@ impl ChangesetMachine {
                 "a committed transaction could not be recorded locally: {}",
                 error.unwrap_or_default()
             )));
+        }
+        Ok(())
+    }
+
+    /// Records what one of this node's own entries carries, at the entry's
+    /// index and proposal instant.
+    ///
+    /// The rows are already in the table, written by the connection that
+    /// proposed them. What the feed needs is the same record of them every
+    /// other member makes, in the same order, which is the log's. A
+    /// schedule run the entry carries is recorded the same way, ahead of
+    /// the commit record that ends the transaction
+    async fn record_local_changes(
+        &self,
+        txn_id: u64,
+        index: u64,
+        header: ChangesetHeader,
+        reader: ChangesetReader<'_>,
+    ) -> Result<()> {
+        let ops: Vec<ChangesetOp<'_>> = reader.collect::<Result<Vec<_>>>()?;
+        self.record_entry_changes(txn_id, index, header, &ops, EntrySide::Proposed)?;
+        self.record_local_schedule_runs(&ops).await
+    }
+
+    /// Records the schedule runs one of this node's own entries carries,
+    /// the same record every other member makes when it applies the entry.
+    /// A run already recorded with the same instants is left as it is, so
+    /// an entry replayed after a restart records nothing twice
+    async fn record_local_schedule_runs(&self, ops: &[ChangesetOp<'_>]) -> Result<()> {
+        for op in ops {
+            if let ChangesetOp::ScheduleRun {
+                schedule_id,
+                last_run,
+                next_run,
+            } = op
+            {
+                self.engine
+                    .catalog
+                    .record_schedule_run(*schedule_id, *last_run, *next_run)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Records one entry's changes in this member's feed, from the bytes
+    /// every member holds, so each member's feed is the same sequence of
+    /// the same records.
+    ///
+    /// A delete or an update on a table whose feed is on carries the whole
+    /// row it removed beside the key the applier probes, and that image is
+    /// what the feed records. A keyed operation without images was written
+    /// by a leader on an earlier release, and on a replaying member the
+    /// operators that put its rows back recorded them, so it is passed
+    /// over here. A truncate a replaying member runs through the
+    /// dispatcher is recorded there, at the same entry
+    fn record_entry_changes(
+        &self,
+        txn_id: u64,
+        index: u64,
+        header: ChangesetHeader,
+        ops: &[ChangesetOp<'_>],
+        side: EntrySide,
+    ) -> Result<()> {
+        let Some(host) = self.ddl.get() else {
+            return Err(ZyronError::Internal(
+                "an entry reached the applier before this node finished starting".into(),
+            ));
+        };
+        let Some(hook) = host.change_hook() else {
+            return Ok(());
+        };
+        let at = header.timestamp_us;
+        let last_at = ops
+            .iter()
+            .rposition(|op| {
+                matches!(
+                    op,
+                    ChangesetOp::Insert { .. }
+                        | ChangesetOp::Delete { .. }
+                        | ChangesetOp::Update { .. }
+                        | ChangesetOp::Truncate { .. }
+                )
+            })
+            .unwrap_or(0);
+        for (i, op) in ops.iter().enumerate() {
+            let last = header.is_last() && i == last_at;
+            match op {
+                ChangesetOp::Insert { table_id, rows, .. } => {
+                    hook.on_insert(*table_id, rows, index, at, txn_id, last, None)?;
+                }
+                ChangesetOp::Delete {
+                    table_id,
+                    index_id,
+                    rows,
+                    images,
+                    ..
+                } => {
+                    let whole: Vec<&[u8]> = if index_id.is_none() {
+                        // A whole-row image that matched several identical
+                        // rows is one image for each of them
+                        let mut whole = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            for _ in 0..row.multiplicity.max(1) {
+                                whole.push(row.bytes);
+                            }
+                        }
+                        whole
+                    } else if !images.is_empty() {
+                        images.clone()
+                    } else {
+                        continue;
+                    };
+                    hook.on_delete(*table_id, &whole, index, at, txn_id, last, None)?;
+                }
+                ChangesetOp::Update {
+                    table_id,
+                    index_id,
+                    rows,
+                    old_images,
+                    ..
+                } => {
+                    let old: Vec<&[u8]> = if index_id.is_none() {
+                        rows.iter().map(|(old, _)| *old).collect()
+                    } else if !old_images.is_empty() {
+                        old_images.clone()
+                    } else {
+                        continue;
+                    };
+                    let new: Vec<&[u8]> = rows.iter().map(|(_, new)| *new).collect();
+                    hook.on_update(*table_id, &old, &new, index, at, txn_id, last, None)?;
+                }
+                ChangesetOp::Truncate { table_id } => {
+                    if side == EntrySide::Proposed {
+                        hook.on_truncate(*table_id, index, at, txn_id, None)?;
+                    }
+                }
+                ChangesetOp::LakeVersion { .. }
+                | ChangesetOp::LakeBranchVersion { .. }
+                | ChangesetOp::LakeFile { .. }
+                | ChangesetOp::Sequence { .. }
+                | ChangesetOp::ScheduleRun { .. }
+                | ChangesetOp::Ddl { .. }
+                | ChangesetOp::StreamAdvance { .. } => {}
+            }
         }
         Ok(())
     }
@@ -587,6 +791,8 @@ impl ChangesetMachine {
                             ctx: Arc::clone(&ctx),
                             term,
                             next_chunk: 0,
+                            stream_advances: Vec::new(),
+                            lake_files: Vec::new(),
                         },
                     );
                     (txn_id, ctx)
@@ -594,28 +800,47 @@ impl ChangesetMachine {
             }
         };
 
-        let outcome = self.replay(&ctx, origin, reader).await;
+        let ops: Vec<ChangesetOp<'_>> = match reader.collect::<Result<Vec<_>>>() {
+            Ok(ops) => ops,
+            Err(e) => {
+                self.abandon(origin);
+                return Err(e);
+            }
+        };
+        let outcome = self
+            .replay(&ctx, origin, (index, header.timestamp_us), &ops)
+            .await;
         if let Err(e) = outcome {
             self.abandon(origin);
             return Err(e);
         }
-
-        let mut staging = self.staging.lock();
-        let Some(staged) = staging.get_mut(&origin) else {
-            return Err(ZyronError::Internal(
-                "a staged transaction vanished while its chunk was being applied".into(),
-            ));
-        };
-        staged.next_chunk = header.chunk_seq + 1;
-        if !header.is_last() {
-            return Ok(());
+        // The rows are in, so the entry's changes reach this member's feed
+        // from the same bytes the leader recorded them from, before the
+        // transaction becomes visible
+        if let Err(e) = self.record_entry_changes(txn_id, index, header, &ops, EntrySide::Replayed)
+        {
+            self.abandon(origin);
+            return Err(e);
         }
-        let Some(mut staged) = staging.remove(&origin) else {
-            return Err(ZyronError::Internal(
-                "a staged transaction vanished as it completed".into(),
-            ));
+
+        let mut staged = {
+            let mut staging = self.staging.lock();
+            let Some(staged) = staging.get_mut(&origin) else {
+                return Err(ZyronError::Internal(
+                    "a staged transaction vanished while its chunk was being applied".into(),
+                ));
+            };
+            staged.next_chunk = header.chunk_seq + 1;
+            if !header.is_last() {
+                return Ok(());
+            }
+            let Some(staged) = staging.remove(&origin) else {
+                return Err(ZyronError::Internal(
+                    "a staged transaction vanished as it completed".into(),
+                ));
+            };
+            staged
         };
-        drop(staging);
 
         let stamp = self.agreed_stamp(index, origin);
         let lsn = self
@@ -624,6 +849,14 @@ impl ChangesetMachine {
             .commit_agreed(&mut staged.txn, &stamp)?;
         self.record_agreed(lsn, index, stamp.floor);
         zyron_lake::publish_txn(&self.engine.data_dir, txn_id)?;
+        // The advances are durable with the commit record, so this brings
+        // the catalog into agreement with what the log already says
+        for entry in std::mem::take(&mut staged.stream_advances) {
+            self.engine
+                .catalog
+                .apply_change_stream_advance(entry)
+                .await?;
+        }
         self.applied_remote.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -642,22 +875,41 @@ impl ChangesetMachine {
     }
 
     /// Applies the operations of one chunk.
+    ///
+    /// The changes it records in a change feed carry the entry's index as
+    /// their version and its proposal instant as their timestamp, both of
+    /// which are the same on every member
     async fn replay(
         &self,
         ctx: &Arc<ExecutionContext>,
         origin: Origin,
-        reader: ChangesetReader<'_>,
+        entry: (u64, i64),
+        ops: &[ChangesetOp<'_>],
     ) -> Result<()> {
-        for op in reader {
-            let op = op?;
-            match &op {
+        ctx.set_change_entry(entry.0, entry.1);
+        // The applier records this entry's changes from the changeset once
+        // the rows are in, so the operators putting them back stay quiet.
+        // A keyed delete or update carrying no row images was written by a
+        // leader on an earlier release, and its rows are recorded by the
+        // operators, which read them off the table as they always did
+        ctx.set_capture_muted(true);
+        for op in ops {
+            match op {
                 ChangesetOp::Insert { .. }
                 | ChangesetOp::Delete { .. }
                 | ChangesetOp::Update { .. } => {
-                    zyron_executor::replication::apply::apply_op(ctx, &op).await?;
+                    let by_operators = recorded_by_operators(op);
+                    if by_operators {
+                        ctx.set_capture_muted(false);
+                    }
+                    let applied = zyron_executor::replication::apply::apply_op(ctx, op).await;
+                    if by_operators {
+                        ctx.set_capture_muted(true);
+                    }
+                    applied?;
                 }
                 ChangesetOp::Truncate { table_id } => {
-                    self.apply_truncate(ctx, *table_id).await?;
+                    self.apply_truncate(ctx, *table_id, entry).await?;
                 }
                 ChangesetOp::LakeVersion {
                     table_id,
@@ -666,11 +918,47 @@ impl ChangesetMachine {
                 } => {
                     self.apply_lake_version(origin, *table_id, *version, version_file)?;
                 }
+                ChangesetOp::LakeBranchVersion {
+                    table_id,
+                    branch,
+                    base_version,
+                    version,
+                    version_file,
+                } => {
+                    self.apply_lake_branch_version(
+                        origin,
+                        *table_id,
+                        branch,
+                        *base_version,
+                        *version,
+                        version_file,
+                    )?;
+                }
+                ChangesetOp::LakeFile {
+                    table_id,
+                    name,
+                    offset,
+                    total_len,
+                    bytes,
+                } => {
+                    self.apply_lake_file(origin, *table_id, name, *offset, *total_len, bytes)
+                        .await?;
+                }
                 ChangesetOp::Sequence {
                     sequence_id,
                     last_value,
                 } => {
                     self.apply_sequence(*sequence_id, *last_value).await?;
+                }
+                ChangesetOp::ScheduleRun {
+                    schedule_id,
+                    last_run,
+                    next_run,
+                } => {
+                    self.engine
+                        .catalog
+                        .record_schedule_run(*schedule_id, *last_run, *next_run)
+                        .await?;
                 }
                 ChangesetOp::Ddl {
                     sql,
@@ -685,26 +973,235 @@ impl ChangesetMachine {
                         search_path: search_path.iter().map(|s| (*s).to_string()).collect(),
                         actor_role_id: *actor_role_id,
                     };
-                    self.apply_ddl(ctx, sql, &context).await?;
+                    self.apply_ddl(ctx, sql, &context, entry).await?;
+                }
+                ChangesetOp::StreamAdvance {
+                    stream_id,
+                    consumed,
+                    at,
+                    actor_role_id,
+                } => {
+                    self.apply_stream_advance(origin, *stream_id, consumed, *at, *actor_role_id)?;
                 }
             }
         }
+        ctx.set_capture_muted(false);
         Ok(())
     }
 
-    async fn apply_truncate(&self, ctx: &Arc<ExecutionContext>, table_id: u32) -> Result<()> {
-        let entry = ctx.get_table_entry(zyron_catalog::TableId(table_id))?;
-        let sql = format!("TRUNCATE TABLE {}", quote_ident(&entry.name));
-        self.run_dispatched(&sql, &self.local_context(), ctx.txn_id)
+    /// Moves a change stream to where the leader's consumer left it.
+    ///
+    /// The count each source was consumed to is the same number here as
+    /// there, and this member's own feed turns it back into the version that
+    /// names that place in its log. The record goes under the staged
+    /// transaction, so the position is durable with the consumer's rows and
+    /// a crash between the two leaves neither, and the entry is installed
+    /// once that transaction commits
+    fn apply_stream_advance(
+        &self,
+        origin: Origin,
+        stream_id: u32,
+        consumed: &[(u32, u64)],
+        at: i64,
+        actor_role_id: u32,
+    ) -> Result<()> {
+        let Some(entry) = self.engine.catalog.get_change_stream_by_id(stream_id) else {
+            return Err(ZyronError::Internal(format!(
+                "a replicated advance names change stream {stream_id}, which this member does \
+                 not hold"
+            )));
+        };
+        let Some(host) = self.ddl.get() else {
+            return Err(ZyronError::Internal(
+                "a stream advance reached the applier before this node finished starting".into(),
+            ));
+        };
+        let mut next = zyron_catalog::ChangeStreamEntry::clone(&entry);
+        for (table_id, count) in consumed {
+            let version = host.change_feed_version_at(*table_id, *count);
+            next.set_position(*table_id, version, *count);
+        }
+        next.last_advanced_at = at;
+        next.last_advanced_by = actor_role_id;
+        let mut staging = self.staging.lock();
+        let Some(staged) = staging.get_mut(&origin) else {
+            return Err(ZyronError::Internal(
+                "a stream advance names a transaction that is not staged here".into(),
+            ));
+        };
+        let lsn = self.engine.catalog.log_change_stream_advance(
+            staged.txn.txn_id(),
+            staged.txn.last_lsn(),
+            &next,
+        )?;
+        staged.txn.set_last_lsn(lsn);
+        staged.txn.mark_wrote_data();
+        staged.stream_advances.push(next);
+        Ok(())
+    }
+
+    async fn apply_truncate(
+        &self,
+        ctx: &Arc<ExecutionContext>,
+        table_id: u32,
+        entry: (u64, i64),
+    ) -> Result<()> {
+        let table = ctx.get_table_entry(zyron_catalog::TableId(table_id))?;
+        let sql = format!("TRUNCATE TABLE {}", quote_ident(&table.name));
+        self.run_dispatched(&sql, &self.local_context(), ctx.txn_id, entry)
             .await
+    }
+
+    /// Lands one piece of a file a lake commit carries.
+    ///
+    /// The pieces of one file arrive in offset order under the transaction
+    /// that commits the version naming it. They accumulate under the
+    /// table's scratch directory and the whole file moves into the data
+    /// directory in one rename, so a reader never sees a file that is
+    /// shorter than its manifest says. A file already whole here, which is
+    /// what a replay after a restart finds, is left as it is
+    async fn apply_lake_file(
+        &self,
+        origin: Origin,
+        table_id: u32,
+        name: &str,
+        offset: u64,
+        total_len: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let partition_id = match zyron_lake::paths::parse_data_file_name(name) {
+            Some(id) => id,
+            None => match zyron_lake::paths::parse_index_file_name(name) {
+                Some((_, id)) => id,
+                None => {
+                    return Err(ZyronError::Internal(format!(
+                        "a replicated lake file is named \"{name}\", which is neither a data \
+                         file nor an index file"
+                    )));
+                }
+            },
+        };
+        let paths = zyron_lake::LakePaths::new(&self.engine.data_dir, table_id);
+        let landed = paths.data_dir().join(name);
+        // Under the lock, the file is found or recorded and its open handle
+        // taken, and the bytes go down off the lock and off the runtime, so
+        // a member landing a large file holds neither the other transactions
+        // staged here nor a worker for the length of the write
+        let (mut writer, partial, completes) = {
+            let mut staging = self.staging.lock();
+            let Some(staged) = staging.get_mut(&origin) else {
+                return Err(ZyronError::Internal(
+                    "a lake file names a transaction that is not staged here".into(),
+                ));
+            };
+            let file = match staged.lake_files.iter_mut().find(|f| f.landed == landed) {
+                Some(file) => file,
+                None => {
+                    if offset != 0 {
+                        return Err(ZyronError::Internal(format!(
+                            "lake file {name} of table {table_id} starts at offset {offset} \
+                             rather than at its first byte"
+                        )));
+                    }
+                    let log = zyron_lake::TransactionLog::open_shared(
+                        paths.clone(),
+                        &zyron_lake::AllCommitted,
+                    )?;
+                    // A file whole under its final name before its first
+                    // piece arrived was carried by an entry applied once
+                    // already and now being replayed. It is recorded so its
+                    // later pieces are recognized, held staged so nothing
+                    // reclaims it before the replay commits, and never
+                    // written to
+                    let whole = std::fs::metadata(&landed)
+                        .map(|m| m.len() == total_len)
+                        .unwrap_or(false);
+                    let partial = paths.tmp_dir().join(name);
+                    let writer = if whole {
+                        None
+                    } else {
+                        std::fs::create_dir_all(paths.tmp_dir())?;
+                        Some(std::fs::File::create(&partial)?)
+                    };
+                    staged.lake_files.push(StagedLakeFile {
+                        partial,
+                        landed: landed.clone(),
+                        received: if whole { total_len } else { 0 },
+                        writer,
+                        whole,
+                        _staged: log.stage_partition_owned(partition_id),
+                    });
+                    staged.lake_files.last_mut().ok_or_else(|| {
+                        ZyronError::Internal("a lake file was not recorded".into())
+                    })?
+                }
+            };
+            if file.whole {
+                return Ok(());
+            }
+            if file.received != offset {
+                return Err(ZyronError::Internal(format!(
+                    "lake file {name} of table {table_id} carries a piece at offset {offset} \
+                     where {} bytes have arrived",
+                    file.received
+                )));
+            }
+            let writer = match file.writer.take() {
+                Some(writer) => writer,
+                None => std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&file.partial)?,
+            };
+            (
+                writer,
+                file.partial.clone(),
+                file.received + bytes.len() as u64 >= total_len,
+            )
+        };
+        let piece = bytes.to_vec();
+        let data_dir = paths.data_dir().to_path_buf();
+        let landed_name = landed.clone();
+        let written = tokio::task::spawn_blocking(move || -> Result<Option<std::fs::File>> {
+            use std::io::Write;
+            writer.write_all(&piece)?;
+            if !completes {
+                return Ok(Some(writer));
+            }
+            // Durable before it is named, so a crash after the rename never
+            // leaves a whole name over a short file
+            writer.sync_all()?;
+            drop(writer);
+            std::fs::create_dir_all(&data_dir)?;
+            std::fs::rename(&partial, &landed_name)?;
+            Ok(None)
+        })
+        .await
+        .map_err(|e| ZyronError::Internal(format!("lake file task: {e}")))??;
+        // Back under the lock, the bytes count and the handle returns for
+        // the next piece. The transaction is still staged, since its pieces
+        // arrive in the entries of one apply, one after another
+        let mut staging = self.staging.lock();
+        let Some(staged) = staging.get_mut(&origin) else {
+            return Err(ZyronError::Internal(
+                "a lake file's transaction was abandoned while a piece was landing".into(),
+            ));
+        };
+        let Some(file) = staged.lake_files.iter_mut().find(|f| f.landed == landed) else {
+            return Err(ZyronError::Internal(
+                "a lake file was forgotten while a piece was landing".into(),
+            ));
+        };
+        file.received += bytes.len() as u64;
+        file.writer = written;
+        Ok(())
     }
 
     /// Applies a lake commit by replaying the leader's version file into this
     /// node's own log.
     ///
-    /// The entries name data files by partition id, and on shared storage
-    /// those files are already readable here, so this moves metadata and
-    /// copies no data at all
+    /// The entries name data files by partition id, and the bytes of every
+    /// file the commit added arrived ahead of it in the same transaction, so
+    /// this moves metadata and reads the files that are already here
     fn apply_lake_version(
         &self,
         origin: Origin,
@@ -738,6 +1235,75 @@ impl ChangesetMachine {
         Ok(())
     }
 
+    /// Applies one lake commit on the head a branch keeps on a table.
+    ///
+    /// The branch DDL forks every lake table on every member at the same
+    /// version, so the head is usually there. A branch that forked the
+    /// table on the leader alone, at its first write there, is forked here
+    /// at the version the leader forked it at, and a head found at another
+    /// base is refused rather than built on, since its versions would name
+    /// a history the leader's do not
+    fn apply_lake_branch_version(
+        &self,
+        origin: Origin,
+        table_id: u32,
+        branch: &str,
+        base_version: u64,
+        version: u64,
+        version_file: &[u8],
+    ) -> Result<()> {
+        let txn_id = {
+            let staging = self.staging.lock();
+            let Some(staged) = staging.get(&origin) else {
+                return Err(ZyronError::Internal(
+                    "a lake branch commit names a transaction that is not staged here".into(),
+                ));
+            };
+            staged.txn.txn_id()
+        };
+        let paths = zyron_lake::LakePaths::new(&self.engine.data_dir, table_id);
+        let data = zyron_lake::VersionFileData::decode(
+            version_file,
+            &format!("version {version} of branch {branch}"),
+        )?;
+        let followed = zyron_lake::FollowedVersion {
+            version,
+            timestamp_us: data.header.timestamp_us,
+            operation: data.header.operation,
+            entries: data.entries,
+        };
+        let log = match zyron_lake::open_branch_shared(&paths, branch) {
+            Ok(log) => log,
+            Err(ZyronError::BranchNotFound(_)) => {
+                let main = zyron_lake::TransactionLog::open_shared(
+                    paths.clone(),
+                    &zyron_lake::AllCommitted,
+                )?;
+                match zyron_lake::create_branch(
+                    &main,
+                    branch,
+                    Some(base_version),
+                    data.header.timestamp_us,
+                ) {
+                    Ok(_) | Err(ZyronError::BranchAlreadyExists(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                zyron_lake::open_branch_shared(&paths, branch)?
+            }
+            Err(e) => return Err(e),
+        };
+        if log.branch_base() != base_version {
+            return Err(ZyronError::Internal(format!(
+                "branch {branch} forked lake table {table_id} at version {} here and at \
+                 version {base_version} on the leader, so the leader's version {version} \
+                 cannot be applied on it",
+                log.branch_base()
+            )));
+        }
+        zyron_lake::apply_versions_under(&log, std::slice::from_ref(&followed), txn_id)?;
+        Ok(())
+    }
+
     /// Moves a sequence's counter to where the leader left it.
     ///
     /// The values themselves are already in the rows, so nothing here draws a
@@ -762,13 +1328,14 @@ impl ChangesetMachine {
         sql: &str,
         context: &zyron_executor::replication::StatementContext,
         apply_txn_id: u64,
+        entry: (u64, i64),
     ) -> Result<()> {
         let Some(runner) = self.ddl.get() else {
             return Err(ZyronError::Internal(
                 "a schema change reached the applier before this node finished starting".into(),
             ));
         };
-        runner.run(sql, context, apply_txn_id).await
+        runner.run(sql, context, apply_txn_id, entry).await
     }
 
     /// The context a change this node makes on its own behalf runs under
@@ -788,6 +1355,7 @@ impl ChangesetMachine {
         ctx: &Arc<ExecutionContext>,
         sql: &str,
         context: &zyron_executor::replication::StatementContext,
+        entry: (u64, i64),
     ) -> Result<()> {
         // A schema change the group agreed to and this node then refused, for
         // a name that is already taken or one that is not there, is refused
@@ -799,7 +1367,7 @@ impl ChangesetMachine {
         // this node, and it is caught by the first entry that depends on what
         // this one was supposed to make: that one fails to apply and the node
         // stops rather than carrying on wrong
-        if let Err(e) = self.run_dispatched(sql, context, ctx.txn_id).await {
+        if let Err(e) = self.run_dispatched(sql, context, ctx.txn_id, entry).await {
             tracing::warn!(
                 error = %e,
                 statement = %sql,
@@ -819,6 +1387,20 @@ impl ChangesetMachine {
                 tracing::warn!(error = %e, "a staged transaction could not be abandoned cleanly");
             }
             zyron_lake::abandon_txn(&self.engine.data_dir, txn_id);
+            // A file still arriving goes with the transaction. One that
+            // landed whole is named by no version now and the vacuum
+            // reclaims it once its registration drops with this state
+            for file in &staged.lake_files {
+                if file.partial.exists()
+                    && let Err(e) = std::fs::remove_file(&file.partial)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        path = %file.partial.display(),
+                        "an abandoned transaction's half written lake file could not be removed"
+                    );
+                }
+            }
         }
     }
 
@@ -879,15 +1461,29 @@ pub struct ChunkProposer {
     /// Where a streaming transaction announces itself, so the applier can
     /// tell its live chunks from a dead process's
     pending: Arc<PendingRegistry>,
+    /// Bytes of chunks queued and not yet handed to the log, which is what
+    /// a caller streaming a file's pieces waits on
+    queued_bytes: Arc<AtomicUsize>,
+    /// Signalled as a batch leaves the queue
+    room: Arc<(parking_lot::Mutex<()>, parking_lot::Condvar)>,
 }
+
+/// Queued bytes past which a caller streaming file pieces waits for the
+/// proposer to drain, which bounds the memory a large lake commit holds
+/// ahead of the log at a few times the batch the log takes at once
+const QUEUED_BYTES_HIGH_WATER: usize = 64 << 20;
 
 impl ChunkProposer {
     pub fn start(node: Arc<RaftNode>, pending: Arc<PendingRegistry>) -> Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueuedChunk>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let room = Arc::new((parking_lot::Mutex::new(()), parking_lot::Condvar::new()));
         let proposer = Arc::new(Self {
             tx,
             node: Arc::clone(&node),
             pending,
+            queued_bytes: Arc::clone(&queued_bytes),
+            room: Arc::clone(&room),
         });
         tokio::spawn(async move {
             let mut batch: Vec<QueuedChunk> = Vec::with_capacity(64);
@@ -907,13 +1503,22 @@ impl ChunkProposer {
                 // every one of them would put the whole replication stream
                 // through the allocator a second time
                 let mut commands: Vec<RaftCommand> = Vec::with_capacity(batch.len());
+                let mut batch_bytes = 0usize;
                 for queued in batch.drain(..) {
+                    batch_bytes += queued.chunk.payload.len();
                     commands.push(RaftCommand::Data {
                         payload: queued.chunk.payload,
                     });
                     answers.push(queued.answer);
                 }
                 let outcome = node.propose_batch_detached(commands);
+                // The batch has left the queue whatever the log said, so a
+                // caller waiting for room is woken either way
+                queued_bytes.fetch_sub(batch_bytes, Ordering::AcqRel);
+                {
+                    let _held = room.0.lock();
+                    room.1.notify_all();
+                }
                 match outcome {
                     Ok(first_index) => {
                         for (offset, answer) in answers.drain(..).enumerate() {
@@ -933,20 +1538,30 @@ impl ChunkProposer {
         proposer
     }
 
+    /// Queues one chunk, counting its bytes until the batch it joins
+    /// leaves the queue
+    fn queue(&self, queued: QueuedChunk) -> Result<()> {
+        let bytes = queued.chunk.payload.len();
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        if self.tx.send(queued).is_err() {
+            self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(ZyronError::Internal(
+                "the consensus proposer is no longer running".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Queues the final chunk and answers with the index it took.
     pub fn propose_final(
         &self,
         chunk: ChangesetChunk,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<u64>>> {
         let (answer, wait) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(QueuedChunk {
-                chunk,
-                answer: Some(answer),
-            })
-            .map_err(|_| {
-                ZyronError::Internal("the consensus proposer is no longer running".into())
-            })?;
+        self.queue(QueuedChunk {
+            chunk,
+            answer: Some(answer),
+        })?;
         Ok(wait)
     }
 
@@ -964,16 +1579,28 @@ impl ChangesetSink for ChunkProposer {
         if !chunk.last {
             self.pending.register_running_if_absent(chunk.origin);
         }
-        self.tx
-            .send(QueuedChunk {
-                chunk,
-                answer: None,
-            })
-            .map_err(|_| ZyronError::Internal("the consensus proposer is no longer running".into()))
+        self.queue(QueuedChunk {
+            chunk,
+            answer: None,
+        })
     }
 
     fn barrier_index(&self) -> u64 {
         self.node.last_applied()
+    }
+
+    /// Blocks the calling thread while more than the high water mark is
+    /// queued, checking again each time a batch leaves. A proposer that
+    /// has stopped is not waited on, the next emit reports it
+    fn wait_for_room(&self) {
+        let mut held = self.room.0.lock();
+        while self.queued_bytes.load(Ordering::Acquire) > QUEUED_BYTES_HIGH_WATER
+            && !self.tx.is_closed()
+        {
+            self.room
+                .1
+                .wait_for(&mut held, std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -993,6 +1620,36 @@ fn clone_error(e: &ZyronError) -> ZyronError {
             elapsed_ms: *elapsed_ms,
         },
         other => ZyronError::Internal(other.to_string()),
+    }
+}
+
+/// Which side of the log an entry is recorded from
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntrySide {
+    /// This node's own transaction, its rows already written by the
+    /// connection that proposed it
+    Proposed,
+    /// Another member's transaction, its rows just put back by the applier
+    Replayed,
+}
+
+/// Whether the rows an operation touches are recorded by the operators
+/// replaying it rather than from the changeset.
+///
+/// A keyed delete or update that carries no row images came from a leader
+/// on a release before the images travelled, and the only copy of the rows
+/// it removed is the table itself
+fn recorded_by_operators(op: &ChangesetOp<'_>) -> bool {
+    match op {
+        ChangesetOp::Delete {
+            index_id, images, ..
+        } => index_id.is_some() && images.is_empty(),
+        ChangesetOp::Update {
+            index_id,
+            old_images,
+            ..
+        } => index_id.is_some() && old_images.is_empty(),
+        _ => false,
     }
 }
 
@@ -1017,13 +1674,62 @@ pub struct ReplicationHandle {
     /// answer that behaves the way the release before this one did, so the
     /// wrong answer costs an owner column and never a stalled member
     pub group_carries_actor_role: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether every member of the group runs a binary that applies a change
+    /// stream advance.
+    ///
+    /// False until the upgrade service has seen the group's version floor
+    /// reach [`STREAM_ADVANCE_INTRODUCED_IN`]. There is no older shape to
+    /// fall back to. A position that moved on the leader alone would hand
+    /// the same changes out again on the next leader, so while this is false
+    /// a transactional consume is refused rather than replicated short
+    pub group_carries_stream_advance: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether every member of the group runs a binary that reads the row
+    /// images a delete or an update on a table with a change data feed
+    /// carries beside its keys.
+    ///
+    /// False until the upgrade service has seen the group's version floor
+    /// reach [`FEED_IMAGES_INTRODUCED_IN`]. A key shipped in place of the
+    /// image would leave every member's feed without the row the change
+    /// removed, so while this is false such a write is refused rather than
+    /// recorded short
+    pub group_carries_feed_images: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether every member of the group runs a binary that writes the data
+    /// and index files a lake commit carries.
+    ///
+    /// False until the upgrade service has seen the group's version floor
+    /// reach [`LAKE_FILES_INTRODUCED_IN`]. A version shipped without its
+    /// files would name bytes a member does not hold, so while this is
+    /// false a lake write is refused rather than replicated short
+    pub group_carries_lake_files: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether every member of the group runs a binary that records a
+    /// schedule's run.
+    ///
+    /// False until the upgrade service has seen the group's version floor
+    /// reach [`SCHEDULE_RUNS_INTRODUCED_IN`]. A run recorded on the leader
+    /// alone would be run again by the next leader, so while this is false
+    /// no schedule runs on this node
+    pub group_carries_schedule_runs: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The release whose applier reads a delete or an update that carries row
+/// images beside its keys, which a table with a change data feed on ships
+pub use zyron_executor::replication::FEED_IMAGES_INTRODUCED_IN;
+/// The release whose applier writes the files a lake commit carries
+pub use zyron_executor::replication::LAKE_FILES_INTRODUCED_IN;
+/// The release whose applier records a schedule's run
+pub use zyron_executor::replication::SCHEDULE_RUNS_INTRODUCED_IN;
 
 /// The release whose applier reads the actor role off a schema change. The
 /// leader holds the field back until every member of the group runs this or
 /// later
 pub const ACTOR_ROLE_INTRODUCED_IN: zyron_common::format::BinaryVersion =
     zyron_common::format::BinaryVersion::new(0, 13, 0);
+
+/// The release whose applier moves a change stream position out of a
+/// replicated transaction. A consume is refused on a group with a member
+/// below it
+pub const STREAM_ADVANCE_INTRODUCED_IN: zyron_common::format::BinaryVersion =
+    zyron_common::format::BinaryVersion::new(0, 18, 0);
 
 impl ReplicationHandle {
     /// The origin stamp for one transaction.
@@ -1035,43 +1741,138 @@ impl ReplicationHandle {
         }
     }
 
-    /// A changeset for one transaction to accumulate into.
+    /// A changeset for one transaction to accumulate into, told what the
+    /// group reads, the row images a feed table's delete or update carries,
+    /// the files a lake commit carries, and a schedule's run
     pub fn changeset(&self, txn_id: u64) -> Arc<zyron_executor::replication::TxnChangeset> {
-        Arc::new(zyron_executor::replication::TxnChangeset::new(
-            self.origin(txn_id),
-            self.chunk_bytes,
-            Arc::clone(&self.proposer) as Arc<dyn ChangesetSink>,
-        ))
+        Arc::new(
+            zyron_executor::replication::TxnChangeset::new(
+                self.origin(txn_id),
+                self.chunk_bytes,
+                Arc::clone(&self.proposer) as Arc<dyn ChangesetSink>,
+            )
+            .with_feed_images(self.group_carries_feed_images.load(Ordering::Relaxed))
+            .with_lake_files(self.group_carries_lake_files.load(Ordering::Relaxed))
+            .with_schedule_runs(self.group_carries_schedule_runs.load(Ordering::Relaxed)),
+        )
     }
 }
 
-/// Reads the version files a transaction has staged, so a lake commit can be
-/// replicated by what it did rather than by the rows it touched.
+/// Reads the version files a transaction has staged, and the files each one
+/// added, so a lake commit can be replicated by what it did rather than by
+/// the rows it touched.
 ///
 /// One capture point covers append, delete, update, optimize and schema
-/// change, because all of them stage the same way
+/// change, because all of them stage the same way. The files go ahead of
+/// the version that names them, so a member holds the bytes before it
+/// applies the manifest that refers to them
 pub fn capture_pending_lake_versions(
     data_dir: &Path,
     txn_id: u64,
     changeset: &zyron_executor::replication::TxnChangeset,
+    carries_files: bool,
 ) -> Result<()> {
     for (root, version) in zyron_lake::pending_versions(data_dir, txn_id) {
-        let paths = zyron_lake::LakePaths::from_root(&root);
-        let Some(table_id) = paths.table_id() else {
+        let Some((table_id, branch)) = lake_head_of_root(data_dir, &root) else {
             return Err(ZyronError::Internal(format!(
-                "a lake log at {} is not named for a table, so it cannot be replicated",
+                "a lake log at {} is neither a table's nor a branch head's on one, so it \
+                 cannot be replicated",
                 root.display()
             )));
         };
-        let bytes = std::fs::read(paths.version_file(version)).map_err(|e| {
+        // The table's paths whichever head committed, since a branch's
+        // data files sit beside the table's own
+        let paths = zyron_lake::LakePaths::new(data_dir, table_id);
+        let version_path = match &branch {
+            Some(name) => paths.branch_version_file(name, version),
+            None => paths.version_file(version),
+        };
+        let bytes = std::fs::read(&version_path).map_err(|e| {
             ZyronError::IoError(format!(
                 "read version {version} of {} for replication: {e}",
                 root.display()
             ))
         })?;
-        changeset.capture_lake_version(table_id, version, &bytes)?;
+        let data = zyron_lake::VersionFileData::decode(&bytes, &version_path.to_string_lossy())?;
+        let mut added: Vec<(String, PathBuf)> = Vec::new();
+        for entry in &data.entries {
+            match entry {
+                zyron_lake::LogEntry::AddFile(file) => added.push((
+                    zyron_lake::paths::data_file_name(file.partition_id),
+                    paths.data_file(file.partition_id),
+                )),
+                zyron_lake::LogEntry::AddIndexFile(index) => added.push((
+                    zyron_lake::paths::index_file_name(index.index_id, index.file.partition_id),
+                    paths.index_file(index.index_id, index.file.partition_id),
+                )),
+                _ => {}
+            }
+        }
+        if !added.is_empty() && !carries_files {
+            return Err(ZyronError::UpgradeRefused(format!(
+                "a write to lake table {table_id} cannot be replicated until every member of \
+                 the group runs {LAKE_FILES_INTRODUCED_IN} or later, because the commit adds \
+                 files a member on an earlier release does not take off the entry"
+            )));
+        }
+        for (name, path) in added {
+            let mut file = std::fs::File::open(&path).map_err(|e| {
+                ZyronError::IoError(format!(
+                    "read lake file {} for replication: {e}",
+                    path.display()
+                ))
+            })?;
+            let total_len = file
+                .metadata()
+                .map_err(|e| {
+                    ZyronError::IoError(format!(
+                        "measure lake file {} for replication: {e}",
+                        path.display()
+                    ))
+                })?
+                .len();
+            changeset.capture_lake_file(table_id, &name, total_len, &mut file)?;
+        }
+        match &branch {
+            Some(name) => {
+                // The tag a branch commit travels under is read by the same
+                // release that reads a lake file
+                if !carries_files {
+                    return Err(ZyronError::UpgradeRefused(format!(
+                        "a write on branch {name} of lake table {table_id} cannot be \
+                         replicated until every member of the group runs \
+                         {LAKE_FILES_INTRODUCED_IN} or later, because a member on an \
+                         earlier release does not take a branch commit off the entry"
+                    )));
+                }
+                let base_version = zyron_lake::open_branch_shared(&paths, name)?.branch_base();
+                changeset.capture_lake_branch_version(
+                    table_id,
+                    name,
+                    base_version,
+                    version,
+                    &bytes,
+                )?;
+            }
+            None => changeset.capture_lake_version(table_id, version, &bytes)?,
+        }
     }
     Ok(())
+}
+
+/// The table a pending version's log root belongs to, and the branch when
+/// the root is the head a branch keeps on the table, which lies under the
+/// table's log directory by the branch's name. None for a root that is
+/// neither
+fn lake_head_of_root(data_dir: &Path, root: &Path) -> Option<(u32, Option<String>)> {
+    if let Some(table_id) = zyron_lake::LakePaths::from_root(root).table_id() {
+        return Some((table_id, None));
+    }
+    let name = root.file_name()?.to_str()?.to_string();
+    let table_root = root.parent()?.parent()?.parent()?;
+    let table_id = zyron_lake::LakePaths::from_root(table_root).table_id()?;
+    let paths = zyron_lake::LakePaths::new(data_dir, table_id);
+    (paths.branch_dir(&name) == root).then_some((table_id, Some(name)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,12 +1884,67 @@ impl zyron_wire::connection::ReplicationRouter for ReplicationHandle {
         ReplicationHandle::changeset(self, txn_id)
     }
 
-    fn capture_lake(
-        &self,
+    fn carries_schedule_runs(&self) -> bool {
+        self.group_carries_schedule_runs.load(Ordering::Relaxed)
+    }
+
+    fn carries_stream_advance(&self) -> bool {
+        self.group_carries_stream_advance.load(Ordering::Relaxed)
+    }
+
+    fn capture_lake<'a>(
+        &'a self,
         txn_id: u64,
+        changeset: Arc<zyron_executor::replication::TxnChangeset>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let data_dir = self.machine.engine.data_dir.clone();
+            // A transaction that staged nothing in the lake, which is most
+            // of them, costs a registry lookup and no thread
+            if zyron_lake::pending_versions(&data_dir, txn_id).is_empty() {
+                return Ok(());
+            }
+            // What the group reads is read now rather than when the
+            // changeset opened, so a member that joined on an older release
+            // since holds the write back
+            let carries_files = self.group_carries_lake_files.load(Ordering::Relaxed);
+            tokio::task::spawn_blocking(move || {
+                capture_pending_lake_versions(&data_dir, txn_id, &changeset, carries_files)
+            })
+            .await
+            .map_err(|e| ZyronError::Internal(format!("lake capture task: {e}")))?
+        })
+    }
+
+    fn capture_stream_advances(
+        &self,
         changeset: &zyron_executor::replication::TxnChangeset,
+        advances: &[zyron_executor::context::PendingStreamAdvance],
+        actor: u32,
     ) -> Result<()> {
-        capture_pending_lake_versions(&self.machine.engine.data_dir, txn_id, changeset)
+        if advances.is_empty() {
+            return Ok(());
+        }
+        if !self.group_carries_stream_advance.load(Ordering::Relaxed) {
+            return Err(ZyronError::UpgradeRefused(format!(
+                "a change stream position cannot move until every member of the group runs \
+                 {STREAM_ADVANCE_INTRODUCED_IN} or later, so the consume is refused rather than \
+                 recorded on this member alone"
+            )));
+        }
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        for advance in advances {
+            let consumed: Vec<(u32, u64)> = advance
+                .positions
+                .iter()
+                .map(|(table_id, _, count)| (*table_id, *count))
+                .collect();
+            changeset.capture_stream_advance(advance.stream_id, &consumed, at, actor)?;
+        }
+        Ok(())
     }
 
     fn commit<'a>(
@@ -1179,7 +2035,7 @@ impl zyron_wire::connection::ReplicationRouter for ReplicationHandle {
         context: &'a zyron_executor::replication::StatementContext,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<tokio::sync::oneshot::Sender<Result<()>>>>
+            dyn std::future::Future<Output = Result<zyron_wire::connection::AgreedStatement>>
                 + Send
                 + 'a,
         >,
@@ -1209,7 +2065,7 @@ async fn begin_statement_inner(
     handle: &ReplicationHandle,
     sql: &str,
     context: &zyron_executor::replication::StatementContext,
-) -> Result<tokio::sync::oneshot::Sender<Result<()>>> {
+) -> Result<zyron_wire::connection::AgreedStatement> {
     if !handle.node.is_leader() {
         return Err(ZyronError::NotLeader {
             leader: handle.node.leader_id(),
@@ -1245,6 +2101,10 @@ async fn begin_statement_inner(
             "a schema change sealed to nothing".into(),
         ));
     };
+    // The instant the entry carries is the one every member reads off it,
+    // so the connection that runs the statement records it the same way
+    let (header, _) = ChangesetReader::open(&chunk.payload)?;
+    let timestamp_us = header.timestamp_us;
 
     let (turn, wait) = tokio::sync::oneshot::channel();
     handle
@@ -1259,8 +2119,8 @@ async fn begin_statement_inner(
             return Err(e);
         }
     };
-    match queued.await {
-        Ok(Ok(_)) => {}
+    let index = match queued.await {
+        Ok(Ok(index)) => index,
         Ok(Err(e)) => {
             handle.machine.pending().take(&origin);
             return Err(e);
@@ -1271,10 +2131,14 @@ async fn begin_statement_inner(
                 "the consensus proposer stopped before answering".into(),
             ));
         }
-    }
+    };
 
     match tokio::time::timeout(handle.propose_timeout, wait).await {
-        Ok(Ok(done)) => Ok(done),
+        Ok(Ok(done)) => Ok(zyron_wire::connection::AgreedStatement {
+            index,
+            timestamp_us,
+            done,
+        }),
         Ok(Err(_)) => Err(ZyronError::Internal(
             "a proposed schema change was dropped before its turn".into(),
         )),
@@ -1345,6 +2209,7 @@ impl DdlRunner for DispatchedDdl {
         sql: &'a str,
         context: &'a zyron_executor::replication::StatementContext,
         apply_txn_id: u64,
+        entry: (u64, i64),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let Some(server) = self.server.upgrade() else {
@@ -1373,6 +2238,9 @@ impl DdlRunner for DispatchedDdl {
                     // An online build this statement runs cannot wait for the
                     // transaction the statement is being replayed under
                     session.apply_txn_id = Some(apply_txn_id);
+                    // A change the statement records carries the entry it
+                    // runs as, the same on every member
+                    session.agreed_entry = Some(entry);
                 }
                 let mut txn = None;
                 let mut branch = None;
@@ -1404,5 +2272,29 @@ impl DdlRunner for DispatchedDdl {
             }
             Ok(())
         })
+    }
+
+    fn change_feed_version_at(&self, table_id: u32, consumed: u64) -> u64 {
+        let Some(server) = self.server.upgrade() else {
+            return 0;
+        };
+        let Some(feeds) = server.cdc_registry.as_ref() else {
+            return 0;
+        };
+        // A lake table's feed is its log, registered as a derived source
+        // with a record index of its own
+        match feeds.get_feed(table_id) {
+            Some(feed) => feed.version_at_count(consumed),
+            None => feeds
+                .derived(table_id)
+                .map(|derived| derived.version_at_count(consumed))
+                .unwrap_or(0),
+        }
+    }
+
+    fn change_hook(&self) -> Option<Arc<dyn zyron_executor::context::CdcHook>> {
+        self.server
+            .upgrade()
+            .and_then(|server| server.cdc_hook.clone())
     }
 }

@@ -18,7 +18,7 @@ use zyron_common::DeploymentMode;
 use zyron_lake::{CommitStatus, IntentAware, LakePaths, TransactionLog};
 
 /// What the startup pass did, reported by the caller and asserted by tests.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LakeRecoveryReport {
     /// Logs opened, reconciled and registered for query and commit
     pub recovered: usize,
@@ -34,6 +34,12 @@ pub struct LakeRecoveryReport {
     /// Lake roots a conversion wrote and never flipped the catalog for,
     /// removed because no reachable manifest names their files
     pub orphan_roots_reclaimed: usize,
+    /// Tables whose log holds a column shape the catalog does not, with the
+    /// schema the log committed. A column type change commits to the log
+    /// and then writes the catalog, so a stop between the two leaves the
+    /// catalog behind, and the log is the authority for a lake table's
+    /// shape
+    pub schema_ahead: Vec<(zyron_catalog::TableId, zyron_lake::LakeSchema)>,
 }
 
 /// Opens and registers the transaction log of every lake table in the
@@ -45,6 +51,46 @@ pub struct LakeRecoveryReport {
 /// reports the lake tables it left closed, so a mode changed under a
 /// populated data directory is visible in the startup log rather than as a
 /// query failure later.
+/// Whether the lake schema declares a column in a shape the catalog entry
+/// does not, by type, digits or length, for a column both hold
+fn schema_is_ahead_of(table: &zyron_catalog::TableEntry, schema: &zyron_lake::LakeSchema) -> bool {
+    table.columns.iter().any(|column| {
+        if column.dropped {
+            return false;
+        }
+        schema.column_by_id(column.id.0 as u32).is_some_and(|lake| {
+            lake.type_id != column.type_id
+                || lake.fractional_digits != column.fractional_digits
+                || lake.max_length != column.max_length.map(|n| n as u32)
+        })
+    })
+}
+
+/// Brings a catalog entry to the shape its lake log committed, the way a
+/// column type change writes the catalog after its log commit
+pub fn catalog_entry_at_lake_shape(
+    table: &zyron_catalog::TableEntry,
+    schema: &zyron_lake::LakeSchema,
+) -> zyron_catalog::TableEntry {
+    let mut entry = table.clone();
+    for column in entry.columns.iter_mut() {
+        if column.dropped {
+            continue;
+        }
+        let Some(lake) = schema.column_by_id(column.id.0 as u32) else {
+            continue;
+        };
+        column.type_id = lake.type_id;
+        column.fractional_digits = lake.fractional_digits;
+        column.max_length = lake.max_length.map(|n| n as usize);
+    }
+    // The rows written from here carry a new epoch, and the ones written
+    // before keep reading through theirs
+    let layout = entry.current_physical_columns();
+    entry.push_schema_epoch(layout);
+    entry
+}
+
 pub fn recover_lake_logs(
     mode: DeploymentMode,
     catalog: &Catalog,
@@ -132,6 +178,17 @@ pub fn recover_lake_logs(
                 // come from the recovered manifest before the first query
                 if let Ok(manifest) = log.latest_manifest() {
                     zyron_executor::lake_stats::publish_manifest_stats(catalog, &table, &manifest);
+                    if schema_is_ahead_of(&table, &manifest.schema) {
+                        tracing::warn!(
+                            table = %table.name,
+                            schema_id = manifest.schema.schema_id,
+                            "the lake log holds a column shape the catalog does not, the \
+                             catalog is brought up to it"
+                        );
+                        report
+                            .schema_ahead
+                            .push((table.id, manifest.schema.clone()));
+                    }
                 }
                 TransactionLog::register_shared(Arc::new(log));
                 report.recovered += 1;

@@ -26,6 +26,7 @@ pub mod follow;
 pub mod format;
 pub mod history;
 pub mod index;
+mod log_migrations;
 
 pub mod maintenance;
 pub mod maintenance_signal;
@@ -40,6 +41,7 @@ pub mod repair;
 pub mod schema;
 pub mod time_travel;
 pub mod transaction_log;
+pub mod widen;
 pub mod workload;
 pub mod writer;
 
@@ -49,7 +51,8 @@ pub use branch::{
 };
 pub use cells::sums_exactly;
 pub use changefeed::{
-    ChangeDescriptor, ChangeKind, change_row_counts, changed_ordinals, changes_between,
+    ChangeDescriptor, ChangeKind, TRUNCATE_COMMIT_INFO, VersionYield, change_records_at,
+    change_row_counts, changed_ordinals, changes_between, is_rewrite_only,
 };
 pub use clone::{
     CLONE_SOURCE_TABLE_PROPERTY, CLONE_SOURCE_VERSION_PROPERTY, CloneOutcome, clone_source,
@@ -61,8 +64,9 @@ pub use constraints::{
 };
 pub use convert::{load_lake_from_rows, read_all_rows, reclaim_orphan_root};
 pub use crosstable::{
-    CrossTableTxn, INTENT_TXN_FLAG, IntentAware, IntentRecovery, IntentState,
-    clear_recovered_intents, intent_state, recover_intents,
+    CrossTableTxn, INTENT_TXN_FLAG, IntentAware, IntentRecovery, IntentState, bind_intent_owner,
+    clear_recovered_intents, finish_intent_owner, intent_owner, intent_owner_of, intent_state,
+    owning_txn, owning_txn_of, prune_intent_owners, recover_intents,
 };
 pub use curve::{normalize_component, ordering_key};
 pub use encoded_filter::StoredFilter;
@@ -98,7 +102,7 @@ pub use manifest::{
     DEFAULT_AUTO_COMPACT_DEAD_ROW_RATIO, DEFAULT_AUTO_COMPACT_SMALL_FILE_RATIO,
     DEFAULT_CLUSTER_REPAIR_INTERVAL_SECS, DEFAULT_CLUSTER_REPAIR_URGENCY_THRESHOLD,
     DeletePredicate, FileStats, MIN_SMALL_FILES_TO_MERGE, ManifestFile, PartitionEntry,
-    TARGET_ROWS_PER_FILE_PROPERTY,
+    PriorColumnType, TARGET_ROWS_PER_FILE_PROPERTY, WrittenColumn,
 };
 pub use operations::{
     AppendOutcome, DeleteOutcome, OptimizeOutcome, RestoreOutcome, UpdateOutcome, append_rows,
@@ -123,10 +127,11 @@ pub use schema::{DerivedColumn, LakeColumn, LakeSchema};
 pub use time_travel::{TimeTravelSpec, manifest_as_of, resolve_version};
 pub use transaction_log::{
     AllCommitted, CommitAttempt, CommitHeader, CommitInfo, CommitStatus, LogEntry, OperationKind,
-    TransactionLog, VersionFileData, WRITER_NODE_PROPERTY, abandon_txn, local_node,
-    pending_versions, publish_txn, register_txn_pending, set_local_node, transfer_writer,
-    writer_node,
+    OwnedStagedPartition, TransactionLog, VersionFileData, WRITER_NODE_PROPERTY, abandon_txn,
+    local_node, pending_versions, publish_txn, register_txn_pending, set_local_node,
+    transfer_writer, writer_node,
 };
+pub use widen::{CellShape, Widening, widen_cells, widening_between};
 pub use workload::{
     ObserverStats, TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_JOIN_KEY,
     TERM_RANGE, TERM_ROWS_MATCHED, TERM_ROWS_SCANNED, TERMS_PER_COLUMN, WorkloadObserver,

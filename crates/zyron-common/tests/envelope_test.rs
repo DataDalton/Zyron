@@ -135,7 +135,7 @@ fn magic_bytes_are_unique_and_total() {
         assert!(!row.doc.is_empty());
     }
     assert_eq!(MAGIC_ALLOCATIONS.len(), ALL_FORMAT_KINDS.len());
-    assert_eq!(ALL_FORMAT_KINDS.len(), 29);
+    assert_eq!(ALL_FORMAT_KINDS.len(), 33);
     for kind in ALL_FORMAT_KINDS {
         assert!(MAGIC_ALLOCATIONS.iter().any(|row| row.kind == *kind));
     }
@@ -451,7 +451,7 @@ fn a_fixture_migrates_forward_and_round_trips() {
         &read_back.body,
     )
     .expect("undoes");
-    assert_eq!(back.body, b"fixture body");
+    assert_eq!(back.body.as_ref(), b"fixture body");
 }
 
 /// A one-way migration blocks the reverse and names the step

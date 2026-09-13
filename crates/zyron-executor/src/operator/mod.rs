@@ -8,6 +8,7 @@ pub mod aggregate;
 pub mod analytics_table_fn;
 pub mod asof_join;
 pub mod branch_write;
+pub mod change_scan;
 pub mod column_scan;
 pub mod distinct;
 pub mod doc_fetch;
@@ -81,44 +82,42 @@ pub(crate) fn apply_column_security(
         let cleared = sm
             .classification_store
             .check_clearance(sc.clearance, table_id, col_id);
-        let mut probe = String::new();
-        let has_mask = sm.masking_policy_store.apply_masking(
-            table_id,
-            col_id,
-            "",
-            &sc.effective_roles,
-            &mut probe,
-        );
-        if cleared && !has_mask {
-            untouched.push(col_id);
-            cols.push(col.clone());
-            continue;
-        }
-        let mut b = ColumnBuilder::new(col.type_id, n);
-        for r in 0..n {
-            let v = col.get_scalar(r);
-            let masked_text = if let ScalarValue::Utf8(s) = &v {
-                let mut buf = String::new();
-                if sm.masking_policy_store.apply_masking(
-                    table_id,
-                    col_id,
-                    s,
-                    &sc.effective_roles,
-                    &mut buf,
-                ) {
-                    Some(buf)
-                } else {
-                    None
+        // The mask is resolved once for the column and applied to each
+        // value, so the per-value work is the masking function and nothing
+        // else
+        let mask = sm
+            .masking_policy_store
+            .mask_for(table_id, col_id, &sc.effective_roles);
+        let Some(function) = mask else {
+            if cleared {
+                untouched.push(col_id);
+                cols.push(col.clone());
+            } else {
+                let mut b = ColumnBuilder::shaped_like(col, n);
+                for _ in 0..n {
+                    b.push_null();
                 }
-            } else {
-                None
-            };
-            if let Some(m) = masked_text {
-                b.push(&ScalarValue::Utf8(m));
-            } else if cleared {
-                b.push(&v);
-            } else {
-                b.push(&ScalarValue::Null);
+                cols.push(b.finish());
+            }
+            continue;
+        };
+        // A text cell is masked through the function. A NULL mask withholds
+        // the cell, and a cell the function has no text for, a number or a
+        // NULL, is shown when the session is cleared for the column and
+        // withheld when it is not
+        let mut b = ColumnBuilder::shaped_like(col, n);
+        let mut buf = String::new();
+        for r in 0..n {
+            match col.utf8_at(r) {
+                Some(text) => {
+                    if zyron_auth::masking::apply_mask(text, &function, &mut buf) {
+                        b.push_owned(ScalarValue::Utf8(std::mem::take(&mut buf)));
+                    } else {
+                        b.push_null();
+                    }
+                }
+                None if cleared => b.push_row_from(col, r),
+                None => b.push_null(),
             }
         }
         cols.push(b.finish());
@@ -157,11 +156,11 @@ pub(crate) fn expose_column_value(
     let cleared = sm
         .classification_store
         .check_clearance(sc.clearance, table_id, cid.0);
-    let mut probe = String::new();
-    let has_mask =
-        sm.masking_policy_store
-            .apply_masking(table_id, cid.0, "", &sc.effective_roles, &mut probe);
-    if cleared && !has_mask {
+    let masked = sm
+        .masking_policy_store
+        .mask_for(table_id, cid.0, &sc.effective_roles)
+        .is_some();
+    if cleared && !masked {
         value
     } else {
         ScalarValue::Null

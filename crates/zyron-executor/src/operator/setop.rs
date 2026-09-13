@@ -204,7 +204,7 @@ impl RowStore {
                 .iter()
                 .map(|c| {
                     Column::new_ts(
-                        ColumnData::with_capacity(c.type_id, 64),
+                        ColumnData::with_capacity_for(c.type_id, c.fractional_digits, 64),
                         c.type_id,
                         c.fractional_digits,
                     )
@@ -222,8 +222,7 @@ impl RowStore {
             {
                 self.declared[ci] = (col.type_id, col.fractional_digits);
                 let held = self.columns[ci].len();
-                self.columns[ci] = Column::null_column(col.type_id, held);
-                self.columns[ci].fractional_digits = col.fractional_digits;
+                self.columns[ci] = Column::null_column_ts(col.type_id, col.fractional_digits, held);
             }
         }
     }

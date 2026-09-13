@@ -38,12 +38,11 @@ impl WebAuthnCredentialStore {
             }
         }
         drop(snap);
-        let cred_id_for_index = cred.credential_id.clone();
         self.credentials.update(|m| {
-            m.entry(user_id).or_default().push(cred);
+            m.entry(user_id).or_default().push(cred.clone());
         });
         self.cred_index.update(|m| {
-            m.insert(cred_id_for_index, user_id);
+            m.insert(cred.credential_id.clone(), user_id);
         });
         Ok(())
     }

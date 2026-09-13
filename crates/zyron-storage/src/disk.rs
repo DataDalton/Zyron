@@ -275,6 +275,16 @@ impl DiskManager {
         }
     }
 
+    /// Whether a file exists, open here or on disk, without creating it.
+    ///
+    /// Recovery asks before replaying a page change, because a file that is
+    /// gone belonged to a table that was dropped after the change was
+    /// logged, and reading through `entry` would create an empty file for
+    /// it
+    pub fn file_exists(&self, file_id: u32) -> bool {
+        self.files.contains_sync(&file_id) || self.file_path(file_id).exists()
+    }
+
     /// Places a file in a directory of its own rather than the data
     /// directory.
     ///

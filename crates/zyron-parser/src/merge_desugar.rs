@@ -249,6 +249,7 @@ pub fn desugar_merge(stmt: &MergeStatement) -> Result<Vec<Statement>> {
                             name: stmt.target.clone(),
                             alias: None,
                             as_of: None,
+                            options: Vec::new(),
                         }],
                         Some(Box::new(stmt.on.clone())),
                     )),

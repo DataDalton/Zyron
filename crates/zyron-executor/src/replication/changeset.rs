@@ -70,6 +70,63 @@ const OP_DDL: u8 = 10;
 /// instead, and the leader holds this one back until every member of the
 /// group runs a binary that reads it
 const OP_DDL_ACTOR: u8 = 11;
+/// A change stream position moved by the transaction that consumed from it.
+///
+/// Carries the count each source stream consumed rather than a version,
+/// because a version names a place in one node's own log and the count is
+/// the same number on every member. A member that does not know the tag
+/// refuses the whole entry, so the leader refuses the consume until every
+/// member of the group runs a binary that reads it
+const OP_STREAM_ADVANCE: u8 = 12;
+/// A delete on a table whose change data feed is on, naming each row by its
+/// replica identity key and carrying the whole row image beside it.
+///
+/// The key is what the applier probes, the image is what the feed records.
+/// A delete carrying keys alone leaves a member's feed without the row the
+/// change removed, so a table with a feed replicates its deletes this way,
+/// and the leader refuses the write until every member of the group runs a
+/// binary that reads the tag
+const OP_DELETE_IMAGED: u8 = 13;
+/// An update on a table whose change data feed is on, each row as its
+/// replica identity key, the old row image and the new row
+const OP_UPDATE_IMAGED: u8 = 14;
+/// One piece of a data or index file a lake commit added, carried ahead of
+/// the version that names it so every member holds the bytes the version
+/// refers to. A file is cut into pieces no larger than a chunk, each piece
+/// naming its offset and the whole file's length, so a member appends them
+/// in order and knows when the file is whole
+const OP_LAKE_FILE: u8 = 15;
+/// A schedule's run bookkeeping, the instant it last ran and the instant it
+/// is due next, so a member elected later continues the schedule from where
+/// the leader left it rather than running the body again at once
+const OP_SCHEDULE_RUN: u8 = 16;
+/// A lake commit on the head a branch keeps on a table, naming the branch
+/// and the version the branch forked the table at beside the version file,
+/// so a member forks the table at the same version when the branch has not
+/// touched it there and applies the commit on the branch's head rather
+/// than the table's. Read by the same release that reads a lake file, so
+/// the leader holds a branch write back on the same terms
+const OP_LAKE_BRANCH_VERSION: u8 = 17;
+
+/// The release whose applier reads a delete or an update that carries the
+/// old row images beside the keys. A write to a table with a change data
+/// feed on and a replica identity is refused on a group with a member
+/// below it, since a key alone cannot be recorded as the row it named
+pub const FEED_IMAGES_INTRODUCED_IN: zyron_common::format::BinaryVersion =
+    zyron_common::format::BinaryVersion::new(0, 18, 0);
+
+/// The release whose applier writes the data and index files a lake commit
+/// carries. A lake write on a group with a member below it is refused,
+/// since a version shipped without its files would name bytes that member
+/// does not hold
+pub const LAKE_FILES_INTRODUCED_IN: zyron_common::format::BinaryVersion =
+    zyron_common::format::BinaryVersion::new(0, 18, 0);
+
+/// The release whose applier records a schedule's run. A schedule is held
+/// back on a group with a member below it, since a run recorded on the
+/// leader alone would be run again by the next leader
+pub const SCHEDULE_RUNS_INTRODUCED_IN: zyron_common::format::BinaryVersion =
+    zyron_common::format::BinaryVersion::new(0, 18, 0);
 
 /// Written where an index id would go when rows are matched by their whole
 /// image instead
@@ -167,6 +224,18 @@ fn put_u64(buf: &mut Vec<u8>, v: u64) {
 fn put_bytes(buf: &mut Vec<u8>, v: &[u8]) {
     put_u32(buf, v.len() as u32);
     buf.extend_from_slice(v);
+}
+
+/// An instant that may be absent, a presence byte, then the value when
+/// present
+fn put_optional_i64(buf: &mut Vec<u8>, v: Option<i64>) {
+    match v {
+        Some(value) => {
+            buf.push(1);
+            put_u64(buf, value as u64);
+        }
+        None => buf.push(0),
+    }
 }
 
 /// Encodes one row straight into `buf` behind its length, so a row never
@@ -308,12 +377,20 @@ pub enum ChangesetOp<'a> {
         columns: u16,
         index_id: Option<u32>,
         rows: Vec<RowImage<'a>>,
+        /// The whole image of each row in `rows`, carried when the table's
+        /// change data feed records the delete and the rows are named by
+        /// key. Empty when the rows are their own images or when the feed
+        /// records nothing
+        images: Vec<&'a [u8]>,
     },
     Update {
         table_id: u32,
         columns: u16,
         index_id: Option<u32>,
         rows: Vec<(&'a [u8], &'a [u8])>,
+        /// The whole old image of each row in `rows`, carried on the same
+        /// terms as a delete's
+        old_images: Vec<&'a [u8]>,
     },
     Truncate {
         table_id: u32,
@@ -323,9 +400,36 @@ pub enum ChangesetOp<'a> {
         version: u64,
         version_file: &'a [u8],
     },
+    /// A lake commit on the head a branch keeps on a table, with the
+    /// version the branch forked the table at
+    LakeBranchVersion {
+        table_id: u32,
+        branch: &'a str,
+        base_version: u64,
+        version: u64,
+        version_file: &'a [u8],
+    },
+    /// One piece of a file a lake commit added, under the table's data
+    /// directory by `name`. Pieces of one file arrive in offset order and
+    /// the file is whole when `offset + bytes.len()` reaches `total_len`
+    LakeFile {
+        table_id: u32,
+        name: &'a str,
+        offset: u64,
+        total_len: u64,
+        bytes: &'a [u8],
+    },
     Sequence {
         sequence_id: u32,
         last_value: i64,
+    },
+    /// A schedule's run, as the instants its entry records after it. None
+    /// where the entry holds none, which is what a schedule that has never
+    /// run says of its last run
+    ScheduleRun {
+        schedule_id: u32,
+        last_run: Option<i64>,
+        next_run: Option<i64>,
     },
     Ddl {
         sql: &'a str,
@@ -343,6 +447,17 @@ pub enum ChangesetOp<'a> {
         /// a member of the group does not read it yet, and from an entry
         /// written before this build
         actor_role_id: Option<u32>,
+    },
+    StreamAdvance {
+        stream_id: u32,
+        /// The count each source table's feed has been consumed to, which
+        /// the applying member turns back into a version of its own feed
+        consumed: Vec<(u32, u64)>,
+        /// When the consumer's commit moved it, in microseconds since the
+        /// epoch
+        at: i64,
+        /// The role the consumer ran under
+        actor_role_id: u32,
     },
 }
 
@@ -440,6 +555,23 @@ impl<'a> ChangesetReader<'a> {
         std::str::from_utf8(raw).map_err(|_| bad("changeset carries text that is not utf8"))
     }
 
+    /// An instant that may be absent, written as a presence byte and then
+    /// the value when present
+    fn optional_i64(&mut self) -> Result<Option<i64>> {
+        if self.at >= self.data.len() {
+            return Err(bad("changeset ends inside an optional field"));
+        }
+        let present = self.data[self.at];
+        self.at += 1;
+        match present {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64()? as i64)),
+            other => Err(bad(&format!(
+                "an optional field carries presence byte {other}"
+            ))),
+        }
+    }
+
     /// Rows a count field claims, refused when the chunk cannot hold them.
     ///
     /// A corrupt count would otherwise reserve gigabytes before the read that
@@ -485,15 +617,20 @@ impl<'a> ChangesetReader<'a> {
                     rows,
                 })
             }
-            OP_DELETE => {
+            OP_DELETE | OP_DELETE_IMAGED => {
                 let table_id = self.u32()?;
                 let columns = self.u16()?;
                 let index_id = self.u32()?;
                 let count = self.u32()?;
                 let count = self.rows_claimed(count)?;
+                let imaged = tag == OP_DELETE_IMAGED;
                 let mut rows = Vec::with_capacity(count);
+                let mut images = Vec::with_capacity(if imaged { count } else { 0 });
                 for _ in 0..count {
                     let bytes = self.bytes()?;
+                    if imaged {
+                        images.push(self.bytes()?);
+                    }
                     let multiplicity = self.u32()?;
                     rows.push(RowImage {
                         bytes,
@@ -505,17 +642,23 @@ impl<'a> ChangesetReader<'a> {
                     columns,
                     index_id: (index_id != NO_INDEX).then_some(index_id),
                     rows,
+                    images,
                 })
             }
-            OP_UPDATE => {
+            OP_UPDATE | OP_UPDATE_IMAGED => {
                 let table_id = self.u32()?;
                 let columns = self.u16()?;
                 let index_id = self.u32()?;
                 let count = self.u32()?;
                 let count = self.rows_claimed(count)?;
+                let imaged = tag == OP_UPDATE_IMAGED;
                 let mut rows = Vec::with_capacity(count);
+                let mut old_images = Vec::with_capacity(if imaged { count } else { 0 });
                 for _ in 0..count {
                     let old = self.bytes()?;
+                    if imaged {
+                        old_images.push(self.bytes()?);
+                    }
                     let new = self.bytes()?;
                     rows.push((old, new));
                 }
@@ -524,6 +667,7 @@ impl<'a> ChangesetReader<'a> {
                     columns,
                     index_id: (index_id != NO_INDEX).then_some(index_id),
                     rows,
+                    old_images,
                 })
             }
             OP_TRUNCATE => Ok(ChangesetOp::Truncate {
@@ -534,10 +678,54 @@ impl<'a> ChangesetReader<'a> {
                 version: self.u64()?,
                 version_file: self.bytes()?,
             }),
+            OP_LAKE_BRANCH_VERSION => {
+                let table_id = self.u32()?;
+                let branch = self.text()?;
+                let base_version = self.u64()?;
+                let version = self.u64()?;
+                let version_file = self.bytes()?;
+                Ok(ChangesetOp::LakeBranchVersion {
+                    table_id,
+                    branch,
+                    base_version,
+                    version,
+                    version_file,
+                })
+            }
+            OP_LAKE_FILE => {
+                let table_id = self.u32()?;
+                let name = self.text()?;
+                let offset = self.u64()?;
+                let total_len = self.u64()?;
+                let bytes = self.bytes()?;
+                if offset.saturating_add(bytes.len() as u64) > total_len {
+                    return Err(bad(&format!(
+                        "a piece of lake file {name} at offset {offset} runs past its length \
+                         {total_len}"
+                    )));
+                }
+                Ok(ChangesetOp::LakeFile {
+                    table_id,
+                    name,
+                    offset,
+                    total_len,
+                    bytes,
+                })
+            }
             OP_SEQUENCE => Ok(ChangesetOp::Sequence {
                 sequence_id: self.u32()?,
                 last_value: self.u64()? as i64,
             }),
+            OP_SCHEDULE_RUN => {
+                let schedule_id = self.u32()?;
+                let last_run = self.optional_i64()?;
+                let next_run = self.optional_i64()?;
+                Ok(ChangesetOp::ScheduleRun {
+                    schedule_id,
+                    last_run,
+                    next_run,
+                })
+            }
             OP_DDL | OP_DDL_ACTOR => {
                 let sql = self.text()?;
                 let user = self.text()?;
@@ -557,6 +745,25 @@ impl<'a> ChangesetReader<'a> {
                     user,
                     database,
                     search_path,
+                    actor_role_id,
+                })
+            }
+            OP_STREAM_ADVANCE => {
+                let stream_id = self.u32()?;
+                let at = self.u64()? as i64;
+                let actor_role_id = self.u32()?;
+                let count = self.u32()?;
+                let count = self.rows_claimed(count)?;
+                let mut consumed = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let table_id = self.u32()?;
+                    let to = self.u64()?;
+                    consumed.push((table_id, to));
+                }
+                Ok(ChangesetOp::StreamAdvance {
+                    stream_id,
+                    consumed,
+                    at,
                     actor_role_id,
                 })
             }
@@ -633,6 +840,11 @@ pub trait ChangesetSink: Send + Sync {
     /// The index every entry of this transaction must wait behind, read when
     /// the transaction seals rather than when it started
     fn barrier_index(&self) -> u64;
+
+    /// Waits until the sink has room for another chunk, so a transaction
+    /// streaming a large file never queues it whole ahead of the log. A
+    /// sink that never fills answers at once
+    fn wait_for_room(&self) {}
 }
 
 /// The effects of one transaction, accumulating as it runs.
@@ -654,6 +866,19 @@ pub struct TxnChangeset {
     /// schema change needs: every entry after it is encoded against the schema
     /// it makes
     barrier: std::sync::atomic::AtomicBool,
+    /// Whether every member of the group reads a delete or an update that
+    /// carries row images beside its keys, read off the group when the
+    /// changeset opens. False holds such a write back rather than shipping
+    /// a tag a member refuses
+    feed_images: bool,
+    /// Whether every member of the group writes the files a lake commit
+    /// carries, read the same way. False holds a lake write back rather
+    /// than shipping a version whose files a member would not hold
+    lake_files: bool,
+    /// Whether every member of the group records a schedule's run, read the
+    /// same way. False holds a schedule back rather than recording its run
+    /// on the leader alone
+    schedule_runs: bool,
 }
 
 impl TxnChangeset {
@@ -665,7 +890,56 @@ impl TxnChangeset {
             sink,
             streamed: std::sync::atomic::AtomicBool::new(false),
             barrier: std::sync::atomic::AtomicBool::new(false),
+            feed_images: false,
+            lake_files: false,
+            schedule_runs: false,
         }
+    }
+
+    /// Says whether the group reads row images beside the keys of a delete
+    /// or an update on a table whose change data feed is on
+    pub fn with_feed_images(mut self, carried: bool) -> Self {
+        self.feed_images = carried;
+        self
+    }
+
+    /// Whether a delete or an update on a table with a change data feed may
+    /// carry its row images to the group
+    #[inline]
+    pub fn carries_feed_images(&self) -> bool {
+        self.feed_images
+    }
+
+    /// Says whether the group writes the files a lake commit carries
+    pub fn with_lake_files(mut self, carried: bool) -> Self {
+        self.lake_files = carried;
+        self
+    }
+
+    /// Whether a lake commit may carry its data and index files to the group
+    #[inline]
+    pub fn carries_lake_files(&self) -> bool {
+        self.lake_files
+    }
+
+    /// Says whether the group records a schedule's run
+    pub fn with_schedule_runs(mut self, carried: bool) -> Self {
+        self.schedule_runs = carried;
+        self
+    }
+
+    /// Whether a schedule's run may be recorded through the group
+    #[inline]
+    pub fn carries_schedule_runs(&self) -> bool {
+        self.schedule_runs
+    }
+
+    /// The most bytes one piece of a lake file carries, which is the chunk
+    /// size, so a file replicates as a run of ordinary chunks rather than
+    /// as one entry the size of the file
+    #[inline]
+    pub fn piece_bytes(&self) -> usize {
+        self.chunk_bytes
     }
 
     #[inline]
@@ -807,6 +1081,83 @@ impl TxnChangeset {
         self.maybe_stream(&mut buffer)
     }
 
+    /// Records rows leaving a table whose change data feed is on, each named
+    /// by its replica identity key and carrying its whole image.
+    ///
+    /// The key is what the applier probes and the image is what every
+    /// member's feed records, so a delete on such a table costs the log the
+    /// row as well as the key. A row named by its key is one row, so no
+    /// image is folded with another
+    pub fn capture_delete_imaged(
+        &self,
+        table: &TableEntry,
+        identity: &ReplicaIdentity,
+        keys: &[&[u8]],
+        images: &[&[u8]],
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if keys.len() != images.len() {
+            return Err(ZyronError::Internal(format!(
+                "replication capture was given {} keys against {} row images",
+                keys.len(),
+                images.len()
+            )));
+        }
+        let mut buffer = self.buffer.lock();
+        let buf = &mut buffer.payload;
+        buf.push(OP_DELETE_IMAGED);
+        put_u32(buf, table.id.0);
+        put_u16(buf, table.columns.len() as u16);
+        put_u32(buf, identity.index_id());
+        put_u32(buf, keys.len() as u32);
+        for (key, image) in keys.iter().zip(images) {
+            put_bytes(buf, key);
+            put_bytes(buf, image);
+            put_u32(buf, 1);
+        }
+        buffer.ops += 1;
+        self.maybe_stream(&mut buffer)
+    }
+
+    /// Records rows changing in a table whose change data feed is on, each
+    /// as its replica identity key, its whole old image and its new row
+    pub fn capture_update_imaged(
+        &self,
+        table: &TableEntry,
+        identity: &ReplicaIdentity,
+        keys: &[&[u8]],
+        old_images: &[&[u8]],
+        new_batch: &DataBatch,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if keys.len() != new_batch.num_rows || keys.len() != old_images.len() {
+            return Err(ZyronError::Internal(format!(
+                "replication capture was given {} keys, {} old images and {} new rows",
+                keys.len(),
+                old_images.len(),
+                new_batch.num_rows
+            )));
+        }
+        let mut buffer = self.buffer.lock();
+        let buf = &mut buffer.payload;
+        buf.push(OP_UPDATE_IMAGED);
+        put_u32(buf, table.id.0);
+        put_u16(buf, table.columns.len() as u16);
+        put_u32(buf, identity.index_id());
+        put_u32(buf, keys.len() as u32);
+        for (row, (key, old)) in keys.iter().zip(old_images).enumerate() {
+            put_bytes(buf, key);
+            put_bytes(buf, old);
+            put_row(buf, new_batch, row, &table.columns);
+        }
+        buffer.ops += 1;
+        self.maybe_stream(&mut buffer)
+    }
+
     /// Records a whole table emptying.
     ///
     /// Shipped as itself rather than as a delete per row, because that is what
@@ -844,6 +1195,96 @@ impl TxnChangeset {
         self.maybe_stream(&mut buffer)
     }
 
+    /// Records one lake commit on the head a branch keeps on a table, on
+    /// the same terms as `capture_lake_version`, naming the branch and the
+    /// version it forked the table at so a member applies the commit on
+    /// the same head over the same base
+    pub fn capture_lake_branch_version(
+        &self,
+        table_id: u32,
+        branch: &str,
+        base_version: u64,
+        version: u64,
+        version_file: &[u8],
+    ) -> Result<()> {
+        let mut buffer = self.buffer.lock();
+        let buf = &mut buffer.payload;
+        buf.push(OP_LAKE_BRANCH_VERSION);
+        put_u32(buf, table_id);
+        put_bytes(buf, branch.as_bytes());
+        put_u64(buf, base_version);
+        put_u64(buf, version);
+        put_bytes(buf, version_file);
+        buffer.ops += 1;
+        self.maybe_stream(&mut buffer)
+    }
+
+    /// Records one file a lake commit added, read from `source` in pieces
+    /// no larger than a chunk.
+    ///
+    /// The version file names the file and the manifest records its size,
+    /// but only the bytes themselves let a member read the rows, so they go
+    /// ahead of the version in the same transaction. Each piece is streamed
+    /// as soon as it fills a chunk, so a file of any size replicates as a
+    /// run of chunks rather than being held whole. A source that ends short
+    /// of or past `total_len` is refused, because a member would otherwise
+    /// hold a file whose length disagrees with the manifest that names it
+    pub fn capture_lake_file(
+        &self,
+        table_id: u32,
+        name: &str,
+        total_len: u64,
+        source: &mut dyn std::io::Read,
+    ) -> Result<()> {
+        let piece_bytes = self.chunk_bytes;
+        let mut piece: Vec<u8> = Vec::with_capacity(piece_bytes.min(total_len as usize));
+        let mut offset = 0u64;
+        loop {
+            // Each piece waits for the group to take what is already queued,
+            // so a file is read at the pace the log accepts it rather than
+            // held whole in memory ahead of it
+            self.sink.wait_for_room();
+            let want = (total_len - offset).min(piece_bytes as u64) as usize;
+            piece.resize(want, 0);
+            if want > 0 {
+                source.read_exact(&mut piece).map_err(|e| {
+                    ZyronError::IoError(format!(
+                        "lake file {name} ended at {offset} of the {total_len} bytes its \
+                         manifest records: {e}"
+                    ))
+                })?;
+            }
+            {
+                let mut buffer = self.buffer.lock();
+                let buf = &mut buffer.payload;
+                buf.push(OP_LAKE_FILE);
+                put_u32(buf, table_id);
+                put_bytes(buf, name.as_bytes());
+                put_u64(buf, offset);
+                put_u64(buf, total_len);
+                put_bytes(buf, &piece);
+                buffer.ops += 1;
+                self.maybe_stream(&mut buffer)?;
+            }
+            offset += want as u64;
+            if offset >= total_len {
+                break;
+            }
+        }
+        let mut probe = [0u8; 1];
+        if source.read(&mut probe).map_err(|e| {
+            ZyronError::IoError(format!(
+                "lake file {name} could not be read past its end: {e}"
+            ))
+        })? != 0
+        {
+            return Err(ZyronError::IoError(format!(
+                "lake file {name} holds more than the {total_len} bytes its manifest records"
+            )));
+        }
+        Ok(())
+    }
+
     /// Records how far a sequence was drawn.
     ///
     /// The values themselves are already in the row images, so a follower
@@ -855,6 +1296,56 @@ impl TxnChangeset {
         buf.push(OP_SEQUENCE);
         put_u32(buf, sequence_id);
         put_u64(buf, last_value as u64);
+        buffer.ops += 1;
+        self.maybe_stream(&mut buffer)
+    }
+
+    /// Records a schedule's run, the instants its entry holds once the run
+    /// is accounted for.
+    ///
+    /// The body's own rows are already in the chunk. This is what moves the
+    /// schedule beside them on every member, so a node elected later runs
+    /// the body at its next period rather than at once
+    pub fn capture_schedule_run(
+        &self,
+        schedule_id: u32,
+        last_run: Option<i64>,
+        next_run: Option<i64>,
+    ) -> Result<()> {
+        let mut buffer = self.buffer.lock();
+        let buf = &mut buffer.payload;
+        buf.push(OP_SCHEDULE_RUN);
+        put_u32(buf, schedule_id);
+        put_optional_i64(buf, last_run);
+        put_optional_i64(buf, next_run);
+        buffer.ops += 1;
+        self.maybe_stream(&mut buffer)
+    }
+
+    /// Records how far a change stream was consumed.
+    ///
+    /// The consumer's own rows are already in the chunk, and this is what
+    /// moves the stream beside them on every member, so a node elected later
+    /// continues the stream from where this commit left it rather than
+    /// handing the same changes out again
+    pub fn capture_stream_advance(
+        &self,
+        stream_id: u32,
+        consumed: &[(u32, u64)],
+        at: i64,
+        actor_role_id: u32,
+    ) -> Result<()> {
+        let mut buffer = self.buffer.lock();
+        let buf = &mut buffer.payload;
+        buf.push(OP_STREAM_ADVANCE);
+        put_u32(buf, stream_id);
+        put_u64(buf, at as u64);
+        put_u32(buf, actor_role_id);
+        put_u32(buf, consumed.len() as u32);
+        for (table_id, to) in consumed {
+            put_u32(buf, *table_id);
+            put_u64(buf, *to);
+        }
         buffer.ops += 1;
         self.maybe_stream(&mut buffer)
     }
@@ -1095,6 +1586,113 @@ mod tests {
                 assert_eq!(*last_value, -42);
             }
             other => panic!("expected a sequence, got {other:?}"),
+        }
+    }
+
+    /// A lake file is cut at the chunk size, each piece names where it goes
+    /// and how long the whole file is, and the pieces read back in order
+    #[test]
+    fn a_lake_file_is_carried_in_pieces_no_larger_than_a_chunk() {
+        // The smallest chunk the changeset allows, so a file a little over
+        // it takes two pieces
+        let chunk = 64 * 1024;
+        let file: Vec<u8> = (0..chunk + 100).map(|i| (i % 251) as u8).collect();
+        let sink = Arc::new(CollectingSink {
+            chunks: parking_lot::Mutex::new(Vec::new()),
+        });
+        let set = TxnChangeset::new(origin(), chunk, Arc::clone(&sink) as Arc<dyn ChangesetSink>);
+        set.capture_lake_file(
+            7,
+            "p-0000000000000001.zyr",
+            file.len() as u64,
+            &mut &file[..],
+        )
+        .expect("file");
+        // The first piece filled a chunk and streamed on its own, the
+        // second is sealed with the transaction
+        let mut chunks: Vec<ChangesetChunk> = std::mem::take(&mut *sink.chunks.lock());
+        chunks.push(set.seal(0).expect("chunk"));
+        assert_eq!(chunks.len(), 2);
+
+        let mut ops = Vec::new();
+        for chunk in &chunks {
+            let (_, reader) = ChangesetReader::open(&chunk.payload).expect("header");
+            ops.extend(reader.map(|op| op.expect("op")));
+        }
+        let mut rebuilt = Vec::new();
+        for op in &ops {
+            match op {
+                ChangesetOp::LakeFile {
+                    table_id,
+                    name,
+                    offset,
+                    total_len,
+                    bytes,
+                } => {
+                    assert_eq!(*table_id, 7);
+                    assert_eq!(*name, "p-0000000000000001.zyr");
+                    assert_eq!(*offset as usize, rebuilt.len());
+                    assert_eq!(*total_len as usize, file.len());
+                    assert!(bytes.len() <= chunk);
+                    rebuilt.extend_from_slice(bytes);
+                }
+                other => panic!("expected a lake file piece, got {other:?}"),
+            }
+        }
+        assert_eq!(ops.len(), 2);
+        assert_eq!(rebuilt, file);
+    }
+
+    /// A source shorter or longer than the length the manifest records is
+    /// refused, because a member would hold a file the manifest misdescribes
+    #[test]
+    fn a_lake_file_whose_length_disagrees_with_its_manifest_is_refused() {
+        let set = TxnChangeset::new(origin(), 1 << 20, Arc::new(NullSink));
+        let short: Vec<u8> = vec![1u8; 10];
+        assert!(
+            set.capture_lake_file(1, "p-0000000000000002.zyr", 11, &mut &short[..])
+                .is_err()
+        );
+        let long: Vec<u8> = vec![1u8; 12];
+        assert!(
+            set.capture_lake_file(1, "p-0000000000000002.zyr", 11, &mut &long[..])
+                .is_err()
+        );
+    }
+
+    /// A schedule run reads back with both instants, present or absent
+    #[test]
+    fn a_schedule_run_reads_back_with_its_instants() {
+        let set = TxnChangeset::new(origin(), 1 << 20, Arc::new(NullSink));
+        set.capture_schedule_run(5, None, Some(1_700_000_000_000_000))
+            .expect("run");
+        set.capture_schedule_run(6, Some(-3), None).expect("run");
+        let chunk = set.seal(0).expect("chunk");
+        let (_, reader) = ChangesetReader::open(&chunk.payload).expect("header");
+        let ops: Vec<_> = reader.map(|op| op.expect("op")).collect();
+        match &ops[0] {
+            ChangesetOp::ScheduleRun {
+                schedule_id,
+                last_run,
+                next_run,
+            } => {
+                assert_eq!(*schedule_id, 5);
+                assert_eq!(*last_run, None);
+                assert_eq!(*next_run, Some(1_700_000_000_000_000));
+            }
+            other => panic!("expected a schedule run, got {other:?}"),
+        }
+        match &ops[1] {
+            ChangesetOp::ScheduleRun {
+                schedule_id,
+                last_run,
+                next_run,
+            } => {
+                assert_eq!(*schedule_id, 6);
+                assert_eq!(*last_run, Some(-3));
+                assert_eq!(*next_run, None);
+            }
+            other => panic!("expected a schedule run, got {other:?}"),
         }
     }
 

@@ -682,6 +682,7 @@ mod tests {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         })
     }
 

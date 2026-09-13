@@ -472,7 +472,7 @@ fn merge_batches(mut batches: Vec<DataBatch>, total_rows: usize) -> Option<DataB
         let template = &batches[0].columns[col_idx];
         let type_id = template.type_id;
         let fractional_digits = template.fractional_digits;
-        let mut data = ColumnData::with_capacity(type_id, total_rows);
+        let mut data = ColumnData::with_capacity_for(type_id, fractional_digits, total_rows);
         let mut nulls = NullBitmap::empty();
         for batch in &batches {
             data.extend_from(&batch.columns[col_idx].data);
@@ -1214,7 +1214,7 @@ impl HashJoinOperator {
                 .chain(second.iter())
                 .map(|c| {
                     Column::with_nulls_ts(
-                        ColumnData::with_capacity(c.type_id, BATCH_SIZE),
+                        ColumnData::with_capacity_for(c.type_id, c.fractional_digits, BATCH_SIZE),
                         NullBitmap::empty(),
                         c.type_id,
                         c.fractional_digits,
@@ -1266,7 +1266,7 @@ impl HashJoinOperator {
             .iter()
             .map(|c| {
                 Column::with_nulls_ts(
-                    ColumnData::with_capacity(c.type_id, BATCH_SIZE),
+                    ColumnData::with_capacity_for(c.type_id, c.fractional_digits, BATCH_SIZE),
                     NullBitmap::empty(),
                     c.type_id,
                     c.fractional_digits,
@@ -2354,7 +2354,7 @@ fn merge_batch_list(mut batches: Vec<DataBatch>) -> Option<DataBatch> {
         let template = &batches[0].columns[c];
         let type_id = template.type_id;
         let fractional_digits = template.fractional_digits;
-        let mut data = ColumnData::with_capacity(type_id, total);
+        let mut data = ColumnData::with_capacity_for(type_id, fractional_digits, total);
         let mut nulls = NullBitmap::empty();
         for b in &batches {
             data.extend_from(&b.columns[c].data);

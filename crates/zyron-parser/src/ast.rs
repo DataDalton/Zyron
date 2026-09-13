@@ -309,6 +309,170 @@ pub enum Statement {
     ShowUpgrade(Box<ShowUpgradeStatement>),
     /// EXPLAIN REWRITE FOR OBJECT <name>
     ExplainRewrite(Box<ExplainRewriteStatement>),
+
+    // Change streams.
+    /// CREATE CHANGE STREAM name ON TABLE t [AT VERSION n] [APPEND_ONLY] ...
+    CreateChangeStream(Box<CreateChangeStreamStatement>),
+    /// ALTER CHANGE STREAM name RESET TO VERSION n, or SET COLUMNS (...)
+    AlterChangeStream(Box<AlterChangeStreamStatement>),
+    /// DROP CHANGE STREAM [IF EXISTS] name
+    DropChangeStream(Box<DropChangeStreamStatement>),
+    /// SHOW CHANGE STREAMS [ON TABLE t], or SHOW CHANGE STREAM name
+    ShowChangeStreams(Box<ShowChangeStreamsStatement>),
+    /// APPLY CHANGES INTO target FROM source KEYS (...) ...
+    ApplyChanges(Box<ApplyChangesStatement>),
+}
+
+// ---------------------------------------------------------------------------
+// Change stream statements
+// ---------------------------------------------------------------------------
+
+/// What a change stream reads
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeStreamTarget {
+    /// ON TABLE t
+    Table(String),
+    /// ON TABLES (a, b, c)
+    Tables(Vec<String>),
+    /// ON VIEW v
+    View(String),
+}
+
+/// Where a newly created change stream starts reading
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeStreamStart {
+    /// The source's current version, so the stream yields nothing until the
+    /// next change
+    Now,
+    /// AT VERSION n
+    Version(Expr),
+    /// AT TIMESTAMP ts
+    Timestamp(Expr),
+    /// SHOW INITIAL ROWS, so the first read yields every existing row as an
+    /// insert at the creation version
+    InitialRows,
+}
+
+/// `CREATE CHANGE STREAM <name> ON ... [AT ...] [APPEND_ONLY] [WHERE ...]
+/// [COLUMNS (...)]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateChangeStreamStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub target: ChangeStreamTarget,
+    pub start: ChangeStreamStart,
+    /// True for APPEND_ONLY, which yields inserts only
+    pub append_only: bool,
+    pub predicate: Option<Expr>,
+    /// Columns the stream yields. Empty yields the source's own columns
+    pub columns: Vec<String>,
+}
+
+/// What an `ALTER CHANGE STREAM` does
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterChangeStreamAction {
+    /// RESET, which moves the position back to the oldest change held
+    Reset,
+    /// RESET TO VERSION n
+    ResetToVersion(Expr),
+    /// RESET TO TIMESTAMP ts
+    ResetToTimestamp(Expr),
+    /// RESET TO LATEST, so the next read yields nothing
+    ResetToLatest,
+    /// RESET TO POSITION n, where n counts the source's records the stream
+    /// has consumed. A version addresses a place in one node's own feed and a
+    /// count names the same place on every member, so this is the form a
+    /// reset takes when it reaches a consensus group
+    ResetToPosition(Expr),
+    /// SET COLUMNS (c, ...), which replaces the stream's column list
+    SetColumns(Vec<String>),
+    /// SET ALL COLUMNS, which clears the list so the stream yields the
+    /// source's own columns
+    SetAllColumns,
+}
+
+/// `ALTER CHANGE STREAM <name> <action>`
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterChangeStreamStatement {
+    pub name: String,
+    pub action: AlterChangeStreamAction,
+}
+
+/// `DROP CHANGE STREAM [IF EXISTS] <name>`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropChangeStreamStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// `SHOW CHANGE STREAMS [ON TABLE <t>]` or `SHOW CHANGE STREAM <name>`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowChangeStreamsStatement {
+    /// One stream by name, for the singular form
+    pub name: Option<String>,
+    /// Narrows the listing to the streams on one table
+    pub on_table: Option<String>,
+}
+
+/// The history shape an `APPLY CHANGES` target keeps
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScdKind {
+    /// One row per key, the last change winning
+    Type1,
+    /// One row per version of a key, with a validity window
+    Type2,
+}
+
+/// Which columns cause a new version of a key under SCD TYPE 2
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrackHistoryClause {
+    /// TRACK HISTORY ON (c, ...)
+    On(Vec<String>),
+    /// TRACK HISTORY EXCEPT (c, ...)
+    Except(Vec<String>),
+}
+
+/// What an `APPLY CHANGES` reads from
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApplySource {
+    /// A bare name, which resolves to a change stream when one carries it and
+    /// to a relation otherwise
+    Named(String),
+    /// Any relation carrying the metadata columns, including
+    /// `table_changes(...)` and a subquery over one
+    Relation(Box<TableRef>),
+}
+
+/// `APPLY CHANGES INTO <target> FROM <source> KEYS (...) ...`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyChangesStatement {
+    pub target: String,
+    pub source: ApplySource,
+    pub keys: Vec<String>,
+    /// SEQUENCE BY <expr>, which orders two changes to one key
+    pub sequence_by: Option<Expr>,
+    /// IGNORE NULL UPDATES, which treats a NULL as not supplied
+    pub ignore_null_updates: bool,
+    /// APPLY AS DELETE WHEN <expr>
+    pub delete_when: Option<Expr>,
+    /// APPLY AS TRUNCATE WHEN <expr>
+    pub truncate_when: Option<Expr>,
+    /// EXCEPT COLUMNS (c, ...)
+    pub except_columns: Vec<String>,
+    /// STORED AS SCD TYPE 1 or 2. Type 1 when the clause is absent
+    pub scd: ScdKind,
+    pub track_history: Option<TrackHistoryClause>,
+}
+
+impl ApplyChangesStatement {
+    /// The source as a bare name, which a pipeline orders its stages by.
+    /// Empty for a relation, which no other stage produces
+    pub fn source_name(&self) -> String {
+        match &self.source {
+            ApplySource::Named(name) => name.clone(),
+            ApplySource::Relation(_) => String::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,8 +852,16 @@ pub enum AlterTableOperation {
     AlterColumnSetNotNull { column: String },
     /// ALTER TABLE ... ALTER [COLUMN] name DROP NOT NULL
     AlterColumnDropNotNull { column: String },
-    /// ALTER TABLE ... ALTER [COLUMN] name TYPE <data_type>
-    AlterColumnSetType { column: String, data_type: DataType },
+    /// ALTER TABLE ... ALTER [COLUMN] name TYPE <data_type> [ACKNOWLEDGE STREAM BREAK]
+    ///
+    /// A change that narrows the column is refused while a change stream
+    /// reads the table, unless the statement acknowledges the break, which
+    /// marks every stream on the table as needing attention
+    AlterColumnSetType {
+        column: String,
+        data_type: DataType,
+        acknowledge_stream_break: bool,
+    },
     /// ALTER TABLE ... ADD CONSTRAINT ...
     AddConstraint(TableConstraint),
     /// ALTER TABLE ... DROP CONSTRAINT name [IF EXISTS]
@@ -876,6 +1048,7 @@ pub enum GrantObject {
     PublicationsLike(String),
     PublicationsTagged(String),
     Endpoint(String),
+    ChangeStream(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -890,6 +1063,12 @@ pub enum Privilege {
     AlterIndex,
     Subscribe,
     Invoke,
+    /// Reads a change stream without moving its position
+    Peek,
+    /// Creates, alters, resets and drops a change stream
+    Manage,
+    /// Changes a table's change data feed settings
+    ManageChangeFeeds,
     All,
 }
 
@@ -1586,7 +1765,23 @@ pub struct DropRoleStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePipelineStatement {
     pub name: String,
+    /// ON CHANGE DATA FROM stream [MIN ROWS n] [MAX WAIT d], which runs the
+    /// pipeline when the stream has changes pending
+    pub trigger: Option<ChangeDataTrigger>,
     pub stages: Vec<PipelineStage>,
+}
+
+/// `ON CHANGE DATA FROM stream [MIN ROWS n] [MAX WAIT d]`: a run fires when
+/// the stream holds at least `min_rows` pending changes, or when `max_wait`
+/// has passed with at least one pending. The pending count is read without
+/// touching the stream's position
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeDataTrigger {
+    pub stream: String,
+    /// MIN ROWS n, one when absent
+    pub min_rows: u64,
+    /// MAX WAIT d, after which one pending change fires a run
+    pub max_wait: Option<TtlDuration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1597,6 +1792,35 @@ pub struct PipelineStage {
     pub mode: Option<String>,
     pub transform: Option<Box<SelectStatement>>,
     pub expectations: Vec<PipelineExpectation>,
+    /// The change stream work a CONSUME CHANGES or APPLY CHANGES stage does.
+    /// None for a stage that loads its target from a source or a transform
+    pub changes: Option<ChangeStage>,
+}
+
+/// A stage that reads a change stream, in the transaction that moves the
+/// stream's position
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeStage {
+    /// CONSUME CHANGES FROM stream [MAX ROWS n] (INTO relation | AS (statement))
+    Consume(ConsumeChangesStage),
+    /// APPLY CHANGES INTO target FROM stream KEYS (...) ..., the statement
+    /// as a stage
+    Apply(Box<ApplyChangesStatement>),
+}
+
+/// `CONSUME CHANGES FROM stream [MAX ROWS n] INTO relation`, or with a
+/// statement in place of the relation, run with the change set bound as the
+/// relation `changes`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsumeChangesStage {
+    pub stream: String,
+    /// MAX ROWS n, the most change records one run takes, so a backlog
+    /// drains over several runs rather than one transaction
+    pub max_rows: Option<u64>,
+    /// INTO relation, which takes the change set's data columns
+    pub into: Option<String>,
+    /// AS (statement), which reads the change set as the relation `changes`
+    pub statement: Option<Box<Statement>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1788,7 +2012,12 @@ pub struct DropReplicationSlotStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateCdcStreamStatement {
     pub name: String,
+    /// The table the stream delivers changes of, named directly with ON
+    /// TABLE. Empty when the source is a change stream
     pub table_name: String,
+    /// The change stream the outbound stream consumes, named with FROM
+    /// CHANGE STREAM. None creates one named after the outbound stream
+    pub change_stream: Option<String>,
     pub sink_type: String,
     pub options: Vec<TableOption>,
 }
@@ -2974,11 +3203,16 @@ pub enum WindowFrameDirection {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
-    /// Simple table reference with optional alias and time travel.
+    /// Simple table reference with optional alias, time travel and read
+    /// options
     Table {
         name: String,
         alias: Option<String>,
         as_of: Option<Box<AsOf>>,
+        /// `WITH (key => value, ...)` written after the relation. A change
+        /// stream reads `peek` and `schema` from here, and every other
+        /// relation refuses an option it does not know
+        options: Vec<TableOption>,
     },
     /// JOIN between two table references. Boxed to keep TableRef small.
     Join(Box<JoinTableRef>),
@@ -3987,6 +4221,7 @@ mod tests {
                 name: "users".to_string(),
                 alias: None,
                 as_of: None,
+                options: Vec::new(),
             }],
             where_clause: None,
             group_by: vec![],
@@ -4094,12 +4329,14 @@ mod tests {
                 name: "a".to_string(),
                 alias: None,
                 as_of: None,
+                options: Vec::new(),
             },
             join_type: JoinType::Left,
             right: TableRef::Table {
                 name: "b".to_string(),
                 alias: None,
                 as_of: None,
+                options: Vec::new(),
             },
             condition: JoinCondition::On(Box::new(Expr::BinaryOp {
                 left: Box::new(Expr::QualifiedIdentifier {

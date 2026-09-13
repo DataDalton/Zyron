@@ -8,6 +8,8 @@ pub mod authority;
 pub mod cdc_ingest;
 pub mod cdc_stream_pump;
 pub mod cdc_writer;
+pub mod change_data_trigger;
+pub mod change_stream_sweeper;
 pub mod checkpoint;
 pub mod compaction;
 pub mod credential_refresh;
@@ -133,6 +135,7 @@ impl BackgroundWorkers {
         doc_registry: Arc<zyron_common::DocRegistry>,
         table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
         authority: self::authority::WriteAuthority,
+        cdc_writer_config: CdcWriterConfig,
     ) -> Self {
         info!("Starting background workers");
 
@@ -176,24 +179,16 @@ impl BackgroundWorkers {
 
         let catalog_for_mv = catalog.clone();
         let catalog_for_cdc = catalog.clone();
-        let retention = RetentionWorker::start(
-            catalog.clone(),
-            txn_manager.clone(),
-            wal.clone(),
-            buffer_pool.clone(),
-            disk_manager.clone(),
-            RetentionWorkerConfig::default(),
-            authority.clone(),
-        );
-        let schedule = ScheduleWorker::start(
-            catalog.clone(),
-            txn_manager.clone(),
-            wal.clone(),
-            buffer_pool.clone(),
-            disk_manager.clone(),
-            ScheduleWorkerConfig::default(),
-            authority.clone(),
-        );
+        // What the change feeds ask to forget the transactions they still
+        // count as open, answered from the commit status map
+        let txn_ended: cdc_writer::TxnEnded = {
+            let status = Arc::clone(txn_manager.status_map());
+            Arc::new(move |txn_id: u64| {
+                status.status(txn_id) != zyron_storage::txn::TxnStatus::Active
+            })
+        };
+        let retention = RetentionWorker::start(RetentionWorkerConfig::default(), authority.clone());
+        let schedule = ScheduleWorker::start(ScheduleWorkerConfig::default(), authority.clone());
         let compaction = CompactionWorker::start(
             catalog.clone(),
             txn_manager.clone(),
@@ -205,7 +200,6 @@ impl BackgroundWorkers {
             doc_registry,
             Arc::clone(&btree_indexes),
             table_io_stats.clone(),
-            authority.clone(),
         );
         let vacuum = VacuumWorker::start(
             catalog,
@@ -215,6 +209,7 @@ impl BackgroundWorkers {
             wal,
             btree_indexes,
             table_io_stats,
+            cdc_registry.clone(),
             vacuum_config,
         );
 
@@ -228,20 +223,19 @@ impl BackgroundWorkers {
         });
 
         let cdc_writer = CdcWriter::start_with_registry(
-            CdcWriterConfig::default(),
+            cdc_writer_config,
             cdc_registry.clone(),
             slot_manager,
             Some(catalog_for_cdc),
+            Some(txn_ended),
         );
         let mv_refresh = MvRefreshWorker::start_with_catalog(
             MvRefreshConfig::default(),
             Some(catalog_for_mv),
             authority.clone(),
         );
-        let feature_materialization = FeatureMaterializationWorker::start(
-            FeatureMaterializationConfig::default(),
-            authority.clone(),
-        );
+        let feature_materialization =
+            FeatureMaterializationWorker::start(FeatureMaterializationConfig::default());
         let stream_monitor = StreamMonitor::start_with_manager(
             StreamMonitorConfig::default(),
             stream_job_manager.clone(),
@@ -294,11 +288,17 @@ impl BackgroundWorkers {
         self.lake_follower.as_ref().map(|w| Arc::clone(w.stats()))
     }
 
-    /// Hands the retention worker the server state once it exists, which
-    /// enables its age-tiering pass. The workers start before the state is
-    /// built, so this arrives late by construction
+    /// Hands the retention, schedule and lake clustering workers the server
+    /// state once it exists. Retention expires rows, schedules run their
+    /// bodies and clustering commits its passes through it, which is what
+    /// carries their changes to the rest of a group. The workers start
+    /// before the state is built, so this arrives late by construction
     pub fn attach_server_state(&self, state: Arc<zyron_wire::connection::ServerState>) {
-        self.retention.install_server_state(state);
+        self.retention.install_server_state(Arc::clone(&state));
+        self.schedule.install_server_state(Arc::clone(&state));
+        if let Some(clustering) = &self.lake_clustering {
+            clustering.install_server_state(state);
+        }
     }
 
     /// Attaches the Adaptive Clustering worker. Returns without starting a

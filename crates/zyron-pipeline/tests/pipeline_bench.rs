@@ -30,7 +30,6 @@ use zyron_pipeline::refresh::*;
 use zyron_pipeline::schedule::*;
 use zyron_pipeline::sla::*;
 use zyron_pipeline::stored_procedure::*;
-use zyron_pipeline::trigger::*;
 use zyron_pipeline::trigger_trace::*;
 use zyron_pipeline::udf::*;
 use zyron_pipeline::watermark::*;
@@ -49,9 +48,6 @@ const QUALITY_CHECK_OVERHEAD_PCT: f64 = 5.0;
 const WATERMARK_RESOLUTION_TARGET_US: f64 = 500.0;
 const PIPELINE_TRIGGER_TARGET_MS: f64 = 100.0;
 const CRON_JITTER_TARGET_MS: f64 = 20.0;
-const TRIGGER_DISPATCH_NONE_NS: f64 = 15.0;
-const BEFORE_TRIGGER_ROW_NS: f64 = 300.0;
-const AFTER_TRIGGER_ROW_NS: f64 = 800.0;
 const SQL_UDF_INLINED_NS: f64 = 8.0;
 const STORED_PROCEDURE_CALL_US: f64 = 200.0;
 const EVENT_DISPATCH_US: f64 = 3.0;
@@ -79,29 +75,6 @@ fn pipeline(name: &str, stages: Vec<PipelineStageConfig>) -> Pipeline {
         enabled: true,
         created_at: 1000,
         sla: None,
-    }
-}
-
-fn trigger(
-    name: &str,
-    table_id: u32,
-    timing: TriggerTiming,
-    event: TriggerEvent,
-    priority: u32,
-) -> Trigger {
-    Trigger {
-        id: TriggerId(1),
-        name: name.to_string(),
-        tableId: table_id,
-        timing,
-        events: vec![event],
-        level: TriggerLevel::Row,
-        whenCondition: None,
-        functionName: "test_func".to_string(),
-        args: Vec::new(),
-        enabled: true,
-        priority,
-        transitionTables: None,
     }
 }
 
@@ -524,103 +497,6 @@ fn test_pipeline_dag_and_dependencies() {
 }
 
 #[test]
-fn test_before_trigger() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== BEFORE Trigger ===");
-
-    let mgr = TriggerManager::new();
-    mgr.registerTrigger(trigger(
-        "set_updated",
-        100,
-        TriggerTiming::Before,
-        TriggerEvent::Insert,
-        1000,
-    ))
-    .expect("t1");
-
-    assert!(mgr.hasTriggers(100, TriggerTiming::Before, TriggerEvent::Insert));
-    assert!(!mgr.hasTriggers(100, TriggerTiming::After, TriggerEvent::Insert));
-    assert!(!mgr.hasTriggers(999, TriggerTiming::Before, TriggerEvent::Insert));
-
-    let mut reject = trigger(
-        "reject_neg",
-        100,
-        TriggerTiming::Before,
-        TriggerEvent::Insert,
-        500,
-    );
-    reject.whenCondition = Some("new.total < 0".to_string());
-    mgr.registerTrigger(reject).expect("t2");
-
-    let triggers = mgr.getMatchingTriggers(100, TriggerTiming::Before, TriggerEvent::Insert);
-    assert_eq!(triggers.len(), 2);
-    assert_eq!(triggers[0].name, "reject_neg"); // priority 500
-    assert_eq!(triggers[1].name, "set_updated"); // priority 1000
-
-    tprintln!("  BEFORE INSERT: set_updated(1000), reject_neg(500, WHEN new.total<0)");
-    tprintln!("  Priority order: reject_neg fires first");
-    tprintln!("  PASS");
-}
-
-#[test]
-fn test_after_trigger() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== AFTER Trigger ===");
-
-    let mgr = TriggerManager::new();
-    let mut t = trigger(
-        "audit_log",
-        100,
-        TriggerTiming::After,
-        TriggerEvent::Insert,
-        1000,
-    );
-    t.events = vec![
-        TriggerEvent::Insert,
-        TriggerEvent::Update,
-        TriggerEvent::Delete,
-    ];
-    mgr.registerTrigger(t).expect("register");
-
-    assert!(mgr.hasTriggers(100, TriggerTiming::After, TriggerEvent::Insert));
-    assert!(mgr.hasTriggers(100, TriggerTiming::After, TriggerEvent::Update));
-    assert!(mgr.hasTriggers(100, TriggerTiming::After, TriggerEvent::Delete));
-    assert!(!mgr.hasTriggers(100, TriggerTiming::After, TriggerEvent::Truncate));
-
-    // Context carries old/new row data
-    let insert_ctx = TriggerContext {
-        oldRow: None,
-        newRow: Some(vec![1, 2, 3]),
-        operation: TriggerEvent::Insert,
-        tableName: "orders".to_string(),
-        triggerName: "audit_log".to_string(),
-        tableId: 100,
-        txnId: 42,
-        transitionTables: None,
-    };
-    assert!(insert_ctx.oldRow.is_none() && insert_ctx.newRow.is_some());
-
-    let update_ctx = TriggerContext {
-        oldRow: Some(vec![1, 2, 3]),
-        newRow: Some(vec![4, 5, 6]),
-        operation: TriggerEvent::Update,
-        tableName: "orders".to_string(),
-        triggerName: "audit_log".to_string(),
-        tableId: 100,
-        txnId: 42,
-        transitionTables: None,
-    };
-    assert!(update_ctx.oldRow.is_some() && update_ctx.newRow.is_some());
-
-    tprintln!("  AFTER INSERT|UPDATE|DELETE on orders");
-    tprintln!("  INSERT context: new row only");
-    tprintln!("  UPDATE context: old + new rows");
-    tprintln!("  PASS");
-}
-
-#[test]
 fn test_sql_udf_lifecycle() {
     zyron_bench_harness::init("pipeline");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -752,49 +628,6 @@ fn test_stored_procedure() {
 
     tprintln!("  batch_process(batch_size INT) SECURITY INVOKER");
     tprintln!("  admin_cleanup() SECURITY DEFINER");
-    tprintln!("  PASS");
-}
-
-#[test]
-fn test_trigger_priority_order() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== Trigger Priority Order ===");
-
-    let mgr = TriggerManager::new();
-    mgr.registerTrigger(trigger(
-        "low",
-        100,
-        TriggerTiming::Before,
-        TriggerEvent::Insert,
-        3000,
-    ))
-    .expect("t1");
-    mgr.registerTrigger(trigger(
-        "high",
-        100,
-        TriggerTiming::Before,
-        TriggerEvent::Insert,
-        100,
-    ))
-    .expect("t2");
-    mgr.registerTrigger(trigger(
-        "med",
-        100,
-        TriggerTiming::Before,
-        TriggerEvent::Insert,
-        1000,
-    ))
-    .expect("t3");
-
-    let ts = mgr.getMatchingTriggers(100, TriggerTiming::Before, TriggerEvent::Insert);
-    assert_eq!(ts.len(), 3);
-    assert_eq!(ts[0].name, "high"); // 100
-    assert_eq!(ts[1].name, "med"); // 1000
-    assert_eq!(ts[2].name, "low"); // 3000
-
-    tprintln!("  Priorities: high(100), med(1000), low(3000)");
-    tprintln!("  Fire order verified: high, med, low");
     tprintln!("  PASS");
 }
 
@@ -1061,16 +894,6 @@ fn test_hot_swap_udf() {
     tprintln!("  PASS");
 }
 
-#[test]
-fn test_recursion_depth_limit() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== Trigger Recursion Depth Limit ===");
-    assert_eq!(MAX_TRIGGER_DEPTH, 16);
-    tprintln!("  MAX_TRIGGER_DEPTH = 16");
-    tprintln!("  PASS");
-}
-
 // =========================================================================
 // Performance benchmarks
 // =========================================================================
@@ -1108,130 +931,6 @@ fn test_bench_watermark_resolution() {
     );
     record_test_util("Watermark Resolution", snap0, snap1);
     assert!(r.passed, "Watermark resolution above target");
-}
-
-#[test]
-fn test_bench_trigger_dispatch_none() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== Benchmark: Trigger Dispatch (No Triggers) ===");
-
-    let mgr = TriggerManager::new();
-    let iters = 10_000_000u64;
-    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
-    let snap0 = take_util_snapshot();
-    for run in 0..VALIDATION_RUNS {
-        let start = Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(mgr.hasTriggers(100, TriggerTiming::Before, TriggerEvent::Insert));
-        }
-        let ns = start.elapsed().as_nanos() as f64 / iters as f64;
-        runs.push(ns);
-        tprintln!("  Run {}: {:.2} ns/check", run + 1, ns);
-    }
-    let snap1 = take_util_snapshot();
-    let r = validate_metric(
-        "Trigger Dispatch (none)",
-        "Latency (ns/check)",
-        runs,
-        TRIGGER_DISPATCH_NONE_NS,
-        false,
-    );
-    record_test_util("Trigger Dispatch (none)", snap0, snap1);
-    assert!(r.passed, "Trigger dispatch (none) above target");
-}
-
-#[test]
-fn test_bench_before_trigger_per_row() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== Benchmark: BEFORE Trigger Per Row ===");
-
-    let mgr = TriggerManager::new();
-    mgr.registerTrigger(trigger(
-        "perf",
-        100,
-        TriggerTiming::Before,
-        TriggerEvent::Insert,
-        1000,
-    ))
-    .expect("reg");
-
-    let iters = 5_000_000u64;
-    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
-    let snap0 = take_util_snapshot();
-    for run in 0..VALIDATION_RUNS {
-        let start = Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(mgr.getMatchingTriggers(
-                100,
-                TriggerTiming::Before,
-                TriggerEvent::Insert,
-            ));
-        }
-        let ns = start.elapsed().as_nanos() as f64 / iters as f64;
-        runs.push(ns);
-        tprintln!("  Run {}: {:.1} ns/row", run + 1, ns);
-    }
-    let snap1 = take_util_snapshot();
-    let r = validate_metric(
-        "BEFORE Trigger Per Row",
-        "Latency (ns/row)",
-        runs,
-        BEFORE_TRIGGER_ROW_NS,
-        false,
-    );
-    record_test_util("BEFORE Trigger Per Row", snap0, snap1);
-    assert!(r.passed, "BEFORE trigger per row above target");
-}
-
-#[test]
-fn test_bench_after_trigger_per_row() {
-    zyron_bench_harness::init("pipeline");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tprintln!("\n=== Benchmark: AFTER Trigger Per Row ===");
-
-    let mgr = TriggerManager::new();
-    let mut t = trigger(
-        "audit",
-        100,
-        TriggerTiming::After,
-        TriggerEvent::Insert,
-        1000,
-    );
-    t.events = vec![
-        TriggerEvent::Insert,
-        TriggerEvent::Update,
-        TriggerEvent::Delete,
-    ];
-    mgr.registerTrigger(t).expect("reg");
-
-    let iters = 5_000_000u64;
-    let mut runs = Vec::with_capacity(VALIDATION_RUNS);
-    let snap0 = take_util_snapshot();
-    for run in 0..VALIDATION_RUNS {
-        let start = Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(mgr.getMatchingTriggers(
-                100,
-                TriggerTiming::After,
-                TriggerEvent::Insert,
-            ));
-        }
-        let ns = start.elapsed().as_nanos() as f64 / iters as f64;
-        runs.push(ns);
-        tprintln!("  Run {}: {:.1} ns/row", run + 1, ns);
-    }
-    let snap1 = take_util_snapshot();
-    let r = validate_metric(
-        "AFTER Trigger Per Row",
-        "Latency (ns/row)",
-        runs,
-        AFTER_TRIGGER_ROW_NS,
-        false,
-    );
-    record_test_util("AFTER Trigger Per Row", snap0, snap1);
-    assert!(r.passed, "AFTER trigger per row above target");
 }
 
 #[test]

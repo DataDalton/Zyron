@@ -43,6 +43,9 @@ pub fn operator_kind_of(plan: &PhysicalPlan) -> Option<OperatorKind> {
         PhysicalPlan::SeqScan { .. }
         | PhysicalPlan::HybridScan { .. }
         | PhysicalPlan::ParallelSeqScan { .. }
+        // A change scan walks framed records front to back and decodes each
+        // one, which is the same shape of work a sequential scan does
+        | PhysicalPlan::ChangeScan { .. }
         | PhysicalPlan::ColumnarMetadataAggregate { .. } => Some(OperatorKind::SeqScan),
         PhysicalPlan::LakeScan { .. }
         | PhysicalPlan::LakeDelete { .. }
@@ -118,6 +121,13 @@ fn relation_of(plan: &PhysicalPlan) -> Option<TableId> {
         | PhysicalPlan::Insert { table_id, .. }
         | PhysicalPlan::Update { table_id, .. }
         | PhysicalPlan::Delete { table_id, .. } => Some(*table_id),
+        // A change scan over one source names it, so a plan shape hash keeps
+        // two scans of different tables apart. A multi-table stream names
+        // none, because it is not one relation
+        PhysicalPlan::ChangeScan { spec, .. } => match spec.windows.as_slice() {
+            [window] => Some(window.table_id),
+            _ => None,
+        },
         _ => None,
     }
 }

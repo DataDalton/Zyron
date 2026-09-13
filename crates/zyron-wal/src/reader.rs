@@ -301,6 +301,18 @@ impl RecoveryManager {
         // Pre-size from cached segment data: ~48 bytes per record average.
         let estimated = (self.reader.total_data_bytes() / 48).max(64);
         let mut redo_records = Vec::with_capacity(estimated);
+        // Every page change the log holds, in log order. Not filtered by
+        // the checkpoint boundary, because a checkpoint proves durability
+        // for the catalog's own pages and the page image itself says which
+        // records it already holds. Not filtered by commit either. A page
+        // image is put back exactly as it was, and an uncommitted row on
+        // it stays invisible through its transaction's status
+        let mut page_records = Vec::new();
+        // Every change feed append the log holds, in log order, from every
+        // transaction, for the same reason as the page changes. The feed
+        // files hold what the appends wrote whether or not the transaction
+        // committed, and a reader answers to the transaction's status
+        let mut feed_records = Vec::new();
         let mut active_txns = std::collections::HashMap::with_capacity(256);
         // Maps each committed transaction to its commit-record LSN, which dates
         // the transaction for time-travel after recovery.
@@ -367,6 +379,12 @@ impl RecoveryManager {
                 | LogRecordType::FullPage => {
                     redo_records.push(record);
                 }
+                kind if kind.is_page_change() => {
+                    page_records.push(record);
+                }
+                LogRecordType::ChangeFeedFrames => {
+                    feed_records.push(record);
+                }
                 _ => {}
             }
         })?;
@@ -380,6 +398,8 @@ impl RecoveryManager {
 
         Ok(RecoveryResult {
             redo_records,
+            page_records,
+            feed_records,
             undo_txns,
             committed_txns,
             // Report the highest real record LSN observed, not segment offset 0,
@@ -395,6 +415,12 @@ impl RecoveryManager {
 pub struct RecoveryResult {
     /// Records to redo (from committed transactions).
     pub redo_records: Vec<LogRecord>,
+    /// Heap page changes to replay onto the page images, in log order, from
+    /// every transaction the log holds
+    pub page_records: Vec<LogRecord>,
+    /// Change feed appends to replay onto the feed segment files, in log
+    /// order, from every transaction the log holds
+    pub feed_records: Vec<LogRecord>,
     /// Transaction IDs to undo (uncommitted at crash).
     pub undo_txns: Vec<u64>,
     /// Committed transactions paired with their commit-record LSN, used to date
@@ -411,6 +437,8 @@ impl RecoveryResult {
     pub fn empty() -> Self {
         Self {
             redo_records: Vec::new(),
+            page_records: Vec::new(),
+            feed_records: Vec::new(),
             undo_txns: Vec::new(),
             committed_txns: Vec::new(),
             last_lsn: None,
@@ -419,14 +447,16 @@ impl RecoveryResult {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.redo_records.is_empty() && self.undo_txns.is_empty()
+        self.redo_records.is_empty()
+            && self.page_records.is_empty()
+            && self.feed_records.is_empty()
+            && self.undo_txns.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::LogSegment;
     use crate::writer::{WalWriter, WalWriterConfig};
     use tempfile::tempdir;
 

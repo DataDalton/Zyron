@@ -1,0 +1,73 @@
+{
+  "id": "2026-09-13_012256_6e2ce74-local",
+  "date": "2026-09-13 01:22:58Z",
+  "ts": 1789262578,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Branch against main": {
+      "insert of 800 rows on a branch": {
+        "average": 935.500000,
+        "runs": [977.10, 916.10, 964.60, 835.70, 984.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "insert of 800 rows on the main line": {
+        "average": 509.640000,
+        "runs": [572.40, 447.50, 499.40, 527.60, 501.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "branch insert over the main line": {
+        "average": 1.835609,
+        "runs": [1.84],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Branch append scaling": {
+      "insert of 800 rows, branch holding 800 appends": {
+        "average": 946.160000,
+        "runs": [787.80, 983.60, 816.30, 1040.00, 1103.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "insert of 800 rows, branch holding 1600 appends": {
+        "average": 1038.220000,
+        "runs": [1035.60, 937.20, 1029.10, 1254.20, 935.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "insert cost growth when the branch's appends double": {
+        "average": 1.097299,
+        "runs": [1.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

@@ -18,7 +18,7 @@ use zyron_parser::ast::{
     ColumnConstraint, ColumnDef, DataType, TableConstraint, TableConstraintKind,
 };
 use zyron_wal::RecoveryManager;
-use zyron_wal::record::{LogRecordType, Lsn};
+use zyron_wal::record::{LogRecord, LogRecordType, Lsn};
 use zyron_wal::writer::WalWriter;
 
 /// DDL operation type prefixes for WAL payloads.
@@ -95,6 +95,11 @@ const DDL_DROP_COLLATION: u8 = 0x45;
 /// the state byte, so recovery replays the transition without carrying the
 /// whole entry a second time
 const DDL_INDEX_STATE: u8 = 0x46;
+const DDL_CREATE_CHANGE_STREAM: u8 = 0x47;
+/// Records a change stream's position, staleness or definition change. A
+/// transactional consume writes one of these in the consumer's own commit
+const DDL_UPDATE_CHANGE_STREAM: u8 = 0x48;
+const DDL_DROP_CHANGE_STREAM: u8 = 0x49;
 
 /// Result of a `drop_table` call. `soft_dropped` is true when the table went
 /// to the recycle bin (entry and backing files retained for UNDROP); false
@@ -125,6 +130,7 @@ pub struct SchemaContents {
     pub resilience_policies: Vec<String>,
     pub user_types: Vec<String>,
     pub collations: Vec<String>,
+    pub change_streams: Vec<String>,
 }
 
 impl SchemaContents {
@@ -143,6 +149,7 @@ impl SchemaContents {
             && self.resilience_policies.is_empty()
             && self.user_types.is_empty()
             && self.collations.is_empty()
+            && self.change_streams.is_empty()
     }
 
     /// One line naming what the schema holds, at most five names per kind,
@@ -200,6 +207,12 @@ impl SchemaContents {
         );
         kind(&mut parts, "user type", "user types", &self.user_types);
         kind(&mut parts, "collation", "collations", &self.collations);
+        kind(
+            &mut parts,
+            "change stream",
+            "change streams",
+            &self.change_streams,
+        );
         parts.join(", ")
     }
 }
@@ -297,6 +310,12 @@ pub struct Catalog {
     /// Collations keyed by (schema_id, name) and by id (for drop)
     collations_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::CollationEntry>>>,
     collations_by_id: RwLock<HashMap<u32, Arc<crate::schema::CollationEntry>>>,
+    /// Change streams keyed by (schema_id, name), by id, and by each source
+    /// table so a write path resolves the streams on a table without walking
+    /// every stream on the node
+    change_streams_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::ChangeStreamEntry>>>,
+    change_streams_by_id: RwLock<HashMap<u32, Arc<crate::schema::ChangeStreamEntry>>>,
+    change_streams_by_table: RwLock<HashMap<u32, Vec<u32>>>,
     /// Serializes compliance-log appends so the tamper-evident hash chain is
     /// linear. The load-compute-store sequence runs under this lock so two
     /// concurrent appends cannot read the same tail and fork the chain.
@@ -331,6 +350,22 @@ impl Catalog {
         cache: Arc<CatalogCache>,
         wal: Arc<WalWriter>,
     ) -> Result<Self> {
+        Self::new_with_recovery(storage, cache, wal, None).await
+    }
+
+    /// Opens the catalog with the committed records a WAL recovery already
+    /// read, so the log is scanned once at startup rather than once here
+    /// and once by the server. None scans the log here
+    pub async fn new_with_recovery(
+        storage: Arc<dyn CatalogStorage>,
+        cache: Arc<CatalogCache>,
+        wal: Arc<WalWriter>,
+        recovered: Option<Vec<LogRecord>>,
+    ) -> Result<Self> {
+        // The catalog's own pages record their changes in the same log its
+        // entries are logged in, so a page that never reached disk is put
+        // back from the log before the entries are replayed over it
+        storage.attach_wal(&wal);
         let catalog = Self {
             storage,
             cache,
@@ -372,6 +407,9 @@ impl Catalog {
             user_types_by_id: RwLock::new(HashMap::new()),
             collations_by_name: RwLock::new(HashMap::new()),
             collations_by_id: RwLock::new(HashMap::new()),
+            change_streams_by_name: RwLock::new(HashMap::new()),
+            change_streams_by_id: RwLock::new(HashMap::new()),
+            change_streams_by_table: RwLock::new(HashMap::new()),
             compliance_append_lock: tokio::sync::Mutex::new(()),
             table_update_locks: scc::HashMap::new(),
             system_catalog: RwLock::new(SystemCatalogIds::default()),
@@ -400,7 +438,7 @@ impl Catalog {
             None => false,
         };
         if !skip_recover {
-            catalog.recover_unflushed_ddl().await?;
+            catalog.recover_unflushed_ddl(recovered).await?;
         }
 
         catalog.load().await?;
@@ -461,11 +499,16 @@ impl Catalog {
     /// committed before a crash but had not been flushed by the buffer pool.
     /// Each record is applied in LSN order. Stores are idempotent against
     /// existing rows; deletes are no-ops when the row is already absent.
-    async fn recover_unflushed_ddl(&self) -> Result<()> {
-        let wal_dir = self.wal.wal_dir().to_path_buf();
-        let rm = RecoveryManager::new(&wal_dir)?;
-        let result = rm.recover()?;
-        if result.redo_records.is_empty() {
+    async fn recover_unflushed_ddl(&self, recovered: Option<Vec<LogRecord>>) -> Result<()> {
+        let redo_records = match recovered {
+            Some(records) => records,
+            None => {
+                let wal_dir = self.wal.wal_dir().to_path_buf();
+                let rm = RecoveryManager::new(&wal_dir)?;
+                rm.recover()?.redo_records
+            }
+        };
+        if redo_records.is_empty() {
             return Ok(());
         }
 
@@ -676,6 +719,13 @@ impl Catalog {
             .into_iter()
             .map(|e| e.id)
             .collect();
+        let mut have_change_streams: HashSet<u32> = self
+            .storage
+            .load_change_streams()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
 
         // Pre-dedupe redo records in LSN order, keeping only the latest
         // record per (entity-kind, id) tuple. Subsequent records for the
@@ -689,7 +739,7 @@ impl Catalog {
         // wins over earlier CREATE/UPDATE) plus the affected id. For the
         // pub-table junction the key is the (publication_id, table_id)
         // pair.
-        let mut redo = result.redo_records;
+        let mut redo = redo_records;
         redo.sort_by_key(|r| r.lsn.0);
 
         fn entity_key(ddl_type: u8, entry_bytes: &[u8]) -> Option<(u8, u64)> {
@@ -1001,6 +1051,17 @@ impl Catalog {
                     // collation
                     Some((29, id as u64))
                 }
+                DDL_CREATE_CHANGE_STREAM | DDL_UPDATE_CHANGE_STREAM | DDL_DROP_CHANGE_STREAM => {
+                    let id: u32 = if ddl_type == DDL_DROP_CHANGE_STREAM {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::ChangeStreamEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    // change stream
+                    Some((31, id as u64))
+                }
                 _ => None,
             }
         }
@@ -1082,6 +1143,9 @@ impl Catalog {
                     | DDL_DROP_USER_TYPE
                     | DDL_CREATE_COLLATION
                     | DDL_DROP_COLLATION
+                    | DDL_CREATE_CHANGE_STREAM
+                    | DDL_UPDATE_CHANGE_STREAM
+                    | DDL_DROP_CHANGE_STREAM
             )
         }
 
@@ -1641,6 +1705,29 @@ impl Catalog {
                         }
                     }
                 }
+                DDL_CREATE_CHANGE_STREAM | DDL_UPDATE_CHANGE_STREAM => {
+                    if let Ok(entry) = crate::schema::ChangeStreamEntry::from_bytes(entry_bytes) {
+                        if have_change_streams.contains(&entry.id) {
+                            let _ = self.storage.update_change_stream(&entry).await;
+                        } else {
+                            let _ = self.storage.store_change_stream(&entry).await;
+                            have_change_streams.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_CHANGE_STREAM => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_change_streams.remove(&id) {
+                            let _ = self.storage.delete_change_stream(id).await;
+                        }
+                    }
+                }
                 DDL_CREATE_EXTERNAL_SOURCE | DDL_ALTER_EXTERNAL_SOURCE => {
                     if let Ok(entry) = ExternalSourceEntry::from_bytes(entry_bytes) {
                         if have_external_sources.contains(&entry.id.0) {
@@ -1853,6 +1940,7 @@ impl Catalog {
             resilience_policies,
             user_types,
             collations,
+            change_streams,
         ) = tokio::try_join!(
             self.storage.load_databases(),
             self.storage.load_schemas(),
@@ -1883,6 +1971,7 @@ impl Catalog {
             self.storage.load_resilience_policies(),
             self.storage.load_user_types(),
             self.storage.load_collations(),
+            self.storage.load_change_streams(),
         )?;
 
         let mut max_oid: u32 = USER_OID_START;
@@ -2235,6 +2324,30 @@ impl Catalog {
             }
         }
 
+        {
+            let mut by_name = self.change_streams_by_name.write();
+            let mut by_id = self.change_streams_by_id.write();
+            let mut by_table = self.change_streams_by_table.write();
+            by_name.clear();
+            by_id.clear();
+            by_table.clear();
+            for stream in change_streams {
+                if stream.id >= max_oid {
+                    max_oid = stream.id + 1;
+                }
+                let sources = stream.source.table_ids();
+                let entry = Arc::new(stream);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, Arc::clone(&entry));
+                for table_id in sources {
+                    by_table.entry(table_id).or_default().push(entry.id);
+                }
+            }
+            for list in by_table.values_mut() {
+                list.sort_unstable();
+            }
+        }
+
         // The scan gives the highest id still in use, which is below the
         // highest ever handed out whenever the object holding one was dropped.
         // The recorded mark is what keeps the next allocation from repeating
@@ -2243,15 +2356,26 @@ impl Catalog {
         // by kind and id, and a member that restarted would number a new
         // object differently from one that did not
         let recorded = self.storage.load_counters().await?;
-        if let Some(counters) = recorded {
+        if let Some(counters) = &recorded {
             max_oid = max_oid.max(counters.next_oid);
         }
         self.oid_allocator.reset(max_oid);
 
-        // Written back so the mark covers what the scan just proved, which is
-        // what closes the window where a crash lost the write that followed an
-        // allocation and the object it numbered is dropped afterwards
-        self.persist_counters().await?;
+        // Written back when the scan proved something the row does not hold,
+        // which closes the window where a crash lost the write that followed
+        // an allocation and the object it numbered is dropped afterwards. A
+        // row already at or above every mark is left alone, so an open that
+        // found the catalog as it was left writes nothing, logs nothing, and
+        // the next open after it pays for no write of this one
+        let (next_heap_file, next_index_file) = self.storage.file_id_counters();
+        let covered = recorded.is_some_and(|counters| {
+            counters.next_oid >= max_oid
+                && counters.next_heap_file >= next_heap_file
+                && counters.next_index_file >= next_index_file
+        });
+        if !covered {
+            self.persist_counters().await?;
+        }
         Ok(())
     }
 
@@ -2663,6 +2787,15 @@ impl Catalog {
             .collect();
         collations.sort_unstable();
 
+        let mut change_streams: Vec<String> = self
+            .change_streams_by_name
+            .read()
+            .keys()
+            .filter(|(sid, _)| *sid == schema_id.0)
+            .map(|(_, n)| n.clone())
+            .collect();
+        change_streams.sort_unstable();
+
         SchemaContents {
             tables,
             recycled_tables,
@@ -2677,6 +2810,7 @@ impl Catalog {
             resilience_policies,
             user_types,
             collations,
+            change_streams,
         }
     }
 
@@ -2922,6 +3056,7 @@ impl Catalog {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         let mut entry = entry;
         entry.seal_initial_epoch();
@@ -3014,6 +3149,7 @@ impl Catalog {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         let mut entry = entry;
         entry.seal_initial_epoch();
@@ -3065,9 +3201,11 @@ impl Catalog {
         let indexes = self.cache.get_indexes_for_table(id);
         let comment_ids = self.stale_comment_ids(name);
         let triggers = self.triggers_owned_by_table(id);
+        let change_streams = self.change_streams_owned_by_table(id);
 
-        let mut ddl_records: Vec<(u8, Vec<u8>)> =
-            Vec::with_capacity(indexes.len() + comment_ids.len() + triggers.len() + 1);
+        let mut ddl_records: Vec<(u8, Vec<u8>)> = Vec::with_capacity(
+            indexes.len() + comment_ids.len() + triggers.len() + change_streams.len() + 1,
+        );
         for idx in &indexes {
             ddl_records.push((DDL_DROP_INDEX, idx.id.0.to_le_bytes().to_vec()));
         }
@@ -3076,6 +3214,9 @@ impl Catalog {
         }
         for trig in &triggers {
             ddl_records.push((DDL_DROP_TRIGGER, trig.id.to_le_bytes().to_vec()));
+        }
+        for (stream_id, _, _) in &change_streams {
+            ddl_records.push((DDL_DROP_CHANGE_STREAM, stream_id.to_le_bytes().to_vec()));
         }
         ddl_records.push((DDL_DROP_TABLE, id.0.to_le_bytes().to_vec()));
         self.log_ddl_batch(&ddl_records)?;
@@ -3089,6 +3230,7 @@ impl Catalog {
         }
         self.purge_table_comments(&comment_ids, name).await?;
         self.purge_table_triggers(id, &triggers).await?;
+        self.purge_table_change_streams(&change_streams).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
         self.remove_stats(id);
@@ -3208,9 +3350,11 @@ impl Catalog {
         let indexes = self.cache.get_indexes_for_table(id);
         let comment_ids = self.stale_comment_ids(&entry.name);
         let triggers = self.triggers_owned_by_table(id);
+        let change_streams = self.change_streams_owned_by_table(id);
 
-        let mut ddl_records: Vec<(u8, Vec<u8>)> =
-            Vec::with_capacity(indexes.len() + comment_ids.len() + triggers.len() + 1);
+        let mut ddl_records: Vec<(u8, Vec<u8>)> = Vec::with_capacity(
+            indexes.len() + comment_ids.len() + triggers.len() + change_streams.len() + 1,
+        );
         for idx in &indexes {
             ddl_records.push((DDL_DROP_INDEX, idx.id.0.to_le_bytes().to_vec()));
         }
@@ -3219,6 +3363,9 @@ impl Catalog {
         }
         for trig in &triggers {
             ddl_records.push((DDL_DROP_TRIGGER, trig.id.to_le_bytes().to_vec()));
+        }
+        for (stream_id, _, _) in &change_streams {
+            ddl_records.push((DDL_DROP_CHANGE_STREAM, stream_id.to_le_bytes().to_vec()));
         }
         ddl_records.push((DDL_DROP_TABLE, id.0.to_le_bytes().to_vec()));
         self.log_ddl_batch(&ddl_records)?;
@@ -3229,6 +3376,7 @@ impl Catalog {
         }
         self.purge_table_comments(&comment_ids, &entry.name).await?;
         self.purge_table_triggers(id, &triggers).await?;
+        self.purge_table_change_streams(&change_streams).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
         Ok(Some(entry))
@@ -3348,6 +3496,7 @@ impl Catalog {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         entry.seal_initial_epoch();
         Ok(entry)
@@ -3750,14 +3899,22 @@ impl Catalog {
         Ok(())
     }
 
-    /// Drops the layouts no live tuple of a table carries any more.
+    /// Drops the layouts no live tuple and no retained change record of a
+    /// table carries any more.
     ///
     /// A vacuum pass is the only thing that visits every live tuple, so it is
-    /// the only thing that can say an epoch is gone. `min_live_epoch` is the
-    /// lowest epoch above zero the pass saw, and `any_unstamped` says whether
-    /// it saw a tuple that predates stamping. An epoch below the minimum is
-    /// carried by nothing and its column list is dead weight; epoch 0 and the
-    /// pre-stamp layout retire together, because they describe the same rows.
+    /// the only thing that can say an epoch is gone from the heap.
+    /// `min_live_epoch` is the lowest epoch above zero the pass saw, and
+    /// `any_unstamped` says whether it saw a tuple that predates stamping. An
+    /// epoch below the minimum is carried by nothing and its column list is
+    /// dead weight. Epoch 0 and the pre-stamp layout retire together, because
+    /// they describe the same rows.
+    ///
+    /// A change data feed keeps rows the heap has rewritten or deleted, each
+    /// decoding through the layout it was written under, so `feed_floor`, the
+    /// lowest epoch any feed of the table still holds, keeps that layout for
+    /// as long as the feed does. A feed holding a record written before
+    /// stamping keeps the pre-stamp layout the same way.
     ///
     /// A pass that saw no live tuple at all changes nothing: an empty table
     /// still has to be able to read the rows a concurrent writer is adding
@@ -3770,10 +3927,19 @@ impl Catalog {
         min_live_epoch: u16,
         any_unstamped: bool,
         saw_nothing: bool,
+        feed_floor: Option<u32>,
     ) -> Result<bool> {
         if saw_nothing {
             return Ok(false);
         }
+        let (min_live_epoch, any_unstamped) = match feed_floor {
+            Some(0) => (min_live_epoch, true),
+            Some(held) => (
+                min_live_epoch.min(u16::try_from(held).unwrap_or(u16::MAX)),
+                any_unstamped,
+            ),
+            None => (min_live_epoch, any_unstamped),
+        };
         let existing = self.get_table_by_id(table_id)?;
         let current = existing.schema_epoch;
         // The current epoch is never retired, because the next write uses it
@@ -4412,6 +4578,7 @@ impl Catalog {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         let mut entry = entry;
         entry.seal_initial_epoch();
@@ -4471,6 +4638,7 @@ impl Catalog {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         entry.seal_initial_epoch();
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
@@ -5297,6 +5465,35 @@ impl Catalog {
         self.schedules_by_name.read().get(name).map(Arc::clone)
     }
 
+    pub fn get_schedule_by_id(&self, id: u32) -> Option<Arc<crate::schema::ScheduleEntry>> {
+        self.schedules_by_id.read().get(&id).map(Arc::clone)
+    }
+
+    /// Records a run of a schedule as the instants it leaves behind, the
+    /// last run and the next.
+    ///
+    /// A member of a group applies this from the leader's commit, so every
+    /// member holds the same next run and a member elected later continues
+    /// the schedule from where the leader left it. A schedule that was
+    /// dropped between the leader's run and this apply has nothing to record
+    pub async fn record_schedule_run(
+        &self,
+        id: u32,
+        last_run: Option<i64>,
+        next_run: Option<i64>,
+    ) -> Result<()> {
+        let Some(entry) = self.get_schedule_by_id(id) else {
+            return Ok(());
+        };
+        if entry.last_run == last_run && entry.next_run == next_run {
+            return Ok(());
+        }
+        let mut updated = crate::schema::ScheduleEntry::clone(&entry);
+        updated.last_run = last_run;
+        updated.next_run = next_run;
+        self.update_schedule(updated).await
+    }
+
     pub fn list_schedules(&self) -> Vec<Arc<crate::schema::ScheduleEntry>> {
         self.schedules_by_id
             .read()
@@ -5968,6 +6165,278 @@ impl Catalog {
         self.storage.delete_resilience_policy(id).await?;
         self.resilience_policies_by_name.write().remove(&key);
         self.resilience_policies_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Change stream operations
+    // -----------------------------------------------------------------------
+
+    /// Streams a table may carry before a create is refused
+    pub const CHANGE_STREAMS_PER_TABLE_CAP: usize = 64;
+
+    /// Creates a change stream. Assigns an id when the entry carries 0.
+    ///
+    /// A stream on more than the cap allows is refused naming the count, so a
+    /// table cannot accumulate positions faster than anything consumes them
+    pub async fn create_change_stream(
+        &self,
+        entry: crate::schema::ChangeStreamEntry,
+    ) -> Result<u32> {
+        self.create_change_stream_under(entry, Self::CHANGE_STREAMS_PER_TABLE_CAP)
+            .await
+    }
+
+    /// Creates a change stream, refusing one that would put a source table
+    /// over `per_table_cap` streams
+    pub async fn create_change_stream_under(
+        &self,
+        mut entry: crate::schema::ChangeStreamEntry,
+        per_table_cap: usize,
+    ) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.change_streams_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "change stream '{}' already exists in schema '{}'",
+                entry.name,
+                self.schema_label(entry.schema_id)
+            )));
+        }
+        {
+            let by_table = self.change_streams_by_table.read();
+            for table_id in entry.source.table_ids() {
+                let held = by_table.get(&table_id).map(|v| v.len()).unwrap_or(0);
+                if held >= per_table_cap {
+                    return Err(ZyronError::Internal(format!(
+                        "table {table_id} already carries {held} change streams, which is the \
+                         change_streams_per_table cap of {per_table_cap}. Drop one before \
+                         creating another"
+                    )));
+                }
+            }
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_CHANGE_STREAM, &entry.to_bytes())?;
+        self.storage.store_change_stream(&entry).await?;
+        self.persist_counters().await?;
+        self.install_change_stream(entry);
+        Ok(id)
+    }
+
+    /// Puts an entry into the three in-memory maps
+    fn install_change_stream(&self, entry: crate::schema::ChangeStreamEntry) {
+        let key = (entry.schema_id.0, entry.name.clone());
+        let sources = entry.source.table_ids();
+        let id = entry.id;
+        let shared = Arc::new(entry);
+        self.change_streams_by_name
+            .write()
+            .insert(key, Arc::clone(&shared));
+        self.change_streams_by_id
+            .write()
+            .insert(id, Arc::clone(&shared));
+        let mut by_table = self.change_streams_by_table.write();
+        for table_id in sources {
+            let list = by_table.entry(table_id).or_default();
+            if !list.contains(&id) {
+                list.push(id);
+            }
+        }
+    }
+
+    /// Removes an entry from the three in-memory maps
+    fn forget_change_stream(&self, entry: &crate::schema::ChangeStreamEntry) {
+        self.change_streams_by_name
+            .write()
+            .remove(&(entry.schema_id.0, entry.name.clone()));
+        self.change_streams_by_id.write().remove(&entry.id);
+        let mut by_table = self.change_streams_by_table.write();
+        for table_id in entry.source.table_ids() {
+            if let Some(list) = by_table.get_mut(&table_id) {
+                list.retain(|id| *id != entry.id);
+                if list.is_empty() {
+                    by_table.remove(&table_id);
+                }
+            }
+        }
+    }
+
+    /// Resolves a change stream by schema and name
+    pub fn get_change_stream(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::ChangeStreamEntry>> {
+        self.change_streams_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a change stream by id
+    pub fn get_change_stream_by_id(
+        &self,
+        id: u32,
+    ) -> Option<Arc<crate::schema::ChangeStreamEntry>> {
+        self.change_streams_by_id.read().get(&id).map(Arc::clone)
+    }
+
+    /// Every change stream, ordered by id so a listing is stable
+    pub fn list_change_streams(&self) -> Vec<Arc<crate::schema::ChangeStreamEntry>> {
+        let mut out: Vec<Arc<crate::schema::ChangeStreamEntry>> = self
+            .change_streams_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect();
+        out.sort_by_key(|s| s.id);
+        out
+    }
+
+    /// Every change stream that reads one table's feed.
+    ///
+    /// Resolved through the per-table index rather than by walking every
+    /// stream, because a write path consults this per statement
+    pub fn change_streams_on_table(
+        &self,
+        table_id: u32,
+    ) -> Vec<Arc<crate::schema::ChangeStreamEntry>> {
+        let ids = self
+            .change_streams_by_table
+            .read()
+            .get(&table_id)
+            .cloned()
+            .unwrap_or_default();
+        let by_id = self.change_streams_by_id.read();
+        let mut out: Vec<Arc<crate::schema::ChangeStreamEntry>> = ids
+            .iter()
+            .filter_map(|id| by_id.get(id).map(Arc::clone))
+            .collect();
+        out.sort_by_key(|s| s.id);
+        out
+    }
+
+    /// Resolves a change stream by a bare or schema-qualified name
+    pub fn resolve_change_stream(
+        &self,
+        db_id: DatabaseId,
+        name: &str,
+    ) -> Result<Arc<crate::schema::ChangeStreamEntry>> {
+        if let Some((schema_part, bare)) = name.split_once('.') {
+            let schema = self.get_schema(db_id, schema_part)?;
+            return self
+                .change_streams_by_name
+                .read()
+                .get(&(schema.id.0, bare.to_string()))
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    ZyronError::Internal(format!(
+                        "change stream '{bare}' not found in schema '{schema_part}'"
+                    ))
+                });
+        }
+        let map = self.change_streams_by_name.read();
+        let mut found: Option<Arc<crate::schema::ChangeStreamEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == name {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "change stream name '{name}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("change stream '{name}' not found")))
+    }
+
+    /// Replaces a change stream's entry, which is how a position advance, a
+    /// reset and a staleness flag all become durable
+    pub async fn update_change_stream(
+        &self,
+        entry: crate::schema::ChangeStreamEntry,
+    ) -> Result<()> {
+        let previous = self.get_change_stream_by_id(entry.id);
+        self.log_ddl(DDL_UPDATE_CHANGE_STREAM, &entry.to_bytes())?;
+        self.storage.update_change_stream(&entry).await?;
+        if let Some(previous) = previous {
+            self.forget_change_stream(&previous);
+        }
+        self.install_change_stream(entry);
+        Ok(())
+    }
+
+    /// Records a change stream's advanced position under one commit.
+    ///
+    /// The advance rides the consumer's own transaction. The record is logged
+    /// under the transaction the caller names and becomes durable with that
+    /// transaction's commit record, so a rollback leaves the position where it
+    /// was and a commit moves it exactly once
+    pub fn log_change_stream_advance(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        entry: &crate::schema::ChangeStreamEntry,
+    ) -> Result<Lsn> {
+        let bytes = entry.to_bytes();
+        let mut payload = Vec::with_capacity(1 + bytes.len());
+        payload.push(DDL_UPDATE_CHANGE_STREAM);
+        payload.extend_from_slice(&bytes);
+        self.wal.log_insert(txn_id, prev_lsn, &payload)
+    }
+
+    /// Applies an advance the caller's transaction has committed.
+    ///
+    /// The durable record was written under that transaction, so this only
+    /// moves the in-memory entry and its heap row into agreement with it
+    pub async fn apply_change_stream_advance(
+        &self,
+        entry: crate::schema::ChangeStreamEntry,
+    ) -> Result<()> {
+        let previous = self.get_change_stream_by_id(entry.id);
+        self.storage.update_change_stream(&entry).await?;
+        if let Some(previous) = previous {
+            self.forget_change_stream(&previous);
+        }
+        self.install_change_stream(entry);
+        Ok(())
+    }
+
+    /// Drops a change stream and removes its durable entry
+    pub async fn drop_change_stream(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let entry = self
+            .change_streams_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("change stream '{name}' not found")))?;
+
+        self.log_ddl(DDL_DROP_CHANGE_STREAM, &entry.id.to_le_bytes())?;
+        self.storage.delete_change_stream(entry.id).await?;
+        self.forget_change_stream(&entry);
+        Ok(())
+    }
+
+    /// Every change stream on a table, as (id, name) pairs, for the drop
+    /// cascade that removes them with the table
+    fn change_streams_owned_by_table(&self, table_id: TableId) -> Vec<(u32, SchemaId, String)> {
+        self.change_streams_on_table(table_id.0)
+            .into_iter()
+            .map(|s| (s.id, s.schema_id, s.name.clone()))
+            .collect()
+    }
+
+    /// Removes the change streams a dropped table carried
+    async fn purge_table_change_streams(&self, streams: &[(u32, SchemaId, String)]) -> Result<()> {
+        for (id, _, _) in streams {
+            self.storage.delete_change_stream(*id).await?;
+            if let Some(entry) = self.get_change_stream_by_id(*id) {
+                self.forget_change_stream(&entry);
+            }
+        }
         Ok(())
     }
 
@@ -7002,6 +7471,15 @@ impl Catalog {
         self.schema_version
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(commit_lsn)
+    }
+
+    /// The directory this catalog's storage writes under, when it has one.
+    ///
+    /// The one thing that identifies which node's data a catalog describes,
+    /// which is what a per-node registry keyed outside the catalog looks it
+    /// up by. A storage with no directory holds its rows in memory
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.storage.data_dir()
     }
 
     /// Returns the current schema version. Bumped on every DDL.

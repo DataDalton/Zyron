@@ -65,7 +65,11 @@ impl IndexAdvisor {
                 }
                 self.walk_and_record(child);
             }
+            // A change scan reads framed change records in commit order, and
+            // no index over the table's rows reaches them, so a predicate on
+            // one advises nothing
             LogicalPlan::Scan { .. }
+            | LogicalPlan::ChangeScan { .. }
             | LogicalPlan::Values { .. }
             | LogicalPlan::GraphAlgorithm { .. }
             | LogicalPlan::AnalyticsTableFunction { .. } => {}

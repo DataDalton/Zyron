@@ -16,7 +16,7 @@ use std::fs;
 
 use zyron_common::ZyronError;
 
-use crate::manifest::{DeletePredicate, ManifestFile, PartitionEntry};
+use crate::manifest::{DeletePredicate, ManifestFile, PartitionEntry, PriorColumnType};
 use crate::paths::LakePaths;
 use crate::transaction_log::{CommitAttempt, LogEntry, TransactionLog};
 
@@ -382,9 +382,16 @@ pub fn merge_branch(
                 listed.join(", ")
             )));
         }
-        if theirs.schema.schema_id != base.schema.schema_id
-            && ours.schema.schema_id != base.schema.schema_id
-            && ours.schema.schema_id != theirs.schema.schema_id
+        // Schema ids are allocated on each side of the fork independently,
+        // so two sides at the same id may hold different columns. Both
+        // sides having moved is a conflict unless they arrived at the same
+        // columns
+        let theirs_moved = theirs.schema.schema_id != base.schema.schema_id;
+        let ours_moved = ours.schema.schema_id != base.schema.schema_id;
+        if theirs_moved
+            && ours_moved
+            && (ours.schema.columns != theirs.schema.columns
+                || ours.schema.derived != theirs.schema.derived)
         {
             return Err(ZyronError::BranchConflict(format!(
                 "branch \"{}\" and main both changed the schema since version {}",
@@ -393,7 +400,24 @@ pub fn merge_branch(
         }
 
         let mut entries = Vec::new();
-        // Removals first, then predicates, then adds. A predicate attaches
+        // The schema first, so every file the branch adds is added under a
+        // schema id the table has reached. The files carry the ids they
+        // were written under, and the shapes those ids stood for on the
+        // branch travel with them, so a file written before a column
+        // widened on either side reads in the shape it holds
+        if theirs.schema.schema_id > ours.schema.schema_id {
+            entries.push(LogEntry::SchemaChange(theirs.schema.clone()));
+            let since_fork: Vec<PriorColumnType> = theirs
+                .type_history
+                .iter()
+                .filter(|prior| prior.through_schema_id >= base.schema.schema_id)
+                .copied()
+                .collect();
+            if !since_fork.is_empty() {
+                entries.push(LogEntry::TypeHistory(since_fork));
+            }
+        }
+        // Removals next, then predicates, then adds. A predicate attaches
         // only to files already in the manifest, so the branch's own new
         // files never inherit a predicate the branch already applied to them
         for id in &branch_removed {
@@ -428,9 +452,6 @@ pub fn merge_branch(
                 entry.added_version = 0;
                 entries.push(LogEntry::AddFile(entry));
             }
-        }
-        if theirs.schema.schema_id > ours.schema.schema_id {
-            entries.push(LogEntry::SchemaChange(theirs.schema.clone()));
         }
         for (key, value) in schema_property_diff(&base, &theirs) {
             entries.push(LogEntry::SetProperty { key, value });

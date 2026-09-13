@@ -16,7 +16,9 @@ pub mod feature_persistence;
 pub mod format;
 pub mod gateway;
 pub mod health;
-pub mod hooks;
+/// The DML hook bridges, which live beside the change feed reader they write
+/// through so a test harness and the server install the same ones
+pub use zyron_wire::dml_hooks as hooks;
 pub mod lake_recovery;
 pub mod mesh_node;
 pub mod metrics;
@@ -76,6 +78,10 @@ pub struct CliOptions {
     pub log_level: Option<String>,
     pub single_user: bool,
     pub skip_recovery: bool,
+    /// Pass over a page change record recovery cannot apply, reporting it,
+    /// rather than refusing to start. An operator's way past one bad
+    /// record, taken knowing the page it names keeps what it held
+    pub skip_bad_page_records: bool,
 }
 
 impl Default for CliOptions {
@@ -88,6 +94,7 @@ impl Default for CliOptions {
             log_level: None,
             single_user: false,
             skip_recovery: false,
+            skip_bad_page_records: false,
         }
     }
 }
@@ -169,6 +176,9 @@ pub fn parse_cli_args() -> Option<CliOptions> {
             "--skip-recovery" => {
                 opts.skip_recovery = true;
             }
+            "--skip-bad-page-records" => {
+                opts.skip_bad_page_records = true;
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 print_usage();
@@ -235,6 +245,10 @@ pub struct Server {
     /// When true, skip WAL replay on startup. Set by --skip-recovery for
     /// emergency boots only.
     skip_recovery: bool,
+    /// When true, a page change record replay cannot apply is reported and
+    /// passed over rather than stopping the start. Set by
+    /// --skip-bad-page-records for a boot an operator has decided to force
+    skip_bad_page_records: bool,
     /// When true, the connection ceiling is pinned to one regardless of what
     /// the machine could afford. Carried from the CLI because the ceiling is
     /// set where the node's identity is established, not where options parse
@@ -343,6 +357,7 @@ impl Server {
             query_metrics,
             control,
             skip_recovery: opts.skip_recovery,
+            skip_bad_page_records: opts.skip_bad_page_records,
             single_user: opts.single_user,
         })
     }
@@ -467,6 +482,10 @@ impl Server {
             dm_for_evict.write_page_sync(page_id, data)
         });
         buffer_pool.set_evict_writer(evict_writer)?;
+        // Every other write of a page through the pool, the background
+        // writer's, a checkpoint's and a heap's own flush, waits on the same
+        // barrier before the page lands
+        buffer_pool.set_wal_barrier(Arc::clone(&wal_barrier))?;
 
         let dm_for_bg = Arc::clone(&disk_manager);
         let write_fn: WriteFn =
@@ -483,7 +502,7 @@ impl Server {
         ));
 
         // 5. WAL recovery
-        let recovery_result = if self.skip_recovery {
+        let mut recovery_result = if self.skip_recovery {
             warn!(
                 "Skipping WAL recovery (--skip-recovery); committed records will not be replayed"
             );
@@ -491,12 +510,44 @@ impl Server {
         } else if self.config.storage.data_dir.exists() {
             info!("Running WAL recovery");
             let recovery_mgr = RecoveryManager::new(&wal_dir)?;
-            let result = recovery_mgr.recover()?;
+            let mut result = recovery_mgr.recover()?;
+            // Every heap page change the log holds goes back onto its page
+            // image before anything reads a page, so a row whose page never
+            // reached disk is there again. The pages stay dirty in the pool
+            // and the first checkpoint writes them
+            let on_bad = if self.skip_bad_page_records {
+                zyron_storage::heap_redo::BadPageRecord::SkipAndReport
+            } else {
+                zyron_storage::heap_redo::BadPageRecord::Stop
+            };
+            let redone = zyron_storage::heap_redo::apply_page_records(
+                &disk_manager,
+                &buffer_pool,
+                &result.page_records,
+                on_bad,
+            )
+            .await?;
+            // The page images are on their pages, so the records that put
+            // them there are released before the catalog and everything
+            // after it starts
+            result.page_records = Vec::new();
             info!(
-                "WAL recovery complete: {} redo records, {} undo transactions",
+                "WAL recovery complete: {} page changes replayed, {} already on disk, {} for \
+                 dropped tables, {} passed over, {} catalog records, {} undo transactions",
+                redone.applied,
+                redone.already_held,
+                redone.dropped,
+                redone.skipped,
                 result.redo_records.len(),
                 result.undo_txns.len()
             );
+            if redone.skipped > 0 {
+                warn!(
+                    "{} page change records were passed over on the operator's instruction, \
+                     each reported above with the page it named",
+                    redone.skipped
+                );
+            }
             Some(result)
         } else {
             None
@@ -526,8 +577,21 @@ impl Server {
             Arc::clone(&buffer_pool),
         )?);
         let catalog_cache = Arc::new(CatalogCache::new(1024, 256));
-        let catalog =
-            Arc::new(Catalog::new(catalog_storage, catalog_cache, Arc::clone(&wal)).await?);
+        // The committed records the recovery above read go to the catalog,
+        // which replays its own out of them rather than scanning the log a
+        // second time
+        let recovered_ddl = recovery_result
+            .as_mut()
+            .map(|result| std::mem::take(&mut result.redo_records));
+        let catalog = Arc::new(
+            Catalog::new_with_recovery(
+                catalog_storage,
+                catalog_cache,
+                Arc::clone(&wal),
+                recovered_ddl,
+            )
+            .await?,
+        );
 
         // Load catalog entries from disk
         catalog.load().await?;
@@ -602,10 +666,12 @@ impl Server {
             }
         }
 
-        // 8. Create SecurityManager with heap-backed auth storage
-        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
-            zyron_auth::HeapAuthStorage::new(Arc::clone(&disk_manager), Arc::clone(&buffer_pool))?,
-        );
+        // 8. Create SecurityManager with heap-backed auth storage, whose
+        // pages record their changes in the log like the catalog's
+        let heap_auth_storage =
+            zyron_auth::HeapAuthStorage::new(Arc::clone(&disk_manager), Arc::clone(&buffer_pool))?;
+        heap_auth_storage.attach_wal(&wal);
+        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(heap_auth_storage);
         let mut security_manager = zyron_auth::SecurityManager::new(auth_storage).await?;
         security_manager
             .credential_cache
@@ -660,6 +726,57 @@ impl Server {
 
         // 10. Initialize subsystem managers (before background workers so workers can use them)
         let cdc_registry_arc = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.clone()));
+        // Every append to a feed is recorded in the log ahead of the commit
+        // record that names its transaction, so a change a committed
+        // transaction recorded is in its feed after a crash. The bytes the
+        // log holds go back into the segment files before any feed opens,
+        // and the log keeps its segments from the oldest append no sync
+        // pass has reached yet
+        if let Some(result) = recovery_result.as_mut() {
+            let logged = std::mem::take(&mut result.feed_records);
+            if !logged.is_empty() {
+                let restored = zyron_cdc::restore_logged_frames(&data_dir, &logged)?;
+                info!(
+                    "Change feed recovery laid {} logged appends, {} bytes, back into their \
+                     segments, {} passed over as already durable",
+                    restored.laid, restored.bytes, restored.passed
+                );
+            }
+        }
+        cdc_registry_arc.attach_wal(&wal);
+        wal.add_retention_hook(Arc::new({
+            let feeds = Arc::clone(&cdc_registry_arc);
+            move || feeds.retained_lsn()
+        }));
+        // Every table recording changes records again from here, and a
+        // stream over one reads again, before a connection is accepted
+        match zyron_wire::change_feed_bridge::reopen_feeds(&catalog, &cdc_registry_arc) {
+            Ok(0) => {}
+            Ok(opened) => info!("Reopened {} change data feed(s)", opened),
+            Err(e) => {
+                return Err(zyron_common::ZyronError::Internal(format!(
+                    "a change data feed could not be reopened: {e}"
+                )));
+            }
+        }
+        // The branches of the database, loaded before anything that names
+        // a branch's head on a lake table
+        let branch_mgr = zyron_versioning::BranchManager::new(data_dir.clone());
+        branch_mgr.load()?;
+        let branch_mgr_arc = Arc::new(branch_mgr);
+        // The planner resolves a change scan's bounds, refuses a range
+        // retention has reclaimed and tells EXPLAIN how many change files a
+        // scan will open, all of which need the feeds themselves. Installed
+        // once here, so no planning call site has to carry them
+        zyron_planner::install_change_feed_facts_for(
+            data_dir.clone(),
+            Arc::new(zyron_wire::change_feed_bridge::ChangeFeedBridge::new(
+                Arc::clone(&cdc_registry_arc),
+                Arc::clone(&catalog),
+                data_dir.clone(),
+                Some(Arc::clone(&branch_mgr_arc)),
+            )),
+        );
         let slot_mgr_arc =
             match zyron_cdc::SlotManager::open(&data_dir, zyron_cdc::SlotLagConfig::default()) {
                 Ok(m) => Some(Arc::new(m)),
@@ -690,7 +807,6 @@ impl Server {
             }
         };
 
-        let trigger_mgr_arc = Arc::new(zyron_pipeline::trigger::TriggerManager::new());
         let udf_reg_arc = Arc::new(zyron_pipeline::udf::UdfRegistry::new());
         let uda_reg_arc = Arc::new(zyron_pipeline::aggregate::UdaRegistry::new());
         let proc_reg_arc = Arc::new(zyron_pipeline::stored_procedure::ProcedureRegistry::new());
@@ -747,9 +863,6 @@ impl Server {
         let stream_mgr_arc = Arc::new(parking_lot::Mutex::new(
             zyron_streaming::job::StreamJobManager::new(),
         ));
-        let branch_mgr = zyron_versioning::BranchManager::new(data_dir.clone());
-        branch_mgr.load()?;
-        let branch_mgr_arc = Arc::new(branch_mgr);
         let notif_arc = Arc::new(zyron_wire::notifications::NotificationChannels::new());
 
         // Currency rates: load the persisted table into the process store
@@ -1156,6 +1269,31 @@ impl Server {
                     "lake transaction logs opened"
                 );
             }
+            // A column type change commits to the lake log and then writes
+            // the catalog, so a stop between the two left the catalog
+            // behind the shape the log holds. The log is the authority for
+            // a lake table's shape, and the catalog catches up before any
+            // statement plans against the table
+            for (table_id, schema) in &report.schema_ahead {
+                let table = catalog.get_table_by_id(*table_id)?;
+                let entry = crate::lake_recovery::catalog_entry_at_lake_shape(&table, schema);
+                catalog.update_table(entry).await?;
+            }
+        }
+        // A lake table's changes are read off its log, so the source of a
+        // stream over one is registered once the log is open
+        match zyron_wire::change_feed_bridge::reopen_lake_sources(
+            &catalog,
+            &cdc_registry_arc,
+            Some(&branch_mgr_arc),
+        ) {
+            Ok(0) => {}
+            Ok(registered) => info!("Registered {} lake change source(s)", registered),
+            Err(e) => {
+                return Err(zyron_common::ZyronError::Internal(format!(
+                    "a lake table's change source could not be registered: {e}"
+                )));
+            }
         }
 
         // 11. Start background workers
@@ -1240,10 +1378,10 @@ impl Server {
             doc_registry: Arc::clone(&doc_registry_arc),
             btree_indexes: Arc::clone(&btree_indexes),
         });
-        // A member of a group produces no background changes at all, because
-        // these workers do not capture what they change and a change held by
-        // one member alone is a divergence. A node in no group decides
-        // everything for itself
+        // A member of a group produces background changes only while it
+        // leads, and commits them through the group, so every member applies
+        // the same change. The leadership reading is attached once the group
+        // has started. A node in no group decides everything for itself
         let write_authority = if self.config.cluster.enabled {
             crate::background::authority::WriteAuthority::pending()
         } else {
@@ -1272,6 +1410,12 @@ impl Server {
             Arc::clone(&doc_registry_arc),
             Arc::clone(&table_io_stats_arc),
             write_authority.clone(),
+            background::cdc_writer::CdcWriterConfig {
+                max_retention_micros: (self.config.cdc.cdf_max_retention_secs as i64)
+                    .saturating_mul(1_000_000),
+                max_bytes_per_table: self.config.cdc.cdf_max_bytes_per_table,
+                ..background::cdc_writer::CdcWriterConfig::default()
+            },
         );
 
         // Attach the QuotaGossip worker with the default no-op transport.
@@ -1515,6 +1659,11 @@ impl Server {
                 Arc::clone(&txn_manager),
             )
             .await?;
+            // The workers that produce changes read leadership off the node
+            // from here on, so a member that takes the lead starts its
+            // maintenance and one that loses it stops
+            let node = Arc::clone(&handle.node);
+            write_authority.attach_group(Arc::new(move || node.is_leader()));
             Some(handle)
         } else {
             None
@@ -1561,6 +1710,18 @@ impl Server {
                 group_carries_actor_role: cluster
                     .as_ref()
                     .map(|c| Arc::clone(&c.replication.group_carries_actor_role)),
+                group_carries_stream_advance: cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.replication.group_carries_stream_advance)),
+                group_carries_feed_images: cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.replication.group_carries_feed_images)),
+                group_carries_lake_files: cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.replication.group_carries_lake_files)),
+                group_carries_schedule_runs: cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.replication.group_carries_schedule_runs)),
             })
             .await?
         };
@@ -1736,7 +1897,7 @@ impl Server {
                         .map(|m| {
                             m.list_streams()
                                 .into_iter()
-                                .map(|s| (s.name, s.table_id, s.active, s.slot_name))
+                                .map(|s| (s.name, s.table_id, s.active, s.change_stream))
                                 .collect()
                         })
                         .unwrap_or_default()
@@ -1771,7 +1932,6 @@ impl Server {
             cdc_stream_manager: cdc_stream_mgr_arc,
             cdc_ingest_manager: cdc_ingest_mgr_arc,
             // Pipeline managers
-            trigger_manager: Some(Arc::clone(&trigger_mgr_arc)),
             udf_registry: Some(udf_reg_arc),
             uda_registry: Some(uda_reg_arc),
             procedure_registry: Some(proc_reg_arc),
@@ -1788,19 +1948,16 @@ impl Server {
             vector_manager: Some(Arc::clone(&vec_mgr_arc)),
             graph_manager: Some(Arc::clone(&graph_mgr_arc)),
             spatial_manager: Some(Arc::clone(&spatial_mgr_arc)),
-            // DML hooks: CDC capture + trigger dispatch
-            cdc_hook: Some(Arc::new(hooks::CdcHookBridge::new(
-                Arc::clone(&cdc_registry_arc),
-                Arc::clone(&trigger_mgr_arc),
-            )) as Arc<dyn zyron_executor::context::CdcHook>),
-            dml_hook: Some(Arc::new(hooks::CompositeDmlHook::new(vec![
-                Arc::new(hooks::LegalHoldDmlHook::new(
-                    Arc::clone(&legal_hold_registry),
-                    Arc::clone(&catalog),
-                )) as Arc<dyn zyron_executor::context::DmlHook>,
-                Arc::new(hooks::DmlHookBridge::new(Arc::clone(&trigger_mgr_arc)))
-                    as Arc<dyn zyron_executor::context::DmlHook>,
-            ])) as Arc<dyn zyron_executor::context::DmlHook>),
+            // DML hooks, change feed capture after a write and legal hold
+            // enforcement before one
+            cdc_hook: Some(Arc::new(
+                hooks::CdcHookBridge::new(Arc::clone(&cdc_registry_arc))
+                    .with_catalog(Arc::clone(&catalog)),
+            ) as Arc<dyn zyron_executor::context::CdcHook>),
+            dml_hook: Some(Arc::new(hooks::LegalHoldDmlHook::new(
+                Arc::clone(&legal_hold_registry),
+                Arc::clone(&catalog),
+            )) as Arc<dyn zyron_executor::context::DmlHook>),
             // Notification channels
             notification_channels: Some(notif_arc),
             tls_mode,
@@ -1852,8 +2009,8 @@ impl Server {
             );
         }
 
-        // The retention worker's age-tiering pass drives the wire
-        // relocation, which needs the server state that exists only now
+        // Retention, schedules and lake maintenance run their writes through
+        // the server state, which exists only now
         background.attach_server_state(Arc::clone(&server_state));
 
         // Restore feature groups and trained models from on-disk snapshots
@@ -2038,6 +2195,48 @@ impl Server {
                     sh_cdc_pump,
                     wake_cdc_pump,
                     background::cdc_stream_pump::DEFAULT_INTERVAL_SECS,
+                )
+                .await;
+            }));
+
+            // Staleness, stream metrics and the change feed alerts, raised
+            // through the same contact channels an upgrade step reaches
+            let server_sweep = Arc::clone(&server_state);
+            let sh_sweep = Arc::clone(&self.shutdown);
+            let wake_sweep = Arc::clone(&self.shutdown_wake);
+            let labeled_sweep = Arc::clone(&labeled);
+            let sweep_config = background::change_stream_sweeper::SweeperConfig {
+                interval_secs: self.config.cdc.sweep_interval_secs,
+                lag_rows: self.config.cdc.stream_lag_rows,
+                lag_seconds: self.config.cdc.stream_lag_seconds,
+                retention_margin_secs: self.config.cdc.retention_margin_secs,
+            };
+            let sweep_notifier = Some(Arc::new(crate::upgrade::service::build_notifier(
+                &self.config,
+            )?));
+            spawned_workers.push(tokio::spawn(async move {
+                background::change_stream_sweeper::change_stream_sweeper_loop(
+                    server_sweep,
+                    sh_sweep,
+                    wake_sweep,
+                    sweep_config,
+                    sweep_notifier,
+                    Some(labeled_sweep),
+                )
+                .await;
+            }));
+
+            // Pipelines that run on change data, started within a second of
+            // their stream holding enough pending changes
+            let server_trigger = Arc::clone(&server_state);
+            let sh_trigger = Arc::clone(&self.shutdown);
+            let wake_trigger = Arc::clone(&self.shutdown_wake);
+            spawned_workers.push(tokio::spawn(async move {
+                background::change_data_trigger::change_data_trigger_loop(
+                    server_trigger,
+                    sh_trigger,
+                    wake_trigger,
+                    background::change_data_trigger::DEFAULT_INTERVAL_SECS,
                 )
                 .await;
             }));

@@ -292,6 +292,23 @@ pub enum LogicalPlan {
         outer_input: bool,
     },
 
+    /// Reads a table's recorded changes rather than its rows.
+    ///
+    /// `table_changes(t, from, to)` and a read of a named change stream are
+    /// one node. Both walk a window of one or more feeds and produce the
+    /// source's own columns beside the change metadata. A stream read
+    /// additionally takes the position lock and records the advance its
+    /// commit will make, which is the only difference between them
+    ChangeScan {
+        /// Boxed for the reason `AsofJoin`'s spec is, the widest arm would
+        /// otherwise set the width of every node in the tree
+        spec: Box<ChangeScanSpec>,
+        /// Every column the node outputs, the data columns then the metadata
+        /// ones, already carrying the identity an enclosing query addresses
+        /// them by
+        output_columns: Vec<LogicalColumn>,
+    },
+
     /// Joins each left row to the nearest right row in one direction along
     /// an ordered column, within the equality group the ON clause names.
     ///
@@ -353,6 +370,249 @@ pub enum ExpandSpec {
         /// False drops a group whose every value is null
         include_nulls: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Change scan
+// ---------------------------------------------------------------------------
+
+/// One end of a change scan's window, as the statement wrote it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeBound {
+    Version(u64),
+    Timestamp(i64),
+    /// The oldest change the feed still holds
+    Earliest,
+    /// The newest change the feed holds
+    Latest,
+}
+
+/// One metadata column a change scan appends after the data columns
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeMetadataColumn {
+    /// 'insert', 'update_preimage', 'update_postimage', 'delete', 'truncate'
+    ChangeType,
+    CommitVersion,
+    CommitTimestamp,
+    CommitTxnId,
+    /// Position within the commit, so an update's two rows sort together
+    ChangeOrdinal,
+    /// Which source table the change came from, on a multi-table stream
+    SourceTable,
+}
+
+impl ChangeMetadataColumn {
+    /// The name the column takes in a result
+    pub fn name(self) -> &'static str {
+        match self {
+            ChangeMetadataColumn::ChangeType => "_change_type",
+            ChangeMetadataColumn::CommitVersion => "_commit_version",
+            ChangeMetadataColumn::CommitTimestamp => "_commit_ts",
+            ChangeMetadataColumn::CommitTxnId => "_commit_txn_id",
+            ChangeMetadataColumn::ChangeOrdinal => "_change_ordinal",
+            ChangeMetadataColumn::SourceTable => "_source_table",
+        }
+    }
+
+    /// The type the column carries
+    pub fn type_id(self) -> TypeId {
+        match self {
+            ChangeMetadataColumn::ChangeType => TypeId::Text,
+            ChangeMetadataColumn::CommitTimestamp => TypeId::TimestampTz,
+            _ => TypeId::Int64,
+        }
+    }
+
+    /// Resolves a metadata column by the name a predicate writes
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "_change_type" => Some(ChangeMetadataColumn::ChangeType),
+            "_commit_version" => Some(ChangeMetadataColumn::CommitVersion),
+            "_commit_ts" => Some(ChangeMetadataColumn::CommitTimestamp),
+            "_commit_txn_id" => Some(ChangeMetadataColumn::CommitTxnId),
+            "_change_ordinal" => Some(ChangeMetadataColumn::ChangeOrdinal),
+            "_source_table" => Some(ChangeMetadataColumn::SourceTable),
+            _ => None,
+        }
+    }
+
+    /// Every metadata column a single-table change scan produces, in order
+    pub fn single_table() -> &'static [ChangeMetadataColumn] {
+        &[
+            ChangeMetadataColumn::ChangeType,
+            ChangeMetadataColumn::CommitVersion,
+            ChangeMetadataColumn::CommitTimestamp,
+            ChangeMetadataColumn::CommitTxnId,
+            ChangeMetadataColumn::ChangeOrdinal,
+        ]
+    }
+
+    /// The same, plus the source table a multi-table stream names
+    pub fn multi_table() -> &'static [ChangeMetadataColumn] {
+        &[
+            ChangeMetadataColumn::ChangeType,
+            ChangeMetadataColumn::CommitVersion,
+            ChangeMetadataColumn::CommitTimestamp,
+            ChangeMetadataColumn::CommitTxnId,
+            ChangeMetadataColumn::ChangeOrdinal,
+            ChangeMetadataColumn::SourceTable,
+        ]
+    }
+
+    /// The column's fixed place among the metadata columns, which is what
+    /// its column id is built from, so a scan that carries only some of
+    /// them still addresses each by the same id
+    pub fn position(self) -> usize {
+        match self {
+            ChangeMetadataColumn::ChangeType => 0,
+            ChangeMetadataColumn::CommitVersion => 1,
+            ChangeMetadataColumn::CommitTimestamp => 2,
+            ChangeMetadataColumn::CommitTxnId => 3,
+            ChangeMetadataColumn::ChangeOrdinal => 4,
+            ChangeMetadataColumn::SourceTable => 5,
+        }
+    }
+
+    /// The column at a fixed place, None past the last
+    pub fn at_position(position: usize) -> Option<Self> {
+        ChangeMetadataColumn::multi_table().get(position).copied()
+    }
+}
+
+/// The first column id a change scan's metadata columns take.
+///
+/// Metadata columns are addressed alongside the source's own, so they need
+/// ids no real column can hold. A table cannot declare this many columns, and
+/// the gap is what lets a predicate on `_commit_version` be told apart from
+/// one on a data column by its reference alone
+pub const CHANGE_METADATA_COLUMN_BASE: u16 = 0xFF00;
+
+/// The column id a metadata column takes, the same whichever of them a
+/// scan carries
+pub fn change_metadata_column_id(column: ChangeMetadataColumn) -> ColumnId {
+    ColumnId(CHANGE_METADATA_COLUMN_BASE + column.position() as u16)
+}
+
+/// The metadata column a column id names, None for a data column or a
+/// metadata column the scan does not carry
+pub fn change_metadata_of(
+    spec: &ChangeScanSpec,
+    column_id: ColumnId,
+) -> Option<ChangeMetadataColumn> {
+    if column_id.0 < CHANGE_METADATA_COLUMN_BASE {
+        return None;
+    }
+    let column =
+        ChangeMetadataColumn::at_position((column_id.0 - CHANGE_METADATA_COLUMN_BASE) as usize)?;
+    spec.metadata.contains(&column).then_some(column)
+}
+
+/// One source table's window in a change scan
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeScanWindow {
+    pub table_id: TableId,
+    /// The table's name, for the message a refusal carries
+    pub table_name: String,
+    /// The branch whose feed is read, None for the table's own
+    pub branch: Option<u64>,
+    /// Changes above this version are read
+    pub from_exclusive: u64,
+    /// Changes at or below this version are read
+    pub to_inclusive: u64,
+    /// True when the upper bound was written as LATEST, so a read inside a
+    /// branch extends it to the branch's newest change
+    pub open_ended: bool,
+    /// Lowest commit timestamp a record may carry
+    pub from_timestamp: i64,
+    /// Highest commit timestamp a record may carry
+    pub to_timestamp: i64,
+    /// One bit per admitted change kind. None admits every kind
+    pub change_types: Option<u8>,
+    /// The record count at or below `to_inclusive`, which is what a stream
+    /// position replicates as
+    pub consumed_to: u64,
+    /// Change files this window opens, as the facts reported them
+    pub files_opened: usize,
+    /// Change files the window's bounds pruned
+    pub files_pruned: usize,
+    /// Rows the window holds, from the feed's per-version counters
+    pub estimated_rows: u64,
+}
+
+/// The change stream a scan consumes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeStreamBinding {
+    pub stream_id: u32,
+    pub stream_name: String,
+    /// True reads without taking the position lock and without advancing
+    pub peek: bool,
+    /// The most records one read takes past the position, per source. The
+    /// read ends on a version no transaction writes across, so a bounded
+    /// read still hands over whole transactions. None reads everything
+    pub max_rows: Option<u64>,
+}
+
+/// What one `ChangeScan` node reads
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeScanSpec {
+    /// One window per source table, ascending by table id
+    pub windows: Vec<ChangeScanWindow>,
+    /// The stream this scan consumes, None for `table_changes`
+    pub stream: Option<ChangeStreamBinding>,
+    /// True renders each record through the layout it was written under
+    /// rather than through the table's current schema
+    pub as_of_change: bool,
+    /// True yields the source's existing rows as inserts rather than reading
+    /// the feed, which is what a stream created with SHOW INITIAL ROWS does
+    /// on its first read
+    pub initial_rows: bool,
+    /// Columns decoded out of each record, in output order
+    pub data_columns: Vec<LogicalColumn>,
+    /// Columns decoded only for the predicate and dropped before the row
+    /// leaves the scan. A stream's stored WHERE reads the source's columns
+    /// whether or not its COLUMNS list exposes them
+    pub filter_columns: Vec<LogicalColumn>,
+    /// Metadata columns appended after them, in output order
+    pub metadata: Vec<ChangeMetadataColumn>,
+    /// Predicate narrowing the change rows, applied after decode. A stream's
+    /// stored WHERE and a query's own are both here
+    pub predicate: Option<BoundExpr>,
+    /// The table index the node's columns are addressed by
+    pub table_idx: usize,
+}
+
+impl ChangeScanSpec {
+    /// The resolved version range across every source, for EXPLAIN
+    pub fn version_range(&self) -> (u64, u64) {
+        let from = self
+            .windows
+            .iter()
+            .map(|w| w.from_exclusive)
+            .min()
+            .unwrap_or(0);
+        let to = self
+            .windows
+            .iter()
+            .map(|w| w.to_inclusive)
+            .max()
+            .unwrap_or(0);
+        (from, to)
+    }
+
+    /// Change files the scan will open across every source
+    pub fn files_opened(&self) -> usize {
+        self.windows.iter().map(|w| w.files_opened).sum()
+    }
+
+    /// Change files the bounds pruned across every source
+    pub fn files_pruned(&self) -> usize {
+        self.windows.iter().map(|w| w.files_pruned).sum()
+    }
+
+    /// Rows the windows hold, from the feeds' per-version counters
+    pub fn estimated_rows(&self) -> u64 {
+        self.windows.iter().map(|w| w.estimated_rows).sum()
+    }
 }
 
 /// How far back or forward an ASOF match may reach.
@@ -458,6 +718,7 @@ impl LogicalPlan {
     pub fn output_schema(&self) -> Vec<LogicalColumn> {
         match self {
             LogicalPlan::Scan { columns, .. } => columns.clone(),
+            LogicalPlan::ChangeScan { output_columns, .. } => output_columns.clone(),
             LogicalPlan::Filter { child, .. } => child.output_schema(),
             LogicalPlan::Project {
                 expressions,
@@ -585,6 +846,7 @@ impl LogicalPlan {
     pub fn children(&self) -> Vec<&LogicalPlan> {
         match self {
             LogicalPlan::Scan { .. }
+            | LogicalPlan::ChangeScan { .. }
             | LogicalPlan::Values { .. }
             | LogicalPlan::GraphAlgorithm { .. }
             | LogicalPlan::AnalyticsTableFunction { .. } => vec![],

@@ -89,6 +89,7 @@ pub struct VacuumWorker {
 
 impl VacuumWorker {
     /// Starts the vacuum worker thread.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         catalog: Arc<Catalog>,
         txn_manager: Arc<TransactionManager>,
@@ -97,6 +98,7 @@ impl VacuumWorker {
         _wal: Arc<WalWriter>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
+        feeds: Option<Arc<zyron_cdc::CdfRegistry>>,
         config: VacuumWorkerConfig,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -119,6 +121,7 @@ impl VacuumWorker {
                     &disk_manager,
                     &buffer_pool,
                     &table_io_stats,
+                    feeds.as_deref(),
                     &config,
                     &thread_shutdown,
                     &thread_stats,
@@ -135,6 +138,7 @@ impl VacuumWorker {
     }
 
     /// Main vacuum loop.
+    #[allow(clippy::too_many_arguments)]
     fn vacuum_loop(
         catalog: &Catalog,
         btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
@@ -143,6 +147,7 @@ impl VacuumWorker {
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
         table_io_stats: &zyron_common::TableIOStatsRegistry,
+        feeds: Option<&zyron_cdc::CdfRegistry>,
         config: &VacuumWorkerConfig,
         shutdown: &AtomicBool,
         stats: &VacuumStats,
@@ -279,6 +284,7 @@ impl VacuumWorker {
                     config.max_pages_per_cycle,
                     disk_manager,
                     buffer_pool,
+                    wal,
                     txn_manager.status_map(),
                     retention_floor,
                     &index_snap.btree,
@@ -319,16 +325,19 @@ impl VacuumWorker {
             }
             // Retire the layouts nothing carries any more. Done after the
             // per-table loop because each retirement rewrites a catalog entry
-            // the loop is reading
+            // the loop is reading. A change data feed keeps rows the heap
+            // has rewritten, so the lowest epoch it still holds is kept too
             for (table_id, census) in epoch_census.drain(..) {
                 if census.saw_nothing() {
                     continue;
                 }
+                let feed_floor = feeds.and_then(|feeds| feeds.oldest_schema_epoch(table_id.0));
                 let outcome = catalog.retire_schema_epochs(
                     table_id,
                     census.min_live_epoch,
                     census.any_unstamped,
                     false,
+                    feed_floor,
                 );
                 if let Err(e) = futures::executor::block_on(outcome) {
                     debug!(
@@ -428,6 +437,7 @@ impl VacuumWorker {
         max_pages: usize,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
+        wal: &Arc<WalWriter>,
         status_map: &zyron_storage::TxnStatusMap,
         retention_floor: u64,
         btree: &[zyron_catalog::BTreeIndexSpec],
@@ -487,19 +497,40 @@ impl VacuumWorker {
             // Reclaimed rows' images, captured under the lock so their index
             // entries can be deleted after the lock is released.
             let mut dead: Vec<(u16, u16, Vec<u8>)> = Vec::new();
-            let (reclaimed_on_page, modified, page_census) = {
+            let mut changes = zyron_storage::PageVacuum::default();
+            let outcome = {
                 let mut guard = frame.write_data();
                 let data: &mut [u8] = &mut guard[..];
-                if HeapPage::heap_header_from_slice(data).slot_count == 0 {
+                let pass = if HeapPage::heap_header_from_slice(data).slot_count == 0 {
                     (0u64, false, zyron_storage::EpochCensus::default())
                 } else if clean_indexes {
-                    HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead)
+                    HeapPage::vacuum_in_slice_collect(
+                        data,
+                        &is_dead,
+                        &is_aborted,
+                        &mut dead,
+                        &mut changes,
+                    )
                 } else {
-                    HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted)
-                }
+                    HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted, &mut changes)
+                };
+                // Logged under the frame lock, before the page can be copied
+                // out, and the page stamped with each record so a flush
+                // carries it and recovery replays the pass the same way
+                zyron_storage::heap_redo::log_vacuum(wal, &buffer_pool, page_id, &changes)
+                    .map(|_| pass)
+            };
+            let (reclaimed_on_page, modified, page_census) = match &outcome {
+                Ok((reclaimed, modified, page_census)) => (*reclaimed, *modified, *page_census),
+                Err(_) => (0, true, zyron_storage::EpochCensus::default()),
             };
             census.merge(page_census);
             buffer_pool.unpin_page(page_id, modified);
+            if let Err(e) = outcome {
+                return Err(format!(
+                    "vacuum of page {page_id:?} could not be logged: {e}"
+                ));
+            }
 
             // Delete the reclaimed rows' B+tree entries outside the frame lock,
             // so a stale entry never outlives the heap tuple it points at.
@@ -579,6 +610,7 @@ pub fn vacuum_table_immediate(
     prune_horizon: u64,
     disk_manager: &Arc<DiskManager>,
     buffer_pool: &Arc<BufferPool>,
+    wal: &Arc<WalWriter>,
     status_map: &zyron_storage::TxnStatusMap,
     retention_floor: u64,
     btree: &[zyron_catalog::BTreeIndexSpec],
@@ -590,6 +622,7 @@ pub fn vacuum_table_immediate(
         0,
         disk_manager,
         buffer_pool,
+        wal,
         status_map,
         retention_floor,
         btree,

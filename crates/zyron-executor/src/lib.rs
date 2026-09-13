@@ -1,3 +1,4 @@
+pub mod apply_changes;
 pub mod array_functions;
 pub mod batch;
 pub mod calibrate;

@@ -38,9 +38,10 @@ pub use freespace::{
     ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmHeader, FsmPage, category_to_min_space,
     space_to_category,
 };
+pub use heap::redo as heap_redo;
 pub use heap::{
-    EpochCensus, HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId,
-    TupleSlot,
+    BurstPlacement, EpochCensus, HeapFile, HeapFileConfig, HeapPage, HeapPageHeader,
+    HeapPageIterator, PageVacuum, SlotId, TupleSlot,
 };
 pub use tuple::{
     Tuple, TupleFlags, TupleHeader, TupleId, TupleView, VERSIONED_TUPLE_HEADER_SIZE,

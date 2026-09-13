@@ -445,7 +445,7 @@ pub fn entries_for_file(
     batch: &mut IndexBatch,
 ) -> Result<(), ZyronError> {
     batch.cover(entry.partition_id);
-    let reader = LakeFileReader::open(paths, entry.partition_id)?;
+    let reader = LakeFileReader::open_in(manifest, paths, entry.partition_id)?;
     let rows = reader.row_count();
     if rows == 0 {
         return Ok(());

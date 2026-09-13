@@ -10,7 +10,7 @@ use zyron_common::format::FormatKind;
 use zyron_common::format::envelope;
 use zyron_common::format::registry::{FormatFixture, FormatMigrator};
 
-use crate::format::{LAKE_MANIFEST_FORMAT_VERSION, LAKE_MANIFEST_FORMAT_VERSION_2_0};
+use crate::format::{LAKE_MANIFEST_FORMAT_VERSION_2_0, LAKE_MANIFEST_FORMAT_VERSION_2_1};
 use crate::manifest::ManifestFile;
 
 /// A checkpoint the 0.11.0 writer produced, so the 2.0 reader and this
@@ -31,7 +31,7 @@ inventory::submit! {
     FormatMigrator {
         kind: FormatKind::LakeManifest,
         from: LAKE_MANIFEST_FORMAT_VERSION_2_0,
-        to: LAKE_MANIFEST_FORMAT_VERSION,
+        to: LAKE_MANIFEST_FORMAT_VERSION_2_1,
         reversible: false,
         forward: manifest_2_0_to_2_1,
         backward: None,
@@ -56,7 +56,7 @@ pub fn manifest_2_0_to_2_1(file: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     let manifest = ManifestFile::decode(file, "manifest migration").map_err(|e| e.to_string())?;
-    Ok(manifest.encode())
+    Ok(manifest.encode_at(LAKE_MANIFEST_FORMAT_VERSION_2_1))
 }
 
 #[cfg(test)]
@@ -84,7 +84,7 @@ mod tests {
     fn moving_forward_keeps_every_entry_and_stamps_2_1() {
         let moved = manifest_2_0_to_2_1(FIXTURE_2_0).expect("moves");
         let (_, version) = envelope::peek(&moved).expect("peeks");
-        assert_eq!(version, LAKE_MANIFEST_FORMAT_VERSION);
+        assert_eq!(version, LAKE_MANIFEST_FORMAT_VERSION_2_1);
         let before = ManifestFile::decode(FIXTURE_2_0, "fixture").expect("decodes");
         let after = ManifestFile::decode(&moved, "moved").expect("decodes");
         assert_eq!(after.snapshot_id, before.snapshot_id);

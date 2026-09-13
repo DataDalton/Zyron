@@ -172,7 +172,7 @@ impl MaskingPolicyStore {
             }
         }
         self.policies.update(|m| {
-            m.entry(key).or_insert_with(Vec::new).push(policy);
+            m.entry(key).or_insert_with(Vec::new).push(policy.clone());
         });
         Ok(())
     }
@@ -199,6 +199,31 @@ impl MaskingPolicyStore {
             .unwrap_or_default()
     }
 
+    /// The mask a session's roles read one column through, None when no
+    /// enabled policy covers the column or the first enabled one exempts
+    /// one of the roles.
+    ///
+    /// Resolved once per column per batch by the scan operators, which then
+    /// apply the function to each value with no lookup per value. The
+    /// lookup borrows the current snapshot rather than counting a reference
+    /// on it, since it finishes before returning
+    pub fn mask_for(
+        &self,
+        table_id: u32,
+        column_id: u16,
+        role_ids: &[RoleId],
+    ) -> Option<MaskFunction> {
+        let snap = self.policies.read();
+        let policies = snap.get(&(table_id, column_id))?;
+        let policy = policies.iter().find(|p| p.enabled)?;
+        if !policy.exempt_roles.is_empty()
+            && policy.exempt_roles.iter().any(|er| role_ids.contains(er))
+        {
+            return None;
+        }
+        Some(policy.function.clone())
+    }
+
     /// Applies the first matching masking policy to a value. Writes the
     /// masked result into buf. Returns true if masking was applied, false
     /// if no policy matched, the role is exempt, or the mask is Null.
@@ -210,7 +235,7 @@ impl MaskingPolicyStore {
         role_ids: &[RoleId],
         buf: &mut String,
     ) -> bool {
-        let snap = self.policies.load();
+        let snap = self.policies.read();
         let policies = match snap.get(&(table_id, column_id)) {
             Some(v) => v,
             None => return false,

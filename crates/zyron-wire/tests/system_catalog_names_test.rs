@@ -33,7 +33,7 @@ fn every_canonical_name_parses_as_a_relation() {
 fn every_table_function_parses_as_a_call() {
     let mut failures = Vec::new();
     for object in SYSTEM_OBJECTS {
-        if object.kind != SystemObjectKind::TableFunction {
+        if !object.kind.is_table_function() {
             continue;
         }
         let name = object.canonical_name();

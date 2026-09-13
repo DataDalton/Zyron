@@ -620,7 +620,7 @@ impl BruteForceManager {
     /// Adds a policy binding. Bindings are kept sorted by priority (ascending).
     pub fn add_policy_binding(&self, binding: BruteForcePolicyBinding) {
         self.policy_bindings.update(|v| {
-            v.push(binding);
+            v.push(binding.clone());
             v.sort_by_key(|b| b.priority);
         });
     }

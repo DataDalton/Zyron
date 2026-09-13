@@ -346,6 +346,18 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// Reads a table's recorded changes rather than its rows.
+    ///
+    /// `table_changes(t, from, to)` and a read of a named change stream are
+    /// one node. The windows are resolved before the plan is built, so the
+    /// operator opens exactly the change files the bounds admit
+    ChangeScan {
+        /// Boxed for the same reason `AsofJoin` boxes its spec
+        spec: Box<crate::logical::ChangeScanSpec>,
+        columns: Vec<LogicalColumn>,
+        cost: PlanCost,
+    },
+
     /// Expands each input row into zero or more output rows: UNNEST over
     /// arrays, FLATTEN over a VARIANT document, UNPIVOT over column groups.
     ExpandRows {
@@ -733,6 +745,7 @@ impl PhysicalPlan {
     pub fn cost(&self) -> &PlanCost {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
+            | PhysicalPlan::ChangeScan { cost, .. }
             | PhysicalPlan::HybridScan { cost, .. }
             | PhysicalPlan::LakeScan { cost, .. }
             | PhysicalPlan::ForeignScan { cost, .. }
@@ -780,6 +793,7 @@ impl PhysicalPlan {
     pub fn output_schema(&self) -> Vec<LogicalColumn> {
         match self {
             PhysicalPlan::SeqScan { columns, .. }
+            | PhysicalPlan::ChangeScan { columns, .. }
             | PhysicalPlan::HybridScan { columns, .. }
             | PhysicalPlan::LakeScan { columns, .. }
             | PhysicalPlan::ForeignScan { columns, .. }
@@ -939,6 +953,7 @@ impl PhysicalPlan {
         let own = *self.cost();
         let children_cost = match self {
             PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::ChangeScan { .. }
             | PhysicalPlan::HybridScan { .. }
             | PhysicalPlan::LakeScan { .. }
             | PhysicalPlan::ForeignScan { .. }

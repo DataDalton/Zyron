@@ -68,7 +68,7 @@ Writes against the table are maintained into the index from the moment the state
 
 ## ADD CONSTRAINT
 
-A constraint is enforced on every write from the moment the statement starts. The rows that predate it are checked afterwards. While that check runs, `zyron_sys.core.constraints` reports the constraint's `state` as `validating`; it becomes `valid` when the check completes.
+A constraint is enforced on every write from the moment the statement starts. The rows that predate it are checked afterwards. While that check runs, `zyron_sys.core.constraints` reports the constraint's `state` as `validating`, and it becomes `valid` when the check completes.
 
 A row that already breaks the rule ends the statement and the constraint is not added, so a rule the data does not satisfy never sits on a table unenforced.
 

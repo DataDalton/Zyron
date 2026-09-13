@@ -11,6 +11,7 @@ use crate::durability::DurabilityNotifier;
 use crate::format::WAL_RECORD_VERSION_BYTE;
 use crate::record::{
     LogRecordType, Lsn, backfill_checksums, record_size_for_payload, serialize_raw_deferred,
+    serialize_raw_deferred_split,
 };
 use crate::ring_buffer::RingBuffer;
 use crate::segment::{LogSegment, SegmentHeader, SegmentId};
@@ -1044,15 +1045,35 @@ impl WalWriter {
         record_version: u8,
         payload: &[u8],
     ) -> Result<Lsn> {
+        self.append_split(txn_id, prev_lsn, record_type, record_version, &[], payload)
+    }
+
+    /// Appends a log record whose payload is two pieces. Zero-allocation
+    /// hot path.
+    ///
+    /// `head` then `tail` land next to each other in the reserved slot, so
+    /// a caller framing bytes it already holds writes the fixed fields
+    /// ahead of them without first joining the two in a buffer of its own.
+    /// Everything else matches `append`
+    fn append_split(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        record_type: LogRecordType,
+        record_version: u8,
+        head: &[u8],
+        tail: &[u8],
+    ) -> Result<Lsn> {
         if self.flush_io_error.load(Ordering::Acquire) {
             return Err(ZyronError::WalWriteFailed(
                 "flush thread encountered an I/O error".into(),
             ));
         }
-        if payload.len() > crate::constants::MAX_PAYLOAD_SIZE {
-            return Self::payload_too_large(payload.len());
+        let payload_len = head.len() + tail.len();
+        if payload_len > crate::constants::MAX_PAYLOAD_SIZE {
+            return Self::payload_too_large(payload_len);
         }
-        let record_size = record_size_for_payload(payload.len()) as u32;
+        let record_size = record_size_for_payload(payload_len) as u32;
 
         loop {
             // Reserve LSN atomically (lock-free)
@@ -1072,14 +1093,15 @@ impl WalWriter {
                     let linear = linear_of(lsn, self.config.segment_size);
                     unsafe {
                         let buf = self.ring_buffer.write_at(linear, record_size as usize);
-                        serialize_raw_deferred(
+                        serialize_raw_deferred_split(
                             buf,
                             lsn,
                             prev_lsn,
                             txn_id,
                             record_type as u8,
                             record_version,
-                            payload,
+                            head,
+                            tail,
                         );
                     }
                     self.ring_buffer.publish(linear);
@@ -1110,14 +1132,15 @@ impl WalWriter {
             let linear = linear_of(lsn, self.config.segment_size);
             unsafe {
                 let buf = self.ring_buffer.write_at(linear, record_size as usize);
-                serialize_raw_deferred(
+                serialize_raw_deferred_split(
                     buf,
                     lsn,
                     prev_lsn,
                     txn_id,
                     record_type as u8,
                     record_version,
-                    payload,
+                    head,
+                    tail,
                 );
             }
 
@@ -1579,6 +1602,84 @@ impl WalWriter {
         }
 
         Ok(())
+    }
+
+    /// Logs a change to one heap page image, under the transaction that
+    /// made it.
+    ///
+    /// Written from inside the page's frame lock by the heap that changed
+    /// the page, so the record exists before any flush can copy the page,
+    /// and recovery replays every such record onto the page whatever its
+    /// transaction did, which is what puts the page image back exactly as
+    /// it was. A record chain is not kept for page changes, the page id in
+    /// the payload is what recovery orders them by
+    #[inline]
+    pub fn log_page_change(
+        &self,
+        txn_id: u64,
+        record_type: LogRecordType,
+        payload: &[u8],
+    ) -> Result<Lsn> {
+        debug_assert!(record_type.is_page_change());
+        self.append(
+            txn_id,
+            Lsn::INVALID,
+            record_type,
+            WAL_RECORD_VERSION_BYTE,
+            payload,
+        )
+    }
+
+    /// Logs bytes a change data feed appended to its open segment, under
+    /// the transaction whose changes they frame. Answers the positions of
+    /// the first and the last record written, which the feed keeps as the
+    /// point the log must hold until the segment is synced and the point
+    /// its files are durable through once it is, and None when there were
+    /// no bytes to log.
+    ///
+    /// A record's payload is bounded, so an append longer than one record
+    /// carries goes as consecutive records, each naming its own offset,
+    /// and recovery lays them into the file in log order. Nothing about a
+    /// frame's boundaries matters to that, the file is put back byte for
+    /// byte and the feed's own walk of the frames cuts a tail a partial
+    /// run of records leaves
+    pub fn log_change_feed_frames(
+        &self,
+        txn_id: u64,
+        table_id: u32,
+        branch_id: u64,
+        seq: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<Option<(Lsn, Lsn)>> {
+        const PREFIX: usize = crate::record::ChangeFeedFrames::PREFIX;
+        let per_record = crate::constants::MAX_PAYLOAD_SIZE - PREFIX;
+        // The fixed fields are built on the stack and handed to the append
+        // beside the frames, which stay where the feed framed them
+        let mut prefix = [0u8; PREFIX];
+        prefix[..4].copy_from_slice(&table_id.to_le_bytes());
+        prefix[4..12].copy_from_slice(&branch_id.to_le_bytes());
+        prefix[12..20].copy_from_slice(&seq.to_le_bytes());
+        let mut written: Option<(Lsn, Lsn)> = None;
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let take = (bytes.len() - at).min(per_record);
+            prefix[20..28].copy_from_slice(&(offset + at as u64).to_le_bytes());
+            let lsn = self.append_split(
+                txn_id,
+                Lsn::INVALID,
+                LogRecordType::ChangeFeedFrames,
+                WAL_RECORD_VERSION_BYTE,
+                &prefix,
+                &bytes[at..at + take],
+            )?;
+            written = Some(match written {
+                Some((first, _)) => (first, lsn),
+                None => (lsn, lsn),
+            });
+            at += take;
+        }
+        Ok(written)
     }
 
     /// Logs an update operation.

@@ -9,11 +9,19 @@
 //! takes the lowest as the group's floor, and says whether a thing
 //! introduced at a given release may be used.
 //!
-//! A member that did not answer has no known version, and the floor is then
-//! unknown rather than taken over the members that did answer. A member mid
-//! restart comes back on either the new binary or the old one, and the gate
-//! cannot tell which until it answers. A member that is gone for good is
-//! removed from the group, which takes it out of the gate.
+//! A member that did not answer has no known version. When the members that
+//! did answer are a majority of the group the floor is taken over them,
+//! because the group commits by majority and a member that is away commits
+//! nothing until it is back, so a gated use held for it would hold every
+//! write of its kind for the length of any one member's outage. When they
+//! are not a majority the floor is unknown, and so is whether anything
+//! gated may be used, which is also when the group cannot commit at all. A
+//! member that comes back on a release older than the floor meets entries
+//! it cannot read and refuses each one by name rather than skipping it,
+//! which an upgrade of that member resolves. A member mid restart comes
+//! back on either the new binary or the old one, and the gate cannot tell
+//! which until it answers. A member that is gone for good is removed from
+//! the group, which takes it out of the gate.
 //!
 //! A reading is trusted for a short time so a burst of gated uses shares
 //! one round of probes, and the driver drops it whenever it restarts or
@@ -72,8 +80,8 @@ impl std::fmt::Display for UnknownVersion {
 /// The lowest version any member runs, or the reason it cannot be known
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Floor {
-    /// Every member answered, and this is the lowest with the member that
-    /// runs it
+    /// A majority of the members answered, and this is the lowest version
+    /// among them with the member that runs it
     Known {
         version: BinaryVersion,
         member: String,
@@ -82,31 +90,37 @@ pub enum Floor {
     /// probe, so it cannot be asked what it runs. Its exact version is
     /// unreadable and it is certainly below `VERSION_PROBE_ADDED_IN`
     Predates { member: String },
-    /// A member did not answer, so nothing can be said about the group
+    /// Half the members or more did not answer, so nothing can be said
+    /// about the group
     Unknown { member: String, reason: String },
 }
 
 impl Floor {
-    /// The floor over a set of answers. A member without a version makes the
-    /// floor unknown whatever the others answered, and otherwise the lowest
-    /// version is the floor, the earlier member on a tie.
+    /// The floor over a set of answers.
+    ///
+    /// The members that answered decide it when they are a majority of the
+    /// set, and the lowest version among them is the floor, the earlier
+    /// member on a tie. When the members that did not answer are half the
+    /// set or more the floor is unknown, named for the first of them.
     ///
     /// A member that could not be reached outranks one that merely predates
     /// the probe, because an outage is the more urgent fact and an old member
     /// would otherwise mask it for the length of an upgrade
     pub fn over(members: &[MemberVersion]) -> Floor {
-        if let Some(member) = members
-            .iter()
-            .find(|m| matches!(&m.version, Err(UnknownVersion::NotAnswered(_))))
-        {
-            let reason = match &member.version {
-                Err(unknown) => unknown.to_string(),
-                Ok(_) => String::new(),
-            };
-            return Floor::Unknown {
-                member: member.name.clone(),
-                reason,
-            };
+        let silent = |m: &&MemberVersion| matches!(&m.version, Err(UnknownVersion::NotAnswered(_)));
+        let unanswered = members.iter().filter(silent).count();
+        let answered = members.len() - unanswered;
+        if unanswered > 0 && answered * 2 <= members.len() {
+            if let Some(member) = members.iter().find(silent) {
+                let reason = match &member.version {
+                    Err(unknown) => unknown.to_string(),
+                    Ok(_) => String::new(),
+                };
+                return Floor::Unknown {
+                    member: member.name.clone(),
+                    reason,
+                };
+            }
         }
         if let Some(member) = members
             .iter()
@@ -285,13 +299,40 @@ mod tests {
         );
     }
 
+    /// A member that is away commits nothing until it is back, so the
+    /// members that can commit decide the floor while they are a majority
     #[test]
-    fn test_one_silent_member_makes_the_floor_unknown_whatever_the_others_run() {
+    fn test_a_silent_minority_leaves_the_floor_to_the_members_that_answered() {
         let floor = Floor::over(&[
             runs("node-1", "0.12.0"),
             silent("node-2"),
             runs("node-3", "0.11.0"),
         ]);
+        assert_eq!(
+            floor,
+            Floor::Known {
+                version: BinaryVersion::new(0, 11, 0),
+                member: "node-3".to_string(),
+            }
+        );
+        let floor = Floor::over(&[
+            runs("node-1", "0.12.0"),
+            silent("node-2"),
+            runs("node-3", "0.12.0"),
+            runs("node-4", "0.12.0"),
+            silent("node-5"),
+        ]);
+        assert!(
+            matches!(&floor, Floor::Known { member, .. } if member == "node-1"),
+            "{floor:?}"
+        );
+    }
+
+    /// Half the members silent is the point the group stops committing, and
+    /// the floor stops being known there too, named for the first of them
+    #[test]
+    fn test_half_the_members_silent_or_more_makes_the_floor_unknown() {
+        let floor = Floor::over(&[runs("node-1", "0.12.0"), silent("node-2")]);
         assert_eq!(
             floor,
             Floor::Unknown {
@@ -304,6 +345,16 @@ mod tests {
             .expect_err("held");
         assert!(refusal.contains("node-2"), "{refusal}");
         assert!(refusal.contains("did not answer"), "{refusal}");
+        let floor = Floor::over(&[
+            silent("node-1"),
+            runs("node-2", "0.12.0"),
+            silent("node-3"),
+            runs("node-4", "0.12.0"),
+        ]);
+        assert!(
+            matches!(&floor, Floor::Unknown { member, .. } if member == "node-1"),
+            "{floor:?}"
+        );
     }
 
     /// A member from before the status path existed is reported as old, not
@@ -341,6 +392,20 @@ mod tests {
     /// mask it for the length of an upgrade
     #[test]
     fn test_a_silent_member_outranks_one_that_only_predates_the_probe() {
+        let floor = Floor::over(&[predates("node-2"), silent("node-3")]);
+        assert!(
+            matches!(&floor, Floor::Unknown { member, .. } if member == "node-3"),
+            "{floor:?}"
+        );
+        let floor = Floor::over(&[
+            runs("node-1", "0.12.0"),
+            predates("node-2"),
+            silent("node-3"),
+        ]);
+        assert!(
+            matches!(&floor, Floor::Predates { member } if member == "node-2"),
+            "a silent minority leaves the old member holding the floor, {floor:?}"
+        );
         let floor = Floor::over(&[predates("node-2"), silent("node-3")]);
         assert!(
             matches!(&floor, Floor::Unknown { member, .. } if member == "node-3"),

@@ -338,6 +338,56 @@ impl ExplainNode {
                     children: Vec::new(),
                 }
             }
+            PhysicalPlan::ChangeScan { spec, cost, .. } => {
+                let (from, to) = spec.version_range();
+                let tables = spec
+                    .windows
+                    .iter()
+                    .map(|w| w.table_name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut details = vec![
+                    ("table".to_string(), tables),
+                    ("version_range".to_string(), format!("({from}, {to}]")),
+                    // What a range or a change type predicate saved, the
+                    // files it kept the scan from opening at all
+                    ("change_files".to_string(), spec.files_opened().to_string()),
+                ];
+                if spec.files_pruned() > 0 {
+                    details.push(("files_pruned".to_string(), spec.files_pruned().to_string()));
+                }
+                details.push((
+                    "columns".to_string(),
+                    format!(
+                        "{} data, {} metadata",
+                        spec.data_columns.len(),
+                        spec.metadata.len()
+                    ),
+                ));
+                if let Some(stream) = &spec.stream {
+                    details.push(("stream".to_string(), stream.stream_name.clone()));
+                    details.push((
+                        "advances".to_string(),
+                        if stream.peek { "no" } else { "yes" }.to_string(),
+                    ));
+                }
+                if spec.initial_rows {
+                    details.push(("initial_rows".to_string(), "yes".to_string()));
+                }
+                if spec.as_of_change {
+                    details.push(("schema".to_string(), "as_of_change".to_string()));
+                }
+                if spec.predicate.is_some() {
+                    details.push(("filter".to_string(), "yes".to_string()));
+                }
+                Self {
+                    operator_name: "ChangeScan".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
             PhysicalPlan::HybridScan {
                 table_id,
                 columns,

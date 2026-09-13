@@ -835,8 +835,12 @@ impl CdcChangeSource {
     /// The change records one member table produced after `start`.
     ///
     /// A lake table derives them from its transaction log, which is the
-    /// change record itself, so nothing is captured twice. Every other
-    /// table reads the change file the DML path captured into.
+    /// change record itself, so nothing is captured twice. Each commit is
+    /// derived under the before image setting its records were counted
+    /// under, so what a subscriber receives for a version is what a stream
+    /// position over the table counts for it, whatever the setting was
+    /// changed to since. Every other table reads the change file the DML
+    /// path captured into
     fn records_for_table(
         &self,
         table_id: u32,
@@ -853,8 +857,29 @@ impl CdcChangeSource {
                     // changes to publish for the table
                     return Ok(Vec::new());
                 };
-                return crate::lake_changes::lake_change_records(&log, table, start, u64::MAX)
-                    .map_err(|e| ProtocolError::Malformed(format!("lake change feed: {}", e)));
+                // The table's feed keeps the setting each version was
+                // counted under. A table whose feed is off publishes
+                // nothing, the way a heap table without a feed does
+                let Some(source) = self.registry.derived(table_id) else {
+                    return Ok(Vec::new());
+                };
+                let latest = log.latest_version();
+                let mut records = Vec::new();
+                for version in start.max(1)..=latest {
+                    records.extend(
+                        crate::lake_changes::lake_change_records(
+                            &log,
+                            table,
+                            version,
+                            version,
+                            source.preimages_at(version),
+                        )
+                        .map_err(|e| {
+                            ProtocolError::Malformed(format!("lake change feed: {}", e))
+                        })?,
+                    );
+                }
+                return Ok(records);
             }
         }
         match self.registry.get_feed(table_id) {

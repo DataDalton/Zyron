@@ -246,7 +246,9 @@ impl AbacStore {
             }
         }
         map.update(|m| {
-            m.entry(object_id).or_insert_with(Vec::new).push(policy);
+            m.entry(object_id)
+                .or_insert_with(Vec::new)
+                .push(policy.clone());
         });
         Ok(())
     }
@@ -725,7 +727,7 @@ impl AbacRuleStore {
         match self.rules.insert_sync(id, rule) {
             Ok(_) => {
                 self.sorted_rules.update(|sorted| {
-                    sorted.push(rule_clone);
+                    sorted.push(rule_clone.clone());
                     sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
                 });
                 Ok(())

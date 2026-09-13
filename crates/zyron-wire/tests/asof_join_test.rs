@@ -360,6 +360,103 @@ async fn a_match_condition_over_two_columns_of_one_side_is_refused() {
     );
 }
 
+/// Both sides run past one execution batch, so the merge replaces the batch
+/// it is reading right rows out of partway through an output batch, and a
+/// left row that matches nothing sits between rows that match.
+///
+/// The answer is checked against the same question asked as a correlated
+/// lookup, row for row
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_right_side_wider_than_one_batch_answers_what_a_correlated_lookup_does() {
+    let (server, _schema, _tmp) = common::create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE wide_trades (symbol TEXT, ts BIGINT, price INT)",
+    )
+    .await
+    .expect("create wide_trades");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE wide_quotes (symbol TEXT, ts BIGINT, bid INT)",
+    )
+    .await
+    .expect("create wide_quotes");
+
+    // Enough rows a side that the merge reads several batches of each, and
+    // the two symbols interleave so a group boundary falls inside a batch
+    const ROWS: i64 = 5_000;
+    for chunk in 0..(ROWS / 500) {
+        let trades: Vec<String> = (0..500)
+            .map(|r| {
+                let i = chunk * 500 + r;
+                let symbol = if i % 2 == 0 { "AAA" } else { "BBB" };
+                format!("('{symbol}', {}, {i})", i * 10)
+            })
+            .collect();
+        exec_dml(
+            &server,
+            &format!("INSERT INTO wide_trades VALUES {}", trades.join(", ")),
+        )
+        .await;
+        // Quotes start above the first trades, so the earliest trades of
+        // each symbol have nothing at or before them
+        let quotes: Vec<String> = (0..500)
+            .map(|r| {
+                let i = chunk * 500 + r;
+                let symbol = if i % 2 == 0 { "AAA" } else { "BBB" };
+                format!("('{symbol}', {}, {})", i * 10 + 205, i + 1_000)
+            })
+            .collect();
+        exec_dml(
+            &server,
+            &format!("INSERT INTO wide_quotes VALUES {}", quotes.join(", ")),
+        )
+        .await;
+    }
+
+    for form in ["ASOF JOIN", "ASOF LEFT JOIN"] {
+        let by_join = query_values(
+            &server,
+            &format!(
+                "SELECT t.ts, q.bid FROM wide_trades AS t \
+                 {form} wide_quotes AS q MATCH_CONDITION (t.ts >= q.ts) \
+                 ON t.symbol = q.symbol ORDER BY t.ts"
+            ),
+        )
+        .await;
+        let by_subquery = query_values(
+            &server,
+            "SELECT t.ts, (SELECT q.bid FROM wide_quotes AS q \
+                           WHERE q.symbol = t.symbol AND q.ts <= t.ts \
+                           ORDER BY q.ts DESC LIMIT 1) \
+             FROM wide_trades AS t ORDER BY t.ts",
+        )
+        .await;
+        let inner = form == "ASOF JOIN";
+        let expected: Vec<(i64, Option<i64>)> = by_subquery
+            .iter()
+            .filter(|r| !inner || number(&r[1]).is_some())
+            .map(|r| (number(&r[0]).unwrap_or(0), number(&r[1])))
+            .collect();
+        let actual: Vec<(i64, Option<i64>)> = by_join
+            .iter()
+            .map(|r| (number(&r[0]).unwrap_or(0), number(&r[1])))
+            .collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{form} over several batches a side hands back the rows the lookup does"
+        );
+        assert_eq!(
+            actual, expected,
+            "{form} over several batches a side answers what the lookup does"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_unparser_writes_an_asof_join_back_as_written() {
     for sql in [

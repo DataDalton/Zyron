@@ -3138,13 +3138,82 @@ fn radix_indices(data: &ColumnData, asc: bool) -> Option<Vec<u32>> {
     })
 }
 
+/// The keys of one integer column in the order `indices` names, each
+/// transformed so that sorting the keys unsigned sorts the values as
+/// declared, with the range observed for the passes
+macro_rules! radix_pairs_in_order {
+    ($data:expr, $indices:expr, $asc:expr, $uty:ty, $sign_bit:expr, $prep:expr) => {{
+        let mut pairs: Vec<(u64, u32)> = Vec::with_capacity($indices.len());
+        if $asc {
+            for &i in $indices.iter() {
+                let key = ($data[i as usize] as $uty as u64) ^ $sign_bit;
+                $prep.observe(key);
+                pairs.push((key, i));
+            }
+        } else {
+            for &i in $indices.iter() {
+                let key = !(($data[i as usize] as $uty as u64) ^ $sign_bit);
+                $prep.observe(key);
+                pairs.push((key, i));
+            }
+        }
+        pairs
+    }};
+}
+
+/// The keys of one integer column in the order `indices` names, or None
+/// for a type the radix passes cannot key
+fn radix_pairs(
+    data: &ColumnData,
+    indices: &[u32],
+    asc: bool,
+    prep: &mut RadixPrep,
+) -> Option<Vec<(u64, u32)>> {
+    Some(match data {
+        ColumnData::Int64(v) => {
+            radix_pairs_in_order!(v, indices, asc, u64, 0x8000_0000_0000_0000u64, prep)
+        }
+        ColumnData::Int32(v) => radix_pairs_in_order!(v, indices, asc, u32, 0x8000_0000u64, prep),
+        ColumnData::Int16(v) => radix_pairs_in_order!(v, indices, asc, u16, 0x8000u64, prep),
+        ColumnData::Int8(v) => radix_pairs_in_order!(v, indices, asc, u8, 0x80u64, prep),
+        ColumnData::UInt64(v) => radix_pairs_in_order!(v, indices, asc, u64, 0u64, prep),
+        ColumnData::UInt32(v) => radix_pairs_in_order!(v, indices, asc, u32, 0u64, prep),
+        ColumnData::UInt16(v) => radix_pairs_in_order!(v, indices, asc, u16, 0u64, prep),
+        ColumnData::UInt8(v) => radix_pairs_in_order!(v, indices, asc, u8, 0u64, prep),
+        _ => return None,
+    })
+}
+
+/// Sorted indices of several integer columns by LSD radix sort, or None
+/// when any column is a type the radix passes cannot key.
+///
+/// The columns are sorted from the last key to the first, each pass a
+/// stable radix sort over the order the previous pass left, which is what
+/// makes the result lexicographic over the keys. The cost is one pass per
+/// key over the rows, whatever order they arrive in, so a source that
+/// arrives shuffled sorts in the same time as one that arrives in order
+fn radix_indices_multi(
+    columns: &[&Column],
+    ascending: &[bool],
+    num_rows: usize,
+) -> Option<Vec<u32>> {
+    let mut indices: Vec<u32> = (0..num_rows as u32).collect();
+    for (column, asc) in columns.iter().zip(ascending.iter()).rev() {
+        let mut prep = RadixPrep::new();
+        let pairs = radix_pairs(&column.data, &indices, *asc, &mut prep)?;
+        prep.build_histograms(&pairs, |p: (u64, u32)| p.0);
+        indices = radix_sort_pair_indices(pairs, &prep);
+    }
+    Some(indices)
+}
+
 /// Sort indices with ties left in input order.
 ///
 /// A window's rows that tie on the ORDER BY keys are still distinct rows
 /// to LAG, ROW_NUMBER and a frame edge, so the order among them has to be
 /// the one thing that is the same on every run, which is the order they
-/// arrived in. The radix path is stable by construction and the comparison
-/// paths use the stable sort
+/// arrived in. The radix paths are stable by construction and the
+/// comparison paths use the stable sort
 pub fn sort_indices_stable(
     columns: &[&Column],
     ascending: &[bool],
@@ -3155,6 +3224,12 @@ pub fn sort_indices_stable(
     if !any_nulls
         && columns.len() == 1
         && let Some(indices) = radix_indices(&columns[0].data, ascending[0])
+    {
+        return indices;
+    }
+    if !any_nulls
+        && columns.len() > 1
+        && let Some(indices) = radix_indices_multi(columns, ascending, num_rows)
     {
         return indices;
     }
@@ -3224,6 +3299,9 @@ pub fn sort_indices(
         return indices;
     }
 
+    if !any_nulls && let Some(indices) = radix_indices_multi(columns, ascending, num_rows) {
+        return indices;
+    }
     let mut indices: Vec<u32> = (0..num_rows as u32).collect();
     if any_nulls {
         indices.sort_unstable_by(|&a, &b| {
@@ -4032,6 +4110,75 @@ mod radix_sort_tests {
             TypeId::Float64,
         )];
         assert!(radix_sort_batches_values(&floats, true).is_none());
+    }
+
+    #[test]
+    fn multi_key_sort_is_lexicographic_stable_and_order_independent() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let n = 5000usize;
+        // Few distinct values per key, so ties on the first key are common
+        // and the second key and the input order both decide
+        let first: Vec<i64> = (0..n).map(|_| (lcg(&mut state) % 7) as i64 - 3).collect();
+        let second: Vec<i32> = (0..n).map(|_| (lcg(&mut state) % 11) as i32).collect();
+        let columns = [
+            Column::new(ColumnData::Int64(first.clone()), TypeId::Int64),
+            Column::new(ColumnData::Int32(second.clone()), TypeId::Int32),
+        ];
+        let refs: Vec<&Column> = columns.iter().collect();
+        for (asc_first, asc_second) in [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let sorted = sort_indices_stable(&refs, &[asc_first, asc_second], &[false, false], n);
+            let mut expect: Vec<u32> = (0..n as u32).collect();
+            expect.sort_by(|&a, &b| {
+                let a_first = first[a as usize];
+                let b_first = first[b as usize];
+                let by_first = if asc_first {
+                    a_first.cmp(&b_first)
+                } else {
+                    b_first.cmp(&a_first)
+                };
+                let a_second = second[a as usize];
+                let b_second = second[b as usize];
+                let by_second = if asc_second {
+                    a_second.cmp(&b_second)
+                } else {
+                    b_second.cmp(&a_second)
+                };
+                by_first.then(by_second)
+            });
+            assert_eq!(sorted, expect, "asc {asc_first} {asc_second}");
+        }
+
+        // The same rows already in order sort to the same answer as they
+        // do shuffled, which is what makes the cost the same either way
+        let ordered = sort_indices_stable(&refs, &[true, true], &[false, false], n);
+        let shuffled_rows: Vec<u32> = ordered.iter().rev().copied().collect();
+        let first_shuffled: Vec<i64> = shuffled_rows.iter().map(|&i| first[i as usize]).collect();
+        let second_shuffled: Vec<i32> = shuffled_rows.iter().map(|&i| second[i as usize]).collect();
+        let columns = [
+            Column::new(ColumnData::Int64(first_shuffled.clone()), TypeId::Int64),
+            Column::new(ColumnData::Int32(second_shuffled.clone()), TypeId::Int32),
+        ];
+        let refs: Vec<&Column> = columns.iter().collect();
+        let again = sort_indices_stable(&refs, &[true, true], &[false, false], n);
+        let keys: Vec<(i64, i32)> = again
+            .iter()
+            .map(|&i| (first_shuffled[i as usize], second_shuffled[i as usize]))
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn multi_key_sort_declines_a_key_the_passes_cannot_hold() {
+        let columns = [
+            Column::new(ColumnData::Int64(vec![1, 2, 3]), TypeId::Int64),
+            Column::new(ColumnData::Float64(vec![1.0, 2.0, 3.0]), TypeId::Float64),
+        ];
+        let refs: Vec<&Column> = columns.iter().collect();
+        assert!(radix_indices_multi(&refs, &[true, true], 3).is_none());
+        // The comparison path still sorts it
+        let sorted = sort_indices_stable(&refs, &[false, true], &[false, false], 3);
+        assert_eq!(sorted, vec![2, 1, 0]);
     }
 
     #[test]

@@ -258,3 +258,68 @@ async fn reserved_schemas_refuse_cascade_before_touching_anything() {
     let err = ddl_err(&server, "DROP SCHEMA zyron_sys CASCADE").await;
     assert!(err.contains("reserved"), "{err}");
 }
+
+/// Marks a table immutable the way the catalog stores the flag.
+async fn set_immutable(server: &Arc<ServerState>, schema: &str, table: &str) {
+    let db_id = zyron_catalog::DatabaseId(1);
+    let schema_id = server.catalog.get_schema(db_id, schema).expect("schema").id;
+    let mut entry = (*server.catalog.get_table(schema_id, table).expect("table")).clone();
+    entry.lifecycle.immutable = true;
+    server
+        .catalog
+        .update_table(entry)
+        .await
+        .expect("set immutable");
+}
+
+#[tokio::test]
+async fn immutable_tables_refuse_drop_truncate_and_cascade() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    ddl(&server, "CREATE SCHEMA sw").await;
+    ddl(&server, "CREATE TABLE sw.locked (id INT)").await;
+    exec_dml(&server, "INSERT INTO sw.locked (id) VALUES (1)").await;
+    set_immutable(&server, "sw", "locked").await;
+
+    // The lock refuses every path that reaches the same rows, and names the
+    // same reason the DML hook gives.
+    let err = ddl_err(&server, "DROP TABLE sw.locked").await;
+    assert!(err.contains("immutable"), "{err}");
+    let err = ddl_err(&server, "TRUNCATE sw.locked").await;
+    assert!(err.contains("immutable"), "{err}");
+    let err = ddl_err(&server, "DROP SCHEMA sw CASCADE").await;
+    assert!(err.contains("immutable"), "{err}");
+
+    // The table and its rows survive every refusal.
+    let rows = query_values(&server, "SELECT id FROM sw.locked").await;
+    assert_eq!(rows.len(), 1, "a refused statement changed the table");
+}
+
+#[tokio::test]
+async fn a_retention_lock_refuses_drop_until_it_expires() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    ddl(&server, "CREATE SCHEMA sl").await;
+    ddl(&server, "CREATE TABLE sl.held (id INT)").await;
+
+    let db_id = zyron_catalog::DatabaseId(1);
+    let schema_id = server.catalog.get_schema(db_id, "sl").expect("schema").id;
+    let mut entry = (*server.catalog.get_table(schema_id, "held").expect("table")).clone();
+    entry.lifecycle.retention_lock_until = zyron_lifecycle::ttl::now_micros() + 3_600_000_000;
+    server
+        .catalog
+        .update_table(entry)
+        .await
+        .expect("set retention lock");
+
+    let err = ddl_err(&server, "DROP TABLE sl.held").await;
+    assert!(err.contains("retention"), "{err}");
+
+    // A lock that has passed holds nothing.
+    let mut entry = (*server.catalog.get_table(schema_id, "held").expect("table")).clone();
+    entry.lifecycle.retention_lock_until = 1;
+    server
+        .catalog
+        .update_table(entry)
+        .await
+        .expect("expire retention lock");
+    ddl(&server, "DROP TABLE sl.held").await;
+}

@@ -859,6 +859,27 @@ fn write_alias(out: &mut String, alias: &Option<String>) {
     }
 }
 
+fn write_table_option_value(out: &mut String, value: &crate::ast::TableOptionValue) {
+    use crate::ast::TableOptionValue as V;
+    match value {
+        V::String(text) => write_string(out, text),
+        V::Identifier(name) => write_ident(out, name),
+        V::Integer(n) => out.push_str(&n.to_string()),
+        V::Float(n) => out.push_str(&n.to_string()),
+        V::Boolean(b) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
+        V::StringList(items) => {
+            out.push_str("ARRAY[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_string(out, item);
+            }
+            out.push(']');
+        }
+    }
+}
+
 fn backend_word(backend: &ExternalBackendKind) -> &'static str {
     match backend {
         ExternalBackendKind::File => "FILE",
@@ -896,12 +917,29 @@ fn write_options(out: &mut String, options: &[(String, String)]) {
 
 fn write_table_ref(out: &mut String, table: &TableRef) -> Out {
     match table {
-        TableRef::Table { name, alias, as_of } => {
+        TableRef::Table {
+            name,
+            alias,
+            as_of,
+            options,
+        } => {
             write_qualified(out, name);
             if let Some(as_of) = as_of {
                 write_as_of(out, as_of)?;
             }
             write_alias(out, alias);
+            if !options.is_empty() {
+                out.push_str(" WITH (");
+                for (i, option) in options.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&option.key);
+                    out.push_str(" => ");
+                    write_table_option_value(out, &option.value);
+                }
+                out.push(')');
+            }
         }
         TableRef::Join(join) => {
             write_table_ref(out, &join.left)?;
@@ -1395,11 +1433,49 @@ pub(crate) fn write_statement(out: &mut String, statement: &Statement) -> Out {
         Statement::CreatePipeline(pipeline) => {
             out.push_str("CREATE PIPELINE ");
             write_ident(out, &pipeline.name);
+            if let Some(trigger) = &pipeline.trigger {
+                out.push_str(" ON CHANGE DATA FROM ");
+                write_qualified(out, &trigger.stream);
+                if trigger.min_rows != 1 {
+                    out.push_str(&format!(" MIN ROWS {}", trigger.min_rows));
+                }
+                if let Some(wait) = &trigger.max_wait {
+                    out.push_str(" MAX WAIT ");
+                    write_ttl_duration(out, wait);
+                }
+            }
             out.push_str(" AS (");
             write_list(out, &pipeline.stages, |out, stage| {
                 out.push_str("STAGE ");
                 write_ident(out, &stage.name);
                 out.push_str(" (");
+                match &stage.changes {
+                    Some(ChangeStage::Apply(apply)) => {
+                        let apply = Statement::ApplyChanges(apply.clone());
+                        write_statement(out, &apply)?;
+                        out.push(')');
+                        return Ok(());
+                    }
+                    Some(ChangeStage::Consume(consume)) => {
+                        out.push_str("CONSUME CHANGES FROM ");
+                        write_qualified(out, &consume.stream);
+                        if let Some(n) = consume.max_rows {
+                            out.push_str(&format!(" MAX ROWS {n}"));
+                        }
+                        if let Some(into) = &consume.into {
+                            out.push_str(" INTO ");
+                            write_qualified(out, into);
+                        }
+                        if let Some(statement) = &consume.statement {
+                            out.push_str(" AS (");
+                            write_statement(out, statement)?;
+                            out.push(')');
+                        }
+                        out.push(')');
+                        return Ok(());
+                    }
+                    None => {}
+                }
                 let mut clauses: Vec<String> = Vec::new();
                 if !stage.source.is_empty() {
                     let mut clause = String::from("SOURCE ");
@@ -1619,6 +1695,179 @@ pub(crate) fn write_statement(out: &mut String, statement: &Statement) -> Out {
                 AlterExternalSinkAction::SetCredentialProvider(provider) => {
                     out.push_str("SET CREDENTIAL_PROVIDER ");
                     write_credential_provider(out, provider);
+                }
+            }
+        }
+        Statement::CreateChangeStream(create) => {
+            out.push_str("CREATE CHANGE STREAM ");
+            if create.if_not_exists {
+                out.push_str("IF NOT EXISTS ");
+            }
+            write_qualified(out, &create.name);
+            match &create.target {
+                ChangeStreamTarget::Table(name) => {
+                    out.push_str(" ON TABLE ");
+                    write_qualified(out, name);
+                }
+                ChangeStreamTarget::View(name) => {
+                    out.push_str(" ON VIEW ");
+                    write_qualified(out, name);
+                }
+                ChangeStreamTarget::Tables(names) => {
+                    out.push_str(" ON TABLES (");
+                    for (i, name) in names.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_qualified(out, name);
+                    }
+                    out.push(')');
+                }
+            }
+            match &create.start {
+                ChangeStreamStart::Now => {}
+                ChangeStreamStart::Version(expr) => {
+                    out.push_str(" AT VERSION ");
+                    write_expr(out, expr)?;
+                }
+                ChangeStreamStart::Timestamp(expr) => {
+                    out.push_str(" AT TIMESTAMP ");
+                    write_expr(out, expr)?;
+                }
+                ChangeStreamStart::InitialRows => out.push_str(" SHOW INITIAL ROWS"),
+            }
+            if create.append_only {
+                out.push_str(" APPEND_ONLY");
+            }
+            if let Some(predicate) = &create.predicate {
+                out.push_str(" WHERE ");
+                write_expr(out, predicate)?;
+            }
+            if !create.columns.is_empty() {
+                out.push_str(" COLUMNS (");
+                for (i, name) in create.columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_ident(out, name);
+                }
+                out.push(')');
+            }
+        }
+        Statement::AlterChangeStream(alter) => {
+            out.push_str("ALTER CHANGE STREAM ");
+            write_qualified(out, &alter.name);
+            match &alter.action {
+                AlterChangeStreamAction::Reset => out.push_str(" RESET"),
+                AlterChangeStreamAction::ResetToVersion(expr) => {
+                    out.push_str(" RESET TO VERSION ");
+                    write_expr(out, expr)?;
+                }
+                AlterChangeStreamAction::ResetToTimestamp(expr) => {
+                    out.push_str(" RESET TO TIMESTAMP ");
+                    write_expr(out, expr)?;
+                }
+                AlterChangeStreamAction::ResetToLatest => out.push_str(" RESET TO LATEST"),
+                AlterChangeStreamAction::ResetToPosition(expr) => {
+                    out.push_str(" RESET TO POSITION ");
+                    write_expr(out, expr)?;
+                }
+                AlterChangeStreamAction::SetAllColumns => out.push_str(" SET ALL COLUMNS"),
+                AlterChangeStreamAction::SetColumns(names) => {
+                    out.push_str(" SET COLUMNS (");
+                    for (i, name) in names.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_ident(out, name);
+                    }
+                    out.push(')');
+                }
+            }
+        }
+        Statement::DropChangeStream(drop) => {
+            out.push_str("DROP CHANGE STREAM ");
+            if drop.if_exists {
+                out.push_str("IF EXISTS ");
+            }
+            write_qualified(out, &drop.name);
+        }
+        Statement::ShowChangeStreams(show) => match (&show.name, &show.on_table) {
+            (Some(name), _) => {
+                out.push_str("SHOW CHANGE STREAM ");
+                write_qualified(out, name);
+            }
+            (None, Some(table)) => {
+                out.push_str("SHOW CHANGE STREAMS ON TABLE ");
+                write_qualified(out, table);
+            }
+            (None, None) => out.push_str("SHOW CHANGE STREAMS"),
+        },
+        Statement::ApplyChanges(apply) => {
+            out.push_str("APPLY CHANGES INTO ");
+            write_qualified(out, &apply.target);
+            out.push_str(" FROM ");
+            match &apply.source {
+                ApplySource::Named(name) => write_qualified(out, name),
+                ApplySource::Relation(table) => write_table_ref(out, table)?,
+            }
+            out.push_str(" KEYS (");
+            for (i, key) in apply.keys.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_ident(out, key);
+            }
+            out.push(')');
+            if let Some(expr) = &apply.sequence_by {
+                out.push_str(" SEQUENCE BY ");
+                write_expr(out, expr)?;
+            }
+            if apply.ignore_null_updates {
+                out.push_str(" IGNORE NULL UPDATES");
+            }
+            if let Some(expr) = &apply.delete_when {
+                out.push_str(" APPLY AS DELETE WHEN ");
+                write_expr(out, expr)?;
+            }
+            if let Some(expr) = &apply.truncate_when {
+                out.push_str(" APPLY AS TRUNCATE WHEN ");
+                write_expr(out, expr)?;
+            }
+            if !apply.except_columns.is_empty() {
+                out.push_str(" EXCEPT COLUMNS (");
+                for (i, name) in apply.except_columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_ident(out, name);
+                }
+                out.push(')');
+            }
+            if apply.scd == ScdKind::Type2 {
+                out.push_str(" STORED AS SCD TYPE 2");
+            }
+            match &apply.track_history {
+                None => {}
+                Some(TrackHistoryClause::On(names)) => {
+                    out.push_str(" TRACK HISTORY ON (");
+                    for (i, name) in names.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_ident(out, name);
+                    }
+                    out.push(')');
+                }
+                Some(TrackHistoryClause::Except(names)) => {
+                    out.push_str(" TRACK HISTORY EXCEPT (");
+                    for (i, name) in names.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_ident(out, name);
+                    }
+                    out.push(')');
                 }
             }
         }

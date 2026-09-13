@@ -118,6 +118,105 @@ pub fn intent_state(data_dir: &Path, txn_id: u64) -> Option<IntentState> {
         .map(|(_, state)| state)
 }
 
+/// What one intent was opened by, and whether it has finished
+struct IntentOwner {
+    db_txn_id: u64,
+    finished: bool,
+}
+
+type OwnerKey = (PathBuf, u64);
+
+/// The database transaction each intent was opened inside, by database and
+/// intent id.
+///
+/// A version committed under an intent carries the intent's id, and the
+/// heap rows the same transaction wrote carry the database transaction's,
+/// so a change reader deciding whether the transaction is over as of its
+/// snapshot needs the one behind the other. A finished intent stays bound
+/// until no snapshot can still hold its transaction open, which is the
+/// prune horizon the caller passes to `prune_intent_owners`
+static INTENT_OWNERS: std::sync::OnceLock<scc::HashMap<OwnerKey, IntentOwner>> =
+    std::sync::OnceLock::new();
+
+fn intent_owners() -> &'static scc::HashMap<OwnerKey, IntentOwner> {
+    INTENT_OWNERS.get_or_init(scc::HashMap::new)
+}
+
+/// Records that `intent_txn_id` was opened inside `db_txn_id`
+pub fn bind_intent_owner(data_dir: &Path, intent_txn_id: u64, db_txn_id: u64) {
+    let owner = IntentOwner {
+        db_txn_id,
+        finished: false,
+    };
+    let _ = intent_owners().upsert_sync((data_dir.to_path_buf(), intent_txn_id), owner);
+}
+
+/// The database transaction an intent was opened inside, None for an id
+/// that is not an intent's or an intent bound before the process started
+pub fn intent_owner(data_dir: &Path, intent_txn_id: u64) -> Option<u64> {
+    if intent_txn_id & INTENT_TXN_FLAG == 0 {
+        return None;
+    }
+    intent_owners().read_sync(&(data_dir.to_path_buf(), intent_txn_id), |_, owner| {
+        owner.db_txn_id
+    })
+}
+
+/// The database transaction an intent is bound to in this process, zero
+/// for an id that is not an intent's or an intent this process did not
+/// open. What a commit under the intent records in its header, so the
+/// binding outlives the process
+pub fn intent_owner_of(paths: &crate::paths::LakePaths, db_txn_id: u64) -> u64 {
+    if db_txn_id & INTENT_TXN_FLAG == 0 {
+        return 0;
+    }
+    paths
+        .database_dir()
+        .and_then(|data_dir| intent_owner(data_dir, db_txn_id))
+        .unwrap_or(0)
+}
+
+/// The database transaction a reader's snapshot judges a commit by, the
+/// id itself for a commit made under a database transaction, the
+/// transaction that opened the intent for one made under an intent, and
+/// zero for an intent that finished and left nothing a snapshot could
+/// still hold open, which reads as committed the way a standalone commit
+/// does
+pub fn owning_txn(paths: &crate::paths::LakePaths, db_txn_id: u64) -> u64 {
+    owning_txn_of(paths, db_txn_id, 0)
+}
+
+/// The same judgement with the owner a commit header recorded in hand.
+/// The binding this process holds answers first, and the recorded owner
+/// answers for an intent opened by an earlier process, so a commit made
+/// under an intent names its database transaction for as long as the
+/// commit exists
+pub fn owning_txn_of(paths: &crate::paths::LakePaths, db_txn_id: u64, owner_txn_id: u64) -> u64 {
+    if db_txn_id & INTENT_TXN_FLAG == 0 {
+        return db_txn_id;
+    }
+    match intent_owner_of(paths, db_txn_id) {
+        0 => owner_txn_id,
+        owner => owner,
+    }
+}
+
+/// Marks an intent finished, committed or aborted. The binding outlives
+/// the intent until the transaction behind it is below every snapshot
+pub fn finish_intent_owner(data_dir: &Path, intent_txn_id: u64) {
+    let _ = intent_owners().update_sync(&(data_dir.to_path_buf(), intent_txn_id), |_, owner| {
+        owner.finished = true;
+    });
+}
+
+/// Forgets the finished intents whose transaction is below `horizon`, the
+/// database's prune horizon, so no snapshot still holds them open
+pub fn prune_intent_owners(data_dir: &Path, horizon: u64) {
+    intent_owners().retain_sync(|(dir, _), owner| {
+        dir.as_path() != data_dir || !owner.finished || owner.db_txn_id >= horizon
+    });
+}
+
 /// Routes a transaction id to the oracle that owns it: an intent-flagged id
 /// to the intent files, everything else to the database's commit status.
 pub struct IntentAware<'a> {

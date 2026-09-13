@@ -288,7 +288,9 @@ impl RlsPolicyStore {
             }
         }
         self.policies.update(|m| {
-            m.entry(table_id).or_insert_with(Vec::new).push(policy);
+            m.entry(table_id)
+                .or_insert_with(Vec::new)
+                .push(policy.clone());
         });
         Ok(())
     }

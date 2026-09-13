@@ -11,6 +11,10 @@ Every document here has a user-facing counterpart under [../business/](../busine
 - [storage/formats/zyridx-spec.md](storage/formats/zyridx-spec.md), the `.zyridx` index checkpoint format.
 - [storage/online-ddl.md](storage/online-ddl.md), schema epochs and the slot field they live in, absent values and dropped placeholders, the publish-wait-scan-load-flip sequence and why the wait is what makes it correct, the shadow rewrite's dual-write hook and catch-up, the bulk tree build, and epoch retirement.
 
+## Change Data Capture
+
+- [cdc/streams-and-positions.md](cdc/streams-and-positions.md), the change feed's segments and per-version counts, the position lock and its handover through the transaction manager, the window a stream read resolves across several sources, background writers and schedule runs on a member of a group, lake changes derived from the transaction log and the lake's data files carried in the replication log, schema epochs in the feed, branch feeds and the branch point, outbound delivery from a stream, and why a change stream is neither a queue nor a streaming job.
+
 ## Operations
 
 - [operations/auto-upgrade.md](operations/auto-upgrade.md), the compatibility gate, upgrade coordination across nodes, and health baseline mechanics.

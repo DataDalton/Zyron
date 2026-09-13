@@ -71,13 +71,14 @@ impl FeatureMaterializationWorker {
         Arc::clone(&self.stats)
     }
 
-    /// Starts the background worker
-    /// The worker consults the process-wide feature store singleton and
-    /// the lineage registry to perform refresh bookkeeping
-    pub fn start(
-        config: FeatureMaterializationConfig,
-        authority: crate::background::authority::WriteAuthority,
-    ) -> Self {
+    /// Starts the background worker.
+    ///
+    /// The worker consults the process-wide feature store and the lineage
+    /// registry to perform refresh bookkeeping. Both are this node's own
+    /// in-memory copies, computed from tables every member holds, so a
+    /// member of a group materializes its own rather than waiting on the
+    /// leader for rows it can derive itself
+    pub fn start(config: FeatureMaterializationConfig) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
         let stats = Arc::new(FeatureMaterializationStats::default());
@@ -90,7 +91,7 @@ impl FeatureMaterializationWorker {
             .name("zyron-feature-materialization".into())
             .spawn(move || {
                 let _ = thread_waker.set(thread::current());
-                Self::refresh_loop(&config, &thread_shutdown, &thread_stats, &authority);
+                Self::refresh_loop(&config, &thread_shutdown, &thread_stats);
             })
             .expect("failed to spawn feature materialization thread");
 
@@ -106,7 +107,6 @@ impl FeatureMaterializationWorker {
         config: &FeatureMaterializationConfig,
         shutdown: &AtomicBool,
         stats: &FeatureMaterializationStats,
-        authority: &crate::background::authority::WriteAuthority,
     ) {
         let interval = Duration::from_secs(config.interval_secs);
         loop {
@@ -115,12 +115,6 @@ impl FeatureMaterializationWorker {
                 return;
             }
 
-            // Materializing a feature group writes rows that nothing
-            // captures for the rest of a group, so a member materializes
-            // nothing rather than holding rows the others do not
-            if !authority.may_write() {
-                continue;
-            }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)

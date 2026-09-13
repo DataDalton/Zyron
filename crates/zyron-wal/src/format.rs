@@ -34,7 +34,11 @@ inventory::submit! {
         downgrade_write_supported: false,
         notes: "envelope header plus a per-record version tag, a new segment is written at the \
                 current version and older segments are replayed then retired by checkpoint, \
-                never rewritten in place",
+                never rewritten in place. Record types are additive: a heap page change \
+                carries the page id and the exact slots and bytes it wrote, and is replayed \
+                onto the page image whose stamped LSN is below the record's, and a change \
+                feed append carries the feed, the segment, the offset and the bytes, and is \
+                laid back into the segment file before the feed reopens",
     }
 }
 

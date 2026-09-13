@@ -98,6 +98,19 @@ pub fn inspect(path: &Path) -> Result<Inspection, String> {
                 ),
                 Err(e) => (false, e.to_string()),
             },
+            Framing::EnvelopeChain => match inspect_chain(&bytes) {
+                Ok(records) => (
+                    true,
+                    format!(
+                        "{records} envelope(s) in the chain, every header and body checksum \
+                         verified"
+                    ),
+                ),
+                Err((records, detail)) => (
+                    false,
+                    format!("{records} envelope(s) verified, then {detail}"),
+                ),
+            },
         };
         return Ok(Inspection {
             path: path.to_path_buf(),
@@ -133,6 +146,55 @@ pub fn inspect(path: &Path) -> Result<Inspection, String> {
         integrity_ok: false,
         detail: "the first bytes name no registered format".to_string(),
     })
+}
+
+/// Walks a chain of envelopes, each carrying its body length in its header
+/// extension, verifying every one. Answers with the record count, or with
+/// the records verified before the one that fails and what fails in it. A
+/// chain whose last record is cut short is what a stop mid append leaves,
+/// which the format's own reader cuts off on its next open
+fn inspect_chain(bytes: &[u8]) -> Result<u64, (u64, String)> {
+    let mut offset = 0usize;
+    let mut records = 0u64;
+    while offset < bytes.len() {
+        let (header, extension) = envelope::decode_header(&bytes[offset..]).map_err(|e| {
+            (
+                records,
+                format!("the record at byte {offset} does not decode, {e}"),
+            )
+        })?;
+        if extension.len() != 4 {
+            return Err((
+                records,
+                format!(
+                    "the record at byte {offset} carries a {} byte header extension rather \
+                     than its body length",
+                    extension.len()
+                ),
+            ));
+        }
+        let body_len =
+            u32::from_le_bytes([extension[0], extension[1], extension[2], extension[3]]) as usize;
+        let total = header.body_offset() + body_len + envelope::ENVELOPE_FOOTER_LEN;
+        if offset + total > bytes.len() {
+            return Err((
+                records,
+                format!(
+                    "the record at byte {offset} declares {total} bytes and {} remain",
+                    bytes.len() - offset
+                ),
+            ));
+        }
+        envelope::decode_as(&bytes[offset..offset + total], header.kind).map_err(|e| {
+            (
+                records,
+                format!("the record at byte {offset} does not verify, {e}"),
+            )
+        })?;
+        offset += total;
+        records += 1;
+    }
+    Ok(records)
 }
 
 /// What `format verify` found across a directory

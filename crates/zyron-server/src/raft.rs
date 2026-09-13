@@ -389,6 +389,22 @@ pub async fn start_cluster(
         // version. Until then a schema change replicates the way the previous
         // release wrote it
         group_carries_actor_role: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Raised the same way. Until then a transactional consume is refused
+        // on this node, because there is no shorter form of an advance to
+        // send in its place
+        group_carries_stream_advance: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Raised the same way. Until then a delete or update on a table
+        // with a change data feed is refused on this node, because a key
+        // sent in place of the row would leave every feed short of it
+        group_carries_feed_images: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Raised the same way. Until then a lake write is refused on this
+        // node, because a version sent without its files would name bytes
+        // a member does not hold
+        group_carries_lake_files: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Raised the same way. Until then no schedule runs on this node,
+        // because a run recorded here alone would be run again by the next
+        // leader
+        group_carries_schedule_runs: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     tracing::info!(

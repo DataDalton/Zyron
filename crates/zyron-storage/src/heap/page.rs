@@ -465,12 +465,13 @@ impl HeapPage {
     /// supplies a predicate that is true only for versions dead to every live
     /// snapshot (a committed delete below the frozen horizon, or an aborted
     /// insert). Slot ids of surviving tuples are preserved by compaction, so
-    /// outstanding tuple and index references stay valid. Returns true if any
-    /// tuple was pruned. This is the on-access pruning that keeps MVCC-updated
-    /// heaps compact without waiting for vacuum.
-    pub fn prune_dead_in_slice(data: &mut [u8], is_dead: &impl Fn(u64, u64) -> bool) -> bool {
+    /// outstanding tuple and index references stay valid. Returns the slots
+    /// pruned, empty when nothing was, which is what the page's log record
+    /// carries. This is the on-access pruning that keeps MVCC-updated heaps
+    /// compact without waiting for vacuum
+    pub fn prune_dead_in_slice(data: &mut [u8], is_dead: &impl Fn(u64, u64) -> bool) -> Vec<u16> {
         let header = Self::heap_header_from_slice(data);
-        let mut pruned = false;
+        let mut pruned = Vec::new();
         for i in 0..header.slot_count {
             let slot_id = SlotId(i);
             let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
@@ -480,15 +481,25 @@ impl HeapPage {
                 continue;
             }
             if is_dead(slot.header.xmin, slot.header.xmax) {
-                // Mark the slot empty; compaction below reclaims the bytes.
-                Self::set_slot_in_slice(data, slot_id, TupleSlot::empty());
-                pruned = true;
+                pruned.push(i);
             }
         }
-        if pruned {
-            Self::compact_in_slice(data);
-        }
+        Self::prune_slots_in_slice(data, &pruned);
         pruned
+    }
+
+    /// Empties the named slots and compacts the page, which is the whole of
+    /// a prune once the slots are decided. Recovery replays a prune record
+    /// through this with the slots the record names, so a replayed page is
+    /// compacted exactly the way the live one was
+    pub fn prune_slots_in_slice(data: &mut [u8], slots: &[u16]) {
+        if slots.is_empty() {
+            return;
+        }
+        for &slot in slots {
+            Self::set_slot_in_slice(data, SlotId(slot), TupleSlot::empty());
+        }
+        Self::compact_in_slice(data);
     }
 
     /// Vacuums a page slice in place. Two actions:
@@ -500,13 +511,16 @@ impl HeapPage {
     ///    delete below the horizon) and compacts to reclaim their bytes.
     ///
     /// `is_dead(xmin, xmax)` marks reclaimable versions; `is_aborted(xid)` marks
-    /// a transaction that aborted. Returns (tuples reclaimed, page modified).
+    /// a transaction that aborted. Returns (tuples reclaimed, page modified),
+    /// and records the slots it cleared and pruned in `changes`, which is
+    /// what the page's log record carries
     pub fn vacuum_in_slice(
         data: &mut [u8],
         is_dead: &impl Fn(u64, u64) -> bool,
         is_aborted: &impl Fn(u64) -> bool,
+        changes: &mut PageVacuum,
     ) -> (u64, bool, EpochCensus) {
-        Self::vacuum_in_slice_inner(data, is_dead, is_aborted, None)
+        Self::vacuum_in_slice_inner(data, is_dead, is_aborted, None, changes)
     }
 
     /// Same as `vacuum_in_slice` but, before pruning, records each reclaimed
@@ -520,8 +534,9 @@ impl HeapPage {
         is_dead: &impl Fn(u64, u64) -> bool,
         is_aborted: &impl Fn(u64) -> bool,
         dead_out: &mut Vec<(u16, u16, Vec<u8>)>,
+        changes: &mut PageVacuum,
     ) -> (u64, bool, EpochCensus) {
-        Self::vacuum_in_slice_inner(data, is_dead, is_aborted, Some(dead_out))
+        Self::vacuum_in_slice_inner(data, is_dead, is_aborted, Some(dead_out), changes)
     }
 
     fn vacuum_in_slice_inner(
@@ -529,6 +544,7 @@ impl HeapPage {
         is_dead: &impl Fn(u64, u64) -> bool,
         is_aborted: &impl Fn(u64) -> bool,
         mut dead_out: Option<&mut Vec<(u16, u16, Vec<u8>)>>,
+        changes: &mut PageVacuum,
     ) -> (u64, bool, EpochCensus) {
         let header = Self::heap_header_from_slice(data);
         let mut reclaimed = 0u64;
@@ -561,12 +577,15 @@ impl HeapPage {
                     // Live row whose deleter aborted: clear the stale stamp.
                     let xoff = Self::slot_offset(slot_id) + TupleSlot::XMAX_OFFSET;
                     data[xoff..xoff + 8].copy_from_slice(&0u64.to_le_bytes());
+                    changes.cleared.push(i);
                     modified = true;
                 }
             }
         }
-        if Self::prune_dead_in_slice(data, is_dead) {
+        let pruned = Self::prune_dead_in_slice(data, is_dead);
+        if !pruned.is_empty() {
             modified = true;
+            changes.pruned.extend(pruned);
         }
         (reclaimed, modified, census)
     }
@@ -632,7 +651,11 @@ impl HeapPage {
 
     /// Reads a slot from a slice.
     #[inline]
-    fn get_slot_from_slice(data: &[u8], slot_id: SlotId, slot_count: u16) -> Option<TupleSlot> {
+    pub(crate) fn get_slot_from_slice(
+        data: &[u8],
+        slot_id: SlotId,
+        slot_count: u16,
+    ) -> Option<TupleSlot> {
         if slot_id.0 >= slot_count {
             return None;
         }
@@ -644,7 +667,7 @@ impl HeapPage {
 
     /// Writes a slot to a slice.
     #[inline]
-    fn set_slot_in_slice(data: &mut [u8], slot_id: SlotId, slot: TupleSlot) {
+    pub(crate) fn set_slot_in_slice(data: &mut [u8], slot_id: SlotId, slot: TupleSlot) {
         let offset = Self::DATA_START + (slot_id.0 as usize) * TupleSlot::SIZE;
         data[offset..offset + TupleSlot::SIZE].copy_from_slice(&slot.to_bytes());
     }
@@ -717,10 +740,27 @@ impl HeapPage {
         tuples: &[Tuple],
         results: &mut Vec<TupleId>,
     ) -> usize {
+        unsafe { Self::insert_tuples_burst_placed(page_ptr, page_id, tuples, results) }.count
+    }
+
+    /// The same append as `insert_tuples_burst`, also reporting where the
+    /// rows went, the first slot the burst claimed and the data offset the
+    /// tuple region ended at before it, which is what the page's log record
+    /// carries so recovery puts the bytes back at exactly these positions
+    /// whatever order concurrent bursts logged in
+    ///
+    /// # Safety
+    /// As `insert_tuples_burst`
+    pub unsafe fn insert_tuples_burst_placed(
+        page_ptr: *mut u8,
+        page_id: PageId,
+        tuples: &[Tuple],
+        results: &mut Vec<TupleId>,
+    ) -> BurstPlacement {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
         if tuples.is_empty() {
-            return 0;
+            return BurstPlacement::default();
         }
 
         let header_atomic = unsafe { &*(page_ptr.add(HEAP_HEADER_OFFSET) as *const AtomicU64) };
@@ -745,7 +785,7 @@ impl HeapPage {
                 n_fit += 1;
             }
             if n_fit == 0 {
-                return 0;
+                return BurstPlacement::default();
             }
 
             let slot_bytes_total = n_fit * TupleSlot::SIZE;
@@ -808,7 +848,11 @@ impl HeapPage {
                             results.push(TupleId::new(page_id, slot_id));
                         }
                     }
-                    return n_fit;
+                    return BurstPlacement {
+                        count: n_fit,
+                        first_slot: base_slot,
+                        data_end: hdr.free_space_end,
+                    };
                 }
                 Err(_) => {
                     std::hint::spin_loop();
@@ -818,6 +862,91 @@ impl HeapPage {
         }
     }
 
+    /// Puts rows back at the positions a burst claimed, for recovery.
+    ///
+    /// The bytes and slot entries land exactly where the record says, and
+    /// the header moves by the widest of what it holds and what the record
+    /// claims, so two bursts on one page replay to the same image whichever
+    /// order their records were logged in. A record that does not fit the
+    /// page it names is refused, since applying it would write past the
+    /// region the page owns
+    pub fn replay_burst_in_slice(
+        data: &mut [u8],
+        first_slot: u16,
+        data_end: u16,
+        tuples: &[Tuple],
+    ) -> Result<()> {
+        let slot_bytes = (first_slot as usize + tuples.len()) * TupleSlot::SIZE;
+        let total: usize = tuples.iter().map(|t| t.data().len()).sum();
+        let slots_end = Self::DATA_START + slot_bytes;
+        let data_start =
+            (data_end as usize)
+                .checked_sub(total)
+                .ok_or_else(|| ZyronError::WalCorrupted {
+                    lsn: 0,
+                    reason: format!(
+                        "a heap append record claims {total} bytes below offset {data_end}"
+                    ),
+                })?;
+        if slots_end > data_start || data_end as usize > data.len() {
+            return Err(ZyronError::WalCorrupted {
+                lsn: 0,
+                reason: format!(
+                    "a heap append record of {} rows at slot {first_slot} and offset {data_end} \
+                     does not fit its page",
+                    tuples.len()
+                ),
+            });
+        }
+        let mut offset = data_end;
+        for (i, tuple) in tuples.iter().enumerate() {
+            let len = tuple.data().len();
+            offset -= len as u16;
+            let start = offset as usize;
+            data[start..start + len].copy_from_slice(tuple.data());
+            Self::set_slot_in_slice(
+                data,
+                SlotId(first_slot + i as u16),
+                TupleSlot::new(offset, *tuple.header()),
+            );
+        }
+        let mut header = Self::heap_header_from_slice(data);
+        header.slot_count = header.slot_count.max(first_slot + tuples.len() as u16);
+        header.free_space_start = header.free_space_start.max(slots_end as u16);
+        header.free_space_end = header.free_space_end.min(offset);
+        Self::set_heap_header_in_slice(data, header);
+        Ok(())
+    }
+}
+
+/// Where one burst append put its rows, for the page's log record
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BurstPlacement {
+    /// Rows the burst placed, zero when the page had no room
+    pub count: usize,
+    /// The first slot the burst claimed
+    pub first_slot: u16,
+    /// Where the tuple region ended before the burst, which its rows were
+    /// written downward from
+    pub data_end: u16,
+}
+
+/// The slots one vacuum pass changed on a page, stamps cleared on rows
+/// whose deleter aborted, and rows pruned. What the page's log record
+/// carries, so recovery repeats the pass without repeating its decisions
+#[derive(Debug, Default)]
+pub struct PageVacuum {
+    pub cleared: Vec<u16>,
+    pub pruned: Vec<u16>,
+}
+
+impl PageVacuum {
+    pub fn is_empty(&self) -> bool {
+        self.cleared.is_empty() && self.pruned.is_empty()
+    }
+}
+
+impl HeapPage {
     /// Returns the raw page data.
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
         &self.data
@@ -1146,7 +1275,10 @@ mod tests {
         let free_before = page.free_space();
 
         let is_dead = |_xmin: u64, xmax: u64| xmax != 0 && xmax < 100;
-        assert!(HeapPage::prune_dead_in_slice(page.as_bytes_mut(), &is_dead));
+        assert_eq!(
+            HeapPage::prune_dead_in_slice(page.as_bytes_mut(), &is_dead),
+            vec![s1.0]
+        );
 
         // Survivors keep their slot ids and data; the pruned slot reads empty.
         assert_eq!(page.get_tuple(s0).unwrap().data(), b"alpha");
@@ -1169,10 +1301,7 @@ mod tests {
         assert!(page.set_tuple_xmax(s1, 200));
 
         let is_dead = |_xmin: u64, xmax: u64| xmax != 0 && xmax < 100;
-        assert!(!HeapPage::prune_dead_in_slice(
-            page.as_bytes_mut(),
-            &is_dead
-        ));
+        assert!(HeapPage::prune_dead_in_slice(page.as_bytes_mut(), &is_dead).is_empty());
         assert_eq!(page.get_tuple(s0).unwrap().data(), b"keep");
         assert_eq!(page.get_tuple(s1).unwrap().data(), b"recent");
     }
@@ -1201,11 +1330,15 @@ mod tests {
 
         let is_dead = |xmin: u64, xmax: u64| xmin == 20 || xmax == 12;
         let is_aborted = |xid: u64| xid == 20 || xid == 21;
+        let mut changes = PageVacuum::default();
         let (reclaimed, modified, census) =
-            HeapPage::vacuum_in_slice(page.as_bytes_mut(), &is_dead, &is_aborted);
+            HeapPage::vacuum_in_slice(page.as_bytes_mut(), &is_dead, &is_aborted, &mut changes);
 
         assert!(modified);
         assert_eq!(reclaimed, 2); // aborted insert + committed delete
+        // What the pass changed, as its log record carries it
+        assert_eq!(changes.cleared, vec![s_ad.0]);
+        assert_eq!(changes.pruned, vec![s_ai.0, s_cd.0]);
         // The rows that survived were written by the test at epoch 0
         assert!(census.any_unstamped);
         // Dead rows are gone.

@@ -389,13 +389,18 @@ fn table_scoped_path(
 /// typed at, so what the other members get is the rows it settled on. False
 /// for one classified `Statement`, which the group agreed before it ran and
 /// which every member is now running for itself: proposing again from inside
-/// it waits on a commit that cannot finish until this call returns
+/// it waits on a commit that cannot finish until this call returns.
+///
+/// `agreed` is the group entry a `Statement` classified caller runs as, so
+/// the changes it writes are recorded at the entry's index and instant on
+/// every member, the same place in every member's feed
 async fn run_sql(
     server: &Arc<ServerState>,
     ns: (zyron_catalog::DatabaseId, Vec<String>),
     sql: &str,
     dml: bool,
     through_group: bool,
+    agreed: Option<(u64, i64)>,
 ) -> Result<(u64, Vec<zyron_executor::batch::DataBatch>), ProtocolError> {
     let stmts = zyron_parser::parse(sql).map_err(ProtocolError::Database)?;
     let stmt = stmts
@@ -451,6 +456,26 @@ async fn run_sql(
             std::sync::Arc::clone(&server.catalog),
         )) as std::sync::Arc<dyn zyron_executor::context::DmlHook>,
     );
+    // The rows a lifecycle statement removes, restores or expires are the
+    // table's changes, recorded for its feed the way a client's own DML is.
+    // A statement every member runs for itself records them at the entry
+    // it runs as, since no changeset carries them to the applier
+    server.install_change_capture(&mut ctx);
+    if dml && !through_group {
+        match agreed {
+            Some((index, timestamp_us)) => {
+                ctx.change_capture_mode = zyron_executor::context::ChangeCaptureMode::Applied;
+                ctx.set_change_entry(index, timestamp_us);
+            }
+            None if !server.records_changes_at_statement() => {
+                let _ = server.txn_manager.abort(&mut txn);
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "`{sql}` reached the change feed without a group entry to record it as"
+                ))));
+            }
+            None => {}
+        }
+    }
     // The rows a lifecycle statement moves go to the group the same way a
     // client's own DML does. Without this the erasure, restore and retention
     // statements wrote rows nothing captured, so each of them had to be
@@ -474,7 +499,8 @@ async fn run_sql(
             match (server.replication.as_ref(), changeset) {
                 (Some(router), Some(changeset)) => {
                     router
-                        .capture_lake(txn_id, &changeset)
+                        .capture_lake(txn_id, std::sync::Arc::clone(&changeset))
+                        .await
                         .map_err(ProtocolError::Database)?;
                     if changeset.is_dirty() {
                         router
@@ -642,8 +668,26 @@ pub async fn handle_alter_table_options(
         apply_lake_maintenance_options(server, &mut entry, &stmt.table, &lake_pairs).await?;
     }
 
+    // Whether this statement turned the change data feed on or off, as
+    // against leaving it where it was. Applied after the entry is written, so
+    // a failure opening the feed leaves neither half changed
+    let mut cdf_enable: Option<bool> = None;
+    // The feed options this statement set beside the toggle, which is what
+    // a reconfiguration audit names
+    let mut cdf_reconfigured: Vec<String> = Vec::new();
     for (k, v) in &pairs {
-        match k.to_ascii_lowercase().as_str() {
+        let key = k.to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "cdf_retention"
+                | "cdf_retention_days"
+                | "cdf_columns"
+                | "cdf_before_image"
+                | "cdf_compression"
+        ) {
+            cdf_reconfigured.push(key.clone());
+        }
+        match key.as_str() {
             "soft_delete" => entry.lifecycle.soft_delete_enabled = v == "true",
             "soft_delete_column" => {
                 let id = column_id(&entry, v).ok_or_else(|| {
@@ -696,6 +740,52 @@ pub async fn handle_alter_table_options(
             // through ALTER COLUMN classification. Recognized here so a preset
             // does not trip the unknown-key error.
             "audit" | "classification" => {}
+            // Change data feed settings. Turning the feed on or off is the
+            // one that also opens or closes the feed itself, which happens
+            // after the entry is written so a failure there leaves neither
+            // half changed
+            "change_data_feed" | "cdf" | "cdc" | "change_feed" => {
+                cdf_enable = Some(v == "true");
+            }
+            "cdf_retention" => {
+                entry.cdf.retention_micros =
+                    parse_duration_secs(v)?.saturating_mul(1_000_000) as i64;
+            }
+            // The day count a shorter statement writes, converted once here
+            "cdf_retention_days" => {
+                let days: u32 = v.parse().map_err(|_| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "cdf_retention_days takes a whole number of days, found '{v}'"
+                    )))
+                })?;
+                entry.cdf_retention_days = days;
+                entry.cdf.retention_micros = days as i64 * zyron_cdc::change_feed::MICROS_PER_DAY;
+            }
+            // The recorded set is the named columns plus the key, tied to a
+            // schema epoch minted for it, so the records written under an
+            // earlier set keep decoding through that set
+            "cdf_columns" => {
+                let mut ids = Vec::new();
+                for name in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let column = entry
+                        .live_columns()
+                        .find(|c| c.name.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| {
+                            ProtocolError::Database(ZyronError::Internal(format!(
+                                "cdf_columns names '{name}', which is not a column of '{}'",
+                                stmt.table
+                            )))
+                        })?;
+                    ids.push(column.id);
+                }
+                entry.record_cdf_columns(&ids);
+            }
+            "cdf_before_image" => entry.cdf.before_image = v == "true",
+            "cdf_compression" => {
+                entry.cdf.compression = zyron_cdc::change_feed::CdfCodec::from_name(v)
+                    .map_err(|e| ProtocolError::Database(ZyronError::Internal(e.to_string())))?
+                    as u8;
+            }
             other => {
                 return Err(ProtocolError::Database(ZyronError::Internal(format!(
                     "unknown table option '{other}' on '{}'",
@@ -704,6 +794,45 @@ pub async fn handle_alter_table_options(
             }
         }
     }
+    if let Some(enable) = cdf_enable {
+        entry.cdf_enabled = enable;
+        if enable && entry.cdf_retention_days == 0 && entry.cdf.retention_micros == 0 {
+            entry.cdf_retention_days = DEFAULT_CDF_RETENTION_DAYS;
+            entry.cdf.retention_micros =
+                DEFAULT_CDF_RETENTION_DAYS as i64 * zyron_cdc::change_feed::MICROS_PER_DAY;
+        }
+        // A lake table's log already holds its history, and turning the
+        // feed on records no history, so the feed's changes begin above
+        // the version the table stands at now. A member that runs no lake
+        // tier holds no log and serves no read of the table, so it records
+        // the setting and leaves the source unregistered rather than
+        // refusing a statement the group agreed
+        if enable && entry.lake.is_lake() && server.deployment_mode.allows_lake() {
+            let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+            let log = zyron_lake::TransactionLog::lookup_shared(&paths).ok_or_else(|| {
+                ProtocolError::Database(ZyronError::CdcStreamError(format!(
+                    "lake table '{}' has no open transaction log on this node, so its                      change data feed cannot be turned on here",
+                    stmt.table
+                )))
+            })?;
+            entry.cdf.first_version = log.latest_version();
+        }
+    }
+    // The node's cap on any feed's retention holds whatever the statement
+    // asked for, and asking for more is refused naming the cap rather than
+    // silently held down to it
+    let max_retention_secs = cdc_setting(server, "cdc.cdf_max_retention_secs");
+    if max_retention_secs > 0 {
+        let asked_secs = entry.cdf.retention_micros / 1_000_000;
+        if asked_secs > max_retention_secs as i64 {
+            return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                "cdf_retention of {asked_secs} seconds on '{}' is above cdc.cdf_max_retention_secs,                  which caps every feed on this node at {max_retention_secs} seconds",
+                stmt.table
+            ))));
+        }
+    }
+    let cdf_config = feed_config_of(&entry);
+    let cdf_settings = (entry.id.0, entry.cdf_enabled, cdf_enable);
     let tid = entry.id.0;
     let retention = entry.time_travel_retention_secs;
     server
@@ -718,8 +847,173 @@ pub async fn handle_alter_table_options(
     if retention != 0 {
         server.txn_manager.status_map().enable_lsn_tracking();
     }
+    apply_feed_settings(server, cdf_settings, cdf_config).await?;
     audit(server, 8, &stmt.table, tid, "set lifecycle options").await?;
+    let actor_role = crate::ddl_dispatch::actor_role_id(session);
+    match cdf_enable {
+        Some(true) => tracing::info!(
+            target: "zyron::audit",
+            event = "ChangeFeedEnabled",
+            table = %stmt.table,
+            actor_role,
+        ),
+        Some(false) => tracing::info!(
+            target: "zyron::audit",
+            event = "ChangeFeedDisabled",
+            table = %stmt.table,
+            actor_role,
+        ),
+        None => {}
+    }
+    if !cdf_reconfigured.is_empty() {
+        tracing::info!(
+            target: "zyron::audit",
+            event = "ChangeFeedReconfigured",
+            table = %stmt.table,
+            options = %cdf_reconfigured.join(","),
+            actor_role,
+        );
+    }
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+}
+
+/// Default change data feed retention when a table turns the feed on without
+/// naming one
+pub(crate) const DEFAULT_CDF_RETENTION_DAYS: u32 = 7;
+
+/// A numeric `cdc.*` setting as the node's configuration holds it, zero
+/// when it is not set or not a number
+pub(crate) fn cdc_setting(server: &Arc<ServerState>, key: &str) -> u64 {
+    server
+        .config_lookup
+        .as_ref()
+        .and_then(|lookup| lookup(key))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// The feed configuration a table's catalog entry describes
+pub fn feed_config_of(entry: &zyron_catalog::TableEntry) -> zyron_cdc::FeedConfig {
+    let retention_micros = if entry.cdf.retention_micros != 0 {
+        entry.cdf.retention_micros
+    } else {
+        // A table carrying only the day count converts once here, which is
+        // what makes the interval the stored form from now on
+        entry.cdf_retention_days as i64 * zyron_cdc::change_feed::MICROS_PER_DAY
+    };
+    zyron_cdc::FeedConfig {
+        enabled: entry.cdf_enabled,
+        retention_micros,
+        columns: if entry.cdf.recorded_columns().is_empty() {
+            None
+        } else {
+            Some(entry.cdf.recorded_columns().iter().map(|id| id.0).collect())
+        },
+        before_image: entry.cdf.before_image,
+        codec: zyron_cdc::CdfCodec::from_u8(entry.cdf.compression)
+            .unwrap_or(zyron_cdc::CdfCodec::Lz4),
+        branch_point: 0,
+        first_version: entry.cdf.first_version,
+    }
+}
+
+/// Opens, reconfigures or closes a table's feed to match its entry.
+///
+/// Turning the feed off marks every stream on the table stale rather than
+/// dropping them, so an operator sees what turning it off broke and can turn
+/// it back on and reset
+pub(crate) async fn apply_feed_settings(
+    server: &Arc<ServerState>,
+    settings: (u32, bool, Option<bool>),
+    config: zyron_cdc::FeedConfig,
+) -> Result<(), ProtocolError> {
+    let (table_id, enabled, toggled) = settings;
+    let Some(registry) = server.cdc_registry.as_ref() else {
+        // Nothing to open. A table may still record the settings, which is
+        // what a node without CDC running answers with
+        return Ok(());
+    };
+    // A lake table records no feed. Its transaction log is the change
+    // record, registered here as the source a stream over it is judged by
+    let lake = server
+        .catalog
+        .get_table_by_id(zyron_catalog::TableId(table_id))
+        .map(|table| table.lake.is_lake())
+        .unwrap_or(false);
+    // A member that runs no lake tier holds no log to follow, and the
+    // streams over the table are read where the log is
+    if enabled && lake && !server.deployment_mode.allows_lake() {
+        return Ok(());
+    }
+    if enabled && lake {
+        crate::change_feed_bridge::register_lake_source(
+            registry,
+            server.disk_manager.data_dir(),
+            table_id,
+            config.before_image,
+            config.first_version,
+        )
+        .map_err(ProtocolError::Database)?;
+        // A branch that forked the table before its feed was on records
+        // the branch's changes of it from here on, from the head it keeps
+        if let Some(branches) = server.branch_manager.as_ref() {
+            crate::change_feed_bridge::register_lake_branch_sources(
+                registry,
+                server.disk_manager.data_dir(),
+                table_id,
+                config.before_image,
+                branches,
+            )
+            .map_err(ProtocolError::Database)?;
+        }
+        if toggled == Some(true) {
+            let cleared = crate::change_stream_dispatch::mark_streams_stale(server, table_id, "");
+            let cleared: Vec<zyron_catalog::ChangeStreamEntry> = cleared
+                .into_iter()
+                .map(|mut entry| {
+                    entry.stale = false;
+                    entry.stale_reason.clear();
+                    entry
+                })
+                .collect();
+            crate::change_stream_dispatch::persist_stream_changes(server, cleared).await?;
+        }
+        return Ok(());
+    }
+    if !enabled && lake {
+        let stale =
+            crate::change_stream_dispatch::mark_streams_stale(server, table_id, "feed_disabled");
+        crate::change_stream_dispatch::persist_stream_changes(server, stale).await?;
+        registry.remove_derived(table_id);
+        return Ok(());
+    }
+    if enabled {
+        registry
+            .enable_with_config(table_id, config)
+            .map_err(ProtocolError::Database)?;
+        if toggled == Some(true) {
+            let cleared = crate::change_stream_dispatch::mark_streams_stale(server, table_id, "");
+            let cleared: Vec<zyron_catalog::ChangeStreamEntry> = cleared
+                .into_iter()
+                .map(|mut entry| {
+                    entry.stale = false;
+                    entry.stale_reason.clear();
+                    entry
+                })
+                .collect();
+            crate::change_stream_dispatch::persist_stream_changes(server, cleared).await?;
+        }
+        return Ok(());
+    }
+    // The streams keep their positions, so what an operator broke is visible
+    // and recoverable rather than gone
+    let stale =
+        crate::change_stream_dispatch::mark_streams_stale(server, table_id, "feed_disabled");
+    crate::change_stream_dispatch::persist_stream_changes(server, stale).await?;
+    registry
+        .disable_for_table(table_id, false)
+        .map_err(ProtocolError::Database)?;
+    Ok(())
 }
 
 /// Parses a time-travel retention setting into seconds. `unlimited` is u64::MAX
@@ -867,6 +1161,10 @@ pub async fn handle_forget_user(
         &format!("FORGET USER '{}'", stmt.user_id),
     )?;
 
+    // Every member runs the erasure for itself, and each records the rows
+    // it removed in its feeds at the entry the statement runs as
+    let agreed = session.as_ref().and_then(|s| s.agreed_entry);
+
     // Legal hold supersedes erasure: reload holds and reject the whole
     // operation before mutating anything if any target table is held.
     reload_holds(server).await?;
@@ -898,6 +1196,7 @@ pub async fn handle_forget_user(
             &count_sql,
             false,
             false,
+            None,
         )
         .await?;
         if matched == 0 && t.history_table_id == 0 {
@@ -915,6 +1214,7 @@ pub async fn handle_forget_user(
             &del_sql,
             true,
             false,
+            agreed,
         )
         .await?;
         total_rows += deleted;
@@ -938,6 +1238,7 @@ pub async fn handle_forget_user(
                     &h_sql,
                     true,
                     false,
+                    agreed,
                 )
                 .await?;
                 total_rows += hn;
@@ -983,6 +1284,7 @@ pub async fn handle_export_user(
             &sel,
             false,
             false,
+            None,
         )
         .await?;
         let mut records: Vec<Vec<u8>> = Vec::new();
@@ -1518,6 +1820,7 @@ pub async fn handle_restore_soft_delete(
         &restore_sql,
         true,
         true,
+        None,
     )
     .await?;
 
@@ -1630,6 +1933,7 @@ pub async fn handle_run_retention_job(
                 &sel,
                 false,
                 false,
+                None,
             )
             .await?;
             (n, 4u8) // skipped/dry-run
@@ -1641,6 +1945,7 @@ pub async fn handle_run_retention_job(
                 &del,
                 true,
                 true,
+                None,
             )
             .await?;
             (n, 2u8) // done

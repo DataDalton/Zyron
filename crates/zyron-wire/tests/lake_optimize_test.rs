@@ -75,7 +75,7 @@ async fn optimize(server: &Arc<ServerState>, table: &str, cluster: bool, delete:
         .expect("table");
     let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
     let log = zyron_lake::TransactionLog::lookup_shared(&paths).expect("lake log");
-    zyron_wire::connection::lake_optimize(&server.catalog, &log, entry.id.0, cluster, delete)
+    zyron_wire::connection::lake_optimize(server, &log, entry.id.0, cluster, delete)
         .await
         .expect("optimize")
 }

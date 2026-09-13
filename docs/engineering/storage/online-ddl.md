@@ -28,7 +28,7 @@ A tuple whose epoch is neither 0 nor a recorded one is a corruption error naming
 | --- | --- | --- |
 | `ADD COLUMN` | New epoch appended | The encoded shape gained a column, so the bitmap and every offset after it moved |
 | `ALTER COLUMN ... TYPE <wider>` | New epoch appended | The encoded width changed |
-| `DROP COLUMN` | Unchanged | The bytes stay exactly where they were; only the catalog stops naming the column |
+| `DROP COLUMN` | Unchanged | The bytes stay exactly where they were, and only the catalog stops naming the column |
 
 ### Absent values and dropped placeholders
 
@@ -67,7 +67,7 @@ An index build has to cover two sets of rows: what existed when it started, and 
 
 **Wait.** This is the step the whole argument rests on. A transaction that resolved its index set *before* publication will not maintain the new index for the rest of its life, so its writes would fall in the gap. The build records `ProcArray::active_txn_ids()` at publication and waits until every one of them has ended. Afterwards, every writer still running resolved its index set after publication, so maintenance covers all of them.
 
-The wait holds out the transactions the statement is itself running inside: a session's own open transaction under an explicit `BEGIN`, and the transaction an applier is replaying a schema change under. Neither resolved an index set for the table before publication, and both are transactions that cannot end until the build returns. `Session::open_txn_id` and `Session::apply_txn_id` carry them; the DDL dispatch sets the first on every statement and the replication applier sets the second.
+The wait holds out the transactions the statement is itself running inside: a session's own open transaction under an explicit `BEGIN`, and the transaction an applier is replaying a schema change under. Neither resolved an index set for the table before publication, and both are transactions that cannot end until the build returns. `Session::open_txn_id` and `Session::apply_txn_id` carry them, the DDL dispatch setting the first on every statement and the replication applier the second.
 
 **Scan.** One `Snapshot`, streamed in batches of at most `DEFAULT_BUILD_BATCH_ROWS` (65536). Heap pages in page order through `HeapPage::live_slot_in_slice`, columnar segments through the columnar scan with the patch overlay. Each batch's (key, locator) pairs go into `KeySorter`, which holds one run buffer and spills sorted runs to `<data_dir>/indexes/build-<index_file_id>/` when it fills. Nothing holds more than one batch of rows and one run buffer.
 
@@ -103,11 +103,15 @@ When it is false the rows are re-encoded, in crates/zyron-wire/src/shadow_rewrit
 
 **Copy.** The source streamed under one `Snapshot`, cast, written to the shadow at background priority. No sort, so no spill. A cast failure names the row's locator and value, drops the shadow and its files, removes the maintenance entry, and leaves the source untouched.
 
+The shadow's heap carries no log through the fill, so a rewrite of a large table writes its rows once rather than once into the heap and again into the log the source's own writers are committing through. Nothing outside the rewrite can read those rows, since no statement resolves the shadow entry, and a stop before the swap drops the shadow and its files, so there is nothing to replay.
+
 **Catch up.** The copy read one snapshot. A row committed after it is either mirrored by the hook, which covers every writer that resolved its maintenance list after publication, or written by one of the transactions the wait drained. The second set is found by reading the source again and taking every row the row map does not already name. The wait is what bounds it.
 
 **Indexes.** Every B+tree the source declares is built on the shadow through the sequence above, so the swap installs a table that answers every access path the source did.
 
-**Swap.** One `update_table` replaces the source's heap file ids, columns and epochs with the shadow's, and `seal_initial_epoch` starts its epoch history over because nothing on disk was written under any earlier one. Statements that already opened the old files finish on them; new statements resolve the entry and open the new ones.
+**Swap.** The shadow's heap takes the log, every page the fill left dirty is flushed, and the heap and free space map files are synced, so from the moment the catalog names these files each row is either on disk or in the log. The log is attached ahead of the flush, so a row a writer mirrors while the flush runs is recorded rather than left on a page the flush already copied.
+
+One `update_table` then replaces the source's heap file ids, columns and epochs with the shadow's, and `seal_initial_epoch` starts its epoch history over because nothing on disk was written under any earlier one. Statements that already opened the old files finish on them. New statements resolve the entry and open the new ones.
 
 ## Constraints
 

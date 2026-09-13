@@ -40,17 +40,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
 use zyron_catalog::Catalog;
-use zyron_common::{ClusterDecision, DeploymentMode, LabeledMetrics};
+use zyron_common::{ClusterDecision, DeploymentMode, LabeledMetrics, ZyronError};
 use zyron_lake::{
     Decision, GateConfig, LakePaths, ResumeOptions, TablePassOptions, TransactionLog,
 };
+use zyron_wire::connection::ServerState;
 
 /// Longest a table waits to be looked at with nothing driving it. Reaching
 /// this means neither a commit nor read evidence nor an expiring retention
@@ -160,6 +161,10 @@ pub struct LakeClusteringWorker {
     shutdown: Arc<AtomicBool>,
     stats: Arc<LakeClusteringStats>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// Installed once the server state exists, which is after the worker
+    /// starts. A rewrite commits through it, which is what carries the
+    /// versions a pass writes to the rest of a group
+    server_state: Arc<OnceLock<Arc<ServerState>>>,
 }
 
 impl LakeClusteringWorker {
@@ -177,6 +182,7 @@ impl LakeClusteringWorker {
         }
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(LakeClusteringStats::default());
+        let server_state: Arc<OnceLock<Arc<ServerState>>> = Arc::new(OnceLock::new());
         let handle = tokio::spawn(clustering_loop(
             Arc::clone(&shutdown),
             Arc::clone(&stats),
@@ -184,13 +190,21 @@ impl LakeClusteringWorker {
             metrics,
             config,
             authority,
+            Arc::clone(&server_state),
         ));
         info!("lake clustering worker started");
         Some(Self {
             shutdown,
             stats,
             handle: Some(handle),
+            server_state,
         })
+    }
+
+    /// Hands the worker the server state its rewrites commit through. The
+    /// first installation is the one kept
+    pub fn install_server_state(&self, state: Arc<ServerState>) {
+        let _ = self.server_state.set(state);
     }
 
     pub fn stats(&self) -> &Arc<LakeClusteringStats> {
@@ -366,6 +380,47 @@ impl RewriteBudget {
     }
 }
 
+/// What one wake may do to a table.
+///
+/// Collapsing the log, checkpointing it and vacuuming unreferenced files is
+/// a node's own housekeeping over versions every member holds, so every
+/// member does it for itself. Rewriting the table commits new versions, so
+/// only a node with write authority does that, and a member of a group does
+/// it through the server state so the versions reach the group
+enum Scope {
+    Collapse,
+    Rewrite(Option<Arc<ServerState>>),
+}
+
+impl Scope {
+    /// The server state a rewrite commits through, None when this wake may
+    /// not rewrite or the node commits standalone
+    fn rewrites(&self) -> Option<Option<&Arc<ServerState>>> {
+        match self {
+            Scope::Collapse => None,
+            Scope::Rewrite(server) => Some(server.as_ref()),
+        }
+    }
+}
+
+/// What this wake may do, from whether the node may write and whether it
+/// has the state a group member commits through. A member that leads but
+/// whose server state is not installed yet collapses only, because a
+/// version it committed standalone would be held by this member alone
+fn scope_of(
+    authority: &crate::background::authority::WriteAuthority,
+    server_state: &OnceLock<Arc<ServerState>>,
+) -> Scope {
+    if !authority.may_write() {
+        return Scope::Collapse;
+    }
+    match server_state.get() {
+        Some(server) => Scope::Rewrite(Some(Arc::clone(server))),
+        None if authority.in_group() => Scope::Collapse,
+        None => Scope::Rewrite(None),
+    }
+}
+
 async fn clustering_loop(
     shutdown: Arc<AtomicBool>,
     stats: Arc<LakeClusteringStats>,
@@ -373,38 +428,23 @@ async fn clustering_loop(
     metrics: Option<Arc<LabeledMetrics>>,
     config: LakeClusteringConfig,
     authority: crate::background::authority::WriteAuthority,
+    server_state: Arc<OnceLock<Arc<ServerState>>>,
 ) {
-    // Passes a crash left half done are finished or unwound before any new
-    // one starts, so a resumed pass never races a fresh one over the same
-    // staging directory
     let mut states: HashMap<u32, TableState> = HashMap::new();
     let startup = Instant::now();
-    for (name, log) in lake_tables(&catalog, &config.data_dir) {
-        match zyron_lake::resume_cluster_passes(
-            &log,
-            pass_attempt(),
-            &[],
-            &ResumeOptions::default(),
-        ) {
-            Ok(outcomes) => {
-                for outcome in outcomes {
-                    stats.resumed.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        table = %name,
-                        pass_id = outcome.pass_id,
-                        version = ?outcome.version,
-                        "resumed an interrupted clustering pass"
-                    );
-                }
-            }
-            Err(e) => warn!(table = %name, error = %e, "clustering resume failed"),
-        }
-        // Nothing is known about a table until it has been looked at once,
-        // so every table the node holds open is due at startup
+    // Nothing is known about a table until it has been looked at once, so
+    // every table the node holds open is due at startup
+    for (_, log) in lake_tables(&catalog, &config.data_dir) {
         if let Some(id) = log.paths().table_id() {
             states.entry(id).or_insert_with(|| TableState::new(startup));
         }
     }
+    // Passes a crash left half done are finished or unwound before any new
+    // one starts, so a resumed pass never races a fresh one over the same
+    // staging directory. Finishing one commits a version, so it waits for
+    // the first wake on which this node may rewrite, and a resume that
+    // fails on one is tried again on the next such wake
+    let mut resumed = false;
 
     // A commit wakes the worker rather than a clock finding the commit
     // later. One worker owns the record, so a second installation would be
@@ -434,13 +474,9 @@ async fn clustering_loop(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        // Rewriting a lake table commits versions to this node's own log,
-        // and nothing carries a background commit to the rest of a group, so
-        // a member holds off entirely rather than leaving the others' logs
-        // behind its own
-        if !authority.may_write() {
-            tokio::time::sleep(Duration::from_secs(config.interval_secs.max(1))).await;
-            continue;
+        let scope = scope_of(&authority, &server_state);
+        if !resumed && let Some(server) = scope.rewrites() {
+            resumed = resume_passes(&catalog, &config, &stats, server).await;
         }
         stats.wakes.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
@@ -551,6 +587,7 @@ async fn clustering_loop(
                 &stats,
                 metrics.as_deref(),
                 &config,
+                &scope,
             )
             .await;
         }
@@ -564,6 +601,69 @@ async fn clustering_loop(
             _ = notify.notified() => {}
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
         }
+    }
+}
+
+/// Finishes or unwinds every clustering pass a crash left behind, one
+/// transaction per table, so a finished pass reaches the group the way a
+/// fresh one does. Answers whether every table's passes were dealt with,
+/// so a table whose resume failed is looked at again on the next wake
+async fn resume_passes(
+    catalog: &Catalog,
+    config: &LakeClusteringConfig,
+    stats: &LakeClusteringStats,
+    server: Option<&Arc<ServerState>>,
+) -> bool {
+    let mut all_resumed = true;
+    for (name, log) in lake_tables(catalog, &config.data_dir) {
+        let outcome = commit_step(server, |attempt| {
+            zyron_lake::resume_cluster_passes(&log, attempt, &[], &ResumeOptions::default())
+        })
+        .await;
+        match outcome {
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    stats.resumed.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        table = %name,
+                        pass_id = outcome.pass_id,
+                        version = ?outcome.version,
+                        "resumed an interrupted clustering pass"
+                    );
+                }
+            }
+            Err(e) => {
+                all_resumed = false;
+                warn!(table = %name, error = %e, "clustering resume failed, tried again on the next wake");
+            }
+        }
+    }
+    all_resumed
+}
+
+/// Runs one maintenance step that may commit a lake version, under a
+/// transaction of the server's when the node has one.
+///
+/// The version the step stages is committed through the group when this
+/// node leads one, which carries it and the files it adds to every member,
+/// and published here once the commit record is durable otherwise. A step
+/// that fails takes its staged version with it. Without a server state the
+/// step commits standalone, which is what a node outside any group does
+/// before its state is installed
+async fn commit_step<T>(
+    server: Option<&Arc<ServerState>>,
+    step: impl FnOnce(zyron_lake::CommitAttempt<'static>) -> Result<T, ZyronError>,
+) -> Result<T, ZyronError> {
+    match server {
+        Some(server) => {
+            zyron_wire::ddl_dispatch::lake_maintenance_step(
+                server,
+                zyron_lake::OperationKind::Optimize,
+                step,
+            )
+            .await
+        }
+        None => step(standalone_attempt()),
     }
 }
 
@@ -633,6 +733,7 @@ async fn evaluate_table(
     stats: &LakeClusteringStats,
     metrics: Option<&LabeledMetrics>,
     config: &LakeClusteringConfig,
+    scope: &Scope,
 ) {
     let now = Instant::now();
     // A deadline is the table asking to be looked at with no commit behind
@@ -677,8 +778,16 @@ async fn evaluate_table(
         }
     }
 
+    // A member that may not rewrite judges nothing about the layout. The
+    // leader's passes reach it as versions, and it looks again when they do
+    let Some(server) = scope.rewrites() else {
+        verdict.judged_version = Some(version);
+        state.seen_version = version;
+        reschedule(state, &verdict, budget, config, Instant::now());
+        return;
+    };
     match run_one_table(
-        catalog, name, log, table_id, pass_id, budget, stats, metrics, config,
+        catalog, name, log, table_id, pass_id, budget, stats, metrics, config, server,
     )
     .await
     {
@@ -962,11 +1071,12 @@ fn advance_retain_min(
 ///
 /// Returns the bytes the rewrite moved, which is what the caller charges
 /// against the node's rewrite budget
-fn auto_compact(
+async fn auto_compact(
     name: &str,
     log: &TransactionLog,
     table_id: u32,
     config: &LakeClusteringConfig,
+    server: Option<&Arc<ServerState>>,
 ) -> u64 {
     let Ok(before) = log.latest_manifest() else {
         return 0;
@@ -977,12 +1087,11 @@ fn auto_compact(
     };
 
     let dead_before = need.pending_deleted_rows;
-    let outcome = match zyron_lake::optimize(
-        log,
-        pass_attempt(),
-        table_id as u64,
-        config.target_rows_per_file,
-    ) {
+    let outcome = match commit_step(server, |attempt| {
+        zyron_lake::optimize(log, attempt, table_id as u64, config.target_rows_per_file)
+    })
+    .await
+    {
         Ok(o) => o,
         Err(e) => {
             warn!(
@@ -1063,6 +1172,7 @@ async fn run_one_table(
     stats: &LakeClusteringStats,
     metrics: Option<&LabeledMetrics>,
     config: &LakeClusteringConfig,
+    server: Option<&Arc<ServerState>>,
 ) -> Result<PassSummary, zyron_common::ZyronError> {
     let manifest = log.latest_manifest()?;
     let schedule = manifest.clustering_schedule();
@@ -1097,11 +1207,11 @@ async fn run_one_table(
     // appends its own index file over whatever keys it touched, so their
     // ranges overlap and a probe stops being able to prune to one file.
     // The check reads the manifest and opens nothing
-    match zyron_lake::operations::compact_indexes_if_fragmented(
-        log,
-        pass_attempt(),
-        table_id as u64,
-    ) {
+    match commit_step(server, |attempt| {
+        zyron_lake::operations::compact_indexes_if_fragmented(log, attempt, table_id as u64)
+    })
+    .await
+    {
         Ok(Some(version)) => tracing::info!(
             target: "zyron::lake",
             table = name,
@@ -1126,23 +1236,26 @@ async fn run_one_table(
     // delete pass first: a rewrite that drops logically deleted rows and
     // merges undersized files leaves the clustering pass fewer rows and
     // fewer inputs to carry
-    budget.charge(auto_compact(name, log, table_id, config));
+    budget.charge(auto_compact(name, log, table_id, config, server).await);
 
     // The layout decision itself lives in zyron-lake, so a scheduled pass
     // and an OPTIMIZE ... CLUSTER pass choose from the same evidence
     let started = Instant::now();
-    let report = zyron_lake::run_table_cluster_pass(
-        log,
-        pass_attempt(),
-        table_id,
-        &TablePassOptions {
-            pass_id,
-            target_rows_per_file: config.target_rows_per_file,
-            max_inputs: config.max_inputs,
-            gate: config.gate,
-            max_proposed_keys: zyron_lake::DEFAULT_MAX_PROPOSED_KEYS,
-        },
-    )?;
+    let report = commit_step(server, |attempt| {
+        zyron_lake::run_table_cluster_pass(
+            log,
+            attempt,
+            table_id,
+            &TablePassOptions {
+                pass_id,
+                target_rows_per_file: config.target_rows_per_file,
+                max_inputs: config.max_inputs,
+                gate: config.gate,
+                max_proposed_keys: zyron_lake::DEFAULT_MAX_PROPOSED_KEYS,
+            },
+        )
+    })
+    .await?;
     if let Some(metrics) = metrics {
         metrics.clusteringWorkloadWindowSet(name, report.evidence_columns as u64);
         metrics.clusteringPendingProposalsSet(name, u64::from(report.proposal_pending));
@@ -1312,9 +1425,11 @@ fn resolve_table(
     Some((entry.name.clone(), log))
 }
 
-/// Maintenance commits stand alone. `db_txn_id` zero publishes immediately
-/// rather than waiting on a database transaction that does not exist
-fn pass_attempt() -> zyron_lake::CommitAttempt<'static> {
+/// A maintenance commit with no database transaction behind it, which
+/// publishes as soon as it lands. What a node with no server state to
+/// commit through runs, which is a node outside any group before its state
+/// is installed
+fn standalone_attempt() -> zyron_lake::CommitAttempt<'static> {
     zyron_lake::CommitAttempt {
         operation: zyron_lake::OperationKind::Optimize,
         db_txn_id: 0,
@@ -1370,6 +1485,7 @@ mod tests {
             size_bytes: 8,
             row_count: 1,
             added_version: 0,
+            schema_id: 0,
             cluster_spec_id: 0,
             column_stats: std::sync::Arc::new(vec![]),
             delete_predicate_ids: vec![],

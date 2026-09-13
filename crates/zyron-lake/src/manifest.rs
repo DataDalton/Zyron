@@ -7,22 +7,33 @@
 //! point for time travel and the statistics source for pruning.
 //!
 //! Layout: 64-byte header, schema section, cluster spec section, file
-//! manifest section, delete predicate section, 48-byte footer holding the
-//! five section offsets, a CRC32 over everything before the checksum, and
-//! a trailing magic. All integers little endian.
+//! manifest section, delete predicate section, property section, index
+//! spec section, index file section, column type history section, a
+//! footer holding one offset per section plus the footer's own, a CRC32
+//! over everything before the checksum, and a trailing magic. All
+//! integers little endian.
 //!
 //! Two deliberate deviations from the original specification. The partition
 //! spec section carries the cluster spec, which subsumes a partition scheme.
 //! File entries are keyed by partition id, the data file path derives from
 //! it, so there is no path string table and no file lookup bloom, entries
 //! are sorted and binary searched exactly. Per-column value blooms are
-//! carried as opaque bytes and interpreted by the segment bloom reader
+//! carried as opaque bytes and interpreted by the segment bloom reader.
+//!
+//! A data file is immutable and holds its cells at the width its columns
+//! had when it was written. Each file entry records the schema id it was
+//! written under, and the type history records what each column's type was
+//! through each schema id it changed at, so a reader resolves the shape a
+//! file's cells actually have and widens them to the shape the column
+//! declares now. That is what lets a column's type widen without a file
+//! being rewritten
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use zyron_common::ZyronError;
 use zyron_common::format::envelope::{self, ENVELOPE_HEADER_LEN};
 use zyron_common::format::{FormatKind, FormatVersion};
+use zyron_common::{TypeId, ZyronError};
 
 use zyron_storage::columnar::{might_contain_serialized, might_contain_serialized_batch};
 
@@ -30,9 +41,11 @@ use crate::cells::value_to_cell;
 use crate::codec::{Cursor, corrupt};
 use crate::index::{IndexFileEntry, LakeIndexSpec};
 use crate::predicate::{
-    ColumnBounds, LakePredicate, LakeValue, PruneDecision, StatsSource, decode_value, encode_value,
+    ColumnBounds, CompareOp, LakePredicate, LakeValue, PruneDecision, StatsSource, decode_value,
+    encode_value,
 };
 use crate::schema::LakeSchema;
+use crate::widen::{CellShape, PICOS_PER_MICRO, Widening, widen_value, widening_between};
 
 /// The steps that move an older checkpoint forward, one file each beside
 /// the fixtures they read
@@ -48,10 +61,43 @@ pub const MANIFEST_FORMAT_VERSION: FormatVersion = crate::format::LAKE_MANIFEST_
 
 /// Envelope header plus the manifest's own header extension.
 const HEADER_LEN: usize = 64;
-// Eight section offsets, CRC32, trailing magic. Three more than the
-// original five-offset specification: properties, index specs and index
-// files
-const FOOTER_LEN: usize = 8 * 8 + 4 + 4;
+
+/// Sections a manifest written at 2.1 or earlier holds, each with an
+/// offset in the footer, schema, cluster spec, files, delete predicates,
+/// properties, index specs and index files
+const SECTIONS_THROUGH_2_1: usize = 7;
+
+/// Sections the current layout holds, the column type history behind the
+/// index files
+const SECTIONS: usize = SECTIONS_THROUGH_2_1 + 1;
+
+/// One offset per section, one for the footer itself, CRC32, trailing
+/// magic
+const fn footer_len(sections: usize) -> usize {
+    (sections + 1) * 8 + 4 + 4
+}
+
+/// Sections a manifest at `version` holds
+fn sections_at(version: FormatVersion) -> usize {
+    if version < crate::format::LAKE_MANIFEST_FORMAT_VERSION_2_2 {
+        SECTIONS_THROUGH_2_1
+    } else {
+        SECTIONS
+    }
+}
+
+/// Whether a manifest at `version` records the schema id each file was
+/// written under and the column type history
+fn records_written_shapes(version: FormatVersion) -> bool {
+    version >= crate::format::LAKE_MANIFEST_FORMAT_VERSION_2_2
+}
+
+/// Smallest footer any readable version carries
+const MIN_FOOTER_LEN: usize = footer_len(SECTIONS_THROUGH_2_1);
+
+/// Encoded size of one type history record, the bound a count is checked
+/// against
+pub(crate) const MIN_PRIOR_TYPE: usize = 4 + 8 + 1 + 1;
 
 // Minimum encoded sizes guarding count fields against corrupt preallocation
 const MIN_FILE_ENTRY: usize = 42;
@@ -188,6 +234,11 @@ pub struct PartitionEntry {
     pub row_count: u64,
     /// Log version whose commit added this file
     pub added_version: u64,
+    /// Schema the file's cells were encoded under, stamped by the log when
+    /// the adding commit applies. A column whose type widened since is
+    /// resolved through the manifest's type history to the shape this
+    /// file actually holds
+    pub schema_id: u64,
     /// Cluster spec the file was written under, reconstructing the layout
     /// a past version saw
     pub cluster_spec_id: u32,
@@ -219,6 +270,251 @@ impl StatsSource for PartitionEntry {
     }
 }
 
+/// The shape one column had in a file written under `schema_id`, from a
+/// type history sorted by column id then schema id, None when it is the
+/// shape the schema declares now
+fn written_type_in(
+    history: &[PriorColumnType],
+    column_id: u32,
+    schema_id: u64,
+) -> Option<PriorColumnType> {
+    let start =
+        history.partition_point(|p| (p.column_id, p.through_schema_id) < (column_id, schema_id));
+    history
+        .get(start)
+        .filter(|p| p.column_id == column_id)
+        .copied()
+}
+
+/// Bounds recorded in the shape `prior` describes, widened to the shape
+/// `column` declares. Borrowed when the two shapes are the same bytes or
+/// no widening reads one as the other, in which case the bounds stand as
+/// recorded, and a bound the widening cannot move reads as unknown
+fn bounds_in_shape<'a>(
+    prior: &PriorColumnType,
+    column: &crate::schema::LakeColumn,
+    bounds: &'a ColumnBounds,
+) -> Cow<'a, ColumnBounds> {
+    let from = CellShape::new(prior.type_id, prior.fractional_digits);
+    let to = CellShape::new(column.type_id, column.fractional_digits);
+    let Ok(Some(widening)) = widening_between(from, to) else {
+        return Cow::Borrowed(bounds);
+    };
+    if matches!(
+        widening,
+        Widening::SignExtend { .. } | Widening::ZeroExtend { .. }
+    ) {
+        return Cow::Borrowed(bounds);
+    }
+    Cow::Owned(ColumnBounds {
+        min: bounds.min.as_ref().and_then(|v| widen_value(widening, v)),
+        max: bounds.max.as_ref().and_then(|v| widen_value(widening, v)),
+        null_count: bounds.null_count,
+        row_count: bounds.row_count,
+    })
+}
+
+/// The factor a column's constants move by between two declared shapes
+#[derive(Debug, Clone, Copy)]
+enum ScaleChange {
+    /// The new shape holds the old values multiplied by the factor, as a
+    /// sixteen byte value
+    Grow(i128),
+    /// The new shape holds the old values divided by the factor, at the
+    /// physical type the new shape lays cells out as
+    Shrink { factor: i128, physical: TypeId },
+}
+
+/// What one comparison on a rescaled column becomes
+enum Rescaled {
+    Value(LakeValue),
+    /// The constant fell between two values of the new scale or outside
+    /// it, which decides the comparison for every row
+    Always(bool),
+    Unchanged,
+}
+
+/// The change between two shapes, None when they are the same bytes or
+/// when the change moves no value, such as a wider integer or a change of
+/// family a comparison already cannot decide
+fn scale_change(from: CellShape, to: CellShape) -> Result<Option<ScaleChange>, ZyronError> {
+    if from == to {
+        return Ok(None);
+    }
+    if let Ok(Some(widening)) = widening_between(from, to) {
+        return Ok(scale_factor(widening)?.map(ScaleChange::Grow));
+    }
+    if let Ok(Some(widening)) = widening_between(to, from) {
+        return Ok(scale_factor(widening)?.map(|factor| ScaleChange::Shrink {
+            factor,
+            physical: to.physical(),
+        }));
+    }
+    Ok(None)
+}
+
+/// The factor a widening multiplies values by, None for one that leaves
+/// every value as it is
+fn scale_factor(widening: Widening) -> Result<Option<i128>, ZyronError> {
+    Ok(match widening {
+        Widening::MicrosToPicos => Some(PICOS_PER_MICRO),
+        Widening::DecimalRescale { by } => Some(10i128.checked_pow(by).ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "a decimal scale cannot grow by {by} digits inside a sixteen byte value"
+            ))
+        })?),
+        Widening::SignExtend { .. } | Widening::ZeroExtend { .. } => None,
+    })
+}
+
+fn integer_of(value: &LakeValue) -> Option<i128> {
+    match value {
+        LakeValue::Int(v) => Some(*v as i128),
+        LakeValue::Int128(v) => Some(*v),
+        LakeValue::UInt(v) => Some(*v as i128),
+        LakeValue::UInt128(v) => i128::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+fn scale_overflow(value: i128, factor: i128) -> ZyronError {
+    ZyronError::Internal(format!(
+        "a delete predicate constant {value} does not fit its column's scale grown by {factor}"
+    ))
+}
+
+/// A value on the narrower scale, at the physical type that scale lays
+/// cells out as. None when it does not fit that type, which a caller
+/// decides the comparison from
+fn narrowed(value: i128, physical: TypeId) -> Option<LakeValue> {
+    match physical.fixed_size() {
+        Some(8) => i64::try_from(value).ok().map(LakeValue::Int),
+        _ => Some(LakeValue::Int128(value)),
+    }
+}
+
+/// Moves one comparison's constant across a scale change. Shrinking
+/// rounds toward the side that keeps the comparison exact, so `x < c`
+/// over picoseconds admits the same rows over microseconds
+fn rescale_compare(
+    op: CompareOp,
+    value: &LakeValue,
+    change: ScaleChange,
+) -> Result<Rescaled, ZyronError> {
+    let Some(v) = integer_of(value) else {
+        return Ok(Rescaled::Unchanged);
+    };
+    match change {
+        ScaleChange::Grow(factor) => Ok(Rescaled::Value(LakeValue::Int128(
+            v.checked_mul(factor)
+                .ok_or_else(|| scale_overflow(v, factor))?,
+        ))),
+        ScaleChange::Shrink { factor, physical } => {
+            let exact = v.rem_euclid(factor) == 0;
+            let floor = v.div_euclid(factor);
+            let ceil = if exact { floor } else { floor + 1 };
+            let scaled = match op {
+                CompareOp::Eq if !exact => return Ok(Rescaled::Always(false)),
+                CompareOp::NotEq if !exact => return Ok(Rescaled::Always(true)),
+                CompareOp::Eq | CompareOp::NotEq => floor,
+                CompareOp::Lt | CompareOp::GtEq => ceil,
+                CompareOp::LtEq | CompareOp::Gt => floor,
+            };
+            match narrowed(scaled, physical) {
+                Some(value) => Ok(Rescaled::Value(value)),
+                // Past the narrower type's range on one side, so every
+                // value the column can hold sits on the other
+                None => {
+                    let above = scaled > 0;
+                    Ok(Rescaled::Always(match op {
+                        CompareOp::Lt | CompareOp::LtEq => above,
+                        CompareOp::Gt | CompareOp::GtEq => !above,
+                        CompareOp::Eq => false,
+                        CompareOp::NotEq => true,
+                    }))
+                }
+            }
+        }
+    }
+}
+
+/// One member of an IN list across a scale change, None for a member no
+/// value of the new scale equals
+fn scale_exact(value: &LakeValue, change: ScaleChange) -> Result<Option<LakeValue>, ZyronError> {
+    let Some(v) = integer_of(value) else {
+        return Ok(Some(value.clone()));
+    };
+    match change {
+        ScaleChange::Grow(factor) => Ok(Some(LakeValue::Int128(
+            v.checked_mul(factor)
+                .ok_or_else(|| scale_overflow(v, factor))?,
+        ))),
+        ScaleChange::Shrink { factor, physical } => {
+            if v.rem_euclid(factor) != 0 {
+                return Ok(None);
+            }
+            Ok(narrowed(v.div_euclid(factor), physical))
+        }
+    }
+}
+
+/// Moves every constant on `column_id` inside a predicate tree across a
+/// scale change. A comparison the change decides for every row becomes
+/// the empty conjunction or disjunction, which is what true and false are
+/// in this tree
+fn rescale_node(
+    node: &mut LakePredicate,
+    column_id: u32,
+    change: ScaleChange,
+) -> Result<(), ZyronError> {
+    let decided = match node {
+        LakePredicate::Compare {
+            column_id: c,
+            op,
+            value,
+        } if *c == column_id => match rescale_compare(*op, value, change)? {
+            Rescaled::Value(moved) => {
+                *value = moved;
+                None
+            }
+            Rescaled::Always(truth) => Some(truth),
+            Rescaled::Unchanged => None,
+        },
+        LakePredicate::In {
+            column_id: c,
+            values,
+        } if *c == column_id => {
+            let mut kept = Vec::with_capacity(values.len());
+            for value in values.iter() {
+                if let Some(moved) = scale_exact(value, change)? {
+                    kept.push(moved);
+                }
+            }
+            *values = kept;
+            None
+        }
+        LakePredicate::And(children) | LakePredicate::Or(children) => {
+            for child in children.iter_mut() {
+                rescale_node(child, column_id, change)?;
+            }
+            None
+        }
+        LakePredicate::Not(inner) => {
+            rescale_node(inner, column_id, change)?;
+            None
+        }
+        _ => None,
+    };
+    if let Some(truth) = decided {
+        *node = if truth {
+            LakePredicate::And(Vec::new())
+        } else {
+            LakePredicate::Or(Vec::new())
+        };
+    }
+    Ok(())
+}
+
 /// One file's statistics read against the schema that types its columns.
 ///
 /// A bloom probe needs the column's physical type to encode the constant
@@ -228,11 +524,26 @@ impl StatsSource for PartitionEntry {
 pub struct FileStats<'a> {
     entry: &'a PartitionEntry,
     schema: &'a LakeSchema,
+    /// The physical type each column's cells were written as, for the
+    /// columns whose type widened since the file was written. A bloom was
+    /// built over the written cells, so a constant is encoded at that
+    /// width to probe it
+    written: Vec<(u32, TypeId)>,
+    /// The bounds of those same columns widened to the shape the schema
+    /// declares, since the file recorded them in the shape it was written
+    /// in and a constant compares on the declared scale
+    widened: Vec<(u32, ColumnBounds)>,
 }
 
 impl<'a> FileStats<'a> {
+    /// Statistics of a file whose cells have the shape the schema declares
     pub fn new(entry: &'a PartitionEntry, schema: &'a LakeSchema) -> Self {
-        Self { entry, schema }
+        Self {
+            entry,
+            schema,
+            written: Vec::new(),
+            widened: Vec::new(),
+        }
     }
 
     pub fn entry(&self) -> &'a PartitionEntry {
@@ -251,7 +562,12 @@ impl<'a> FileStats<'a> {
         let stats = self.entry.stats_for(column_id)?;
         let bloom = stats.bloom.as_deref()?;
         let column = self.schema.column_by_id(column_id)?;
-        let physical = column.physical_type_id();
+        let physical = self
+            .written
+            .iter()
+            .find(|(id, _)| *id == column_id)
+            .map(|(_, physical)| *physical)
+            .unwrap_or_else(|| column.physical_type_id());
         let width = physical.fixed_size().unwrap_or(0);
         Some((bloom, physical, width))
     }
@@ -259,6 +575,9 @@ impl<'a> FileStats<'a> {
 
 impl StatsSource for FileStats<'_> {
     fn bounds(&self, column_id: u32) -> Option<&ColumnBounds> {
+        if let Some((_, bounds)) = self.widened.iter().find(|(id, _)| *id == column_id) {
+            return Some(bounds);
+        }
         self.entry.stats_for(column_id).map(|s| &s.bounds)
     }
 
@@ -326,6 +645,45 @@ pub struct DeletePredicate {
     pub pending_rows: u64,
 }
 
+/// The type one column had through one schema id, recorded when a later
+/// schema changed it.
+///
+/// A file written under a schema id at or below `through_schema_id` holds
+/// this column's cells in this shape. Records ascend by column id, then by
+/// the schema id they reach, so the first record at or past a file's schema
+/// id is the shape that file has
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorColumnType {
+    pub column_id: u32,
+    /// The last schema id the column was written in this shape under
+    pub through_schema_id: u64,
+    pub type_id: TypeId,
+    pub fractional_digits: Option<u8>,
+}
+
+impl PriorColumnType {
+    /// The type the cell bytes were laid out as under this shape
+    pub fn physical_type_id(&self) -> TypeId {
+        TypeId::timestamp_physical_type_id(self.type_id, self.fractional_digits)
+    }
+}
+
+/// The shape one column's cells have in one file, resolved from the
+/// file's schema id and the type history
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrittenColumn {
+    pub column_id: u32,
+    pub type_id: TypeId,
+    pub fractional_digits: Option<u8>,
+}
+
+impl WrittenColumn {
+    /// The type the cell bytes are laid out as
+    pub fn physical_type_id(&self) -> TypeId {
+        TypeId::timestamp_physical_type_id(self.type_id, self.fractional_digits)
+    }
+}
+
 /// Complete table state at one log version
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManifestFile {
@@ -349,6 +707,11 @@ pub struct ManifestFile {
     /// the same directory the data files do and are versioned with them,
     /// which is what makes an index readable at a past version
     pub index_files: Vec<IndexFileEntry>,
+    /// What each column's type was through each schema id it changed at,
+    /// sorted by column id then schema id. Empty on a table whose columns
+    /// have kept their types, which is the common case and costs nothing
+    /// to ask
+    pub type_history: Vec<PriorColumnType>,
 }
 
 impl ManifestFile {
@@ -434,7 +797,172 @@ impl ManifestFile {
                 )));
             }
         }
+        for entry in self
+            .entries
+            .iter()
+            .chain(self.index_files.iter().map(|f| &f.file))
+        {
+            if entry.schema_id > self.schema.schema_id {
+                return Err(ZyronError::Internal(format!(
+                    "partition {:#x} was written under schema {}, which is past the manifest's \
+                     schema {}",
+                    entry.partition_id, entry.schema_id, self.schema.schema_id
+                )));
+            }
+        }
+        for pair in self.type_history.windows(2) {
+            let a = (pair[0].column_id, pair[0].through_schema_id);
+            let b = (pair[1].column_id, pair[1].through_schema_id);
+            if a >= b {
+                return Err(ZyronError::Internal(format!(
+                    "manifest type history not strictly sorted at column {} schema {}",
+                    b.0, b.1
+                )));
+            }
+        }
+        for prior in &self.type_history {
+            if prior.through_schema_id >= self.schema.schema_id {
+                return Err(ZyronError::Internal(format!(
+                    "manifest type history names column {} through schema {}, which is not \
+                     below the manifest's schema {}",
+                    prior.column_id, prior.through_schema_id, self.schema.schema_id
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Records what the columns of the current schema were before `next`
+    /// replaces it, for every column whose type or digits `next` changes.
+    ///
+    /// Called by the log as it applies a schema change, so a file written
+    /// under the schema being replaced stays readable in the shape it has
+    pub fn record_type_changes(&mut self, next: &LakeSchema) {
+        let through = self.schema.schema_id;
+        let mut changed = false;
+        for column in &next.columns {
+            let Some(prior) = self.schema.column_by_id(column.id) else {
+                continue;
+            };
+            if prior.type_id == column.type_id
+                && prior.fractional_digits == column.fractional_digits
+            {
+                continue;
+            }
+            self.type_history.push(PriorColumnType {
+                column_id: column.id,
+                through_schema_id: through,
+                type_id: prior.type_id,
+                fractional_digits: prior.fractional_digits,
+            });
+            changed = true;
+        }
+        if changed {
+            self.type_history
+                .sort_unstable_by_key(|p| (p.column_id, p.through_schema_id));
+        }
+    }
+
+    /// Whether any column's type changed after `schema_id`, which is when
+    /// a file written under it holds a column in another shape than the
+    /// schema declares. One comparison against the last record, since the
+    /// history is empty on a table whose types never changed
+    pub fn types_changed_since(&self, schema_id: u64) -> bool {
+        self.type_history
+            .iter()
+            .any(|prior| prior.through_schema_id >= schema_id)
+    }
+
+    /// The shape one column had in a file written under `schema_id`, None
+    /// when it is the shape the schema declares now
+    pub fn written_type_at(&self, column_id: u32, schema_id: u64) -> Option<PriorColumnType> {
+        written_type_in(&self.type_history, column_id, schema_id)
+    }
+
+    /// Records shapes columns had under earlier schema ids that a clone or
+    /// a merge carried in beside files written under them. A shape already
+    /// recorded stays as it is
+    pub fn absorb_type_history(&mut self, carried: &[PriorColumnType]) {
+        let mut changed = false;
+        for prior in carried {
+            let known = self.type_history.iter().any(|p| {
+                p.column_id == prior.column_id && p.through_schema_id == prior.through_schema_id
+            });
+            if !known {
+                self.type_history.push(*prior);
+                changed = true;
+            }
+        }
+        if changed {
+            self.type_history
+                .sort_unstable_by_key(|p| (p.column_id, p.through_schema_id));
+        }
+    }
+
+    /// Moves the constants of every delete predicate on a column whose
+    /// declared shape `next` changes to the scale the column declares from
+    /// then on, so a predicate recorded against microsecond instants still
+    /// names the same instants once the column holds picoseconds. Files
+    /// written at the new width compare against the constants as they
+    /// are, and a file in the old shape is compared through its own shape
+    /// by the reader
+    pub fn rescale_predicates_for(&mut self, next: &LakeSchema) -> Result<(), ZyronError> {
+        for column in &next.columns {
+            let Some(prior) = self.schema.column_by_id(column.id) else {
+                continue;
+            };
+            let from = CellShape::new(prior.type_id, prior.fractional_digits);
+            let to = CellShape::new(column.type_id, column.fractional_digits);
+            let Some(change) = scale_change(from, to)? else {
+                continue;
+            };
+            for predicate in &mut self.delete_predicates {
+                rescale_node(&mut predicate.predicate, column.id, change)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The shape every column's cells have in a file written under
+    /// `schema_id`, one record per column of the current schema
+    pub fn written_columns(&self, schema_id: u64) -> Vec<WrittenColumn> {
+        self.schema
+            .columns
+            .iter()
+            .map(|column| match self.written_type_at(column.id, schema_id) {
+                Some(prior) => WrittenColumn {
+                    column_id: column.id,
+                    type_id: prior.type_id,
+                    fractional_digits: prior.fractional_digits,
+                },
+                None => WrittenColumn {
+                    column_id: column.id,
+                    type_id: column.type_id,
+                    fractional_digits: column.fractional_digits,
+                },
+            })
+            .collect()
+    }
+
+    /// The schema a file's stored bytes follow, the current schema with
+    /// every column the file holds in an older shape typed as written.
+    ///
+    /// Borrowed for a file whose cells have the declared shape, which is
+    /// every file of a table whose types never changed, so the common
+    /// case allocates nothing. A predicate lowered against this schema
+    /// compares constants encoded the way the file's cells are
+    pub fn file_schema(&self, entry: &PartitionEntry) -> Cow<'_, LakeSchema> {
+        if !self.types_changed_since(entry.schema_id) {
+            return Cow::Borrowed(&self.schema);
+        }
+        let mut schema = self.schema.clone();
+        for column in &mut schema.columns {
+            if let Some(prior) = self.written_type_at(column.id, entry.schema_id) {
+                column.type_id = prior.type_id;
+                column.fractional_digits = prior.fractional_digits;
+            }
+        }
+        Cow::Owned(schema)
     }
 
     /// One declared index, indexes are sorted by index id
@@ -584,9 +1112,59 @@ impl ManifestFile {
     }
 
     /// One file's statistics paired with this manifest's schema, the form
-    /// pruning reads so bounds and value blooms both apply
+    /// pruning reads so bounds and value blooms both apply. A column the
+    /// file holds in an older shape probes its bloom at that shape
     pub fn file_stats<'a>(&'a self, entry: &'a PartitionEntry) -> FileStats<'a> {
-        FileStats::new(entry, &self.schema)
+        Self::file_stats_in(&self.schema, &self.type_history, entry)
+    }
+
+    /// The same view from a schema and a type history held apart from the
+    /// manifest, for a caller that is changing the manifest's files while
+    /// it judges them
+    pub fn file_stats_in<'a>(
+        schema: &'a LakeSchema,
+        history: &[PriorColumnType],
+        entry: &'a PartitionEntry,
+    ) -> FileStats<'a> {
+        let mut stats = FileStats::new(entry, schema);
+        if !history
+            .iter()
+            .any(|prior| prior.through_schema_id >= entry.schema_id)
+        {
+            return stats;
+        }
+        for column in &schema.columns {
+            let Some(prior) = written_type_in(history, column.id, entry.schema_id) else {
+                continue;
+            };
+            stats.written.push((column.id, prior.physical_type_id()));
+            if let Some(recorded) = entry.stats_for(column.id)
+                && let Cow::Owned(bounds) = bounds_in_shape(&prior, column, &recorded.bounds)
+            {
+                stats.widened.push((column.id, bounds));
+            }
+        }
+        stats
+    }
+
+    /// One file's bounds for a column in the shape the schema declares. A
+    /// column the file holds in an older shape recorded its bounds in that
+    /// shape, and a comparison against a constant on the declared scale
+    /// needs them widened first. Borrowed when the file holds the column
+    /// as declared, which is every column of a table whose types never
+    /// changed
+    pub fn bounds_in_declared_shape<'a>(
+        &self,
+        entry: &PartitionEntry,
+        stats: &'a ColumnStatsEntry,
+    ) -> Cow<'a, ColumnBounds> {
+        let Some(prior) = self.written_type_at(stats.column_id, entry.schema_id) else {
+            return Cow::Borrowed(&stats.bounds);
+        };
+        let Some(column) = self.schema.column_by_id(stats.column_id) else {
+            return Cow::Borrowed(&stats.bounds);
+        };
+        bounds_in_shape(&prior, column, &stats.bounds)
     }
 
     /// How this predicate scores against one file, bounds and blooms both
@@ -607,7 +1185,17 @@ impl ManifestFile {
 
     /// Serializes the whole manifest including header and footer
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER_LEN + FOOTER_LEN + 256 * self.entries.len());
+        self.encode_at(MANIFEST_FORMAT_VERSION)
+    }
+
+    /// Serializes the manifest in the layout of `version`, which a
+    /// migration step uses to lay a checkpoint down at the version its
+    /// step reaches. A layout before 2.2 records no written shapes, so the
+    /// type history and the files' schema ids are left out of it
+    pub fn encode_at(&self, version: FormatVersion) -> Vec<u8> {
+        let with_shapes = records_written_shapes(version);
+        let mut buf =
+            Vec::with_capacity(HEADER_LEN + footer_len(SECTIONS) + 256 * self.entries.len());
 
         // Envelope header, then the manifest's own header fields. The
         // envelope's header checksum is stamped over the fixed part and the
@@ -621,7 +1209,7 @@ impl ManifestFile {
         buf.resize(HEADER_LEN, 0);
         let header = envelope::encode_header(
             FormatKind::LakeManifest,
-            MANIFEST_FORMAT_VERSION,
+            version,
             0,
             &buf[ENVELOPE_HEADER_LEN..HEADER_LEN],
         );
@@ -636,7 +1224,7 @@ impl ManifestFile {
         let files_off = buf.len() as u64;
         buf.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
         for entry in &self.entries {
-            encode_partition_entry(entry, &mut buf);
+            encode_partition_entry_at(entry, &mut buf, with_shapes);
         }
 
         let deletes_off = buf.len() as u64;
@@ -663,7 +1251,15 @@ impl ManifestFile {
         let index_files_off = buf.len() as u64;
         buf.extend_from_slice(&(self.index_files.len() as u64).to_le_bytes());
         for file in &self.index_files {
-            encode_index_file(file, &mut buf);
+            encode_index_file_at(file, &mut buf, with_shapes);
+        }
+
+        let history_off = buf.len() as u64;
+        if with_shapes {
+            buf.extend_from_slice(&(self.type_history.len() as u32).to_le_bytes());
+            for prior in &self.type_history {
+                encode_prior_type(prior, &mut buf);
+            }
         }
 
         let footer_off = buf.len() as u64;
@@ -674,6 +1270,9 @@ impl ManifestFile {
         buf.extend_from_slice(&props_off.to_le_bytes());
         buf.extend_from_slice(&index_specs_off.to_le_bytes());
         buf.extend_from_slice(&index_files_off.to_le_bytes());
+        if with_shapes {
+            buf.extend_from_slice(&history_off.to_le_bytes());
+        }
         buf.extend_from_slice(&footer_off.to_le_bytes());
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -684,7 +1283,7 @@ impl ManifestFile {
     /// Parses and validates a whole manifest. `ctx` names the file for
     /// error messages. The checksum is verified before any section parse
     pub fn decode(bytes: &[u8], ctx: &str) -> Result<Self, ZyronError> {
-        if bytes.len() < HEADER_LEN + FOOTER_LEN {
+        if bytes.len() < HEADER_LEN + MIN_FOOTER_LEN {
             return Err(corrupt(
                 ctx,
                 format!(
@@ -755,14 +1354,29 @@ impl ManifestFile {
         let parent_snapshot_id = h.u64()?;
         let header_spec_id = h.u32()?;
 
-        let mut f = Cursor::new(&bytes[bytes.len() - FOOTER_LEN..crc_field], ctx);
-        let mut offsets = [0u64; 8];
+        // The footer holds one offset per section the version lays down,
+        // so its length and the offset count follow from the version
+        let sections = sections_at(header.version);
+        let with_shapes = records_written_shapes(header.version);
+        let footer = footer_len(sections);
+        if bytes.len() < HEADER_LEN + footer {
+            return Err(corrupt(
+                ctx,
+                format!(
+                    "manifest of {} bytes is shorter than header plus the footer its version \
+                     carries",
+                    bytes.len()
+                ),
+            ));
+        }
+        let mut f = Cursor::new(&bytes[bytes.len() - footer..crc_field], ctx);
+        let mut offsets = vec![0u64; sections + 1];
         for slot in &mut offsets {
             *slot = f.u64()?;
         }
-        let footer_start = (bytes.len() - FOOTER_LEN) as u64;
+        let footer_start = (bytes.len() - footer) as u64;
         if offsets[0] != HEADER_LEN as u64
-            || offsets[7] != footer_start
+            || offsets[sections] != footer_start
             || offsets.windows(2).any(|w| w[0] > w[1])
         {
             return Err(corrupt(
@@ -805,12 +1419,20 @@ impl ManifestFile {
             ));
         }
 
+        // A layout before 2.2 recorded no schema id per file. No column
+        // type had ever changed under such a layout, so every file it
+        // lists holds the shape its schema declares
+        let shapes = if with_shapes {
+            WrittenShapes::Recorded
+        } else {
+            WrittenShapes::Declared(header_schema_id)
+        };
         let mut fr = Cursor::new(section(2), ctx);
         let file_count = fr.u64()? as usize;
         fr.check_count(file_count, MIN_FILE_ENTRY, "file entry")?;
         let mut entries = Vec::with_capacity(file_count);
         for _ in 0..file_count {
-            entries.push(decode_partition_entry(&mut fr)?);
+            entries.push(decode_partition_entry_at(&mut fr, shapes)?);
         }
         if fr.remaining() != 0 {
             return Err(corrupt(
@@ -866,10 +1488,27 @@ impl ManifestFile {
         xr.check_count(index_file_count, MIN_INDEX_FILE, "index file")?;
         let mut index_files = Vec::with_capacity(index_file_count);
         for _ in 0..index_file_count {
-            index_files.push(decode_index_file(&mut xr)?);
+            index_files.push(decode_index_file_at(&mut xr, shapes)?);
         }
         if xr.remaining() != 0 {
             return Err(corrupt(ctx, "index file section has trailing bytes".into()));
+        }
+
+        let mut type_history = Vec::new();
+        if with_shapes {
+            let mut hr = Cursor::new(section(7), ctx);
+            let prior_count = hr.u32()? as usize;
+            hr.check_count(prior_count, MIN_PRIOR_TYPE, "type history record")?;
+            type_history.reserve(prior_count);
+            for _ in 0..prior_count {
+                type_history.push(decode_prior_type(&mut hr)?);
+            }
+            if hr.remaining() != 0 {
+                return Err(corrupt(
+                    ctx,
+                    "type history section has trailing bytes".into(),
+                ));
+            }
         }
 
         let manifest = Self {
@@ -883,6 +1522,7 @@ impl ManifestFile {
             properties,
             indexes,
             index_files,
+            type_history,
         };
         manifest
             .validate()
@@ -925,18 +1565,87 @@ pub(crate) fn decode_index_spec(r: &mut Cursor<'_>) -> Result<LakeIndexSpec, Zyr
     Ok(spec)
 }
 
-/// Serializes one index file record, shared by the manifest index file
-/// section and AddIndexFile log entries
+/// The digits byte of a type history record for a column that declares
+/// none
+const NO_DIGITS: u8 = 0xFF;
+
+/// Serializes one type history record, the shape a column had through a
+/// schema id, the way the manifest's history section and a log entry
+/// carrying history both lay it down
+pub(crate) fn encode_prior_type(prior: &PriorColumnType, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&prior.column_id.to_le_bytes());
+    buf.extend_from_slice(&prior.through_schema_id.to_le_bytes());
+    buf.push(prior.type_id as u8);
+    buf.push(prior.fractional_digits.unwrap_or(NO_DIGITS));
+}
+
+/// Parses one type history record from a positioned cursor
+pub(crate) fn decode_prior_type(r: &mut Cursor<'_>) -> Result<PriorColumnType, ZyronError> {
+    let column_id = r.u32()?;
+    let through_schema_id = r.u64()?;
+    let raw_type = r.u8()?;
+    let type_id = TypeId::from_u8(raw_type).ok_or_else(|| {
+        r.corrupt(format!(
+            "type history names column {column_id} with unknown type {raw_type}"
+        ))
+    })?;
+    let digits = r.u8()?;
+    Ok(PriorColumnType {
+        column_id,
+        through_schema_id,
+        type_id,
+        fractional_digits: (digits != NO_DIGITS).then_some(digits),
+    })
+}
+
+/// Where a decoded file record takes the schema id it was written under
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrittenShapes {
+    /// The record carries it
+    Recorded,
+    /// The record predates the field, and the file holds the shape this
+    /// schema declares. A log entry passes zero, which the log stamps
+    /// with the schema in force when the entry applies
+    Declared(u64),
+}
+
+/// Serializes one index file record for an AddIndexFile log entry, which
+/// carries no schema id, the log stamps one when the entry applies
 pub(crate) fn encode_index_file(file: &IndexFileEntry, buf: &mut Vec<u8>) {
+    encode_index_file_at(file, buf, false);
+}
+
+/// Serializes one index file record with the schema id its file was
+/// written under, for a log entry that carries one
+pub(crate) fn encode_index_file_recorded(file: &IndexFileEntry, buf: &mut Vec<u8>) {
+    encode_index_file_at(file, buf, true);
+}
+
+/// Parses one index file record that carries its schema id
+pub(crate) fn decode_index_file_recorded(r: &mut Cursor<'_>) -> Result<IndexFileEntry, ZyronError> {
+    decode_index_file_at(r, WrittenShapes::Recorded)
+}
+
+/// Serializes one index file record, with the schema id its file was
+/// written under when `with_schema_id`
+fn encode_index_file_at(file: &IndexFileEntry, buf: &mut Vec<u8>, with_schema_id: bool) {
     buf.extend_from_slice(&file.index_id.to_le_bytes());
     buf.extend_from_slice(&(file.covers.len() as u32).to_le_bytes());
     for partition_id in &file.covers {
         buf.extend_from_slice(&partition_id.to_le_bytes());
     }
-    encode_partition_entry(&file.file, buf);
+    encode_partition_entry_at(&file.file, buf, with_schema_id);
 }
 
+/// Parses one index file record of an AddIndexFile log entry
 pub(crate) fn decode_index_file(r: &mut Cursor<'_>) -> Result<IndexFileEntry, ZyronError> {
+    decode_index_file_at(r, WrittenShapes::Declared(0))
+}
+
+fn decode_index_file_at(
+    r: &mut Cursor<'_>,
+    shapes: WrittenShapes,
+) -> Result<IndexFileEntry, ZyronError> {
     let index_id = r.u32()?;
     let cover_count = r.u32()? as usize;
     r.check_count(cover_count, 8, "index coverage")?;
@@ -944,7 +1653,7 @@ pub(crate) fn decode_index_file(r: &mut Cursor<'_>) -> Result<IndexFileEntry, Zy
     for _ in 0..cover_count {
         covers.push(r.u64()?);
     }
-    let file = decode_partition_entry(r)?;
+    let file = decode_partition_entry_at(r, shapes)?;
     Ok(IndexFileEntry {
         index_id,
         covers,
@@ -952,13 +1661,23 @@ pub(crate) fn decode_index_file(r: &mut Cursor<'_>) -> Result<IndexFileEntry, Zy
     })
 }
 
-/// Serializes one data file record, shared by the manifest file section
-/// and AddFile log entries
+/// Serializes one data file record for an AddFile log entry, which carries
+/// no schema id, the log stamps one when the entry applies
 pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) {
+    encode_partition_entry_at(entry, buf, false);
+}
+
+/// Serializes one data file record, with the schema id the file was
+/// written under when `with_schema_id`, which the manifest file section
+/// records and a log entry does not
+fn encode_partition_entry_at(entry: &PartitionEntry, buf: &mut Vec<u8>, with_schema_id: bool) {
     buf.extend_from_slice(&entry.partition_id.to_le_bytes());
     buf.extend_from_slice(&entry.size_bytes.to_le_bytes());
     buf.extend_from_slice(&entry.row_count.to_le_bytes());
     buf.extend_from_slice(&entry.added_version.to_le_bytes());
+    if with_schema_id {
+        buf.extend_from_slice(&entry.schema_id.to_le_bytes());
+    }
     buf.extend_from_slice(&entry.cluster_spec_id.to_le_bytes());
     buf.extend_from_slice(&(entry.column_stats.len() as u16).to_le_bytes());
     for stat in entry.column_stats.iter() {
@@ -1013,12 +1732,38 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
     }
 }
 
-/// Parses one data file record from a positioned cursor
+/// Parses one data file record of an AddFile log entry
 pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEntry, ZyronError> {
+    decode_partition_entry_at(fr, WrittenShapes::Declared(0))
+}
+
+/// Serializes one data file record with the schema id the file was
+/// written under, for a log entry that carries one
+pub(crate) fn encode_partition_entry_recorded(entry: &PartitionEntry, buf: &mut Vec<u8>) {
+    encode_partition_entry_at(entry, buf, true);
+}
+
+/// Parses one data file record that carries its schema id
+pub(crate) fn decode_partition_entry_recorded(
+    fr: &mut Cursor<'_>,
+) -> Result<PartitionEntry, ZyronError> {
+    decode_partition_entry_at(fr, WrittenShapes::Recorded)
+}
+
+/// Parses one data file record from a positioned cursor, taking the
+/// schema id it was written under from the record or from `shapes`
+fn decode_partition_entry_at(
+    fr: &mut Cursor<'_>,
+    shapes: WrittenShapes,
+) -> Result<PartitionEntry, ZyronError> {
     let partition_id = fr.u64()?;
     let size_bytes = fr.u64()?;
     let row_count = fr.u64()?;
     let added_version = fr.u64()?;
+    let schema_id = match shapes {
+        WrittenShapes::Recorded => fr.u64()?,
+        WrittenShapes::Declared(schema_id) => schema_id,
+    };
     let cluster_spec_id = fr.u32()?;
     let stats_count = fr.u16()? as usize;
     fr.check_count(stats_count, MIN_STATS_ENTRY, "column stats")?;
@@ -1093,6 +1838,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
         size_bytes,
         row_count,
         added_version,
+        schema_id,
         cluster_spec_id,
         column_stats: std::sync::Arc::new(column_stats),
         delete_predicate_ids,
@@ -1512,6 +2258,7 @@ mod tests {
                     size_bytes: 4096,
                     row_count: 100,
                     added_version: 7,
+                    schema_id: 2,
                     cluster_spec_id: 1,
                     column_stats: std::sync::Arc::new(vec![stats(0, 1, 100, 0, 100)]),
                     delete_predicate_ids: vec![],
@@ -1521,6 +2268,7 @@ mod tests {
                     size_bytes: 8192,
                     row_count: 200,
                     added_version: 40,
+                    schema_id: 3,
                     cluster_spec_id: 2,
                     column_stats: std::sync::Arc::new(vec![
                         stats(0, 101, 300, 0, 200),
@@ -1578,6 +2326,7 @@ mod tests {
                     size_bytes: 512,
                     row_count: 6,
                     added_version: 41,
+                    schema_id: 3,
                     cluster_spec_id: 0,
                     column_stats: std::sync::Arc::new(vec![ColumnStatsEntry {
                         column_id: 0,
@@ -1595,6 +2344,14 @@ mod tests {
                     delete_predicate_ids: Vec::new(),
                 },
             }],
+            // The id column was a narrower integer through schema two,
+            // so the file written under schema two holds it in that shape
+            type_history: vec![PriorColumnType {
+                column_id: 0,
+                through_schema_id: 2,
+                type_id: TypeId::Int32,
+                fractional_digits: None,
+            }],
         }
     }
 
@@ -1604,6 +2361,112 @@ mod tests {
         let bytes = m.encode();
         let decoded = ManifestFile::decode(&bytes, "test.zym").expect("decodes");
         assert_eq!(decoded, m);
+    }
+
+    /// The layout before written shapes carries no schema id per file and
+    /// no type history, so encoding at it drops both and decoding it reads
+    /// every file as holding the declared shape
+    #[test]
+    fn test_encoding_at_the_previous_layout_records_no_written_shapes() {
+        let m = sample();
+        let bytes = m.encode_at(crate::format::LAKE_MANIFEST_FORMAT_VERSION_2_1);
+        let (_, version) = envelope::peek(&bytes).expect("peeks");
+        assert_eq!(version, crate::format::LAKE_MANIFEST_FORMAT_VERSION_2_1);
+        let decoded = ManifestFile::decode(&bytes, "test.zym").expect("decodes");
+        assert!(decoded.type_history.is_empty());
+        assert!(
+            decoded
+                .entries
+                .iter()
+                .chain(decoded.index_files.iter().map(|f| &f.file))
+                .all(|e| e.schema_id == m.schema.schema_id),
+            "a file the old layout lists holds the shape its schema declares"
+        );
+        let mut expected = m.clone();
+        expected.type_history.clear();
+        for entry in &mut expected.entries {
+            entry.schema_id = m.schema.schema_id;
+        }
+        for file in &mut expected.index_files {
+            file.file.schema_id = m.schema.schema_id;
+        }
+        assert_eq!(decoded, expected);
+    }
+
+    /// A file's schema id and the type history together say what shape
+    /// each of its columns has, and a table whose types never changed
+    /// answers the current schema without allocating
+    #[test]
+    fn test_written_shapes_resolve_through_the_type_history() {
+        let m = sample();
+        // The file written under schema two holds the id column as it was
+        let narrow = &m.entries[0];
+        assert_eq!(
+            m.written_type_at(0, narrow.schema_id).map(|p| p.type_id),
+            Some(TypeId::Int32)
+        );
+        assert!(m.types_changed_since(narrow.schema_id));
+        let schema = m.file_schema(narrow);
+        assert!(matches!(schema, Cow::Owned(_)));
+        assert_eq!(
+            schema.column_by_id(0).map(|c| c.type_id),
+            Some(TypeId::Int32)
+        );
+        assert_eq!(
+            schema.column_by_id(1).map(|c| c.type_id),
+            m.schema.column_by_id(1).map(|c| c.type_id),
+            "a column that never changed keeps its declared type"
+        );
+        let written = m.written_columns(narrow.schema_id);
+        assert_eq!(written[0].type_id, TypeId::Int32);
+        assert_eq!(written[0].physical_type_id(), TypeId::Int32);
+        assert_eq!(
+            Some(written[1].type_id),
+            m.schema.column_by_id(1).map(|c| c.type_id)
+        );
+
+        // The file written under schema three holds the shape declared now
+        let wide = &m.entries[1];
+        assert_eq!(m.written_type_at(0, wide.schema_id), None);
+        assert!(!m.types_changed_since(wide.schema_id));
+        assert!(matches!(m.file_schema(wide), Cow::Borrowed(_)));
+
+        // Without a history nothing is resolved and nothing is allocated
+        let mut plain = m.clone();
+        plain.type_history.clear();
+        assert!(!plain.types_changed_since(1));
+        assert!(matches!(plain.file_schema(narrow), Cow::Borrowed(_)));
+    }
+
+    /// A schema change that widens a column records the shape it replaces
+    /// against the schema id it was written under, once per change
+    #[test]
+    fn test_a_schema_change_records_the_shape_it_replaces() {
+        let mut m = sample();
+        m.type_history.clear();
+        let mut next = m.schema.clone();
+        next.schema_id += 1;
+        next.columns[0].type_id = TypeId::Int128;
+        m.record_type_changes(&next);
+        assert_eq!(
+            m.type_history,
+            vec![PriorColumnType {
+                column_id: 0,
+                through_schema_id: m.schema.schema_id,
+                type_id: TypeId::Int64,
+                fractional_digits: None,
+            }]
+        );
+        let unchanged_before = m.type_history.clone();
+        let mut renamed = next.clone();
+        renamed.schema_id += 1;
+        renamed.columns[1].name = "label".into();
+        m.schema = next;
+        m.record_type_changes(&renamed);
+        assert_eq!(
+            m.type_history, unchanged_before,
+            "a change that keeps every type records nothing"
+        );
     }
 
     #[test]
@@ -1619,6 +2482,7 @@ mod tests {
             properties: BTreeMap::new(),
             indexes: Vec::new(),
             index_files: Vec::new(),
+            type_history: Vec::new(),
         };
         let bytes = m.encode();
         let decoded = ManifestFile::decode(&bytes, "test.zym").expect("decodes");
@@ -1979,6 +2843,7 @@ mod tests {
                 size_bytes: rows * 8,
                 row_count: *rows,
                 added_version: 1,
+                schema_id: manifest.schema.schema_id,
                 cluster_spec_id: 0,
                 column_stats: std::sync::Arc::new(Vec::new()),
                 delete_predicate_ids: Vec::new(),

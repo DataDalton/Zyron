@@ -186,6 +186,7 @@ mod tests {
             size_bytes: 64,
             row_count: 1,
             added_version: 0,
+            schema_id: 0,
             cluster_spec_id: 0,
             column_stats: std::sync::Arc::new(vec![]),
             delete_predicate_ids: vec![],

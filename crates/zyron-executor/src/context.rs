@@ -20,7 +20,17 @@ use crate::column::ScalarValue;
 
 /// Hook for Change Data Capture. Implemented by zyron-cdc, called by DML operators.
 pub trait CdcHook: Send + Sync {
-    /// Called after rows are inserted.
+    /// Whether a write on the table hands the hook its row images.
+    ///
+    /// A heap write has the tuples it wrote in hand, but a lake write
+    /// encodes an image per row for the hook alone, so a hook that records
+    /// nothing of the table, or derives the table's changes from its own
+    /// store, answers false and the writer encodes nothing for it
+    fn records_rows_of(&self, table_id: u32, branch: Option<u64>) -> bool;
+
+    /// Called after rows are inserted. `branch` names the branch the write
+    /// landed on, None for the table itself, and a branch's changes are
+    /// recorded in the branch's own feed
     fn on_insert(
         &self,
         table_id: u32,
@@ -29,6 +39,7 @@ pub trait CdcHook: Send + Sync {
         timestamp: i64,
         txn_id: u64,
         is_last_in_txn: bool,
+        branch: Option<u64>,
     ) -> zyron_common::Result<()>;
 
     /// Called after rows are deleted. old_data contains pre-delete tuple bytes.
@@ -40,6 +51,7 @@ pub trait CdcHook: Send + Sync {
         timestamp: i64,
         txn_id: u64,
         is_last_in_txn: bool,
+        branch: Option<u64>,
     ) -> zyron_common::Result<()>;
 
     /// Called after rows are updated. old_data/new_data contain pre/post tuple bytes.
@@ -52,7 +64,407 @@ pub trait CdcHook: Send + Sync {
         timestamp: i64,
         txn_id: u64,
         is_last_in_txn: bool,
+        branch: Option<u64>,
     ) -> zyron_common::Result<()>;
+
+    /// Called after a table is truncated. The record names no row, so a
+    /// consumer reads the change kind and nothing else
+    fn on_truncate(
+        &self,
+        table_id: u32,
+        version: u64,
+        timestamp: i64,
+        txn_id: u64,
+        branch: Option<u64>,
+    ) -> zyron_common::Result<()>;
+}
+
+/// Which feed a change is recorded in or read from, a table's own, or a
+/// branch's on that table
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FeedKey {
+    pub table_id: u32,
+    pub branch: Option<u64>,
+}
+
+impl FeedKey {
+    pub fn table(table_id: u32) -> Self {
+        Self {
+            table_id,
+            branch: None,
+        }
+    }
+}
+
+/// One change record a scan reads, borrowing its row bytes from whatever
+/// holds them.
+///
+/// A heap table's changes come from its own change files and a lake table's
+/// are derived from its transaction log, and this is the shape both arrive
+/// in. Borrowed rather than owned because a scan of ten million changes
+/// decodes straight into column builders, and an owned row per record would
+/// be an allocation per record
+#[derive(Debug, Clone, Copy)]
+pub struct ChangeRowRef<'a> {
+    pub table_id: u32,
+    /// The change kind's own code, which `_change_type` renders by name
+    pub change_type: u8,
+    pub commit_version: u64,
+    pub commit_timestamp: i64,
+    pub txn_id: u64,
+    /// Position within the commit, so an update's two rows sort together
+    pub change_ordinal: u64,
+    /// The layout the row bytes were written under
+    pub schema_epoch: u16,
+    /// True when the row bytes hold the feed's column subset rather than the
+    /// table's full layout
+    pub projected: bool,
+    pub row_data: &'a [u8],
+}
+
+/// One source table's window in a change scan
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeWindow {
+    pub table_id: u32,
+    /// The branch whose feed is read, None for the table's own
+    pub branch: Option<u64>,
+    /// Changes above this version are read
+    pub from_exclusive: u64,
+    /// Changes at or below this version are read
+    pub to_inclusive: u64,
+    /// Lowest commit timestamp a record may carry
+    pub from_timestamp: i64,
+    /// Highest commit timestamp a record may carry
+    pub to_timestamp: i64,
+    /// One bit per admitted change kind. None admits every kind
+    pub change_types: Option<u8>,
+}
+
+/// What one window's read opened
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangeScanStats {
+    pub files_opened: usize,
+    pub files_pruned: usize,
+}
+
+/// One read of a window in progress.
+///
+/// The scan operator asks for one batch at a time, and what the cursor
+/// holds between two asks is where it stopped, so the whole read costs one
+/// pass over the window's files
+pub trait ChangeCursor: Send {
+    /// Feeds changes to the visitor from where the cursor stands until the
+    /// visitor answers false or the window ends. Answers false once the
+    /// window is exhausted
+    fn next(
+        &mut self,
+        visit: &mut dyn FnMut(ChangeRowRef<'_>) -> zyron_common::Result<bool>,
+    ) -> zyron_common::Result<bool>;
+
+    /// The files the read opens over its whole window and the ones it
+    /// pruned, known once it is opened
+    fn stats(&self) -> ChangeScanStats;
+
+    /// Takes the rest of the read as parts that load and walk apart from
+    /// one another, in the order their records come, leaving the cursor
+    /// with nothing to hand over through `next`. A part is what one worker
+    /// decodes on its own, a segment of a feed or one commit of a lake
+    /// table's log, so a wide window is decoded across cores
+    fn take_segments(&mut self) -> Vec<Box<dyn ChangeSegment>>;
+}
+
+/// One part of a window's read that loads and walks on its own
+pub trait ChangeSegment: Send {
+    /// Loads the part and hands its records, in commit version then
+    /// position order, to the visitor until it answers false or the part
+    /// ends
+    fn visit(
+        &mut self,
+        visit: &mut dyn FnMut(ChangeRowRef<'_>) -> zyron_common::Result<bool>,
+    ) -> zyron_common::Result<()>;
+
+    /// The part in its column-sliced form, when it is stored that way, so
+    /// a read appends whole columns and decodes only the ones it wants.
+    /// None for a part that is read through `visit`
+    fn columns(&mut self) -> zyron_common::Result<Option<Box<dyn ChangeColumnSource>>>;
+}
+
+/// The group a record with no row bytes names
+pub const CHANGE_NO_GROUP: u16 = u16::MAX;
+
+/// The record headers of a column-sliced part, one vector per field, in
+/// record order
+#[derive(Debug, Default, Clone)]
+pub struct ChangeRecordHeads {
+    pub change_types: Vec<u8>,
+    pub versions: Vec<u64>,
+    pub timestamps: Vec<i64>,
+    pub txn_ids: Vec<u64>,
+    pub ordinals: Vec<u64>,
+    /// Which layout group each record's row is in, `CHANGE_NO_GROUP` for a
+    /// record with no row
+    pub group_of: Vec<u16>,
+}
+
+/// The rows of one layout in a column-sliced part
+#[derive(Debug, Clone)]
+pub struct ChangeGroupShape {
+    pub epoch: u16,
+    pub projected: bool,
+    pub rows: usize,
+    /// The physical type of each column, in tuple order
+    pub types: Vec<zyron_common::TypeId>,
+}
+
+/// One column of one group, decoded
+#[derive(Debug, Clone)]
+pub enum ChangeColumnBlock {
+    /// Cells of one width back to back, a NULL cell's bytes zero, with one
+    /// null bit per row
+    Fixed {
+        width: usize,
+        nulls: Vec<u8>,
+        values: Vec<u8>,
+    },
+    /// Cells laid end to end with their starts, one more than the rows
+    Varlen {
+        nulls: Vec<u8>,
+        offsets: Vec<u32>,
+        bytes: Vec<u8>,
+    },
+}
+
+impl ChangeColumnBlock {
+    /// Whether the cell at `row` is NULL
+    #[inline]
+    pub fn is_null(&self, row: usize) -> bool {
+        let nulls = match self {
+            ChangeColumnBlock::Fixed { nulls, .. } => nulls,
+            ChangeColumnBlock::Varlen { nulls, .. } => nulls,
+        };
+        nulls
+            .get(row / 8)
+            .is_some_and(|byte| (byte >> (row % 8)) & 1 == 1)
+    }
+
+    /// Whether any cell in `rows` is NULL
+    pub fn any_null(&self, rows: std::ops::Range<usize>) -> bool {
+        let nulls = match self {
+            ChangeColumnBlock::Fixed { nulls, .. } => nulls,
+            ChangeColumnBlock::Varlen { nulls, .. } => nulls,
+        };
+        // Whole bytes are tested at once, the partial ones at either end
+        // bit by bit
+        let mut at = rows.start;
+        while at < rows.end {
+            if at % 8 == 0 && at + 8 <= rows.end {
+                if nulls.get(at / 8).is_some_and(|byte| *byte != 0) {
+                    return true;
+                }
+                at += 8;
+            } else {
+                if self.is_null(at) {
+                    return true;
+                }
+                at += 1;
+            }
+        }
+        false
+    }
+
+    /// The cell's bytes at `row`
+    #[inline]
+    pub fn cell(&self, row: usize) -> &[u8] {
+        match self {
+            ChangeColumnBlock::Fixed { width, values, .. } => {
+                &values[row * width..(row + 1) * width]
+            }
+            ChangeColumnBlock::Varlen { offsets, bytes, .. } => {
+                &bytes[offsets[row] as usize..offsets[row + 1] as usize]
+            }
+        }
+    }
+}
+
+/// A column-sliced part, its record headers decoded and its columns
+/// decoded as they are asked for
+pub trait ChangeColumnSource: Send {
+    fn heads(&self) -> &ChangeRecordHeads;
+    fn groups(&self) -> &[ChangeGroupShape];
+    /// Decodes one column of one group
+    fn column(&self, group: usize, column: usize) -> zyron_common::Result<ChangeColumnBlock>;
+    /// The null bits of one column of one group, one bit per row, a set bit
+    /// a NULL cell
+    fn column_nulls(&self, group: usize, column: usize) -> zyron_common::Result<Vec<u8>>;
+    /// Decodes the cells of a fixed width column straight into `out`, which
+    /// is the column's width times its rows long, a NULL cell's bytes zero.
+    /// A column that is not fixed width is an error
+    fn column_values_into(
+        &self,
+        group: usize,
+        column: usize,
+        out: &mut [u8],
+    ) -> zyron_common::Result<()>;
+}
+
+/// Reads a table's recorded changes, whichever store holds them.
+///
+/// Implemented by the server layer, which is where the change feeds and the
+/// lake transaction logs live. The executor asks for a window and decodes
+/// what comes back, so the operator is the same for a heap table and a lake
+/// table
+pub trait ChangeFeedReader: Send + Sync {
+    /// Opens a read of the window's changes, in commit version then position
+    /// order, that hands them over a batch at a time and keeps its place
+    /// between batches.
+    ///
+    /// `resume` names the last position already handed over, so a read that
+    /// continues from a stream's position starts after it
+    fn open_window(
+        &self,
+        window: &ChangeWindow,
+        resume: Option<(u64, u64)>,
+    ) -> zyron_common::Result<Box<dyn ChangeCursor>>;
+
+    /// The files a window would open, without opening one
+    fn plan_window(&self, window: &ChangeWindow) -> zyron_common::Result<ChangeScanStats>;
+
+    /// What every named source holds at one instant.
+    ///
+    /// A stream read resolves its windows against this once it holds the
+    /// position lock, so what it reads is what stands at that instant rather
+    /// than at the instant the statement was planned. `outcome` says whether
+    /// a transaction is over as of the read's snapshot, and a source's
+    /// `first_open` names the lowest version an unfinished one wrote at,
+    /// which no window may reach. A transaction whose commit of one source
+    /// readers cannot see yet is unfinished for every source, so its writes
+    /// are handed over to all of them at once
+    fn boundaries(
+        &self,
+        sources: &[FeedKey],
+        outcome: &dyn Fn(u64) -> zyron_storage::txn::TxnStatus,
+    ) -> zyron_common::Result<Vec<SourceBoundary>>;
+
+    /// Records at or below a version, counted from the feed's creation, which
+    /// is the number a stream position replicates as
+    fn records_at_or_below(&self, source: FeedKey, version: u64) -> zyron_common::Result<u64>;
+
+    /// Records written before the record at `ordinal` within `version`,
+    /// counted from the feed's creation
+    fn records_before(
+        &self,
+        source: FeedKey,
+        version: u64,
+        ordinal: u64,
+    ) -> zyron_common::Result<u64>;
+
+    /// The version and ordinal of the record at which the source had
+    /// recorded exactly `count` changes, where a read resumes after a
+    /// position that consumed that many. None for a count of zero
+    fn cursor_at_count(
+        &self,
+        source: FeedKey,
+        count: u64,
+    ) -> zyron_common::Result<Option<(u64, u64)>>;
+
+    /// One version a read of `sources` that takes at most `max_rows`
+    /// records past each position ends at, moved past every transaction
+    /// that wrote inside the read and again beyond it. Each source is the
+    /// feed, the version its read starts after, and the records consumed
+    /// so far. None when no source holds that many records past its
+    /// position
+    fn bounded_cut(
+        &self,
+        sources: &[(FeedKey, u64, u64)],
+        max_rows: u64,
+    ) -> zyron_common::Result<Option<u64>>;
+
+    /// The version each window ends at once no transaction is handed over
+    /// by halves across the sources, in the order given. A transaction
+    /// with a commit inside one window pulls the others up to its commits
+    /// in their sources, and one that cannot be held whole within every
+    /// source's limit is left for a later read, with every window held
+    /// below it
+    fn align_windows(&self, windows: &[WindowBound]) -> zyron_common::Result<Vec<u64>>;
+
+    /// Where a branch's feed on a table begins, the version of the table's
+    /// own feed the branch was taken at. None when the branch records no
+    /// changes of the table, so a read inside it is a read of the table
+    fn branch_point(&self, table_id: u32, branch: u64) -> zyron_common::Result<Option<u64>>;
+
+    /// The newest version a source's changes reach, zero when none
+    fn latest_version(&self, source: FeedKey) -> zyron_common::Result<u64>;
+}
+
+/// One source's window as a stream read resolved it on its own, before
+/// the windows of every source are aligned
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBound {
+    pub source: FeedKey,
+    /// The version the read starts after
+    pub from_exclusive: u64,
+    /// The version the read ends at, bounded by the source's own count
+    pub to_inclusive: u64,
+    /// The highest version the read may end at, the newest the source
+    /// holds below the first commit of a transaction still open
+    pub limit: u64,
+}
+
+/// What one source holds at the instant a stream read resolves its windows
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceBoundary {
+    pub source: FeedKey,
+    /// The newest version the source's changes reach, zero when none
+    pub latest: u64,
+    /// Changes recorded since the source's feed was created
+    pub records: u64,
+    /// The lowest version an unfinished transaction wrote at, None when
+    /// every recorded change belongs to a transaction that has ended
+    pub first_open: Option<u64>,
+    /// True when the source is a lake table, whose versions are its own
+    /// commit sequence rather than the node's change clock
+    pub lake: bool,
+}
+
+/// When a write's changes are recorded in the table's change feed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangeCaptureMode {
+    /// The statement records its own changes as it writes them, at the log
+    /// position it wrote at. What a node with no consensus group does
+    #[default]
+    AtStatement,
+    /// The statement records nothing. Its changes reach the feed when the
+    /// group's applier applies the entry that carries them, in the log's
+    /// order, so every member's feed holds the same changes in the same
+    /// order. What a connection on a grouped node does
+    Deferred,
+    /// The applier is recording an entry's changes, at that entry's index
+    /// and the instant the entry was proposed, which are the same on every
+    /// member
+    Applied,
+}
+
+/// A write's changes go here, at this version and instant
+pub struct ChangeCapture<'a> {
+    pub hook: &'a Arc<dyn CdcHook>,
+    pub version: u64,
+    pub timestamp: i64,
+    /// The branch the write lands on, None for the table itself
+    pub branch: Option<u64>,
+}
+
+/// A change stream position this statement will move when it commits.
+///
+/// Recorded by the scan and applied by the commit path, which is what puts
+/// the advance in the same commit as the rows the consumer wrote. A rollback
+/// discards the record along with everything else the transaction held
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingStreamAdvance {
+    pub stream_id: u32,
+    /// Per source table, the version reached and the record count at or below
+    /// it. The count is what replicates, because it names the same place on
+    /// every member of a group
+    pub positions: Vec<(u32, u64, u64)>,
 }
 
 /// Hook for BEFORE triggers. Called before DML mutations to allow
@@ -213,6 +625,31 @@ pub struct ExecutionContext {
     pub analyze: bool,
     /// Optional CDC hook invoked by DML operators after mutations.
     pub cdc_hook: Option<Arc<dyn CdcHook>>,
+    /// When this context's writes reach the change feed
+    pub change_capture_mode: ChangeCaptureMode,
+    /// Set while the applier records an entry's changes itself, from the
+    /// changeset, so the operators replaying its rows do not record them a
+    /// second time. Cleared around an operation the changeset carries no
+    /// row images for, which the operators record as they always did
+    capture_muted: AtomicBool,
+    /// The version an applied entry's changes are recorded at, set by the
+    /// applier before each entry it records
+    pub change_version: AtomicU64,
+    /// The instant an applied entry's changes are recorded at, in
+    /// microseconds since the epoch
+    pub change_timestamp: std::sync::atomic::AtomicI64,
+    /// Reads a table's recorded changes, for `table_changes` and for a read
+    /// of a change stream. None where CDC is not enabled, and a change scan
+    /// then reports that rather than answering with nothing
+    pub change_feed: Option<Arc<dyn ChangeFeedReader>>,
+    /// Change stream positions this statement will move at commit. Shared
+    /// with every child context, so a stream read inside a subquery records
+    /// its advance in the same place the top level statement does
+    pub pending_stream_advances: Arc<parking_lot::Mutex<Vec<PendingStreamAdvance>>>,
+    /// Exclusive locks over change stream positions. A transactional consume
+    /// takes one before its first record and holds it until the transaction
+    /// ends, so two consumers never take the same changes
+    pub stream_position_locks: Option<Arc<zyron_storage::txn::StreamPositionLocks>>,
     /// Where this transaction's effects accumulate for the consensus group.
     /// None on a node that leads no group, which is what makes replication an
     /// addition to the write path rather than a second write path
@@ -392,6 +829,13 @@ impl ExecutionContext {
             variant_paths: std::sync::RwLock::new(Arc::from(Vec::new())),
             analyze: false,
             cdc_hook: None,
+            change_feed: None,
+            change_capture_mode: ChangeCaptureMode::AtStatement,
+            capture_muted: AtomicBool::new(false),
+            change_version: AtomicU64::new(0),
+            change_timestamp: std::sync::atomic::AtomicI64::new(0),
+            pending_stream_advances: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            stream_position_locks: None,
             replication: None,
             replication_apply: false,
             dml_hook: None,
@@ -476,6 +920,15 @@ impl ExecutionContext {
             variant_paths: std::sync::RwLock::new(self.variant_paths()),
             analyze: false,
             cdc_hook: self.cdc_hook.clone(),
+            change_capture_mode: self.change_capture_mode,
+            capture_muted: AtomicBool::new(self.capture_muted.load(Ordering::Relaxed)),
+            change_version: AtomicU64::new(self.change_version.load(Ordering::Relaxed)),
+            change_timestamp: std::sync::atomic::AtomicI64::new(
+                self.change_timestamp.load(Ordering::Relaxed),
+            ),
+            change_feed: self.change_feed.clone(),
+            pending_stream_advances: Arc::clone(&self.pending_stream_advances),
+            stream_position_locks: self.stream_position_locks.clone(),
             replication: self.replication.clone(),
             replication_apply: self.replication_apply,
             dml_hook: self.dml_hook.clone(),
@@ -632,15 +1085,15 @@ impl ExecutionContext {
         }
     }
 
-    /// Records that a WAL data record was appended during this execution.
-    /// DML operators call this when they log inserts, updates, or deletes.
-    #[inline]
     /// The transaction id a lake commit runs under: the cross-table intent
     /// when one is open, otherwise the database transaction.
     pub fn lake_txn_id(&self) -> u64 {
         self.lake_txn_id.unwrap_or(self.txn_id as u64)
     }
 
+    /// Records that a WAL data record was appended during this execution.
+    /// DML operators call this when they log inserts, updates, or deletes
+    #[inline]
     pub fn mark_wrote_wal(&self) {
         self.wrote_wal.store(true, Ordering::Relaxed);
     }
@@ -777,6 +1230,63 @@ impl ExecutionContext {
         self.wrote_wal.load(Ordering::Relaxed)
     }
 
+    /// Where a write's changes are recorded and at what version, None when
+    /// this context records nothing.
+    ///
+    /// `statement_version` is the log position the write reached, which is
+    /// the version a statement recording its own changes uses. An applier
+    /// records at the entry's index and proposal instant instead, and a
+    /// connection on a grouped node records nothing because the applier
+    /// will record the same entry
+    #[inline]
+    pub fn change_capture(&self, statement_version: u64) -> Option<ChangeCapture<'_>> {
+        let hook = self.cdc_hook.as_ref()?;
+        if self.capture_muted.load(Ordering::Relaxed) {
+            return None;
+        }
+        match self.change_capture_mode {
+            ChangeCaptureMode::AtStatement => Some(ChangeCapture {
+                hook,
+                version: statement_version,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0),
+                branch: self.active_branch_id,
+            }),
+            ChangeCaptureMode::Deferred => None,
+            ChangeCaptureMode::Applied => Some(ChangeCapture {
+                hook,
+                version: self.change_version.load(Ordering::Relaxed),
+                timestamp: self.change_timestamp.load(Ordering::Relaxed),
+                branch: self.active_branch_id,
+            }),
+        }
+    }
+
+    /// Whether a write through this context records its changes, so a
+    /// statement that would only gather images for the feed can skip that
+    /// when nothing here records them
+    #[inline]
+    pub fn captures_changes(&self) -> bool {
+        self.cdc_hook.is_some()
+            && self.change_capture_mode != ChangeCaptureMode::Deferred
+            && !self.capture_muted.load(Ordering::Relaxed)
+    }
+
+    /// Points an applying context at the entry whose changes it records next
+    pub fn set_change_entry(&self, version: u64, timestamp: i64) {
+        self.change_version.store(version, Ordering::Relaxed);
+        self.change_timestamp.store(timestamp, Ordering::Relaxed);
+    }
+
+    /// Silences or restores the recording the operators of this context do,
+    /// for an applier that records an entry's changes from the changeset
+    /// itself
+    pub fn set_capture_muted(&self, muted: bool) {
+        self.capture_muted.store(muted, Ordering::Relaxed);
+    }
+
     /// Checks cancellation and the statement deadline, returning an error when
     /// either trips. Operators call this at batch boundaries for cooperative
     /// cancellation. A tripped deadline reports a statement timeout so the
@@ -800,10 +1310,13 @@ impl ExecutionContext {
     /// init_cache the first time a table is touched.
     pub async fn get_heap_file(&self, table_id: TableId) -> Result<Arc<HeapFile>> {
         let entry = self.catalog.get_table_by_id(table_id)?;
-        if let Some(cache) = &self.heap_files {
-            if let Some(hit) = cache.get_async(&entry.heap_file_id).await {
-                return Ok(Arc::clone(hit.get()));
-            }
+        // A temporary table lives in one session on one node, is dropped
+        // when that session ends, and is cleared from disk by the next node
+        // start. A record of its pages would describe changes nothing will
+        // ever replay, so its heap records none. Every other heap records
+        // each page change in the log, which is what puts a page back after
+        // a crash that took it before it was flushed
+        let build = || -> Result<HeapFile> {
             let hf = HeapFile::new(
                 self.disk_manager.clone(),
                 self.buffer_pool.clone(),
@@ -812,6 +1325,16 @@ impl ExecutionContext {
                     fsm_file_id: entry.fsm_file_id,
                 },
             )?;
+            if !entry.is_temporary() {
+                hf.attach_wal(&self.wal);
+            }
+            Ok(hf)
+        };
+        if let Some(cache) = &self.heap_files {
+            if let Some(hit) = cache.get_async(&entry.heap_file_id).await {
+                return Ok(Arc::clone(hit.get()));
+            }
+            let hf = build()?;
             hf.init_cache().await?;
             let arc = Arc::new(hf);
             // Race tolerated, the loser's instance is dropped, ensuing
@@ -831,14 +1354,7 @@ impl ExecutionContext {
                 }
             }
         } else {
-            let hf = HeapFile::new(
-                self.disk_manager.clone(),
-                self.buffer_pool.clone(),
-                HeapFileConfig {
-                    heap_file_id: entry.heap_file_id,
-                    fsm_file_id: entry.fsm_file_id,
-                },
-            )?;
+            let hf = build()?;
             hf.init_cache().await?;
             Ok(Arc::new(hf))
         }
@@ -847,21 +1363,24 @@ impl ExecutionContext {
     /// Returns a `HeapFile` bound to a branch's append overlay files, building
     /// and caching it in the shared heap file cache keyed by the append file id.
     /// Branch append file ids are disjoint from table heap file ids, so the same
-    /// cache holds both without collision.
+    /// cache holds both without collision. A branch's rows are durable the way
+    /// a table's are, so the heap records its page changes
     pub async fn branch_append_heap(
         &self,
         append_file_id: u32,
         append_fsm_file_id: u32,
     ) -> Result<Arc<HeapFile>> {
         let build = || -> Result<HeapFile> {
-            HeapFile::new(
+            let hf = HeapFile::new(
                 self.disk_manager.clone(),
                 self.buffer_pool.clone(),
                 HeapFileConfig {
                     heap_file_id: append_file_id,
                     fsm_file_id: append_fsm_file_id,
                 },
-            )
+            )?;
+            hf.attach_wal(&self.wal);
+            Ok(hf)
         };
         if let Some(cache) = &self.heap_files {
             if let Some(hit) = cache.get_async(&append_file_id).await {

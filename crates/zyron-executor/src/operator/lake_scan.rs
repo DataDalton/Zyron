@@ -263,7 +263,13 @@ fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
 /// Cells decode by the physical type, which is what sizes them. A
 /// TIMESTAMP(p>6) column stores 16 byte i128 picoseconds, and decoding it
 /// as its logical type would read half the cell and hand the i128 builder
-/// a variant it zeroes. Every other type's physical form is its logical one
+/// a variant it zeroes. Every other type's physical form is its logical one.
+///
+/// The cells come back in the shape the plan's column declares, which is
+/// the table's current type. A file written while the column was narrower,
+/// or a version read from before the column widened, hands over cells the
+/// reader widens on the way out, so the batch is typed the way the plan
+/// expects whatever version the scan reads
 fn decode_range_columns(
     reader: &LakeFileReader,
     schema: &zyron_lake::LakeSchema,
@@ -279,14 +285,32 @@ fn decode_range_columns(
                 col.name
             ))
         })?;
-        let physical = lake_col.physical_type_id();
+        let wanted = declared_as(lake_col, col.type_id, col.fractional_digits);
+        let physical = wanted.physical_type_id();
         decoded.push((
             physical,
             physical.fixed_size().unwrap_or(0),
-            reader.read_column_range(lake_col, start, end)?,
+            reader.read_column_range(&wanted, start, end)?,
         ));
     }
     Ok(decoded)
+}
+
+/// The lake column as the plan declares it, so the reader hands the cells
+/// over in the plan's shape rather than the shape one manifest version
+/// declares. Borrowed when the two agree, which is the common case
+pub fn declared_as<'a>(
+    lake_col: &'a zyron_lake::LakeColumn,
+    type_id: zyron_common::TypeId,
+    fractional_digits: Option<u8>,
+) -> std::borrow::Cow<'a, zyron_lake::LakeColumn> {
+    if lake_col.type_id == type_id && lake_col.fractional_digits == fractional_digits {
+        return std::borrow::Cow::Borrowed(lake_col);
+    }
+    let mut wanted = lake_col.clone();
+    wanted.type_id = type_id;
+    wanted.fractional_digits = fractional_digits;
+    std::borrow::Cow::Owned(wanted)
 }
 
 /// The columns a row filter reads, when the projection does not carry all
@@ -645,6 +669,10 @@ pub struct LakeScanOperator {
     /// The predicate lowered onto stored bytes, applied per file before
     /// any projected column is decoded. None when nothing lowered
     stored_filter: Option<zyron_lake::StoredFilter>,
+    /// The predicate lowered against each older shape a file of this scan
+    /// holds, by the schema id the file was written under, so the files of
+    /// one shape share one lowering rather than each lowering it again
+    old_shape_filters: std::collections::HashMap<u64, Option<zyron_lake::StoredFilter>>,
     /// Whether the lowered predicate is equivalent to the bound one rather
     /// than merely implied by it.
     ///
@@ -876,6 +904,7 @@ impl LakeScanOperator {
             bytes_considered,
             bytes_skipped,
             stored_filter,
+            old_shape_filters: std::collections::HashMap::new(),
             lowering_is_complete,
             filter_columns,
             files_skipped_on_read: 0,
@@ -1051,7 +1080,7 @@ impl LakeScanOperator {
         })?;
         let reader = {
             let _s = profile::scope(Phase::LakeOpenFile);
-            LakeFileReader::open_shared(&self.paths, partition_id)?
+            LakeFileReader::open_shared_in(&self.manifest, &self.paths, partition_id)?
         };
         // The reader is shared with whatever scanned this file before, so its
         // counter is a running total. What this scan read is the difference
@@ -1101,15 +1130,37 @@ impl LakeScanOperator {
         // time over decoded values can only agree with what is already
         // decided. An index path does not run the filter at all, so it
         // decides nothing here
+        // A file written while a column had a narrower type holds that
+        // column's cells at the narrower width, and the stored filter
+        // compares constants against stored bytes. Such a file is answered
+        // by a filter lowered against its own schema, so the constants are
+        // encoded the way its cells are and the answer stays exact, and the
+        // files of one shape share that lowering. A file holding every
+        // column as declared, which is every file of a table whose types
+        // never changed, uses the filter lowered once
+        let file_filter: Option<std::borrow::Cow<'_, zyron_lake::StoredFilter>> =
+            if self.manifest.types_changed_since(entry.schema_id) {
+                let manifest = &self.manifest;
+                let lowered = self.lowered.as_ref();
+                self.old_shape_filters
+                    .entry(entry.schema_id)
+                    .or_insert_with(|| {
+                        let schema = manifest.file_schema(entry);
+                        lowered.and_then(|p| zyron_lake::StoredFilter::lower(p, &schema))
+                    })
+                    .as_ref()
+                    .map(std::borrow::Cow::Borrowed)
+            } else {
+                self.stored_filter.as_ref().map(std::borrow::Cow::Borrowed)
+            };
         let answered = self.index_rows.is_none()
             && self.lowering_is_complete
-            && self
-                .stored_filter
-                .as_ref()
+            && file_filter
+                .as_deref()
                 .is_some_and(|filter| filter.is_exact());
         let stored_mask = {
             let _s = profile::scope(Phase::LakeStoredFilter);
-            match (self.index_rows.is_none(), &self.stored_filter) {
+            match (self.index_rows.is_none(), file_filter.as_deref()) {
                 (true, Some(filter)) => reader.rows_matching(filter)?,
                 _ => None,
             }
@@ -1429,13 +1480,27 @@ impl Operator for LakeUpdateOperator {
             self.ctx.ensure_writable("UPDATE")?;
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
 
-            // Accumulate the new images. The child projects every column
-            // in table order, so a batch is already a full row image and
-            // an assignment replaces one of its columns in place
-            let mut columns: Vec<zyron_lake::ColumnData> = table_entry
+            // The child projects the live columns in table order, and every
+            // read below is by position in the table's whole column list, so
+            // a table with a dropped column widens each batch to that list
+            // before an assignment replaces one of its columns in place
+            let shape = crate::operator::modify::TableShape::of(&table_entry);
+            let fill = match &shape {
+                Some(shape) => shape.widen_schema(&mut self.input_schema, &table_entry)?,
+                None => false,
+            };
+            // Accumulate the new images, the live columns taken from their
+            // positions in the image, since a dropped column holds its
+            // position there with nothing to store
+            let live: Vec<(usize, &zyron_catalog::ColumnEntry)> = table_entry
                 .columns
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .filter(|(_, c)| !c.dropped)
+                .collect();
+            let mut columns: Vec<zyron_lake::ColumnData> = live
+                .iter()
+                .map(|(_, c)| {
                     zyron_lake::ColumnData::with_capacity(
                         c.id.0 as u32,
                         c.physical_type_id().fixed_size().unwrap_or(0),
@@ -1471,14 +1536,21 @@ impl Operator for LakeUpdateOperator {
                 .is_empty();
             let mut fk_pairs: Vec<(crate::batch::DataBatch, crate::batch::DataBatch)> = Vec::new();
             // Old and new images kept for the CDC notification after the
-            // commit, so a feed on the table sees the replacement the same
-            // way it sees a heap update
-            let cdc_capture = self.ctx.cdc_hook.is_some();
+            // commit, so a hook recording this table's rows sees the
+            // replacement the same way it sees a heap update. Kept only
+            // when the hook records them, the images are for it alone
+            let cdc_capture = self.ctx.captures_changes()
+                && self.ctx.cdc_hook.as_ref().is_some_and(|hook| {
+                    hook.records_rows_of(self.table_id.0, self.ctx.active_branch_id)
+                });
             let mut cdc_pairs: Vec<(crate::batch::DataBatch, crate::batch::DataBatch)> = Vec::new();
-            while let Some(batch) = self.child.next().await? {
+            while let Some(mut batch) = self.child.next().await? {
                 self.ctx.check_cancelled()?;
                 if batch.batch.num_rows == 0 {
                     continue;
+                }
+                if fill && let Some(shape) = &shape {
+                    shape.fill_dropped(&mut batch.batch, &table_entry.name)?;
                 }
                 let mut image = batch.batch.clone();
                 for assignment in &self.assignments {
@@ -1572,9 +1644,9 @@ impl Operator for LakeUpdateOperator {
                     .await?;
                     fk_pairs.push((batch.batch.clone(), image.clone()));
                 }
-                for (ci, col_entry) in table_entry.columns.iter().enumerate() {
+                for (li, (ci, col_entry)) in live.iter().enumerate() {
                     let value_size = col_entry.physical_type_id().fixed_size().unwrap_or(0);
-                    let column = &image.columns[ci];
+                    let column = &image.columns[*ci];
                     for r in 0..image.num_rows {
                         let cell = match column.get_scalar(r) {
                             crate::column::ScalarValue::Null => None,
@@ -1584,7 +1656,7 @@ impl Operator for LakeUpdateOperator {
                                 value_size,
                             )),
                         };
-                        columns[ci].push(cell.as_deref());
+                        columns[li].push(cell.as_deref());
                     }
                 }
                 matched += image.num_rows as u64;
@@ -1609,7 +1681,6 @@ impl Operator for LakeUpdateOperator {
             // compare against rows the branch does not have
             let head = effective_head(&self.ctx, None);
             let log = open_lake_write_head(&paths, &table_entry.name, head)?;
-            let root = log.registry_key();
             let timestamp_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as i64)
@@ -1674,12 +1745,8 @@ impl Operator for LakeUpdateOperator {
                     "lake update task failed to run to completion: {e}"
                 ))
             })??;
-            zyron_lake::register_txn_pending(
-                self.ctx.disk_manager.data_dir(),
-                self.ctx.lake_txn_id(),
-                root,
-                outcome.version,
-            );
+            // The commit registered its version with the pending registry
+            // the transaction's end publishes from
             self.ctx.mark_wrote_wal();
             // The rows only have addresses once the commit assigned them,
             // so the search indexes take the new images here rather than
@@ -1695,7 +1762,7 @@ impl Operator for LakeUpdateOperator {
             }
             // One commit replaced the old images with the new, so the feed
             // gets one notification pairing them under the committed version
-            if let Some(ref hook) = self.ctx.cdc_hook {
+            if cdc_capture && let Some(capture) = self.ctx.change_capture(outcome.version) {
                 let mut old_encoded: Vec<Vec<u8>> = Vec::new();
                 let mut new_encoded: Vec<Vec<u8>> = Vec::new();
                 for (old, new) in &cdc_pairs {
@@ -1708,16 +1775,27 @@ impl Operator for LakeUpdateOperator {
                 }
                 let old_refs: Vec<&[u8]> = old_encoded.iter().map(|v| v.as_slice()).collect();
                 let new_refs: Vec<&[u8]> = new_encoded.iter().map(|v| v.as_slice()).collect();
-                hook.on_update(
-                    self.table_id.0,
-                    &old_refs,
-                    &new_refs,
-                    outcome.version,
-                    timestamp_us,
-                    self.ctx.txn_id,
-                    true,
-                )
-                .map_err(|e| ZyronError::ExecutionError(format!("CDC update hook failed: {e}")))?;
+                // A lake commit dates its own version, so the instant the
+                // records carry is the commit's rather than the capture's
+                let timestamp = match self.ctx.change_capture_mode {
+                    crate::context::ChangeCaptureMode::Applied => capture.timestamp,
+                    _ => timestamp_us,
+                };
+                capture
+                    .hook
+                    .on_update(
+                        self.table_id.0,
+                        &old_refs,
+                        &new_refs,
+                        capture.version,
+                        timestamp,
+                        self.ctx.txn_id,
+                        true,
+                        capture.branch,
+                    )
+                    .map_err(|e| {
+                        ZyronError::ExecutionError(format!("CDC update hook failed: {e}"))
+                    })?;
             }
             // ON UPDATE actions that need the moved key committed before
             // they can re-check the children against it
@@ -1801,6 +1879,13 @@ impl Operator for LakeDeleteOperator {
             // same effective head the commit below writes, and the bound
             // predicate reproduces exactly the rows the lowered predicate
             // removes
+            // The images are gathered for the hook only when it records
+            // this table's rows, a hook deriving the table's changes from
+            // its log reads nothing here
+            let cdc_capture = self.ctx.captures_changes()
+                && self.ctx.cdc_hook.as_ref().is_some_and(|hook| {
+                    hook.records_rows_of(self.table_id.0, self.ctx.active_branch_id)
+                });
             let needs_old_rows = !self
                 .ctx
                 .catalog
@@ -1811,12 +1896,14 @@ impl Operator for LakeDeleteOperator {
                     .catalog
                     .triggers_for_table(self.table_id)
                     .is_empty()
-                || self.ctx.cdc_hook.is_some();
+                || cdc_capture;
             let mut old_batches: Vec<crate::batch::DataBatch> = Vec::new();
             if needs_old_rows {
+                // The lake holds the live columns alone, and the rows they
+                // make are read by position in the table's whole column
+                // list, so each gathered batch is widened to that list
                 let scan_columns: Vec<LogicalColumn> = table_entry
-                    .columns
-                    .iter()
+                    .live_columns()
                     .map(|c| LogicalColumn {
                         table_idx: Some(0),
                         column_id: c.id,
@@ -1826,6 +1913,7 @@ impl Operator for LakeDeleteOperator {
                         fractional_digits: c.fractional_digits,
                     })
                     .collect();
+                let shape = crate::operator::modify::TableShape::of(&table_entry);
                 let mut scan = LakeScanOperator::new(
                     Arc::clone(&self.ctx),
                     self.table_id,
@@ -1834,9 +1922,12 @@ impl Operator for LakeDeleteOperator {
                     self.predicate.clone(),
                     None,
                 )?;
-                while let Some(b) = scan.next().await? {
+                while let Some(mut b) = scan.next().await? {
                     if b.batch.num_rows == 0 {
                         continue;
+                    }
+                    if let Some(shape) = &shape {
+                        shape.widen(&mut b.batch, &table_entry.name)?;
                     }
                     crate::operator::fk::enforce_parent_delete(
                         &self.ctx,
@@ -1863,7 +1954,6 @@ impl Operator for LakeDeleteOperator {
             // branch has rather than main's
             let head = effective_head(&self.ctx, None);
             let log = open_lake_write_head(&paths, &table_entry.name, head)?;
-            let root = log.registry_key();
             let timestamp_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as i64)
@@ -1906,16 +1996,12 @@ impl Operator for LakeDeleteOperator {
                 ))
             })??;
             if let Some(version) = outcome.version {
-                zyron_lake::register_txn_pending(
-                    self.ctx.disk_manager.data_dir(),
-                    self.ctx.lake_txn_id(),
-                    root,
-                    version,
-                );
+                // The commit registered its version with the pending
+                // registry the transaction's end publishes from
                 self.ctx.mark_wrote_wal();
                 // The rows the commit removed were gathered above, so the
                 // feed sees the same images the triggers do
-                if let Some(ref hook) = self.ctx.cdc_hook {
+                if cdc_capture && let Some(capture) = self.ctx.change_capture(version) {
                     let mut encoded: Vec<Vec<u8>> = Vec::new();
                     for old in &old_batches {
                         for r in 0..old.num_rows {
@@ -1923,17 +2009,24 @@ impl Operator for LakeDeleteOperator {
                         }
                     }
                     let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
-                    hook.on_delete(
-                        self.table_id.0,
-                        &refs,
-                        version,
-                        timestamp_us,
-                        self.ctx.txn_id,
-                        true,
-                    )
-                    .map_err(|e| {
-                        ZyronError::ExecutionError(format!("CDC delete hook failed: {e}"))
-                    })?;
+                    let timestamp = match self.ctx.change_capture_mode {
+                        crate::context::ChangeCaptureMode::Applied => capture.timestamp,
+                        _ => timestamp_us,
+                    };
+                    capture
+                        .hook
+                        .on_delete(
+                            self.table_id.0,
+                            &refs,
+                            capture.version,
+                            timestamp,
+                            self.ctx.txn_id,
+                            true,
+                            capture.branch,
+                        )
+                        .map_err(|e| {
+                            ZyronError::ExecutionError(format!("CDC delete hook failed: {e}"))
+                        })?;
                 }
             }
             // ON DELETE SET DEFAULT re-checks against the parent with these
@@ -2027,7 +2120,7 @@ impl LakeMetadataAggregateOperator {
     fn answer_from_stats(
         spec: &MetaAggSpec,
         entry: &zyron_lake::PartitionEntry,
-        schema: &zyron_lake::LakeSchema,
+        manifest: &zyron_lake::ManifestFile,
     ) -> Option<StatAnswer> {
         if spec.kind == MetaAggKind::CountStar {
             return Some(StatAnswer::Count(entry.row_count as i64));
@@ -2038,9 +2131,21 @@ impl LakeMetadataAggregateOperator {
             .bounds
             .row_count
             .saturating_sub(stats.bounds.null_count);
+        if spec.kind == MetaAggKind::CountCol {
+            return Some(StatAnswer::Count(live as i64));
+        }
+        // A file written while the column had a narrower shape recorded
+        // its bounds and sum in that shape, and an answer in it would be
+        // read as the declared one. Such a file is read rather than
+        // answered from what it recorded
+        if manifest
+            .written_type_at(column_id, entry.schema_id)
+            .is_some()
+        {
+            return None;
+        }
         match spec.kind {
-            MetaAggKind::CountStar => None,
-            MetaAggKind::CountCol => Some(StatAnswer::Count(live as i64)),
+            MetaAggKind::CountStar | MetaAggKind::CountCol => None,
             MetaAggKind::Min | MetaAggKind::Max => {
                 if live == 0 {
                     return Some(StatAnswer::Empty);
@@ -2050,7 +2155,7 @@ impl LakeMetadataAggregateOperator {
                 } else {
                     stats.bounds.min.as_ref()
                 }?;
-                let physical = schema.column_by_id(column_id)?.physical_type_id();
+                let physical = manifest.schema.column_by_id(column_id)?.physical_type_id();
                 stat_to_scalar(physical, bound).map(StatAnswer::Value)
             }
             MetaAggKind::Sum => {
@@ -2128,8 +2233,10 @@ impl LakeMetadataAggregateOperator {
                 proj.push(as_projected(ce));
             }
         }
+        // A count over no column reads one the lake still holds, which a
+        // dropped column is not
         if proj.is_empty()
-            && let Some(ce) = table_entry.columns.first()
+            && let Some(ce) = table_entry.live_columns().next()
         {
             proj.push(as_projected(ce));
         }
@@ -2208,7 +2315,7 @@ impl Operator for LakeMetadataAggregateOperator {
                 let answers: Option<Vec<StatAnswer>> = if entry.delete_predicate_ids.is_empty() {
                     self.specs
                         .iter()
-                        .map(|s| Self::answer_from_stats(s, entry, &manifest.schema))
+                        .map(|s| Self::answer_from_stats(s, entry, &manifest))
                         .collect()
                 } else {
                     None

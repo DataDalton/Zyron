@@ -419,8 +419,11 @@ impl EncodingPushdown {
                     join_type: join_type.clone(),
                     condition: condition.clone(),
                 }),
-            // Leaf nodes: no transformation
+            // Leaf nodes, no transformation. A change scan reads framed
+            // change records rather than encoded column segments, so an
+            // encoding hint has nothing to reach in it
             LogicalPlan::Scan { .. }
+            | LogicalPlan::ChangeScan { .. }
             | LogicalPlan::Values { .. }
             | LogicalPlan::GraphAlgorithm { .. }
             | LogicalPlan::AnalyticsTableFunction { .. } => None,

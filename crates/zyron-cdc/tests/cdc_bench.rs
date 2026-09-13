@@ -63,10 +63,12 @@ fn make_record(
         commit_timestamp: ts,
         table_id,
         txn_id,
+        change_ordinal: 0,
         schema_version: 1,
         row_data: row.to_vec(),
         primary_key_data: vec![pk],
         is_last_in_txn: true,
+        projected: false,
     }
 }
 
@@ -1009,7 +1011,7 @@ fn test_stream_and_ingest_management() {
         .create_stream(CdcOutputStream {
             name: "user_events".into(),
             table_id: 1,
-            slot_name: "slot1".into(),
+            change_stream: "__cdc_user_events".into(),
             sink: CdcSinkConfig::Kafka {
                 brokers: "localhost:9092".into(),
                 topic: "cdc_users".into(),

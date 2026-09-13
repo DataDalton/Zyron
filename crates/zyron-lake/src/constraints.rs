@@ -602,7 +602,7 @@ fn open_probe(
     superseded: Option<&LakePredicate>,
     stats: &mut UniqueCheckStats,
 ) -> Result<Option<FileProbe>, ZyronError> {
-    let reader = LakeFileReader::open(paths, entry.partition_id)?;
+    let reader = LakeFileReader::open_in(manifest, paths, entry.partition_id)?;
     stats.files_opened += 1;
     let rows = reader.row_count();
     if rows == 0 {

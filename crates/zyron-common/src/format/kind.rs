@@ -74,6 +74,14 @@ pub enum FormatKind {
     UpgradeJournal,
     /// Service principal signing keys, the durable half of the key store
     PrincipalKeyStorePersistence,
+    /// One change data feed segment holding a contiguous run of change records
+    ChangeFeedSegment,
+    /// A table's change data feed manifest, holding its configuration and one
+    /// summary per sealed segment
+    ChangeFeedManifest,
+    /// The record index of a change data feed whose records are derived
+    /// from the table's own store, one count per commit that yields any
+    ChangeFeedVersionIndex,
 }
 
 /// One row of the magic byte allocation registry
@@ -273,6 +281,24 @@ pub const MAGIC_ALLOCATIONS: &[MagicAllocation] = &[
         owner: "zyron-auth",
         doc: "Service principal signing keys, each secret half wrapped by the node's key store",
     },
+    MagicAllocation {
+        kind: FormatKind::ChangeFeedSegment,
+        magic: *b"ZCDF",
+        owner: "zyron-cdc",
+        doc: "Change data feed segment holding framed change records and a sealed summary trailer",
+    },
+    MagicAllocation {
+        kind: FormatKind::ChangeFeedManifest,
+        magic: *b"ZCDM",
+        owner: "zyron-cdc",
+        doc: "Change data feed manifest, a record holding a table's feed configuration, segment summaries and per-version counters whole, followed by a record per seal of what changed since",
+    },
+    MagicAllocation {
+        kind: FormatKind::ChangeFeedVersionIndex,
+        magic: *b"ZCDI",
+        owner: "zyron-cdc",
+        doc: "Change data feed record index of a lake table, the records each commit yields counted from the version the feed began at",
+    },
 ];
 
 /// Every format kind, in allocation order
@@ -307,6 +333,9 @@ pub const ALL_FORMAT_KINDS: &[FormatKind] = &[
     FormatKind::AppImageBundle,
     FormatKind::UpgradeJournal,
     FormatKind::PrincipalKeyStorePersistence,
+    FormatKind::ChangeFeedSegment,
+    FormatKind::ChangeFeedManifest,
+    FormatKind::ChangeFeedVersionIndex,
 ];
 
 impl FormatKind {
@@ -395,6 +424,9 @@ impl FormatKind {
             FormatKind::AppImageBundle => "app_image_bundle",
             FormatKind::UpgradeJournal => "upgrade_journal",
             FormatKind::PrincipalKeyStorePersistence => "principal_key_store_persistence",
+            FormatKind::ChangeFeedSegment => "change_feed_segment",
+            FormatKind::ChangeFeedManifest => "change_feed_manifest",
+            FormatKind::ChangeFeedVersionIndex => "change_feed_version_index",
         }
     }
 
@@ -444,7 +476,16 @@ impl FormatKind {
             // An envelope header on a file whose trailer and checksums are
             // the format's own, so the substrate reads the header and moves
             // the file forward whole
-            FormatKind::ZyrColumnar | FormatKind::LakeManifest => Framing::OwnTrailer,
+            FormatKind::ZyrColumnar | FormatKind::LakeManifest | FormatKind::ChangeFeedSegment => {
+                Framing::OwnTrailer
+            }
+            // A whole envelope followed by the envelopes of every extension
+            // appended since, each checksummed on its own, so a reader that
+            // stops at the first envelope has read the file as it was first
+            // written rather than the whole of it
+            FormatKind::ChangeFeedManifest | FormatKind::ChangeFeedVersionIndex => {
+                Framing::EnvelopeChain
+            }
             _ => Framing::Envelope,
         }
     }
@@ -458,6 +499,10 @@ pub enum Framing {
     /// A 20-byte envelope header on a file that ends in a trailer of its
     /// own, checksummed by the format rather than by the envelope
     OwnTrailer,
+    /// A file of complete envelopes back to back, the first holding the
+    /// whole and each later one an extension appended since, so the file
+    /// is read envelope by envelope and moved forward whole
+    EnvelopeChain,
     /// A 9-byte stamp inside a container that checksums it
     Stamp,
     /// A `[format]` section in a hand-editable text file
@@ -471,6 +516,7 @@ impl Framing {
         match self {
             Framing::Envelope => "envelope",
             Framing::OwnTrailer => "own_trailer",
+            Framing::EnvelopeChain => "envelope_chain",
             Framing::Stamp => "stamp",
             Framing::Text => "text",
             Framing::RecordTag => "record_tag",
@@ -480,7 +526,9 @@ impl Framing {
     /// Bytes the framing costs at the head of what it wraps
     pub const fn header_bytes(self) -> u32 {
         match self {
-            Framing::Envelope | Framing::OwnTrailer => super::envelope::ENVELOPE_HEADER_LEN as u32,
+            Framing::Envelope | Framing::OwnTrailer | Framing::EnvelopeChain => {
+                super::envelope::ENVELOPE_HEADER_LEN as u32
+            }
             Framing::Stamp => super::stamp::FORMAT_STAMP_LEN as u32,
             Framing::Text => 0,
             Framing::RecordTag => 1,
@@ -495,13 +543,15 @@ impl Framing {
     /// because its checksums cover the header the envelope path would
     /// restamp
     pub const fn migrates_whole_file(self) -> bool {
-        matches!(self, Framing::OwnTrailer)
+        matches!(self, Framing::OwnTrailer | Framing::EnvelopeChain)
     }
 
-    /// Bytes the framing costs at the tail
+    /// Bytes the framing costs at the tail, of each envelope for a chain
     pub const fn footer_bytes(self) -> u32 {
         match self {
-            Framing::Envelope => super::envelope::ENVELOPE_FOOTER_LEN as u32,
+            Framing::Envelope | Framing::EnvelopeChain => {
+                super::envelope::ENVELOPE_FOOTER_LEN as u32
+            }
             _ => 0,
         }
     }
@@ -518,6 +568,12 @@ impl Framing {
                 "[0..4) magic, [4..8) version, [8..12) header_length, [12..16) flags, \
                  [16..20) header_checksum, [20..header_length) extension, body and a \
                  trailer the format checksums itself"
+            }
+            Framing::EnvelopeChain => {
+                "one envelope, [0..4) magic, [4..8) version, [8..12) header_length, \
+                 [12..16) flags, [16..20) header_checksum, [20..header_length) extension, \
+                 body, [len-4..len) body checksum, then the envelope of each extension \
+                 appended since, back to back"
             }
             Framing::Stamp => {
                 "[0..4) magic, [4..6) major, [6..8) minor, [8] flags, body follows, \

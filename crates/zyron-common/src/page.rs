@@ -341,6 +341,27 @@ impl PageHeader {
     }
 }
 
+/// Byte offset of the LSN field inside the serialized PageHeader
+pub const PAGE_LSN_OFFSET: usize = 12;
+
+/// The LSN a page image carries, the newest logged change it holds, which
+/// is what recovery compares a log record against to decide whether the
+/// image already reflects it
+#[inline]
+pub fn page_lsn(page: &[u8]) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&page[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8]);
+    u64::from_le_bytes(raw)
+}
+
+/// Stamps the LSN a page image carries. Written into the image a flush is
+/// about to put on disk, so the on-disk page says which logged changes it
+/// already holds
+#[inline]
+pub fn set_page_lsn(page: &mut [u8], lsn: u64) {
+    page[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8].copy_from_slice(&lsn.to_le_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Page checksums
 // ---------------------------------------------------------------------------

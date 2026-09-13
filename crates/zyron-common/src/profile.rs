@@ -137,6 +137,16 @@ pub enum Phase {
     ExecWindowArgs,
     ExecWindowFold,
     ExecWindowScatter,
+
+    // Change scan, per file of a window decoded on a pool thread. The
+    // file read and decompression, the whole of one file's decode, the
+    // batches finalized out of it, and what the operator's own thread
+    // spent waiting for the oldest file in flight
+    ChangeScanLoad,
+    ChangeScanRead,
+    ChangeScanSegment,
+    ChangeScanFinish,
+    ChangeScanAwait,
 }
 
 #[cfg(feature = "profile")]
@@ -150,7 +160,7 @@ mod imp {
     impl Phase {
         /// Every phase, in discriminant order. COUNT and all indexing derive
         /// from this, so adding a phase to the enum and here cannot drift apart.
-        const ALL: [Phase; 69] = [
+        const ALL: [Phase; 74] = [
             Phase::WireRecvParse,
             Phase::WirePlan,
             Phase::WireExecSetup,
@@ -220,6 +230,11 @@ mod imp {
             Phase::ExecWindowArgs,
             Phase::ExecWindowFold,
             Phase::ExecWindowScatter,
+            Phase::ChangeScanLoad,
+            Phase::ChangeScanRead,
+            Phase::ChangeScanSegment,
+            Phase::ChangeScanFinish,
+            Phase::ChangeScanAwait,
         ];
 
         const COUNT: usize = Phase::ALL.len();
@@ -295,6 +310,11 @@ mod imp {
                 Phase::ExecWindowArgs => "exec.window_args",
                 Phase::ExecWindowFold => "exec.window_fold",
                 Phase::ExecWindowScatter => "exec.window_scatter",
+                Phase::ChangeScanLoad => "cdf.segment_load",
+                Phase::ChangeScanRead => "cdf.  segment_read",
+                Phase::ChangeScanSegment => "exec.change_scan segment",
+                Phase::ChangeScanFinish => "exec.change_scan finish",
+                Phase::ChangeScanAwait => "exec.change_scan await",
             }
         }
     }

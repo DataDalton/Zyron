@@ -1,0 +1,181 @@
+# suite:   parser
+# run:     2026-09-13_011954_6e2ce74-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Error Recovery Performance Test ===
+  Bad queries: 5, 100,000 iterations per run
+  Validation runs: 5
+  Run 1: 0.179 us/error
+  Run 2: 0.180 us/error
+  Run 3: 0.179 us/error
+  Run 4: 0.179 us/error
+  Run 5: 0.180 us/error
+  Latency (us/error) [PASS/OK]:
+    Runs: [0.1792, 0.1799, 0.1788, 0.1788, 0.1799]
+    Average: 0.1793 <= 2 (target)
+    Min/Max: 0.1788 / 0.1799, StdDev: 0.0005
+
+=== Lexer Throughput Performance Test ===
+  Workload: 12300 bytes, 1000 iterations per run
+  Validation runs: 5
+  Run 1: 305.5 MB/sec
+  Run 2: 306.5 MB/sec
+  Run 3: 305.9 MB/sec
+  Run 4: 304.9 MB/sec
+  Run 5: 306.3 MB/sec
+  Throughput (MB/sec) [PASS/OK]:
+    Runs: [305.4565, 306.5222, 305.9268, 304.9294, 306.2848]
+    Average: 305.8239 >= 200 (target)
+    Min/Max: 304.9294 / 306.5222, StdDev: 0.5737
+
+=== Memory per Parse Performance Test ===
+  Statement enum: 16 bytes
+  SelectStatement: 336 bytes
+  Expr enum: 64 bytes
+  TableRef enum: 80 bytes
+  Estimated per-parse (bytes) [PASS]: 912 <= 1,024 (target)
+
+=== Parser Batch Throughput Performance Test ===
+  Query mix: 5 types, 500,000 total per run
+  Validation runs: 5
+  Run 1: 2680875 stmts/sec
+  Run 2: 2678545 stmts/sec
+  Run 3: 2679731 stmts/sec
+  Run 4: 2681665 stmts/sec
+  Run 5: 2680903 stmts/sec
+  Throughput (stmts/sec) [PASS/OK]:
+    Runs: [2,680,875, 2,678,545, 2,679,731, 2,681,665, 2,680,903]
+    Average: 2,680,344 >= 1,000,000 (target)
+    Min/Max: 2,678,545 / 2,681,665, StdDev: 1,091
+
+=== Parser Complex Query Performance Test ===
+  Iterations per run: 10,000
+  Validation runs: 5
+  Run 1: 5.79 us/parse
+  Run 2: 5.76 us/parse
+  Run 3: 5.77 us/parse
+  Run 4: 5.77 us/parse
+  Run 5: 5.76 us/parse
+  Latency (us/parse) [PASS/OK]:
+    Runs: [5.7938, 5.7567, 5.7652, 5.7727, 5.7628]
+    Average: 5.7703 <= 20 (target)
+    Min/Max: 5.7567 / 5.7938, StdDev: 0.0128
+
+=== Parser Simple Query Performance Test ===
+  Query: SELECT id, name FROM users WHERE active = TRUE
+  Iterations per run: 100,000
+  Validation runs: 5
+  Run 1: 672 ns/parse
+  Run 2: 672 ns/parse
+  Run 3: 668 ns/parse
+  Run 4: 667 ns/parse
+  Run 5: 666 ns/parse
+  Latency (ns/parse) [PASS/OK]:
+    Runs: [671.6670, 671.5490, 667.8770, 666.6480, 665.6900]
+    Average: 668.6862 <= 1,000 (target)
+    Min/Max: 665.6900 / 671.6670, StdDev: 2.4846
+
+=== CREATE/DROP INDEX Statement ===
+  CREATE INDEX: PASS
+  DROP INDEX: PASS
+
+=== CREATE TABLE Statement ===
+  CREATE TABLE with constraints: PASS
+
+=== DELETE Statement ===
+  DELETE FROM WHERE: PASS
+
+=== DROP TABLE Statement ===
+  DROP TABLE: PASS
+  DROP TABLE IF EXISTS: PASS
+
+=== Error Handling ===
+  SELECT FROM (missing cols): PASS - Parse error: Expected expression, found FROM at line 1, column 18
+  Leftover tokens after typo: PASS - Parse error: Expected a statement, found FORM at line 1, column 31
+  Incomplete WHERE: PASS - Parse error: Expected expression, found end of input at line 1, column 26
+  Unterminated string: PASS - Parse error: Unterminated string literal starting at line 1, column 8
+
+=== Expression - Arithmetic Precedence ===
+  a + b * c = a + (b * c): PASS
+
+=== Expression - BETWEEN, IN, LIKE ===
+  BETWEEN: PASS
+  IN list: PASS
+  LIKE: PASS
+  IS NULL: PASS
+  IS NOT NULL: PASS
+
+=== Expression - Boolean Precedence ===
+  AND before OR: PASS
+  NOT before AND: PASS
+
+=== Expression - Functions ===
+  COUNT(*): PASS
+  SUM(amount): PASS
+  COALESCE(a, b, c): PASS
+
+=== INSERT Statement ===
+  Multi-row INSERT: PASS
+
+=== Lexer - Comments ===
+  Single-line: PASS
+  Block comment: PASS
+  Nested block: PASS
+
+=== Lexer - Numbers ===
+  Integer: PASS
+  Float: PASS
+  Scientific: PASS
+  Negative (unary): PASS
+
+=== Lexer - Quoted Identifiers ===
+  Spaces in ident: PASS
+  Escaped quote: PASS
+
+=== Lexer - String Escapes ===
+  Single escape: PASS
+  Empty string: PASS
+  Multiple escapes: PASS
+
+=== Lexer - Tokenize SELECT ===
+  Token sequence: PASS
+  Token types: PASS
+  Span tracking: PASS
+
+============================================
+  Parser: SQL Parser - All Tests Complete
+============================================
+  Lexer:       6 correctness tests
+  Expressions: 4 correctness tests
+  SELECT:      4 correctness tests
+  DML:         3 correctness tests
+  DDL:         3 correctness tests
+  Errors:      1 correctness test (4 cases)
+  Round-trip:  1 test (29 statements)
+  Benchmarks:  6 performance tests
+============================================
+
+=== Round-trip Test ===
+  Round-trip: 23/23 passed
+
+=== SELECT - Basic ===
+  SELECT a, b FROM t: PASS
+
+=== SELECT - GROUP BY, HAVING, ORDER BY ===
+  GROUP BY + HAVING: PASS
+  ORDER BY DESC NULLS LAST LIMIT OFFSET: PASS
+
+=== SELECT - JOINs ===
+  INNER JOIN ON: PASS
+  LEFT JOIN USING: PASS
+
+=== SELECT - Qualified Wildcard ===
+  t.* wildcard: PASS
+  u.name qualified: PASS
+  Implicit join (FROM t, u): PASS
+
+=== UPDATE Statement ===
+  UPDATE SET WHERE: PASS

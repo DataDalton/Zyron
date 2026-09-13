@@ -155,7 +155,6 @@ async fn create_test_state(
     let cdc_ingest_mgr_arc = Arc::new(
         zyron_cdc::CdcIngestManager::new(&data_dir_mgr).expect("CdcIngestManager new failed"),
     );
-    let trigger_mgr_arc = Arc::new(zyron_pipeline::trigger::TriggerManager::new());
     let udf_reg_arc = Arc::new(zyron_pipeline::udf::UdfRegistry::new());
     let uda_reg_arc = Arc::new(zyron_pipeline::aggregate::UdaRegistry::new());
     let proc_reg_arc = Arc::new(zyron_pipeline::stored_procedure::ProcedureRegistry::new());
@@ -254,7 +253,7 @@ async fn create_test_state(
             cdc_stream_view_mgr
                 .list_streams()
                 .into_iter()
-                .map(|s| (s.name, s.table_id, s.active, s.slot_name))
+                .map(|s| (s.name, s.table_id, s.active, s.change_stream))
                 .collect()
         })),
         cdc_ingest_stats: Some(Arc::new(move || -> Vec<(String, u32, bool, u64, u64)> {
@@ -269,7 +268,6 @@ async fn create_test_state(
         publication_manager: Some(Arc::clone(&pub_mgr_arc)),
         cdc_stream_manager: Some(Arc::clone(&cdc_stream_mgr_arc)),
         cdc_ingest_manager: Some(Arc::clone(&cdc_ingest_mgr_arc)),
-        trigger_manager: Some(Arc::clone(&trigger_mgr_arc)),
         udf_registry: Some(Arc::clone(&udf_reg_arc)),
         uda_registry: Some(Arc::clone(&uda_reg_arc)),
         procedure_registry: Some(Arc::clone(&proc_reg_arc)),

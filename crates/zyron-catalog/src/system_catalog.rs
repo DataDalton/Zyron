@@ -140,15 +140,30 @@ pub fn default_search_path() -> Vec<String> {
 pub enum SystemObjectKind {
     /// Read with a plain SELECT, computed on read.
     View,
-    /// Called with arguments in a FROM clause.
-    TableFunction,
+    /// Called with arguments in a FROM clause. `required_args` is how many
+    /// positional arguments a call must carry. A function that requires
+    /// none is also read with a plain SELECT, which calls it with none
+    TableFunction { required_args: u8 },
 }
 
 impl SystemObjectKind {
     pub fn label(&self) -> &'static str {
         match self {
             SystemObjectKind::View => "VIEW",
-            SystemObjectKind::TableFunction => "TABLE FUNCTION",
+            SystemObjectKind::TableFunction { .. } => "TABLE FUNCTION",
+        }
+    }
+
+    /// Whether the entity is called rather than read
+    pub fn is_table_function(&self) -> bool {
+        matches!(self, SystemObjectKind::TableFunction { .. })
+    }
+
+    /// How many positional arguments a call must carry, zero for a view
+    pub fn required_args(&self) -> u8 {
+        match self {
+            SystemObjectKind::View => 0,
+            SystemObjectKind::TableFunction { required_args } => *required_args,
         }
     }
 }
@@ -592,9 +607,9 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
     SystemObject {
         schema: "query",
         object: "recommend_indexes",
-        kind: SystemObjectKind::TableFunction,
-        doc: "Indexes the planner's workload tracker would create, with the evidence for each. \
-              Takes an optional schema name filter",
+        kind: SystemObjectKind::TableFunction { required_args: 0 },
+        doc: "recommend_indexes([schema]) returns the indexes the planner's workload tracker \
+              would create, with the evidence for each, narrowed to one schema when named",
     },
     // -----------------------------------------------------------------------
     // sql
@@ -699,7 +714,7 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
     SystemObject {
         schema: "compliance",
         object: "report",
-        kind: SystemObjectKind::TableFunction,
+        kind: SystemObjectKind::TableFunction { required_args: 1 },
         doc: "report(kind) returns the compliance report for one of \
               retention, legal_hold, audit, or events",
     },
@@ -742,16 +757,47 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
     SystemObject {
         schema: "cdc",
         object: "create_replication_slot",
-        kind: SystemObjectKind::TableFunction,
+        kind: SystemObjectKind::TableFunction { required_args: 1 },
         doc: "create_replication_slot(name, plugin) creates a slot pinned at the \
               current WAL head and returns its starting position",
     },
     SystemObject {
         schema: "cdc",
         object: "logical_slot_get_changes",
-        kind: SystemObjectKind::TableFunction,
+        kind: SystemObjectKind::TableFunction { required_args: 1 },
         doc: "logical_slot_get_changes(name [, upto_n]) consumes decoded changes \
               from a slot and advances it past them",
+    },
+    SystemObject {
+        schema: "cdc",
+        object: "change_streams",
+        kind: SystemObjectKind::View,
+        doc: "Change streams with their sources, position, mode, staleness, \
+              pending rows and lag",
+    },
+    SystemObject {
+        schema: "cdc",
+        object: "feeds",
+        kind: SystemObjectKind::View,
+        doc: "Change data feeds with their retention, recorded columns, before \
+              image setting, compression, version range and size",
+    },
+    SystemObject {
+        schema: "cdc",
+        object: "apply_runs",
+        kind: SystemObjectKind::View,
+        doc: "One row per APPLY CHANGES run with its target, source, row counts \
+              and duration",
+    },
+    // -----------------------------------------------------------------------
+    // alert
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "alert",
+        object: "templates",
+        kind: SystemObjectKind::View,
+        doc: "Alert templates a subsystem declares, with the condition each one \
+              fires on and its default threshold",
     },
     // -----------------------------------------------------------------------
     // pressure

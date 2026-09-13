@@ -107,6 +107,96 @@ fn push_projections(
             }
             plan.clone()
         }
+        // A change scan decodes only the data columns something above it
+        // reads, so a query over two of forty columns walks the other thirty
+        // eight without pushing a value. A column only the scan's own
+        // predicate reads is decoded for the predicate and dropped before
+        // the row leaves. A metadata column nothing reads is left out the
+        // same way, so a read of two columns builds no change kind label
+        // per row. The position the scan records comes from the records
+        // themselves, not from these columns
+        LogicalPlan::ChangeScan {
+            spec,
+            output_columns,
+        } => {
+            let Some(needed_cols) = needed else {
+                return plan.clone();
+            };
+            let mut predicate_needs = HashSet::new();
+            if let Some(predicate) = &spec.predicate {
+                collect_needed_columns(predicate, &mut predicate_needs);
+            }
+            let above_reads = |c: &LogicalColumn| {
+                c.table_idx
+                    .map(|ti| needed_cols.contains(&(ti, c.column_id)))
+                    .unwrap_or(true)
+            };
+            let predicate_reads = |c: &LogicalColumn| {
+                c.table_idx
+                    .map(|ti| predicate_needs.contains(&(ti, c.column_id)))
+                    .unwrap_or(false)
+            };
+            let data_columns: Vec<LogicalColumn> = spec
+                .data_columns
+                .iter()
+                .filter(|c| above_reads(c))
+                .cloned()
+                .collect();
+            let metadata_start = output_columns.len() - spec.metadata.len();
+            let mut metadata_outputs: Vec<LogicalColumn> = output_columns[metadata_start..]
+                .iter()
+                .filter(|c| above_reads(c) || predicate_reads(c))
+                .cloned()
+                .collect();
+            // A batch's row count is its columns' length, so a read that
+            // wants no column at all, a bare count, keeps the commit
+            // version, the cheapest column the scan fills
+            if data_columns.is_empty() && metadata_outputs.is_empty() {
+                let version_id = crate::logical::change_metadata_column_id(
+                    crate::logical::ChangeMetadataColumn::CommitVersion,
+                );
+                if let Some(kept) = output_columns[metadata_start..]
+                    .iter()
+                    .find(|c| c.column_id == version_id)
+                    .or_else(|| output_columns[metadata_start..].first())
+                {
+                    metadata_outputs.push(kept.clone());
+                }
+            }
+            if data_columns.len() == spec.data_columns.len()
+                && metadata_outputs.len() == spec.metadata.len()
+            {
+                return plan.clone();
+            }
+            let mut pruned = spec.as_ref().clone();
+            for column in &spec.data_columns {
+                if !above_reads(column)
+                    && predicate_reads(column)
+                    && !pruned
+                        .filter_columns
+                        .iter()
+                        .any(|f| f.column_id == column.column_id)
+                {
+                    pruned.filter_columns.push(column.clone());
+                }
+            }
+            pruned.data_columns = data_columns.clone();
+            pruned.metadata = spec
+                .metadata
+                .iter()
+                .copied()
+                .filter(|meta| {
+                    let id = crate::logical::change_metadata_column_id(*meta);
+                    metadata_outputs.iter().any(|c| c.column_id == id)
+                })
+                .collect();
+            let mut kept_outputs = data_columns;
+            kept_outputs.extend(metadata_outputs);
+            LogicalPlan::ChangeScan {
+                spec: Box::new(pruned),
+                output_columns: kept_outputs,
+            }
+        }
         LogicalPlan::Project {
             expressions,
             aliases,
@@ -402,6 +492,9 @@ fn collect_table_set_recursive(plan: &LogicalPlan, out: &mut HashSet<usize>) {
     match plan {
         LogicalPlan::Scan { table_idx, .. } => {
             out.insert(*table_idx);
+        }
+        LogicalPlan::ChangeScan { spec, .. } => {
+            out.insert(spec.table_idx);
         }
         other => {
             for child in other.children() {

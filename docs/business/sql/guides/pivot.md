@@ -112,7 +112,7 @@ The name column holds the source column's name, or the literal written after `AS
 UNPIVOT (amount FOR month IN (jan AS 'January', feb AS 'February'))
 ```
 
-The columns the `IN` list consumed do not travel to the result. `dept` is there because the list did not name it; `jan` through `apr` are not, because it did.
+The columns the `IN` list consumed do not travel to the result. `dept` is there because the list did not name it, and `jan` through `apr` are not, because it did.
 
 `EXCLUDE NULLS` drops a group whose value is NULL, and is what an unwritten modifier means. `INCLUDE NULLS` keeps it.
 

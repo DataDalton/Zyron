@@ -109,6 +109,87 @@ pub trait RowSecurityProvider: Send + Sync {
     fn has_row_security(&self, table_id: u32) -> bool;
 }
 
+pub mod change_scan;
+
+/// What the planner needs to know about a table's change data feed.
+///
+/// Resolving `LATEST`, refusing a range retention has reclaimed, costing a
+/// change scan and telling EXPLAIN how many change files it will open all
+/// need the feed itself, which lives in the CDC layer. Implemented there and
+/// installed once at startup, the same way the pressure controller and the
+/// media presign secret are, so no planning call site has to carry it
+pub trait ChangeFeedFacts: Send + Sync {
+    /// True when the table records changes right now
+    fn feed_enabled(&self, table_id: u32) -> bool;
+    /// The oldest and newest commit version the feed still holds
+    fn version_range(&self, table_id: u32) -> Option<(u64, u64)>;
+    /// The highest commit version retention has reclaimed, zero when none
+    fn purge_floor(&self, table_id: u32) -> u64;
+    /// The last version at or before a timestamp
+    fn version_at_timestamp(&self, table_id: u32, timestamp: i64) -> u64;
+    /// Records the window holds, from the feed's per-version counters
+    fn rows_in_window(&self, table_id: u32, from_exclusive: u64, to_inclusive: u64) -> u64;
+    /// Change files the window opens, and the ones its bounds prune
+    fn files_for_window(
+        &self,
+        table_id: u32,
+        from_exclusive: u64,
+        to_inclusive: u64,
+    ) -> (usize, usize);
+    /// The columns the feed records, empty when it records every column
+    fn recorded_columns(&self, table_id: u32) -> Vec<u16>;
+    /// False when the feed records one row per update rather than two
+    fn before_image(&self, table_id: u32) -> bool;
+}
+
+/// The change feed facts for one catalog, None before its server installs
+/// them.
+///
+/// Keyed by the directory the catalog's storage writes under, because a
+/// process can hold more than one node's catalog. A test binary builds
+/// several servers, and each has its own feeds. A single provider would give
+/// every one of them the first server's answers.
+///
+/// A planning path with none resolves a change scan's bounds as written and
+/// leaves the resolved range for the operator, which is what an internal plan
+/// built before the server finished starting sees
+pub fn change_feed_facts_for(catalog: &Catalog) -> Option<Arc<dyn ChangeFeedFacts>> {
+    let data_dir = catalog.data_dir()?;
+    CHANGE_FEED_FACTS
+        .get()?
+        .read()
+        .ok()?
+        .iter()
+        .find(|(at, _)| at == data_dir)
+        .map(|(_, facts)| Arc::clone(facts))
+}
+
+/// Installs the change feed facts for one catalog's data directory.
+///
+/// Installing again for the same directory replaces what was there, which is
+/// what a server restarting inside one process does
+pub fn install_change_feed_facts_for(
+    data_dir: std::path::PathBuf,
+    facts: Arc<dyn ChangeFeedFacts>,
+) {
+    let registry = CHANGE_FEED_FACTS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    // A poisoned registry would leave every later plan without facts, so the
+    // lock is taken through the guard a panicking writer left behind
+    let mut held = match registry.write() {
+        Ok(held) => held,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match held.iter_mut().find(|(at, _)| *at == data_dir) {
+        Some(slot) => slot.1 = facts,
+        None => held.push((data_dir, facts)),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+static CHANGE_FEED_FACTS: std::sync::OnceLock<
+    std::sync::RwLock<Vec<(std::path::PathBuf, Arc<dyn ChangeFeedFacts>)>>,
+> = std::sync::OnceLock::new();
+
 /// Plans a parsed SQL statement into an optimized physical execution plan.
 /// Internal/admin path: no row security is injected.
 pub async fn plan(

@@ -1,0 +1,152 @@
+{
+  "id": "2026-09-13_175309_6e2ce74-local",
+  "date": "2026-09-13 17:53:23Z",
+  "ts": 1789322003,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "ALP Packed Decode": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 12.24 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.26 },
+      "ALP decimals decode (float/sec)": {
+        "average": 6671545083.379087,
+        "runs": [4048582995.95, 7194244604.32, 7462686567.16, 7352941176.47, 7299270072.99],
+        "target": 3500000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "ALP decimals zone decode (float/sec)": {
+        "average": 5949789062.443718,
+        "runs": [3690036900.37, 6493506493.51, 6493506493.51, 6535947712.42, 6535947712.42],
+        "target": 2500000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Encoding Round-Trip": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 12.22 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.24 },
+      "FastLanes decode (int/sec)": {
+        "average": 14094202548.987448,
+        "runs": [10989010989.01, 14925373134.33, 14705882352.94, 14925373134.33, 14925373134.33],
+        "target": 120000000000.000000,
+        "passed": false,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "FSST decompress (GB/sec)": {
+        "average": 8.757454,
+        "runs": [5.15, 9.60, 9.38, 9.76, 9.91],
+        "target": 6.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "ALP decode (float/sec)": {
+        "average": 4252347181.487209,
+        "runs": [4149377593.36, 4273504273.50, 4273504273.50, 4273504273.50, 4291845493.56],
+        "target": 3000000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Dictionary lookup (ns/val)": {
+        "average": 0.531000,
+        "runs": [0.57, 0.52, 0.53, 0.52, 0.53],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "RLE decode (val/sec)": {
+        "average": 16125595537.360241,
+        "runs": [3663003663.00, 18518518518.52, 19607843137.25, 19230769230.77, 19607843137.25],
+        "target": 60000000000.000000,
+        "passed": false,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Encoding Selection": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.19 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 12.19 },
+      "Encoding select (us/col)": {
+        "average": 17.340760,
+        "runs": [17.50, 17.44, 17.33, 17.20, 17.23],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "FastLanes Packed Decode": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 12.20 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 12.19 },
+      "FastLanes 20-bit decode (val/sec)": {
+        "average": 7615229109.019600,
+        "runs": [6329113924.05, 7936507936.51, 8000000000.00, 7936507936.51, 7874015748.03],
+        "target": 4500000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "FastLanes 20-bit zone decode (val/sec)": {
+        "average": 9597900184.980776,
+        "runs": [8771929824.56, 9708737864.08, 9900990099.01, 9803921568.63, 9803921568.63],
+        "target": 2800000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "FastLanes delta decode (val/sec)": {
+        "average": 6793528222.099651,
+        "runs": [6802721088.44, 6756756756.76, 6802721088.44, 6802721088.44, 6802721088.44],
+        "target": 3500000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "FastLanes delta zone decode (val/sec)": {
+        "average": 5285388209.548375,
+        "runs": [3937007874.02, 5714285714.29, 5181347150.26, 5813953488.37, 5780346820.81],
+        "target": 2800000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Query-on-Compressed": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.19 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 12.20 },
+      "Compressed eval speedup (x)": {
+        "average": 2533.190866,
+        "runs": [2478.07, 2715.72, 2709.46, 2675.57, 2087.14],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

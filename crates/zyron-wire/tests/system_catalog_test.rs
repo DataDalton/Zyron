@@ -254,13 +254,14 @@ async fn test_system_schemas_refuse_user_tables() {
 // Part A: resolution
 // ---------------------------------------------------------------------------
 
-/// Every registered view answers a plain SELECT and returns its own shape.
+/// Every registered view answers a plain SELECT and returns its own shape,
+/// and so does every table function that requires no argument.
 #[tokio::test]
 async fn test_every_registered_view_resolves_and_answers() {
     let (server, _schema, _tmp) = create_test_server().await;
     let mut failures = Vec::new();
     for object in SYSTEM_OBJECTS {
-        if object.kind != SystemObjectKind::View {
+        if object.kind.required_args() > 0 {
             continue;
         }
         let name = object.canonical_name();
@@ -809,20 +810,24 @@ async fn test_registry_and_dispatch_agree() {
                     Err(e) => unbuilt.push(format!("{name}: {e}")),
                 }
             }
-            SystemObjectKind::TableFunction => {
-                // A function is exercised through its own tests; here it is
-                // enough that reading it as a view is refused for being a
-                // function rather than for being unregistered
-                match zyron_wire::system_views::query_system_view(
+            SystemObjectKind::TableFunction { required_args } => {
+                // A function is exercised through its own tests. Here it is
+                // enough that reading one that needs arguments as a view is
+                // refused for being a function rather than for being
+                // unregistered, and that one needing none answers the way
+                // a view does
+                let answer = zyron_wire::system_views::query_system_view(
                     &name,
                     &server,
                     &zyron_wire::system_views::SystemViewFilters::default(),
                 )
-                .await
-                {
-                    Err(zyron_common::ZyronError::PlanError(msg))
+                .await;
+                match (required_args, answer) {
+                    (0, Ok(Some(_))) => {}
+                    (0, other) => unbuilt.push(format!("{name} answered {other:?} called bare")),
+                    (_, Err(zyron_common::ZyronError::PlanError(msg)))
                         if msg.contains("table function") => {}
-                    other => unbuilt.push(format!("{name} answered {other:?} as a view")),
+                    (_, other) => unbuilt.push(format!("{name} answered {other:?} as a view")),
                 }
             }
         }

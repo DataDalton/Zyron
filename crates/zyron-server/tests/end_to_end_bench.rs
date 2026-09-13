@@ -197,7 +197,6 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         publication_manager: None,
         cdc_stream_manager: None,
         cdc_ingest_manager: None,
-        trigger_manager: None,
         udf_registry: None,
         uda_registry: None,
         procedure_registry: None,

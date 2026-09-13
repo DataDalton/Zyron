@@ -80,6 +80,14 @@ pub enum PrivilegeType {
     ManageRetention = 52,
     ManageErasure = 53,
     ManageCryptoShred = 54,
+    // Change streams and change data feeds.
+    /// Reads a change stream without moving its position, so a dashboard or a
+    /// lag check never takes changes from a consumer
+    Peek = 55,
+    /// Creates, alters, resets and drops a change stream
+    ManageChangeStream = 56,
+    /// Changes a table's change data feed settings
+    ManageChangeFeeds = 57,
     All = 255,
 }
 
@@ -142,6 +150,9 @@ impl PrivilegeType {
             52 => Ok(Self::ManageRetention),
             53 => Ok(Self::ManageErasure),
             54 => Ok(Self::ManageCryptoShred),
+            55 => Ok(Self::Peek),
+            56 => Ok(Self::ManageChangeStream),
+            57 => Ok(Self::ManageChangeFeeds),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -208,6 +219,9 @@ impl PrivilegeType {
             PrivilegeType::ManageRetention,
             PrivilegeType::ManageErasure,
             PrivilegeType::ManageCryptoShred,
+            PrivilegeType::Peek,
+            PrivilegeType::ManageChangeStream,
+            PrivilegeType::ManageChangeFeeds,
         ]
     }
 
@@ -234,6 +248,7 @@ pub enum ObjectType {
     Publication = 10,
     System = 11,
     Endpoint = 12,
+    ChangeStream = 13,
 }
 
 impl ObjectType {
@@ -253,6 +268,7 @@ impl ObjectType {
             10 => Ok(Self::Publication),
             11 => Ok(Self::System),
             12 => Ok(Self::Endpoint),
+            13 => Ok(Self::ChangeStream),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid ObjectType value {}",
                 val
@@ -662,11 +678,11 @@ impl PrivilegeStore {
     /// Adds a GRANT entry to the store.
     pub fn grant(&self, entry: GrantEntry) -> Result<()> {
         if entry.object_pattern.is_some() {
-            self.pattern_grants.update(|v| v.push(entry));
+            self.pattern_grants.update(|v| v.push(entry.clone()));
         } else {
             let key = (entry.object_type as u8, entry.object_id);
             self.grants.update(|m| {
-                m.entry(key).or_insert_with(Vec::new).push(entry);
+                m.entry(key).or_insert_with(Vec::new).push(entry.clone());
             });
         }
         self.generation.fetch_add(1, Ordering::Release);
@@ -677,11 +693,11 @@ impl PrivilegeStore {
     pub fn deny(&self, mut entry: GrantEntry) -> Result<()> {
         entry.state = PrivilegeState::Deny;
         if entry.object_pattern.is_some() {
-            self.pattern_grants.update(|v| v.push(entry));
+            self.pattern_grants.update(|v| v.push(entry.clone()));
         } else {
             let key = (entry.object_type as u8, entry.object_id);
             self.grants.update(|m| {
-                m.entry(key).or_insert_with(Vec::new).push(entry);
+                m.entry(key).or_insert_with(Vec::new).push(entry.clone());
             });
         }
         self.generation.fetch_add(1, Ordering::Release);

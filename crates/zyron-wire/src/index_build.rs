@@ -733,7 +733,10 @@ impl LiveRowStream {
         let (heap_file, page_count) = if table.lake.is_lake() {
             (None, 0)
         } else {
-            let heap_file = open_heap_file(server, table).await?;
+            // The instance every writer shares, with the log attached, so a
+            // build that is the first to open a table's heap leaves the
+            // writers after it recording their pages
+            let heap_file = crate::connection::table_heap(server, table).await?;
             let pages = heap_file.num_pages_cached() as u64;
             (Some(heap_file), pages)
         };
@@ -921,22 +924,18 @@ pub fn decode_live_batch(
     Ok((finalize_builders(builders), locators))
 }
 
-/// Resolves a heap file through the server's cache, for a caller that has the
-/// table entry and needs to write to it.
-pub async fn shadow_heap_file(
-    server: &Arc<ServerState>,
-    table: &TableEntry,
-) -> Result<Arc<HeapFile>, ZyronError> {
-    open_heap_file(server, table).await
-}
-
-/// Resolves a table's heap file through the server's cache.
+/// Resolves a rewrite's shadow heap through the server's cache, building it
+/// with no log attached.
 ///
-/// The cached instance is the one the writers used, so its page count includes
-/// pages that exist only as dirty frames in the buffer pool. A freshly
-/// constructed handle reads its page count off the file on disk and would see
-/// none of them, which would report a just-populated table as empty.
-async fn open_heap_file(
+/// The shadow is filled by the copy and by every writer mirroring into it,
+/// and a restart before the swap drops it whole, so a record of each page it
+/// fills would be a record nothing ever replays, written at the rate of the
+/// copy. The swap attaches the log, flushes the pages the fill left dirty,
+/// and only then names the shadow's files as the table's, so every row is
+/// on disk or in the log before the catalog says the files are the table's.
+/// Opened by the rewrite before the shadow is published to writers, so the
+/// instance a writer's hook finds in the cache is this one
+pub async fn shadow_heap_file(
     server: &Arc<ServerState>,
     table: &TableEntry,
 ) -> Result<Arc<HeapFile>, ZyronError> {

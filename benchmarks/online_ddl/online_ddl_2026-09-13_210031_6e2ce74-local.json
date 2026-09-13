@@ -1,0 +1,263 @@
+{
+  "id": "2026-09-13_210031_6e2ce74-local",
+  "date": "2026-09-13 21:02:48Z",
+  "ts": 1789333368,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Bulk build": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 11.98 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 13.57 },
+      "bulk_build_sorted, 10,000,000 keys": {
+        "average": 0.807556,
+        "runs": [0.83, 0.81, 0.80, 0.80, 0.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": 594.400
+      },
+      "sequential insert, 10,000,000 keys": {
+        "average": 6.352234,
+        "runs": [6.39, 6.35, 6.35, 6.35, 6.33],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": 594.400
+      },
+      "speedup against sequential insert": {
+        "average": 7.865993,
+        "runs": [7.87],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": 594.400
+      }
+    },
+    "Catalog-only column changes": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 13.03 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 13.13 },
+      "ADD COLUMN, 10,000,000 rows": {
+        "average": 0.395000,
+        "runs": [1.30, 0.20, 0.18, 0.12, 0.18],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 594.400
+      },
+      "DROP COLUMN, 10,000,000 rows": {
+        "average": 0.142420,
+        "runs": [0.22, 0.23, 0.11, 0.07, 0.08],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 594.400
+      },
+      "compatible SET TYPE, 10,000,000 rows": {
+        "average": 0.204040,
+        "runs": [0.12, 0.11, 0.55, 0.12, 0.11],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 594.400
+      }
+    },
+    "Epoch-aware decode": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 13.05 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 13.02 },
+      "current epoch, plan resolved once": {
+        "average": 28.307480,
+        "runs": [28.13, 28.69, 28.31, 28.16, 28.25],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 594.400
+      },
+      "current epoch, epoch resolved per row": {
+        "average": 27.788180,
+        "runs": [27.88, 27.78, 27.78, 27.74, 27.76],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 594.400
+      },
+      "current epoch overhead against the resolved plan": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 594.400
+      },
+      "older epoch, 2 absent columns": {
+        "average": 28.134470,
+        "runs": [28.12, 27.98, 28.25, 28.22, 28.11],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 594.400
+      },
+      "older epoch overhead, 2 absent columns": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 594.400
+      }
+    },
+    "Index build": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 12.93 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 13.63 },
+      "throughput, 10,000,000 rows, 8-byte key": {
+        "average": 3791739.031157,
+        "runs": [3877650.96, 3768331.85, 3822271.56, 3811635.24, 3678805.55],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 581.400
+      },
+      "peak RSS growth": {
+        "average": 138088448.000000,
+        "runs": [38297600.00, 39272448.00, 28020736.00, 289628160.00, 295223296.00],
+        "target": 335544320.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 581.400
+      }
+    },
+    "OLTP during a build": {
+      "util_before": { "cpu_pct": 10.0, "ram_used_gb": 13.60 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.06 },
+      "point read p99, no build": {
+        "average": 0.215620,
+        "runs": [0.48, 0.14, 0.15, 0.15, 0.15],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 649.000
+      },
+      "point read p99, build running": {
+        "average": 0.144680,
+        "runs": [0.14, 0.15, 0.15, 0.14, 0.14],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 649.000
+      },
+      "p99 degradation": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 608.100,
+        "storage_calibration_us": 649.000
+      }
+    },
+    "Progress and retirement": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 13.99 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 13.97 },
+      "ddl_progress read": {
+        "average": 0.000712,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 649.000
+      },
+      "vacuum epoch retirement check, per table": {
+        "average": 0.043217,
+        "runs": [0.04, 0.04, 0.04, 0.04, 0.04],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 649.000
+      }
+    },
+    "Publish and wait": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 13.88 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 13.90 },
+      "publish to writers maintaining": {
+        "average": 0.121700,
+        "runs": [0.16, 0.09, 0.08, 0.16, 0.12],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 649.000
+      },
+      "wait for old transactions, none active": {
+        "average": 0.001345,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 649.000
+      }
+    },
+    "Shadow rewrite": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.88 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 13.94 },
+      "throughput, 1,000,000 rows, TEXT to INT": {
+        "average": 2658915.858790,
+        "runs": [2665383.73, 2744570.76, 2747775.13, 2421848.76, 2715000.92],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 684.000
+      },
+      "insert with no shadow": {
+        "average": 88.035840,
+        "runs": [88.34, 75.77, 76.40, 94.36, 105.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 684.000
+      },
+      "insert while the shadow is filling": {
+        "average": 85.478587,
+        "runs": [80.77, 84.76, 82.33, 96.01, 83.52],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 684.000
+      },
+      "dual-write hook overhead per row": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 684.000
+      }
+    }
+  }
+}

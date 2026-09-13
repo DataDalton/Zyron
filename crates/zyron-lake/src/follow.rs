@@ -180,21 +180,9 @@ them the same, so a version out of sequence means a gap rather than a conflict"
             deadline: None,
         };
         let entries = version.entries.clone();
-        let committed = follower.commit(attempt, move |_| Ok(entries.clone()))?;
-        if db_txn_id != 0 {
-            let Some(database_dir) = follower.paths().database_dir() else {
-                return Err(ZyronError::Internal(format!(
-                    "a lake log at {} is not under a database directory, so a transactional apply has nowhere to register",
-                    follower.paths().root().display()
-                )));
-            };
-            crate::transaction_log::register_txn_pending(
-                database_dir,
-                db_txn_id,
-                follower.paths().root().to_path_buf(),
-                committed,
-            );
-        }
+        // A commit under a transaction registers itself with the pending
+        // registry the transaction's end publishes from
+        follower.commit(attempt, move |_| Ok(entries.clone()))?;
         applied += 1;
         // A replica writes as whoever owns the dataset, because the
         // versions it holds are that node's. Without this the first

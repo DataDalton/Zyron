@@ -108,15 +108,36 @@ impl Node {
         )
         .await
         .expect("join the group");
+        // Every member of a test group runs this binary, which is what the
+        // upgrade service would read off the group before raising this. The
+        // service is not started here, so the reading is made directly, and
+        // a change stream position can move through the group
+        cluster
+            .replication
+            .group_carries_stream_advance
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        cluster
+            .replication
+            .group_carries_feed_images
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        cluster
+            .replication
+            .group_carries_lake_files
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        cluster
+            .replication
+            .group_carries_schedule_runs
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Roles, users and grants live here rather than in the catalog, and
         // each node gets its own backed by its own heap. A shared one would
         // let a member that never applied a GRANT read the grant a different
         // member wrote and agree with it
-        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
+        let heap_auth_storage =
             zyron_auth::HeapAuthStorage::new(Arc::clone(&disk), Arc::clone(&buffer_pool))
-                .expect("auth storage"),
-        );
+                .expect("auth storage");
+        heap_auth_storage.attach_wal(&wal);
+        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(heap_auth_storage);
         let security_manager = Arc::new(
             zyron_auth::SecurityManager::new(auth_storage)
                 .await
@@ -175,13 +196,13 @@ impl Node {
             // node working it out again
             actor_role_id: Some(TEST_ACTOR_ROLE),
         };
-        let done = self.router().begin_statement(sql, &context).await?;
+        let agreed = self.router().begin_statement(sql, &context).await?;
         // The originating node runs the statement in no transaction of its
-        // own, which is what zero says here
+        // own, which is what zero says here, as the entry the group agreed
         let outcome = zyron_server::replication::DispatchedDdl::new(&self._server)
-            .run(sql, &context, 0)
+            .run(sql, &context, 0, (agreed.index, agreed.timestamp_us))
             .await;
-        let _ = done.send(match &outcome {
+        let _ = agreed.done.send(match &outcome {
             Ok(()) => Ok(()),
             Err(e) => Err(ZyronError::Internal(e.to_string())),
         });
@@ -205,7 +226,12 @@ impl Node {
             let _ = self.txn_manager.abort(&mut txn);
             return Err(e);
         }
-        ReplicationRouter::capture_lake(self.router().as_ref(), txn.txn_id(), &changeset)?;
+        ReplicationRouter::capture_lake(
+            self.router().as_ref(),
+            txn.txn_id(),
+            Arc::clone(&changeset),
+        )
+        .await?;
         let _ = ReplicationRouter::commit(self.router().as_ref(), txn, changeset).await?;
         Ok(())
     }
@@ -275,6 +301,24 @@ impl Node {
     pub async fn count(&self, table: &str) -> i64 {
         let rows = self.ints(&format!("SELECT COUNT(*) FROM {table}")).await;
         rows.first().copied().unwrap_or(0)
+    }
+
+    /// Every row of an answer rendered as text, in the order the statement
+    /// returned them, so two members compare by whole rows of any type
+    pub async fn rows(&self, sql: &str) -> Vec<String> {
+        let batches = self.query(sql).await.expect("query");
+        let mut out = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows {
+                let cells: Vec<String> = batch
+                    .columns
+                    .iter()
+                    .map(|column| format!("{:?}", column.data.get_scalar(row)))
+                    .collect();
+                out.push(cells.join("|"));
+            }
+        }
+        out
     }
 
     /// Serves the wire protocol off a listening socket the way the process
@@ -357,6 +401,14 @@ pub fn build_server_state(
     cluster: &ClusterHandle,
     security_manager: Arc<zyron_auth::SecurityManager>,
 ) -> Arc<ServerState> {
+    // The feeds and the hook that records into them, built the way the
+    // server builds them, so a change a member applies is recorded in its
+    // own feed and a change stream over it has something to read
+    let cdc_registry = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.to_path_buf()));
+    let cdc_hook: Arc<dyn zyron_executor::context::CdcHook> = Arc::new(
+        zyron_wire::dml_hooks::CdcHookBridge::new(Arc::clone(&cdc_registry))
+            .with_catalog(Arc::clone(&catalog)),
+    );
     Arc::new(ServerState {
         raft: Some(Arc::clone(&cluster.node)),
         replication: Some(
@@ -396,9 +448,7 @@ pub fn build_server_state(
         // builds them, because a statement whose manager is absent is refused
         // for a reason that has nothing to do with whether it replicates, and
         // a conformance case cannot tell those two apart
-        cdc_registry: Some(Arc::new(zyron_cdc::CdfRegistry::new(
-            data_dir.to_path_buf(),
-        ))),
+        cdc_registry: Some(cdc_registry),
         slot_manager: zyron_cdc::SlotManager::open(data_dir, zyron_cdc::SlotLagConfig::default())
             .ok()
             .map(Arc::new),
@@ -411,7 +461,6 @@ pub fn build_server_state(
         cdc_ingest_manager: zyron_cdc::CdcIngestManager::new(data_dir)
             .ok()
             .map(Arc::new),
-        trigger_manager: Some(Arc::new(zyron_pipeline::trigger::TriggerManager::new())),
         udf_registry: Some(Arc::new(zyron_pipeline::udf::UdfRegistry::new())),
         uda_registry: Some(Arc::new(zyron_pipeline::aggregate::UdaRegistry::new())),
         procedure_registry: Some(Arc::new(
@@ -443,7 +492,7 @@ pub fn build_server_state(
         spatial_manager: Some(Arc::new(
             zyron_types::spatial_index::SpatialIndexManager::new(),
         )),
-        cdc_hook: None,
+        cdc_hook: Some(cdc_hook),
         dml_hook: None,
         // Built the way the server builds it, so LISTEN and NOTIFY reach a
         // real registry rather than being refused for want of one
@@ -483,6 +532,121 @@ pub fn build_server_state(
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// A webhook sink
+// ---------------------------------------------------------------------------
+
+/// A webhook listener on the loopback interface that keeps every body it
+/// is posted, answering each request with an empty 200.
+///
+/// What an outbound stream's sink sees is the only proof of delivery, so
+/// the suites that drive the pump read what reached here rather than what
+/// the pump reports
+pub struct WebhookListener {
+    pub url: String,
+    bodies: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl WebhookListener {
+    pub fn start() -> WebhookListener {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the listener");
+        let port = socket.local_addr().expect("the listener's address").port();
+        let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for stream in socket.incoming() {
+                let Ok(stream) = stream else {
+                    break;
+                };
+                let kept = Arc::clone(&kept);
+                std::thread::spawn(move || serve_webhook(stream, kept));
+            }
+        });
+        WebhookListener {
+            url: format!("http://127.0.0.1:{port}/changes"),
+            bodies,
+        }
+    }
+
+    /// Every body posted so far, oldest first
+    pub fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().expect("the bodies").clone()
+    }
+}
+
+/// Reads requests off one connection until the client closes it, keeping
+/// each body
+fn serve_webhook(mut stream: std::net::TcpStream, kept: Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+
+    let mut buffered = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let head_end = loop {
+            if let Some(at) = buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffered.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buffered[..head_end]).into_owned();
+        let length: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while buffered.len() < head_end + length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffered.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let body = String::from_utf8_lossy(&buffered[head_end..head_end + length]).into_owned();
+        kept.lock().expect("the bodies").push(body);
+        buffered.drain(..head_end + length);
+        if stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// The position each member records for a change stream over one table,
+/// as the version it names and the count it consumed, in node order.
+///
+/// The count is what replicates and the version is what each member
+/// resolved it to in its own feed, so the pair is what proves a position
+/// both agreed and localized
+pub fn positions_on_every_member(group: &Group, stream: &str, table: &str) -> Vec<(u64, u64)> {
+    group
+        .nodes
+        .iter()
+        .map(|node| {
+            let table_id = node
+                .catalog
+                .get_table(node.schema, table)
+                .expect("the table")
+                .id
+                .0;
+            node.catalog
+                .list_change_streams()
+                .into_iter()
+                .find(|entry| entry.name == stream)
+                .map(|entry| (entry.position_of(table_id), entry.consumed_of(table_id)))
+                .unwrap_or_else(|| panic!("{} holds no change stream {stream}", node.name))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

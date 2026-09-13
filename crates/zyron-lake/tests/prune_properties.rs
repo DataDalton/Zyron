@@ -129,6 +129,7 @@ fn synthetic_manifest(files: usize) -> ManifestFile {
                 size_bytes: 1 << 20,
                 row_count: 100,
                 added_version: 1,
+                schema_id: 1,
                 cluster_spec_id: 0,
                 column_stats: std::sync::Arc::new(vec![
                     int_stats(0, lo, lo + 99, 100),
@@ -149,6 +150,7 @@ fn synthetic_manifest(files: usize) -> ManifestFile {
         properties: BTreeMap::new(),
         indexes: Vec::new(),
         index_files: Vec::new(),
+        type_history: Vec::new(),
     }
 }
 
@@ -470,6 +472,7 @@ fn test_get_latest_version_performs_no_io() {
             size_bytes: 512,
             row_count: 64,
             added_version: 0,
+            schema_id: 0,
             cluster_spec_id: 0,
             column_stats: std::sync::Arc::new(vec![int_stats(0, 0, 63, 64)]),
             delete_predicate_ids: Vec::new(),

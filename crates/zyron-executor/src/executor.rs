@@ -34,8 +34,8 @@ use crate::operator::{MetricsOperator, Operator, OperatorMetrics};
 
 /// Result of building an operator tree: the operator plus optional metrics
 /// (populated only when analyze mode is enabled on the ExecutionContext).
-struct BuildResult {
-    op: Box<dyn Operator>,
+pub(crate) struct BuildResult {
+    pub(crate) op: Box<dyn Operator>,
     metrics: Option<Arc<OperatorMetrics>>,
 }
 
@@ -417,6 +417,9 @@ fn build_operator_tree(
             left, right, spec, ..
         } => Box::pin(build_asof_join(left, right, spec, analyze, ctx)),
 
+        PhysicalPlan::ChangeScan { spec, columns, .. } => {
+            Box::pin(build_change_scan(spec, columns, analyze, ctx))
+        }
         PhysicalPlan::ExpandRows { child, spec, .. } => {
             Box::pin(build_expand_rows(child, spec, analyze, ctx))
         }
@@ -1939,10 +1942,18 @@ async fn build_update(
         .any(|a| crate::correlated::expr_has_correlated_subquery(&a.value));
     let mut correlated_values = None;
     let assignments = if any_correlated {
+        // The operator reads each row widened to every column of the table,
+        // a dropped one included, so the outer row a correlated value
+        // resolves against is described in that same shape
+        let mut outer_schema = input_schema.clone();
+        let table = ctx.get_table_entry(table_id)?;
+        if let Some(shape) = crate::operator::modify::TableShape::of(&table) {
+            shape.widen_schema(&mut outer_schema, &table)?;
+        }
         correlated_values = Some(
             crate::correlated::prepare_correlated_values(
                 assignments.iter().map(|a| a.value.clone()).collect(),
-                input_schema.clone(),
+                outer_schema,
                 ctx.params.clone(),
                 ctx,
             )
@@ -2064,6 +2075,70 @@ async fn build_asof_join(
 
 /// One arm of `build_operator_tree`, see that function for why the arms
 /// are not written inline
+/// Builds the operator that reads a table's recorded changes
+#[inline(never)]
+async fn build_change_scan(
+    spec: Box<zyron_planner::logical::ChangeScanSpec>,
+    columns: Vec<zyron_planner::logical::LogicalColumn>,
+    analyze: bool,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<BuildResult> {
+    // A stream created with SHOW INITIAL ROWS reads the source's rows on its
+    // first pass, through the same scan any other read of the table goes
+    // through, so visibility and column security are not decided twice
+    let initial: Option<Box<dyn Operator>> = if spec.initial_rows {
+        match spec.windows.first() {
+            Some(window) => {
+                // The seeded rows carry the columns the stream's predicate
+                // reads beside the ones it exposes, in the order a decoded
+                // change carries them, so one filter serves both
+                let scan_columns: Vec<zyron_planner::logical::LogicalColumn> = spec
+                    .data_columns
+                    .iter()
+                    .chain(spec.filter_columns.iter())
+                    .cloned()
+                    .collect();
+                // A lake table's rows are in its log rather than a heap
+                // file, so the seed reads them the way any scan of the
+                // table does
+                let table = ctx.get_table_entry(window.table_id)?;
+                if table.lake.is_lake() {
+                    let scan = crate::operator::lake_scan::LakeScanOperator::new(
+                        Arc::clone(ctx),
+                        window.table_id,
+                        scan_columns,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    Some(Box::new(scan) as Box<dyn Operator>)
+                } else {
+                    let scan = crate::operator::scan::SeqScanOperator::new(
+                        Arc::clone(ctx),
+                        window.table_id,
+                        scan_columns,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await?;
+                    Some(Box::new(scan) as Box<dyn Operator>)
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let op = crate::operator::change_scan::ChangeScanOperator::new(
+        Arc::clone(ctx),
+        *spec,
+        columns,
+        initial,
+    );
+    Ok(BuildResult::new(Box::new(op)).with_metrics("ChangeScan", analyze, Vec::new()))
+}
+
 #[inline(never)]
 async fn build_expand_rows(
     child: Box<zyron_planner::physical::PhysicalPlan>,
@@ -2211,7 +2286,7 @@ fn build_aggregate_schema(
 
 /// Builds an operator tree where the leaf scan tracks tuple IDs.
 /// Used by DELETE and UPDATE to identify which heap rows to modify.
-fn build_scan_with_tuple_ids(
+pub(crate) fn build_scan_with_tuple_ids(
     plan: PhysicalPlan,
     ctx: &Arc<ExecutionContext>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BuildResult>> + Send + '_>> {

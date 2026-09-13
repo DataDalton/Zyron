@@ -16,7 +16,6 @@ pub mod schedule;
 pub mod sla;
 pub mod storage;
 pub mod stored_procedure;
-pub mod trigger;
 pub mod trigger_trace;
 pub mod udf;
 pub mod watermark;

@@ -33,6 +33,11 @@ const FLAG_SCALE: u8 = 0x20;
 /// the whole prefix. Set alongside FLAG_DELTA or FLAG_DELTA_OF_DELTA.
 const FLAG_RESTART: u8 = 0x40;
 
+/// Running values a constant-step decode of the wide layout carries at once.
+/// Each covers every fourth row, so the adds of four rows are in flight
+/// together instead of queueing behind one carry chain
+const LINEAR_LANES: usize = 4;
+
 /// 8-byte (and narrower) encoded format:
 ///   [0..8]    base_value: u64 (FoR base, little-endian)
 ///   [8]       bit_width: u8 (bits per packed value after FoR subtraction)
@@ -1063,6 +1068,70 @@ fn seed_wide_restart<const W: usize>(
     Some((words, k << shift))
 }
 
+/// Fills `count` little-endian 16-byte slots ascending by `step` from
+/// `first`, for a step that fits in 64 bits.
+///
+/// The low halves are a 64-bit arithmetic sequence and the high half moves
+/// only where that sequence wraps, which is once every `u64::MAX / step`
+/// rows. Each run between wraps is written as a 64-bit fill beside a
+/// constant, so a row costs one narrow add and no carry
+fn store_linear_wide(out: &mut [u8], count: usize, first: u128, step: u64) {
+    debug_assert!(
+        out.len() >= count * 16,
+        "wide linear fill wider than its buffer"
+    );
+    debug_assert!(step != 0, "a wide linear fill needs a step");
+    let p = out.as_mut_ptr() as *mut u64;
+    // A buffer the allocator handed out is word aligned, and a run written
+    // through a slice of words is one the compiler pairs up into wide
+    // stores. The unaligned stores answer for a buffer that is not
+    let words: Option<&mut [u64]> = if p.align_offset(std::mem::align_of::<u64>()) == 0 {
+        // SAFETY: out holds count slots of sixteen bytes, which is count
+        // pairs of words, and the pointer is aligned for them
+        Some(unsafe { std::slice::from_raw_parts_mut(p, count * 2) })
+    } else {
+        None
+    };
+    let mut low = first as u64;
+    let mut high = (first >> 64) as u64;
+    let mut at = 0usize;
+    let mut words = words;
+    while at < count {
+        // Rows this run covers, the ones before the low half wraps
+        let room = ((u64::MAX - low) / step) as usize;
+        let run = room.saturating_add(1).min(count - at);
+        match &mut words {
+            Some(words) => {
+                for (i, pair) in words[at * 2..(at + run) * 2]
+                    .chunks_exact_mut(2)
+                    .enumerate()
+                {
+                    // Inside the run `low + i * step` is under the wrap by
+                    // the way `room` was measured, so neither the product
+                    // nor the sum carries
+                    pair[0] = (low + i as u64 * step).to_le();
+                    pair[1] = high.to_le();
+                }
+            }
+            None => {
+                for i in 0..run {
+                    let value = low + i as u64 * step;
+                    // SAFETY: slot at + i is inside out, which holds count
+                    // slots of two words
+                    unsafe {
+                        p.add((at + i) * 2).write_unaligned(value.to_le());
+                        p.add((at + i) * 2 + 1).write_unaligned(high.to_le());
+                    }
+                }
+            }
+        }
+        at += run;
+        let past = (low as u128) + (run as u128) * (step as u128);
+        low = past as u64;
+        high = high.wrapping_add((past >> 64) as u64);
+    }
+}
+
 /// Range decode for the 16-byte layouts. Mirrors the narrow path: closed form
 /// for a constant step, direct bit addressing for plain and patched frame of
 /// reference, and restart-seeded replay for the two cumulative forms.
@@ -1081,9 +1150,18 @@ fn decode_range_wide(
     let bit_width = encoded[16];
     let flags = encoded[17];
     let taken = end - start;
-    let mut out = vec![0u8; taken * 16];
+    // SAFETY: every layout below writes each of the taken slots, sixteen
+    // bytes apiece, which is the whole buffer, before anything reads it.
+    // The closed forms and the plain layout fill slots in order, the
+    // patched layout fills every slot and then overwrites its exceptions,
+    // and the cumulative layouts write each row of start..end as they
+    // replay it
+    let mut out = unsafe { super::scratch::take_uninit(taken * 16) };
     let write = |out: &mut [u8], i: usize, v: u128| {
-        out[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
+        debug_assert!(i < taken, "wide decode slot outside its buffer");
+        // SAFETY: slot i is inside out, which holds taken slots of sixteen
+        // bytes, and the store is unaligned so the buffer needs no alignment
+        unsafe { (out.as_mut_ptr() as *mut u128).add(i).write_unaligned(v) };
     };
 
     if flags & FLAG_SCALE != 0 {
@@ -1099,6 +1177,9 @@ fn decode_range_wide(
             let q = read_u128_le(&quotients, i * 16);
             write(&mut out, i, base.wrapping_add(q.wrapping_mul(scale)));
         }
+        // The inner decode's buffer goes back for the next one on this
+        // thread rather than to the allocator
+        super::scratch::give_back(quotients);
         return Ok(out);
     }
 
@@ -1109,12 +1190,33 @@ fn decode_range_wide(
             ));
         }
         let step = read_u128_le(encoded, WIDE_HEADER_SIZE);
-        for i in 0..taken {
-            write(
-                &mut out,
-                i,
-                base.wrapping_add(((start + i) as u128).wrapping_mul(step)),
-            );
+        let first = base.wrapping_add((start as u128).wrapping_mul(step));
+        match u64::try_from(step) {
+            // A step inside 64 bits leaves the high half of the value fixed
+            // between the rows where the low half wraps, so each run is a
+            // 64-bit sequence beside a constant rather than a carry chain
+            Ok(narrow) if narrow != 0 => store_linear_wide(&mut out, taken, first, narrow),
+            _ => {
+                // Values a lane apart, each carried forward by that many
+                // steps, so a row's add waits on the one a lane back rather
+                // than on the row before it
+                let stride = step.wrapping_mul(LINEAR_LANES as u128);
+                let mut lanes: [u128; LINEAR_LANES] =
+                    std::array::from_fn(|lane| first.wrapping_add(step.wrapping_mul(lane as u128)));
+                let whole = taken - taken % LINEAR_LANES;
+                let mut i = 0;
+                while i < whole {
+                    for (lane, value) in lanes.iter_mut().enumerate() {
+                        write(&mut out, i + lane, *value);
+                        *value = value.wrapping_add(stride);
+                    }
+                    i += LINEAR_LANES;
+                }
+                while i < taken {
+                    write(&mut out, i, lanes[i - whole]);
+                    i += 1;
+                }
+            }
         }
         return Ok(out);
     }
@@ -1965,141 +2067,23 @@ fn encode_pfor_wide(values: &[u128], base: u128, row_count: usize) -> Option<Vec
 }
 
 /// Decodes the 16-byte wide format back to raw little-endian u128 values.
+///
+/// A whole column is the range of every row. The range kernel reads each
+/// layout from its own bit positions and fills a pooled buffer in place,
+/// so the column decode is that call at row zero rather than a second set
+/// of kernels holding the residuals in an array of their own first
 fn decode_wide(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
-    if encoded.len() < WIDE_HEADER_SIZE {
-        return Err(ZyronError::DecodingFailed(
-            "FastLanes wide header too short".to_string(),
-        ));
+    if row_count == 0 {
+        return Ok(Vec::new());
     }
-    let base = read_u128_le(encoded, 0);
-    let bit_width = encoded[16];
-    let flags = encoded[17];
-
-    // Effective-resolution scale wrapper: recurse one level into the inner
-    // core blob, then multiply back.
-    if flags & FLAG_SCALE != 0 {
-        if encoded.len() < WIDE_HEADER_SIZE + 16 {
-            return Err(ZyronError::DecodingFailed(
-                "FastLanes wide scale blob too short".to_string(),
-            ));
-        }
-        let scale = read_u128_le(encoded, WIDE_HEADER_SIZE);
-        let q_raw = decode_wide(&encoded[WIDE_HEADER_SIZE + 16..], row_count)?;
-        let mut out = vec![0u8; row_count * 16];
-        for i in 0..row_count {
-            let q = read_u128_le(&q_raw, i * 16);
-            let v = base.wrapping_add(q.wrapping_mul(scale));
-            out[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
-        }
-        return Ok(out);
-    }
-
-    // Constant-step closed form has no packed bit array.
-    if flags & FLAG_CONST_STEP != 0 {
-        if encoded.len() < WIDE_HEADER_SIZE + 16 {
-            return Err(ZyronError::DecodingFailed(
-                "FastLanes wide constant-step blob too short".to_string(),
-            ));
-        }
-        let first = base;
-        let step = read_u128_le(encoded, WIDE_HEADER_SIZE);
-        let mut out = vec![0u8; row_count * 16];
-        for i in 0..row_count {
-            let v = first.wrapping_add((i as u128).wrapping_mul(step));
-            out[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
-        }
-        return Ok(out);
-    }
-
-    // Patched FoR: [hdr][exception table (20B each)][packed low-width residuals].
-    if flags & FLAG_PFOR != 0 {
-        let exc_count = u16::from_le_bytes([encoded[18], encoded[19]]) as usize;
-        let table_off = WIDE_HEADER_SIZE;
-        let table_bytes = exc_count * 20;
-        if bit_width == 0 || bit_width > 128 || encoded.len() < table_off + table_bytes {
-            return Err(ZyronError::DecodingFailed(
-                "FastLanes wide PFOR blob malformed".to_string(),
-            ));
-        }
-        let packed = &encoded[table_off + table_bytes..];
-        let mut out = vec![0u8; row_count * 16];
-        for i in 0..row_count {
-            let r = unpack_bits_128(packed, i as u64 * bit_width as u64, bit_width);
-            out[i * 16..i * 16 + 16].copy_from_slice(&r.wrapping_add(base).to_le_bytes());
-        }
-        for e in 0..exc_count {
-            let o = table_off + e * 20;
-            let pos =
-                u32::from_le_bytes([encoded[o], encoded[o + 1], encoded[o + 2], encoded[o + 3]])
-                    as usize;
-            let resid = read_u128_le(encoded, o + 4);
-            if pos < row_count {
-                out[pos * 16..pos * 16 + 16]
-                    .copy_from_slice(&resid.wrapping_add(base).to_le_bytes());
-            }
-        }
-        return Ok(out);
-    }
-
-    if bit_width == 0 || bit_width > 128 {
-        return Err(ZyronError::DecodingFailed(format!(
-            "invalid FastLanes wide bit width: {}",
-            bit_width
-        )));
-    }
-    let packed_off = wide_packed_offset(encoded, flags, row_count);
-    if encoded.len() < packed_off {
-        return Err(ZyronError::DecodingFailed(
-            "FastLanes wide restart table truncated".to_string(),
-        ));
-    }
-    let packed = &encoded[packed_off..];
-
-    let mut stream = vec![0u128; row_count];
-    for (i, slot) in stream.iter_mut().enumerate() {
-        *slot = unpack_bits_128(packed, i as u64 * bit_width as u64, bit_width);
-    }
-
-    let mut out = vec![0u8; row_count * 16];
-    let write = |out: &mut [u8], i: usize, v: u128| {
-        out[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
-    };
-
-    if flags & FLAG_DELTA_OF_DELTA != 0 {
-        let mut residual = stream[0];
-        write(&mut out, 0, residual.wrapping_add(base));
-        if row_count > 1 {
-            let mut delta = unzigzag_i128(stream[1]);
-            residual = residual.wrapping_add(delta as u128);
-            write(&mut out, 1, residual.wrapping_add(base));
-            for (i, &s) in stream.iter().enumerate().take(row_count).skip(2) {
-                let dd = unzigzag_i128(s);
-                delta = delta.wrapping_add(dd);
-                residual = residual.wrapping_add(delta as u128);
-                write(&mut out, i, residual.wrapping_add(base));
-            }
-        }
-    } else if flags & FLAG_DELTA != 0 {
-        let mut residual = stream[0];
-        write(&mut out, 0, residual.wrapping_add(base));
-        for (i, &s) in stream.iter().enumerate().take(row_count).skip(1) {
-            let d = unzigzag_i128(s);
-            residual = residual.wrapping_add(d as u128);
-            write(&mut out, i, residual.wrapping_add(base));
-        }
-    } else {
-        for (i, &s) in stream.iter().enumerate().take(row_count) {
-            write(&mut out, i, s.wrapping_add(base));
-        }
-    }
-    Ok(out)
+    decode_range_wide(encoded, row_count, 0, row_count)
 }
 
 /// Evaluates a predicate on the 16-byte wide format. Decodes then compares
 /// numerically as u128 (same unsigned-pattern semantics the 8-byte path uses).
 fn eval_predicate_wide(encoded: &[u8], row_count: usize, predicate: &Predicate) -> Result<Vec<u8>> {
     let decoded = decode_wide(encoded, row_count)?;
-    Ok(match predicate {
+    let mask = match predicate {
         Predicate::Range { low, high } => {
             let lo = match *low {
                 Some(b) => read_u128_bound(b),
@@ -2124,7 +2108,11 @@ fn eval_predicate_wide(encoded: &[u8], row_count: usize, predicate: &Predicate) 
                 targets.contains(&read_u128_le(&decoded, i * 16))
             })
         }
-    })
+    };
+    // The values were read to answer the predicate and nothing holds them
+    // after, so the buffer goes back for the next decode on this thread
+    super::scratch::give_back(decoded);
+    Ok(mask)
 }
 
 #[cfg(test)]
@@ -2770,6 +2758,36 @@ mod tests {
         for (i, v) in values.iter().enumerate() {
             let got = bm[i / 8] & (1 << (i % 8)) != 0;
             assert_eq!(got, *v == 10_013, "eq row {i}");
+        }
+    }
+
+    /// A wide constant-step column whose low 64 bits wrap partway through,
+    /// which is where the high half of the value moves. Checked whole and
+    /// over ranges that open before, on and after each wrap
+    #[test]
+    fn a_wide_constant_step_carries_across_every_wrap_of_its_low_half() {
+        let enc = FastLanesEncoding;
+        // Three wraps inside the column, with the first one four rows in
+        let step: i128 = (u64::MAX as i128 + 1) / 4;
+        let first: i128 = (u64::MAX as i128) - step + 1;
+        let values: Vec<i128> = (0..40).map(|i| first + i * step).collect();
+        let encoded = enc.encode(&pack_i128(&values), values.len(), 16).unwrap();
+        assert_eq!(encoded[17] & FLAG_CONST_STEP, FLAG_CONST_STEP);
+
+        let decoded = enc.decode(&encoded, values.len(), 16).unwrap();
+        assert_eq!(unpack_i128(&decoded), values, "the column decodes whole");
+
+        for start in 0..values.len() {
+            for end in (start + 1)..=values.len() {
+                let part = enc
+                    .decode_range(&encoded, values.len(), 16, start, end)
+                    .unwrap();
+                assert_eq!(
+                    unpack_i128(&part),
+                    values[start..end],
+                    "rows {start}..{end} decode to what the column holds"
+                );
+            }
         }
     }
 

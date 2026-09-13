@@ -188,6 +188,7 @@ fn worm_write_lock_blocks_until_expiry() {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
     assert!(!zyron_lifecycle::worm::write_locked(&e));
     e.lifecycle.retention_lock_until = now_micros() + 3_600_000_000;

@@ -1,0 +1,128 @@
+# suite:   encoding
+# run:     2026-09-13_175309_6e2ce74-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== ALP Bit-Packed Decode ===
+Rows: 100000
+
+  Decimals, no order: 3.20x, 250028 bytes
+  ALP decimals decode (float/sec) [PASS/OK]:
+    Runs: [4,048,582,996, 7,194,244,604, 7,462,686,567, 7,352,941,176, 7,299,270,073]
+    Average: 6,671,545,083 >= 3,500,000,000 (target)
+    Min/Max: 4,048,582,996 / 7,462,686,567, StdDev: 1,314,335,501
+  ALP decimals zone decode (float/sec) [PASS/OK]:
+    Runs: [3,690,036,900, 6,493,506,494, 6,493,506,494, 6,535,947,712, 6,535,947,712]
+    Average: 5,949,789,062 >= 2,500,000,000 (target)
+    Min/Max: 3,690,036,900 / 6,535,947,712, StdDev: 1,130,035,491
+
+=== Encoding Round-Trip Correctness ===
+Rows per encoding: 100000
+
+  FastLanes (sequential i32):
+    Compression ratio: 20000.00x
+  FastLanes decode (int/sec) [FAIL/REGR!]:
+    Runs: [10,989,010,989, 14,925,373,134, 14,705,882,353, 14,925,373,134, 14,925,373,134]
+    Average: 14,094,202,549 >= 120,000,000,000 (target)
+    Min/Max: 10,989,010,989 / 14,925,373,134, StdDev: 1,554,921,248
+
+  FSST (32-byte strings):
+    Compression ratio: 6.36x
+  FSST decompress (GB/sec) [PASS/OK]:
+    Runs: [5.1472, 9.6010, 9.3759, 9.7561, 9.9071]
+    Average: 8.7575 >= 6 (target)
+    Min/Max: 5.1472 / 9.9071, StdDev: 1.8137
+
+  ALP (f64 decimals):
+    Compression ratio: 61.92x
+  ALP decode (float/sec) [PASS/OK]:
+    Runs: [4,149,377,593, 4,273,504,274, 4,273,504,274, 4,273,504,274, 4,291,845,494]
+    Average: 4,252,347,181 >= 3,000,000,000 (target)
+    Min/Max: 4,149,377,593 / 4,291,845,494, StdDev: 51,972,532
+
+  Dictionary (10 distinct i32):
+    Compression ratio: 7.99x
+  Dictionary lookup (ns/val) [PASS/OK]:
+    Runs: [0.5660, 0.5210, 0.5250, 0.5150, 0.5280]
+    Average: 0.5310 <= 3 (target)
+    Min/Max: 0.5150 / 0.5660, StdDev: 0.0180
+
+  RLE (runs of 1000):
+    Compression ratio: 657.89x
+  RLE decode (val/sec) [FAIL/REGR!]:
+    Runs: [3,663,003,663, 18,518,518,519, 19,607,843,137, 19,230,769,231, 19,607,843,137]
+    Average: 16,125,595,537 >= 60,000,000,000 (target)
+    Min/Max: 3,663,003,663 / 19,607,843,137, StdDev: 6,243,980,733
+
+  BitPack (boolean):
+    Compression ratio: 7.99x
+
+  Constant (all 42):
+    Encoded size: 8 bytes (raw: 400000)
+
+  Unencoded (random u32):
+
+  Edge cases:
+    Single row: all encodings pass
+    All zeros: all encodings pass
+    Max u32: FastLanes pass
+
+  Round-trip correctness: ALL PASS
+
+=== Encoding Selection ===
+  All-identical -> Constant: PASS
+  Boolean -> BitPack: PASS
+  Low-cardinality (10 distinct, 100K rows) -> Dictionary: PASS
+  Sequential integers -> FastLanes: PASS
+  Decimal floats -> ALP: PASS
+  Boolean column -> BitPack: PASS
+  Single-value column -> Constant: PASS
+  High-entropy random -> Unencoded: PASS
+  Empty sample -> Unencoded: PASS
+  Encoding select (us/col) [PASS/OK]:
+    Runs: [17.5033, 17.4399, 17.3348, 17.1968, 17.2290]
+    Average: 17.3408 <= 500 (target)
+    Min/Max: 17.1968 / 17.5033, StdDev: 0.1179
+
+  Encoding selection: ALL PASS
+
+=== FastLanes Bit-Packed Decode ===
+Rows: 100000
+
+  Frame of reference, 20-bit residuals: 3.20x, 250012 bytes
+  FastLanes 20-bit decode (val/sec) [PASS/OK]:
+    Runs: [6,329,113,924, 7,936,507,937, 8,000,000,000, 7,936,507,937, 7,874,015,748]
+    Average: 7,615,229,109 >= 4,500,000,000 (target)
+    Min/Max: 6,329,113,924 / 8,000,000,000, StdDev: 644,290,556
+  FastLanes 20-bit zone decode (val/sec) [PASS/OK]:
+    Runs: [8,771,929,825, 9,708,737,864, 9,900,990,099, 9,803,921,569, 9,803,921,569]
+    Average: 9,597,900,185 >= 2,800,000,000 (target)
+    Min/Max: 8,771,929,825 / 9,900,990,099, StdDev: 417,436,257
+
+  Delta, gaps under 64: 10.56x, 75788 bytes
+  FastLanes delta decode (val/sec) [PASS/OK]:
+    Runs: [6,802,721,088, 6,756,756,757, 6,802,721,088, 6,802,721,088, 6,802,721,088]
+    Average: 6,793,528,222 >= 3,500,000,000 (target)
+    Min/Max: 6,756,756,757 / 6,802,721,088, StdDev: 18,385,733
+  FastLanes delta zone decode (val/sec) [PASS/OK]:
+    Runs: [3,937,007,874, 5,714,285,714, 5,181,347,150, 5,813,953,488, 5,780,346,821]
+    Average: 5,285,388,210 >= 2,800,000,000 (target)
+    Min/Max: 3,937,007,874 / 5,813,953,488, StdDev: 712,358,396
+
+=== Query-on-Compressed ===
+Rows: 100000
+  Dictionary equality: PASS
+  RLE range: PASS
+  BitPack equality: PASS
+  Constant equality: PASS
+  FastLanes range: PASS
+  Compressed eval speedup (x) [PASS/OK]:
+    Runs: [2,478, 2,716, 2,709, 2,676, 2,087]
+    Average: 2,533 >= 3 (target)
+    Min/Max: 2,087 / 2,716, StdDev: 239.4418
+  ALP range: PASS
+  FSST equality: PASS
+
+  Query-on-compressed: ALL PASS

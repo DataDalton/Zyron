@@ -286,6 +286,9 @@ fn map_refs_in_from(item: &mut BoundFromItem, f: &dyn Fn(&ColumnRef) -> Option<B
             }
             map_refs_in_expand_spec(&mut expand.spec, f);
         }
+        // A change scan's predicate reads its own columns and nothing from a
+        // preceding FROM item, so there is no outer reference in it to map
+        BoundFromItem::ChangeScan(_) => {}
         BoundFromItem::GraphQuery { params, .. } => {
             for (_, e) in params {
                 map_refs_in_expr(e, f);

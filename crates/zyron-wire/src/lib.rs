@@ -9,8 +9,12 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod admission;
+pub mod apply_changes;
 pub mod auth;
 pub mod auto_param;
+pub mod change_data_trigger;
+pub mod change_feed_bridge;
+pub mod change_stream_dispatch;
 pub mod codec;
 pub mod connection;
 pub mod copy;
@@ -19,6 +23,7 @@ pub mod currency_rates;
 pub mod ddl_dispatch;
 pub mod ddl_progress;
 pub mod dml_enforce;
+pub mod dml_hooks;
 pub mod endpoint_registrar;
 pub mod foreign_reader;
 pub mod format_dispatch;
@@ -42,6 +47,7 @@ pub mod shadow_rewrite;
 pub mod statement_cache;
 pub mod subscription;
 pub mod system_cdc_views;
+pub mod system_change_stream_views;
 pub mod system_compliance_report;
 pub mod system_core_views;
 pub mod system_format_views;

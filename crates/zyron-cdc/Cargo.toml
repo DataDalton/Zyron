@@ -25,6 +25,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 sha2 = "0.10"
 hex = "0.4"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
+zstd = "0.12"
 rskafka = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 apache-avro = "0.19"

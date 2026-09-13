@@ -110,6 +110,16 @@ pub struct LabeledMetrics {
     clusteringMode: SccHashMap<String, AtomicU64>,
     clusteringSchedule: SccHashMap<String, AtomicU64>,
     clusteringLastPassSeconds: SccHashMap<String, AtomicU64>,
+    /// Change stream state per stream, rows and versions not yet consumed,
+    /// the age of the oldest of them, and whether the stream is readable
+    changeStreamPendingRows: SccHashMap<String, AtomicU64>,
+    changeStreamPendingVersions: SccHashMap<String, AtomicU64>,
+    changeStreamLagSeconds: SccHashMap<String, AtomicU64>,
+    changeStreamStale: SccHashMap<String, AtomicU64>,
+    changeStreamAlertsTotal: SccHashMap<String, AtomicU64>,
+    /// Change feed size per table
+    changeFeedBytes: SccHashMap<String, AtomicU64>,
+    changeFeedRecords: SccHashMap<String, AtomicU64>,
     /// Updates refused because a label family hit its series cap. Non-zero
     /// means some label source has unbounded cardinality and its newest
     /// labels are not being recorded.
@@ -145,8 +155,43 @@ impl LabeledMetrics {
             clusteringMode: SccHashMap::new(),
             clusteringSchedule: SccHashMap::new(),
             clusteringLastPassSeconds: SccHashMap::new(),
+            changeStreamPendingRows: SccHashMap::new(),
+            changeStreamPendingVersions: SccHashMap::new(),
+            changeStreamLagSeconds: SccHashMap::new(),
+            changeStreamStale: SccHashMap::new(),
+            changeStreamAlertsTotal: SccHashMap::new(),
+            changeFeedBytes: SccHashMap::new(),
+            changeFeedRecords: SccHashMap::new(),
             seriesOverflowTotal: AtomicU64::new(0),
         }
+    }
+
+    /// Records one change stream's state as the sweeper read it off the
+    /// feed counters
+    pub fn changeStreamSet(
+        &self,
+        stream: &str,
+        pending_rows: u64,
+        pending_versions: u64,
+        lag_seconds: u64,
+        stale: bool,
+    ) {
+        self.setValue(&self.changeStreamPendingRows, stream, pending_rows);
+        self.setValue(&self.changeStreamPendingVersions, stream, pending_versions);
+        self.setValue(&self.changeStreamLagSeconds, stream, lag_seconds);
+        self.setValue(&self.changeStreamStale, stream, u64::from(stale));
+    }
+
+    /// Increments zyron_change_stream_alerts_total{template} once per alert
+    /// the sweeper raised
+    pub fn changeStreamAlert(&self, template: &str) {
+        self.addBy(&self.changeStreamAlertsTotal, template, 1);
+    }
+
+    /// Records one change feed's size
+    pub fn changeFeedSet(&self, table: &str, bytes: u64, records: u64) {
+        self.setValue(&self.changeFeedBytes, table, bytes);
+        self.setValue(&self.changeFeedRecords, table, records);
     }
 
     /// Increments zyron_subscription_reaps_total{result} once per reaped
@@ -723,6 +768,62 @@ impl LabeledMetrics {
             "gauge",
             "table",
             &self.clusteringLastPassSeconds,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_stream_pending_rows",
+            "Changes a stream has not consumed",
+            "gauge",
+            "stream",
+            &self.changeStreamPendingRows,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_stream_pending_versions",
+            "Commit versions a stream has not consumed",
+            "gauge",
+            "stream",
+            &self.changeStreamPendingVersions,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_stream_lag_seconds",
+            "Age of the oldest change a stream has not consumed, in seconds",
+            "gauge",
+            "stream",
+            &self.changeStreamLagSeconds,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_stream_stale",
+            "One when a stream cannot be read until it is reset",
+            "gauge",
+            "stream",
+            &self.changeStreamStale,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_stream_alerts_total",
+            "Alerts raised per change stream template",
+            "counter",
+            "template",
+            &self.changeStreamAlertsTotal,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_feed_bytes",
+            "Bytes a table's change feed holds",
+            "gauge",
+            "table",
+            &self.changeFeedBytes,
+        );
+        Self::renderSingleLabel(
+            out,
+            "zyron_change_feed_records",
+            "Change records a table's feed holds",
+            "gauge",
+            "table",
+            &self.changeFeedRecords,
         );
     }
 }

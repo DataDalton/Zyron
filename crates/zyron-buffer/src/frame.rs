@@ -53,6 +53,13 @@ pub struct BufferFrame {
     /// LSN of the first modification since last flush. 0 = clean.
     /// Stamped via CAS from 0 on first dirty, so it always reflects the oldest unflushed change.
     dirty_lsn: AtomicU64,
+    /// The newest logged change the page holds, raised by every logged
+    /// change and seeded from the page image when it is loaded. What a
+    /// flush stamps into the image it writes, so the on-disk page says
+    /// which log records it already reflects. Kept here rather than in
+    /// the page bytes because appenders share the frame lock and a
+    /// per-frame atomic takes their stamps without a data race
+    page_lsn: AtomicU64,
 }
 
 impl BufferFrame {
@@ -65,6 +72,7 @@ impl BufferFrame {
             pin_count: AtomicU32::new(0),
             is_dirty: AtomicBool::new(false),
             dirty_lsn: AtomicU64::new(0),
+            page_lsn: AtomicU64::new(0),
         }
     }
 
@@ -206,6 +214,28 @@ impl BufferFrame {
             .is_ok()
     }
 
+    /// The newest logged change the page holds
+    #[inline]
+    pub fn page_lsn(&self) -> u64 {
+        self.page_lsn.load(Ordering::Acquire)
+    }
+
+    /// Records a logged change applied to the page. A change never lowers
+    /// the reading, so concurrent appenders that stamp in either order
+    /// leave the newest of their records
+    #[inline]
+    pub fn raise_page_lsn(&self, lsn: u64) {
+        self.page_lsn.fetch_max(lsn, Ordering::AcqRel);
+    }
+
+    /// Copies the LSN stamped in a page image into the frame's reading, so
+    /// changes logged from here on raise it above what the image already
+    /// held
+    #[inline]
+    pub fn seed_page_lsn(&self, lsn: u64) {
+        self.page_lsn.store(lsn, Ordering::Release);
+    }
+
     /// Returns true if this frame is empty (no page loaded).
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -290,6 +320,7 @@ impl BufferFrame {
         self.page_id.store(NO_PAGE, Ordering::Release);
         self.is_dirty.store(false, Ordering::Release);
         self.dirty_lsn.store(0, Ordering::Release);
+        self.page_lsn.store(0, Ordering::Release);
         // Zero out data for security
         let mut data = self.data.write();
         data.fill(0);

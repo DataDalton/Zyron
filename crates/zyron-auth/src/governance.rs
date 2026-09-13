@@ -198,16 +198,15 @@ impl DelegationTracker {
     pub fn record_grant(&self, edge: DelegationEdge) {
         let grantee = edge.grantee;
         let grantor = edge.grantor;
-        let edge_clone = edge.clone();
 
         // Add to incoming[grantee]
         self.incoming.update(|m| {
-            m.entry(grantee).or_insert_with(Vec::new).push(edge);
+            m.entry(grantee).or_insert_with(Vec::new).push(edge.clone());
         });
 
         // Add to outgoing[grantor]
         self.outgoing.update(|m| {
-            m.entry(grantor).or_insert_with(Vec::new).push(edge_clone);
+            m.entry(grantor).or_insert_with(Vec::new).push(edge.clone());
         });
     }
 
@@ -351,7 +350,7 @@ impl TwoPersonManager {
 
     /// Adds a rule defining which operations need approval.
     pub fn add_rule(&self, rule: TwoPersonRule) {
-        self.rules.update(|v| v.push(rule));
+        self.rules.update(|v| v.push(rule.clone()));
     }
 
     /// Returns true if any rule matches the given operation.

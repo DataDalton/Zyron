@@ -404,6 +404,7 @@ fn table_with_two_epochs(columns: u16) -> TableEntry {
         schema_epoch: 0,
         schema_epochs: Vec::new(),
         pre_stamp_columns: Vec::new(),
+        cdf: Default::default(),
     };
 
     // Epoch 1 is the narrow layout, two columns short of what the table
@@ -1162,7 +1163,7 @@ async fn bench_progress_and_retirement() {
         for _ in 0..CHECKS {
             let retired = server
                 .catalog
-                .retire_schema_epochs(table_id, black_box(1), true, false)
+                .retire_schema_epochs(table_id, black_box(1), true, false, None)
                 .await
                 .expect("the check runs");
             debug_assert!(!retired, "nothing should retire with the floor at 1");

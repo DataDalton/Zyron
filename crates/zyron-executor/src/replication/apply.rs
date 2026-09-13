@@ -356,17 +356,21 @@ pub async fn apply_op(ctx: &Arc<ExecutionContext>, op: &ChangesetOp<'_>) -> Resu
             columns,
             rows,
         } => apply_insert(ctx, *table_id, *columns, rows).await,
+        // The row images a feed table's delete or update carries are for
+        // the change feed, the rows are found by what names them
         ChangesetOp::Delete {
             table_id,
             columns,
             index_id,
             rows,
+            ..
         } => apply_delete(ctx, *table_id, *columns, *index_id, rows).await,
         ChangesetOp::Update {
             table_id,
             columns,
             index_id,
             rows,
+            ..
         } => apply_update(ctx, *table_id, *columns, *index_id, rows).await,
         other => Err(ZyronError::Internal(format!(
             "this operation is applied above the executor, not here: {other:?}"

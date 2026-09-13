@@ -144,9 +144,10 @@ impl PhysicalColumn {
 /// under.
 ///
 /// An epoch is minted whenever the encoded shape changes, which is an added
-/// column or a compatible type change. Dropping a column does not mint one,
-/// because the bytes keep their positions. The list retires when vacuum
-/// reports that no live tuple carries the epoch any more.
+/// column, a compatible type change, or a change to the columns the change
+/// data feed records. Dropping a column does not mint one, because the bytes
+/// keep their positions. The list retires when vacuum reports that no live
+/// tuple and no retained change record carries the epoch any more
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochColumns {
     pub epoch: u16,
@@ -1092,6 +1093,136 @@ pub struct TableEntry {
     /// remains.
     #[serde(default)]
     pub pre_stamp_columns: Vec<PhysicalColumn>,
+    /// What the change data feed records and how long it keeps it
+    /// (tail-appended). A table written before the feed carried more than a
+    /// day count reads the defaults, and `cdf_retention_days` converts into
+    /// the interval once at read
+    #[serde(default)]
+    pub cdf: CdfConfig,
+}
+
+/// Per-table change data feed configuration.
+///
+/// The retention is an interval in microseconds. `cdf_retention_days` on the
+/// table remains the day-count form a shorter statement writes, and a table
+/// carrying only that converts once when its feed opens
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdfConfig {
+    /// Zero means the interval is not set and the day count decides
+    pub retention_micros: i64,
+    /// The columns the feed has recorded, one entry per schema epoch at
+    /// which the list changed, ascending by epoch. A change record carries
+    /// its epoch, so the entry in force at that epoch is the layout its row
+    /// bytes hold. Empty records every column
+    pub column_sets: Vec<CdfColumnSet>,
+    /// False records one row per update rather than two
+    pub before_image: bool,
+    /// 0 none, 1 lz4, 2 zstd
+    pub compression: u8,
+    /// The source version the feed began recording at, above which its
+    /// changes lie. A lake table's log holds every commit, those made
+    /// before the feed was turned on included, and those are not the
+    /// feed's. Zero for a heap table, whose feed holds nothing it did not
+    /// record
+    pub first_version: u64,
+}
+
+/// The columns a feed records from one schema epoch on.
+///
+/// The named columns plus the table's key columns as they stood when the
+/// list was set, ascending by id, so a change touching none of the named
+/// columns still records the row's identity. Every change to the list mints
+/// a schema epoch, which is what lets a record written under an earlier list
+/// decode through that list rather than the current one
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdfColumnSet {
+    /// The first schema epoch this list applies to
+    pub from_epoch: u16,
+    /// The recorded columns, ascending by id. Empty records every column
+    pub columns: Vec<ColumnId>,
+}
+
+impl Default for CdfConfig {
+    fn default() -> Self {
+        Self {
+            retention_micros: 0,
+            column_sets: Vec::new(),
+            before_image: true,
+            compression: 1,
+            first_version: 0,
+        }
+    }
+}
+
+impl CdfConfig {
+    /// The columns the feed records right now, empty when it records every
+    /// column
+    pub fn recorded_columns(&self) -> &[ColumnId] {
+        self.column_sets
+            .last()
+            .map(|set| set.columns.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The columns a record written under `epoch` holds when it carries the
+    /// projected flag, which is the list in force at that epoch. Empty when
+    /// no list was in force, which no projected record is written under
+    pub fn columns_at(&self, epoch: u16) -> &[ColumnId] {
+        self.column_sets
+            .iter()
+            .rev()
+            .find(|set| set.from_epoch <= epoch)
+            .map(|set| set.columns.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        write_u64(buf, self.retention_micros as u64);
+        write_u32(buf, self.column_sets.len() as u32);
+        for set in &self.column_sets {
+            write_u16(buf, set.from_epoch);
+            write_u16(buf, set.columns.len() as u16);
+            for id in &set.columns {
+                write_u16(buf, id.0);
+            }
+        }
+        write_bool(buf, self.before_image);
+        write_u8(buf, self.compression);
+        write_u64(buf, self.first_version);
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        // Tail append. A table written before the feed carried more than a
+        // day count reads the defaults, which is what it meant
+        if *off >= data.len() {
+            return Ok(CdfConfig::default());
+        }
+        let retention_micros = read_u64(data, off)? as i64;
+        let sets = read_u32(data, off)? as usize;
+        let mut column_sets = Vec::with_capacity(sets);
+        for _ in 0..sets {
+            let from_epoch = read_u16(data, off)?;
+            let count = read_u16(data, off)? as usize;
+            let mut columns = Vec::with_capacity(count);
+            for _ in 0..count {
+                columns.push(ColumnId(read_u16(data, off)?));
+            }
+            column_sets.push(CdfColumnSet {
+                from_epoch,
+                columns,
+            });
+        }
+        let before_image = read_bool(data, off)?;
+        let compression = read_u8(data, off)?;
+        let first_version = read_u64(data, off)?;
+        Ok(Self {
+            retention_micros,
+            column_sets,
+            before_image,
+            compression,
+            first_version,
+        })
+    }
 }
 
 /// The remote a foreign table stands for.
@@ -1888,6 +2019,7 @@ impl TableEntry {
         for c in &self.pre_stamp_columns {
             c.write_into(&mut buf);
         }
+        self.cdf.write_into(&mut buf);
 
         buf
     }
@@ -2042,6 +2174,9 @@ impl TableEntry {
             Vec::new()
         };
 
+        // Change data feed configuration (tail-appended, defaults when absent)
+        let cdf = CdfConfig::read_from(data, &mut off)?;
+
         Ok(Self {
             id,
             schema_id,
@@ -2068,6 +2203,7 @@ impl TableEntry {
             schema_epoch,
             schema_epochs,
             pre_stamp_columns,
+            cdf,
         })
     }
 
@@ -2124,8 +2260,9 @@ impl TableEntry {
     /// Records a new layout and makes it the one writes stamp.
     ///
     /// Called by the column-shape changes that alter the encoded bytes, an
-    /// added column and a compatible type change. Dropping a column does not
-    /// call it, because the positions do not move.
+    /// added column and a compatible type change, and by a change to the
+    /// columns the change data feed records. Dropping a column does not call
+    /// it, because the positions do not move
     pub fn push_schema_epoch(&mut self, columns: Vec<PhysicalColumn>) {
         let next = self.schema_epoch.saturating_add(1);
         self.schema_epoch = next;
@@ -2133,6 +2270,71 @@ impl TableEntry {
             epoch: next,
             columns,
         });
+    }
+
+    /// The columns of the table's primary key, in constraint order, none
+    /// when it declares no key
+    pub fn primary_key_columns(&self) -> impl Iterator<Item = ColumnId> + '_ {
+        self.constraints
+            .iter()
+            .filter(|c| c.constraint_type == ConstraintType::PrimaryKey)
+            .flat_map(|c| c.columns.iter().copied())
+    }
+
+    /// Sets the columns the change data feed records to `named` plus the
+    /// table's key columns, minting a schema epoch when the list changes.
+    ///
+    /// A record carries the epoch it was written under and decodes through
+    /// the list in force at that epoch, so a change of the list has to be
+    /// told apart from every record written before it. Minting an epoch is
+    /// what does that. An empty `named` records every column from the new
+    /// epoch on. Answers whether the list changed
+    pub fn record_cdf_columns(&mut self, named: &[ColumnId]) -> bool {
+        let mut recorded: Vec<ColumnId> = if named.is_empty() {
+            Vec::new()
+        } else {
+            named
+                .iter()
+                .copied()
+                .chain(self.primary_key_columns())
+                .collect()
+        };
+        recorded.sort_by_key(|id| id.0);
+        recorded.dedup();
+        if recorded == self.cdf.recorded_columns() {
+            return false;
+        }
+        let layout = self.current_physical_columns();
+        self.push_schema_epoch(layout);
+        self.cdf.column_sets.push(CdfColumnSet {
+            from_epoch: self.schema_epoch,
+            columns: recorded,
+        });
+        true
+    }
+
+    /// The layout a change record written under `epoch` with the feed
+    /// recording `recorded` holds, the epoch's layout narrowed to those
+    /// columns, in the epoch's own order, with the ordinals renumbered from
+    /// zero. None when the epoch names no layout this table wrote
+    pub fn projected_columns_for_epoch(
+        &self,
+        epoch: u16,
+        recorded: &[ColumnId],
+    ) -> Option<Vec<PhysicalColumn>> {
+        let layout = self.physical_columns_for_epoch(epoch)?;
+        let mut out = Vec::with_capacity(recorded.len());
+        for column in layout {
+            if recorded.contains(&column.column_id) {
+                out.push(PhysicalColumn {
+                    column_id: column.column_id,
+                    physical_type: column.physical_type,
+                    fractional_digits: column.fractional_digits,
+                    ordinal: out.len() as u16,
+                });
+            }
+        }
+        Some(out)
     }
 }
 
@@ -5153,9 +5355,456 @@ impl CollationEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ChangeStreamEntry
+// ---------------------------------------------------------------------------
+
+/// What a change stream reads.
+///
+/// A stream over several tables holds one position per table and reads to the
+/// boundary every one of them has reached. A stream over a view reads the
+/// view's single base table and applies the view's predicate and projection
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeStreamSource {
+    Table(u32),
+    Tables(Vec<u32>),
+    /// The view and the single base table it resolves to
+    View {
+        view_id: u32,
+        base_table: u32,
+    },
+}
+
+impl ChangeStreamSource {
+    /// Every table whose feed this stream reads
+    pub fn table_ids(&self) -> Vec<u32> {
+        match self {
+            ChangeStreamSource::Table(id) => vec![*id],
+            ChangeStreamSource::Tables(ids) => ids.clone(),
+            ChangeStreamSource::View { base_table, .. } => vec![*base_table],
+        }
+    }
+
+    /// True when the stream names more than one source table
+    pub fn is_multi_table(&self) -> bool {
+        matches!(self, ChangeStreamSource::Tables(ids) if ids.len() > 1)
+    }
+
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        match self {
+            ChangeStreamSource::Table(id) => {
+                write_u8(buf, 0);
+                write_u32(buf, *id);
+            }
+            ChangeStreamSource::Tables(ids) => {
+                write_u8(buf, 1);
+                write_u32(buf, ids.len() as u32);
+                for id in ids {
+                    write_u32(buf, *id);
+                }
+            }
+            ChangeStreamSource::View {
+                view_id,
+                base_table,
+            } => {
+                write_u8(buf, 2);
+                write_u32(buf, *view_id);
+                write_u32(buf, *base_table);
+            }
+        }
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        match read_u8(data, off)? {
+            0 => Ok(ChangeStreamSource::Table(read_u32(data, off)?)),
+            1 => {
+                let count = read_u32(data, off)? as usize;
+                let mut ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ids.push(read_u32(data, off)?);
+                }
+                Ok(ChangeStreamSource::Tables(ids))
+            }
+            2 => Ok(ChangeStreamSource::View {
+                view_id: read_u32(data, off)?,
+                base_table: read_u32(data, off)?,
+            }),
+            other => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown change stream source kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// What a stream yields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ChangeStreamMode {
+    /// Every change kind the feed holds
+    Standard = 0,
+    /// Inserts only. Updates and deletes on the source are skipped at read
+    /// time and never make the stream stale
+    AppendOnly = 1,
+}
+
+impl ChangeStreamMode {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(ChangeStreamMode::Standard),
+            1 => Ok(ChangeStreamMode::AppendOnly),
+            other => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown change stream mode: {other}"
+            ))),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ChangeStreamMode::Standard => "standard",
+            ChangeStreamMode::AppendOnly => "append_only",
+        }
+    }
+}
+
+/// Where a stream's first read starts
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeStreamOrigin {
+    /// The source's current version, so a stream created now yields nothing
+    /// until the next change
+    Now,
+    Version(u64),
+    Timestamp(i64),
+    /// The first read yields every existing row as an insert at the creation
+    /// version, which seeds a target and catches it up in one statement
+    InitialRows,
+}
+
+impl ChangeStreamOrigin {
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        match self {
+            ChangeStreamOrigin::Now => write_u8(buf, 0),
+            ChangeStreamOrigin::Version(v) => {
+                write_u8(buf, 1);
+                write_u64(buf, *v);
+            }
+            ChangeStreamOrigin::Timestamp(ts) => {
+                write_u8(buf, 2);
+                write_u64(buf, *ts as u64);
+            }
+            ChangeStreamOrigin::InitialRows => write_u8(buf, 3),
+        }
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        match read_u8(data, off)? {
+            0 => Ok(ChangeStreamOrigin::Now),
+            1 => Ok(ChangeStreamOrigin::Version(read_u64(data, off)?)),
+            2 => Ok(ChangeStreamOrigin::Timestamp(read_u64(data, off)? as i64)),
+            3 => Ok(ChangeStreamOrigin::InitialRows),
+            other => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown change stream origin kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// One source table's consumed position.
+///
+/// Two numbers for one place. The version is this node's own address for it,
+/// which is what a range read and a retention check compare against. The
+/// consumed count is how many of the feed's records lie at or below that
+/// version, counted from the feed's creation, and that number is the same on
+/// every member of a group because every member records the same changes in
+/// the same order. So the count is what a position advance replicates, and
+/// each member turns it back into its own version
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPosition {
+    pub table_id: u32,
+    /// Commit version the stream has consumed through. A read returns
+    /// changes strictly above it
+    pub version: u64,
+    /// Feed records at or below `version`, counted from the feed's creation
+    #[serde(default)]
+    pub consumed: u64,
+}
+
+/// Catalog entry for a change stream.
+///
+/// Named CHANGE STREAM rather than STREAM because the catalog already carries
+/// a Streams object kind for streaming subscriptions with watermarks and
+/// subscribers, and one word meaning two things in one tree reads wrong every
+/// time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeStreamEntry {
+    pub id: u32,
+    pub catalog_id: DatabaseId,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub source: ChangeStreamSource,
+    /// One entry per source table, ascending by table id
+    pub position: Vec<StreamPosition>,
+    pub created_at: i64,
+    pub created_from: ChangeStreamOrigin,
+    pub mode: ChangeStreamMode,
+    /// Narrowing predicate as written, evaluated against the postimage for an
+    /// insert or an update and against the preimage for a delete. Empty when
+    /// the stream carries none
+    pub predicate: Option<String>,
+    /// Columns the stream yields. None yields the source's own columns
+    pub columns: Option<Vec<ColumnId>>,
+    pub owner_id: u32,
+    pub last_advanced_at: i64,
+    pub last_advanced_by: u32,
+    /// True when the position is behind what the source still holds, so no
+    /// read can serve it
+    pub stale: bool,
+    /// Why the stream is stale, empty when it is not
+    pub stale_reason: String,
+    /// True when the stream names something the source no longer has. It
+    /// keeps its position and resumes once the definition is corrected
+    pub needs_attention: bool,
+    /// What the stream needs looked at, empty when it needs nothing
+    pub attention_reason: String,
+    /// True while a stream created with SHOW INITIAL ROWS has not yet
+    /// yielded the source's existing rows. The first consume that commits
+    /// clears it, and so does a reset, after which the feed is what the
+    /// stream reads from
+    pub initial_rows_pending: bool,
+    /// The branch the stream was created on, whose changes it reads and
+    /// whose position it keeps. None for a stream on the table itself
+    pub branch: Option<u64>,
+}
+
+impl ChangeStreamEntry {
+    /// The position recorded for one source table, zero when the stream has
+    /// no entry for it
+    pub fn position_of(&self, table_id: u32) -> u64 {
+        self.position
+            .iter()
+            .find(|p| p.table_id == table_id)
+            .map(|p| p.version)
+            .unwrap_or(0)
+    }
+
+    /// The lowest position across every source table, which is the boundary a
+    /// multi-table read starts from
+    pub fn lowest_position(&self) -> u64 {
+        self.position.iter().map(|p| p.version).min().unwrap_or(0)
+    }
+
+    /// The consumed record count recorded for one source table
+    pub fn consumed_of(&self, table_id: u32) -> u64 {
+        self.position
+            .iter()
+            .find(|p| p.table_id == table_id)
+            .map(|p| p.consumed)
+            .unwrap_or(0)
+    }
+
+    /// Records a new position for one source table
+    pub fn set_position(&mut self, table_id: u32, version: u64, consumed: u64) {
+        match self.position.iter_mut().find(|p| p.table_id == table_id) {
+            Some(slot) => {
+                slot.version = version;
+                slot.consumed = consumed;
+            }
+            None => {
+                self.position.push(StreamPosition {
+                    table_id,
+                    version,
+                    consumed,
+                });
+                self.position.sort_by_key(|p| p.table_id);
+            }
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(160);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.catalog_id.0);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        self.source.write_into(&mut buf);
+        write_u32(&mut buf, self.position.len() as u32);
+        for slot in &self.position {
+            write_u32(&mut buf, slot.table_id);
+            write_u64(&mut buf, slot.version);
+            write_u64(&mut buf, slot.consumed);
+        }
+        write_u64(&mut buf, self.created_at as u64);
+        self.created_from.write_into(&mut buf);
+        write_u8(&mut buf, self.mode as u8);
+        write_option_string(&mut buf, &self.predicate);
+        match &self.columns {
+            None => write_u8(&mut buf, 0),
+            Some(list) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, list.len() as u32);
+                for id in list {
+                    write_u16(&mut buf, id.0);
+                }
+            }
+        }
+        write_u32(&mut buf, self.owner_id);
+        write_u64(&mut buf, self.last_advanced_at as u64);
+        write_u32(&mut buf, self.last_advanced_by);
+        write_bool(&mut buf, self.stale);
+        write_string(&mut buf, &self.stale_reason);
+        write_bool(&mut buf, self.needs_attention);
+        write_string(&mut buf, &self.attention_reason);
+        write_bool(&mut buf, self.initial_rows_pending);
+        match self.branch {
+            None => write_bool(&mut buf, false),
+            Some(branch) => {
+                write_bool(&mut buf, true);
+                write_u64(&mut buf, branch);
+            }
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let catalog_id = DatabaseId(read_u32(data, &mut off)?);
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let source = ChangeStreamSource::read_from(data, &mut off)?;
+        let position_count = read_u32(data, &mut off)? as usize;
+        let mut position = Vec::with_capacity(position_count);
+        for _ in 0..position_count {
+            position.push(StreamPosition {
+                table_id: read_u32(data, &mut off)?,
+                version: read_u64(data, &mut off)?,
+                consumed: read_u64(data, &mut off)?,
+            });
+        }
+        let created_at = read_u64(data, &mut off)? as i64;
+        let created_from = ChangeStreamOrigin::read_from(data, &mut off)?;
+        let mode = ChangeStreamMode::from_u8(read_u8(data, &mut off)?)?;
+        let predicate = read_option_string(data, &mut off)?;
+        let columns = if read_u8(data, &mut off)? == 0 {
+            None
+        } else {
+            let count = read_u32(data, &mut off)? as usize;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                list.push(ColumnId(read_u16(data, &mut off)?));
+            }
+            Some(list)
+        };
+        let owner_id = read_u32(data, &mut off)?;
+        let last_advanced_at = read_u64(data, &mut off)? as i64;
+        let last_advanced_by = read_u32(data, &mut off)?;
+        let stale = read_bool(data, &mut off)?;
+        let stale_reason = read_string(data, &mut off)?;
+        let needs_attention = read_bool(data, &mut off)?;
+        let attention_reason = read_string(data, &mut off)?;
+        let initial_rows_pending = read_bool(data, &mut off)?;
+        let branch = if read_bool(data, &mut off)? {
+            Some(read_u64(data, &mut off)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            id,
+            catalog_id,
+            schema_id,
+            name,
+            source,
+            position,
+            created_at,
+            created_from,
+            mode,
+            predicate,
+            columns,
+            owner_id,
+            last_advanced_at,
+            last_advanced_by,
+            stale,
+            stale_reason,
+            needs_attention,
+            attention_reason,
+            initial_rows_pending,
+            branch,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_change_stream_entry_roundtrip() {
+        let entry = ChangeStreamEntry {
+            id: 42,
+            catalog_id: DatabaseId(1),
+            schema_id: SchemaId(7),
+            name: "bronze_orders".to_string(),
+            source: ChangeStreamSource::Tables(vec![3, 9]),
+            position: vec![
+                StreamPosition {
+                    table_id: 3,
+                    version: 11,
+                    consumed: 40,
+                },
+                StreamPosition {
+                    table_id: 9,
+                    version: 4,
+                    consumed: 12,
+                },
+            ],
+            created_at: 1_700_000_000,
+            created_from: ChangeStreamOrigin::Version(2),
+            mode: ChangeStreamMode::AppendOnly,
+            predicate: Some("region = 'eu'".to_string()),
+            columns: Some(vec![ColumnId(0), ColumnId(3)]),
+            owner_id: 5,
+            last_advanced_at: 1_700_000_100,
+            last_advanced_by: 5,
+            stale: true,
+            stale_reason: "feed_disabled".to_string(),
+            needs_attention: true,
+            attention_reason: "column 'note' was dropped".to_string(),
+            initial_rows_pending: true,
+            branch: Some(3),
+        };
+        let decoded = ChangeStreamEntry::from_bytes(&entry.to_bytes()).expect("round trips");
+        assert_eq!(decoded.id, entry.id);
+        assert_eq!(decoded.name, entry.name);
+        assert_eq!(decoded.source, entry.source);
+        assert_eq!(decoded.position, entry.position);
+        assert_eq!(decoded.created_from, entry.created_from);
+        assert_eq!(decoded.mode, entry.mode);
+        assert_eq!(decoded.predicate, entry.predicate);
+        assert_eq!(decoded.columns, entry.columns);
+        assert_eq!(decoded.stale_reason, entry.stale_reason);
+        assert_eq!(decoded.attention_reason, entry.attention_reason);
+        assert!(decoded.initial_rows_pending);
+        assert_eq!(decoded.lowest_position(), 4);
+        assert_eq!(decoded.position_of(9), 4);
+        assert_eq!(decoded.consumed_of(3), 40);
+    }
+
+    #[test]
+    fn test_change_stream_source_kinds_round_trip() {
+        for source in [
+            ChangeStreamSource::Table(1),
+            ChangeStreamSource::Tables(vec![1, 2, 3]),
+            ChangeStreamSource::View {
+                view_id: 8,
+                base_table: 2,
+            },
+        ] {
+            let mut buf = Vec::new();
+            source.write_into(&mut buf);
+            let mut off = 0;
+            let decoded = ChangeStreamSource::read_from(&buf, &mut off).expect("round trips");
+            assert_eq!(decoded, source);
+        }
+    }
 
     #[test]
     fn test_database_entry_roundtrip() {
@@ -5348,6 +5997,7 @@ mod tests {
             schema_epoch: 1,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -5515,6 +6165,135 @@ mod tests {
         }
     }
 
+    /// A keyed table with three columns and its first epoch sealed
+    fn keyed_table() -> TableEntry {
+        let column = |id: u16, name: &str, type_id: TypeId| ColumnEntry {
+            id: ColumnId(id),
+            table_id: TableId(7),
+            name: name.to_string(),
+            type_id,
+            ordinal: id,
+            nullable: true,
+            default_expr: None,
+            max_length: None,
+            fractional_digits: None,
+            tz_offset_secs: None,
+            element_type: None,
+            attrs: Default::default(),
+            absent_value: None,
+            dropped: false,
+        };
+        let mut entry = TableEntry {
+            id: TableId(7),
+            schema_id: SchemaId(1),
+            name: "orders".to_string(),
+            heap_file_id: 1,
+            fsm_file_id: 2,
+            columns: vec![
+                column(0, "id", TypeId::Int64),
+                column(1, "amount", TypeId::Int32),
+                column(2, "note", TypeId::Text),
+            ],
+            constraints: vec![ConstraintEntry {
+                name: "orders_pkey".to_string(),
+                constraint_type: ConstraintType::PrimaryKey,
+                columns: vec![ColumnId(0)],
+                ref_table_id: None,
+                ref_columns: vec![],
+                check_expr: None,
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
+                enforced: true,
+                on_violation: ConstraintViolationAction::Fail,
+                quarantine_table_id: None,
+                without_overlaps: None,
+                fk_period: false,
+                validated: true,
+            }],
+            created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: true,
+            cdf_retention_days: 7,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
+        };
+        entry.seal_initial_epoch();
+        entry
+    }
+
+    #[test]
+    fn test_recording_a_column_list_keeps_the_key_and_mints_an_epoch() {
+        let mut t = keyed_table();
+        assert!(t.cdf.recorded_columns().is_empty());
+        assert!(t.record_cdf_columns(&[ColumnId(2)]));
+        assert_eq!(t.schema_epoch, 2, "the list change minted an epoch");
+        assert_eq!(t.schema_epochs.len(), 2);
+        assert_eq!(t.cdf.recorded_columns(), &[ColumnId(0), ColumnId(2)]);
+        assert_eq!(t.cdf.column_sets[0].from_epoch, 2);
+
+        // The same list again changes nothing
+        assert!(!t.record_cdf_columns(&[ColumnId(2)]));
+        assert_eq!(t.schema_epoch, 2);
+
+        // Records written under epoch 2 read the first list, ones under a
+        // later list read that one, and nothing was in force before
+        assert!(t.record_cdf_columns(&[ColumnId(1), ColumnId(2)]));
+        assert_eq!(t.schema_epoch, 3);
+        assert_eq!(t.cdf.columns_at(1), &[]);
+        assert_eq!(t.cdf.columns_at(2), &[ColumnId(0), ColumnId(2)]);
+        assert_eq!(
+            t.cdf.columns_at(3),
+            &[ColumnId(0), ColumnId(1), ColumnId(2)]
+        );
+        assert_eq!(t.cdf.columns_at(9), t.cdf.recorded_columns());
+
+        // Clearing the list records every column from a new epoch on
+        assert!(t.record_cdf_columns(&[]));
+        assert!(t.cdf.recorded_columns().is_empty());
+        assert_eq!(
+            t.cdf.columns_at(3),
+            &[ColumnId(0), ColumnId(1), ColumnId(2)]
+        );
+    }
+
+    #[test]
+    fn test_the_column_sets_round_trip_through_the_entry_bytes() {
+        let mut t = keyed_table();
+        t.record_cdf_columns(&[ColumnId(2)]);
+        t.record_cdf_columns(&[ColumnId(1)]);
+        let decoded = TableEntry::from_bytes(&t.to_bytes()).expect("decodes");
+        assert_eq!(decoded.cdf, t.cdf);
+        assert_eq!(decoded.cdf.column_sets.len(), 2);
+        assert_eq!(decoded.schema_epochs.len(), 3);
+    }
+
+    #[test]
+    fn test_the_projected_layout_narrows_the_epoch_in_its_own_order() {
+        let mut t = keyed_table();
+        t.record_cdf_columns(&[ColumnId(2)]);
+        let layout = t
+            .projected_columns_for_epoch(2, t.cdf.recorded_columns())
+            .expect("epoch 2");
+        let ids: Vec<u16> = layout.iter().map(|c| c.column_id.0).collect();
+        assert_eq!(ids, vec![0, 2]);
+        let ordinals: Vec<u16> = layout.iter().map(|c| c.ordinal).collect();
+        assert_eq!(ordinals, vec![0, 1]);
+        assert!(t.projected_columns_for_epoch(9, &[]).is_none());
+    }
+
     #[test]
     fn test_empty_table_roundtrip() {
         let entry = TableEntry {
@@ -5543,6 +6322,7 @@ mod tests {
             schema_epoch: 1,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

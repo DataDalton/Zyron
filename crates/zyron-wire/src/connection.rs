@@ -78,11 +78,28 @@ pub trait ReplicationRouter: Send + Sync {
     /// A changeset for one transaction to accumulate into
     fn changeset(&self, txn_id: u64) -> Arc<zyron_executor::replication::TxnChangeset>;
 
-    /// Records the lake versions a transaction staged, before they publish
-    fn capture_lake(
-        &self,
+    /// Records the lake versions a transaction staged, before they publish,
+    /// with the files they name streamed to the group. The file reads run
+    /// off the runtime, so a large commit never holds a worker
+    fn capture_lake<'a>(
+        &'a self,
         txn_id: u64,
+        changeset: Arc<zyron_executor::replication::TxnChangeset>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ZyronError>> + Send + 'a>>;
+
+    /// Records the change stream positions a transaction's reads moved, as
+    /// the counts each stream consumed, under `actor`, the role the
+    /// consumer ran under and zero for a path with no session.
+    ///
+    /// Refused, and the commit with it, while a member of the group runs a
+    /// binary that does not read the operation, because a position that
+    /// moved on the leader alone would hand the same changes out again the
+    /// day another member leads
+    fn capture_stream_advances(
+        &self,
         changeset: &zyron_executor::replication::TxnChangeset,
+        advances: &[zyron_executor::context::PendingStreamAdvance],
+        actor: u32,
     ) -> Result<(), ZyronError>;
 
     /// Seals the changeset, agrees it with the group, and returns once the
@@ -102,6 +119,17 @@ pub trait ReplicationRouter: Send + Sync {
     /// Tells the group to discard a transaction whose chunks already went out
     fn abort(&self, changeset: &zyron_executor::replication::TxnChangeset);
 
+    /// Whether every member of the group records a schedule's run off a
+    /// replicated commit. While false no schedule runs on this node, since
+    /// a run recorded here alone would be run again by the next leader
+    fn carries_schedule_runs(&self) -> bool;
+
+    /// Whether every member of the group moves a change stream's position
+    /// off a replicated commit. While false a delivery whose commit would
+    /// be refused is not started, since a sink handed records the position
+    /// cannot move past would be handed them again on the next pass
+    fn carries_stream_advance(&self) -> bool;
+
     /// Puts a schema change to the group and waits for this node's turn.
     ///
     /// Answers with the channel to report the outcome on. The caller runs the
@@ -113,16 +141,19 @@ pub trait ReplicationRouter: Send + Sync {
         sql: &'a str,
         context: &'a zyron_executor::replication::StatementContext,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        tokio::sync::oneshot::Sender<Result<(), ZyronError>>,
-                        ZyronError,
-                    >,
-                > + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<AgreedStatement, ZyronError>> + Send + 'a>,
     >;
+}
+
+/// A schema change the group has agreed, handed back to the connection that
+/// asked for it when its entry comes up
+pub struct AgreedStatement {
+    /// The entry's index in the group's log
+    pub index: u64,
+    /// The instant the entry was proposed, in microseconds since the epoch
+    pub timestamp_us: i64,
+    /// Where the connection reports how the statement went
+    pub done: tokio::sync::oneshot::Sender<Result<(), ZyronError>>,
 }
 
 /// How a statement reaches the rest of a consensus group.
@@ -213,7 +244,13 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         // heap. Those rows are what the other members need, and the branch
         // itself is consumed by the merge, so replaying the statement
         // elsewhere would find no branch to merge
-        | S::MergeBranch(_) => Rows,
+        | S::MergeBranch(_)
+        // APPLY CHANGES settles a target from a change set one node read.
+        // What the target should hold depends on which changes that read
+        // returned and in which order, so the rows it settled on travel and
+        // the position the read consumed travels with them, in the one
+        // transaction that wrote both
+        | S::ApplyChanges(_) => Rows,
 
         // A temporary table is node-local by design: its definition lives in
         // the session that created it, its files live under this node's tmp
@@ -394,7 +431,19 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         // the group is given the resolved statement, so no member reads the
         // store for itself and none can settle on a different layout. See
         // `Connection::resolve_for_group`
-        | S::CreateExternalSource(_) => AsStatement,
+        | S::CreateExternalSource(_)
+        // A change stream is a catalog object over a table every member
+        // already records changes for. Its starting position is read from
+        // this member's own feed, and every member's feed holds the same
+        // changes in the same order, so a stream created on each of them
+        // starts at the same place in the same change set
+        | S::CreateChangeStream(_)
+        | S::DropChangeStream(_)
+        // A reset names a place in one member's own feed, so the version a
+        // person typed cannot travel as written. `Connection::resolve_for_group`
+        // resolves it to the consumed record count, which counts the same
+        // changes on every member, and that is the form the group receives
+        | S::AlterChangeStream(_) => AsStatement,
 
         // Reads, session state, and per-node physical work
         S::Select(_)
@@ -455,6 +504,9 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         // have each member generate a keypair of its own and call it the same
         // rotation
         | S::RotateServicePrincipalKey(_)
+        // A listing of the change streams this node holds, which every member
+        // answers from its own catalog
+        | S::ShowChangeStreams(_)
         | S::AlterCluster(_) => Local,
     }
 }
@@ -603,6 +655,8 @@ fn report_turn(
 /// takes as its cue to run the statement itself so this node does not end up
 /// the only one without it
 pub struct StatementTurn {
+    /// The entry the statement runs as, its index and proposal instant
+    entry: (u64, i64),
     done: tokio::sync::oneshot::Sender<Result<(), ZyronError>>,
 }
 
@@ -695,7 +749,7 @@ pub struct ServerState {
     /// Replication slot stats: Vec<(name, plugin, confirmed_lsn, restart_lsn, active, lag_bytes)>
     pub cdc_slot_stats:
         Option<Arc<dyn Fn() -> Vec<(String, String, u64, u64, bool, u64)> + Send + Sync>>,
-    /// CDC stream stats: Vec<(name, table_id, active, slot_name)>
+    /// CDC stream stats: Vec<(name, table_id, active, change_stream)>
     pub cdc_stream_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, String)> + Send + Sync>>,
     /// CDC ingest stats: Vec<(name, table_id, active, records_applied, records_failed)>
     pub cdc_ingest_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, u64, u64)> + Send + Sync>>,
@@ -717,8 +771,6 @@ pub struct ServerState {
     // -----------------------------------------------------------------------
     // Pipeline managers
     // -----------------------------------------------------------------------
-    /// Trigger registry indexed by table and event type.
-    pub trigger_manager: Option<Arc<zyron_pipeline::trigger::TriggerManager>>,
     /// User-defined function registry.
     pub udf_registry: Option<Arc<zyron_pipeline::udf::UdfRegistry>>,
     /// User-defined aggregate registry.
@@ -1000,7 +1052,36 @@ impl ServerState {
     pub fn apply_context(&self, txn_id: u64, snapshot: Snapshot) -> ExecutionContext {
         let mut ctx = self.statement_context(txn_id, snapshot);
         ctx.replication_apply = true;
+        // The applier records every entry's changes, its own node's
+        // included, at the entry's index. That is what makes each member's
+        // feed the same sequence of changes in the same order
+        ctx.change_capture_mode = zyron_executor::context::ChangeCaptureMode::Applied;
         ctx
+    }
+
+    /// Hands a context the change capture hook and says when its writes are
+    /// recorded.
+    ///
+    /// A node with no consensus group records each statement's changes as
+    /// it writes them. A member of a group records nothing on the statement
+    /// and leaves it to the applier, which records every agreed entry in the
+    /// log's order, so every member's feed holds the same changes in the
+    /// same order and a stream position names the same place on all of them
+    pub fn install_change_capture(&self, ctx: &mut ExecutionContext) {
+        if let Some(hook) = &self.cdc_hook {
+            ctx.cdc_hook = Some(Arc::clone(hook));
+        }
+        ctx.change_capture_mode = if self.replication.is_some() {
+            zyron_executor::context::ChangeCaptureMode::Deferred
+        } else {
+            zyron_executor::context::ChangeCaptureMode::AtStatement
+        };
+    }
+
+    /// Whether this node records changes as statements write them, rather
+    /// than when the group's applier applies the entry that carries them
+    pub fn records_changes_at_statement(&self) -> bool {
+        self.replication.is_none()
     }
 
     /// A context carrying every registry the server owns, and nothing that
@@ -1035,11 +1116,11 @@ impl ServerState {
         if let Some(mgr) = &self.branch_manager {
             ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
         }
-        // The change feed is fed here as well as on the leader, so a follower
-        // that is promoted carries on publishing where the old leader stopped
-        if let Some(hook) = &self.cdc_hook {
-            ctx.cdc_hook = Some(Arc::clone(hook));
+        self.install_change_capture(&mut ctx);
+        if let Some(bridge) = crate::change_feed_bridge::bridge_for(self) {
+            ctx.change_feed = Some(bridge as Arc<dyn zyron_executor::context::ChangeFeedReader>);
         }
+        ctx.stream_position_locks = Some(Arc::clone(self.txn_manager.stream_positions()));
         ctx
     }
 
@@ -1074,23 +1155,6 @@ impl Drop for VacuumGuard {
     }
 }
 
-/// One lake commit attempt for maintenance the operator asked for.
-fn lake_maintenance_attempt() -> zyron_lake::CommitAttempt<'static> {
-    zyron_lake::CommitAttempt {
-        operation: zyron_lake::OperationKind::Optimize,
-        db_txn_id: 0,
-        commit_lsn: 0,
-        timestamp_us: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0),
-        read_predicate: None,
-        read_version: 0,
-        audit: None,
-        deadline: None,
-    }
-}
-
 /// Runs the maintenance one OPTIMIZE asked for over a lake table and
 /// describes what it did.
 ///
@@ -1100,9 +1164,12 @@ fn lake_maintenance_attempt() -> zyron_lake::CommitAttempt<'static> {
 /// the background worker uses, so an operator-driven pass and a scheduled
 /// one choose from the same evidence. It does not consult the table's
 /// clustering schedule: the schedule governs whether the worker may start a
-/// pass unasked, and this is the operator asking
+/// pass unasked, and this is the operator asking.
+///
+/// Each pass commits under a transaction of the server's, so the version it
+/// writes reaches the rest of a group the way any other lake write does
 pub async fn lake_optimize(
-    catalog: &zyron_catalog::Catalog,
+    server: &Arc<ServerState>,
     log: &zyron_lake::TransactionLog,
     table_id: u32,
     cluster: bool,
@@ -1118,12 +1185,19 @@ pub async fn lake_optimize(
         // The table's own target when it names one, otherwise the shipped
         // default. A compaction merging toward a shape nobody chose would
         // be the wrong shape for a table that chose one
-        let o = zyron_lake::optimize(
-            log,
-            lake_maintenance_attempt(),
-            table_id as u64,
-            zyron_lake::DEFAULT_ROWS_PER_FILE,
-        )?;
+        let o = crate::ddl_dispatch::lake_maintenance_step(
+            server,
+            zyron_lake::OperationKind::Optimize,
+            |attempt| {
+                zyron_lake::optimize(
+                    log,
+                    attempt,
+                    table_id as u64,
+                    zyron_lake::DEFAULT_ROWS_PER_FILE,
+                )
+            },
+        )
+        .await?;
         parts.push(format!(
             "rewrote {} files into {} ({} rows, {} predicates retired)",
             o.files_removed, o.files_written, o.rows_written, o.predicates_retired
@@ -1138,16 +1212,24 @@ pub async fn lake_optimize(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        let report = zyron_lake::run_table_cluster_pass(
-            log,
-            lake_maintenance_attempt(),
-            table_id,
-            &zyron_lake::TablePassOptions::new(pass_id),
-        )?;
+        let report = crate::ddl_dispatch::lake_maintenance_step(
+            server,
+            zyron_lake::OperationKind::Optimize,
+            |attempt| {
+                zyron_lake::run_table_cluster_pass(
+                    log,
+                    attempt,
+                    table_id,
+                    &zyron_lake::TablePassOptions::new(pass_id),
+                )
+            },
+        )
+        .await?;
         // Planning is judged against what the catalog records, so a pass
         // that changed the layout has to record it there before the next
         // statement plans against the old one
-        catalog
+        server
+            .catalog
             .set_active_cluster_keys(zyron_catalog::TableId(table_id), &report.active_keys)
             .await?;
         parts.push(match report.outcome {
@@ -1169,7 +1251,7 @@ pub async fn lake_optimize(
     }
     let epoch_after = log.latest_manifest().map(|m| m.clustering_epoch()).ok();
     if epoch_before != epoch_after {
-        catalog.bump_schema_version();
+        server.catalog.bump_schema_version();
     }
     Ok(format!("OPTIMIZE {}", parts.join(", ")))
 }
@@ -1208,7 +1290,7 @@ pub async fn lake_optimize_statement(
             table.name
         ))
     })?;
-    lake_optimize(&server.catalog, &log, table.id.0, stmt.cluster, stmt.delete).await
+    lake_optimize(server, &log, table.id.0, stmt.cluster, stmt.delete).await
 }
 
 /// Cached prepared statement.
@@ -1257,6 +1339,12 @@ pub struct Connection<T: WireTransport> {
     /// Holds this transaction's place in the node's in-flight count for
     /// exactly as long as `transaction` is Some, so a drain waits on it
     transaction_guard: Option<zyron_common::InFlightGuard>,
+    /// True once a statement failed inside the transaction it opened for
+    /// itself, so that transaction ends by abort rather than by the commit
+    /// that follows a statement otherwise. What the statement wrote before
+    /// it failed and any stream position it recorded ahead of its rows go
+    /// with it, the way a failed block's do
+    implicit_failed: bool,
     /// Holds this session's place in the node's in-flight count for the
     /// life of the connection
     _session_guard: zyron_common::InFlightGuard,
@@ -1266,6 +1354,14 @@ pub struct Connection<T: WireTransport> {
     /// What this transaction has done, as the group will be told it. Opened
     /// with the transaction and taken by whichever of commit or abort ends it
     changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
+    /// Change stream positions this transaction's statements have consumed.
+    ///
+    /// Shared into every execution context the connection builds, so a stream
+    /// read anywhere in a statement records its advance here. Commit writes
+    /// them, and a rollback drops them with everything else the transaction
+    /// held, which is what leaves a rolled back consume's position where it
+    /// was
+    stream_advances: Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>>,
     /// Cross-table lake commit opened by BEGIN ZYRONLAKE TRANSACTION. The
     /// transaction's lake writes commit under its intent, so several lake
     /// tables become visible together without waiting on the database
@@ -1395,11 +1491,17 @@ pub struct CursorState {
 /// READ UNCOMMITTED and READ COMMITTED run as ReadCommitted, REPEATABLE READ
 /// and SNAPSHOT run as SnapshotIsolation. SERIALIZABLE has no engine
 /// equivalent and is rejected rather than silently downgraded.
-/// Opens a table's heap for a maintenance scan, preferring the server's
-/// shared registry so the live page count is visible. A fresh fallback
-/// instance seeds its page count caches from disk before first use,
-/// because a HeapFile starts with a zero cache and would scan no pages.
-async fn open_table_heap(
+/// A table's heap, from the server's registry or built and registered
+/// here, attached to the log the way every durable heap is.
+///
+/// Every path that reaches a table's rows outside an execution context,
+/// a streaming sink, a maintenance scan, a savepoint's undo, comes through
+/// here, so no heap that records nothing is ever built for a table whose
+/// pages recovery puts back from the log. A temporary table's heap records
+/// nothing, its pages being cleared at the next start. A fresh instance
+/// seeds its page count caches from disk before first use, because a
+/// HeapFile starts with a zero cache and would scan no pages
+pub async fn table_heap(
     server: &ServerState,
     table: &zyron_catalog::TableEntry,
 ) -> Result<Arc<zyron_storage::HeapFile>, ZyronError> {
@@ -1415,8 +1517,34 @@ async fn open_table_heap(
             fsm_file_id: table.fsm_file_id,
         },
     )?;
+    if !table.is_temporary() {
+        heap_file.attach_wal(&server.wal);
+    }
     heap_file.init_cache().await?;
-    Ok(Arc::new(heap_file))
+    let heap = Arc::new(heap_file);
+    // Two callers building the same heap at once converge on whichever
+    // registered first, and the other instance is dropped
+    match server
+        .heap_files
+        .insert_async(table.heap_file_id, Arc::clone(&heap))
+        .await
+    {
+        Ok(()) => Ok(heap),
+        Err(_) => Ok(server
+            .heap_files
+            .get_async(&table.heap_file_id)
+            .await
+            .map(|hit| Arc::clone(hit.get()))
+            .unwrap_or(heap)),
+    }
+}
+
+/// Opens a table's heap for a maintenance scan
+async fn open_table_heap(
+    server: &ServerState,
+    table: &zyron_catalog::TableEntry,
+) -> Result<Arc<zyron_storage::HeapFile>, ZyronError> {
+    table_heap(server, table).await
 }
 
 fn map_isolation_level(level: zyron_parser::TxnIsolation) -> ZyronResult<IsolationLevel> {
@@ -1452,9 +1580,11 @@ impl<T: WireTransport> Connection<T> {
             authenticator: Box::new(TrustAuthenticator),
             transaction: None,
             transaction_guard: None,
+            implicit_failed: false,
             _session_guard: session_guard,
             error_responses: 0,
             changeset: None,
+            stream_advances: Arc::new(parking_lot::Mutex::new(Vec::new())),
             lake_txn: None,
             statements: HashMap::new(),
             portals: HashMap::new(),
@@ -2145,9 +2275,10 @@ impl<T: WireTransport> Connection<T> {
             // node is about to do rather than an instruction to go and find
             // out
             let (stmt, agreed_sql) =
-                match Self::resolve_for_group(&self.server, &self.session, stmt, &sql).await {
+                match Self::resolve_for_group(&self.server, &mut self.session, stmt, &sql).await {
                     Ok(pair) => pair,
                     Err(e) => {
+                        self.release_reset_lock();
                         self.send_error(&e).await?;
                         self.mark_failed_if_in_transaction();
                         continue;
@@ -2160,12 +2291,14 @@ impl<T: WireTransport> Connection<T> {
             let turn = match self.agree_statement(&stmt, &agreed_sql).await {
                 Some(Ok(turn)) => Some(turn),
                 Some(Err(e)) => {
+                    self.release_reset_lock();
                     self.send_error(&e).await?;
                     self.mark_failed_if_in_transaction();
                     continue;
                 }
                 None => None,
             };
+            self.set_agreed_entry(turn.as_ref().map(|t| t.entry));
 
             // Handle DDL, DCL, and utility statements directly
             let handled = crate::ddl_dispatch::try_handle_ddl_utility(
@@ -2177,6 +2310,8 @@ impl<T: WireTransport> Connection<T> {
                 &agreed_sql,
             )
             .await;
+            self.set_agreed_entry(None);
+            self.release_reset_lock();
             if matches!(&handled, Some(Ok(_))) {
                 if let Err(e) = self.mark_changeset_savepoints(&stmt) {
                     self.send_error(&e).await?;
@@ -2335,9 +2470,7 @@ impl<T: WireTransport> Connection<T> {
                         txn_id,
                         snapshot,
                     );
-                    if let Some(ref hook) = self.server.cdc_hook {
-                        ctx.cdc_hook = Some(Arc::clone(hook));
-                    }
+                    self.server.install_change_capture(&mut ctx);
                     if let Some(ref hook) = self.server.dml_hook {
                         ctx.dml_hook = Some(Arc::clone(hook));
                     }
@@ -3040,67 +3173,19 @@ impl<T: WireTransport> Connection<T> {
         let dml_verb = dml_tag_verb(&plan);
 
         // Build execution context with security context for privilege enforcement
-        let mut ctx = ExecutionContext::new(
-            self.server.catalog.clone(),
-            self.server.wal.clone(),
-            self.server.buffer_pool.clone(),
-            self.server.disk_manager.clone(),
-            txn_id,
-            snapshot,
-        );
-        ctx.security_context = sec_ctx.map(Arc::new);
-        ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
-        ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
-        ctx.foreign_reader = self.server.foreign_reader.clone();
-        ctx.peers = Some(Arc::clone(&self.server.peers));
-        ctx.intent_locks = Some(Arc::clone(self.server.txn_manager.intent_locks()));
-        ctx.row_locks = Some(Arc::clone(self.server.txn_manager.lock_table()));
-        ctx.doc_registry = Some(Arc::clone(&self.server.doc_registry));
-        ctx.table_io_stats = Some(Arc::clone(&self.server.table_io_stats));
-        ctx.index_io_stats = Some(Arc::clone(&self.server.index_io_stats));
-        ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
-        // The heap routes copy-on-write pages by branch id, the lake opens a
-        // branch head by name, and both come from this one session branch
-        ctx.active_branch_name = self.active_branch.as_deref().map(Arc::from);
-        if let Some(mgr) = &self.server.branch_manager {
-            ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
-            if let Some(name) = &self.active_branch {
-                ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
-            }
-        }
-        if let Some(ref hook) = self.server.cdc_hook {
-            ctx.cdc_hook = Some(Arc::clone(hook));
-        }
-        if let Some(ref hook) = self.server.dml_hook {
-            ctx.dml_hook = Some(Arc::clone(hook));
-        }
-        self.attach_undo_log(&mut ctx);
-        self.attach_replication(&mut ctx);
-        self.apply_session_limits(&mut ctx);
-        let ctx = Arc::new(ctx);
+        let ctx =
+            Arc::new(self.statement_execution_context(txn_id, snapshot, sec_ctx.map(Arc::new)));
 
         // Execute
         self.register_cancellable(&ctx);
-        let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
-            .await
-            .map_err(ProtocolError::Database)?;
+        let outcome = execute_admitted(plan, &ctx, self.admission_tenant().as_deref()).await;
         self.note_ctx_writes(&ctx);
+        // The security context returns to the session whether the statement
+        // succeeded or failed, so the next statement plans under it
+        self.restore_security_context(ctx);
+        let batches = outcome.map_err(ProtocolError::Database)?;
         if let Some((name, kind)) = &temp_written {
             crate::temp_table_dispatch::mark_written(&self.session, name, *kind, &batches);
-        }
-
-        // Return the security context to the session so subsequent queries
-        // can reuse the cached privilege decisions.
-        if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
-            if let Some(session) = self.session.as_mut() {
-                // Recover the owned context from the Arc to return it to the
-                // session with its privilege cache intact. Any child context
-                // from a nested plan has been dropped, so the refcount is one.
-                session.security_context = unwrapped
-                    .security_context
-                    .take()
-                    .and_then(|a| Arc::try_unwrap(a).ok());
-            }
         }
 
         if is_select {
@@ -3234,9 +3319,12 @@ impl<T: WireTransport> Connection<T> {
         ctx.doc_registry = Some(Arc::clone(&self.server.doc_registry));
         ctx.table_io_stats = Some(Arc::clone(&self.server.table_io_stats));
         ctx.index_io_stats = Some(Arc::clone(&self.server.index_io_stats));
-        if let Some(ref hook) = self.server.cdc_hook {
-            ctx.cdc_hook = Some(Arc::clone(hook));
-        }
+        self.server.install_change_capture(&mut ctx);
+        crate::change_feed_bridge::install_change_reads(
+            &self.server,
+            &mut ctx,
+            &self.stream_advances,
+        );
         if let Some(ref hook) = self.server.dml_hook {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
@@ -3403,44 +3491,8 @@ impl<T: WireTransport> Connection<T> {
 
         let (txn_id, snapshot) = self.ensure_transaction()?;
 
-        let mut ctx = ExecutionContext::new(
-            self.server.catalog.clone(),
-            self.server.wal.clone(),
-            self.server.buffer_pool.clone(),
-            self.server.disk_manager.clone(),
-            txn_id,
-            snapshot,
-        );
+        let mut ctx = self.statement_execution_context(txn_id, snapshot, sec_ctx.map(Arc::new));
         ctx.params = params;
-        ctx.security_context = sec_ctx.map(Arc::new);
-        ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
-        ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
-        ctx.foreign_reader = self.server.foreign_reader.clone();
-        ctx.peers = Some(Arc::clone(&self.server.peers));
-        ctx.intent_locks = Some(Arc::clone(self.server.txn_manager.intent_locks()));
-        ctx.row_locks = Some(Arc::clone(self.server.txn_manager.lock_table()));
-        ctx.doc_registry = Some(Arc::clone(&self.server.doc_registry));
-        ctx.table_io_stats = Some(Arc::clone(&self.server.table_io_stats));
-        ctx.index_io_stats = Some(Arc::clone(&self.server.index_io_stats));
-        ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
-        // The heap routes copy-on-write pages by branch id, the lake opens a
-        // branch head by name, and both come from this one session branch
-        ctx.active_branch_name = self.active_branch.as_deref().map(Arc::from);
-        if let Some(mgr) = &self.server.branch_manager {
-            ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
-            if let Some(name) = &self.active_branch {
-                ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
-            }
-        }
-        if let Some(ref hook) = self.server.cdc_hook {
-            ctx.cdc_hook = Some(Arc::clone(hook));
-        }
-        if let Some(ref hook) = self.server.dml_hook {
-            ctx.dml_hook = Some(Arc::clone(hook));
-        }
-        self.attach_undo_log(&mut ctx);
-        self.attach_replication(&mut ctx);
-        self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
 
         let plan = (*cached.plan).clone();
@@ -3449,22 +3501,12 @@ impl<T: WireTransport> Connection<T> {
         let dml_verb = dml_tag_verb(&plan);
 
         self.register_cancellable(&ctx);
-        let batches = execute_admitted(plan, &ctx, self.admission_tenant().as_deref())
-            .await
-            .map_err(ProtocolError::Database)?;
+        let outcome = execute_admitted(plan, &ctx, self.admission_tenant().as_deref()).await;
         self.note_ctx_writes(&ctx);
-
-        if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
-            if let Some(session) = self.session.as_mut() {
-                // Recover the owned context from the Arc to return it to the
-                // session with its privilege cache intact. Any child context
-                // from a nested plan has been dropped, so the refcount is one.
-                session.security_context = unwrapped
-                    .security_context
-                    .take()
-                    .and_then(|a| Arc::try_unwrap(a).ok());
-            }
-        }
+        // The security context returns to the session whether the statement
+        // succeeded or failed, so the next statement plans under it
+        self.restore_security_context(ctx);
+        let batches = outcome.map_err(ProtocolError::Database)?;
 
         if is_select {
             let row_desc = self.build_row_description(&output_schema, &[]);
@@ -3533,23 +3575,21 @@ impl<T: WireTransport> Connection<T> {
 
         if options.analyze {
             let (txn_id, snapshot) = self.ensure_transaction()?;
-            let mut ctx = ExecutionContext::new(
-                self.server.catalog.clone(),
-                self.server.wal.clone(),
-                self.server.buffer_pool.clone(),
-                self.server.disk_manager.clone(),
-                txn_id,
-                snapshot,
-            );
-            self.attach_undo_log(&mut ctx);
-            self.attach_replication(&mut ctx);
-            self.apply_session_limits(&mut ctx);
-            let ctx = Arc::new(ctx);
-
-            let (_batches, metrics) = execute_analyze(plan, &ctx)
-                .await
-                .map_err(ProtocolError::Database)?;
+            // The statement runs through the context a statement of this
+            // connection runs through, so what it writes reaches the change
+            // feeds, the hooks and the group the way the statement's own
+            // run would, and the session's privileges decide what it may
+            // touch
+            let security = self
+                .session
+                .as_mut()
+                .and_then(|s| s.security_context.take())
+                .map(Arc::new);
+            let ctx = Arc::new(self.statement_execution_context(txn_id, snapshot, security));
+            let outcome = execute_analyze(plan, &ctx).await;
             self.note_ctx_writes(&ctx);
+            self.restore_security_context(ctx);
+            let (_batches, metrics) = outcome.map_err(ProtocolError::Database)?;
 
             let mut tree = explain_tree;
             if let Some(m) = metrics {
@@ -3927,9 +3967,7 @@ impl<T: WireTransport> Connection<T> {
         ctx_owned.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
         ctx_owned.foreign_reader = self.server.foreign_reader.clone();
         ctx_owned.peers = Some(Arc::clone(&self.server.peers));
-        if let Some(ref hook) = self.server.cdc_hook {
-            ctx_owned.cdc_hook = Some(Arc::clone(hook));
-        }
+        self.server.install_change_capture(&mut ctx_owned);
         if let Some(ref hook) = self.server.dml_hook {
             ctx_owned.dml_hook = Some(Arc::clone(hook));
         }
@@ -4120,9 +4158,10 @@ impl<T: WireTransport> Connection<T> {
 
         // Settled here first, the same as the simple query path
         let (stmt, agreed_sql) =
-            match Self::resolve_for_group(&self.server, &self.session, stmt, query).await {
+            match Self::resolve_for_group(&self.server, &mut self.session, stmt, query).await {
                 Ok(pair) => pair,
                 Err(e) => {
+                    self.release_reset_lock();
                     self.send_error(&e).await?;
                     self.mark_failed_if_in_transaction();
                     return Ok(());
@@ -4133,12 +4172,14 @@ impl<T: WireTransport> Connection<T> {
         let turn = match self.agree_statement(&stmt, &agreed_sql).await {
             Some(Ok(turn)) => Some(turn),
             Some(Err(e)) => {
+                self.release_reset_lock();
                 self.send_error(&e).await?;
                 self.mark_failed_if_in_transaction();
                 return Ok(());
             }
             None => None,
         };
+        self.set_agreed_entry(turn.as_ref().map(|t| t.entry));
 
         // DDL, DCL, and other utility statements.
         let handled = crate::ddl_dispatch::try_handle_ddl_utility(
@@ -4150,6 +4191,8 @@ impl<T: WireTransport> Connection<T> {
             &agreed_sql,
         )
         .await;
+        self.set_agreed_entry(None);
+        self.release_reset_lock();
         if matches!(&handled, Some(Ok(_))) {
             if let Err(e) = self.mark_changeset_savepoints(&stmt) {
                 self.send_error(&e).await?;
@@ -4311,6 +4354,79 @@ impl<T: WireTransport> Connection<T> {
     /// Attaches the current transaction's shared undo log to an execution
     /// context so DML operators record reverse-ops while a savepoint is open.
     /// No-op when there is no active transaction.
+    /// The context a statement of this connection runs against, every
+    /// registry the server owns and everything the session adds, the change
+    /// feeds and hooks, the stream reads, the undo log, the changeset and
+    /// the session's limits. One builder, so a statement run for EXPLAIN
+    /// ANALYZE writes through exactly what a statement run for its rows
+    /// writes through
+    fn statement_execution_context(
+        &self,
+        txn_id: u64,
+        snapshot: Snapshot,
+        security: Option<Arc<zyron_auth::SecurityContext>>,
+    ) -> ExecutionContext {
+        let mut ctx = ExecutionContext::new(
+            self.server.catalog.clone(),
+            self.server.wal.clone(),
+            self.server.buffer_pool.clone(),
+            self.server.disk_manager.clone(),
+            txn_id,
+            snapshot,
+        );
+        ctx.security_context = security;
+        ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        ctx.foreign_reader = self.server.foreign_reader.clone();
+        ctx.peers = Some(Arc::clone(&self.server.peers));
+        ctx.intent_locks = Some(Arc::clone(self.server.txn_manager.intent_locks()));
+        ctx.row_locks = Some(Arc::clone(self.server.txn_manager.lock_table()));
+        ctx.doc_registry = Some(Arc::clone(&self.server.doc_registry));
+        ctx.table_io_stats = Some(Arc::clone(&self.server.table_io_stats));
+        ctx.index_io_stats = Some(Arc::clone(&self.server.index_io_stats));
+        ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
+        // The heap routes copy-on-write pages by branch id, the lake opens a
+        // branch head by name, and both come from this one session branch
+        ctx.active_branch_name = self.active_branch.as_deref().map(Arc::from);
+        if let Some(mgr) = &self.server.branch_manager {
+            ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+            if let Some(name) = &self.active_branch {
+                ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
+            }
+        }
+        self.server.install_change_capture(&mut ctx);
+        crate::change_feed_bridge::install_change_reads(
+            &self.server,
+            &mut ctx,
+            &self.stream_advances,
+        );
+        if let Some(ref hook) = self.server.dml_hook {
+            ctx.dml_hook = Some(Arc::clone(hook));
+        }
+        self.attach_undo_log(&mut ctx);
+        self.attach_replication(&mut ctx);
+        self.apply_session_limits(&mut ctx);
+        ctx
+    }
+
+    /// Returns the security context a statement ran under to the session,
+    /// with the privilege decisions it cached, whether the statement
+    /// succeeded or failed. A session left without one would plan its next
+    /// statements with no row security at all
+    fn restore_security_context(&mut self, ctx: Arc<ExecutionContext>) {
+        if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
+            if let Some(session) = self.session.as_mut() {
+                // Recover the owned context from the Arc to return it to the
+                // session with its privilege cache intact. Any child context
+                // from a nested plan has been dropped, so the refcount is one
+                session.security_context = unwrapped
+                    .security_context
+                    .take()
+                    .and_then(|a| Arc::try_unwrap(a).ok());
+            }
+        }
+    }
+
     fn attach_undo_log(&self, ctx: &mut ExecutionContext) {
         if let Some(txn) = self.transaction.as_ref() {
             ctx.undo_log = Some(txn.undo_log());
@@ -4353,7 +4469,7 @@ impl<T: WireTransport> Connection<T> {
     /// disagree with, and the handler resolves as it always has
     async fn resolve_for_group<'a>(
         server: &Arc<ServerState>,
-        session: &Option<Session>,
+        session: &mut Option<Session>,
         stmt: zyron_parser::Statement,
         sql: &'a str,
     ) -> Result<(zyron_parser::Statement, Cow<'a, str>), ZyronError> {
@@ -4391,12 +4507,24 @@ impl<T: WireTransport> Connection<T> {
                     zyron_parser::ast::AlterExternalSourceAction::SetColumns(columns);
                 zyron_parser::Statement::AlterExternalSource(Box::new(*resolved_alter))
             }
+            // A reset names a place in this member's own feed, which another
+            // member's feed numbers differently, so it is resolved here into
+            // the count every member lands on alike
+            zyron_parser::Statement::AlterChangeStream(alter) => {
+                let Some(resolved) =
+                    crate::change_stream_dispatch::resolve_reset_for_group(alter, server, session)?
+                else {
+                    return Ok((stmt, Cow::Borrowed(sql)));
+                };
+                zyron_parser::Statement::AlterChangeStream(Box::new(resolved))
+            }
             _ => return Ok((stmt, Cow::Borrowed(sql))),
         };
 
         let resolved_sql = zyron_parser::statement_to_sql(&resolved_stmt).map_err(|e| {
             ZyronError::Internal(format!(
-                "the external source layout was read from the store and could not be written                  back as SQL for the group, {e}"
+                "the statement was resolved on this member and could not be written back as \
+                 SQL for the group, {e}"
             ))
         })?;
         Ok((resolved_stmt, Cow::Owned(resolved_sql)))
@@ -4490,8 +4618,33 @@ impl<T: WireTransport> Connection<T> {
             router
                 .begin_statement(sql, &context)
                 .await
-                .map(|done| StatementTurn { done }),
+                .map(|agreed| StatementTurn {
+                    entry: (agreed.index, agreed.timestamp_us),
+                    done: agreed.done,
+                }),
         )
+    }
+
+    /// Releases the change stream position an ALTER CHANGE STREAM took
+    /// before the group agreed it, once the statement has run here or
+    /// failed to get that far
+    fn release_reset_lock(&mut self) {
+        let Some(owner) = self
+            .session
+            .as_mut()
+            .and_then(|session| session.reset_lock_owner.take())
+        else {
+            return;
+        };
+        self.server.txn_manager.stream_positions().unlock_all(owner);
+    }
+
+    /// Marks the session with the group entry the statement in hand runs
+    /// as, or clears it once the statement is done
+    fn set_agreed_entry(&mut self, entry: Option<(u64, i64)>) {
+        if let Some(session) = self.session.as_mut() {
+            session.agreed_entry = entry;
+        }
     }
 
     /// Hangs this transaction's changeset on a statement's context.
@@ -4552,20 +4705,60 @@ impl<T: WireTransport> Connection<T> {
     /// up, which is why the index rides inside the record
     async fn commit_through_group(
         &mut self,
+        txn: zyron_storage::txn::Transaction,
+    ) -> Result<zyron_storage::txn::Transaction, ZyronError> {
+        let txn_id = txn.txn_id;
+        let outcome = self.commit_with_advances(txn).await;
+        if outcome.is_err() {
+            // The positions this transaction held are released with it. A
+            // commit that succeeded released them as its advances were
+            // installed, so this only reaches a failed one
+            crate::change_stream_dispatch::release_stream_positions(&self.server, txn_id);
+        }
+        outcome
+    }
+
+    /// The body of a commit through the group, with the change stream
+    /// advances this transaction's reads recorded riding in its commit
+    async fn commit_with_advances(
+        &mut self,
         mut txn: zyron_storage::txn::Transaction,
     ) -> Result<zyron_storage::txn::Transaction, ZyronError> {
         let txn_id = txn.txn_id;
+        let actor = self.actor_role();
+        // A change stream position moves in the same commit as the rows the
+        // consumer wrote, so the record goes into this transaction's own log
+        // chain before the commit record closes it
+        let advances = std::mem::take(&mut *self.stream_advances.lock());
+        let advanced = crate::change_stream_dispatch::log_stream_advances(
+            &self.server,
+            &mut txn,
+            &advances,
+            actor,
+        )?;
         let changeset = self.changeset.take();
         let (Some(router), Some(changeset)) = (self.server.replication.as_ref(), changeset) else {
             self.server.txn_manager.commit(&mut txn).await?;
+            self.install_after_commit(txn_id, advanced).await;
             return Ok(txn);
         };
 
         // A lake commit is described by its version files, and every lake
         // write path stages the same way, so reading what this transaction
         // staged catches append, delete, update, optimize and schema change
-        // in one place
-        router.capture_lake(txn_id, &changeset)?;
+        // in one place. A transaction opened with BEGIN LAKE stages its
+        // versions under its cross-table intent rather than under itself,
+        // so what the intent holds is read as well
+        router.capture_lake(txn_id, Arc::clone(&changeset)).await?;
+        if let Some(intent) = self.lake_txn.as_ref().map(|lake_txn| lake_txn.txn_id()) {
+            if intent != txn_id {
+                router.capture_lake(intent, Arc::clone(&changeset)).await?;
+            }
+        }
+        // The advances travel as the counts each stream consumed, which are
+        // the same number on every member, so a member that takes over as
+        // leader continues each stream from where this commit left it
+        router.capture_stream_advances(&changeset, &advances, actor)?;
 
         if !changeset.is_dirty() {
             // Nothing to agree on. A read-only transaction never reaches the
@@ -4576,10 +4769,78 @@ impl<T: WireTransport> Connection<T> {
             } else {
                 self.server.txn_manager.commit_read_only(&mut txn)?;
             }
+            self.install_after_commit(txn_id, advanced).await;
             return Ok(txn);
         }
 
-        router.commit(txn, changeset).await
+        let committed = router.commit(txn, changeset).await?;
+        self.install_after_commit(txn_id, advanced).await;
+        Ok(committed)
+    }
+
+    /// The role this connection's statements run under, zero when no
+    /// security context is active
+    fn actor_role(&self) -> u32 {
+        self.session
+            .as_ref()
+            .and_then(|session| session.security_context.as_ref())
+            .map(|ctx| ctx.current_role.0)
+            .unwrap_or(0)
+    }
+
+    /// Installs the advances of a commit that is durable and releases the
+    /// positions it held.
+    ///
+    /// The commit stands whatever happens here, so a failure is reported as
+    /// a warning on the connection and in the log rather than as a failed
+    /// commit, which would send the client retrying rows that are already
+    /// in. The log holds the advance and recovery replays it, and until
+    /// then a consume of the stream reads the same changes again
+    async fn install_after_commit(
+        &mut self,
+        txn_id: u64,
+        advanced: Vec<zyron_catalog::ChangeStreamEntry>,
+    ) {
+        let streams: Vec<u32> = advanced.iter().map(|entry| entry.id).collect();
+        let Err(e) =
+            crate::change_stream_dispatch::install_stream_advances(&self.server, txn_id, advanced)
+                .await
+        else {
+            return;
+        };
+        tracing::error!(
+            target: "zyron::cdc",
+            txn_id,
+            streams = ?streams,
+            error = %e,
+            "a change stream advance committed durably but its position could not be \
+             installed here, so the position stands behind the log until recovery replays \
+             the advance"
+        );
+        let _ = self
+            .feed(BackendMessage::NoticeResponse(ErrorFields {
+                severity: "WARNING".into(),
+                code: "01000".into(),
+                message: format!(
+                    "the transaction committed, but a change stream position could not be \
+                     installed: {e}"
+                ),
+                detail: None,
+                hint: Some(
+                    "the position stands behind the committed advance until the node \
+                     restarts, and a consume before then reads the same changes again"
+                        .into(),
+                ),
+                position: None,
+            }))
+            .await;
+    }
+
+    /// Whether this connection's open transaction recorded a change stream
+    /// advance, which is a write to the catalog that its commit carries even
+    /// when no row was written
+    fn holds_stream_advances(&self) -> bool {
+        !self.stream_advances.lock().is_empty()
     }
 
     /// Tries to handle BEGIN/COMMIT/ROLLBACK statements directly.
@@ -4643,7 +4904,20 @@ impl<T: WireTransport> Connection<T> {
                                 // to all or none
                                 lake_txn.prepare().map(|()| lake_txn)
                             }) {
-                                Ok(lake_txn) => self.lake_txn = Some(lake_txn),
+                                Ok(lake_txn) => {
+                                    // A change reader judges the intent's
+                                    // commits by the transaction that
+                                    // opened it, the one its heap rows
+                                    // carry
+                                    let db_txn_id =
+                                        self.transaction.as_ref().map(|t| t.txn_id).unwrap_or(0);
+                                    zyron_lake::bind_intent_owner(
+                                        self.server.disk_manager.data_dir(),
+                                        lake_txn.txn_id(),
+                                        db_txn_id,
+                                    );
+                                    self.lake_txn = Some(lake_txn);
+                                }
                                 Err(e) => {
                                     self.transaction = None;
                                     self.transaction_guard = None;
@@ -4683,7 +4957,7 @@ impl<T: WireTransport> Connection<T> {
                     // commit record or flush wait. One that wrote goes through
                     // the group when this node leads one, which is what puts
                     // its visibility in the group's order
-                    let commit_result = if txn.wrote_data() {
+                    let commit_result = if txn.wrote_data() || self.holds_stream_advances() {
                         self.commit_through_group(txn).await.map(|_| ())
                     } else {
                         self.changeset = None;
@@ -4698,7 +4972,11 @@ impl<T: WireTransport> Connection<T> {
                             // instead, which is one write for every table it
                             // touched
                             let published = match self.lake_txn.take() {
-                                Some(lake_txn) => lake_txn.commit(),
+                                Some(lake_txn) => {
+                                    let published = lake_txn.commit();
+                                    self.finish_intent(lake_txn.txn_id());
+                                    published
+                                }
                                 None => zyron_lake::publish_txn(
                                     self.server.disk_manager.data_dir(),
                                     txn_id,
@@ -4764,6 +5042,9 @@ impl<T: WireTransport> Connection<T> {
                     let logs = self.abandon_lake_work(txn.txn_id);
                     refresh_lake_stats(&self.server, &logs);
                     self.abandon_changeset();
+                    // The advances this transaction's reads recorded go with
+                    // it, so the positions stand where they did
+                    self.stream_advances.lock().clear();
                     self.server.txn_manager.abort(&mut txn)
                 } else {
                     Ok(())
@@ -4876,7 +5157,7 @@ impl<T: WireTransport> Connection<T> {
     /// semantics: heap visibility filters entries pointing at a self-deleted
     /// row, and vacuum reclaims them. The read snapshot is unchanged.
     async fn partial_rollback_to_savepoint(&mut self, name: &str) -> ZyronResult<String> {
-        use zyron_storage::{HeapFile, HeapFileConfig, UndoEntry};
+        use zyron_storage::{HeapFile, UndoEntry};
 
         let txn = self.transaction.as_mut().ok_or_else(|| {
             ZyronError::TransactionAborted(
@@ -4901,17 +5182,13 @@ impl<T: WireTransport> Connection<T> {
         let mut heaps: std::collections::HashMap<u32, Arc<HeapFile>> =
             std::collections::HashMap::new();
         for entry in &rollback.undo {
-            let (heap_file_id, fsm_file_id, tid, is_insert) = match entry {
+            let (heap_file_id, tid, is_insert) = match entry {
                 UndoEntry::ReverseInsert {
-                    heap_file_id,
-                    fsm_file_id,
-                    tid,
-                } => (*heap_file_id, *fsm_file_id, *tid, true),
+                    heap_file_id, tid, ..
+                } => (*heap_file_id, *tid, true),
                 UndoEntry::ReverseDelete {
-                    heap_file_id,
-                    fsm_file_id,
-                    tid,
-                } => (*heap_file_id, *fsm_file_id, *tid, false),
+                    heap_file_id, tid, ..
+                } => (*heap_file_id, *tid, false),
                 // Columnar writes reverse through the patch log: the revoke is
                 // WAL logged first so crash recovery replays it, then removed
                 // from the live overlay so the row's prior state is visible
@@ -4960,14 +5237,23 @@ impl<T: WireTransport> Connection<T> {
                     {
                         Arc::clone(hit.get())
                     } else {
-                        Arc::new(HeapFile::new(
-                            Arc::clone(&self.server.disk_manager),
-                            Arc::clone(&self.server.buffer_pool),
-                            HeapFileConfig {
-                                heap_file_id,
-                                fsm_file_id,
-                            },
-                        )?)
+                        // A heap not registered on this node yet is opened
+                        // through the table that owns it, attached to the log
+                        // the way every durable heap is, so the stamps the
+                        // undo sets are recorded like the writes they undo
+                        let table = self
+                            .server
+                            .catalog
+                            .list_all_tables()
+                            .into_iter()
+                            .find(|t| t.heap_file_id == heap_file_id)
+                            .ok_or_else(|| {
+                                ZyronError::Internal(format!(
+                                    "heap file {heap_file_id}, which a savepoint's undo names, \
+                                     belongs to no table"
+                                ))
+                            })?;
+                        table_heap(&self.server, &table).await?
                     };
                     heaps.insert(heap_file_id, Arc::clone(&h));
                     h
@@ -5464,19 +5750,42 @@ impl<T: WireTransport> Connection<T> {
                     continue;
                 };
                 let mut dead: Vec<(u16, u16, Vec<u8>)> = Vec::new();
-                let (reclaimed_on_page, modified, page_census) = {
+                let mut changes = zyron_storage::PageVacuum::default();
+                let outcome = {
                     let mut guard = frame.write_data();
                     let data: &mut [u8] = &mut guard[..];
-                    if HeapPage::heap_header_from_slice(data).slot_count == 0 {
+                    let pass = if HeapPage::heap_header_from_slice(data).slot_count == 0 {
                         (0u64, false, zyron_storage::EpochCensus::default())
                     } else if clean_indexes {
-                        HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead)
+                        HeapPage::vacuum_in_slice_collect(
+                            data,
+                            &is_dead,
+                            &is_aborted,
+                            &mut dead,
+                            &mut changes,
+                        )
                     } else {
-                        HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted)
-                    }
+                        HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted, &mut changes)
+                    };
+                    // Logged under the frame lock, before the page can be
+                    // copied out, and the page stamped with each record
+                    zyron_storage::heap_redo::log_vacuum(
+                        &self.server.wal,
+                        &self.server.buffer_pool,
+                        *page_id,
+                        &changes,
+                    )
+                    .map(|_| pass)
+                };
+                let (reclaimed_on_page, modified, page_census) = match &outcome {
+                    Ok((reclaimed, modified, page_census)) => (*reclaimed, *modified, *page_census),
+                    Err(_) => (0, true, zyron_storage::EpochCensus::default()),
                 };
                 census.merge(page_census);
                 self.server.buffer_pool.unpin_page(*page_id, modified);
+                if let Err(e) = outcome {
+                    return Err(ProtocolError::Database(e));
+                }
 
                 if clean_indexes && !dead.is_empty() {
                     let captured: Vec<zyron_executor::operator::modify::CapturedRow> = dead
@@ -5504,7 +5813,14 @@ impl<T: WireTransport> Connection<T> {
             }
 
             // A layout nothing carries any more is dead weight in the entry,
-            // and epoch 0 retires with the pre-stamp column list it names
+            // and epoch 0 retires with the pre-stamp column list it names. A
+            // change data feed keeps rows the heap has rewritten, so the
+            // lowest epoch it still holds is kept too
+            let feed_floor = self
+                .server
+                .cdc_registry
+                .as_ref()
+                .and_then(|feeds| feeds.oldest_schema_epoch(table.id.0));
             if let Err(e) = self
                 .server
                 .catalog
@@ -5513,6 +5829,7 @@ impl<T: WireTransport> Connection<T> {
                     census.min_live_epoch,
                     census.any_unstamped,
                     census.saw_nothing(),
+                    feed_floor,
                 )
                 .await
             {
@@ -6164,11 +6481,6 @@ impl<T: WireTransport> Connection<T> {
         }
     }
 
-    /// Applies the session statement timeout and result-row cap to an
-    /// execution context. The deadline starts now plus statement_timeout, and
-    /// the row cap is the configured max_result_rows. Both are left unset when
-    /// the server has no corresponding limit configured.
-    #[inline]
     /// Discards every lake version this transaction wrote and resolves an
     /// open cross-table intent, so a prepared intent never outlives the
     /// transaction that opened it.
@@ -6177,11 +6489,29 @@ impl<T: WireTransport> Connection<T> {
         txn_id: u64,
     ) -> Vec<std::sync::Arc<zyron_lake::TransactionLog>> {
         match self.lake_txn.take() {
-            Some(lake_txn) => lake_txn.abort(),
+            Some(lake_txn) => {
+                let touched = lake_txn.abort();
+                self.finish_intent(lake_txn.txn_id());
+                touched
+            }
             None => zyron_lake::abandon_txn(self.server.disk_manager.data_dir(), txn_id),
         }
     }
 
+    /// Marks a cross-table intent finished for the change readers that
+    /// judge its commits by the transaction that opened it, and forgets
+    /// the finished intents no snapshot can still hold open
+    fn finish_intent(&self, intent_txn_id: u64) {
+        let data_dir = self.server.disk_manager.data_dir();
+        zyron_lake::finish_intent_owner(data_dir, intent_txn_id);
+        zyron_lake::prune_intent_owners(data_dir, self.server.txn_manager.prune_horizon());
+    }
+
+    /// Applies the session statement timeout and result-row cap to an
+    /// execution context. The deadline starts now plus statement_timeout, and
+    /// the row cap is the configured max_result_rows. Both are left unset when
+    /// the server has no corresponding limit configured
+    #[inline]
     fn apply_session_limits(&self, ctx: &mut ExecutionContext) {
         // A SET statement_timeout on this session overrides the server
         // default, including an explicit zero that disables the deadline
@@ -6251,19 +6581,21 @@ impl<T: WireTransport> Connection<T> {
             .unwrap_or(false);
 
         if !in_explicit_txn {
+            let failed = std::mem::take(&mut self.implicit_failed);
             if let Some(mut txn) = self.transaction.take() {
                 self.transaction_guard = None;
                 let txn_id = txn.txn_id;
-                if self.session_ref().transaction_state() == TransactionState::Failed {
+                if failed || self.session_ref().transaction_state() == TransactionState::Failed {
                     let logs = self.abandon_lake_work(txn_id);
                     refresh_lake_stats(&self.server, &logs);
                     self.abandon_changeset();
+                    self.stream_advances.lock().clear();
                     if let Err(e) = self.server.txn_manager.abort(&mut txn) {
                         self.write_buf.truncate(buf_mark);
                         self.send_error(&e).await?;
                         return Err(ProtocolError::Database(e));
                     }
-                } else if txn.wrote_data() {
+                } else if txn.wrote_data() || self.holds_stream_advances() {
                     if let Err(e) = self.commit_through_group(txn).await {
                         // The implicit transaction failed to durably commit.
                         // Replace the buffered success responses with an error.
@@ -6306,8 +6638,16 @@ impl<T: WireTransport> Connection<T> {
     fn mark_failed_if_in_transaction(&mut self) {
         if self.transaction.is_some() {
             if let Some(session) = self.session.as_mut() {
-                if session.transaction_state() == TransactionState::InTransaction {
-                    session.set_transaction_state(TransactionState::Failed);
+                match session.transaction_state() {
+                    TransactionState::InTransaction => {
+                        session.set_transaction_state(TransactionState::Failed);
+                    }
+                    TransactionState::Failed => {}
+                    // The statement's own transaction, which ends with the
+                    // statement. A failed one is undone rather than
+                    // committed with the rows it wrote before it failed and
+                    // the stream position it recorded ahead of them
+                    _ => self.implicit_failed = true,
                 }
             }
         }
@@ -7531,11 +7871,7 @@ fn extract_single_from_table(sel: &zyron_parser::SelectStatement) -> Option<Stri
         return None;
     }
     match &sel.from[0] {
-        zyron_parser::TableRef::Table {
-            name,
-            alias: _,
-            as_of: _,
-        } => Some(name.clone()),
+        zyron_parser::TableRef::Table { name, .. } => Some(name.clone()),
         _ => None,
     }
 }

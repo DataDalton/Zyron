@@ -27,7 +27,7 @@ ASOF JOIN quotes AS q
 
 Each trade takes the latest quote on its own symbol at or before its own timestamp.
 
-`ON` carries equalities only. They divide both inputs into groups that are matched independently, the way a partition does, and a trade is never matched against another symbol's quote. `ON` is optional; without it the whole input is one group. An inequality written into `ON` is refused, naming `MATCH_CONDITION` as where it belongs.
+`ON` carries equalities only. They divide both inputs into groups that are matched independently, the way a partition does, and a trade is never matched against another symbol's quote. `ON` is optional, and without it the whole input is one group. An inequality written into `ON` is refused, naming `MATCH_CONDITION` as where it belongs.
 
 ## The match condition
 
@@ -58,7 +58,7 @@ FROM trades AS t
 ASOF LEFT JOIN quotes AS q MATCH_CONDITION (t.ts >= q.ts) ON t.symbol = q.symbol;
 ```
 
-A trade before the first quote on its symbol has no earlier quote to take. Under the inner form it does not appear; under the LEFT form it appears with a NULL bid.
+A trade before the first quote on its symbol has no earlier quote to take. Under the inner form it does not appear. Under the LEFT form it appears with a NULL bid.
 
 There is no `RIGHT` or `FULL` form. `ASOF RIGHT JOIN` does not parse. The join asks a question about each left row, and there is no reading of it that runs the other way as well.
 
@@ -76,7 +76,7 @@ Without a tolerance the reach is unbounded, and a trade takes the last quote on 
 
 ## What it runs as
 
-Both inputs are read in `(equality keys, match column)` order. Inside each equality group the merge steps through both once, holding the nearest right row it has passed; that held row is the answer for every left row until the right side passes it.
+Both inputs are read in `(equality keys, match column)` order. Inside each equality group the merge steps through both once, holding the nearest right row it has passed. That held row is the answer for every left row until the right side passes it.
 
 Nothing is materialized. The operator holds one batch per side, the held row, and the output batch it is filling, whatever the inputs' size.
 

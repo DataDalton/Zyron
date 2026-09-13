@@ -1,0 +1,26 @@
+# suite:   temp_table
+# run:     2026-09-13_013311_6e2ce74-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Temporary INSERT On A Node In A Group ===
+Rows: 20000, rows per statement: 500, group of 3
+  Run 1/5: temporary 1,366,447 rows/sec, permanent 457,035 rows/sec
+  Run 2/5: temporary 2,154,940 rows/sec, permanent 609,596 rows/sec
+  Run 3/5: temporary 2,192,406 rows/sec, permanent 571,798 rows/sec
+  Run 4/5: temporary 1,884,872 rows/sec, permanent 577,502 rows/sec
+  Run 5/5: temporary 1,691,375 rows/sec, permanent 533,107 rows/sec
+  temporary table:
+    Runs: [1,366,447 rows/s, 2,154,940 rows/s, 2,192,406 rows/s, 1,884,872 rows/s, 1,691,375 rows/s]
+    Average: 1,858,008 rows/s (no target set)
+    Min/Max: 1,366,447 rows/s / 2,192,406 rows/s, StdDev: 306,630 rows/s
+  permanent heap through the group:
+    Runs: [457,035 rows/s, 609,596 rows/s, 571,798 rows/s, 577,502 rows/s, 533,107 rows/s]
+    Average: 549,808 rows/s (no target set)
+    Min/Max: 457,035 rows/s / 609,596 rows/s, StdDev: 52,366 rows/s
+  A temporary table takes inserts 3.38x as fast (target 3.0x)
+  temporary over permanent:
+    Runs: [3.3794x]
+    Average: 3.3794x (no target set)

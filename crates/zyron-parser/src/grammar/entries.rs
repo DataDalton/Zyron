@@ -1125,18 +1125,33 @@ pub const GRAMMAR: &[GrammarEntry] = &[
                 default: None,
             },
             Clause {
+                syntax: "ALTER COLUMN name TYPE type ACKNOWLEDGE STREAM BREAK",
+                field: Some("operation"),
+                what: "Narrows a column's type on a table with change streams. Each stream over the table is marked as needing attention, keeps its position, and yields again once its definition is corrected.",
+                default: Some("A narrowing on a table with change streams is refused."),
+            },
+            Clause {
                 syntax: "ADD CONSTRAINT name ...",
                 field: Some("operation"),
                 what: "Adds a constraint, which is checked against the rows already there before it takes effect.",
                 default: None,
             },
         ],
-        refusals: &[],
-        examples: &[Example {
-            statement: "ALTER TABLE orders ADD COLUMN note TEXT",
-            yields: "The table has a new column and no row was rewritten.",
+        refusals: &[Refusal {
+            when: "A column's type is narrowed on a table with change streams and the break is not acknowledged",
+            message: "was narrowed with ACKNOWLEDGE STREAM BREAK",
         }],
-        see_also: &["CREATE TABLE", "ALTER TABLE SET TTL"],
+        examples: &[
+            Example {
+                statement: "ALTER TABLE orders ADD COLUMN note TEXT",
+                yields: "The table has a new column and no row was rewritten.",
+            },
+            Example {
+                statement: "ALTER TABLE orders ALTER COLUMN total TYPE INT ACKNOWLEDGE STREAM BREAK",
+                yields: "The column narrows, and every change stream over the table needs attention until its column list is corrected.",
+            },
+        ],
+        see_also: &["CREATE TABLE", "ALTER TABLE SET TTL", "ALTER CHANGE STREAM"],
         returns: None,
     },
     GrammarEntry {
@@ -2106,21 +2121,58 @@ pub const GRAMMAR: &[GrammarEntry] = &[
         keywords: &["CREATE", "CDC", "STREAM"],
         position: GrammarPosition::Statement,
         category: Category::Streaming,
-        syntax: "CREATE CDC STREAM name ON table TO sink [WITH (option = value, ...)]",
-        summary: "Sends one table's changes to a sink as they happen.",
-        description: "Sends a table's changes to a sink as they are committed, rather than on a schedule. What arrives is the change itself, so a consumer applies rows rather than comparing snapshots.",
-        clauses: &[Clause {
-            syntax: "WITH (option = value, ...)",
-            field: Some("options"),
-            what: "Options the sink reads, such as where to write and how to batch.",
-            default: Some("The sink's own defaults apply."),
-        }],
-        refusals: &[],
-        examples: &[Example {
-            statement: "CREATE CDC STREAM s ON orders TO kafka",
-            yields: "The table's committed changes arrive at that sink.",
-        }],
-        see_also: &["DROP CDC STREAM", "CREATE CDC INGEST"],
+        syntax: "CREATE CDC STREAM name ON [TABLE] table | FROM CHANGE STREAM stream TO sink [WITH (option = value, ...)]",
+        summary: "Sends one table's changes to a sink as they happen, delivering from a change stream.",
+        description: "Sends a table's changes to a sink as they are committed, rather than on a schedule. What arrives is the change itself, so a consumer applies rows rather than comparing snapshots. Delivery reads a change stream and moves its position once the sink has taken the records, so where delivery has got to is the stream's position in zyron_sys.cdc.change_streams. Named with ON, the stream is created with the outbound stream, named after it, at the table's current version, and dropped with it. Named with FROM CHANGE STREAM, an existing stream is consumed from where it stands and stays when the outbound stream is dropped.",
+        clauses: &[
+            Clause {
+                syntax: "ON [TABLE] table",
+                field: Some("table_name"),
+                what: "Delivers the table's changes through a change stream created for this outbound stream, named __cdc_ followed by the outbound stream's name.",
+                default: None,
+            },
+            Clause {
+                syntax: "FROM CHANGE STREAM stream",
+                field: Some("change_stream"),
+                what: "Delivers from a change stream that exists, starting at its position. The stream must read one table.",
+                default: None,
+            },
+            Clause {
+                syntax: "WITH (option = value, ...)",
+                field: Some("options"),
+                what: "Options the sink reads, such as where to write and how to batch.",
+                default: Some("The sink's own defaults apply."),
+            },
+        ],
+        refusals: &[
+            Refusal {
+                when: "The table has no change data feed",
+                message: "so an outbound stream over it would deliver",
+            },
+            Refusal {
+                when: "The change stream named reads more than one table",
+                message: "and an outbound stream",
+            },
+            Refusal {
+                when: "A change stream already holds the name the outbound stream would create",
+                message: "so an outbound stream of that name would",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "CREATE CDC STREAM s ON orders TO kafka",
+                yields: "The table's committed changes arrive at that sink, delivered from a change stream named __cdc_s.",
+            },
+            Example {
+                statement: "CREATE CDC STREAM s FROM CHANGE STREAM order_changes TO webhook WITH (url = 'https://example.test/changes')",
+                yields: "The changes past the stream's position arrive at that sink, and the stream's position moves as they do.",
+            },
+        ],
+        see_also: &[
+            "DROP CDC STREAM",
+            "CREATE CDC INGEST",
+            "CREATE CHANGE STREAM",
+        ],
         returns: None,
     },
     GrammarEntry {
@@ -2130,7 +2182,7 @@ pub const GRAMMAR: &[GrammarEntry] = &[
         category: Category::Streaming,
         syntax: "DROP CDC STREAM name",
         summary: "Stops sending a table's changes to a sink.",
-        description: "Stops the stream. Changes committed after it is dropped are not sent, and the table is otherwise untouched.",
+        description: "Stops the stream. Changes committed after it is dropped are not sent, and the table is otherwise untouched. A change stream created with the outbound stream is dropped with it. One named with FROM CHANGE STREAM stays.",
         clauses: &[],
         refusals: &[],
         examples: &[Example {
@@ -2177,6 +2229,346 @@ pub const GRAMMAR: &[GrammarEntry] = &[
             yields: "The feed stops being applied and the rows already applied stay.",
         }],
         see_also: &["CREATE CDC INGEST"],
+        returns: None,
+    },
+    GrammarEntry {
+        name: "table_changes",
+        keywords: &["table_changes"],
+        position: GrammarPosition::FromItem,
+        category: Category::Streaming,
+        syntax: "table_changes(table [, start [, end]] | table, start_version => n | start_timestamp => 'ts', end_version => n | end_timestamp => 'ts', schema => 'current' | 'as_of_change')",
+        summary: "Reads a table's recorded changes between two versions as rows.",
+        description: "Yields one row per recorded change of a table whose change data feed is on, carrying the row's columns and the metadata columns _change_type, _commit_version, _commit_ts, _commit_txn_id and _change_ordinal. _change_type is insert, update_preimage, update_postimage or delete. A bound is a version, a timestamp string, EARLIEST or LATEST. The start is exclusive and the end inclusive, so reading from the version a previous read ended at continues it. A predicate on the metadata columns is pushed into the read, so a range narrowed by version or by change type reads only the segments holding it.",
+        clauses: &[
+            Clause {
+                syntax: "start_version => n | start_timestamp => 'ts'",
+                field: Some("args"),
+                what: "Where the read starts, exclusive. EARLIEST reads from the oldest change the feed still holds.",
+                default: Some("EARLIEST."),
+            },
+            Clause {
+                syntax: "end_version => n | end_timestamp => 'ts'",
+                field: Some("args"),
+                what: "Where the read ends, inclusive.",
+                default: Some("LATEST."),
+            },
+            Clause {
+                syntax: "schema => 'as_of_change'",
+                field: Some("args"),
+                what: "Renders each change through the columns the table had when the change was written, dropped columns included. A column added later is absent from an older change.",
+                default: Some(
+                    "Each change is rendered through the table's current columns. A column added after a change reads NULL in it, and a dropped column is not yielded.",
+                ),
+            },
+        ],
+        refusals: &[
+            Refusal {
+                when: "The table has no change data feed",
+                message: "has no change data feed",
+            },
+            Refusal {
+                when: "The start is a version older than the feed's retention",
+                message: "is older than the feed's",
+            },
+            Refusal {
+                when: "An argument name is not one the function reads",
+                message: "table_changes does not take an argument called",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "SELECT * FROM table_changes(orders, 0, LATEST) ORDER BY _commit_version, _change_ordinal",
+                yields: "Every recorded change of the table, oldest first, each with the row's columns and the change's metadata.",
+            },
+            Example {
+                statement: "SELECT id, total FROM table_changes(orders, start_timestamp => '2026-09-01 00:00:00') WHERE _change_type = 'delete'",
+                yields: "The rows deleted since that instant.",
+            },
+        ],
+        see_also: &["CREATE CHANGE STREAM", "ALTER TABLE SET OPTIONS"],
+        returns: None,
+    },
+    GrammarEntry {
+        name: "CREATE CHANGE STREAM",
+        keywords: &["CREATE", "CHANGE", "STREAM"],
+        position: GrammarPosition::Statement,
+        category: Category::Streaming,
+        syntax: "CREATE CHANGE STREAM [IF NOT EXISTS] name ON TABLE table | ON TABLES (table, ...) | ON VIEW view [AT VERSION n | AT TIMESTAMP 'ts' | SHOW INITIAL ROWS] [APPEND_ONLY] [WHERE predicate] [COLUMNS (col, ...)]",
+        summary: "Names a durable position over a table's changes that a read moves in its own transaction.",
+        description: "Creates a change stream, a durable position over the changes of a table, of several tables, or of a view over one table. A read of the stream in a FROM clause yields the changes past its position, with the same columns table_changes yields, and the position moves when the reading transaction commits. A read that rolls back leaves the position where it was. Two transactions reading one stream wait on each other, so no change is handed out twice. A stream over several tables yields the union of their columns by name, an absent column reading NULL, plus _source_table naming the table each change came from, and every read ends at one boundary across the tables so a transaction that wrote to two of them is wholly inside the read or wholly after it. Written after the stream in FROM, WITH (peek => true) reads without moving the position, WITH (schema => 'as_of_change') renders each change through the columns it was written under, and WITH (max_rows => n) ends the read after about n changes at a boundary no transaction writes across.",
+        clauses: &[
+            Clause {
+                syntax: "ON TABLE table",
+                field: Some("target"),
+                what: "The stream yields that table's changes.",
+                default: None,
+            },
+            Clause {
+                syntax: "ON TABLES (table, ...)",
+                field: Some("target"),
+                what: "The stream yields the changes of every table named, each row naming its table in _source_table, with one position moved for all of them.",
+                default: None,
+            },
+            Clause {
+                syntax: "ON VIEW view",
+                field: Some("target"),
+                what: "The stream yields the changes of the view's one base table, projected through the view's columns and narrowed by its predicate.",
+                default: None,
+            },
+            Clause {
+                syntax: "AT VERSION n | AT TIMESTAMP 'ts'",
+                field: Some("start"),
+                what: "Where the position starts, so the first read yields the changes past that version or instant.",
+                default: Some(
+                    "The source's current version, so the first read yields nothing until the next change.",
+                ),
+            },
+            Clause {
+                syntax: "SHOW INITIAL ROWS",
+                field: Some("start"),
+                what: "The first read yields every existing row as an insert, then the position continues from the feed, so one definition seeds a target and keeps it current.",
+                default: None,
+            },
+            Clause {
+                syntax: "APPEND_ONLY",
+                field: Some("append_only"),
+                what: "The stream yields inserts alone, and a purge of updates and deletes beneath its position does not make it stale.",
+                default: Some("Every change is yielded."),
+            },
+            Clause {
+                syntax: "WHERE predicate",
+                field: Some("predicate"),
+                what: "Narrows the changes yielded. The predicate reads the row after an insert or an update and the row before a delete, and reads the source's columns whether or not COLUMNS exposes them.",
+                default: Some("Every change is yielded."),
+            },
+            Clause {
+                syntax: "COLUMNS (col, ...)",
+                field: Some("columns"),
+                what: "The stream yields these columns and the metadata columns alone.",
+                default: Some("The source's own columns are yielded."),
+            },
+        ],
+        refusals: &[
+            Refusal {
+                when: "The table has no change data feed",
+                message: "so a change stream over it would follow",
+            },
+            Refusal {
+                when: "Two of the tables hold a column of one name at different types",
+                message: "so a change stream over both cannot yield it as one column",
+            },
+            Refusal {
+                when: "The table already carries as many change streams as the node's change_streams_per_table setting allows",
+                message: "change_streams_per_table cap",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "CREATE CHANGE STREAM order_changes ON TABLE orders",
+                yields: "A stream positioned at the table's current version, whose reads yield the changes from here on.",
+            },
+            Example {
+                statement: "CREATE CHANGE STREAM eu_orders ON TABLE orders SHOW INITIAL ROWS WHERE region = 'eu' COLUMNS (id, total)",
+                yields: "A stream whose first read yields the existing eu rows as inserts and later reads yield the eu changes, each with id, total and the metadata columns.",
+            },
+        ],
+        see_also: &[
+            "ALTER CHANGE STREAM",
+            "DROP CHANGE STREAM",
+            "SHOW CHANGE STREAMS",
+            "APPLY CHANGES",
+            "table_changes",
+            "GRANT",
+        ],
+        returns: None,
+    },
+    GrammarEntry {
+        name: "ALTER CHANGE STREAM",
+        keywords: &["ALTER", "CHANGE", "STREAM"],
+        position: GrammarPosition::Statement,
+        category: Category::Streaming,
+        syntax: "ALTER CHANGE STREAM name RESET [TO VERSION n | TO TIMESTAMP 'ts' | TO POSITION n | TO EARLIEST | TO LATEST] | SET COLUMNS (col, ...) | SET ALL COLUMNS",
+        summary: "Moves a change stream's position, or changes the columns it yields.",
+        description: "Moves the stream's position, which is how a stale stream is recovered and how a consumer replays or skips changes. A reset to a version or an instant names a place in the feed, a reset to a position names it as the count of changes consumed, which is the form that reads the same on every member of a group, and a reset with no target moves to the oldest change the feed still holds. SET COLUMNS changes what the stream yields, which is also how a stream that needs attention after a column was dropped is corrected.",
+        clauses: &[
+            Clause {
+                syntax: "RESET",
+                field: Some("action"),
+                what: "Moves the position to the oldest change the feed still holds.",
+                default: None,
+            },
+            Clause {
+                syntax: "RESET TO VERSION n | RESET TO TIMESTAMP 'ts'",
+                field: Some("action"),
+                what: "Moves the position to that version or instant, so the next read yields the changes past it.",
+                default: None,
+            },
+            Clause {
+                syntax: "RESET TO POSITION n",
+                field: Some("action"),
+                what: "Moves the position to the count of changes consumed, which names the same change on every member of a group.",
+                default: None,
+            },
+            Clause {
+                syntax: "RESET TO LATEST",
+                field: Some("action"),
+                what: "Moves the position to the source's current version, so the next read yields nothing until the next change.",
+                default: None,
+            },
+            Clause {
+                syntax: "SET COLUMNS (col, ...) | SET ALL COLUMNS",
+                field: Some("action"),
+                what: "Changes the columns the stream yields, and clears the attention a dropped column raised.",
+                default: None,
+            },
+        ],
+        refusals: &[Refusal {
+            when: "The version or instant named is below what the feed still holds",
+            message: "Retention reclaimed everything",
+        }],
+        examples: &[Example {
+            statement: "ALTER CHANGE STREAM order_changes RESET TO VERSION 1200",
+            yields: "The next read yields the changes after version 1200.",
+        }],
+        see_also: &["CREATE CHANGE STREAM", "SHOW CHANGE STREAMS"],
+        returns: None,
+    },
+    GrammarEntry {
+        name: "DROP CHANGE STREAM",
+        keywords: &["DROP", "CHANGE", "STREAM"],
+        position: GrammarPosition::Statement,
+        category: Category::Streaming,
+        syntax: "DROP CHANGE STREAM [IF EXISTS] name",
+        summary: "Removes a change stream and its position.",
+        description: "Removes the stream. The changes it was positioned over stay in the feed for their retention, and the grants on the stream are forgotten.",
+        clauses: &[Clause {
+            syntax: "IF EXISTS",
+            field: Some("if_exists"),
+            what: "Succeeds when there is no such stream.",
+            default: Some("A missing stream is an error."),
+        }],
+        refusals: &[],
+        examples: &[Example {
+            statement: "DROP CHANGE STREAM order_changes",
+            yields: "The stream and its position are gone.",
+        }],
+        see_also: &["CREATE CHANGE STREAM"],
+        returns: None,
+    },
+    GrammarEntry {
+        name: "SHOW CHANGE STREAMS",
+        keywords: &["SHOW", "CHANGE", "STREAMS"],
+        position: GrammarPosition::Statement,
+        category: Category::Streaming,
+        syntax: "SHOW CHANGE STREAMS [ON TABLE table] | SHOW CHANGE STREAM name",
+        summary: "Lists change streams with their positions and pending changes.",
+        description: "Lists every change stream, or the streams over one table, or one stream by name, with the source tables, the position, the changes pending past it, the age of the oldest pending change, and whether the stream is stale or needs attention. The same columns are in zyron_sys.cdc.change_streams.",
+        clauses: &[
+            Clause {
+                syntax: "ON TABLE table",
+                field: Some("on_table"),
+                what: "Lists the streams over that table alone.",
+                default: Some("Every stream is listed."),
+            },
+            Clause {
+                syntax: "SHOW CHANGE STREAM name",
+                field: Some("name"),
+                what: "Lists that stream alone.",
+                default: None,
+            },
+        ],
+        refusals: &[],
+        examples: &[Example {
+            statement: "SHOW CHANGE STREAMS ON TABLE orders",
+            yields: "One row per stream over the table, with its position and what pends past it.",
+        }],
+        see_also: &["CREATE CHANGE STREAM", "ALTER CHANGE STREAM"],
+        returns: None,
+    },
+    GrammarEntry {
+        name: "APPLY CHANGES",
+        keywords: &["APPLY", "CHANGES"],
+        position: GrammarPosition::Statement,
+        category: Category::Streaming,
+        syntax: "APPLY CHANGES INTO target FROM stream | relation KEYS (col, ...) [SEQUENCE BY expr] [IGNORE NULL UPDATES] [APPLY AS DELETE WHEN predicate] [APPLY AS TRUNCATE WHEN predicate] [EXCEPT COLUMNS (col, ...)] [STORED AS SCD TYPE 1 | 2] [TRACK HISTORY ON (col, ...) | EXCEPT (col, ...)]",
+        summary: "Maintains a target table from a set of changes, keyed, ordered and deduplicated.",
+        description: "Applies a set of changes into a target table in one transaction. The source is a change stream or any relation carrying the change metadata columns, such as table_changes. The changes are grouped by KEYS, ordered within a key by SEQUENCE BY, and the last change to each key is what the target ends up holding, so applying the same changes twice leaves the target as one application did. An insert or an update upserts the row, a delete removes it, and a change matching APPLY AS DELETE WHEN or APPLY AS TRUNCATE WHEN is treated as that. Read from a stream, the stream's position moves in the same transaction, so a failure leaves both the target and the position where they were. SCD TYPE 2 keeps one row per version of a key with __start_at, __end_at and __is_current columns, closing the current row and opening a new one on each change to the tracked columns.",
+        clauses: &[
+            Clause {
+                syntax: "KEYS (col, ...)",
+                field: Some("keys"),
+                what: "The columns that identify a row, which the target must hold.",
+                default: None,
+            },
+            Clause {
+                syntax: "SEQUENCE BY expr",
+                field: Some("sequence_by"),
+                what: "Orders the changes to one key, so the highest value is the one applied.",
+                default: Some("Changes to one key apply in the order they were recorded."),
+            },
+            Clause {
+                syntax: "IGNORE NULL UPDATES",
+                field: Some("ignore_null_updates"),
+                what: "Treats a NULL in an update as a column not supplied, keeping the target's value.",
+                default: Some("A NULL in an update writes NULL."),
+            },
+            Clause {
+                syntax: "APPLY AS DELETE WHEN predicate",
+                field: Some("delete_when"),
+                what: "Treats a change matching the predicate as a delete of its key.",
+                default: None,
+            },
+            Clause {
+                syntax: "APPLY AS TRUNCATE WHEN predicate",
+                field: Some("truncate_when"),
+                what: "Treats a change matching the predicate as a truncation of the target, applied before the other changes in the set.",
+                default: None,
+            },
+            Clause {
+                syntax: "EXCEPT COLUMNS (col, ...)",
+                field: Some("except_columns"),
+                what: "Leaves those columns out of what is written to the target.",
+                default: Some("Every column the source and the target share is written."),
+            },
+            Clause {
+                syntax: "STORED AS SCD TYPE 2",
+                field: Some("scd"),
+                what: "Keeps one row per version of a key, with __start_at, __end_at and __is_current marking each version's validity.",
+                default: Some("TYPE 1, one row per key holding the last change."),
+            },
+            Clause {
+                syntax: "TRACK HISTORY ON (col, ...) | EXCEPT (col, ...)",
+                field: Some("track_history"),
+                what: "Which columns open a new version under SCD TYPE 2. A change to an untracked column alone updates the current row in place.",
+                default: Some("Every column opens a new version."),
+            },
+        ],
+        refusals: &[
+            Refusal {
+                when: "KEYS is left out",
+                message: "APPLY CHANGES needs KEYS",
+            },
+            Refusal {
+                when: "The target is a lake table",
+                message: "APPLY CHANGES writes into a heap table",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "APPLY CHANGES INTO dim_orders FROM order_changes KEYS (id) SEQUENCE BY _commit_version",
+                yields: "The target holds one row per id reflecting the last change to it, and the stream's position moves in the same commit.",
+            },
+            Example {
+                statement: "APPLY CHANGES INTO dim_customer FROM customer_changes KEYS (id) SEQUENCE BY updated_at STORED AS SCD TYPE 2 TRACK HISTORY EXCEPT (last_seen)",
+                yields: "One row per version of each customer, a change to last_seen alone updating the current row in place.",
+            },
+        ],
+        see_also: &[
+            "CREATE CHANGE STREAM",
+            "table_changes",
+            "MERGE",
+            "CREATE PIPELINE",
+        ],
         returns: None,
     },
     GrammarEntry {
@@ -2956,15 +3348,65 @@ pub const GRAMMAR: &[GrammarEntry] = &[
         position: GrammarPosition::Statement,
         category: Category::Lake,
         syntax: "ALTER TABLE name SET (option = value, ...)",
-        summary: "Changes the storage options recorded against a table.",
-        description: "Changes the storage options a table was created with, such as how it compresses or how large a file it writes. The rows already written keep the options they were written under, so a change takes effect as the table is next written rather than retroactively.",
-        clauses: &[],
-        refusals: &[],
-        examples: &[Example {
-            statement: "ALTER TABLE events SET (compression = 'zstd')",
-            yields: "Later writes use that option and the rows already written keep theirs.",
-        }],
-        see_also: &["ALTER TABLE SET USING"],
+        summary: "Changes the storage options recorded against a table, including its change data feed.",
+        description: "Changes the storage options a table was created with, such as how it compresses or how large a file it writes. The rows already written keep the options they were written under, so a change takes effect as the table is next written rather than retroactively. The change data feed options turn the table's feed on or off and set what it records and for how long. Turning the feed off marks every change stream over the table stale.",
+        clauses: &[
+            Clause {
+                syntax: "change_data_feed = true | false",
+                field: Some("options"),
+                what: "Records the table's changes in a feed that table_changes and change streams read. Off marks every change stream over the table stale.",
+                default: Some("Off."),
+            },
+            Clause {
+                syntax: "cdf_retention = 'interval'",
+                field: Some("options"),
+                what: "How long a recorded change is held before retention reclaims it. A stream positioned below the reclaimed changes is stale.",
+                default: Some("Seven days."),
+            },
+            Clause {
+                syntax: "cdf_columns = 'col, col'",
+                field: Some("options"),
+                what: "Records only the named columns and the table's primary key in each change. Every other column reads NULL in a change.",
+                default: Some("Every column is recorded."),
+            },
+            Clause {
+                syntax: "cdf_before_image = true | false",
+                field: Some("options"),
+                what: "Records the row an update replaced as well as the row it wrote. Off records the row after the update alone, so an update-heavy feed is half the size and no preimage is readable.",
+                default: Some("On."),
+            },
+            Clause {
+                syntax: "cdf_compression = 'none' | 'lz4' | 'zstd'",
+                field: Some("options"),
+                what: "The codec a sealed feed segment is written with.",
+                default: Some("lz4."),
+            },
+        ],
+        refusals: &[
+            Refusal {
+                when: "cdf_columns names a column the table does not have",
+                message: "which is not a column of",
+            },
+            Refusal {
+                when: "cdf_retention is longer than the node's cdc.cdf_max_retention_secs setting",
+                message: "is above cdc.cdf_max_retention_secs",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "ALTER TABLE events SET (compression = 'zstd')",
+                yields: "Later writes use that option and the rows already written keep theirs.",
+            },
+            Example {
+                statement: "ALTER TABLE orders SET (change_data_feed = true, cdf_retention = '3 days')",
+                yields: "The table records its changes and holds each one for three days.",
+            },
+        ],
+        see_also: &[
+            "ALTER TABLE SET USING",
+            "table_changes",
+            "CREATE CHANGE STREAM",
+        ],
         returns: None,
     },
     // -----------------------------------------------------------------
@@ -4237,9 +4679,9 @@ pub const GRAMMAR: &[GrammarEntry] = &[
         keywords: &["CREATE", "PIPELINE"],
         position: GrammarPosition::Statement,
         category: Category::Streaming,
-        syntax: "CREATE PIPELINE name AS (STAGE name (SOURCE src, TARGET dst, MODE full | incremental, TRANSFORM AS (query)), ...)",
-        summary: "Names an ordered set of stages, each reading a source and writing a target.",
-        description: "Names an ordered set of stages that run as one unit. A stage names its source, its target, and the query between them. The mode determines whether the target is rebuilt or added to. A stage does not begin before the stage producing what it reads has finished.",
+        syntax: "CREATE PIPELINE name [ON CHANGE DATA FROM stream [MIN ROWS n] [MAX WAIT duration]] AS (STAGE name (SOURCE src, TARGET dst, MODE full | incremental, TRANSFORM AS (query)) | STAGE name (CONSUME CHANGES FROM stream [MAX ROWS n] INTO relation | AS (statement)) | STAGE name (APPLY CHANGES ...), ...)",
+        summary: "Names an ordered set of stages, each reading a source and writing a target, or consuming a change stream.",
+        description: "Names an ordered set of stages that run as one unit. A stage names its source, its target, and the query between them. The mode determines whether the target is rebuilt or added to. A stage does not begin before the stage producing what it reads has finished. A stage over a change stream runs as one transaction that moves the stream's position, so a stage that fails leaves the position where it was and the next run reads the same changes. A pipeline created ON CHANGE DATA runs on its own when the stream holds enough pending changes.",
         clauses: &[
             Clause {
                 syntax: "MODE full",
@@ -4259,13 +4701,60 @@ pub const GRAMMAR: &[GrammarEntry] = &[
                 what: "The query that turns the source into what the target holds.",
                 default: Some("The source's rows are written to the target unchanged."),
             },
+            Clause {
+                syntax: "STAGE name (CONSUME CHANGES FROM stream [MAX ROWS n] INTO relation)",
+                field: Some("stages"),
+                what: "Reads the stream's pending changes into the relation, writing the columns the relation and the change set share by name. A relation that does not exist is created from the change set, metadata columns included. MAX ROWS ends a run after about n changes at a boundary no transaction writes across, so a backlog drains over several runs.",
+                default: None,
+            },
+            Clause {
+                syntax: "STAGE name (CONSUME CHANGES FROM stream [MAX ROWS n] AS (statement))",
+                field: Some("stages"),
+                what: "Runs the statement with the stream's pending changes bound as the relation named changes, in the transaction that moves the position.",
+                default: None,
+            },
+            Clause {
+                syntax: "STAGE name (APPLY CHANGES INTO target FROM stream KEYS (col, ...) ...)",
+                field: Some("stages"),
+                what: "Maintains the target from the stream the way the APPLY CHANGES statement does, in a transaction of its own.",
+                default: None,
+            },
+            Clause {
+                syntax: "ON CHANGE DATA FROM stream [MIN ROWS n] [MAX WAIT duration]",
+                field: Some("trigger"),
+                what: "Runs the pipeline when the stream holds at least n pending changes, or when the duration has passed with at least one pending. The pending count is read without moving the position. A run starts within a second of the condition being met, on the node standing alone or leading its group.",
+                default: Some(
+                    "The pipeline runs when RUN PIPELINE is issued. MIN ROWS is one, and there is no wait.",
+                ),
+            },
         ],
-        refusals: &[],
-        examples: &[Example {
-            statement: "CREATE PIPELINE etl AS (STAGE s (SOURCE raw, TARGET staging, MODE full, TRANSFORM AS (SELECT id FROM raw)))",
-            yields: "A named unit whose stages run in order, each reading a source and writing a target.",
-        }],
-        see_also: &["RUN PIPELINE", "DROP PIPELINE", "CREATE SCHEDULE"],
+        refusals: &[
+            Refusal {
+                when: "ON CHANGE DATA names something that is not a change stream",
+                message: "which is not a change stream",
+            },
+            Refusal {
+                when: "A CONSUME CHANGES statement never reads the relation named changes",
+                message: "and this one never names it",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "CREATE PIPELINE etl AS (STAGE s (SOURCE raw, TARGET staging, MODE full, TRANSFORM AS (SELECT id FROM raw)))",
+                yields: "A named unit whose stages run in order, each reading a source and writing a target.",
+            },
+            Example {
+                statement: "CREATE PIPELINE cdc ON CHANGE DATA FROM order_changes MIN ROWS 100 MAX WAIT 5 MINUTES AS (STAGE land (CONSUME CHANGES FROM order_changes MAX ROWS 10000 INTO bronze_orders), STAGE apply (APPLY CHANGES INTO dim_orders FROM order_changes KEYS (id)))",
+                yields: "A pipeline that runs once a hundred changes pend or five minutes pass with one, landing the changes and maintaining the target, each stage moving the position in its own commit.",
+            },
+        ],
+        see_also: &[
+            "RUN PIPELINE",
+            "DROP PIPELINE",
+            "CREATE SCHEDULE",
+            "CREATE CHANGE STREAM",
+            "APPLY CHANGES",
+        ],
         returns: None,
     },
     GrammarEntry {

@@ -289,7 +289,6 @@ impl CompactionWorker {
         doc_registry: Arc<zyron_common::DocRegistry>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
-        authority: crate::background::authority::WriteAuthority,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
@@ -322,7 +321,6 @@ impl CompactionWorker {
                     &doc_registry,
                     &btree_indexes,
                     &gate,
-                    &authority,
                 );
             })
             .expect("failed to spawn compaction worker thread");
@@ -351,7 +349,6 @@ impl CompactionWorker {
         doc_registry: &Arc<zyron_common::DocRegistry>,
         btree_indexes: &Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         gate: &CompactionGate,
-        authority: &crate::background::authority::WriteAuthority,
     ) {
         let interval = Duration::from_secs(config.interval_secs.max(1));
 
@@ -362,13 +359,10 @@ impl CompactionWorker {
                 return;
             }
 
-            // A compaction writes new files and retires old ones through the
-            // catalog, and nothing captures that for the rest of a group, so
-            // a member holds off entirely rather than holding files no other
-            // member has
-            if !authority.may_write() {
-                continue;
-            }
+            // A compaction moves this node's own rows between this node's
+            // own files and changes no visible data, so every member of a
+            // group compacts its own layout on its own schedule, the way it
+            // vacuums its own pages
 
             // OLTP-aware backoff: do not compete with the foreground write
             // path when query latency is already elevated.
@@ -1642,7 +1636,7 @@ impl CompactionWorker {
         // delete would see every folded row in both the heap and the new
         // columnar segment (a transient double count). Deleting first closes
         // that window with no durability change.
-        Self::delete_folded_rows(rt, buffer_pool, disk_manager, &folded_rids)?;
+        Self::delete_folded_rows(rt, buffer_pool, disk_manager, wal, &folded_rids)?;
 
         // The folded rows no longer exist in the heap, so a writer that was
         // conflicted out by these locks re-finds them as columnar residents
@@ -1900,6 +1894,7 @@ impl CompactionWorker {
         rt: &tokio::runtime::Runtime,
         buffer_pool: &Arc<BufferPool>,
         disk_manager: &Arc<DiskManager>,
+        wal: &Arc<WalWriter>,
         rids: &[FoldedRid],
     ) -> std::result::Result<(), String> {
         use std::collections::HashMap;
@@ -1926,9 +1921,10 @@ impl CompactionWorker {
                 }
             };
             let mut breached: Option<u16> = None;
-            let page_data: [u8; PAGE_SIZE] = {
+            let outcome: std::result::Result<([u8; PAGE_SIZE], u64), String> = {
                 let mut guard = frame.write_data();
                 let data: &mut [u8] = &mut guard[..];
+                let mut freed = Vec::with_capacity(slots.len());
                 for &(slot, folded_xmin) in &slots {
                     // The fold holds this row's exclusive lock, so the slot
                     // must still hold the folded tuple. Anything else means
@@ -1943,18 +1939,56 @@ impl CompactionWorker {
                     // tuple removed
                     data[slot_off] = 0;
                     data[slot_off + 1] = 0;
+                    freed.push(slot);
                 }
-                // The durable image below is captured under the same guard
-                // that performed the zeroing, so it cannot miss a concurrent
-                // write the frame accepted
-                **guard
+                // The slots freed are logged as the page change they are,
+                // under the guard, so recovery replays the fold's heap half
+                // onto a page that had not reached disk with it, and the
+                // durable image below carries the record's position
+                let stamp = if freed.is_empty() {
+                    Ok(None)
+                } else {
+                    zyron_storage::heap_redo::log_page_change(
+                        wal,
+                        0,
+                        &zyron_storage::heap_redo::PageChange::Free {
+                            page_id,
+                            slots: freed,
+                        },
+                    )
+                    .map(Some)
+                    .map_err(|e| format!("folded slot free could not be logged: {}", e))
+                };
+                stamp.map(|stamp| {
+                    if let Some(lsn) = stamp {
+                        buffer_pool.mark_dirty_with_lsn(page_id, lsn.0);
+                    }
+                    // The durable image below is captured under the same
+                    // guard that performed the zeroing, so it cannot miss a
+                    // concurrent write the frame accepted, and it carries
+                    // the newest logged change it holds the way a flush
+                    // would stamp it
+                    let mut image = **guard;
+                    let newest = frame.page_lsn();
+                    zyron_common::page::set_page_lsn(&mut image, newest);
+                    (image, newest)
+                })
             };
             buffer_pool.unpin_page(page_id, true);
+            let (page_data, newest) = outcome?;
             if let Some(slot) = breached {
                 return Err(format!(
                     "folded slot {} on page {} changed while the fold held its row lock",
                     slot, page_id
                 ));
+            }
+            // The log is durable through the image's stamp before the image
+            // lands, so the page never reaches disk ahead of the records
+            // that produced what it holds
+            if newest > 0 {
+                wal.wait_for_flush(zyron_wal::Lsn(newest)).map_err(|e| {
+                    format!("the log could not be made durable before the page: {e}")
+                })?;
             }
             // Durable write: the heap-delete half of the committed transition
             // must survive a crash without depending on the buffer pool.
@@ -2037,6 +2071,16 @@ mod tests {
         );
         let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 64 }));
         let heap = HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).expect("heap");
+        let wal_dir = dir.path().join("wal");
+        let wal = Arc::new(
+            WalWriter::new(zyron_wal::WalWriterConfig {
+                wal_dir,
+                segment_size: 1024 * 1024,
+                fsync_enabled: false,
+                ring_buffer_capacity: 1024 * 1024,
+            })
+            .expect("wal"),
+        );
 
         let mut total_violations = 0u64;
         for i in 0..200u32 {
@@ -2091,7 +2135,7 @@ mod tests {
                 });
                 // let the victim writer spin up before the zeroing runs
                 thread::sleep(Duration::from_micros(200));
-                CompactionWorker::delete_folded_rows(&rt, &pool, &disk, &rids)
+                CompactionWorker::delete_folded_rows(&rt, &pool, &disk, &wal, &rids)
                     .expect("delete folded rows");
                 stop.store(true, Ordering::Release);
             });

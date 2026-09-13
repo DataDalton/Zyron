@@ -358,6 +358,36 @@ pub fn try_handle_ddl_utility<'a>(
         Statement::DropCdcStream(s) => {
             Box::pin(async move { Some(handle_drop_cdc_stream(s, server, session).await) })
         }
+        Statement::CreateChangeStream(s) => Box::pin(async move {
+            Some(
+                crate::change_stream_dispatch::handle_create_change_stream(
+                    s,
+                    server,
+                    session,
+                    active_branch,
+                )
+                .await,
+            )
+        }),
+        Statement::AlterChangeStream(s) => Box::pin(async move {
+            Some(
+                crate::change_stream_dispatch::handle_alter_change_stream(s, server, session).await,
+            )
+        }),
+        Statement::DropChangeStream(s) => Box::pin(async move {
+            Some(crate::change_stream_dispatch::handle_drop_change_stream(s, server, session).await)
+        }),
+        Statement::ShowChangeStreams(s) => Box::pin(async move {
+            Some(
+                crate::change_stream_dispatch::handle_show_change_streams(s, server, session).await,
+            )
+        }),
+        // APPLY CHANGES settles a target from a change set. It writes those
+        // rows through ordinary INSERT, UPDATE and DELETE statements under
+        // one transaction, the same shape MERGE takes
+        Statement::ApplyChanges(s) => Box::pin(async move {
+            Some(crate::apply_changes::handle_apply_changes(s, server, session).await)
+        }),
         Statement::CreateCdcIngest(s) => {
             Box::pin(async move { Some(handle_create_cdc_ingest(s, server, session).await) })
         }
@@ -889,7 +919,16 @@ async fn handle_alter_table(
                 validate_after = Some((ce.name.clone(), tc.clone()));
             }
             added_constraint = Some(ce.name.clone());
+            let widens_recorded_key = ce.constraint_type == ConstraintType::PrimaryKey
+                && !entry.cdf.recorded_columns().is_empty();
             entry.constraints.push(ce);
+            // A feed recording a column subset always records the row's
+            // key, so a key declared after the subset joins the recorded
+            // set from here on, under an epoch of its own
+            if widens_recorded_key {
+                let named = entry.cdf.recorded_columns().to_vec();
+                entry.record_cdf_columns(&named);
+            }
             // Ongoing enforcement of a uniqueness rule needs the index, which
             // is provisioned once the catalog carries the constraint
             provision_indexes_after = true;
@@ -945,28 +984,37 @@ async fn handle_alter_table(
             return alter_lake_table_columns(&stmt.operation, server, &table).await;
         }
         Op::AddColumn(_) | Op::DropColumn { .. } | Op::AlterColumnSetType { .. } => {
+            // A change stream reads this table through the layouts its
+            // records were written under. A widening change reads through,
+            // a narrowing one does not, so it is refused unless the
+            // statement acknowledges the break
+            let acknowledged = check_stream_break(server, &table, &stmt.operation)?;
             // A lake table's rows live in its transaction log, so a column
             // shape change is a schema-change commit there. The heap rewrite
             // below re-encodes heap tuples and swaps the catalog, which on a
             // lake table either desyncs the catalog from the lake schema or
             // re-appends every row beside the still-live originals
-            if table.lake.is_lake() {
-                return alter_lake_table_columns(&stmt.operation, server, &table).await;
-            }
-            // A heap tuple carries the epoch it was written under, so a column
-            // change is a catalog record and the rows are read through the
-            // layout each one already has. Only a type change the old bytes
-            // cannot be read as touches a row, and that runs beside the live
-            // table rather than in place
-            return alter_heap_table_columns(
-                &stmt.operation,
-                &stmt.name,
-                server,
-                schema_id,
-                &table,
-                session,
-            )
-            .await;
+            let result = if table.lake.is_lake() {
+                alter_lake_table_columns(&stmt.operation, server, &table).await?
+            } else {
+                // A heap tuple carries the epoch it was written under, so a
+                // column change is a catalog record and the rows are read
+                // through the layout each one already has. Only a type change
+                // the old bytes cannot be read as touches a row, and that
+                // runs beside the live table rather than in place
+                alter_heap_table_columns(
+                    &stmt.operation,
+                    &stmt.name,
+                    server,
+                    schema_id,
+                    &table,
+                    session,
+                )
+                .await?
+            };
+            settle_streams_after_column_change(server, table.id.0, &stmt.operation, acknowledged)
+                .await?;
+            return Ok(result);
         }
     }
 
@@ -1344,7 +1392,10 @@ async fn alter_lake_table_columns(
                     def.name, old_table.name
                 ))));
             }
-            if old_table.columns.iter().any(|c| c.name == def.name) {
+            if old_table
+                .live_columns()
+                .any(|c| c.name.eq_ignore_ascii_case(&def.name))
+            {
                 return Err(ProtocolError::Database(ZyronError::Internal(format!(
                     "column \"{}\" already exists",
                     def.name
@@ -1408,6 +1459,12 @@ async fn alter_lake_table_columns(
                 absent_value: None,
                 dropped: false,
             });
+            // A change record of the table is a row image over its column
+            // list, which just grew, so the records written from now on
+            // carry a new epoch and the ones written before it keep reading
+            // through theirs
+            let layout = entry.current_physical_columns();
+            entry.push_schema_epoch(layout);
             server
                 .catalog
                 .update_table(entry)
@@ -1415,7 +1472,11 @@ async fn alter_lake_table_columns(
                 .map_err(ProtocolError::Database)?;
         }
         Op::DropColumn { name, if_exists } => {
-            let Some(pos) = old_table.columns.iter().position(|c| &c.name == name) else {
+            let Some(pos) = old_table
+                .columns
+                .iter()
+                .position(|c| !c.dropped && c.name.eq_ignore_ascii_case(name))
+            else {
                 if *if_exists {
                     return Ok(DdlResult::Tag("ALTER TABLE".to_string()));
                 }
@@ -1423,7 +1484,7 @@ async fn alter_lake_table_columns(
                     name.clone(),
                 )));
             };
-            if old_table.columns.len() == 1 {
+            if old_table.live_columns().count() == 1 {
                 return Err(ProtocolError::Database(ZyronError::Internal(
                     "cannot drop the only column of a table".to_string(),
                 )));
@@ -1508,11 +1569,15 @@ async fn alter_lake_table_columns(
             })
             .map_err(ProtocolError::Database)?;
 
+            // The lake schema no longer carries the column, so no file
+            // written from now on holds it, while the files written before
+            // the drop keep their segment of it. The catalog keeps the
+            // column's place so a change record still decodes through the
+            // layout it was written under, and a read of the changes as
+            // they were written can still name the column
             let mut entry = old_table.clone();
-            entry.columns.remove(pos);
-            for (i, c) in entry.columns.iter_mut().enumerate() {
-                c.ordinal = i as u16;
-            }
+            entry.columns[pos].dropped = true;
+            entry.constraints.retain(|c| !c.columns.contains(&col_id));
             server
                 .catalog
                 .update_table(entry)
@@ -1618,11 +1683,110 @@ async fn alter_lake_table_columns(
                 .await
                 .map_err(ProtocolError::Database)?;
         }
-        Op::AlterColumnSetType { column, .. } => {
-            return Err(ProtocolError::Database(ZyronError::Internal(format!(
-                "cannot change the type of column \"{}\" on lake table \"{}\", the stored files would need a full rewrite",
-                column, old_table.name
-            ))));
+        Op::AlterColumnSetType {
+            column, data_type, ..
+        } => {
+            let Some(pos) = old_table
+                .columns
+                .iter()
+                .position(|c| !c.dropped && c.name.eq_ignore_ascii_case(column))
+            else {
+                return Err(ProtocolError::Database(ZyronError::ColumnNotFound(
+                    column.clone(),
+                )));
+            };
+            let current = &old_table.columns[pos];
+            let target = data_type.to_type_id();
+            let target_digits = data_type.fractional_digits();
+            let target_len = alter_extract_max_length(data_type);
+            // A data file is immutable and holds its cells in the shape the
+            // column had when it was written. A change every stored cell
+            // reads through as the new type is a schema change the reader
+            // widens on the way out. Anything else would need every file
+            // rewritten, and is refused
+            let from = zyron_types::Representation {
+                type_id: current.type_id,
+                max_length: current.max_length,
+                fractional_digits: current.fractional_digits,
+                nullable: current.nullable,
+            };
+            let to = zyron_types::Representation {
+                type_id: target,
+                max_length: target_len,
+                fractional_digits: target_digits,
+                nullable: current.nullable,
+            };
+            let refuse = |reason: &str| {
+                ProtocolError::Database(ZyronError::Internal(format!(
+                    "cannot change the type of column \"{}\" on lake table \"{}\" from {:?} to \
+                     {:?}, {reason}. The stored files would need a full rewrite, only a \
+                     widening the files already read through is a schema change",
+                    column, old_table.name, current.type_id, target
+                )))
+            };
+            if !zyron_types::representation_compatible(from, to) {
+                return Err(refuse("the stored cells do not read as the new type"));
+            }
+            zyron_lake::widening_between(
+                zyron_lake::CellShape::new(current.type_id, current.fractional_digits),
+                zyron_lake::CellShape::new(target, target_digits),
+            )
+            .map_err(|e| refuse(&e.to_string()))?;
+            let lake_id = current.id.0 as u32;
+            log.commit(attempt, |base| {
+                // An index file holds the column's values as keys at the
+                // width they had when the index was built, and a probe at
+                // the new width would miss every one of them
+                if let Some(spec) = base
+                    .indexes
+                    .iter()
+                    .find(|s| s.column_ids.contains(&lake_id))
+                {
+                    return Err(ZyronError::Internal(format!(
+                        "cannot change the type of column \"{column}\": lake index \"{}\" is \
+                         keyed on it, drop the index first",
+                        spec.name
+                    )));
+                }
+                let mut columns = base.schema.columns.clone();
+                let Some(lake_column) = columns.iter_mut().find(|c| c.id == lake_id) else {
+                    return Err(ZyronError::Internal(format!(
+                        "column \"{column}\" (id {lake_id}) is not in the lake schema"
+                    )));
+                };
+                lake_column.type_id = target;
+                lake_column.fractional_digits = target_digits;
+                lake_column.max_length = target_len.map(|n| n as u32);
+                let schema = zyron_lake::LakeSchema {
+                    schema_id: base.schema.schema_id + 1,
+                    next_column_id: base.schema.next_column_id,
+                    columns,
+                    // A widened column denotes the same values, so every
+                    // expression over it computes what it computed before
+                    derived: base.schema.derived.clone(),
+                };
+                schema.validate()?;
+                Ok(vec![zyron_lake::LogEntry::SchemaChange(schema)])
+            })
+            .map_err(ProtocolError::Database)?;
+
+            // The catalog mirrors the shape the log committed. A change
+            // record of the table is a row image over its column list,
+            // whose width just changed, so the records written from now
+            // on carry a new epoch and the ones written before it keep
+            // reading through theirs
+            let mut entry = old_table.clone();
+            let col = &mut entry.columns[pos];
+            col.type_id = target;
+            col.max_length = target_len;
+            col.fractional_digits = target_digits;
+            let layout = entry.current_physical_columns();
+            entry.push_schema_epoch(layout);
+            server
+                .catalog
+                .update_table(entry)
+                .await
+                .map_err(ProtocolError::Database)?;
         }
         other => {
             return Err(ProtocolError::Database(ZyronError::Internal(format!(
@@ -1632,6 +1796,106 @@ async fn alter_lake_table_columns(
     }
 
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+}
+
+/// Refuses a type change that narrows a column while a change stream reads
+/// the table, unless the statement acknowledges the break. Answers with
+/// whether it was acknowledged
+fn check_stream_break(
+    server: &Arc<ServerState>,
+    table: &zyron_catalog::schema::TableEntry,
+    op: &zyron_parser::ast::AlterTableOperation,
+) -> Result<bool, ProtocolError> {
+    let zyron_parser::ast::AlterTableOperation::AlterColumnSetType {
+        column,
+        data_type,
+        acknowledge_stream_break,
+    } = op
+    else {
+        return Ok(false);
+    };
+    let Some(current) = table
+        .live_columns()
+        .find(|c| c.name.eq_ignore_ascii_case(column))
+    else {
+        return Ok(false);
+    };
+    let active = server
+        .catalog
+        .change_streams_on_table(table.id.0)
+        .into_iter()
+        .filter(|s| !s.stale)
+        .count();
+    zyron_cdc::schema_evolution::check_type_change(
+        &table.name,
+        &current.name,
+        current.type_id,
+        data_type.to_type_id(),
+        active,
+        zyron_cdc::schema_evolution::StreamBreak {
+            acknowledged: *acknowledge_stream_break,
+        },
+    )
+    .map_err(ProtocolError::Database)?;
+    Ok(*acknowledge_stream_break
+        && !zyron_cdc::schema_evolution::type_change_is_widening(
+            current.type_id,
+            data_type.to_type_id(),
+        ))
+}
+
+/// Brings the streams on a table into line with a column change that went
+/// through. A dropped column marks the streams naming it as needing
+/// attention, a column back in place clears them, and an acknowledged
+/// break marks every stream on the table
+async fn settle_streams_after_column_change(
+    server: &Arc<ServerState>,
+    table_id: u32,
+    op: &zyron_parser::ast::AlterTableOperation,
+    acknowledged_break: bool,
+) -> Result<(), ProtocolError> {
+    use zyron_parser::ast::AlterTableOperation as Op;
+    let Ok(table) = server
+        .catalog
+        .get_table_by_id(zyron_catalog::TableId(table_id))
+    else {
+        return Ok(());
+    };
+    let changed = match op {
+        Op::AlterColumnSetType { column, .. } if acknowledged_break => {
+            let reason =
+                format!("the type of column '{column}' was narrowed with ACKNOWLEDGE STREAM BREAK");
+            let changed = crate::change_stream_dispatch::mark_streams_needing_attention(
+                server, table_id, &reason,
+            );
+            for entry in &changed {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "ChangeStreamNeedsAttention",
+                    stream = %entry.name,
+                    reason = %reason,
+                );
+            }
+            changed
+        }
+        _ => {
+            let changed = crate::change_stream_dispatch::recheck_stream_columns(server, &table);
+            for entry in &changed {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = if entry.needs_attention {
+                        "ChangeStreamNeedsAttention"
+                    } else {
+                        "ChangeStreamAttentionCleared"
+                    },
+                    stream = %entry.name,
+                    reason = %entry.attention_reason,
+                );
+            }
+            changed
+        }
+    };
+    crate::change_stream_dispatch::persist_stream_changes(server, changed).await
 }
 
 /// Applies ADD COLUMN, DROP COLUMN or ALTER COLUMN SET TYPE to a heap table.
@@ -1644,7 +1908,7 @@ async fn alter_lake_table_columns(
 /// record.
 ///
 /// A type change the old bytes cannot be read as is the exception, and it goes
-/// to the shadow rewrite instead.
+/// to the shadow rewrite instead
 async fn alter_heap_table_columns(
     op: &zyron_parser::ast::AlterTableOperation,
     table_name: &str,
@@ -1801,7 +2065,9 @@ async fn alter_heap_table_columns(
             entry.columns[pos].dropped = true;
             entry.constraints.retain(|c| !c.columns.contains(&col_id));
         }
-        Op::AlterColumnSetType { column, data_type } => {
+        Op::AlterColumnSetType {
+            column, data_type, ..
+        } => {
             let Some(pos) = entry
                 .columns
                 .iter()
@@ -2195,7 +2461,17 @@ async fn execute_write_stmts_atomic(
     search_path: Vec<String>,
     stmts: Vec<zyron_parser::Statement>,
 ) -> Result<(), ProtocolError> {
-    execute_call_body(server, stmts, Vec::new(), db_id, search_path, true).await
+    execute_call_body(
+        server,
+        stmts,
+        Vec::new(),
+        db_id,
+        search_path,
+        true,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Replays reshaped batches through the InsertOperator under a write
@@ -3181,6 +3457,7 @@ async fn handle_create_table(
                 zyron_pipeline::event_handler::EventType::TableCreated,
                 &name,
                 &[("table".to_string(), name.clone())],
+                agreed_entry_of(session),
             )
             .await;
             Ok(DdlResult::Tag("CREATE TABLE".to_string()))
@@ -3846,6 +4123,15 @@ async fn reclaim_heap_storage(
         .disk_manager
         .num_pages(table.fsm_file_id)
         .await
+        .map_err(ProtocolError::Database)?;
+    // The fence record is durable before the file empties, so recovery
+    // empties it at the same point in the log rather than putting the
+    // converted rows back into the heap
+    let fence = zyron_storage::heap_redo::log_truncate(&server.wal, table.heap_file_id)
+        .map_err(ProtocolError::Database)?;
+    server
+        .wal
+        .wait_for_flush(fence)
         .map_err(ProtocolError::Database)?;
     server
         .disk_manager
@@ -4696,6 +4982,7 @@ async fn handle_create_foreign_table(
                 zyron_pipeline::event_handler::EventType::TableCreated,
                 &stmt.name,
                 &[("table".to_string(), stmt.name.clone())],
+                agreed_entry_of(session),
             )
             .await;
             Ok(DdlResult::Tag("CREATE FOREIGN TABLE".to_string()))
@@ -5162,6 +5449,18 @@ async fn reclaim_table_storage(
         }
     }
 
+    // The table's change data feed goes with it, its files and the source a
+    // lake table's changes were derived from, and every stream over it is
+    // marked stale for the reason rather than left reading nothing
+    if let Some(registry) = server.cdc_registry.as_ref() {
+        registry
+            .remove_table(r.table_id)
+            .map_err(ProtocolError::Database)?;
+    }
+    let stale =
+        crate::change_stream_dispatch::mark_streams_stale(server, r.table_id, "table_dropped");
+    crate::change_stream_dispatch::persist_stream_changes(server, stale).await?;
+
     // Reclaim the lake tier: the shared log handle and the whole table
     // root, log, checkpoints and data files. The catalog entry is already
     // gone so nothing can re-register them.
@@ -5300,6 +5599,20 @@ async fn reclaim_table_storage(
     Ok(())
 }
 
+/// Refuses a statement that would remove the rows of a write-locked table.
+///
+/// An immutable table and one inside its retention lock refuse UPDATE and
+/// DELETE through the DML hook. DROP and TRUNCATE reach the same rows by
+/// another route, so they answer with the same lock and the same reason
+fn refuse_write_locked(table: &zyron_catalog::schema::TableEntry) -> Result<(), ProtocolError> {
+    if zyron_lifecycle::worm::write_locked(table) {
+        return Err(ProtocolError::Database(ZyronError::RetentionViolation(
+            zyron_lifecycle::worm::lock_reason(table),
+        )));
+    }
+    Ok(())
+}
+
 /// How the shared table drop treats a configured recycle window.
 enum TableDropMode {
     /// DROP TABLE semantics: a table with a recycle window soft-drops and
@@ -5325,6 +5638,7 @@ async fn drop_table_in_schema(
         .catalog
         .get_table(schema_id, name)
         .map_err(ProtocolError::Database)?;
+    refuse_write_locked(&table)?;
     let reclaim = capture_table_reclaim(server, &table);
     let outcome = server
         .catalog
@@ -5349,7 +5663,7 @@ async fn drop_table_in_schema(
 /// An id is reissued once the row holding it is gone, so a grant left behind
 /// would decide access to whatever is numbered that next. A node with no
 /// security manager records no privileges, so there is nothing to drop
-async fn forget_object_privileges(
+pub(crate) async fn forget_object_privileges(
     server: &Arc<ServerState>,
     object_type: zyron_auth::ObjectType,
     object_id: u32,
@@ -5443,6 +5757,7 @@ async fn handle_drop_table(
                 zyron_pipeline::event_handler::EventType::TableDropped,
                 &stmt.name,
                 &[("table".to_string(), stmt.name.clone())],
+                agreed_entry_of(session),
             )
             .await;
             Ok(DdlResult::Tag("DROP TABLE".to_string()))
@@ -5477,6 +5792,8 @@ async fn handle_truncate(
         table.id.0,
     )?;
 
+    refuse_write_locked(&table)?;
+
     // A lake table's rows live in its transaction log manifest, not in the
     // heap file the path below clears, so the truncate commits a delete-all
     // against the table's effective head. Without this the statement
@@ -5498,6 +5815,17 @@ async fn handle_truncate(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
+        // The commit is annotated as a truncate, so a change feed derived
+        // from the log reports it as one truncate record rather than a
+        // delete per row
+        let audit = zyron_lake::CommitInfo {
+            identity: actor_role_id(session).to_string(),
+            client: String::new(),
+            commit_info: zyron_lake::TRUNCATE_COMMIT_INFO.to_string(),
+            correlation_id: String::new(),
+            trace_id: String::new(),
+            signature: Vec::new(),
+        };
         let attempt = zyron_lake::CommitAttempt {
             operation: zyron_lake::OperationKind::Delete,
             db_txn_id: 0,
@@ -5505,10 +5833,11 @@ async fn handle_truncate(
             timestamp_us,
             read_predicate: None,
             read_version: 0,
-            audit: None,
+            audit: Some(&audit),
             deadline: None,
         };
         zyron_lake::delete_all(&log, attempt).map_err(ProtocolError::Database)?;
+        record_truncate(server, session, &table, active_branch)?;
         return Ok(DdlResult::Tag("TRUNCATE TABLE".to_string()));
     }
 
@@ -5524,6 +5853,16 @@ async fn handle_truncate(
         .disk_manager
         .num_pages(table.fsm_file_id)
         .await
+        .map_err(ProtocolError::Database)?;
+
+    // The fence record is durable before the file empties, so recovery
+    // empties it at the same point in the log and the rows the log put
+    // there earlier do not come back
+    let fence = zyron_storage::heap_redo::log_truncate(&server.wal, table.heap_file_id)
+        .map_err(ProtocolError::Database)?;
+    server
+        .wal
+        .wait_for_flush(fence)
         .map_err(ProtocolError::Database)?;
 
     // Truncate the heap data file and its FSM file to zero pages.
@@ -5653,7 +5992,50 @@ async fn handle_truncate(
         }
     }
 
+    record_truncate(server, session, &table, active_branch)?;
     Ok(DdlResult::Tag("TRUNCATE TABLE".to_string()))
+}
+
+/// Records a truncate in the table's change feed as one record.
+///
+/// Every row went at once, so the feed carries the fact rather than a delete
+/// per row, and a consumer applying it truncates its target rather than
+/// deleting row by row. The version is the WAL position the truncate landed
+/// at, which is what a change scan orders the record by
+fn record_truncate(
+    server: &Arc<ServerState>,
+    session: &Option<Session>,
+    table: &zyron_catalog::TableEntry,
+    active_branch: &Option<String>,
+) -> Result<(), ProtocolError> {
+    let Some(hook) = server.cdc_hook.as_ref() else {
+        return Ok(());
+    };
+    // On a node in a group the record carries the entry the statement runs
+    // as, which is the same index and instant on every member. Every member
+    // runs the statement, so every member records it once
+    let (version, now) = match session.as_ref().and_then(|s| s.agreed_entry) {
+        Some((index, timestamp_us)) => (index, timestamp_us),
+        None => {
+            if !server.records_changes_at_statement() {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "TRUNCATE of '{}' reached the change feed without a group entry to \
+                     record it as",
+                    table.name
+                ))));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
+            (server.wal.next_lsn().0, now)
+        }
+    };
+    // A truncate ends no transaction of its own here, and zero is the
+    // transaction id every reader judges as committed
+    let branch = crate::change_stream_dispatch::active_branch_id(server, active_branch);
+    hook.on_truncate(table.id.0, version, now, 0, branch)
+        .map_err(ProtocolError::Database)
 }
 
 async fn handle_create_index(
@@ -5741,6 +6123,7 @@ async fn handle_create_index(
                 ("index".to_string(), stmt.name.clone()),
                 ("table".to_string(), stmt.table.clone()),
             ],
+            agreed_entry_of(session),
         )
         .await;
         return Ok(DdlResult::Tag("CREATE INDEX".to_string()));
@@ -5771,6 +6154,7 @@ async fn handle_create_index(
             ("index".to_string(), stmt.name.clone()),
             ("table".to_string(), stmt.table.clone()),
         ],
+        agreed_entry_of(session),
     )
     .await;
     Ok(DdlResult::Tag("CREATE INDEX".to_string()))
@@ -6289,6 +6673,7 @@ async fn handle_drop_index(
                         zyron_pipeline::event_handler::EventType::IndexDropped,
                         &stmt.name,
                         &[("index".to_string(), stmt.name.clone())],
+                        agreed_entry_of(session),
                     )
                     .await;
                     Ok(DdlResult::Tag("DROP INDEX".to_string()))
@@ -6384,6 +6769,7 @@ async fn handle_create_schema(
                     ("schema".to_string(), stmt.name.clone()),
                     ("operation".to_string(), "create".to_string()),
                 ],
+                agreed_entry_of(session),
             )
             .await;
             Ok(DdlResult::Tag("CREATE SCHEMA".to_string()))
@@ -6498,6 +6884,7 @@ async fn handle_drop_schema(
                     ("schema".to_string(), stmt.name.clone()),
                     ("operation".to_string(), "drop".to_string()),
                 ],
+                agreed_entry_of(session),
             )
             .await;
             Ok(DdlResult::Tag("DROP SCHEMA".to_string()))
@@ -7366,7 +7753,17 @@ async fn handle_merge(
         return Ok(DdlResult::Tag("MERGE 0".to_string()));
     }
     let (db_id, search_path) = session_db_and_search_path(session);
-    execute_call_body(server, statements, Vec::new(), db_id, search_path, true).await?;
+    execute_call_body(
+        server,
+        statements,
+        Vec::new(),
+        db_id,
+        search_path,
+        true,
+        None,
+        None,
+    )
+    .await?;
     Ok(DdlResult::Tag("MERGE".to_string()))
 }
 
@@ -7451,15 +7848,18 @@ async fn handle_lake_procedure(
                 .and_then(call_arg_text)
                 .map(|v| v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let attempt = lake_maintenance_attempt(zyron_lake::OperationKind::Vacuum);
-            let report = zyron_lake::repair(
-                &log,
-                zyron_lake::RepairOptions {
-                    remove_missing_files: drop_missing,
-                },
-                attempt,
-            )
-            .map_err(ProtocolError::Database)?;
+            let report =
+                lake_maintenance_step(server, zyron_lake::OperationKind::Vacuum, |attempt| {
+                    zyron_lake::repair(
+                        &log,
+                        zyron_lake::RepairOptions {
+                            remove_missing_files: drop_missing,
+                        },
+                        attempt,
+                    )
+                })
+                .await
+                .map_err(ProtocolError::Database)?;
             [
                 (
                     "checkpoints_removed",
@@ -7523,14 +7923,51 @@ fn call_arg_text(expr: &zyron_parser::Expr) -> Option<String> {
     }
 }
 
-/// A standalone maintenance commit: no enclosing database transaction, so it
-/// publishes as soon as it lands.
-fn lake_maintenance_attempt(
+/// Runs one maintenance step that commits a lake version, under a
+/// transaction of the server's, so the version reaches the group.
+///
+/// OPTIMIZE, a branch merge and a repair each commit versions to the
+/// table's log, and a version that stayed on this node would leave every
+/// other member's log behind. The step stages its version under the
+/// transaction, and the commit carries it and the files it adds to the
+/// group when this node leads one, or publishes it here once the commit
+/// record is durable otherwise. A step that fails takes its staged version
+/// with it
+pub async fn lake_maintenance_step<T>(
+    server: &Arc<ServerState>,
     operation: zyron_lake::OperationKind,
+    step: impl FnOnce(zyron_lake::CommitAttempt<'static>) -> Result<T, ZyronError>,
+) -> Result<T, ZyronError> {
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
+    let txn_id = txn.txn_id;
+    let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
+    let outcome = match step(lake_maintenance_attempt_under(operation, txn_id)) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            abandon_generated(server, &mut txn, changeset.as_deref());
+            return Err(e);
+        }
+    };
+    commit_generated(server, txn, changeset, &[])
+        .await
+        .map_err(|e| match e {
+            ProtocolError::Database(e) => e,
+            other => ZyronError::Internal(other.to_string()),
+        })?;
+    Ok(outcome)
+}
+
+/// A maintenance commit under `db_txn_id`, staged behind that transaction's
+/// commit. Zero publishes as soon as it lands
+fn lake_maintenance_attempt_under(
+    operation: zyron_lake::OperationKind,
+    db_txn_id: u64,
 ) -> zyron_lake::CommitAttempt<'static> {
     zyron_lake::CommitAttempt {
         operation,
-        db_txn_id: 0,
+        db_txn_id,
         commit_lsn: 0,
         timestamp_us: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7601,6 +8038,8 @@ async fn handle_call(
         db_id,
         zyron_catalog::default_search_path(),
         true,
+        None,
+        None,
     )
     .await?;
     Ok(DdlResult::Tag("CALL".to_string()))
@@ -7722,7 +8161,17 @@ async fn handle_do_block(
     }
 
     let (db_id, search_path) = session_db_and_search_path(session);
-    execute_call_body(server, statements, Vec::new(), db_id, search_path, true).await?;
+    execute_call_body(
+        server,
+        statements,
+        Vec::new(),
+        db_id,
+        search_path,
+        true,
+        None,
+        None,
+    )
+    .await?;
     tracing::info!(
         target: "zyron::audit",
         event = "DoBlockExecuted",
@@ -7742,7 +8191,17 @@ async fn handle_do_block(
 /// node runs at the same applied position, an event handler fired by a
 /// replicated schema change, commits locally instead: capturing it would
 /// ship each node's own copy and a follower would hold the rows once per
-/// member
+/// member.
+///
+/// `before_commit` records what the caller wants to travel in the body's
+/// own commit beside its rows, such as the run of the schedule the body
+/// belongs to. It runs once the body has succeeded and only when the commit
+/// goes through the group, so a body that fails leaves nothing of it behind.
+///
+/// `applied_at` is the agreed entry a body every member runs belongs to.
+/// Its changes are recorded at that entry, the way the applier records the
+/// entry's own, so each member's feed holds them once and in the log's
+/// order rather than not at all
 async fn execute_call_body(
     server: &Arc<ServerState>,
     statements: Vec<zyron_parser::Statement>,
@@ -7750,6 +8209,8 @@ async fn execute_call_body(
     db_id: zyron_catalog::DatabaseId,
     search_path: Vec<String>,
     through_group: bool,
+    before_commit: Option<&BeforeCommit<'_>>,
+    applied_at: Option<(u64, i64)>,
 ) -> Result<(), ProtocolError> {
     use zyron_executor::context::ExecutionContext;
 
@@ -7763,6 +8224,11 @@ async fn execute_call_body(
     } else {
         None
     };
+    // One record of stream advances for the whole body, so a stream that
+    // more than one of its statements reads is read at one window and its
+    // position moves once, in the body's own commit
+    let advances: Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
 
     for stmt in statements {
         let plan = match zyron_planner::plan(
@@ -7776,7 +8242,7 @@ async fn execute_call_body(
         {
             Ok(p) => p,
             Err(e) => {
-                let _ = server.txn_manager.abort(&mut txn);
+                abandon_generated(server, &mut txn, changeset.as_deref());
                 return Err(ProtocolError::Database(e));
             }
         };
@@ -7797,6 +8263,8 @@ async fn execute_call_body(
         ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
         ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
         ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+        ctx.set_media_store(Arc::clone(&server.media_store));
+        ctx.set_key_store(Arc::clone(&server.key_store));
         if let Some(m) = &server.fts_manager {
             ctx.set_fts_manager(Arc::clone(m));
         }
@@ -7806,38 +8274,229 @@ async fn execute_call_body(
         if let Some(m) = &server.spatial_manager {
             ctx.set_spatial_manager(Arc::clone(m));
         }
+        // The rows a body writes are the table's changes, recorded for its
+        // feed and fired through its triggers the way a statement a person
+        // runs is, and a change stream the body reads is read under its
+        // position lock
+        server.install_change_capture(&mut ctx);
+        if let Some((index, timestamp)) = applied_at {
+            ctx.change_capture_mode = zyron_executor::context::ChangeCaptureMode::Applied;
+            ctx.set_change_entry(index, timestamp);
+        }
+        if let Some(hook) = &server.dml_hook {
+            ctx.dml_hook = Some(Arc::clone(hook));
+        }
+        crate::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
         ctx.params = params.clone();
         ctx.replication = changeset.clone();
         let ctx = Arc::new(ctx);
 
-        if let Err(e) = zyron_executor::execute(plan, &ctx).await {
-            let _ = server.txn_manager.abort(&mut txn);
-            withdraw_streamed(server, changeset.as_deref());
+        let outcome = zyron_executor::execute(plan, &ctx).await;
+        if ctx.wrote_wal() {
+            txn.mark_wrote_data();
+        }
+        if let Err(e) = outcome {
+            abandon_generated(server, &mut txn, changeset.as_deref());
             return Err(ProtocolError::Database(e));
         }
     }
 
+    // What the caller wants agreed beside the rows goes in once every
+    // statement has succeeded, so a body that failed left none of it behind
+    if let (Some(record), Some(set)) = (before_commit, changeset.as_deref())
+        && let Err(e) = record(set)
+    {
+        abandon_generated(server, &mut txn, Some(set));
+        return Err(ProtocolError::Database(e));
+    }
+
+    // The positions the body's reads took move in its own commit, so a
+    // failure above left every one of them where it was
+    let held = std::mem::take(&mut *advances.lock());
+    let outcome = commit_generated(server, txn, changeset, &held).await;
+    if outcome.is_err() {
+        crate::change_stream_dispatch::release_stream_positions(server, txn_id);
+    }
+    outcome
+}
+
+/// What a generated body's caller records in the body's changeset before
+/// the commit goes to the group
+pub type BeforeCommit<'a> =
+    dyn Fn(&zyron_executor::replication::TxnChangeset) -> Result<(), ZyronError> + Sync + 'a;
+
+/// Abandons a generated body's transaction. Aborts it, discards the lake
+/// versions it staged, and tells the group to discard any chunk of it that
+/// already went out
+pub fn abandon_generated(
+    server: &Arc<ServerState>,
+    txn: &mut zyron_storage::txn::Transaction,
+    changeset: Option<&zyron_executor::replication::TxnChangeset>,
+) {
+    let txn_id = txn.txn_id;
+    let _ = server.txn_manager.abort(txn);
+    zyron_lake::abandon_txn(server.disk_manager.data_dir(), txn_id);
+    withdraw_streamed(server, changeset);
+}
+
+/// Runs one resolved APPLY CHANGES in a transaction of its own.
+///
+/// The rows reach the target through the ordinary write operators, so they
+/// are captured for the group, fire triggers and are held to constraints
+/// exactly as a person's own statements would be. A change stream the
+/// source read advances in this transaction's own commit, and a failure
+/// anywhere leaves the target and the position exactly as they were
+pub(crate) async fn run_apply_job(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+    job: zyron_executor::apply_changes::ApplyJob,
+) -> Result<zyron_executor::apply_changes::ApplyCounts, ProtocolError> {
+    use zyron_executor::context::ExecutionContext;
+
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .map_err(ProtocolError::Database)?;
+    let txn_id = txn.txn_id;
+    let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
+    let advances: Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let snapshot = server.txn_manager.refresh_snapshot(&txn);
+    let mut ctx = ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn_id,
+        snapshot,
+    );
+    ctx.heap_files = Some(Arc::clone(&server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    ctx.foreign_reader = server.foreign_reader.clone();
+    ctx.peers = Some(Arc::clone(&server.peers));
+    ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
+    ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
+    ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+    ctx.set_media_store(Arc::clone(&server.media_store));
+    ctx.set_key_store(Arc::clone(&server.key_store));
+    if let Some(m) = &server.fts_manager {
+        ctx.set_fts_manager(Arc::clone(m));
+    }
+    if let Some(m) = &server.vector_manager {
+        ctx.set_vector_manager(Arc::clone(m));
+    }
+    if let Some(m) = &server.spatial_manager {
+        ctx.set_spatial_manager(Arc::clone(m));
+    }
+    server.install_change_capture(&mut ctx);
+    if let Some(hook) = &server.dml_hook {
+        ctx.dml_hook = Some(Arc::clone(hook));
+    }
+    crate::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
+    ctx.replication = changeset.clone();
+    // The reader's own security, so the target rows the apply may touch
+    // and the change rows it reads are the ones the reader may see. Moved
+    // into the context for the run and handed back afterward with its
+    // privilege cache intact
+    if let Some(sm) = &server.security_manager {
+        ctx.security_manager = Some(Arc::clone(sm));
+    }
+    ctx.security_context = session
+        .as_mut()
+        .and_then(|s| s.security_context.take())
+        .map(Arc::new);
+    let ctx = Arc::new(ctx);
+
+    let outcome = zyron_executor::apply_changes::run_apply(&ctx, job).await;
+    let wrote = ctx.wrote_wal();
+    if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
+        if let Some(session) = session.as_mut() {
+            session.security_context = unwrapped
+                .security_context
+                .take()
+                .and_then(|a| Arc::try_unwrap(a).ok());
+        }
+    }
+    let counts = match outcome {
+        Ok(counts) => counts,
+        Err(e) => {
+            abandon_generated(server, &mut txn, changeset.as_deref());
+            return Err(ProtocolError::Database(e));
+        }
+    };
+    // An apply that wrote a row commits with a commit record, so its writes
+    // read as committed by every path that judges a row by its transaction
+    if wrote {
+        txn.mark_wrote_data();
+    }
+
+    // The position the source consumed moves in this transaction's own
+    // commit, so a failure above left it exactly where it was
+    let held = std::mem::take(&mut *advances.lock());
+    let outcome = commit_generated(server, txn, changeset, &held).await;
+    if outcome.is_err() {
+        // A commit that failed after the advances were logged still holds
+        // the positions its reads took. A commit that succeeded released
+        // them as it installed the advances
+        crate::change_stream_dispatch::release_stream_positions(server, txn_id);
+    }
+    outcome.map(|()| counts)
+}
+
+/// Commits the transaction a generated body ran under, through the group
+/// when this node leads one, with the stream advances its reads recorded
+/// riding in the commit.
+///
+/// A lake version the body staged becomes visible with the commit. The
+/// applier publishes it when the commit goes through the group, and the
+/// local path publishes it here once the commit record is durable, the
+/// same order a connection's own commit keeps
+pub async fn commit_generated(
+    server: &Arc<ServerState>,
+    mut txn: zyron_storage::txn::Transaction,
+    changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
+    held: &[zyron_executor::context::PendingStreamAdvance],
+) -> Result<(), ProtocolError> {
+    let txn_id = txn.txn_id;
+    // A generated body runs under no session, which is what zero says of
+    // the role that moved the position
+    let advanced = crate::change_stream_dispatch::log_stream_advances(server, &mut txn, held, 0)
+        .map_err(ProtocolError::Database)?;
+    // A lake commit the body staged is a write whether or not a heap row
+    // went with it, and needs a commit record for its rows to read as
+    // committed
+    let data_dir = server.disk_manager.data_dir();
+    let staged_lake = !zyron_lake::pending_versions(data_dir, txn_id).is_empty();
+
     match (server.replication.as_ref(), changeset) {
         (Some(router), Some(changeset)) => {
-            // The same order a connection's commit takes: lake versions are
-            // read into the changeset once everything is staged, and the
-            // transaction is agreed with the group before it becomes visible
-            if let Err(e) = router.capture_lake(txn_id, &changeset) {
-                let _ = server.txn_manager.abort(&mut txn);
-                withdraw_streamed(server, Some(&changeset));
+            if let Err(e) = router.capture_lake(txn_id, Arc::clone(&changeset)).await {
+                abandon_generated(server, &mut txn, Some(&changeset));
+                return Err(ProtocolError::Database(e));
+            }
+            if let Err(e) = router.capture_stream_advances(&changeset, held, 0) {
+                abandon_generated(server, &mut txn, Some(&changeset));
                 return Err(ProtocolError::Database(e));
             }
             if changeset.is_dirty() {
-                router
-                    .commit(txn, changeset)
-                    .await
-                    .map_err(ProtocolError::Database)?;
-            } else if txn.wrote_data() {
-                server
-                    .txn_manager
-                    .commit(&mut txn)
-                    .await
-                    .map_err(ProtocolError::Database)?;
+                let streamed = Arc::clone(&changeset);
+                if let Err(e) = router.commit(txn, changeset).await {
+                    // The transaction went with the failed commit. What it
+                    // staged in the lake and streamed to the group is
+                    // discarded here, or the version would stay pending
+                    // under an id nothing publishes and hold every later
+                    // commit of its table back
+                    zyron_lake::abandon_txn(server.disk_manager.data_dir(), txn_id);
+                    withdraw_streamed(server, Some(streamed.as_ref()));
+                    return Err(ProtocolError::Database(e));
+                }
+            } else if txn.wrote_data() || staged_lake {
+                if let Err(e) = server.txn_manager.commit(&mut txn).await {
+                    abandon_generated(server, &mut txn, None);
+                    return Err(ProtocolError::Database(e));
+                }
+                publish_generated_lake(server, txn_id)?;
             } else {
                 server
                     .txn_manager
@@ -7846,13 +8505,46 @@ async fn execute_call_body(
             }
         }
         _ => {
-            server
-                .txn_manager
-                .commit(&mut txn)
-                .await
-                .map_err(ProtocolError::Database)?;
+            if txn.wrote_data() || staged_lake {
+                if let Err(e) = server.txn_manager.commit(&mut txn).await {
+                    abandon_generated(server, &mut txn, None);
+                    return Err(ProtocolError::Database(e));
+                }
+                publish_generated_lake(server, txn_id)?;
+            } else {
+                server
+                    .txn_manager
+                    .commit_read_only(&mut txn)
+                    .map_err(ProtocolError::Database)?;
+            }
         }
     }
+    // The commit stands whatever happens here, so an install that fails is
+    // reported in the log rather than as a failed commit. The log holds the
+    // advance and recovery replays it, and until then a pass over the
+    // stream reads the same changes again
+    if let Err(e) =
+        crate::change_stream_dispatch::install_stream_advances(server, txn_id, advanced).await
+    {
+        tracing::error!(
+            target: "zyron::cdc",
+            txn_id,
+            error = %e,
+            "a change stream advance committed durably but its position could not be \
+             installed here, so the position stands behind the log until recovery replays \
+             the advance"
+        );
+    }
+    Ok(())
+}
+
+/// Publishes the lake versions a generated body staged, once its commit
+/// record is durable, and refreshes the statistics of the tables they
+/// touched
+fn publish_generated_lake(server: &Arc<ServerState>, txn_id: u64) -> Result<(), ProtocolError> {
+    let logs = zyron_lake::publish_txn(server.disk_manager.data_dir(), txn_id)
+        .map_err(ProtocolError::Database)?;
+    crate::connection::refresh_lake_stats(server, &logs);
     Ok(())
 }
 
@@ -8078,8 +8770,16 @@ async fn handle_drop_trigger(
 // Schedule handlers + background execution
 // ---------------------------------------------------------------------------
 
-/// Current time in epoch microseconds.
-fn schedule_now_micros() -> i64 {
+/// The instant a schedule statement runs at, in epoch microseconds.
+///
+/// On a group every member runs the statement from the same agreed entry,
+/// and the entry's instant is what they all read, so the phase a schedule
+/// takes at creation or resumption is the same on every member. A node in
+/// no group reads its own clock
+fn schedule_now_micros(session: &Option<Session>) -> i64 {
+    if let Some((_, timestamp_us)) = session.as_ref().and_then(|s| s.agreed_entry) {
+        return timestamp_us;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -8252,7 +8952,7 @@ async fn handle_create_schedule(
         )));
     }
 
-    let now = schedule_now_micros();
+    let now = schedule_now_micros(session);
     let entry = zyron_catalog::ScheduleEntry {
         id: 0,
         schema_id,
@@ -8330,7 +9030,7 @@ async fn handle_resume_schedule(
     let mut updated = (*entry).clone();
     updated.paused = false;
     // Recompute the next fire from now so a long pause does not produce a burst.
-    updated.next_run = compute_next_run(&updated, schedule_now_micros());
+    updated.next_run = compute_next_run(&updated, schedule_now_micros(session));
     server
         .catalog
         .update_schedule(updated)
@@ -8344,63 +9044,82 @@ async fn handle_resume_schedule(
 pub struct ScheduleRunReport {
     pub executed: usize,
     pub failed: usize,
+    /// Schedules that were due and not run, because the group this node
+    /// leads has a member that does not record a run off the log yet
+    pub held: usize,
 }
 
-/// Plans and executes a schedule body in its own transaction. Mirrors the
-/// background DML execution model: a fresh ExecutionContext over the shared
-/// buffer pool and disk manager, with no client session.
+/// Runs a schedule body in a transaction of its own, in the schedule's own
+/// database and schema so the names in it resolve to the namespace it was
+/// created in.
+///
+/// The body runs the way a CALL body does. Its writes are captured for the
+/// group and recorded for the tables' feeds, a change stream it reads moves
+/// in its own commit, and the run itself rides in that commit, so every
+/// member records the schedule as run in the same entry that carries what
+/// it did
 async fn execute_schedule_body(
-    catalog: &Arc<zyron_catalog::Catalog>,
-    txn_manager: &Arc<zyron_storage::txn::TransactionManager>,
-    wal: &Arc<zyron_wal::WalWriter>,
-    buffer_pool: &Arc<zyron_buffer::BufferPool>,
-    disk_manager: &Arc<zyron_storage::DiskManager>,
-    body_sql: &str,
-    schema_id: zyron_catalog::SchemaId,
-) -> Result<(), ZyronError> {
-    use zyron_executor::context::ExecutionContext;
-
-    let stmt = zyron_parser::parse(body_sql)
-        .map_err(|e| ZyronError::Internal(format!("schedule body parse: {e}")))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| ZyronError::Internal("schedule body is empty".to_string()))?;
-
-    // Plan in the schedule's own database and schema rather than a fixed default
-    // so unqualified names in the body resolve to the namespace it was created
-    // in.
-    let schema = catalog.get_schema_by_id(schema_id)?;
-    let plan = zyron_planner::plan(
-        catalog,
+    server: &Arc<ServerState>,
+    schedule: &zyron_catalog::ScheduleEntry,
+    run: ScheduleRun,
+) -> Result<(), ProtocolError> {
+    let statements = zyron_parser::parse(&schedule.body_sql).map_err(|e| {
+        ProtocolError::Database(ZyronError::Internal(format!("schedule body parse: {e}")))
+    })?;
+    if statements.is_empty() {
+        return Err(ProtocolError::Database(ZyronError::Internal(
+            "schedule body is empty".to_string(),
+        )));
+    }
+    let schema = server
+        .catalog
+        .get_schema_by_id(schedule.schema_id)
+        .map_err(ProtocolError::Database)?;
+    let record = |changeset: &zyron_executor::replication::TxnChangeset| {
+        changeset.capture_schedule_run(run.schedule_id, run.last_run, run.next_run)
+    };
+    execute_call_body(
+        server,
+        statements,
+        Vec::new(),
         schema.database_id,
         vec![schema.name.clone()],
-        stmt,
+        true,
+        Some(&record),
         None,
     )
-    .await?;
+    .await
+}
 
-    let mut txn = txn_manager.begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
-    let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id;
-    let ctx = Arc::new(ExecutionContext::new(
-        Arc::clone(catalog),
-        Arc::clone(wal),
-        Arc::clone(buffer_pool),
-        Arc::clone(disk_manager),
-        txn_id,
-        snapshot,
-    ));
+/// The instants a schedule's entry holds once a run is accounted for
+#[derive(Clone, Copy)]
+struct ScheduleRun {
+    schedule_id: u32,
+    last_run: Option<i64>,
+    next_run: Option<i64>,
+}
 
-    match zyron_executor::execute(plan, &ctx).await {
-        Ok(_) => {
-            txn_manager.commit(&mut txn).await?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = txn_manager.abort(&mut txn);
-            Err(e)
-        }
+/// Records a schedule's run through the group in a transaction of its own,
+/// for a run whose body failed and so committed nothing that could carry
+/// it. Every member still has to move past this period, or the next leader
+/// would run the failing body again at once
+async fn record_schedule_run_through_group(
+    server: &Arc<ServerState>,
+    run: ScheduleRun,
+) -> Result<(), ProtocolError> {
+    let Some(router) = server.replication.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .map_err(ProtocolError::Database)?;
+    let changeset = router.changeset(txn.txn_id);
+    if let Err(e) = changeset.capture_schedule_run(run.schedule_id, run.last_run, run.next_run) {
+        abandon_generated(server, &mut txn, Some(&changeset));
+        return Err(ProtocolError::Database(e));
     }
+    commit_generated(server, txn, Some(changeset), &[]).await
 }
 
 /// Executes every active schedule whose next_run has elapsed, then advances its
@@ -8408,47 +9127,87 @@ async fn execute_schedule_body(
 /// failing schedule retries on its next period rather than every sweep. Called
 /// by the background schedule worker on each tick; reusable from tests with a
 /// controlled `now_micros`.
-pub async fn run_due_schedules(
-    catalog: &Arc<zyron_catalog::Catalog>,
-    txn_manager: &Arc<zyron_storage::txn::TransactionManager>,
-    wal: &Arc<zyron_wal::WalWriter>,
-    buffer_pool: &Arc<zyron_buffer::BufferPool>,
-    disk_manager: &Arc<zyron_storage::DiskManager>,
-    now_micros: i64,
-) -> ScheduleRunReport {
+///
+/// On a group the run travels in the body's own commit, and a failed body's
+/// run in a commit of its own, so every member moves the schedule past this
+/// period together. While a member of the group does not read a run off the
+/// log, the due schedules are held rather than run, and the report says so
+pub async fn run_due_schedules(server: &Arc<ServerState>, now_micros: i64) -> ScheduleRunReport {
     let mut report = ScheduleRunReport::default();
-    let due: Vec<Arc<zyron_catalog::ScheduleEntry>> = catalog
+    let due: Vec<Arc<zyron_catalog::ScheduleEntry>> = server
+        .catalog
         .list_schedules()
         .into_iter()
         .filter(|s| !s.paused && s.next_run.map(|n| n <= now_micros).unwrap_or(false))
         .collect();
+    let group_records_runs = server
+        .replication
+        .as_ref()
+        .map(|router| router.carries_schedule_runs())
+        .unwrap_or(true);
 
     for sched in due {
+        if !group_records_runs {
+            report.held += 1;
+            continue;
+        }
+        let next_run = compute_next_run(&sched, now_micros);
         let result = execute_schedule_body(
-            catalog,
-            txn_manager,
-            wal,
-            buffer_pool,
-            disk_manager,
-            &sched.body_sql,
-            sched.schema_id,
+            server,
+            &sched,
+            ScheduleRun {
+                schedule_id: sched.id,
+                last_run: Some(now_micros),
+                next_run,
+            },
         )
         .await;
 
-        let mut updated = (*sched).clone();
-        updated.next_run = compute_next_run(&sched, now_micros);
-        match result {
+        let (last_run, agreed) = match result {
             Ok(()) => {
-                updated.last_run = Some(now_micros);
                 report.executed += 1;
+                (Some(now_micros), true)
             }
             Err(e) => {
-                eprintln!("schedule '{}' execution failed: {e}", sched.name);
+                tracing::warn!(schedule = %sched.name, error = %e, "a schedule's body failed");
                 report.failed += 1;
+                let run = ScheduleRun {
+                    schedule_id: sched.id,
+                    last_run: sched.last_run,
+                    next_run,
+                };
+                let agreed = match record_schedule_run_through_group(server, run).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            schedule = %sched.name,
+                            error = %e,
+                            "a failed schedule's next period could not be agreed with the group"
+                        );
+                        false
+                    }
+                };
+                (sched.last_run, agreed)
             }
-        }
-        if let Err(e) = catalog.update_schedule(updated).await {
-            eprintln!("schedule '{}' state persist failed: {e}", sched.name);
+        };
+        // On a group the run reaches this node's catalog from its own entry
+        // as the applier finishes it, ahead of the commit record, so a period
+        // the group refused to agree stays due here as it does everywhere
+        // else and the next leader runs it. A node standing alone records
+        // its run here
+        if server.replication.is_none() {
+            if let Err(e) = server
+                .catalog
+                .record_schedule_run(sched.id, last_run, next_run)
+                .await
+            {
+                tracing::warn!(schedule = %sched.name, error = %e, "a schedule's run could not be recorded");
+            }
+        } else if !agreed {
+            tracing::warn!(
+                schedule = %sched.name,
+                "a schedule's period was not agreed with the group and stays due"
+            );
         }
     }
     report
@@ -8833,6 +9592,7 @@ fn stage_effective_select(
         name: stage.source.clone(),
         alias: None,
         as_of: None,
+        options: Vec::new(),
     }];
     Box::new(select)
 }
@@ -8915,19 +9675,26 @@ async fn plan_select_columns(
 /// so stage tables resolve in the pipeline's own schema.
 /// A transaction and the context a pipeline stage runs against.
 ///
-/// `capture` decides whether the rows it writes are collected for the group.
-/// A stage that only reads passes false and nothing is collected; one that
-/// writes passes true and the caller commits through
-/// [`commit_pipeline_txn`], which is what carries the rows to the other
-/// members
+/// What it writes, and the position a change stream it reads moves to, is
+/// collected for the group, and the caller commits through
+/// [`commit_pipeline_txn`], which is what carries them to the other members.
+/// A stage that only reads collects nothing and its commit never reaches
+/// the group, so a read costs no consensus
+/// The stream advances a pipeline transaction's reads recorded, moved in
+/// its commit
+type StageAdvances = Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>>;
+
+/// A transaction and context for one pipeline statement, wired the way a
+/// connection's statement is. The change feeds record what it writes, the
+/// triggers fire, and a change stream it reads moves in its commit
 async fn pipeline_context(
     server: &Arc<ServerState>,
-    capture: bool,
 ) -> Result<
     (
         zyron_storage::txn::Transaction,
         Arc<zyron_executor::context::ExecutionContext>,
         Option<Arc<zyron_executor::replication::TxnChangeset>>,
+        StageAdvances,
     ),
     ProtocolError,
 > {
@@ -8953,6 +9720,8 @@ async fn pipeline_context(
     ctx.intent_locks = Some(Arc::clone(server.txn_manager.intent_locks()));
     ctx.row_locks = Some(Arc::clone(server.txn_manager.lock_table()));
     ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+    ctx.set_media_store(Arc::clone(&server.media_store));
+    ctx.set_key_store(Arc::clone(&server.key_store));
     if let Some(m) = &server.fts_manager {
         ctx.set_fts_manager(Arc::clone(m));
     }
@@ -8962,13 +9731,19 @@ async fn pipeline_context(
     if let Some(m) = &server.spatial_manager {
         ctx.set_spatial_manager(Arc::clone(m));
     }
-    let changeset = if capture {
-        server.replication.as_ref().map(|r| r.changeset(txn_id))
-    } else {
-        None
-    };
+    server.install_change_capture(&mut ctx);
+    if let Some(hook) = &server.dml_hook {
+        ctx.dml_hook = Some(Arc::clone(hook));
+    }
+    let advances: StageAdvances = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    crate::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
+    // A read that moves a change stream's position is a write to the
+    // catalog every member must see, so even a stage that only reads
+    // carries a changeset, which stays empty and reaches no one when the
+    // stage moved nothing
+    let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
     ctx.replication = changeset.clone();
-    Ok((txn, Arc::new(ctx), changeset))
+    Ok((txn, Arc::new(ctx), changeset, advances))
 }
 
 /// Runs one read statement (a SELECT) in its own transaction, returning the
@@ -9007,14 +9782,10 @@ async fn run_pipeline_read(
             (name, c.type_id)
         })
         .collect();
-    let (mut txn, ctx, _) = pipeline_context(server, false).await?;
+    let (mut txn, ctx, changeset, advances) = pipeline_context(server).await?;
     match zyron_executor::execute(plan, &ctx).await {
         Ok(batches) => {
-            server
-                .txn_manager
-                .commit(&mut txn)
-                .await
-                .map_err(ProtocolError::Database)?;
+            commit_pipeline_txn(server, txn, changeset, &advances).await?;
             Ok((schema, batches))
         }
         Err(e) => {
@@ -9047,63 +9818,43 @@ async fn run_pipeline_write_txn(
             .map_err(ProtocolError::Database)?,
         );
     }
-    let (mut txn, ctx, changeset) = pipeline_context(server, true).await?;
-    let txn_id = txn.txn_id;
+    let (mut txn, ctx, changeset, advances) = pipeline_context(server).await?;
     let mut last = Vec::new();
     for plan in plans {
         match zyron_executor::execute(plan, &ctx).await {
             Ok(batches) => last = batches,
             Err(e) => {
-                let _ = server.txn_manager.abort(&mut txn);
-                withdraw_streamed(server, changeset.as_deref());
+                abandon_generated(server, &mut txn, changeset.as_deref());
                 return Err(ProtocolError::Database(e));
             }
         }
     }
-    commit_pipeline_txn(server, txn, txn_id, changeset).await?;
+    if ctx.wrote_wal() {
+        txn.mark_wrote_data();
+    }
+    commit_pipeline_txn(server, txn, changeset, &advances).await?;
     Ok(last)
 }
 
-/// Commits a stage's transaction, through the group when there is one.
+/// Commits a stage's transaction, through the group when there is one, with
+/// the change stream advances its reads recorded riding in the commit.
 ///
 /// A stage writes rows like any other statement, so they reach the other
-/// members the same way. Committing straight through the transaction manager
-/// left them on the node that ran the stage and nowhere else
+/// members the same way, and a stream it read moves in this same commit,
+/// so a stage that fails leaves the position where it was
 async fn commit_pipeline_txn(
     server: &Arc<ServerState>,
-    mut txn: zyron_storage::txn::Transaction,
-    txn_id: u64,
+    txn: zyron_storage::txn::Transaction,
     changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
+    advances: &StageAdvances,
 ) -> Result<(), ProtocolError> {
-    match (server.replication.as_ref(), changeset) {
-        (Some(router), Some(changeset)) => {
-            if let Err(e) = router.capture_lake(txn_id, &changeset) {
-                let _ = server.txn_manager.abort(&mut txn);
-                withdraw_streamed(server, Some(&changeset));
-                return Err(ProtocolError::Database(e));
-            }
-            if changeset.is_dirty() {
-                router
-                    .commit(txn, changeset)
-                    .await
-                    .map_err(ProtocolError::Database)?;
-            } else {
-                server
-                    .txn_manager
-                    .commit(&mut txn)
-                    .await
-                    .map_err(ProtocolError::Database)?;
-            }
-        }
-        _ => {
-            server
-                .txn_manager
-                .commit(&mut txn)
-                .await
-                .map_err(ProtocolError::Database)?;
-        }
+    let txn_id = txn.txn_id;
+    let held = std::mem::take(&mut *advances.lock());
+    let outcome = commit_generated(server, txn, changeset, &held).await;
+    if outcome.is_err() {
+        crate::change_stream_dispatch::release_stream_positions(server, txn_id);
     }
-    Ok(())
+    outcome
 }
 
 /// Converts a scalar key value to a SQL literal for an IN list. Returns None
@@ -9192,6 +9943,38 @@ async fn handle_create_pipeline(
         return Err(ProtocolError::Database(ZyronError::Internal(format!(
             "pipeline '{name}' has no stages"
         ))));
+    }
+
+    // A trigger names a stream that exists, so a run has something to
+    // count pending changes on
+    if let Some(trigger) = &stmt.trigger {
+        server
+            .catalog
+            .resolve_change_stream(get_session_database(session)?, &trigger.stream)
+            .map_err(|_| {
+                ProtocolError::Database(ZyronError::Internal(format!(
+                    "pipeline '{name}' runs on change data from '{}', which is not a change \
+                     stream",
+                    trigger.stream
+                )))
+            })?;
+    }
+    // A consuming stage names a stream that exists. An applying stage's
+    // source may be a relation as well as a stream, which its own binding
+    // settles at run time
+    for stage in &stmt.stages {
+        if let Some(zyron_parser::ast::ChangeStage::Consume(consume)) = &stage.changes {
+            server
+                .catalog
+                .resolve_change_stream(get_session_database(session)?, &consume.stream)
+                .map_err(|_| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "pipeline '{name}' stage '{}' consumes '{}', which is not a change \
+                         stream",
+                        stage.name, consume.stream
+                    )))
+                })?;
+        }
     }
 
     // Reject duplicate stage names and validate the stage graph is acyclic
@@ -9333,6 +10116,7 @@ async fn handle_run_pipeline(
     let mut total_rows: u64 = 0;
     let run_result = run_pipeline_stages(
         server,
+        session,
         db_id,
         &search_path,
         schema_id,
@@ -9372,6 +10156,7 @@ async fn handle_run_pipeline(
             ("pipeline".to_string(), name.clone()),
             ("rows".to_string(), total_rows.to_string()),
         ],
+        agreed_entry_of(session),
     )
     .await;
     Ok(DdlResult::Tag("RUN PIPELINE".to_string()))
@@ -9382,6 +10167,7 @@ async fn handle_run_pipeline(
 #[allow(clippy::too_many_arguments)]
 async fn run_pipeline_stages(
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
     db_id: zyron_catalog::DatabaseId,
     search_path: &[String],
     schema_id: zyron_catalog::SchemaId,
@@ -9394,6 +10180,12 @@ async fn run_pipeline_stages(
 
     for &idx in order {
         let stage = &definition.stages[idx];
+        if let Some(changes) = &stage.changes {
+            let rows =
+                run_change_stage(server, session, db_id, search_path, stage, changes).await?;
+            *total_rows = total_rows.saturating_add(rows);
+            continue;
+        }
         if stage.target.is_empty() {
             return Err(ProtocolError::Database(ZyronError::Internal(format!(
                 "pipeline stage '{}' has no target",
@@ -9414,11 +10206,7 @@ async fn run_pipeline_stages(
                     stage.name
                 ))));
             }
-            server
-                .catalog
-                .create_table_from_columns(schema_id, &stage.target, &cols)
-                .await
-                .map_err(ProtocolError::Database)?;
+            create_generated_table(server, session, schema_id, &stage.target, &cols).await?;
         }
 
         // Enforce expectations against the stage output before loading.
@@ -9579,6 +10367,159 @@ async fn run_pipeline_stages(
     Ok(())
 }
 
+/// The alias a CONSUME CHANGES statement reads the change set under
+const CONSUMED_CHANGES: &str = "changes";
+
+/// Runs a stage over a change stream. One transaction, the stream's position
+/// moving in its commit, so a stage that fails leaves the position where it
+/// was and the retry reads the same changes again.
+///
+/// Answers with the rows the stage wrote
+async fn run_change_stage(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: &[String],
+    stage: &zyron_parser::ast::PipelineStage,
+    changes: &zyron_parser::ast::ChangeStage,
+) -> Result<u64, ProtocolError> {
+    use zyron_parser::ast::ChangeStage;
+    match changes {
+        ChangeStage::Apply(apply) => {
+            let counts = crate::apply_changes::run_apply_changes(apply, server, session).await?;
+            Ok(counts.upserted + counts.deleted + counts.versioned)
+        }
+        ChangeStage::Consume(consume) => {
+            let statement = consume_statement(server, session, db_id, search_path, consume).await?;
+            let batches =
+                run_pipeline_write_txn(server, db_id, search_path.to_vec(), vec![statement])
+                    .await
+                    .map_err(|e| match e {
+                        ProtocolError::Database(inner) => {
+                            ProtocolError::Database(ZyronError::Internal(format!(
+                                "pipeline stage '{}': {inner}",
+                                stage.name
+                            )))
+                        }
+                        other => other,
+                    })?;
+            Ok(affected_count(&batches))
+        }
+    }
+}
+
+/// The statement a CONSUME CHANGES stage runs.
+///
+/// With INTO, an insert of the change set's columns the target holds, in
+/// the target's order, creating the target from the change set when it does
+/// not exist. With a statement, that statement with the relation `changes`
+/// bound to the stream read. Either way the read carries the stage's MAX
+/// ROWS bound
+async fn consume_statement(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: &[String],
+    consume: &zyron_parser::ast::ConsumeChangesStage,
+) -> Result<zyron_parser::Statement, ProtocolError> {
+    use zyron_parser::ast::{
+        InsertSource, InsertStatement, SelectItem, Statement, TableOption, TableOptionValue,
+        TableRef,
+    };
+
+    let mut options = Vec::new();
+    if let Some(max_rows) = consume.max_rows {
+        options.push(TableOption {
+            key: "max_rows".to_string(),
+            value: TableOptionValue::Integer(max_rows as i64),
+        });
+    }
+
+    if let Some(statement) = &consume.statement {
+        let mut bound = (**statement).clone();
+        let places = zyron_parser::rewriter::walk::bind_relation(
+            &mut bound,
+            CONSUMED_CHANGES,
+            &consume.stream,
+            &options,
+        );
+        if places == 0 {
+            return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                "a CONSUME CHANGES statement reads the change set as the relation \
+                 '{CONSUMED_CHANGES}', and this one never names it"
+            ))));
+        }
+        return Ok(bound);
+    }
+
+    let into = consume.into.as_deref().ok_or_else(|| {
+        ProtocolError::Database(ZyronError::PlanError(
+            "CONSUME CHANGES names INTO <relation> or carries AS (<statement>)".to_string(),
+        ))
+    })?;
+    let (schema_id, target_name) = resolve_qualified_name(into, server, session)?;
+
+    // The change set's columns, read without touching the position
+    let mut probe = empty_select();
+    probe.projections = vec![SelectItem::Wildcard];
+    probe.from = vec![TableRef::Table {
+        name: consume.stream.clone(),
+        alias: None,
+        as_of: None,
+        options: vec![TableOption {
+            key: "peek".to_string(),
+            value: TableOptionValue::Boolean(true),
+        }],
+    }];
+    let change_columns =
+        plan_select_columns(server, db_id, search_path.to_vec(), Box::new(probe)).await?;
+
+    let columns: Vec<String> = match server.catalog.get_table(schema_id, &target_name) {
+        Ok(target) => {
+            let held: Vec<String> = target
+                .live_column_list()
+                .into_iter()
+                .map(|c| c.name)
+                .filter(|name| change_columns.iter().any(|(c, _, _, _)| c == name))
+                .collect();
+            if held.is_empty() {
+                return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                    "CONSUME CHANGES INTO {into}: the target holds none of the change set's \
+                     columns"
+                ))));
+            }
+            held
+        }
+        Err(_) => {
+            create_generated_table(server, session, schema_id, &target_name, &change_columns)
+                .await?;
+            change_columns
+                .iter()
+                .map(|(c, _, _, _)| c.clone())
+                .collect()
+        }
+    };
+
+    let mut select = empty_select();
+    select.projections = columns
+        .iter()
+        .map(|name| SelectItem::Expr(zyron_parser::ast::Expr::Identifier(name.clone()), None))
+        .collect();
+    select.from = vec![TableRef::Table {
+        name: consume.stream.clone(),
+        alias: None,
+        as_of: None,
+        options,
+    }];
+    Ok(Statement::Insert(Box::new(InsertStatement {
+        table: into.to_string(),
+        columns,
+        source: InsertSource::Query(Box::new(select)),
+        on_conflict: None,
+        returning: None,
+    })))
+}
+
 async fn handle_drop_pipeline(
     stmt: &zyron_parser::ast::DropPipelineStatement,
     server: &Arc<ServerState>,
@@ -9685,7 +10626,8 @@ async fn handle_create_branch(
         }
         None => zyron_versioning::VersionId(server.wal.flushed_lsn().0),
     };
-    mgr.create_branch(&stmt.name, parent, base_version, "", now_micros())
+    let branch_id = mgr
+        .create_branch(&stmt.name, parent, base_version, "", now_micros())
         .map_err(ProtocolError::Database)?;
     mgr.persist().map_err(ProtocolError::Database)?;
     // A database-wide branch covers lake tables as well, so every lake table
@@ -9694,6 +10636,28 @@ async fn handle_create_branch(
     // carry main's writes made in between. One marker file per table, no
     // data read or copied
     fork_lake_tables(server, &stmt.name)?;
+    // Every table recording changes gets a feed for the branch now, taken
+    // at the table's current version, so a read inside the branch knows
+    // where the table's history ends and the branch's begins, whether or
+    // not the branch has written the table yet. A lake table's changes on
+    // the branch are derived from the head the fork above created, which
+    // is registered as their source on the same terms
+    if let Some(feeds) = server.cdc_registry.as_ref() {
+        for table_id in feeds.table_ids() {
+            feeds
+                .open_branch_feed(table_id, branch_id.0)
+                .map_err(ProtocolError::Database)?;
+        }
+        if server.deployment_mode.allows_lake() {
+            for table in server.catalog.list_all_tables() {
+                if !table.cdf_enabled || table.dropped_at.is_some() || !table.lake.is_lake() {
+                    continue;
+                }
+                crate::change_feed_bridge::open_lake_branch_source(server, table.id.0, branch_id.0)
+                    .map_err(ProtocolError::Database)?;
+            }
+        }
+    }
     Ok(DdlResult::Tag("CREATE BRANCH".to_string()))
 }
 
@@ -9910,6 +10874,7 @@ async fn handle_drop_branch(
             // added and main never merged become unreferenced, so the
             // table's orphan cleanup reclaims them
             drop_lake_branch_heads(server, &stmt.name)?;
+            drop_branch_streams(server, entry.id.0, &stmt.name).await?;
             mgr.delete_branch(entry.id)
                 .map_err(ProtocolError::Database)?;
             mgr.persist().map_err(ProtocolError::Database)?;
@@ -9918,6 +10883,42 @@ async fn handle_drop_branch(
         Err(_) if stmt.if_exists => Ok(DdlResult::Tag("DROP BRANCH".to_string())),
         Err(e) => Err(ProtocolError::Database(e)),
     }
+}
+
+/// Drops the change streams created on a branch and the feeds they read.
+///
+/// A stream on a branch reads the branch's changes, which go when the branch
+/// does, whether it is dropped or merged. The streams on the table itself
+/// stay where they are either way, which is what merging a branch leaving
+/// streams alone means
+async fn drop_branch_streams(
+    server: &Arc<ServerState>,
+    branch_id: u64,
+    branch_name: &str,
+) -> Result<(), ProtocolError> {
+    for stream in server.catalog.list_change_streams() {
+        if stream.branch != Some(branch_id) {
+            continue;
+        }
+        server
+            .catalog
+            .drop_change_stream(stream.schema_id, &stream.name)
+            .await
+            .map_err(ProtocolError::Database)?;
+        forget_object_privileges(server, zyron_auth::ObjectType::ChangeStream, stream.id).await?;
+        tracing::info!(
+            target: "zyron::audit",
+            event = "ChangeStreamDropped",
+            stream = %stream.name,
+            branch = %branch_name,
+        );
+    }
+    if let Some(feeds) = server.cdc_registry.as_ref() {
+        feeds
+            .remove_branch(branch_id)
+            .map_err(ProtocolError::Database)?;
+    }
+    Ok(())
 }
 
 /// Opens the transaction log of a lake table named by branch DDL, refusing a
@@ -10000,9 +11001,11 @@ async fn merge_lake_branch(
         ))));
     }
     let log = lake_log_for_branch_ddl(table_name, "MERGE BRANCH", server, session)?;
-    let attempt = lake_maintenance_attempt(zyron_lake::OperationKind::Merge);
-    let outcome =
-        zyron_lake::merge_branch(&log, &stmt.source, attempt).map_err(ProtocolError::Database)?;
+    let outcome = lake_maintenance_step(server, zyron_lake::OperationKind::Merge, |attempt| {
+        zyron_lake::merge_branch(&log, &stmt.source, attempt)
+    })
+    .await
+    .map_err(ProtocolError::Database)?;
     Ok(DdlResult::Rows {
         tag: "MERGE BRANCH".to_string(),
         columns: vec![
@@ -10106,7 +11109,7 @@ async fn merge_branch_into_main(
 
     let mgr = branch_manager(server)?;
 
-    let txn = server
+    let mut txn = server
         .txn_manager
         .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
         .map_err(ProtocolError::Database)?;
@@ -10142,6 +11145,9 @@ async fn merge_branch_into_main(
     // nowhere else, which is why the statement had to be refused in a group
     let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
     ctx.replication = changeset.clone();
+    // The rows the merge lands on main are the table's changes, recorded in
+    // its feed the way any write's are
+    server.install_change_capture(&mut ctx);
     let ctx = Arc::new(ctx);
 
     let mut total_inserted = 0u64;
@@ -10235,7 +11241,11 @@ async fn merge_branch_into_main(
             .map_err(ProtocolError::Database)?;
     }
 
-    commit_pipeline_txn(server, txn, txn_id, changeset).await?;
+    // The merge wrote through the store's own logged paths, so the commit
+    // record is what makes those writes read as committed
+    txn.mark_wrote_data();
+    let advances: StageAdvances = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    commit_pipeline_txn(server, txn, changeset, &advances).await?;
 
     // Lake side: every lake table holding a branch of this name replays
     // that branch's file set onto its main log, the same merge the
@@ -10251,8 +11261,11 @@ async fn merge_branch_into_main(
         let Some(log) = zyron_lake::TransactionLog::lookup_shared(&paths) else {
             continue;
         };
-        let attempt = lake_maintenance_attempt(zyron_lake::OperationKind::Merge);
-        match zyron_lake::merge_branch(&log, source_name, attempt) {
+        let merged = lake_maintenance_step(server, zyron_lake::OperationKind::Merge, |attempt| {
+            zyron_lake::merge_branch(&log, source_name, attempt)
+        })
+        .await;
+        match merged {
             Ok(outcome) => {
                 total_inserted += outcome.files_added as u64;
                 total_deleted += outcome.files_removed as u64;
@@ -10265,7 +11278,10 @@ async fn merge_branch_into_main(
         }
     }
 
-    // Consume the branch: its changes now live in main, so the overlay must go.
+    // Consume the branch. Its changes now live in main, so the overlay must go,
+    // and the streams that read the branch go with it. The table's own
+    // streams saw the merge land as the table's changes
+    drop_branch_streams(server, source.0, source_name).await?;
     mgr.delete_branch(source).map_err(ProtocolError::Database)?;
     mgr.persist().map_err(ProtocolError::Database)?;
 
@@ -10674,22 +11690,55 @@ async fn handle_create_cdc_stream(
     use zyron_cdc::cdc_stream::{CdcOutputStream, CdcSinkConfig, OutputFormat, StreamRetryPolicy};
     use zyron_cdc::decoder::DecoderPlugin;
 
-    let (schema_id, table_name) = resolve_qualified_name(&stmt.table_name, server, session)?;
     let mgr = server.cdc_stream_manager.as_ref().ok_or_else(|| {
         ProtocolError::Database(ZyronError::CdcStreamError(
             "CDC streaming is not enabled on this server".into(),
         ))
     })?;
-    let slot_mgr = server.slot_manager.as_ref().ok_or_else(|| {
-        ProtocolError::Database(ZyronError::CdcStreamError(
-            "replication slots are not enabled on this server".into(),
-        ))
-    })?;
 
-    let table = server
-        .catalog
-        .get_table(schema_id, &table_name)
-        .map_err(ProtocolError::Database)?;
+    // The change stream the outbound stream consumes, one that exists, or
+    // one created now, named after the outbound stream, at the source's
+    // current version. Either way the delivery position is that stream's,
+    // visible in zyron_sys.cdc.change_streams, and nothing else records it
+    let (table, change_stream) = match &stmt.change_stream {
+        Some(named) => {
+            let entry = server
+                .catalog
+                .resolve_change_stream(get_session_database(session)?, named)
+                .map_err(|_| {
+                    ProtocolError::Database(ZyronError::CdcStreamError(format!(
+                        "change stream '{named}' does not exist"
+                    )))
+                })?;
+            let ids = entry.source.table_ids();
+            let [table_id] = ids.as_slice() else {
+                return Err(ProtocolError::Database(ZyronError::CdcStreamError(
+                    format!(
+                        "change stream '{named}' reads {} tables, and an outbound stream \
+                     delivers one table's changes",
+                        ids.len()
+                    ),
+                )));
+            };
+            let table = server
+                .catalog
+                .get_table_by_id(zyron_catalog::TableId(*table_id))
+                .map_err(ProtocolError::Database)?;
+            (table, entry.name.clone())
+        }
+        None => {
+            let (schema_id, table_name) =
+                resolve_qualified_name(&stmt.table_name, server, session)?;
+            let table = server
+                .catalog
+                .get_table(schema_id, &table_name)
+                .map_err(ProtocolError::Database)?;
+            (
+                table,
+                zyron_cdc::cdc_stream::implicit_change_stream_name(&stmt.name),
+            )
+        }
+    };
 
     check_ddl_privilege(
         server,
@@ -10749,23 +11798,24 @@ async fn handle_create_cdc_stream(
         if cols.is_empty() { None } else { Some(cols) }
     };
 
-    // A dedicated replication slot tracks delivery progress for the stream.
-    // Create it checked, then pin WAL retention from the current head so no
-    // change between creation and the consumer's first advance is reclaimed.
-    let slot_name = format!("{}_slot", stmt.name);
-    slot_mgr
-        .create_slot(&slot_name, decoder_plugin, Some(vec![table.id.0]))
-        .map_err(ProtocolError::Database)?;
-    let start = server.wal.next_lsn();
-    if let Err(e) = slot_mgr.advance_slot(&slot_name, start) {
-        let _ = slot_mgr.drop_slot(&slot_name);
-        return Err(ProtocolError::Database(e));
+    // An outbound stream created without a change stream of its own gets
+    // one now, positioned at the table's current version, so what it
+    // delivers is what changes from here on
+    let implicit = stmt.change_stream.is_none();
+    if implicit {
+        crate::change_stream_dispatch::create_implicit_stream(
+            server,
+            session,
+            &change_stream,
+            &table,
+        )
+        .await?;
     }
 
     let stream = CdcOutputStream {
         name: stmt.name.clone(),
         table_id: table.id.0,
-        slot_name: slot_name.clone(),
+        change_stream: change_stream.clone(),
         sink,
         decoder_plugin,
         filter: cdc_opt_str(opts, "filter"),
@@ -10776,8 +11826,11 @@ async fn handle_create_cdc_stream(
         retry_policy: StreamRetryPolicy::default(),
     };
     if let Err(e) = mgr.create_stream(stream) {
-        // Roll back the slot so a failed stream registration leaves no orphan.
-        let _ = slot_mgr.drop_slot(&slot_name);
+        // A failed registration leaves no orphan stream behind
+        if implicit {
+            let _ =
+                crate::change_stream_dispatch::drop_implicit_stream(server, &change_stream).await;
+        }
         return Err(ProtocolError::Database(e));
     }
 
@@ -10802,10 +11855,15 @@ async fn handle_drop_cdc_stream(
         0,
     )?;
 
+    let stream = mgr
+        .get_stream(&stmt.name)
+        .map_err(ProtocolError::Database)?;
     mgr.drop_stream(&stmt.name)
         .map_err(ProtocolError::Database)?;
-    if let Some(slot_mgr) = server.slot_manager.as_ref() {
-        let _ = slot_mgr.drop_slot(&format!("{}_slot", stmt.name));
+    // A change stream created for this outbound stream goes with it. One
+    // the operator named stays, it is theirs
+    if stream.change_stream == zyron_cdc::cdc_stream::implicit_change_stream_name(&stmt.name) {
+        crate::change_stream_dispatch::drop_implicit_stream(server, &stream.change_stream).await?;
     }
     Ok(DdlResult::Tag("DROP CDC STREAM".to_string()))
 }
@@ -11227,12 +12285,18 @@ pub async fn fire_event(
     event_type: zyron_pipeline::event_handler::EventType,
     source: &str,
     details: &[(String, String)],
+    agreed: Option<(u64, i64)>,
 ) {
     use zyron_executor::column::ScalarValue;
 
     let Some(dispatcher) = &server.event_dispatcher else {
         return;
     };
+    // An event a replicated statement fires is fired on every member at the
+    // agreed entry, so each handler body runs everywhere and commits where
+    // it ran, recording its changes at that entry. One a statement fires
+    // on this node alone runs once and takes its changes to the group
+    let through_group = agreed.is_none() && server.replication.is_some();
     let handlers = dispatcher.handlersFor(&event_type);
     if handlers.is_empty() {
         return;
@@ -11291,8 +12355,17 @@ pub async fn fire_event(
             }
         };
         let (db_id, search_path) = session_db_and_search_path(&None);
-        if let Err(e) =
-            execute_call_body(server, body_stmts, params, db_id, search_path, false).await
+        if let Err(e) = execute_call_body(
+            server,
+            body_stmts,
+            params,
+            db_id,
+            search_path,
+            through_group,
+            None,
+            agreed,
+        )
+        .await
         {
             tracing::warn!(target: "zyron::events", handler = %handler.name, "event handler execution failed: {e:?}");
         }
@@ -11729,31 +12802,28 @@ async fn set_table_feature(
         }
         "cdf" | "cdc" | "change_data_feed" | "change_feed" => {
             // CDF capture needs a registered feed, so the registry must exist.
-            let registry = server.cdc_registry.as_ref().cloned().ok_or_else(|| {
-                ProtocolError::Database(ZyronError::Internal(
+            if server.cdc_registry.is_none() {
+                return Err(ProtocolError::Database(ZyronError::Internal(
                     "change data feed requires CDC to be enabled on this server".into(),
-                ))
-            })?;
-            entry.cdf_enabled = enable;
-            if enable && entry.cdf_retention_days == 0 {
-                entry.cdf_retention_days = DEFAULT_CDF_RETENTION_DAYS;
+                )));
             }
-            let table_id = entry.id.0;
-            let retention = entry.cdf_retention_days;
+            entry.cdf_enabled = enable;
+            if enable && entry.cdf_retention_days == 0 && entry.cdf.retention_micros == 0 {
+                entry.cdf_retention_days = DEFAULT_CDF_RETENTION_DAYS;
+                entry.cdf.retention_micros =
+                    DEFAULT_CDF_RETENTION_DAYS as i64 * zyron_cdc::change_feed::MICROS_PER_DAY;
+            }
+            let settings = (entry.id.0, enable, Some(enable));
+            let config = crate::lifecycle_dispatch::feed_config_of(&entry);
             server
                 .catalog
                 .update_table(entry)
                 .await
                 .map_err(ProtocolError::Database)?;
-            if enable {
-                registry
-                    .enable_for_table(table_id, retention)
-                    .map_err(ProtocolError::Database)?;
-            } else {
-                registry
-                    .disable_for_table(table_id, false)
-                    .map_err(ProtocolError::Database)?;
-            }
+            // The same path ALTER TABLE ... SET (change_data_feed = ...)
+            // takes, so both spellings open the feed the same way and both
+            // leave the streams on the table where turning it off found them
+            crate::lifecycle_dispatch::apply_feed_settings(server, settings, config).await?;
         }
         other => {
             return Err(ProtocolError::Database(ZyronError::Internal(format!(
@@ -11971,6 +13041,7 @@ async fn ingest_key_exists(
         name: target.to_string(),
         alias: None,
         as_of: None,
+        options: Vec::new(),
     }];
     select.where_clause = Some(Box::new(pred));
     select.limit = Some(Box::new(Expr::Literal(LiteralValue::Integer(1))));
@@ -12480,6 +13551,13 @@ fn map_privilege(p: zyron_parser::ast::Privilege) -> Vec<zyron_auth::PrivilegeTy
         zyron_parser::ast::Privilege::AlterIndex => vec![zyron_auth::PrivilegeType::AlterIndex],
         zyron_parser::ast::Privilege::Subscribe => vec![zyron_auth::PrivilegeType::Subscribe],
         zyron_parser::ast::Privilege::Invoke => vec![zyron_auth::PrivilegeType::InvokeEndpoint],
+        zyron_parser::ast::Privilege::Peek => vec![zyron_auth::PrivilegeType::Peek],
+        zyron_parser::ast::Privilege::Manage => {
+            vec![zyron_auth::PrivilegeType::ManageChangeStream]
+        }
+        zyron_parser::ast::Privilege::ManageChangeFeeds => {
+            vec![zyron_auth::PrivilegeType::ManageChangeFeeds]
+        }
         zyron_parser::ast::Privilege::All => vec![
             zyron_auth::PrivilegeType::Select,
             zyron_auth::PrivilegeType::Insert,
@@ -12514,26 +13592,24 @@ async fn handle_grant(
         .lookup_role(&stmt.to)
         .ok_or_else(|| ProtocolError::Database(ZyronError::RoleNotFound(stmt.to.clone())))?;
 
-    // Resolve the target table to get its catalog ID
-    let (schema_id, table_name) = resolve_qualified_name(&stmt.on_table, server, session)?;
-    let table = server
-        .catalog
-        .get_table(schema_id, &table_name)
-        .map_err(ProtocolError::Database)?;
+    // The object the grant names, which decides both the kind recorded on the
+    // entry and which catalog listing the name is resolved through
+    let (object_type, object_id, object_label) =
+        resolve_grant_object(&stmt.object, &stmt.on_table, server, session)?;
 
     // The grantor is the session's current role, recorded so the privilege
     // graph attributes the grant to the actor rather than to role 0.
     let granted_by = zyron_auth::RoleId(actor_role_id(session));
 
-    // Grant each privilege on the table
+    // Grant each privilege on the object
     for priv_ast in &stmt.privileges {
         let priv_types = map_privilege(*priv_ast);
         for pt in priv_types {
             let entry = zyron_auth::GrantEntry {
                 grantee: grantee.id,
                 privilege: pt,
-                object_type: zyron_auth::ObjectType::Table,
-                object_id: table.id.0,
+                object_type,
+                object_id,
                 columns: None,
                 state: zyron_auth::PrivilegeState::Grant,
                 with_grant_option: stmt.with_grant_option,
@@ -12559,10 +13635,96 @@ async fn handle_grant(
         target: "zyron::audit",
         event = "PrivilegeGranted",
         grantee = %stmt.to,
-        object = %stmt.on_table,
+        object = %object_label,
         actor_role = granted_by.0,
     );
     Ok(DdlResult::Tag("GRANT".to_string()))
+}
+
+/// Resolves what a GRANT or REVOKE names to the kind and id a grant records.
+///
+/// The object clause decides the listing the name is resolved through, so a
+/// grant on a change stream, a publication or an endpoint records that kind
+/// rather than recording every grant against a table
+fn resolve_grant_object(
+    object: &zyron_parser::ast::GrantObject,
+    on_table: &str,
+    server: &Arc<ServerState>,
+    session: &Option<Session>,
+) -> Result<(zyron_auth::ObjectType, u32, String), ProtocolError> {
+    use zyron_parser::ast::GrantObject as G;
+    match object {
+        G::Table(name) => {
+            let (schema_id, table_name) = resolve_qualified_name(name, server, session)?;
+            let table = server
+                .catalog
+                .get_table(schema_id, &table_name)
+                .map_err(ProtocolError::Database)?;
+            Ok((zyron_auth::ObjectType::Table, table.id.0, name.clone()))
+        }
+        G::ChangeStream(name) => {
+            let (schema_id, stream_name) = resolve_qualified_name(name, server, session)?;
+            let stream = server
+                .catalog
+                .get_change_stream(schema_id, &stream_name)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "change stream '{name}' does not exist"
+                    )))
+                })?;
+            Ok((
+                zyron_auth::ObjectType::ChangeStream,
+                stream.id,
+                name.clone(),
+            ))
+        }
+        G::Publication(name) => {
+            let (schema_id, publication_name) = resolve_qualified_name(name, server, session)?;
+            let publication = server
+                .catalog
+                .get_publication(schema_id, &publication_name)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "publication '{name}' does not exist"
+                    )))
+                })?;
+            Ok((
+                zyron_auth::ObjectType::Publication,
+                publication.id.0,
+                name.clone(),
+            ))
+        }
+        G::Endpoint(name) => {
+            let (schema_id, endpoint_name) = resolve_qualified_name(name, server, session)?;
+            let endpoint = server
+                .catalog
+                .get_endpoint(schema_id, &endpoint_name)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "endpoint '{name}' does not exist"
+                    )))
+                })?;
+            Ok((
+                zyron_auth::ObjectType::Endpoint,
+                endpoint.id.0,
+                name.clone(),
+            ))
+        }
+        // A pattern names no single object, so the grant is recorded against
+        // the table clause the statement also carried
+        G::PublicationsLike(_) | G::PublicationsTagged(_) => {
+            let (schema_id, table_name) = resolve_qualified_name(on_table, server, session)?;
+            let table = server
+                .catalog
+                .get_table(schema_id, &table_name)
+                .map_err(ProtocolError::Database)?;
+            Ok((
+                zyron_auth::ObjectType::Table,
+                table.id.0,
+                on_table.to_string(),
+            ))
+        }
+    }
 }
 
 async fn handle_revoke(
@@ -12584,14 +13746,10 @@ async fn handle_revoke(
         .lookup_role(&stmt.from)
         .ok_or_else(|| ProtocolError::Database(ZyronError::RoleNotFound(stmt.from.clone())))?;
 
-    // Resolve the target table to get its catalog ID
-    let (schema_id, table_name) = resolve_qualified_name(&stmt.on_table, server, session)?;
-    let table = server
-        .catalog
-        .get_table(schema_id, &table_name)
-        .map_err(ProtocolError::Database)?;
+    let (object_type, object_id, object_label) =
+        resolve_grant_object(&stmt.object, &stmt.on_table, server, session)?;
 
-    // Revoke each privilege on the table
+    // Revoke each privilege on the object
     for priv_ast in &stmt.privileges {
         let priv_types = map_privilege(*priv_ast);
         for pt in priv_types {
@@ -12599,15 +13757,9 @@ async fn handle_revoke(
             // A revoke that cleared only memory would come back as a live
             // grant on the next start. No CASCADE clause exists on the
             // statement, so what was delegated onward is left alone
-            sm.revoke_privilege(
-                grantee.id,
-                pt,
-                zyron_auth::ObjectType::Table,
-                table.id.0,
-                false,
-            )
-            .await
-            .map_err(ProtocolError::Database)?;
+            sm.revoke_privilege(grantee.id, pt, object_type, object_id, false)
+                .await
+                .map_err(ProtocolError::Database)?;
         }
     }
 
@@ -12615,7 +13767,7 @@ async fn handle_revoke(
         target: "zyron::audit",
         event = "PrivilegeRevoked",
         grantee = %stmt.from,
-        object = %stmt.on_table,
+        object = %object_label,
         actor_role = actor_role_id(session),
     );
     Ok(DdlResult::Tag("REVOKE".to_string()))
@@ -12799,6 +13951,141 @@ pub(crate) fn get_session_schema(
 /// the caller's namespace. Stored bodies never use this: they run under the
 /// system default path so a body resolves the same tables for every caller.
 /// Background dispatch with no session gets the system default path only.
+/// Creates the table a generated statement lands rows in, a pipeline
+/// stage's target or a consume's, from the columns those rows carry.
+///
+/// A node in no group writes the catalog directly. A member of a group
+/// agrees the creation with the group as the CREATE TABLE it amounts to and
+/// runs it here on this node's turn, the way a connection's own CREATE
+/// TABLE runs, so the rows that follow through the changeset find the table
+/// on every member rather than on the one that ran the statement
+async fn create_generated_table(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+    schema_id: zyron_catalog::SchemaId,
+    name: &str,
+    columns: &[(String, zyron_common::TypeId, bool, Option<u8>)],
+) -> Result<(), ProtocolError> {
+    use zyron_parser::ast::{ColumnDef, CreateTableStatement, DataType, TableFormat};
+
+    let Some(router) = server.replication.as_ref() else {
+        server
+            .catalog
+            .create_table_from_columns(schema_id, name, columns)
+            .await
+            .map_err(ProtocolError::Database)?;
+        return Ok(());
+    };
+    let schema = server
+        .catalog
+        .get_schema_by_id(schema_id)
+        .map_err(ProtocolError::Database)?;
+    let mut defs = Vec::with_capacity(columns.len());
+    for (column, type_id, nullable, digits) in columns {
+        let declared = DataType::from_type_id(*type_id).ok_or_else(|| {
+            ProtocolError::Database(ZyronError::ConfigError(format!(
+                "column \"{column}\" is {type_id}, which has no declaration a table can carry"
+            )))
+        })?;
+        // The digits an instant or a decimal carries are its precision,
+        // which the declaration keeps
+        let data_type = match (declared, digits) {
+            (DataType::Timestamp(_), Some(p)) => DataType::Timestamp(Some(*p)),
+            (DataType::TimestampTz(_), Some(p)) => DataType::TimestampTz(Some(*p)),
+            (DataType::Decimal(precision, _), Some(scale)) => {
+                DataType::Decimal(precision, Some(*scale))
+            }
+            (DataType::Numeric(precision, _), Some(scale)) => {
+                DataType::Numeric(precision, Some(*scale))
+            }
+            (other, _) => other,
+        };
+        defs.push(ColumnDef {
+            name: column.clone(),
+            data_type,
+            nullable: Some(*nullable),
+            default: None,
+            constraints: Vec::new(),
+            generated: None,
+            encrypted: None,
+            collation: None,
+            media_format: None,
+            media_storage: None,
+            user_type_id: None,
+        });
+    }
+    let create = CreateTableStatement {
+        name: format!("{}.{}", schema.name, name),
+        if_not_exists: false,
+        columns: defs,
+        constraints: Vec::new(),
+        options: Vec::new(),
+        ttl: None,
+        // A heap table, the way the direct path creates one whatever the
+        // node's default format is
+        using: Some(TableFormat::Heap),
+        cluster_by: None,
+        clone_of: None,
+        temporary: false,
+        on_commit: None,
+        or_replace: false,
+        as_query: None,
+    };
+    let sql = zyron_parser::statement_to_sql(&zyron_parser::Statement::CreateTable(Box::new(
+        create.clone(),
+    )))
+    .map_err(|e| {
+        ProtocolError::Database(ZyronError::Internal(format!(
+            "the generated CREATE TABLE could not be written as SQL for the group, {e}"
+        )))
+    })?;
+    let context = zyron_executor::replication::StatementContext {
+        user: session
+            .as_ref()
+            .map(|s| s.user.clone())
+            .unwrap_or_else(|| "zyron".to_string()),
+        database: session
+            .as_ref()
+            .map(|s| s.database.clone())
+            .unwrap_or_else(|| "zyron".to_string()),
+        search_path: session
+            .as_ref()
+            .map(|s| s.search_path.clone())
+            .unwrap_or_else(zyron_catalog::default_search_path),
+        actor_role_id: session
+            .as_ref()
+            .and_then(|s| s.security_context.as_ref())
+            .map(|ctx| ctx.current_role.0),
+    };
+    let agreed = router
+        .begin_statement(&sql, &context)
+        .await
+        .map_err(ProtocolError::Database)?;
+    // The statement runs here as the entry the group agreed, the way a
+    // connection runs its own, and the session goes back to the entry it
+    // held once it is done
+    let previous = session.as_ref().and_then(|s| s.agreed_entry);
+    if let Some(s) = session.as_mut() {
+        s.agreed_entry = Some((agreed.index, agreed.timestamp_us));
+    }
+    let outcome = handle_create_table(&create, server, session).await;
+    if let Some(s) = session.as_mut() {
+        s.agreed_entry = previous;
+    }
+    let report = match &outcome {
+        Ok(_) => Ok(()),
+        Err(e) => Err(ZyronError::Internal(e.to_string())),
+    };
+    let _ = agreed.done.send(report);
+    outcome.map(|_| ())
+}
+
+/// The entry the group agreed for the statement a session is running, None
+/// on a node in no group and for a statement that runs on this node alone
+fn agreed_entry_of(session: &Option<Session>) -> Option<(u64, i64)> {
+    session.as_ref().and_then(|s| s.agreed_entry)
+}
+
 fn session_db_and_search_path(
     session: &Option<Session>,
 ) -> (zyron_catalog::DatabaseId, Vec<String>) {
@@ -14165,16 +15452,9 @@ pub async fn spawn_bound_streaming_job(
                 .catalog
                 .get_table_by_id(tgt_table_id)
                 .map_err(ProtocolError::Database)?;
-            let heap = zyron_storage::HeapFile::new(
-                Arc::clone(&server.disk_manager),
-                Arc::clone(&server.buffer_pool),
-                zyron_storage::HeapFileConfig {
-                    heap_file_id: target_entry.heap_file_id,
-                    fsm_file_id: target_entry.fsm_file_id,
-                },
-            )
-            .map_err(ProtocolError::Database)?;
-            let heap_arc = Arc::new(heap);
+            let heap_arc = crate::connection::table_heap(server, &target_entry)
+                .await
+                .map_err(ProtocolError::Database)?;
             manager
                 .lock()
                 .spawn_zyron_table_job(
@@ -14206,16 +15486,9 @@ pub async fn spawn_bound_streaming_job(
                 .catalog
                 .get_table_by_id(tgt_table_id)
                 .map_err(ProtocolError::Database)?;
-            let heap = zyron_storage::HeapFile::new(
-                Arc::clone(&server.disk_manager),
-                Arc::clone(&server.buffer_pool),
-                zyron_storage::HeapFileConfig {
-                    heap_file_id: target_entry.heap_file_id,
-                    fsm_file_id: target_entry.fsm_file_id,
-                },
-            )
-            .map_err(ProtocolError::Database)?;
-            let heap_arc = Arc::new(heap);
+            let heap_arc = crate::connection::table_heap(server, &target_entry)
+                .await
+                .map_err(ProtocolError::Database)?;
             let ctx_arc = Arc::new(parking_lot::Mutex::new(security_ctx));
             let sink = match bsj.write_mode {
                 zyron_catalog::schema::CatalogStreamingWriteMode::Upsert => {
@@ -14311,16 +15584,9 @@ pub async fn spawn_bound_streaming_job(
                 .catalog
                 .get_table_by_id(tgt_table_id)
                 .map_err(ProtocolError::Database)?;
-            let heap = zyron_storage::HeapFile::new(
-                Arc::clone(&server.disk_manager),
-                Arc::clone(&server.buffer_pool),
-                zyron_storage::HeapFileConfig {
-                    heap_file_id: target_entry.heap_file_id,
-                    fsm_file_id: target_entry.fsm_file_id,
-                },
-            )
-            .map_err(ProtocolError::Database)?;
-            let heap_arc = Arc::new(heap);
+            let heap_arc = crate::connection::table_heap(server, &target_entry)
+                .await
+                .map_err(ProtocolError::Database)?;
             let ctx_arc = Arc::new(parking_lot::Mutex::new(security_ctx));
             let sink = match bsj.write_mode {
                 zyron_catalog::schema::CatalogStreamingWriteMode::Upsert => {
@@ -14433,7 +15699,7 @@ pub async fn spawn_bound_streaming_job(
 /// role the originating node carried with it. Without that second source the
 /// owner was the real role on the node the statement was typed at and zero on
 /// every other member, for every replicated CREATE
-fn actor_role_id(session: &Option<Session>) -> u32 {
+pub(crate) fn actor_role_id(session: &Option<Session>) -> u32 {
     let Some(session) = session.as_ref() else {
         return 0;
     };
@@ -14696,20 +15962,14 @@ async fn build_zyron_sink_client(
                     dlq_table_name
                 )))
             })?;
-            let heap = zyron_storage::HeapFile::new(
-                Arc::clone(&server.disk_manager),
-                Arc::clone(&server.buffer_pool),
-                zyron_storage::HeapFileConfig {
-                    heap_file_id: table.heap_file_id,
-                    fsm_file_id: table.fsm_file_id,
-                },
-            )
-            .map_err(ProtocolError::Database)?;
+            let heap = crate::connection::table_heap(server, &table)
+                .await
+                .map_err(ProtocolError::Database)?;
             let row_sink = zyron_streaming::sink_connector::ZyronRowSink::new(
                 table.id.0,
                 zyron_catalog::schema::CatalogStreamingWriteMode::Append,
                 Arc::clone(&server.catalog),
-                Arc::new(heap),
+                heap,
                 Arc::clone(&server.txn_manager),
                 security_ctx,
                 Arc::clone(sm),

@@ -13,6 +13,11 @@ Zyron upgrades itself, moves its own on-disk formats forward, and rotates its ow
 - [sql/guides/pivot.md](sql/guides/pivot.md), turning values into columns and columns into rows. PIVOT, UNPIVOT, why the value list is written out rather than queried, and the plan each one runs as.
 - [sql/guides/asof-join.md](sql/guides/asof-join.md), joining each row to the nearest row along an ordered column. The match condition and its direction, the tolerance that bounds how far a match reaches, and when a side's sort is elided.
 
+## Data
+
+- [data/change-streams.md](data/change-streams.md), what a table's change data feed records, how a change stream holds a position that moves in the reading transaction's own commit, why that makes reprocessing safe, the batch shape through `table_changes` and the continuous shape through a stream, pipelines that run on change data, and when a stream is stale.
+- [data/apply-changes.md](data/apply-changes.md), maintaining a target from a set of changes. Keys and sequencing, type 1 and type 2 with tracked history, sources that deliver out of order, deletes and truncates, what is refused at bind, and a medallion worked from bronze to silver to gold.
+
 ## Storage
 
 - [storage/format-agility.md](storage/format-agility.md), what happens to files written by an older version of Zyron. Migration policies per format, how far back the running binary can read, and how to watch a migration progress.

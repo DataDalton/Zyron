@@ -168,6 +168,9 @@ pub async fn merge_branch_table_into_main(
     // the branch cow copy was deleted (or updated, which deletes then appends)
     // by the branch.
     let mut del_tids: Vec<TupleId> = Vec::new();
+    // The rows the merge removes from the main line, as the main pages hold
+    // them, for the table's change feed
+    let mut del_images: Vec<Vec<u8>> = Vec::new();
     for (original, cow) in cow_overrides {
         let main_data =
             read_page_through_pool(&ctx.buffer_pool, &ctx.disk_manager, *original).await?;
@@ -189,27 +192,17 @@ pub async fn merge_branch_table_into_main(
                 .unwrap_or(false);
             if main_live && !cow_live {
                 del_tids.push(TupleId::new(*original, s));
+                if let Some(view) = main_page.get_tuple_view(slot) {
+                    del_images.push(view.data.to_vec());
+                }
             }
         }
     }
     if !del_tids.is_empty() {
-        let payloads: Vec<Vec<u8>> = del_tids
-            .iter()
-            .map(|t| {
-                let mut b = Vec::with_capacity(14);
-                b.extend_from_slice(&t.page_id.file_id.to_le_bytes());
-                b.extend_from_slice(&t.page_id.page_num.to_le_bytes());
-                b.extend_from_slice(&t.slot_id.to_le_bytes());
-                b
-            })
-            .collect();
-        let recs: Vec<(u64, &[u8])> = payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
-        let lsns = ctx.wal.log_delete_batch(&recs)?;
-        ctx.mark_wrote_wal();
-        let last = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
         // MVCC delete on the main line: stamp xmax with the merge transaction.
         // Index entries are kept; the index scan rechecks visibility and key on
-        // fetch, so the merged-out rows drop out without entry removal.
+        // fetch, so the merged-out rows drop out without entry removal. The
+        // heap logs each page it stamps and stamps the page with the record
         stats.deleted = main_heap
             .mark_deleted_batch(
                 &del_tids,
@@ -222,8 +215,23 @@ pub async fn merge_branch_table_into_main(
                 false,
             )
             .await? as u64;
-        for t in &del_tids {
-            ctx.buffer_pool.mark_dirty_with_lsn(t.page_id, last.0);
+        ctx.mark_wrote_wal();
+        // A merge changes the main line the way a delete of these rows
+        // would, so the table's feed records it as one
+        if let Some(capture) = ctx.change_capture(ctx.wal.next_lsn().0) {
+            let refs: Vec<&[u8]> = del_images.iter().map(|v| v.as_slice()).collect();
+            capture
+                .hook
+                .on_delete(
+                    table_id.0,
+                    &refs,
+                    capture.version,
+                    capture.timestamp,
+                    txn_id,
+                    true,
+                    capture.branch,
+                )
+                .map_err(|e| ZyronError::ExecutionError(format!("CDC delete hook failed: {e}")))?;
         }
     }
 

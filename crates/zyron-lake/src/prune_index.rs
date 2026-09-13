@@ -152,7 +152,10 @@ impl PruneIndex {
                 let k = slot as usize;
                 let base = k * file_count;
                 let meta = &mut keys[k];
-                let bounds = &stats.bounds;
+                // In the shape the column declares now, so a file written
+                // while the column was narrower keys on the same scale as
+                // the constants it is swept against
+                let bounds = manifest.bounds_in_declared_shape(entry, stats);
                 if stats.bloom.is_some() {
                     meta.bloomed = true;
                 }
@@ -649,6 +652,7 @@ mod tests {
             size_bytes: 1024,
             row_count,
             added_version: 1,
+            schema_id: 1,
             cluster_spec_id: 0,
             column_stats: std::sync::Arc::new(stats),
             delete_predicate_ids: Vec::new(),
@@ -689,6 +693,7 @@ mod tests {
             properties: BTreeMap::new(),
             indexes: Vec::new(),
             index_files: Vec::new(),
+            type_history: Vec::new(),
         }
     }
 

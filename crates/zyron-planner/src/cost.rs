@@ -788,6 +788,19 @@ impl CostModel {
                     }
                 }
             }
+            // A change scan's row count comes from the feed's own per-version
+            // counters rather than from table statistics, which describe the
+            // rows the table holds rather than the changes it recorded. That
+            // is what lets a join between a change set and a dimension pick
+            // the right build side
+            LogicalPlan::ChangeScan { spec, .. } => {
+                let rows = spec.estimated_rows().max(1) as f64;
+                PlanCost {
+                    io_cost: spec.files_opened() as f64 * self.seq_page_cost,
+                    cpu_cost: rows * self.cpu_tuple_cost,
+                    row_count: rows,
+                }
+            }
             LogicalPlan::Filter { predicate, child } => {
                 let child_cost = self.estimate_plan_cost(child, catalog);
                 let selectivity = self.estimate_selectivity(predicate, None, None);

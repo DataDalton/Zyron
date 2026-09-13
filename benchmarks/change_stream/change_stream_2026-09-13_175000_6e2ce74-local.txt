@@ -1,0 +1,172 @@
+# suite:   change_stream
+# run:     2026-09-13_175000_6e2ce74-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== APPLY CHANGES Type 1, Type 2 And Out Of Order ===
+  1,000,000 changes over 100,000 keys, 10 per key, ordered and shuffled, written in 0.4s
+  Run 1/5: type 1 4,255,810 changes/s, type 2 1,047,648 changes/s, out of order 4,335,028 changes/s
+  Run 2/5: type 1 4,485,665 changes/s, type 2 564,049 changes/s, out of order 4,398,936 changes/s
+  Run 3/5: type 1 2,836,746 changes/s, type 2 392,894 changes/s, out of order 2,838,459 changes/s
+  Run 4/5: type 1 4,100,085 changes/s, type 2 520,878 changes/s, out of order 2,437,473 changes/s
+  Run 5/5: type 1 2,785,850 changes/s, type 2 421,025 changes/s, out of order 2,687,368 changes/s
+  type 1, 1M changes over 100K keys:
+    Runs: [4,255,810 changes/s, 4,485,665 changes/s, 2,836,746 changes/s, 4,100,085 changes/s, 2,785,850 changes/s]
+    Average: 3,692,831 changes/s (no target set)
+    Min/Max: 2,785,850 changes/s / 4,485,665 changes/s, StdDev: 730,326 changes/s
+  type 2, 1M changes over 100K keys:
+    Runs: [1,047,648 changes/s, 564,049 changes/s, 392,894 changes/s, 520,878 changes/s, 421,025 changes/s]
+    Average: 589,299 changes/s (no target set)
+    Min/Max: 392,894 changes/s / 1,047,648 changes/s, StdDev: 237,611 changes/s
+  type 1, out of order:
+    Runs: [4,335,028 changes/s, 4,398,936 changes/s, 2,838,459 changes/s, 2,437,473 changes/s, 2,687,368 changes/s]
+    Average: 3,339,453 changes/s (no target set)
+    Min/Max: 2,437,473 changes/s / 4,398,936 changes/s, StdDev: 848,935 changes/s
+  type 1 [PASS]: 3,692,831 changes/s >= 500,000 changes/s (target)
+  type 2 [PASS]: 589,299 changes/s >= 250,000 changes/s (target)
+  Out of order costs 9.6% (target ≤ 15%)
+  out of order over in order, throughput lost:
+    Runs: [9.5693%]
+    Average: 9.5693% (no target set)
+
+=== CDF Write Overhead Per Row ===
+  Run 1/5: plain 762 ns/row, feed on 934 ns/row, feed off 783 ns/row
+  Run 2/5: plain 698 ns/row, feed on 879 ns/row, feed off 765 ns/row
+  Run 3/5: plain 680 ns/row, feed on 771 ns/row, feed off 741 ns/row
+  Run 4/5: plain 751 ns/row, feed on 845 ns/row, feed off 703 ns/row
+  Run 5/5: plain 1323 ns/row, feed on 1234 ns/row, feed off 1246 ns/row
+  plain table:
+    Runs: [761.5370 ns/row, 697.5090 ns/row, 679.9225 ns/row, 750.8900 ns/row, 1,323 ns/row]
+    Average: 842.5819 ns/row (no target set)
+    Min/Max: 679.9225 ns/row / 1,323 ns/row, StdDev: 242.2108 ns/row
+  feed enabled:
+    Runs: [933.7250 ns/row, 878.6470 ns/row, 770.5190 ns/row, 845.3870 ns/row, 1,234 ns/row]
+    Average: 932.5388 ns/row (no target set)
+    Min/Max: 770.5190 ns/row / 1,234 ns/row, StdDev: 159.9259 ns/row
+  feed disabled:
+    Runs: [783.2890 ns/row, 765.2560 ns/row, 740.8370 ns/row, 703.0885 ns/row, 1,246 ns/row]
+    Average: 847.6154 ns/row (no target set)
+    Min/Max: 703.0885 ns/row / 1,246 ns/row, StdDev: 200.8022 ns/row
+  Feed enabled adds 90 ns/row (target 100), feed disabled adds 5 ns/row (target 0, run noise 480)
+  feed enabled added latency [PASS]: 89.9569 ns/row <= 100 ns/row (target)
+  feed disabled added latency:
+    Runs: [5.0335 ns/row]
+    Average: 5.0335 ns/row (no target set)
+
+=== Staleness Sweep Over 10K Streams And Before Image Storage ===
+  Run 1/5: sweep of 10000 streams in 1.12 ms, 4990 stale
+  Run 2/5: sweep of 10000 streams in 0.67 ms, 4990 stale
+  Run 3/5: sweep of 10000 streams in 0.61 ms, 4990 stale
+  Run 4/5: sweep of 10000 streams in 0.63 ms, 4990 stale
+  Run 5/5: sweep of 10000 streams in 0.61 ms, 4990 stale
+  10K streams:
+    Runs: [1.1157 ms, 0.6657 ms, 0.6134 ms, 0.6257 ms, 0.6113 ms]
+    Average: 0.7264 ms (no target set)
+    Min/Max: 0.6113 ms / 1.1157 ms, StdDev: 0.1957 ms
+  10K streams [PASS]: 0.7264 ms <= 200 ms (target)
+  Before images on 23,600,611 bytes, off 11,800,361 bytes, off is 50.0% of on (target ≤ 55%)
+  before images off over on:
+    Runs: [0.5000x]
+    Average: 0.5000x (no target set)
+
+=== Stream Read And Advance Against The Same MERGE ===
+  Run 1/5: through the stream 48.3 ms, from the table 43.4 ms
+  Run 2/5: through the stream 53.8 ms, from the table 43.7 ms
+  Run 3/5: through the stream 41.5 ms, from the table 42.1 ms
+  Run 4/5: through the stream 44.9 ms, from the table 43.1 ms
+  Run 5/5: through the stream 41.4 ms, from the table 42.0 ms
+  MERGE through the stream, 100K changes:
+    Runs: [48.3461 ms, 53.8144 ms, 41.5345 ms, 44.8520 ms, 41.3527 ms]
+    Average: 45.9799 ms (no target set)
+    Min/Max: 41.3527 ms / 53.8144 ms, StdDev: 4.6781 ms
+  MERGE from the table, 100K changes:
+    Runs: [43.3653 ms, 43.6939 ms, 42.1152 ms, 43.1133 ms, 41.9621 ms]
+    Average: 42.8500 ms (no target set)
+    Min/Max: 41.9621 ms / 43.6939 ms, StdDev: 0.6892 ms
+  The stream costs 107.3% of the table (target ≤ 110%)
+  stream over table:
+    Runs: [1.0730x]
+    Average: 1.0730x (no target set)
+  Run 1/5: one change through the stream 124 us, from the table 118 us
+  Run 2/5: one change through the stream 137 us, from the table 131 us
+  Run 3/5: one change through the stream 100 us, from the table 98 us
+  Run 4/5: one change through the stream 81 us, from the table 75 us
+  Run 5/5: one change through the stream 83 us, from the table 78 us
+  added latency, one commit:
+    Runs: [6.6385 us, 5.8845 us, 1.5515 us, 6.0030 us, 5.3830 us]
+    Average: 5.0921 us (no target set)
+    Min/Max: 1.5515 us / 6.6385 us, StdDev: 1.8149 us
+  the same statement from the table:
+    Runs: [117.6185 us, 131.3925 us, 97.9490 us, 75.1050 us, 77.7450 us]
+    Average: 99.9620 us (no target set)
+    Min/Max: 75.1050 us / 131.3925 us, StdDev: 21.9779 us
+  added latency, one commit [PASS]: 5.0921 us <= 200 us (target)
+  Run 1/5: the second consumer finished 0.47 ms after the first began committing (its whole wait 36.3 ms), one commit 0.10 ms
+  Run 2/5: the second consumer finished 0.35 ms after the first began committing (its whole wait 31.2 ms), one commit 0.10 ms
+  Run 3/5: the second consumer finished 0.45 ms after the first began committing (its whole wait 30.9 ms), one commit 0.10 ms
+  Run 4/5: the second consumer finished 0.43 ms after the first began committing (its whole wait 30.8 ms), one commit 0.10 ms
+  Run 5/5: the second consumer finished 0.51 ms after the first began committing (its whole wait 30.7 ms), one commit 0.10 ms
+  second proceeds after the first's commit:
+    Runs: [0.4688 ms, 0.3531 ms, 0.4467 ms, 0.4284 ms, 0.5148 ms]
+    Average: 0.4424 ms (no target set)
+    Min/Max: 0.3531 ms / 0.5148 ms, StdDev: 0.0532 ms
+  one commit:
+    Runs: [0.1000 ms]
+    Average: 0.1000 ms (no target set)
+
+=== table_changes Scan, Projection, Pruning and Peek ===
+  10,000,000 changes over 40 columns in 1000 files, written in 16.2s
+  Run 1/5: all columns 7,010,170 rows/s
+  Run 2/5: all columns 40,488,699 rows/s
+  Run 3/5: all columns 29,612,020 rows/s
+  Run 4/5: all columns 46,615,961 rows/s
+  Run 5/5: all columns 43,197,328 rows/s
+  all columns:
+    Runs: [7,010,170 rows/s, 40,488,699 rows/s, 29,612,020 rows/s, 46,615,961 rows/s, 43,197,328 rows/s]
+    Average: 33,384,836 rows/s (no target set)
+    Min/Max: 7,010,170 rows/s / 46,615,961 rows/s, StdDev: 14,364,329 rows/s
+  10M changes, all columns [PASS]: 33,384,836 rows/s >= 20,000,000 rows/s (target)
+  Run 1/5: two columns 390,204,311 rows/s
+  Run 2/5: two columns 349,644,237 rows/s
+  Run 3/5: two columns 519,561,490 rows/s
+  Run 4/5: two columns 270,868,377 rows/s
+  Run 5/5: two columns 453,741,095 rows/s
+  2 of 40 columns:
+    Runs: [390,204,311 rows/s, 349,644,237 rows/s, 519,561,490 rows/s, 270,868,377 rows/s, 453,741,095 rows/s]
+    Average: 396,803,902 rows/s (no target set)
+    Min/Max: 270,868,377 rows/s / 519,561,490 rows/s, StdDev: 85,368,161 rows/s
+  Projecting 2 of 40 columns reads 11.89x as fast (target 8x)
+  projection over all columns:
+    Runs: [11.8858x]
+    Average: 11.8858x (no target set)
+  A one file window over 1000 files opens 1 file(s) (versions 4295001227..=4295001227 of 4295000827..=4295001826)
+  files opened for one file window:
+    Runs: [1 files]
+    Average: 1 files (no target set)
+  Run 1/5: peek of 10,000,000 pending in 0.012 ms
+  Run 2/5: peek of 10,000,000 pending in 0.001 ms
+  Run 3/5: peek of 10,000,000 pending in 0.001 ms
+  Run 4/5: peek of 10,000,000 pending in 0.001 ms
+  Run 5/5: peek of 10,000,000 pending in 0.001 ms
+  10M pending:
+    Runs: [0.0122 ms, 0.0006 ms, 0.0005 ms, 0.0005 ms, 0.0006 ms]
+    Average: 0.0029 ms (no target set)
+    Min/Max: 0.0005 ms / 0.0122 ms, StdDev: 0.0047 ms
+  10M pending [PASS]: 0.0029 ms <= 5 ms (target)
+  10,000,000 rows landed in the lake table in 100 commits, 1.5s
+  Run 1/5: lake changes 71,879,358 rows/s
+  Run 2/5: lake changes 73,006,609 rows/s
+  Run 3/5: lake changes 72,423,620 rows/s
+  Run 4/5: lake changes 69,847,962 rows/s
+  Run 5/5: lake changes 71,258,569 rows/s
+  10M changes from the log:
+    Runs: [71,879,358 rows/s, 73,006,609 rows/s, 72,423,620 rows/s, 69,847,962 rows/s, 71,258,569 rows/s]
+    Average: 71,683,224 rows/s (no target set)
+    Min/Max: 69,847,962 rows/s / 73,006,609 rows/s, StdDev: 1,085,037 rows/s
+  10M changes from the log [PASS]: 71,683,224 rows/s >= 20,000,000 rows/s (target)
+  A compaction of the lake table produced 0 change record(s), the stream pends 10000000 (was 10000000)
+  change records produced:
+    Runs: [0 records]
+    Average: 0 records (no target set)

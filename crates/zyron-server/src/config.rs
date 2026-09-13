@@ -94,6 +94,50 @@ pub struct ZyronConfig {
     /// here through the replicated log, so a scheme an operator chose is
     /// still in force after a restart and on every member of the group
     pub crypto: CryptoSection,
+    /// Change data feeds and change streams, the caps every feed's
+    /// retention and size stay under, how many streams a table may carry,
+    /// and the thresholds the stream alerts fire on
+    pub cdc: CdcSection,
+}
+
+/// [cdc] section of the config file
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CdcSection {
+    /// Bytes one table's change feed may hold before its oldest changes are
+    /// purged ahead of their retention. Zero sets no cap. A feed at its cap
+    /// purges rather than refusing the table's writes
+    pub cdf_max_bytes_per_table: u64,
+    /// The longest retention any feed may be given, in seconds. Zero sets no
+    /// cap. A feed asked for more is refused naming this
+    pub cdf_max_retention_secs: u64,
+    /// Change streams one table may carry before another is refused
+    pub change_streams_per_table: u32,
+    /// Pending rows at which cdc_stream_lag fires
+    pub stream_lag_rows: u64,
+    /// Age in seconds of the oldest unconsumed change at which
+    /// cdc_stream_lag fires
+    pub stream_lag_seconds: u64,
+    /// How close, in seconds, retention may come to reclaiming a stream's
+    /// unconsumed changes before cdf_retention_pressure fires
+    pub retention_margin_secs: u64,
+    /// Seconds between passes of the staleness sweeper and the alert
+    /// evaluation
+    pub sweep_interval_secs: u64,
+}
+
+impl Default for CdcSection {
+    fn default() -> Self {
+        Self {
+            cdf_max_bytes_per_table: 0,
+            cdf_max_retention_secs: 0,
+            change_streams_per_table: 64,
+            stream_lag_rows: 1_000_000,
+            stream_lag_seconds: 3600,
+            retention_margin_secs: 3600,
+            sweep_interval_secs: 10,
+        }
+    }
 }
 
 /// [crypto] section of the config file.
@@ -425,6 +469,7 @@ impl Default for ZyronConfig {
             media: MediaSection::default(),
             upgrade: UpgradeSection::default(),
             crypto: CryptoSection::default(),
+            cdc: CdcSection::default(),
         }
     }
 }
@@ -1308,6 +1353,17 @@ impl ZyronConfig {
                 "vacuum.dead_tuple_threshold must be between 0.0 and 1.0".into(),
             ));
         }
+        // Change data feed section
+        if self.cdc.change_streams_per_table == 0 {
+            return Err(ZyronError::Internal(
+                "cdc.change_streams_per_table must be at least 1".into(),
+            ));
+        }
+        if self.cdc.sweep_interval_secs == 0 {
+            return Err(ZyronError::Internal(
+                "cdc.sweep_interval_secs must be at least 1".into(),
+            ));
+        }
         // Query section
         match self.query.default_isolation.as_str() {
             "snapshot" | "read_committed" => {}
@@ -1462,6 +1518,14 @@ impl ZyronConfig {
             "vacuum.enabled" => Some(self.vacuum.enabled.to_string()),
             "vacuum.interval_secs" => Some(self.vacuum.interval_secs.to_string()),
             "vacuum.dead_tuple_threshold" => Some(self.vacuum.dead_tuple_threshold.to_string()),
+            // Change data feeds and streams
+            "cdc.cdf_max_bytes_per_table" => Some(self.cdc.cdf_max_bytes_per_table.to_string()),
+            "cdc.cdf_max_retention_secs" => Some(self.cdc.cdf_max_retention_secs.to_string()),
+            "cdc.change_streams_per_table" => Some(self.cdc.change_streams_per_table.to_string()),
+            "cdc.stream_lag_rows" => Some(self.cdc.stream_lag_rows.to_string()),
+            "cdc.stream_lag_seconds" => Some(self.cdc.stream_lag_seconds.to_string()),
+            "cdc.retention_margin_secs" => Some(self.cdc.retention_margin_secs.to_string()),
+            "cdc.sweep_interval_secs" => Some(self.cdc.sweep_interval_secs.to_string()),
             // Query
             "query.default_isolation" => Some(self.query.default_isolation.clone()),
             "query.statement_timeout_secs" => Some(self.query.statement_timeout_secs.to_string()),
@@ -1732,6 +1796,41 @@ impl ZyronConfig {
                 "vacuum.dead_tuple_threshold".into(),
                 self.vacuum.dead_tuple_threshold.to_string(),
                 "Dead tuple fraction before vacuum triggers".into(),
+            ),
+            (
+                "cdc.cdf_max_bytes_per_table".into(),
+                self.cdc.cdf_max_bytes_per_table.to_string(),
+                "Bytes a change feed may hold before it purges oldest first, 0 for no cap".into(),
+            ),
+            (
+                "cdc.cdf_max_retention_secs".into(),
+                self.cdc.cdf_max_retention_secs.to_string(),
+                "Longest change feed retention in seconds, 0 for no cap".into(),
+            ),
+            (
+                "cdc.change_streams_per_table".into(),
+                self.cdc.change_streams_per_table.to_string(),
+                "Change streams one table may carry".into(),
+            ),
+            (
+                "cdc.stream_lag_rows".into(),
+                self.cdc.stream_lag_rows.to_string(),
+                "Pending rows at which cdc_stream_lag fires".into(),
+            ),
+            (
+                "cdc.stream_lag_seconds".into(),
+                self.cdc.stream_lag_seconds.to_string(),
+                "Age of the oldest unconsumed change at which cdc_stream_lag fires".into(),
+            ),
+            (
+                "cdc.retention_margin_secs".into(),
+                self.cdc.retention_margin_secs.to_string(),
+                "Seconds before reclamation at which cdf_retention_pressure fires".into(),
+            ),
+            (
+                "cdc.sweep_interval_secs".into(),
+                self.cdc.sweep_interval_secs.to_string(),
+                "Seconds between staleness sweeps and alert evaluations".into(),
             ),
             (
                 "query.default_isolation".into(),

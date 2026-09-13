@@ -195,9 +195,11 @@ mod tests {
             table_id: 0,
             txn_id: 1,
             schema_version: 1,
+            change_ordinal: 0,
             row_data: vec![1, 2, 3],
             primary_key_data: vec![version as u8],
             is_last_in_txn: true,
+            projected: false,
         }
     }
 

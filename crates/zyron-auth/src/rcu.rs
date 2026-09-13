@@ -1,123 +1,72 @@
-//! Lock-free Read-Copy-Update primitive for read-heavy, write-rarely data.
+//! Lock-free read-copy-update primitive for read-heavy, write-rarely data.
 //!
-//! Uses AtomicPtr + Arc refcounting. Readers do an atomic pointer load and
-//! increment the Arc refcount (~2-3ns, zero locks, zero contention). Writers
-//! clone the inner data, modify it, and atomically swap the pointer. The old
-//! data lives until all readers drop their Arc references.
+//! Readers take a snapshot of the current value as an `Arc<T>`, writers
+//! publish a whole new value, and the old value lives until its last reader
+//! drops it. The swap and the reclamation are `arc_swap`'s, which parks a
+//! reader's claim in a per-thread slot before it dereferences the pointer,
+//! so a reader preempted between reading the pointer and taking its
+//! reference never sees a value a writer freed underneath it.
 //!
-//! This is the core synchronization primitive for all auth stores. It replaces
-//! scc::HashMap (bucket locks on read_sync) and parking_lot::RwLock (atomic
-//! counter contention on read) with truly lock-free reads.
+//! This is the synchronization primitive of the auth stores. A read is a
+//! few atomic operations with no lock and no contention between readers. A
+//! write is a clone, the mutation, and one pointer swap
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-/// Lock-free read-copy-update container.
-///
-/// Readers call `load()` to get an `Arc<T>` snapshot. The read path is
-/// two atomic operations: one Acquire load + one refcount increment.
-/// No locks, no contention, no blocking.
-///
-/// Writers call `store()` or `update()` to atomically swap the data.
-/// The previous generation is kept alive via a second AtomicPtr to
-/// prevent use-after-free for readers that loaded the old pointer but
-/// haven't incremented the refcount yet.
-///
-/// Writers are NOT serialized against each other. If concurrent writes
-/// are possible, the caller must serialize them externally.
+use arc_swap::ArcSwap;
+
+/// Lock-free read-copy-update container
 pub struct Rcu<T> {
-    ptr: AtomicPtr<T>,
-    /// Holds the previous generation to prevent premature deallocation.
-    /// When store() swaps in a new value, the old value moves here.
-    /// The value that was previously here (generation N-2) is dropped,
-    /// which is safe because any reader that loaded N-2's pointer has
-    /// completed the refcount increment (the race window is 1-2 CPU
-    /// instructions, far shorter than a full store() call).
-    prev: AtomicPtr<T>,
+    inner: ArcSwap<T>,
 }
 
-// SAFETY: The inner T is always behind an Arc, which is Send + Sync when T is.
-// The AtomicPtr operations are inherently thread-safe.
-unsafe impl<T: Send + Sync> Send for Rcu<T> {}
-unsafe impl<T: Send + Sync> Sync for Rcu<T> {}
-
 impl<T> Rcu<T> {
-    /// Creates a new Rcu with the given initial value.
+    /// Creates a new Rcu with the given initial value
     pub fn new(val: T) -> Self {
-        let arc = Arc::new(val);
         Self {
-            ptr: AtomicPtr::new(Arc::into_raw(arc) as *mut T),
-            prev: AtomicPtr::new(std::ptr::null_mut()),
+            inner: ArcSwap::from_pointee(val),
         }
     }
 
-    /// Lock-free read: atomically loads the pointer and returns an owned
-    /// Arc<T> snapshot. Cost: one Acquire load + one atomic refcount increment.
+    /// Lock-free read, an owned `Arc<T>` snapshot of the current value
     pub fn load(&self) -> Arc<T> {
-        let ptr = self.ptr.load(Ordering::Acquire);
-        // SAFETY: ptr was produced by Arc::into_raw. The refcount is >= 1
-        // because either ptr is the current value (Rcu holds it) or it was
-        // just swapped to prev (which also holds it). We increment the
-        // refcount to create a new Arc handle.
-        unsafe {
-            Arc::increment_strong_count(ptr);
-            Arc::from_raw(ptr)
-        }
+        self.inner.load_full()
     }
 
-    /// Atomically replaces the stored value. The previous value is kept alive
-    /// in a deferred slot. The value before that (N-2) is dropped.
+    /// Lock-free read that borrows the current value for the guard's
+    /// lifetime without taking a reference count on it. The guard holds a
+    /// per-thread claim that keeps the value alive, so a lookup that
+    /// finishes before returning costs a claim and its release rather than
+    /// two reference count changes. Held briefly, never across an await,
+    /// since a thread has few claim slots and a read that finds none free
+    /// takes the reference count instead
+    #[inline]
+    pub fn read(&self) -> arc_swap::Guard<Arc<T>> {
+        self.inner.load()
+    }
+
+    /// Atomically replaces the stored value. A reader holding the previous
+    /// snapshot keeps it until it drops it
     pub fn store(&self, new_val: T) {
-        let new_arc = Arc::new(new_val);
-        let old_ptr = self
-            .ptr
-            .swap(Arc::into_raw(new_arc) as *mut T, Ordering::AcqRel);
-
-        // Move old_ptr to prev, retrieving the previous prev (N-2).
-        // old_ptr stays alive in prev, protecting any reader that loaded it
-        // but hasn't incremented the refcount yet.
-        let prev_prev = self.prev.swap(old_ptr, Ordering::AcqRel);
-
-        // Drop generation N-2. Any reader that loaded N-2 has completed
-        // its refcount increment by now (the increment happens within 1-2
-        // instructions of the pointer load, and an entire store() call
-        // with its atomic operations serves as a sufficient fence).
-        if !prev_prev.is_null() {
-            unsafe {
-                Arc::from_raw(prev_prev);
-            }
-        }
+        self.inner.store(Arc::new(new_val));
     }
 
-    /// Clone-modify-swap: loads the current snapshot, clones the inner T,
-    /// applies the mutation function, and atomically stores the result.
-    /// The caller must serialize concurrent update() calls externally.
-    pub fn update(&self, f: impl FnOnce(&mut T))
+    /// Clone-modify-swap. `f` receives a clone of the current value, and the
+    /// result is published only when no other writer published in between.
+    /// Otherwise the clone is discarded and `f` runs again over the newer
+    /// value, so concurrent writers never lose one another's changes. `f`
+    /// is therefore repeatable and must not move anything it captures
+    pub fn update(&self, mut f: impl FnMut(&mut T))
     where
         T: Clone,
     {
-        let snap = self.load();
-        let mut new_val = (*snap).clone();
-        f(&mut new_val);
-        self.store(new_val);
-    }
-}
-
-impl<T> Drop for Rcu<T> {
-    fn drop(&mut self) {
-        // SAFETY: Drop both the current and previous generation Arcs.
-        unsafe {
-            let ptr = self.ptr.load(Ordering::Relaxed);
-            if !ptr.is_null() {
-                Arc::from_raw(ptr);
-            }
-            let prev = self.prev.load(Ordering::Relaxed);
-            if !prev.is_null() {
-                Arc::from_raw(prev);
-            }
-        }
+        self.inner.rcu(|current| {
+            let mut next = (**current).clone();
+            f(&mut next);
+            next
+        });
     }
 }
 
@@ -125,8 +74,8 @@ impl<T> Drop for Rcu<T> {
 // Convenience type alias and helpers for HashMap-based Rcu stores
 // ---------------------------------------------------------------------------
 
-/// Lock-free map: Rcu wrapping a HashMap. Readers get a snapshot via load(),
-/// then do standard HashMap lookups on it. Writers clone-modify-swap.
+/// Lock-free map, an `Rcu` over a `HashMap`. Readers look up in a snapshot,
+/// writers clone-modify-swap
 pub type RcuMap<K, V> = Rcu<HashMap<K, V>>;
 
 impl<K, V> Rcu<HashMap<K, V>>
@@ -134,34 +83,35 @@ where
     K: Eq + Hash + Clone,
     V: Clone,
 {
-    /// Creates an empty RcuMap.
+    /// Creates an empty RcuMap
     pub fn empty_map() -> Self {
         Self::new(HashMap::new())
     }
 
-    /// Lock-free lookup: loads snapshot, returns cloned value if found.
+    /// Lock-free lookup, the value cloned out of the current snapshot
+    /// without taking a reference on the snapshot itself
     pub fn get(&self, key: &K) -> Option<V> {
-        let snap = self.load();
-        snap.get(key).cloned()
+        self.inner.load().get(key).cloned()
     }
 
-    /// Inserts or replaces a key-value pair via clone-modify-swap.
+    /// Inserts or replaces a key-value pair via clone-modify-swap
     pub fn insert(&self, key: K, value: V) {
         self.update(|m| {
-            m.insert(key, value);
+            m.insert(key.clone(), value.clone());
         });
     }
 
-    /// Removes a key via clone-modify-swap. Returns true if the key existed.
+    /// Removes a key via clone-modify-swap. Returns true if the key existed
+    /// in the map the removal was published over
     pub fn remove(&self, key: &K) -> bool {
-        let snap = self.load();
-        if !snap.contains_key(key) {
+        if !self.inner.load().contains_key(key) {
             return false;
         }
+        let mut removed = false;
         self.update(|m| {
-            m.remove(key);
+            removed = m.remove(key).is_some();
         });
-        true
+        removed
     }
 }
 
@@ -284,6 +234,38 @@ mod tests {
         let total_reads: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(total_reads, 800_000);
         assert_eq!(*rcu.load(), 1000);
+    }
+
+    /// Several writers updating the same value at once, none of their
+    /// changes lost, which the clone-modify-swap of a single writer at a
+    /// time never had to prove
+    #[test]
+    fn test_rcu_concurrent_updates_lose_nothing() {
+        let rcu = Arc::new(Rcu::new(Vec::<u64>::new()));
+        let barrier = Arc::new(Barrier::new(8));
+        let writers: Vec<_> = (0..8u64)
+            .map(|w| {
+                let rcu = rcu.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..500u64 {
+                        rcu.update(|v| v.push(w * 1000 + i));
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let mut all = (*rcu.load()).clone();
+        all.sort_unstable();
+        let expected: Vec<u64> = (0..8u64)
+            .flat_map(|w| (0..500u64).map(move |i| w * 1000 + i))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(all, expected);
     }
 
     #[test]

@@ -23,11 +23,24 @@ const PREFETCH_RESERVE_DIVISOR: usize = 16;
 /// contents are unwritten. Wired from the pool construction site.
 /// The buffer is the pool's private copy of the frame, passed mutably so the
 /// writer can stamp integrity fields in place instead of copying the page.
-/// The third argument is the page's dirty LSN, so the writer can hold the
-/// write until the WAL is durable up to it: a data page must never reach
-/// disk ahead of the log records that produced it.
+/// The third argument is the newest logged change the image holds, so the
+/// writer can hold the write until the WAL is durable up to it. A data page
+/// must never reach disk ahead of the log records that produced it
 pub type EvictWriteFn =
     std::sync::Arc<dyn Fn(PageId, &mut [u8; PAGE_SIZE], u64) -> Result<()> + Send + Sync>;
+
+/// One dirty page the background writer is offered, with the two positions
+/// a flush needs, the oldest unflushed change, which orders the flush and
+/// is what the frame is cleared against, and the newest logged change the
+/// image holds, which the WAL must be durable through before the image
+/// lands
+#[derive(Debug, Clone, Copy)]
+pub struct DirtyPage {
+    pub page_id: PageId,
+    pub frame_id: FrameId,
+    pub dirty_lsn: u64,
+    pub page_lsn: u64,
+}
 
 /// What a flush_all callback did with the page it was offered. A callback
 /// that filters by file id answers Skipped for a page it does not own, and
@@ -245,6 +258,11 @@ pub struct BufferPool {
     /// to disk in opposite order. Eviction does not take it: a claimed
     /// victim is unreachable to every flusher through the failed pin.
     flush_serial: parking_lot::Mutex<()>,
+    /// Waits for the log to be durable through a position before a page
+    /// stamped with it is written, so no page reaches disk ahead of the
+    /// records that produced what it holds, whichever path writes it. A
+    /// pool without one, which the unit tests build, writes unbarriered
+    wal_barrier: OnceLock<crate::background_writer::WalBarrierFn>,
 }
 
 impl BufferPool {
@@ -265,7 +283,35 @@ impl BufferPool {
             replacer: ClockReplacer::new(num_frames),
             evict_writer: OnceLock::new(),
             flush_serial: parking_lot::Mutex::new(()),
+            wal_barrier: OnceLock::new(),
         }
+    }
+
+    /// Installs the wait on the log's durability that every page write
+    /// through this pool makes before the page lands. Set once, beside the
+    /// evict writer, by whoever owns the log
+    pub fn set_wal_barrier(&self, barrier: crate::background_writer::WalBarrierFn) -> Result<()> {
+        self.wal_barrier
+            .set(barrier)
+            .map_err(|_| ZyronError::Internal("wal barrier already set".to_string()))
+    }
+
+    /// Drops every resident page of one file from the pool, for a file
+    /// being emptied. Answers with how many pages went. A page a reader
+    /// holds pinned stays, and the caller that empties the file decides
+    /// what that means
+    pub fn drop_file_pages(&self, file_id: u32) -> usize {
+        let mut pages = Vec::new();
+        self.page_table.for_each(|page_id, _| {
+            if page_id.file_id == file_id {
+                pages.push(page_id);
+            }
+            true
+        });
+        pages
+            .into_iter()
+            .filter(|page_id| self.delete_page(*page_id))
+            .count()
     }
 
     /// Installs the write hook used to flush a dirty victim during eviction.
@@ -428,11 +474,14 @@ impl BufferPool {
             if frame.is_dirty()
                 && let Some(page_id) = frame.page_id()
             {
-                let mut data = Box::new([0u8; PAGE_SIZE]);
-                let dirty_lsn = frame.dirty_lsn();
-                let data_guard = frame.read_data();
-                data.copy_from_slice(&**data_guard);
-                drop(data_guard);
+                let (mut data, newest) = match self.copy_for_flush(frame) {
+                    Ok(copy) => copy,
+                    Err(e) => {
+                        frame.unclaim();
+                        self.replacer.record_access(victim_id);
+                        return Err(e);
+                    }
+                };
 
                 let Some(write) = write_through else {
                     frame.unclaim();
@@ -446,7 +495,7 @@ impl BufferPool {
                 // page is not silently lost. Leaving it claimed would hang
                 // every later reader of that page on a claim that nothing
                 // will ever drop
-                if let Err(e) = write(page_id, &mut data, dirty_lsn) {
+                if let Err(e) = write(page_id, &mut data, newest) {
                     frame.unclaim();
                     self.replacer.record_access(victim_id);
                     return Err(e);
@@ -525,6 +574,11 @@ impl BufferPool {
             frame.reset_keeping_pin();
             if let Some(data) = init {
                 frame.copy_from(data);
+                // The image says which logged changes it holds, and every
+                // change logged from here on raises the reading above that
+                if data.len() >= zyron_common::page::PAGE_LSN_OFFSET + 8 {
+                    frame.seed_page_lsn(zyron_common::page::page_lsn(data));
+                }
             }
             frame.set_page_id(Some(page_id));
             // An eviction claim converts to a normal pin only after the
@@ -642,11 +696,9 @@ impl BufferPool {
         let expected_lsn = frame.dirty_lsn();
         frame.set_dirty(false);
         let _ = frame.clear_dirty_lsn(expected_lsn);
-        let mut data: Box<[u8; PAGE_SIZE]> = {
-            let guard = frame.read_data();
-            Box::new(**guard)
-        };
-        let outcome = flush_fn(page_id, &mut data[..]);
+        let outcome = self
+            .copy_for_flush(frame)
+            .and_then(|(mut data, _)| flush_fn(page_id, &mut data[..]));
         drop(flush_order);
         match outcome {
             Ok(()) => {
@@ -702,11 +754,10 @@ impl BufferPool {
             let expected_lsn = frame.dirty_lsn();
             frame.set_dirty(false);
             let _ = frame.clear_dirty_lsn(expected_lsn);
-            let mut data: Box<[u8; PAGE_SIZE]> = {
-                let guard = frame.read_data();
-                Box::new(**guard)
-            };
-            match flush_fn(page_id, &mut data[..]) {
+            let outcome = self
+                .copy_for_flush(frame)
+                .and_then(|(mut data, _)| flush_fn(page_id, &mut data[..]));
+            match outcome {
                 Ok(FlushOutcome::Written) => {
                     frame.unpin();
                     flushed += 1;
@@ -939,15 +990,57 @@ impl BufferPool {
         })
     }
 
-    /// Marks a page dirty and stamps it with the given LSN for checkpoint ordering.
-    /// The LSN is only written if this is the first dirty since last flush (CAS from 0).
+    /// Marks a page dirty with the LSN of a logged change applied to it.
+    ///
+    /// The oldest such stamp since the last flush orders the flush, so it is
+    /// taken once (CAS from 0). The newest is what the page image carries
+    /// to disk, so it is raised by every stamp
     #[inline]
     pub fn mark_dirty_with_lsn(&self, page_id: PageId, lsn: u64) {
         if let Some(frame_id) = self.page_table.get(page_id) {
             let frame = &self.frames[frame_id.0 as usize];
             frame.set_dirty(true);
             frame.set_dirty_lsn(lsn);
+            frame.raise_page_lsn(lsn);
         }
+    }
+
+    /// The newest logged change a resident page holds, None when the page
+    /// is not resident
+    #[inline]
+    pub fn page_lsn(&self, page_id: PageId) -> Option<u64> {
+        let frame_id = self.page_table.get(page_id)?;
+        let frame = &self.frames[frame_id.0 as usize];
+        (frame.page_id() == Some(page_id)).then(|| frame.page_lsn())
+    }
+
+    /// Copies a frame's page for a flush, stamped with the newest logged
+    /// change it holds, and returns that reading beside the copy.
+    ///
+    /// The copy is taken under the frame's exclusive lock. An appender
+    /// holds the shared lock from placing its rows through logging them and
+    /// stamping the frame, so the copy never carries a change whose log
+    /// record does not yet exist, and the stamp covers every change the
+    /// copy carries. That is what lets recovery compare a record against
+    /// the on-disk page and know whether the page already reflects it
+    fn copy_for_flush(&self, frame: &BufferFrame) -> Result<(Box<[u8; PAGE_SIZE]>, u64)> {
+        // The reading is taken under the same lock as the copy. Read after
+        // the lock is dropped it could carry a change a writer logged and
+        // stamped in between, which the copy does not hold, and recovery
+        // would then skip that change's record over a page without it
+        let (mut data, newest): (Box<[u8; PAGE_SIZE]>, u64) = {
+            let guard = frame.write_data();
+            (Box::new(**guard), frame.page_lsn())
+        };
+        // The wait runs off the lock, so a writer of the page is never held
+        // behind the log's flush
+        if newest > 0
+            && let Some(barrier) = self.wal_barrier.get()
+        {
+            barrier(newest)?;
+        }
+        zyron_common::page::set_page_lsn(&mut data[..], newest);
+        Ok((data, newest))
     }
 
     /// Returns true if any frame is dirty at or below the boundary.
@@ -974,23 +1067,28 @@ impl BufferPool {
 
     /// Collects dirty frames with dirty_lsn <= below_lsn, sorted oldest-first.
     /// Skips pinned pages to avoid blocking the background writer.
-    /// Returns up to `limit` entries as (page_id, frame_id, dirty_lsn).
+    /// Returns up to `limit` entries.
     ///
     /// A dirty frame with no LSN stamp has an unknown age, so it is
     /// collected under every boundary and sorts first, otherwise it would
     /// stay invisible to the background writer forever.
-    pub fn collect_dirty_pages(&self, below_lsn: u64, limit: usize) -> Vec<(PageId, FrameId, u64)> {
+    pub fn collect_dirty_pages(&self, below_lsn: u64, limit: usize) -> Vec<DirtyPage> {
         let mut dirty = Vec::new();
         self.page_table.for_each(|page_id, frame_id| {
             let frame = &self.frames[frame_id.0 as usize];
             let dlsn = frame.dirty_lsn();
             let eligible = (dlsn > 0 && dlsn <= below_lsn) || (dlsn == 0 && frame.is_dirty());
             if eligible && !frame.is_pinned() {
-                dirty.push((page_id, frame_id, dlsn));
+                dirty.push(DirtyPage {
+                    page_id,
+                    frame_id,
+                    dirty_lsn: dlsn,
+                    page_lsn: frame.page_lsn(),
+                });
             }
             true
         });
-        dirty.sort_unstable_by_key(|&(_, _, lsn)| lsn);
+        dirty.sort_unstable_by_key(|page| page.dirty_lsn);
         dirty.truncate(limit);
         dirty
     }
@@ -1052,14 +1150,10 @@ impl BufferPool {
             return Ok(false);
         }
 
-        // Copy data out while pinned
-        let mut buf = Box::new([0u8; PAGE_SIZE]);
-        let data = frame.read_data();
-        buf.copy_from_slice(&**data);
-        drop(data);
-
-        // Write to disk
-        let outcome = flush_fn(page_id, &mut buf);
+        // Copy data out while pinned, then write it
+        let outcome = self
+            .copy_for_flush(frame)
+            .and_then(|(mut buf, _)| flush_fn(page_id, &mut buf));
         drop(flush_order);
         match outcome {
             Ok(()) => {
@@ -1327,7 +1421,7 @@ mod tests {
         );
         let collected = pool.collect_dirty_pages(1, 16);
         assert!(
-            collected.iter().any(|&(p, _, _)| p == pid),
+            collected.iter().any(|page| page.page_id == pid),
             "the background flusher must see a dirty page with no LSN"
         );
     }

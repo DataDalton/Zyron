@@ -49,6 +49,18 @@ pub struct Session {
     /// resolved no index set for the table before publication either: a schema
     /// change is a barrier in the changeset and applies alone
     pub apply_txn_id: Option<u64>,
+    /// The group entry the statement in hand runs as, its index and the
+    /// instant it was proposed, on a node in a consensus group. Set for the
+    /// statement's duration on the node that proposed it and on every node
+    /// applying it, so a change the statement records in a change feed
+    /// carries the same version and instant on every member
+    pub agreed_entry: Option<(u64, i64)>,
+    /// The owner under which this session holds a change stream's position
+    /// for an ALTER CHANGE STREAM it is running on a member of a group,
+    /// taken before the group agrees the statement and released once it
+    /// has run here, so a consume committing meanwhile cannot install over
+    /// what the statement writes
+    pub reset_lock_owner: Option<u64>,
     /// The session's own open transaction, when a statement runs inside an
     /// explicit BEGIN.
     ///
@@ -144,6 +156,8 @@ impl Session {
             process_id: 0,
             replicated_actor: None,
             apply_txn_id: None,
+            agreed_entry: None,
+            reset_lock_owner: None,
             open_txn_id: None,
             temp_tables: None,
             temp_table_guard: None,

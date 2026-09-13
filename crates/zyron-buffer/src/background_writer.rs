@@ -274,16 +274,21 @@ impl BackgroundWriter {
             return 0;
         }
 
-        // WAL-before-data: the log covering every page in this batch must be
-        // durable before any of the pages reaches disk. One barrier at the
-        // batch maximum covers the whole cycle. On failure the pages stay
-        // dirty and the cycle retries later
-        let batch_max_lsn = dirty_pages.iter().map(|&(_, _, l)| l).max().unwrap_or(0);
+        // WAL before data, the log covering every change in this batch must
+        // be durable before any of the pages reaches disk. Each page's
+        // newest logged change is what its image carries, so one barrier at
+        // the newest of them covers the whole cycle. On failure the pages
+        // stay dirty and the cycle retries later
+        let batch_max_lsn = dirty_pages
+            .iter()
+            .map(|page| page.page_lsn.max(page.dirty_lsn))
+            .max()
+            .unwrap_or(0);
         if batch_max_lsn > 0 && wal_barrier(batch_max_lsn).is_err() {
             durable_error.store(true, Ordering::Release);
             let batch_min = dirty_pages
                 .iter()
-                .map(|&(_, _, l)| l)
+                .map(|page| page.dirty_lsn)
                 .min()
                 .unwrap_or(u64::MAX);
             min_dirty_lsn.store(batch_min, Ordering::Release);
@@ -301,7 +306,8 @@ impl BackgroundWriter {
         // (file_id, [(frame_id, dirty_lsn)]).
         let mut written: Vec<(u32, Vec<(crate::frame::FrameId, u64)>)> = Vec::with_capacity(8);
 
-        for &(page_id, frame_id, dlsn) in &dirty_pages {
+        for page in &dirty_pages {
+            let (page_id, frame_id, dlsn) = (page.page_id, page.frame_id, page.dirty_lsn);
             match pool.flush_dirty_frame(page_id, frame_id, dlsn, true, |pid, data| {
                 write_fn(pid, data)
             }) {
@@ -355,8 +361,8 @@ impl BackgroundWriter {
         if new_min == u64::MAX {
             // All collected pages were flushed. Check if there are more dirty pages.
             let remaining = pool.collect_dirty_pages(threshold, 1);
-            if let Some(&(_, _, lsn)) = remaining.first() {
-                min_dirty_lsn.store(lsn, Ordering::Release);
+            if let Some(page) = remaining.first() {
+                min_dirty_lsn.store(page.dirty_lsn, Ordering::Release);
             } else {
                 min_dirty_lsn.store(u64::MAX, Ordering::Release);
             }

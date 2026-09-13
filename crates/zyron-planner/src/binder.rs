@@ -1563,6 +1563,9 @@ pub enum BoundFromItem {
     /// UNPIVOT lowers to. Boxed because it is by far the widest variant and
     /// every `BoundFromItem` would otherwise pay for it
     Expand(Box<BoundExpand>),
+    /// A read of a table's recorded changes: `table_changes(...)` or a named
+    /// change stream. Boxed for the same reason `Expand` is
+    ChangeScan(Box<crate::logical::ChangeScanSpec>),
 }
 
 /// One bound row-generating FROM item.
@@ -1650,6 +1653,9 @@ fn owned_from_indices(item: &BoundFromItem, set: &mut std::collections::HashSet<
                 owned_from_indices(input, set);
             }
         }
+        BoundFromItem::ChangeScan(spec) => {
+            set.insert(spec.table_idx);
+        }
     }
 }
 
@@ -1720,6 +1726,13 @@ fn for_each_ref_in_from(item: &BoundFromItem, f: &mut dyn FnMut(&ColumnRef)) {
                 for_each_ref_in_from(input, f);
             }
             for_each_ref_in_expand_spec(&expand.spec, f);
+        }
+        // A change scan's predicate reads its own columns and nothing from a
+        // preceding FROM item, so it never correlates
+        BoundFromItem::ChangeScan(spec) => {
+            if let Some(predicate) = &spec.predicate {
+                for_each_ref_in_bound_expr(predicate, f);
+            }
         }
         BoundFromItem::GraphQuery { params, .. } => {
             for (_, e) in params {
@@ -3385,6 +3398,280 @@ impl<'a> Binder<'a> {
         Ok(items)
     }
 
+    /// Binds `table_changes(<table>, <from>, <to>)`.
+    ///
+    /// The window is resolved here, so EXPLAIN reports the range the scan
+    /// settled on and how many change files it will open rather than the
+    /// words the statement was written with
+    async fn bind_table_changes(
+        &mut self,
+        ctx: &mut BindContext,
+        args: &[zyron_parser::ast::FunctionArg],
+        alias: Option<&str>,
+    ) -> Result<BoundFromItem> {
+        let table_name = crate::change_scan::table_argument(args)?;
+        let (from, to, as_of_change) = crate::change_scan::bound_arguments(args)?;
+        let entry = self.resolver.resolve_relation(&table_name).await?;
+        let facts = crate::change_feed_facts_for(self.catalog);
+        let idx = self.alloc_table_idx();
+        let mut spec = crate::change_scan::table_function_spec(
+            facts.as_deref(),
+            &entry,
+            idx,
+            from,
+            to,
+            as_of_change,
+        )?;
+        self.secure_change_scan(&mut spec, std::slice::from_ref(&entry), idx)
+            .await?;
+        self.register_change_scan(ctx, idx, &spec, alias.unwrap_or(&entry.name));
+        Ok(BoundFromItem::ChangeScan(Box::new(spec)))
+    }
+
+    /// Puts the reader's row security into a change scan.
+    ///
+    /// A change row is a row of the table it came from, so the same
+    /// predicates that narrow a read of the table narrow the read of its
+    /// changes, evaluated per reader. Two readers of one stream then see
+    /// different rows while the stream's position moves once. A scan over
+    /// several tables applies each source's own predicate to the rows that
+    /// came from it, keyed by the source table column
+    async fn secure_change_scan(
+        &mut self,
+        spec: &mut crate::logical::ChangeScanSpec,
+        tables: &[Arc<TableEntry>],
+        table_idx: usize,
+    ) -> Result<()> {
+        use zyron_parser::ast::{BinaryOperator, Expr, LiteralValue};
+        if self.row_security.is_none() {
+            return Ok(());
+        }
+        let multi = tables.len() > 1;
+        let mut guarded: Vec<Expr> = Vec::new();
+        let mut any = false;
+        for table in tables {
+            let own = self.row_security_predicate(table.id.0)?;
+            if own.is_some() {
+                any = true;
+            }
+            if !multi {
+                if let Some(own) = own {
+                    guarded.push(own);
+                }
+                continue;
+            }
+            let from_this = Expr::BinaryOp {
+                left: Box::new(Expr::Identifier("_source_table".to_string())),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Literal(LiteralValue::Integer(table.id.0 as i64))),
+            };
+            guarded.push(match own {
+                Some(own) => Expr::BinaryOp {
+                    left: Box::new(from_this),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::Nested(Box::new(own))),
+                },
+                None => from_this,
+            });
+        }
+        if !any {
+            return Ok(());
+        }
+        let mut it = guarded.into_iter();
+        let Some(mut combined) = it.next() else {
+            return Ok(());
+        };
+        for next in it {
+            combined = Expr::BinaryOp {
+                left: Box::new(combined),
+                op: if multi {
+                    BinaryOperator::Or
+                } else {
+                    BinaryOperator::And
+                },
+                right: Box::new(next),
+            };
+        }
+        let source = tables.first().ok_or_else(|| {
+            ZyronError::PlanError("a change scan names no source table".to_string())
+        })?;
+        // Bound against the scan's own columns and metadata, so the source
+        // table column resolves beside the data columns. A scan over several
+        // tables yields the union of their columns, and each source's own
+        // predicate names columns out of that union
+        let all_columns = if multi {
+            crate::change_scan::multi_table_columns(tables, table_idx)?
+        } else {
+            crate::change_scan::columns_of(source, table_idx, spec.as_of_change)
+        };
+        let bound = self
+            .bind_change_scan_predicate(
+                all_columns.clone(),
+                &source.name,
+                spec,
+                table_idx,
+                &combined,
+            )
+            .await?;
+        let mut visible: Vec<LogicalColumn> = spec.data_columns.clone();
+        visible.extend(spec.filter_columns.iter().cloned());
+        let extra =
+            crate::change_scan::filter_only_columns(&bound, &visible, &all_columns, table_idx);
+        spec.filter_columns.extend(extra);
+        spec.predicate = Some(match spec.predicate.take() {
+            Some(existing) => BoundExpr::BinaryOp {
+                left: Box::new(existing),
+                op: BinaryOperator::And,
+                right: Box::new(bound),
+                type_id: TypeId::Boolean,
+            },
+            None => bound,
+        });
+        Ok(())
+    }
+
+    /// Binds a predicate against everything a change scan yields, the data
+    /// columns the scan is given at the scan's index and the metadata
+    /// columns, under `alias`, the name the scan's rows answer to
+    async fn bind_change_scan_predicate(
+        &mut self,
+        data_columns: Vec<LogicalColumn>,
+        alias: &str,
+        spec: &crate::logical::ChangeScanSpec,
+        table_idx: usize,
+        expr: &zyron_parser::ast::Expr,
+    ) -> Result<BoundExpr> {
+        let metadata = crate::change_scan::metadata_columns(&spec.metadata, table_idx);
+        let mut columns: Vec<BoundColumnDef> = data_columns
+            .into_iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.column_id,
+                name: c.name,
+                type_id: c.type_id,
+                nullable: true,
+                ordinal: 0,
+                fractional_digits: c.fractional_digits,
+            })
+            .collect();
+        for (i, column) in metadata.iter().enumerate() {
+            columns.push(BoundColumnDef {
+                column_id: column.column_id,
+                name: column.name.clone(),
+                type_id: column.type_id,
+                nullable: false,
+                ordinal: i as u16,
+                fractional_digits: None,
+            });
+        }
+        let mut scope = BindContext::new();
+        scope.tables.push(BoundTableRef {
+            table_idx,
+            table_id: None,
+            alias: alias.to_string(),
+            columns,
+            entry: None,
+        });
+        self.bind_expr(&scope, expr).await
+    }
+
+    /// Binds a read of a named change stream
+    async fn bind_change_stream(
+        &mut self,
+        ctx: &mut BindContext,
+        entry: &Arc<zyron_catalog::ChangeStreamEntry>,
+        alias: Option<&str>,
+        options: crate::change_scan::StreamReadOptions,
+    ) -> Result<BoundFromItem> {
+        let mut tables = Vec::new();
+        for table_id in entry.source.table_ids() {
+            tables.push(self.catalog.get_table_by_id(TableId(table_id))?);
+        }
+        let facts = crate::change_feed_facts_for(self.catalog);
+        let idx = self.alloc_table_idx();
+        // The stream's stored predicate is bound against its source's columns
+        // at the scan's own table index, so it reads the change rows rather
+        // than anything the enclosing query put in scope
+        let predicate = match &entry.predicate {
+            None => None,
+            Some(sql) => {
+                let parsed = parse_predicate_sql(sql)?;
+                let source = tables.first().ok_or_else(|| {
+                    ZyronError::PlanError(format!(
+                        "change stream '{}' names no source table",
+                        entry.name
+                    ))
+                })?;
+                // A stream over several tables yields the union of their
+                // columns, and its predicate names columns out of that
+                // union rather than out of the first source alone
+                if tables.len() > 1 {
+                    let columns: Vec<BoundColumnDef> =
+                        crate::change_scan::multi_table_columns(&tables, idx)?
+                            .into_iter()
+                            .map(|c| BoundColumnDef {
+                                column_id: c.column_id,
+                                name: c.name,
+                                type_id: c.type_id,
+                                nullable: true,
+                                ordinal: 0,
+                                fractional_digits: c.fractional_digits,
+                            })
+                            .collect();
+                    Some(
+                        self.bind_predicate_over_columns(columns, &source.name, idx, &parsed)
+                            .await?,
+                    )
+                } else {
+                    Some(self.bind_predicate_at_index(source, idx, &parsed).await?)
+                }
+            }
+        };
+        let mut spec = crate::change_scan::stream_spec(
+            facts.as_deref(),
+            entry,
+            &tables,
+            idx,
+            options,
+            predicate,
+        )?;
+        self.secure_change_scan(&mut spec, &tables, idx).await?;
+        self.register_change_scan(ctx, idx, &spec, alias.unwrap_or(&entry.name));
+        Ok(BoundFromItem::ChangeScan(Box::new(spec)))
+    }
+
+    /// Puts a change scan's columns in scope under one name
+    fn register_change_scan(
+        &mut self,
+        ctx: &mut BindContext,
+        idx: usize,
+        spec: &crate::logical::ChangeScanSpec,
+        alias: &str,
+    ) {
+        let metadata = crate::change_scan::metadata_columns(&spec.metadata, idx);
+        let columns: Vec<BoundColumnDef> = spec
+            .data_columns
+            .iter()
+            .chain(metadata.iter())
+            .enumerate()
+            .map(|(ordinal, column)| BoundColumnDef {
+                column_id: column.column_id,
+                name: column.name.clone(),
+                type_id: column.type_id,
+                nullable: column.nullable,
+                ordinal: ordinal as u16,
+                fractional_digits: column.fractional_digits,
+            })
+            .collect();
+        let bare = alias.rsplit('.').next().unwrap_or(alias);
+        ctx.tables.push(BoundTableRef {
+            table_idx: idx,
+            table_id: None,
+            alias: bare.to_string(),
+            columns,
+            entry: None,
+        });
+    }
+
     fn bind_table_ref<'b>(
         &'b mut self,
         ctx: &'b mut BindContext,
@@ -3393,7 +3680,33 @@ impl<'a> Binder<'a> {
     {
         Box::pin(async move {
             match table_ref {
-                TableRef::Table { name, alias, as_of } => {
+                TableRef::Table {
+                    name,
+                    alias,
+                    as_of,
+                    options,
+                } => {
+                    // A name that resolves to a change stream reads its
+                    // changes rather than any table's rows. Probed before the
+                    // CTE and the view, because a CTE or a view carrying a
+                    // stream's name would otherwise shadow the stream the
+                    // session addressed
+                    if let Ok(stream) = self
+                        .catalog
+                        .resolve_change_stream(self.resolver.database_id(), name)
+                    {
+                        let read = crate::change_scan::read_options(options)?;
+                        return self
+                            .bind_change_stream(ctx, &stream, alias.as_deref(), read)
+                            .await;
+                    }
+                    if !options.is_empty() {
+                        return Err(ZyronError::PlanError(format!(
+                            "relation '{name}' reads no options. Only a change stream reads \
+                             peek, schema and max_rows"
+                        )));
+                    }
+
                     // Check if this is a CTE reference
                     let display_name = alias.as_deref().unwrap_or(name);
                     if let Some(cte) = ctx.ctes.get(name).cloned() {
@@ -3719,6 +4032,12 @@ impl<'a> Binder<'a> {
                     let name = &tf.name;
                     let args = &tf.args;
                     let alias = &tf.alias;
+                    // table_changes reads a table's recorded changes, which
+                    // no analytics or graph function does, so it resolves
+                    // before either registry is consulted
+                    if crate::change_scan::is_change_function(name) {
+                        return self.bind_table_changes(ctx, args, alias.as_deref()).await;
+                    }
                     // Check if this is a graph algorithm table function.
                     let algo = name.to_lowercase();
                     let graph_algos = [
@@ -6771,6 +7090,52 @@ impl<'a> Binder<'a> {
     /// statement to plan, so the predicate is evaluated by the same
     /// expression machinery a query would use rather than a second
     /// interpretation of the same SQL.
+    /// Binds one predicate against a table's columns at a given table index.
+    ///
+    /// A change scan needs its stored WHERE bound at the index its own
+    /// columns are addressed by, so the references the predicate carries
+    /// resolve to the scan rather than to whatever sits at index zero
+    pub async fn bind_predicate_at_index(
+        &mut self,
+        entry: &TableEntry,
+        table_idx: usize,
+        expr: &zyron_parser::ast::Expr,
+    ) -> Result<BoundExpr> {
+        let columns: Vec<BoundColumnDef> = entry
+            .live_columns()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+                fractional_digits: c.fractional_digits,
+            })
+            .collect();
+        self.bind_predicate_over_columns(columns, &entry.name, table_idx, expr)
+            .await
+    }
+
+    /// Binds a predicate against one relation of the given columns at a
+    /// table index, under `alias`, the name its rows answer to
+    pub async fn bind_predicate_over_columns(
+        &mut self,
+        columns: Vec<BoundColumnDef>,
+        alias: &str,
+        table_idx: usize,
+        expr: &zyron_parser::ast::Expr,
+    ) -> Result<BoundExpr> {
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx,
+            table_id: None,
+            alias: alias.to_string(),
+            columns,
+            entry: None,
+        });
+        self.bind_expr(&ctx, expr).await
+    }
+
     pub async fn bind_table_predicate(
         &mut self,
         entry: &TableEntry,
@@ -7838,6 +8203,7 @@ impl<'a> Binder<'a> {
                 name: view_name.to_string(),
                 alias: None,
                 as_of: None,
+                options: Vec::new(),
             }],
             where_clause: None,
             group_by: Vec::new(),
@@ -10222,6 +10588,7 @@ fn collect_from_item_table_idxs(item: &BoundFromItem, out: &mut Vec<usize>) {
             }
             out.push(expand.table_idx);
         }
+        BoundFromItem::ChangeScan(spec) => out.push(spec.table_idx),
     }
 }
 

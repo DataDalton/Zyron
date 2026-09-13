@@ -162,6 +162,7 @@ pub fn version_details(log: &TransactionLog, version: u64) -> Result<VersionDeta
                 "index {} remove file {:#x}",
                 index_id, partition_id
             )),
+            LogEntry::TypeHistory(_) => {}
         }
     }
 

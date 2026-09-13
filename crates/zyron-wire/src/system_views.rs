@@ -13,7 +13,7 @@
 
 use std::sync::atomic::Ordering;
 
-use zyron_catalog::system_catalog::{self, SystemObject, SystemObjectKind};
+use zyron_catalog::system_catalog::{self, SystemObject};
 use zyron_common::ZyronError;
 
 use crate::connection::ServerState;
@@ -421,11 +421,21 @@ pub fn parse_system_function(
         }
         None => return None,
     };
-    if object.kind != SystemObjectKind::TableFunction {
+    if !object.kind.is_table_function() {
         return Some(Err(ZyronError::PlanError(format!(
             "`{}` is a view, read it with `SELECT * FROM {}`",
             name,
             object.canonical_name()
+        ))));
+    }
+    let required = object.kind.required_args() as usize;
+    if call.args.len() < required {
+        return Some(Err(ZyronError::PlanError(format!(
+            "`{}` takes {} required argument{}, this call carries {}",
+            object.canonical_name(),
+            required,
+            if required == 1 { "" } else { "s" },
+            call.args.len()
         ))));
     }
 
@@ -522,9 +532,9 @@ pub fn resolve_in_search_path<S: AsRef<str>>(
 /// Reads one entity of the system catalog.
 ///
 /// Returns Ok(None) only when the name is not registered; a registered name
-/// always has a builder, which the registry test enforces. Table functions
-/// are refused here because they need their arguments, and a bare SELECT
-/// carries none.
+/// always has a builder, which the registry test enforces. A table function
+/// that requires arguments is refused here because a bare SELECT carries
+/// none, and one that requires none is called with none.
 pub async fn query_system_view(
     name: &str,
     server: &ServerState,
@@ -533,12 +543,21 @@ pub async fn query_system_view(
     let Some(object) = system_catalog::find(name) else {
         return Ok(None);
     };
-    if object.kind == SystemObjectKind::TableFunction {
-        return Err(ZyronError::PlanError(format!(
-            "`{}` is a table function and needs its arguments, call it as `{}(...)`",
-            name,
-            object.canonical_name()
-        )));
+    if object.kind.is_table_function() {
+        if object.kind.required_args() > 0 {
+            return Err(ZyronError::PlanError(format!(
+                "`{}` is a table function and needs its arguments, call it as `{}(...)`",
+                name,
+                object.canonical_name()
+            )));
+        }
+        let call = SystemFunctionCall {
+            object,
+            args: Vec::new(),
+        };
+        return query_system_function(&call, server, filters)
+            .await
+            .map(Some);
     }
 
     // The pressure schema computes its own rows off the controller rather
@@ -557,6 +576,15 @@ pub async fn query_system_view(
     // off ServerState, so it is dispatched before the rest
     if crate::system_format_views::owns(object.schema, object.object) {
         let (fields, rows) = crate::system_format_views::build(object.schema, object.object)?;
+        let rows = filters.apply(&fields, rows);
+        return filters.project(name, fields, rows).map(Some);
+    }
+
+    // The change stream views read the catalog and the feed counters, and
+    // the alert template view reads what each subsystem declares
+    if crate::system_change_stream_views::owns(object.schema, object.object) {
+        let (fields, rows) =
+            crate::system_change_stream_views::build(object.schema, object.object, server)?;
         let rows = filters.apply(&fields, rows);
         return filters.project(name, fields, rows).map(Some);
     }
@@ -1379,14 +1407,14 @@ fn build_stat_replication_slots(server: &ServerState) -> ViewRows {
 }
 
 /// Builds the zyron_sys.stat.cdc_streams view.
-/// Columns: name, table_id, active, slot_name.
+/// Columns: name, table_id, active, change_stream.
 /// Data source: server.cdc_stream_stats callback.
 fn build_stat_cdc_streams(server: &ServerState) -> ViewRows {
     let fields = vec![
         make_field("name", PG_TEXT_OID, -1),
         make_field("table_id", PG_INT4_OID, 4),
         make_field("active", PG_TEXT_OID, -1),
-        make_field("slot_name", PG_TEXT_OID, -1),
+        make_field("change_stream", PG_TEXT_OID, -1),
     ];
 
     let rows = if let Some(ref stats_fn) = server.cdc_stream_stats {
@@ -1470,8 +1498,12 @@ fn build_stat_streaming_jobs(server: &ServerState) -> ViewRows {
 
 /// Builds the zyron_sys.stat.trigger_executions view.
 /// Columns: trigger_name, table_id, timing, events, enabled.
-/// Data source: server.trigger_manager.
+/// Data source: the catalog's trigger entries, the rows the executor fires
+/// from, so a trigger created on any member of a group is listed on every
+/// member
 fn build_stat_trigger_executions(server: &ServerState) -> ViewRows {
+    use zyron_catalog::TriggerEntry;
+
     let fields = vec![
         make_field("trigger_name", PG_TEXT_OID, -1),
         make_field("table_id", PG_INT4_OID, 4),
@@ -1480,28 +1512,36 @@ fn build_stat_trigger_executions(server: &ServerState) -> ViewRows {
         make_field("enabled", PG_TEXT_OID, -1),
     ];
 
-    let rows = if let Some(ref mgr) = server.trigger_manager {
-        mgr.listAll()
-            .into_iter()
-            .map(|t| {
-                let events: String = t
-                    .events
-                    .iter()
-                    .map(|e| format!("{:?}", e))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                vec![
-                    Some(t.name.as_bytes().to_vec()),
-                    Some(t.tableId.to_string().into_bytes()),
-                    Some(format!("{:?}", t.timing).into_bytes()),
-                    Some(events.into_bytes()),
-                    Some(t.enabled.to_string().into_bytes()),
-                ]
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let rows = server
+        .catalog
+        .list_triggers()
+        .into_iter()
+        .map(|t| {
+            let timing = match t.timing {
+                TriggerEntry::TIMING_BEFORE => "BEFORE".to_string(),
+                TriggerEntry::TIMING_AFTER => "AFTER".to_string(),
+                TriggerEntry::TIMING_INSTEAD_OF => "INSTEAD OF".to_string(),
+                other => format!("timing {other}"),
+            };
+            let mut events: Vec<&str> = Vec::with_capacity(3);
+            if t.events & TriggerEntry::EVENT_INSERT != 0 {
+                events.push("INSERT");
+            }
+            if t.events & TriggerEntry::EVENT_UPDATE != 0 {
+                events.push("UPDATE");
+            }
+            if t.events & TriggerEntry::EVENT_DELETE != 0 {
+                events.push("DELETE");
+            }
+            vec![
+                Some(t.name.as_bytes().to_vec()),
+                Some(t.table_id.to_string().into_bytes()),
+                Some(timing.into_bytes()),
+                Some(events.join(",").into_bytes()),
+                Some(t.enabled.to_string().into_bytes()),
+            ]
+        })
+        .collect();
     (fields, rows)
 }
 

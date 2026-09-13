@@ -19,10 +19,11 @@ use zyron_storage::encoding::Predicate;
 
 use crate::cells::{CellFamily, cell_family, compare_cell_to_value, compare_cells};
 use crate::encoded_filter::{ColumnEvidence, StoredFilter, Validity, rows_matching};
-use crate::manifest::{ManifestFile, PartitionEntry};
+use crate::manifest::{ManifestFile, PartitionEntry, WrittenColumn};
 use crate::paths::LakePaths;
 use crate::predicate::{CompareOp, LakePredicate, LakeValue};
 use crate::schema::{LakeColumn, LakeSchema};
+use crate::widen::{CellShape, widen_cells, widening_between};
 
 /// What one open data file can answer without decoding a column.
 ///
@@ -352,6 +353,14 @@ pub enum ZoneVerdict {
 pub struct LakeFileReader {
     reader: ZyrFileReader,
     row_count: usize,
+    /// The shape each column's cells were written in, resolved from the
+    /// manifest the file was opened through. A column whose type widened
+    /// since is decoded at this shape and widened to the shape a caller
+    /// asks for. Set once, on the first open that has a manifest to
+    /// resolve it from, and true for the life of the file, since a data
+    /// file is never rewritten in place. Empty for a file opened without a
+    /// manifest, whose cells are read at the shape the caller declares
+    written: std::sync::OnceLock<Box<[WrittenColumn]>>,
 }
 
 /// Readers already open, keyed by the data file each one reads.
@@ -399,9 +408,27 @@ fn evict_open_readers() {
 }
 
 impl LakeFileReader {
-    /// Opens the data file for one partition id
+    /// Opens the data file for one partition id, reading every column at
+    /// the shape the caller declares.
+    ///
+    /// For a file the manifest names, `open_in` is the open that resolves
+    /// the shape each column was actually written in, which a column whose
+    /// type widened since the file was written needs to be read correctly
     pub fn open(paths: &LakePaths, partition_id: u64) -> Result<Self, ZyronError> {
         Self::open_path(&paths.data_file(partition_id))
+    }
+
+    /// Opens the data file for one partition id the manifest names, with
+    /// the shape each column was written in resolved from the file's schema
+    /// id and the manifest's type history
+    pub fn open_in(
+        manifest: &ManifestFile,
+        paths: &LakePaths,
+        partition_id: u64,
+    ) -> Result<Self, ZyronError> {
+        let reader = Self::open_path(&paths.data_file(partition_id))?;
+        reader.adopt_written(manifest, partition_id);
+        Ok(reader)
     }
 
     /// Opens the data file for one partition id through the process-global
@@ -436,6 +463,58 @@ impl LakeFileReader {
         }
     }
 
+    /// The shared open of a file the manifest names, with the shape each
+    /// column was written in resolved from the file's schema id and the
+    /// manifest's type history. A reader the registry already holds takes
+    /// the shapes on if no earlier open had a manifest to resolve them
+    pub fn open_shared_in(
+        manifest: &ManifestFile,
+        paths: &LakePaths,
+        partition_id: u64,
+    ) -> Result<std::sync::Arc<Self>, ZyronError> {
+        let reader = Self::open_shared(paths, partition_id)?;
+        reader.adopt_written(manifest, partition_id);
+        Ok(reader)
+    }
+
+    /// Records the shape each column was written in, from the manifest
+    /// entry of `partition_id`, unless an earlier open already did. The
+    /// answer is a property of the immutable file, so whichever manifest
+    /// resolves it first resolves it for good.
+    ///
+    /// Recorded whether or not the manifest's types have changed since the
+    /// file was written, because a caller reads the file's cells in the
+    /// shape a later schema declares, a change record derived under the
+    /// version that wrote the file and laid out over the table's current
+    /// columns being one, and the shape the file holds is then the shape
+    /// this manifest declared. One record of every column per open, once
+    /// per process for a file opened through the registry
+    fn adopt_written(&self, manifest: &ManifestFile, partition_id: u64) {
+        if self.written.get().is_some() {
+            return;
+        }
+        let Some(entry) = manifest.entry_for(partition_id) else {
+            return;
+        };
+        let _ = self
+            .written
+            .set(manifest.written_columns(entry.schema_id).into_boxed_slice());
+    }
+
+    /// The shape one column's cells have in this file, the written shape
+    /// when an open resolved it and the declared shape otherwise
+    fn written_shape(&self, col: &LakeColumn) -> CellShape {
+        let declared = CellShape::new(col.type_id, col.fractional_digits);
+        let Some(written) = self.written.get() else {
+            return declared;
+        };
+        written
+            .iter()
+            .find(|w| w.column_id == col.id)
+            .map(|w| CellShape::new(w.type_id, w.fractional_digits))
+            .unwrap_or(declared)
+    }
+
     /// Drops every cached reader nothing else is holding, so the files they
     /// keep open can be removed.
     pub fn release_cached_readers() {
@@ -458,7 +537,11 @@ impl LakeFileReader {
     pub fn open_path(path: &std::path::Path) -> Result<Self, ZyronError> {
         let reader = ZyrFileReader::open(path)?;
         let row_count = reader.row_count() as usize;
-        Ok(Self { reader, row_count })
+        Ok(Self {
+            reader,
+            row_count,
+            written: std::sync::OnceLock::new(),
+        })
     }
 
     pub fn row_count(&self) -> usize {
@@ -541,9 +624,12 @@ impl LakeFileReader {
         let physical = column.physical_type_id();
         let value_size = physical.fixed_size().unwrap_or(0);
         // A slot holds a 32-byte prefix for a variable-length value and the
-        // whole value otherwise. Anything wider carries no usable bound
+        // whole value otherwise. Anything wider carries no usable bound. The
+        // slots hold the cells as written, so a column this file holds in
+        // an older shape than the cells were encoded at decides nothing
         let usable = value_size == 0 || (1..=STAT_VALUE_SIZE).contains(&value_size);
-        if !usable || !self.reader.has_segment(column.id) {
+        let as_written = self.written_shape(column).physical() == physical;
+        if !usable || !as_written || !self.reader.has_segment(column.id) {
             return Ok(ZoneVerdict::Undecided);
         }
         let order = slot_order(physical);
@@ -592,7 +678,12 @@ impl LakeFileReader {
     /// reach them makes the cost of one row the cost of the column. The
     /// returned column answers `cell` for ordinals inside the range and
     /// None outside it, so a caller that holds absolute ordinals does not
-    /// have to rebase them
+    /// have to rebase them.
+    ///
+    /// The cells come back in the shape `col` declares. A column this file
+    /// holds in an older shape is decoded at that shape and widened, one
+    /// pass over the decoded cells, which only a file written before the
+    /// column's type changed pays
     pub fn read_column_range(
         &self,
         col: &LakeColumn,
@@ -616,9 +707,30 @@ impl LakeFileReader {
                 all_null: true,
             });
         }
+        let written = self.written_shape(col);
+        let widening =
+            widening_between(written, CellShape::new(col.type_id, col.fractional_digits)).map_err(
+                |e| {
+                    ZyronError::Internal(format!(
+                        "column {} of the file cannot be read as the schema declares it, {e}",
+                        col.name
+                    ))
+                },
+            )?;
+        let stored_size = written.width();
         let (data, null_bitmap) =
             self.reader
-                .decode_column_range(col.id, self.row_count, value_size, start, end)?;
+                .decode_column_range(col.id, self.row_count, stored_size, start, end)?;
+        let (data, recyclable) = match widening {
+            None => (data, start == 0 && end == self.row_count),
+            Some(widening) => {
+                let widened = widen_cells(widening, &data, end - start)?;
+                // The stored width buffer goes back for the next decode,
+                // the widened one is this column's own
+                zyron_storage::encoding::recycle_decode_buffer(data);
+                (widened, false)
+            }
+        };
         Ok(DecodedColumn {
             column_id: col.id,
             physical,
@@ -627,7 +739,7 @@ impl LakeFileReader {
             null_bitmap,
             row_count: end - start,
             base: start,
-            recyclable: start == 0 && end == self.row_count,
+            recyclable,
             all_null: false,
         })
     }
@@ -1659,6 +1771,163 @@ mod tests {
         }
     }
 
+    /// A file written while a column was a narrower integer keeps its cells
+    /// at that width. Opened through the manifest that records the change,
+    /// the reader decodes the cells at the width they have and widens them
+    /// to the width the column declares, so every path over decoded cells
+    /// sees the declared shape, while the zone maps, which hold the cells
+    /// as written, decide nothing for that column
+    #[test]
+    fn test_a_column_written_narrower_is_widened_on_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = LakePaths::new(dir.path(), 7);
+        std::fs::create_dir_all(paths.data_dir()).expect("data dir");
+        let mut narrow = schema();
+        narrow.columns[0].type_id = TypeId::Int32;
+        let ids: [i32; 4] = [-7, 3, i32::MAX, i32::MIN];
+        let columns = vec![
+            ColumnData::from_cells(
+                0,
+                ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+            ),
+            ColumnData::from_cells(1, str_cells(&[Some("a"), Some("b"), Some("c"), Some("d")])),
+        ];
+        let mut entry = write_data_file(
+            &paths,
+            &narrow,
+            &WriteRequest {
+                partition_id: 0x71,
+                columns: &columns,
+                sort_keys: &[0],
+                sort_strategies: &[],
+                cluster_spec_id: 0,
+                table_id: 7,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write");
+        entry.schema_id = 1;
+        entry.delete_predicate_ids = vec![5];
+
+        // The schema moved on to a wider id column, and the manifest
+        // remembers what the column was through the schema the file carries
+        let mut wide = schema();
+        wide.schema_id = 2;
+        let manifest = ManifestFile {
+            snapshot_id: 3,
+            parent_snapshot_id: 1,
+            timestamp_us: 0,
+            schema: wide.clone(),
+            cluster_spec: crate::ClusterSpec::none(),
+            entries: vec![entry.clone()],
+            delete_predicates: vec![DeletePredicate {
+                id: 5,
+                sql: "id < 0".into(),
+                predicate: LakePredicate::Compare {
+                    column_id: 0,
+                    op: CompareOp::Lt,
+                    value: LakeValue::Int(0),
+                },
+                created_version: 3,
+                pending_rows: 0,
+            }],
+            properties: BTreeMap::new(),
+            indexes: Vec::new(),
+            index_files: Vec::new(),
+            type_history: vec![crate::manifest::PriorColumnType {
+                column_id: 0,
+                through_schema_id: 1,
+                type_id: TypeId::Int32,
+                fractional_digits: None,
+            }],
+        };
+        manifest.validate().expect("a valid manifest");
+
+        let reader = LakeFileReader::open_in(&manifest, &paths, 0x71).expect("open");
+        let column = reader
+            .read_column(&wide.columns[0])
+            .expect("widened id column");
+        assert_eq!(column.physical_type_id(), TypeId::Int64);
+        let mut seen: Vec<i64> = (0..reader.row_count())
+            .map(|r| {
+                let cell = column.cell(r).expect("a value");
+                assert_eq!(cell.len(), 8, "cells come back at the declared width");
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(cell);
+                i64::from_le_bytes(raw)
+            })
+            .collect();
+        seen.sort_unstable();
+        let mut expected: Vec<i64> = ids.iter().map(|v| *v as i64).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "every value survives the widening, sign included"
+        );
+
+        // The widened cells order the same way the narrow ones were sorted
+        assert!(reader.is_sorted_by(0));
+        let target = 3i64.to_le_bytes();
+        let range = column.sort_key_range_in(&target, 0..reader.row_count());
+        assert_eq!(range.len(), 1);
+        assert!(column.cell_equals(range.start, &target));
+
+        // Zone maps hold the cells as written, so they decide nothing here
+        assert_eq!(
+            reader
+                .zone_span_for_cells(&wide.columns[0], &[&target])
+                .expect("zones"),
+            ZoneVerdict::Undecided
+        );
+
+        // A delete predicate over the widened column removes exactly the
+        // rows it names, evaluated on the widened cells
+        let keep = reader
+            .delete_survivors(&wide, &manifest, &entry)
+            .expect("survivors");
+        let kept: Vec<i64> = (0..reader.row_count())
+            .filter(|r| keep[r / 8] & (1 << (r % 8)) != 0)
+            .map(|r| {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(column.cell(r).expect("a value"));
+                i64::from_le_bytes(raw)
+            })
+            .collect();
+        assert_eq!(kept, vec![3, i32::MAX as i64]);
+
+        // The file's own schema types the column as written, so a stored
+        // filter lowered against it answers on the stored bytes exactly
+        let file_schema = manifest.file_schema(&entry);
+        assert_eq!(
+            file_schema.column_by_id(0).map(|c| c.type_id),
+            Some(TypeId::Int32)
+        );
+        let filter = StoredFilter::lower(
+            &LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::GtEq,
+                value: LakeValue::Int(3),
+            },
+            &file_schema,
+        )
+        .expect("lowers");
+        assert!(filter.is_exact());
+        let mask = reader
+            .rows_matching(&filter)
+            .expect("stored filter")
+            .expect("a mask");
+        let matched: Vec<i64> = (0..reader.row_count())
+            .filter(|r| mask[r / 8] & (1 << (r % 8)) != 0)
+            .map(|r| {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(column.cell(r).expect("a value"));
+                i64::from_le_bytes(raw)
+            })
+            .collect();
+        assert_eq!(matched, vec![3, i32::MAX as i64]);
+    }
+
     #[test]
     fn test_delete_survivors_keep_unknown_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1689,6 +1958,7 @@ mod tests {
             properties: BTreeMap::new(),
             indexes: Vec::new(),
             index_files: Vec::new(),
+            type_history: Vec::new(),
         };
         let reader = LakeFileReader::open(&paths, 0x1).expect("open");
         let keep = reader

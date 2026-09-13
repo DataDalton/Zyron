@@ -1776,7 +1776,7 @@ async fn test_lake_change_records_come_from_the_log_with_no_capture_file() {
 
     let entry = server.catalog.get_table(schema_id, "c").expect("entry");
     let log = open_log(&server, &entry);
-    let records = zyron_wire::lake_changes::lake_change_records(&log, &entry, 1, u64::MAX)
+    let records = zyron_wire::lake_changes::lake_change_records(&log, &entry, 1, u64::MAX, true)
         .expect("change records");
 
     assert_eq!(records.len(), 3, "three inserted rows");
@@ -1802,7 +1802,7 @@ async fn test_lake_change_records_come_from_the_log_with_no_capture_file() {
     assert!(records[2].is_last_in_txn, "version three ends here");
 
     // A version range narrows the feed without re-reading the earlier ones
-    let later = zyron_wire::lake_changes::lake_change_records(&log, &entry, 3, u64::MAX)
+    let later = zyron_wire::lake_changes::lake_change_records(&log, &entry, 3, u64::MAX, true)
         .expect("change records");
     assert_eq!(later.len(), 1);
     assert_eq!(later[0].commit_version, 3);
@@ -1838,8 +1838,8 @@ async fn test_lake_update_and_delete_produce_paired_change_records() {
     let log = open_log(&server, &entry);
 
     // The update commit pairs pre and post images under one version
-    let update =
-        zyron_wire::lake_changes::lake_change_records(&log, &entry, 3, 3).expect("change records");
+    let update = zyron_wire::lake_changes::lake_change_records(&log, &entry, 3, 3, true)
+        .expect("change records");
     let pre: Vec<_> = update
         .iter()
         .filter(|r| r.change_type == zyron_cdc::ChangeType::UpdatePreimage)
@@ -1866,8 +1866,8 @@ async fn test_lake_update_and_delete_produce_paired_change_records() {
     );
 
     // The delete commit reports the removed row, not the surviving ones
-    let delete =
-        zyron_wire::lake_changes::lake_change_records(&log, &entry, 4, 4).expect("change records");
+    let delete = zyron_wire::lake_changes::lake_change_records(&log, &entry, 4, 4, true)
+        .expect("change records");
     assert_eq!(delete.len(), 1);
     assert_eq!(delete[0].change_type, zyron_cdc::ChangeType::Delete);
     assert_eq!(decode_id_tag(&delete[0].row_data).0, Some(9));

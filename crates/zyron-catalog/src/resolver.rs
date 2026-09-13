@@ -559,6 +559,25 @@ mod tests {
         async fn delete_collation(&self, _: u32) -> Result<bool> {
             unimplemented!()
         }
+        async fn load_change_streams(&self) -> Result<Vec<crate::schema::ChangeStreamEntry>> {
+            Ok(vec![])
+        }
+        async fn store_change_stream(
+            &self,
+            _: &crate::schema::ChangeStreamEntry,
+        ) -> Result<TupleId> {
+            Err(ZyronError::Internal(
+                "the resolver mock holds no change streams".into(),
+            ))
+        }
+        async fn update_change_stream(&self, _: &crate::schema::ChangeStreamEntry) -> Result<()> {
+            Err(ZyronError::Internal(
+                "the resolver mock holds no change streams".into(),
+            ))
+        }
+        async fn delete_change_stream(&self, _: u32) -> Result<bool> {
+            Ok(false)
+        }
         async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>> {
             Ok(vec![])
         }
@@ -782,6 +801,7 @@ mod tests {
                     schema_epoch: 1,
                     schema_epochs: Vec::new(),
                     pre_stamp_columns: Vec::new(),
+                    cdf: Default::default(),
                 },
                 TableEntry {
                     id: TableId(20),
@@ -809,6 +829,7 @@ mod tests {
                     schema_epoch: 1,
                     schema_epochs: Vec::new(),
                     pre_stamp_columns: Vec::new(),
+                    cdf: Default::default(),
                 },
             ],
         });

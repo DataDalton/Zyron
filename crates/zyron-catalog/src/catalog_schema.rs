@@ -205,6 +205,10 @@ const TABLES: &[Table] = &[
         name: "zyron_sys.core.resilience_policies",
         doc: "Bulkheads and retry policies",
     },
+    Table {
+        name: "zyron_sys.cdc.change_streams",
+        doc: "Change streams with their sources, position and mode",
+    },
 ];
 
 /// Submits one table's registration.
@@ -258,6 +262,7 @@ register_table!(29);
 register_table!(30);
 register_table!(31);
 register_table!(32);
+register_table!(33);
 
 /// How many catalog tables are registered
 pub const REGISTERED_TABLE_COUNT: usize = TABLES.len();
@@ -265,6 +270,16 @@ pub const REGISTERED_TABLE_COUNT: usize = TABLES.len();
 /// Every registered catalog table name
 pub fn table_names() -> Vec<&'static str> {
     TABLES.iter().map(|table| table.name).collect()
+}
+
+/// The version one catalog table's rows are written at, by name, None for
+/// a name that is not a registered table. The tables reshaped since the
+/// shared version stand above it and the rest at it
+pub fn table_version(name: &str) -> Option<FormatVersion> {
+    TABLES
+        .iter()
+        .position(|table| table.name == name)
+        .map(version_of)
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +383,7 @@ mod tests {
         for name in table_names() {
             assert!(registered.contains(name), "`{name}` is not registered");
         }
-        assert_eq!(REGISTERED_TABLE_COUNT, 33);
+        assert_eq!(REGISTERED_TABLE_COUNT, 34);
     }
 
     #[test]
@@ -466,6 +481,7 @@ mod tests {
             schema_epoch: 0,
             schema_epochs: Vec::new(),
             pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
         };
         entry.schema_epoch = 0;
         let mut row = entry.to_bytes();

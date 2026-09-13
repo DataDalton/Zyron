@@ -84,6 +84,8 @@ const COLLATIONS_HEAP_FILE_ID: u32 = 188;
 const COLLATIONS_FSM_FILE_ID: u32 = 189;
 const COUNTERS_HEAP_FILE_ID: u32 = 190;
 const COUNTERS_FSM_FILE_ID: u32 = 191;
+const CHANGE_STREAMS_HEAP_FILE_ID: u32 = 192;
+const CHANGE_STREAMS_FSM_FILE_ID: u32 = 193;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
@@ -153,11 +155,23 @@ fn scan_decode<T>(
     entity: &str,
     decode: impl Fn(&[u8]) -> Result<T>,
 ) -> Result<Vec<T>> {
+    scan_decode_rows(heap, entity, decode, |_, _| {})
+}
+
+/// `scan_decode` that also hands each decoded entry's row to `seen`, for a
+/// load that keeps where every row sits
+fn scan_decode_rows<T>(
+    heap: &HeapFile,
+    entity: &str,
+    decode: impl Fn(&[u8]) -> Result<T>,
+    mut seen: impl FnMut(TupleId, &T),
+) -> Result<Vec<T>> {
     let mut entries = Vec::new();
     let mut decode_err: Option<ZyronError> = None;
     let guard = heap.scan()?;
-    guard.try_for_each(|_tid, view| match decode(view.data) {
+    guard.try_for_each(|tid, view| match decode(view.data) {
         Ok(entry) => {
+            seen(tid, &entry);
             entries.push(entry);
             true
         }
@@ -173,6 +187,50 @@ fn scan_decode<T>(
         return Err(e);
     }
     Ok(entries)
+}
+
+/// Where each row of one heap sits, keyed by the object's id.
+///
+/// Filled by the load that reads the heap and by every store into it, so a
+/// delete or an update finds its row in one lookup rather than by decoding
+/// every row in the heap. An id the map does not name is looked for once in
+/// the heap by the id the row begins with, so a map that missed a row never
+/// reports an object that exists as gone
+#[derive(Default)]
+struct RowMap(parking_lot::Mutex<std::collections::HashMap<u32, TupleId>>);
+
+impl RowMap {
+    fn remember(&self, id: u32, tid: TupleId) {
+        self.0.lock().insert(id, tid);
+    }
+
+    fn replace(&self, rows: std::collections::HashMap<u32, TupleId>) {
+        *self.0.lock() = rows;
+    }
+
+    fn forget(&self, id: u32) -> Option<TupleId> {
+        self.0.lock().remove(&id)
+    }
+
+    /// The row holding the object, from the map or from one pass over the
+    /// heap comparing the id each row begins with. The map is left without
+    /// the id either way, since the caller is about to delete the row
+    fn take(&self, heap: &HeapFile, id: u32) -> Result<Option<TupleId>> {
+        if let Some(tid) = self.forget(id) {
+            return Ok(Some(tid));
+        }
+        let wanted = id.to_le_bytes();
+        let mut target = None;
+        let guard = heap.scan()?;
+        guard.try_for_each(|tid, view| {
+            if view.data.len() >= 4 && view.data[..4] == wanted {
+                target = Some(tid);
+                return false;
+            }
+            true
+        });
+        Ok(target)
+    }
 }
 
 /// Abstraction over catalog persistence.
@@ -355,6 +413,11 @@ pub trait CatalogStorage: Send + Sync {
     async fn store_collation(&self, entry: &CollationEntry) -> Result<TupleId>;
     async fn delete_collation(&self, id: u32) -> Result<bool>;
 
+    async fn load_change_streams(&self) -> Result<Vec<ChangeStreamEntry>>;
+    async fn store_change_stream(&self, entry: &ChangeStreamEntry) -> Result<TupleId>;
+    async fn update_change_stream(&self, entry: &ChangeStreamEntry) -> Result<()>;
+    async fn delete_change_stream(&self, id: u32) -> Result<bool>;
+
     // Streaming job operations
     async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>>;
     async fn store_streaming_job(&self, entry: &StreamingJobEntry) -> Result<TupleId>;
@@ -463,6 +526,11 @@ pub trait CatalogStorage: Send + Sync {
     /// Applied when a recorded high-water mark is above what the live rows
     /// show, which is what a file id belonging to a dropped table looks like
     fn raise_file_id_counters(&self, next_heap_file: u32, next_index_file: u32);
+
+    /// Attaches the log every page change is recorded in, so a catalog page
+    /// that has not reached disk when the process dies is put back from the
+    /// log. A storage with no pages records nothing
+    fn attach_wal(&self, _wal: &Arc<zyron_wal::WalWriter>) {}
 }
 
 /// Catalog storage backed by heap files (self-hosting).
@@ -471,8 +539,13 @@ pub struct HeapCatalogStorage {
     databases_heap: HeapFile,
     schemas_heap: HeapFile,
     tables_heap: HeapFile,
+    /// Where each table's row sits, so a drop or an update, which every
+    /// ALTER is, finds it without decoding every table in the catalog
+    table_rows: RowMap,
     columns_heap: HeapFile,
     indexes_heap: HeapFile,
+    /// Where each index's row sits, for the same reason
+    index_rows: RowMap,
     streaming_jobs_heap: HeapFile,
     external_sources_heap: HeapFile,
     external_sinks_heap: HeapFile,
@@ -502,6 +575,10 @@ pub struct HeapCatalogStorage {
     resilience_policies_heap: HeapFile,
     user_types_heap: HeapFile,
     collations_heap: HeapFile,
+    change_streams_heap: HeapFile,
+    /// Where each change stream's row sits in its heap, so an advance,
+    /// which rewrites the row on every consume, finds it without a scan
+    change_stream_rows: RowMap,
     /// Holds one row, the highest identifiers handed out. Kept apart from
     /// every other heap because it is state about the catalog rather than an
     /// object in it
@@ -793,6 +870,14 @@ impl HeapCatalogStorage {
                 fsm_file_id: COLLATIONS_FSM_FILE_ID,
             },
         )?;
+        let change_streams_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: CHANGE_STREAMS_HEAP_FILE_ID,
+                fsm_file_id: CHANGE_STREAMS_FSM_FILE_ID,
+            },
+        )?;
         let counters_heap = HeapFile::new(
             Arc::clone(&disk),
             Arc::clone(&pool),
@@ -806,8 +891,10 @@ impl HeapCatalogStorage {
             databases_heap,
             schemas_heap,
             tables_heap,
+            table_rows: RowMap::default(),
             columns_heap,
             indexes_heap,
+            index_rows: RowMap::default(),
             streaming_jobs_heap,
             external_sources_heap,
             external_sinks_heap,
@@ -837,6 +924,8 @@ impl HeapCatalogStorage {
             resilience_policies_heap,
             user_types_heap,
             collations_heap,
+            change_streams_heap,
+            change_stream_rows: RowMap::default(),
             counters_heap,
             counters_row: parking_lot::Mutex::new(None),
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
@@ -896,6 +985,7 @@ impl HeapCatalogStorage {
             self.resilience_policies_heap.init_cache(),
             self.user_types_heap.init_cache(),
             self.collations_heap.init_cache(),
+            self.change_streams_heap.init_cache(),
             self.counters_heap.init_cache(),
         )?;
         // The file id counters start at the bottom of the user range in a
@@ -970,6 +1060,48 @@ impl HeapCatalogStorage {
     /// The heap holding one registered catalog table's rows, by the
     /// three-part name the catalog schema registry uses. None for a table
     /// whose rows live outside these heaps
+    /// Every heap this storage writes, the counters row's included
+    fn heaps(&self) -> [&HeapFile; 36] {
+        [
+            &self.databases_heap,
+            &self.schemas_heap,
+            &self.tables_heap,
+            &self.columns_heap,
+            &self.indexes_heap,
+            &self.streaming_jobs_heap,
+            &self.external_sources_heap,
+            &self.external_sinks_heap,
+            &self.publications_heap,
+            &self.publication_tables_heap,
+            &self.subscriptions_heap,
+            &self.endpoints_heap,
+            &self.security_maps_heap,
+            &self.legal_holds_heap,
+            &self.retention_policies_heap,
+            &self.retention_jobs_heap,
+            &self.compliance_log_heap,
+            &self.sequences_heap,
+            &self.views_heap,
+            &self.mviews_heap,
+            &self.functions_heap,
+            &self.comments_heap,
+            &self.aggregates_heap,
+            &self.procedures_heap,
+            &self.schedules_heap,
+            &self.triggers_heap,
+            &self.pipelines_heap,
+            &self.event_handlers_heap,
+            &self.version_tags_heap,
+            &self.analyzers_heap,
+            &self.synonym_dictionaries_heap,
+            &self.resilience_policies_heap,
+            &self.user_types_heap,
+            &self.collations_heap,
+            &self.change_streams_heap,
+            &self.counters_heap,
+        ]
+    }
+
     fn heap_for_table(&self, catalog_table: &str) -> Option<&HeapFile> {
         let heap = match catalog_table.to_ascii_lowercase().as_str() {
             "zyron_sys.core.databases" => &self.databases_heap,
@@ -992,6 +1124,7 @@ impl HeapCatalogStorage {
             "zyron_sys.external_table.sinks" => &self.external_sinks_heap,
             "zyron_sys.cdc.publications" => &self.publications_heap,
             "zyron_sys.cdc.subscriptions" => &self.subscriptions_heap,
+            "zyron_sys.cdc.change_streams" => &self.change_streams_heap,
             "zyron_sys.core.endpoints" => &self.endpoints_heap,
             "zyron_sys.security.security_maps" => &self.security_maps_heap,
             "zyron_sys.compliance.legal_holds" => &self.legal_holds_heap,
@@ -1015,6 +1148,12 @@ impl HeapCatalogStorage {
 impl CatalogStorage for HeapCatalogStorage {
     fn data_dir(&self) -> Option<&std::path::Path> {
         Some(self.disk.data_dir())
+    }
+
+    fn attach_wal(&self, wal: &Arc<zyron_wal::WalWriter>) {
+        for heap in self.heaps() {
+            heap.attach_wal(wal);
+        }
     }
 
     async fn raw_rows(&self, catalog_table: &str) -> Result<Vec<Vec<u8>>> {
@@ -1132,6 +1271,8 @@ impl CatalogStorage for HeapCatalogStorage {
             USER_TYPES_FSM_FILE_ID,
             COLLATIONS_HEAP_FILE_ID,
             COLLATIONS_FSM_FILE_ID,
+            CHANGE_STREAMS_HEAP_FILE_ID,
+            CHANGE_STREAMS_FSM_FILE_ID,
             COUNTERS_HEAP_FILE_ID,
             COUNTERS_FSM_FILE_ID,
         ]
@@ -1214,7 +1355,17 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_tables(&self) -> Result<Vec<TableEntry>> {
-        scan_decode(&self.tables_heap, "table", TableEntry::from_bytes)
+        let mut rows = std::collections::HashMap::new();
+        let entries = scan_decode_rows(
+            &self.tables_heap,
+            "table",
+            TableEntry::from_bytes,
+            |tid, entry| {
+                rows.insert(entry.id.0, tid);
+            },
+        )?;
+        self.table_rows.replace(rows);
+        Ok(entries)
     }
 
     async fn load_table_by_name(
@@ -1225,9 +1376,10 @@ impl CatalogStorage for HeapCatalogStorage {
         let guard = self.tables_heap.scan()?;
         let mut found = None;
         let mut decode_err: Option<ZyronError> = None;
-        guard.try_for_each(|_tid, view| match TableEntry::from_bytes(view.data) {
+        guard.try_for_each(|tid, view| match TableEntry::from_bytes(view.data) {
             Ok(entry) => {
                 if entry.schema_id == schema_id && entry.name == name {
+                    self.table_rows.remember(entry.id.0, tid);
                     found = Some(entry);
                     return false; // stop scanning at the first match
                 }
@@ -1251,20 +1403,16 @@ impl CatalogStorage for HeapCatalogStorage {
         let bytes = entry.to_bytes();
         let tuple = Tuple::new(bytes, 0);
         let ids = self.tables_heap.insert_batch(&[tuple]).await?;
-        Ok(ids[0])
+        let tid = ids
+            .first()
+            .copied()
+            .ok_or_else(|| ZyronError::Internal("the table row was not inserted".into()))?;
+        self.table_rows.remember(entry.id.0, tid);
+        Ok(tid)
     }
 
     async fn delete_table(&self, id: TableId) -> Result<bool> {
-        let mut target = None;
-        let guard = self.tables_heap.scan()?;
-        guard.for_each(|tid, view| {
-            if let Ok(entry) = TableEntry::from_bytes(view.data) {
-                if entry.id == id {
-                    target = Some(tid);
-                }
-            }
-        });
-        match target {
+        match self.table_rows.take(&self.tables_heap, id.0)? {
             Some(tid) => self.tables_heap.delete(tid).await,
             None => Ok(false),
         }
@@ -1305,27 +1453,33 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_indexes(&self) -> Result<Vec<IndexEntry>> {
-        scan_decode(&self.indexes_heap, "index", IndexEntry::from_bytes)
+        let mut rows = std::collections::HashMap::new();
+        let entries = scan_decode_rows(
+            &self.indexes_heap,
+            "index",
+            IndexEntry::from_bytes,
+            |tid, entry| {
+                rows.insert(entry.id.0, tid);
+            },
+        )?;
+        self.index_rows.replace(rows);
+        Ok(entries)
     }
 
     async fn store_index(&self, entry: &IndexEntry) -> Result<TupleId> {
         let bytes = entry.to_bytes();
         let tuple = Tuple::new(bytes, 0);
         let ids = self.indexes_heap.insert_batch(&[tuple]).await?;
-        Ok(ids[0])
+        let tid = ids
+            .first()
+            .copied()
+            .ok_or_else(|| ZyronError::Internal("the index row was not inserted".into()))?;
+        self.index_rows.remember(entry.id.0, tid);
+        Ok(tid)
     }
 
     async fn delete_index(&self, id: IndexId) -> Result<bool> {
-        let mut target = None;
-        let guard = self.indexes_heap.scan()?;
-        guard.for_each(|tid, view| {
-            if let Ok(entry) = IndexEntry::from_bytes(view.data) {
-                if entry.id == id {
-                    target = Some(tid);
-                }
-            }
-        });
-        match target {
+        match self.index_rows.take(&self.indexes_heap, id.0)? {
             Some(tid) => self.indexes_heap.delete(tid).await,
             None => Ok(false),
         }
@@ -2053,6 +2207,60 @@ impl CatalogStorage for HeapCatalogStorage {
         });
         match target {
             Some(tid) => self.collations_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_change_streams(&self) -> Result<Vec<ChangeStreamEntry>> {
+        let mut entries = Vec::new();
+        let mut rows = std::collections::HashMap::new();
+        let mut decode_err: Option<ZyronError> = None;
+        let guard = self.change_streams_heap.scan()?;
+        guard.try_for_each(|tid, view| match ChangeStreamEntry::from_bytes(view.data) {
+            Ok(entry) => {
+                rows.insert(entry.id, tid);
+                entries.push(entry);
+                true
+            }
+            Err(e) => {
+                decode_err = Some(ZyronError::CatalogCorrupted(format!(
+                    "change stream catalog tuple failed to decode: {}",
+                    e
+                )));
+                false
+            }
+        });
+        drop(guard);
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
+        self.change_stream_rows.replace(rows);
+        Ok(entries)
+    }
+
+    async fn store_change_stream(&self, entry: &ChangeStreamEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.change_streams_heap.insert_batch(&[tuple]).await?;
+        let tid = ids
+            .first()
+            .copied()
+            .ok_or_else(|| ZyronError::Internal("the change stream row was not inserted".into()))?;
+        self.change_stream_rows.remember(entry.id, tid);
+        Ok(tid)
+    }
+
+    async fn update_change_stream(&self, entry: &ChangeStreamEntry) -> Result<()> {
+        self.delete_change_stream(entry.id).await?;
+        self.store_change_stream(entry).await?;
+        Ok(())
+    }
+
+    async fn delete_change_stream(&self, id: u32) -> Result<bool> {
+        match self
+            .change_stream_rows
+            .take(&self.change_streams_heap, id)?
+        {
+            Some(tid) => self.change_streams_heap.delete(tid).await,
             None => Ok(false),
         }
     }

@@ -110,6 +110,13 @@ impl<'a> Parser<'a> {
             // table called `rotate` or `list` keeps working everywhere else
             Token::Ident(word) if word.eq_ignore_ascii_case("rotate") => self.parse_rotate(),
             Token::Ident(word) if word.eq_ignore_ascii_case("list") => self.parse_list_registry(),
+            // APPLY and CHANGES are matched as soft keywords, so a column or
+            // a table called `apply` or `changes` keeps working everywhere else
+            Token::Ident(word)
+                if word.eq_ignore_ascii_case("apply") && self.peek_is_ident("changes") =>
+            {
+                self.parse_apply_changes()
+            }
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -1418,7 +1425,45 @@ impl<'a> Parser<'a> {
         // A post-qualifier alias wins when present, otherwise the one taken
         // before it, the '<table> <alias> AS OF <expr>' form
         let alias = post_alias.or(pre_qualifier_alias);
-        Ok(TableRef::Table { name, alias, as_of })
+        // Read options the relation carries, as in '<stream> WITH (peek =>
+        // true)'. A parenthesis is required after WITH, so a relation named
+        // `with` and a WITH clause opening a following statement both keep
+        // parsing as what they are
+        let options = if self.at_keyword(Keyword::With) && self.peek.token == Token::LParen {
+            self.advance()?;
+            self.advance()?;
+            let options = self.parse_comma_separated(|p| p.parse_read_option())?;
+            self.expect_token(&Token::RParen)?;
+            options
+        } else {
+            Vec::new()
+        };
+        Ok(TableRef::Table {
+            name,
+            alias,
+            as_of,
+            options,
+        })
+    }
+
+    /// One `key => value` or `key = value` pair inside a relation's read
+    /// options
+    fn parse_read_option(&mut self) -> Result<TableOption> {
+        let key = self.parse_ident()?;
+        if !self.consume_token_if(&Token::FatArrow)? {
+            self.expect_token(&Token::Eq)?;
+        }
+        let value = self.parse_table_option_value()?;
+        Ok(TableOption { key, value })
+    }
+
+    /// Consumes a token when it is the one given, reporting whether it was
+    fn consume_token_if(&mut self, token: &Token) -> Result<bool> {
+        if self.at_token(token) {
+            self.advance()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn is_clause_keyword(&self) -> bool {
@@ -1675,6 +1720,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Version) => self.parse_create_version(),
             Token::Keyword(Keyword::Replication) => self.parse_create_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_create_cdc(),
+            Token::Keyword(Keyword::Change) => self.parse_create_change_stream(),
             Token::Keyword(Keyword::External) => self.parse_create_external(),
             Token::Keyword(Keyword::Publication) => self.parse_create_publication(),
             Token::Keyword(Keyword::Trigger) => self.parse_create_trigger(),
@@ -2036,6 +2082,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Version) => self.parse_drop_version(),
             Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_drop_cdc(),
+            Token::Keyword(Keyword::Change) => self.parse_drop_change_stream(),
             Token::Keyword(Keyword::Streaming) => self.parse_drop_streaming_job(),
             Token::Keyword(Keyword::External) => self.parse_drop_external(),
             Token::Keyword(Keyword::Publication) => self.parse_drop_publication(),
@@ -2111,6 +2158,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::System) => self.parse_alter_system(),
             Token::Keyword(Keyword::Cluster) => self.parse_alter_cluster(),
             Token::Keyword(Keyword::Publication) => self.parse_alter_publication(),
+            Token::Keyword(Keyword::Change) => self.parse_alter_change_stream(),
             Token::Keyword(Keyword::Streaming) => self.parse_alter_streaming_job(),
             Token::Keyword(Keyword::External) => self.parse_alter_external(),
             Token::Keyword(Keyword::Endpoint) => self.parse_alter_endpoint(),
@@ -2465,7 +2513,22 @@ impl<'a> Parser<'a> {
                     }
                 } else if self.consume_keyword(Keyword::Type)? {
                     let data_type = self.parse_data_type()?;
-                    AlterTableOperation::AlterColumnSetType { column, data_type }
+                    // A narrowing change on a table with change streams needs
+                    // the operator to say they know the streams will need
+                    // attention afterward
+                    let acknowledge_stream_break =
+                        if self.consume_ident_ignore_case("acknowledge")? {
+                            self.expect_keyword(Keyword::Stream)?;
+                            self.expect_ident_ignore_case("break")?;
+                            true
+                        } else {
+                            false
+                        };
+                    AlterTableOperation::AlterColumnSetType {
+                        column,
+                        data_type,
+                        acknowledge_stream_break,
+                    }
                 } else {
                     return Err(self.error("Expected SET, DROP, or TYPE after ALTER COLUMN name"));
                 }
@@ -4645,6 +4708,12 @@ impl<'a> Parser<'a> {
             let name = self.parse_ident()?;
             return Ok(GrantObject::Endpoint(name));
         }
+        if self.at_keyword(Keyword::Change) {
+            self.advance()?;
+            self.expect_keyword(Keyword::Stream)?;
+            let name = self.parse_qualified_name()?;
+            return Ok(GrantObject::ChangeStream(name));
+        }
         self.consume_keyword(Keyword::Table)?;
         let name = self.parse_qualified_name()?;
         Ok(GrantObject::Table(name))
@@ -4702,6 +4771,21 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Invoke) => {
                 p.advance()?;
                 Ok(Privilege::Invoke)
+            }
+            // PEEK, MANAGE and MANAGE_CHANGE_FEEDS are matched as soft
+            // keywords, so a column or a table called `peek` or `manage`
+            // keeps working everywhere else
+            Token::Ident(word) if word.eq_ignore_ascii_case("peek") => {
+                p.advance()?;
+                Ok(Privilege::Peek)
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("manage") => {
+                p.advance()?;
+                Ok(Privilege::Manage)
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("manage_change_feeds") => {
+                p.advance()?;
+                Ok(Privilege::ManageChangeFeeds)
             }
             _ => Err(p.error(&format!("Expected privilege, found {}", p.current.token))),
         })
@@ -5199,6 +5283,38 @@ impl<'a> Parser<'a> {
             return Ok(Statement::ShowUpgrade(Box::new(ShowUpgradeStatement {
                 target: ShowUpgradeTarget::FormatMigrations { format_kind },
             })));
+        }
+        // SHOW CHANGE STREAMS lists the change streams on this node, and the
+        // singular form reads one by name. Both read catalog state rather
+        // than a session variable, so both branch before the variable name.
+        // STREAMS is matched as a soft keyword
+        if self.at_keyword(Keyword::Change)
+            && (self.peek.token == Token::Keyword(Keyword::Stream)
+                || matches!(&self.peek.token, Token::Ident(w) if w.eq_ignore_ascii_case("streams")))
+        {
+            self.advance()?;
+            if self.consume_ident_ignore_case("streams")? {
+                let on_table = if self.consume_keyword(Keyword::On)? {
+                    self.expect_keyword(Keyword::Table)?;
+                    Some(self.parse_qualified_name()?)
+                } else {
+                    None
+                };
+                return Ok(Statement::ShowChangeStreams(Box::new(
+                    ShowChangeStreamsStatement {
+                        name: None,
+                        on_table,
+                    },
+                )));
+            }
+            self.expect_keyword(Keyword::Stream)?;
+            let name = self.parse_qualified_name()?;
+            return Ok(Statement::ShowChangeStreams(Box::new(
+                ShowChangeStreamsStatement {
+                    name: Some(name),
+                    on_table: None,
+                },
+            )));
         }
         // SHOW CLUSTERING FOR <table> reads state that belongs to a table
         // rather than to the session, so it names its object
@@ -6255,6 +6371,12 @@ impl<'a> Parser<'a> {
     fn parse_table_option(&mut self) -> Result<TableOption> {
         let key = self.parse_ident()?;
         self.expect_token(&Token::Eq)?;
+        let value = self.parse_table_option_value()?;
+        Ok(TableOption { key, value })
+    }
+
+    /// The value half of an option pair, whichever separator wrote it
+    fn parse_table_option_value(&mut self) -> Result<TableOptionValue> {
         let value = match &self.current.token {
             Token::String(s) => {
                 let v = TableOptionValue::String(s.clone());
@@ -6291,7 +6413,7 @@ impl<'a> Parser<'a> {
                 TableOptionValue::Identifier(ident)
             }
         };
-        Ok(TableOption { key, value })
+        Ok(value)
     }
 
     /// Parses a bracketed string list: ['a', 'b', 'c']
@@ -6805,12 +6927,52 @@ impl<'a> Parser<'a> {
     fn parse_create_pipeline(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Pipeline)?;
         let name = self.parse_ident()?;
+        let trigger = if self.consume_keyword(Keyword::On)? {
+            self.expect_keyword(Keyword::Change)?;
+            self.expect_keyword(Keyword::Data)?;
+            self.expect_keyword(Keyword::From)?;
+            let stream = self.parse_qualified_name()?;
+            let mut min_rows = 1u64;
+            let mut max_wait = None;
+            loop {
+                if self.at_ident_ignore_case("min")
+                    && self.peek.token == Token::Keyword(Keyword::Rows)
+                {
+                    self.advance()?;
+                    self.advance()?;
+                    let n = self.parse_integer_value()?;
+                    if n <= 0 {
+                        return Err(self.error("MIN ROWS takes a whole number above zero"));
+                    }
+                    min_rows = n as u64;
+                    continue;
+                }
+                if self.at_keyword(Keyword::Max) && self.peek_is_ident("wait") {
+                    self.advance()?;
+                    self.advance()?;
+                    max_wait = Some(self.parse_ttl_duration()?);
+                    continue;
+                }
+                break;
+            }
+            Some(ChangeDataTrigger {
+                stream,
+                min_rows,
+                max_wait,
+            })
+        } else {
+            None
+        };
         self.expect_keyword(Keyword::As)?;
         self.expect_token(&Token::LParen)?;
         let stages = self.parse_comma_separated(|p| p.parse_pipeline_stage())?;
         self.expect_token(&Token::RParen)?;
         Ok(Statement::CreatePipeline(Box::new(
-            CreatePipelineStatement { name, stages },
+            CreatePipelineStatement {
+                name,
+                trigger,
+                stages,
+            },
         )))
     }
 
@@ -7041,6 +7203,40 @@ impl<'a> Parser<'a> {
         let name = self.parse_ident()?;
         self.expect_token(&Token::LParen)?;
 
+        // A stage over a change stream carries the statement's own clauses,
+        // so APPLY CHANGES reads the same inside a stage as on its own and
+        // CONSUME CHANGES names the stream, a bound, and where the changes go
+        if self.at_ident_ignore_case("apply") && self.peek_is_ident("changes") {
+            let Statement::ApplyChanges(apply) = self.parse_apply_changes()? else {
+                return Err(self.error("Expected APPLY CHANGES in STAGE"));
+            };
+            self.expect_token(&Token::RParen)?;
+            return Ok(PipelineStage {
+                name,
+                source: apply.source_name(),
+                target: apply.target.clone(),
+                mode: None,
+                transform: None,
+                expectations: vec![],
+                changes: Some(ChangeStage::Apply(apply)),
+            });
+        }
+        if self.at_ident_ignore_case("consume") && self.peek_is_ident("changes") {
+            self.advance()?;
+            self.advance()?;
+            let consume = self.parse_consume_changes_stage()?;
+            self.expect_token(&Token::RParen)?;
+            return Ok(PipelineStage {
+                name,
+                source: consume.stream.clone(),
+                target: consume.into.clone().unwrap_or_default(),
+                mode: None,
+                transform: None,
+                expectations: vec![],
+                changes: Some(ChangeStage::Consume(consume)),
+            });
+        }
+
         let mut source = String::new();
         let mut target = String::new();
         let mut mode = None;
@@ -7087,6 +7283,48 @@ impl<'a> Parser<'a> {
             mode,
             transform,
             expectations,
+            changes: None,
+        })
+    }
+
+    /// The body of a CONSUME CHANGES stage, after the two opening words:
+    /// `FROM stream [MAX ROWS n] (INTO relation | AS (statement))`
+    fn parse_consume_changes_stage(&mut self) -> Result<ConsumeChangesStage> {
+        self.expect_keyword(Keyword::From)?;
+        let stream = self.parse_qualified_name()?;
+        let max_rows =
+            if self.at_keyword(Keyword::Max) && self.peek.token == Token::Keyword(Keyword::Rows) {
+                self.advance()?;
+                self.advance()?;
+                match self.parse_expr()? {
+                    Expr::Literal(LiteralValue::Integer(n)) if n > 0 => Some(n as u64),
+                    other => {
+                        return Err(self.error(&format!(
+                            "MAX ROWS takes a whole number above zero, found {other:?}"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+        if self.consume_keyword(Keyword::Into)? {
+            let into = self.parse_qualified_name()?;
+            return Ok(ConsumeChangesStage {
+                stream,
+                max_rows,
+                into: Some(into),
+                statement: None,
+            });
+        }
+        self.expect_keyword(Keyword::As)?;
+        self.expect_token(&Token::LParen)?;
+        let statement = self.parse_statement()?;
+        self.expect_token(&Token::RParen)?;
+        Ok(ConsumeChangesStage {
+            stream,
+            max_rows,
+            into: None,
+            statement: Some(Box::new(statement)),
         })
     }
 
@@ -7585,11 +7823,327 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `CREATE CHANGE STREAM <name> ON TABLE <t> | ON TABLES (...) | ON VIEW
+    /// <v> [AT VERSION <n> | AT TIMESTAMP <ts> | SHOW INITIAL ROWS]
+    /// [APPEND_ONLY] [WHERE <predicate>] [COLUMNS (<c>, ...)]`
+    ///
+    /// APPEND_ONLY, INITIAL and ROWS are matched as soft keywords, so a
+    /// column or a table carrying one of those names keeps working
+    fn parse_create_change_stream(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Change)?;
+        self.expect_keyword(Keyword::Stream)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_qualified_name()?;
+        self.expect_keyword(Keyword::On)?;
+
+        let target = if self.consume_keyword(Keyword::Table)? {
+            ChangeStreamTarget::Table(self.parse_qualified_name()?)
+        } else if self.consume_keyword(Keyword::View)? {
+            ChangeStreamTarget::View(self.parse_qualified_name()?)
+        } else if self.consume_ident_ignore_case("tables")? {
+            self.expect_token(&Token::LParen)?;
+            let names = self.parse_comma_separated(|p| p.parse_qualified_name())?;
+            self.expect_token(&Token::RParen)?;
+            ChangeStreamTarget::Tables(names)
+        } else {
+            return Err(self.error(&format!(
+                "Expected TABLE, TABLES or VIEW after ON in CREATE CHANGE STREAM, found {}",
+                self.current.token
+            )));
+        };
+
+        let start = if self.consume_keyword(Keyword::At)? {
+            if self.consume_keyword(Keyword::Version)? {
+                ChangeStreamStart::Version(self.parse_expr()?)
+            } else if self.consume_keyword(Keyword::Timestamp)? {
+                ChangeStreamStart::Timestamp(self.parse_expr()?)
+            } else {
+                return Err(self.error(&format!(
+                    "Expected VERSION or TIMESTAMP after AT in CREATE CHANGE STREAM, found {}",
+                    self.current.token
+                )));
+            }
+        } else if self.at_keyword(Keyword::Show) && self.peek_is_ident("initial") {
+            self.advance()?;
+            self.expect_ident_ignore_case("initial")?;
+            self.expect_keyword(Keyword::Rows)?;
+            ChangeStreamStart::InitialRows
+        } else {
+            ChangeStreamStart::Now
+        };
+
+        let append_only = self.consume_ident_ignore_case("append_only")?;
+
+        let predicate = if self.consume_keyword(Keyword::Where)? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let columns = if self.consume_keyword(Keyword::Columns)? {
+            self.expect_token(&Token::LParen)?;
+            let names = self.parse_comma_separated(|p| p.parse_ident())?;
+            self.expect_token(&Token::RParen)?;
+            names
+        } else {
+            Vec::new()
+        };
+
+        Ok(Statement::CreateChangeStream(Box::new(
+            CreateChangeStreamStatement {
+                name,
+                if_not_exists,
+                target,
+                start,
+                append_only,
+                predicate,
+                columns,
+            },
+        )))
+    }
+
+    /// `ALTER CHANGE STREAM <name> RESET [TO VERSION <n> | TO TIMESTAMP <ts>
+    /// | TO LATEST]`, or `SET COLUMNS (<c>, ...)`, or `SET ALL COLUMNS`
+    fn parse_alter_change_stream(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Change)?;
+        self.expect_keyword(Keyword::Stream)?;
+        let name = self.parse_qualified_name()?;
+
+        let action = if self.consume_keyword(Keyword::Reset)? {
+            if self.consume_keyword(Keyword::To)? {
+                if self.consume_keyword(Keyword::Version)? {
+                    AlterChangeStreamAction::ResetToVersion(self.parse_expr()?)
+                } else if self.consume_keyword(Keyword::Timestamp)? {
+                    AlterChangeStreamAction::ResetToTimestamp(self.parse_expr()?)
+                } else if self.consume_ident_ignore_case("latest")? {
+                    AlterChangeStreamAction::ResetToLatest
+                } else if self.consume_ident_ignore_case("earliest")? {
+                    AlterChangeStreamAction::Reset
+                } else if self.consume_ident_ignore_case("position")? {
+                    AlterChangeStreamAction::ResetToPosition(self.parse_expr()?)
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected VERSION, TIMESTAMP, POSITION, EARLIEST or LATEST after TO in \
+                         ALTER CHANGE STREAM, found {}",
+                        self.current.token
+                    )));
+                }
+            } else {
+                AlterChangeStreamAction::Reset
+            }
+        } else if self.consume_keyword(Keyword::Set)? {
+            if self.consume_keyword(Keyword::All)? {
+                self.expect_keyword(Keyword::Columns)?;
+                AlterChangeStreamAction::SetAllColumns
+            } else {
+                self.expect_keyword(Keyword::Columns)?;
+                self.expect_token(&Token::LParen)?;
+                let names = self.parse_comma_separated(|p| p.parse_ident())?;
+                self.expect_token(&Token::RParen)?;
+                AlterChangeStreamAction::SetColumns(names)
+            }
+        } else {
+            return Err(self.error(&format!(
+                "Expected RESET or SET after ALTER CHANGE STREAM <name>, found {}",
+                self.current.token
+            )));
+        };
+
+        Ok(Statement::AlterChangeStream(Box::new(
+            AlterChangeStreamStatement { name, action },
+        )))
+    }
+
+    /// `DROP CHANGE STREAM [IF EXISTS] <name>`
+    fn parse_drop_change_stream(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Change)?;
+        self.expect_keyword(Keyword::Stream)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_qualified_name()?;
+        Ok(Statement::DropChangeStream(Box::new(
+            DropChangeStreamStatement { name, if_exists },
+        )))
+    }
+
+    /// `APPLY CHANGES INTO <target> FROM <source> KEYS (...) [SEQUENCE BY ...]
+    /// [IGNORE NULL UPDATES] [APPLY AS DELETE WHEN ...]
+    /// [APPLY AS TRUNCATE WHEN ...] [EXCEPT COLUMNS (...)]
+    /// [STORED AS SCD TYPE 1 | 2] [TRACK HISTORY ON (...) | EXCEPT (...)]`
+    ///
+    /// APPLY, CHANGES, KEYS, SCD, TRACK and HISTORY are matched as soft
+    /// keywords, so a relation or a column carrying one of those names keeps
+    /// working everywhere else
+    fn parse_apply_changes(&mut self) -> Result<Statement> {
+        self.expect_ident_ignore_case("apply")?;
+        self.expect_ident_ignore_case("changes")?;
+        self.expect_keyword(Keyword::Into)?;
+        let target = self.parse_qualified_name()?;
+        self.expect_keyword(Keyword::From)?;
+
+        // The source is parsed without an alias, because KEYS follows it and
+        // a relation's alias slot would take that word instead. A bare name
+        // resolves to a change stream when one carries it and to a relation
+        // otherwise, which the binder decides
+        let source = if self.at_token(&Token::LParen) {
+            ApplySource::Relation(Box::new(self.parse_base_table_ref()?))
+        } else {
+            let name = self.parse_qualified_name()?;
+            if self.at_token(&Token::LParen) {
+                self.advance()?;
+                let args = if self.at_token(&Token::RParen) {
+                    Vec::new()
+                } else {
+                    self.parse_comma_separated(|p| p.parse_function_arg())?
+                };
+                self.expect_token(&Token::RParen)?;
+                ApplySource::Relation(Box::new(TableRef::TableFunction(Box::new(
+                    crate::ast::TableFunctionRef {
+                        name,
+                        args,
+                        alias: None,
+                    },
+                ))))
+            } else {
+                ApplySource::Named(name)
+            }
+        };
+
+        self.expect_ident_ignore_case("keys")?;
+        self.expect_token(&Token::LParen)?;
+        let keys = self.parse_comma_separated(|p| p.parse_ident())?;
+        self.expect_token(&Token::RParen)?;
+
+        let mut sequence_by = None;
+        let mut ignore_null_updates = false;
+        let mut delete_when = None;
+        let mut truncate_when = None;
+        let mut except_columns = Vec::new();
+        let mut scd = ScdKind::Type1;
+        let mut track_history = None;
+
+        loop {
+            if self.at_keyword(Keyword::Sequence) && self.peek.token == Token::Keyword(Keyword::By)
+            {
+                self.advance()?;
+                self.advance()?;
+                sequence_by = Some(self.parse_expr()?);
+                continue;
+            }
+            if self.at_ident_ignore_case("ignore") {
+                self.advance()?;
+                self.expect_keyword(Keyword::Null)?;
+                self.expect_ident_ignore_case("updates")?;
+                ignore_null_updates = true;
+                continue;
+            }
+            if self.at_ident_ignore_case("apply") {
+                self.advance()?;
+                self.expect_keyword(Keyword::As)?;
+                if self.consume_keyword(Keyword::Delete)? {
+                    self.expect_keyword(Keyword::When)?;
+                    delete_when = Some(self.parse_expr()?);
+                } else if self.consume_keyword(Keyword::Truncate)? {
+                    self.expect_keyword(Keyword::When)?;
+                    truncate_when = Some(self.parse_expr()?);
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected DELETE or TRUNCATE after APPLY AS, found {}",
+                        self.current.token
+                    )));
+                }
+                continue;
+            }
+            if self.at_keyword(Keyword::Except)
+                && self.peek.token == Token::Keyword(Keyword::Columns)
+            {
+                self.advance()?;
+                self.advance()?;
+                self.expect_token(&Token::LParen)?;
+                except_columns = self.parse_comma_separated(|p| p.parse_ident())?;
+                self.expect_token(&Token::RParen)?;
+                continue;
+            }
+            if self.at_keyword(Keyword::Stored) {
+                self.advance()?;
+                self.expect_keyword(Keyword::As)?;
+                self.expect_ident_ignore_case("scd")?;
+                self.expect_keyword(Keyword::Type)?;
+                scd = match self.parse_expr()? {
+                    Expr::Literal(LiteralValue::Integer(1)) => ScdKind::Type1,
+                    Expr::Literal(LiteralValue::Integer(2)) => ScdKind::Type2,
+                    other => {
+                        return Err(self.error(&format!(
+                            "STORED AS SCD TYPE accepts 1 or 2, found {other:?}"
+                        )));
+                    }
+                };
+                continue;
+            }
+            if self.at_ident_ignore_case("track") && self.peek_is_ident("history") {
+                self.advance()?;
+                self.advance()?;
+                if self.consume_keyword(Keyword::On)? {
+                    self.expect_token(&Token::LParen)?;
+                    let names = self.parse_comma_separated(|p| p.parse_ident())?;
+                    self.expect_token(&Token::RParen)?;
+                    track_history = Some(TrackHistoryClause::On(names));
+                } else if self.consume_keyword(Keyword::Except)? {
+                    self.expect_token(&Token::LParen)?;
+                    let names = self.parse_comma_separated(|p| p.parse_ident())?;
+                    self.expect_token(&Token::RParen)?;
+                    track_history = Some(TrackHistoryClause::Except(names));
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected ON or EXCEPT after TRACK HISTORY, found {}",
+                        self.current.token
+                    )));
+                }
+                continue;
+            }
+            break;
+        }
+
+        Ok(Statement::ApplyChanges(Box::new(ApplyChangesStatement {
+            target,
+            source,
+            keys,
+            sequence_by,
+            ignore_null_updates,
+            delete_when,
+            truncate_when,
+            except_columns,
+            scd,
+            track_history,
+        })))
+    }
+
     fn parse_create_cdc_stream(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Stream)?;
         let name = self.parse_ident()?;
-        self.expect_keyword(Keyword::On)?;
-        let table_name = self.parse_qualified_name()?;
+        // ON [TABLE] <table> delivers the table's changes through a change
+        // stream named after this one. FROM CHANGE STREAM <s> delivers
+        // through a stream that already exists, which is where the position
+        // is visible either way
+        let (table_name, change_stream) = if self.consume_keyword(Keyword::From)? {
+            self.expect_keyword(Keyword::Change)?;
+            self.expect_keyword(Keyword::Stream)?;
+            (String::new(), Some(self.parse_qualified_name()?))
+        } else {
+            self.expect_keyword(Keyword::On)?;
+            let _ = self.consume_keyword(Keyword::Table)?;
+            (self.parse_qualified_name()?, None)
+        };
         self.expect_keyword(Keyword::To)?;
         let sink_type = self.parse_ident()?;
         let mut options = vec![];
@@ -7602,6 +8156,7 @@ impl<'a> Parser<'a> {
             CreateCdcStreamStatement {
                 name,
                 table_name,
+                change_stream,
                 sink_type,
                 options,
             },
@@ -11234,8 +11789,22 @@ mod tests {
             Statement::AlterTable(at) => {
                 assert!(matches!(
                     at.operation,
-                    AlterTableOperation::AlterColumnSetType { ref column, ref data_type }
+                    AlterTableOperation::AlterColumnSetType { ref column, ref data_type, acknowledge_stream_break: false }
                     if column == "age" && *data_type == DataType::BigInt
+                ));
+            }
+            _ => panic!("Expected ALTER TABLE"),
+        }
+        let stmt =
+            parse_one("ALTER TABLE users ALTER COLUMN age TYPE SMALLINT ACKNOWLEDGE STREAM BREAK");
+        match stmt {
+            Statement::AlterTable(at) => {
+                assert!(matches!(
+                    at.operation,
+                    AlterTableOperation::AlterColumnSetType {
+                        acknowledge_stream_break: true,
+                        ..
+                    }
                 ));
             }
             _ => panic!("Expected ALTER TABLE"),
@@ -14487,7 +15056,9 @@ mod tests {
         for (sql, want_alias, want_qualifier) in cases {
             match parse_one(sql) {
                 Statement::Select(s) => match &s.from[0] {
-                    TableRef::Table { name, alias, as_of } => {
+                    TableRef::Table {
+                        name, alias, as_of, ..
+                    } => {
                         assert_eq!(name, "t", "{sql}");
                         assert_eq!(alias.as_deref(), want_alias, "{sql}");
                         assert_eq!(as_of.is_some(), want_qualifier, "{sql}");
@@ -14701,6 +15272,95 @@ mod tests {
             }
             _ => panic!("Expected CREATE PIPELINE"),
         }
+    }
+
+    /// A stage over a change stream carries the statement's own clauses,
+    /// and both forms write back as they were read
+    #[test]
+    fn a_pipeline_stage_consumes_or_applies_a_change_stream() {
+        let sql = "CREATE PIPELINE cdc AS (\
+            STAGE bronze (CONSUME CHANGES FROM orders_stream MAX ROWS 1000 INTO bronze_orders), \
+            STAGE silver (CONSUME CHANGES FROM orders_stream AS (\
+                INSERT INTO silver_orders SELECT id, total FROM changes WHERE _change_type <> 'delete'\
+            )), \
+            STAGE gold (APPLY CHANGES INTO dim_orders FROM orders_stream KEYS (id) \
+                SEQUENCE BY _commit_version STORED AS SCD TYPE 2)\
+        )";
+        let stmt = parse_one(sql);
+        let Statement::CreatePipeline(pipeline) = &stmt else {
+            panic!("Expected CREATE PIPELINE");
+        };
+        assert!(pipeline.trigger.is_none());
+        assert_eq!(pipeline.stages.len(), 3);
+        let Some(ChangeStage::Consume(bronze)) = &pipeline.stages[0].changes else {
+            panic!("the first stage consumes");
+        };
+        assert_eq!(bronze.stream, "orders_stream");
+        assert_eq!(bronze.max_rows, Some(1000));
+        assert_eq!(bronze.into.as_deref(), Some("bronze_orders"));
+        assert_eq!(pipeline.stages[0].source, "orders_stream");
+        assert_eq!(pipeline.stages[0].target, "bronze_orders");
+        let Some(ChangeStage::Consume(silver)) = &pipeline.stages[1].changes else {
+            panic!("the second stage consumes");
+        };
+        assert!(silver.into.is_none());
+        assert!(matches!(
+            silver.statement.as_deref(),
+            Some(Statement::Insert(_))
+        ));
+        let Some(ChangeStage::Apply(gold)) = &pipeline.stages[2].changes else {
+            panic!("the third stage applies");
+        };
+        assert_eq!(gold.target, "dim_orders");
+        assert_eq!(gold.keys, vec!["id".to_string()]);
+        assert_eq!(gold.scd, ScdKind::Type2);
+        assert_eq!(pipeline.stages[2].source, "orders_stream");
+
+        let rendered = crate::unparse::statement_to_sql(&stmt).expect("unparses");
+        assert_eq!(parse_one(&rendered), stmt, "{rendered}");
+    }
+
+    /// A pipeline that runs on change data names the stream, how many
+    /// pending changes fire a run, and how long one pending change waits
+    #[test]
+    fn a_pipeline_runs_on_change_data() {
+        let sql = "CREATE PIPELINE cdc ON CHANGE DATA FROM orders_stream MIN ROWS 100                    MAX WAIT 5 MINUTES AS (                   STAGE land (CONSUME CHANGES FROM orders_stream INTO bronze_orders))";
+        let stmt = parse_one(sql);
+        let Statement::CreatePipeline(pipeline) = &stmt else {
+            panic!("Expected CREATE PIPELINE");
+        };
+        let trigger = pipeline.trigger.as_ref().expect("a trigger");
+        assert_eq!(trigger.stream, "orders_stream");
+        assert_eq!(trigger.min_rows, 100);
+        assert_eq!(
+            trigger.max_wait,
+            Some(TtlDuration {
+                value: 5,
+                unit: TtlUnit::Minutes
+            })
+        );
+        let rendered = crate::unparse::statement_to_sql(&stmt).expect("unparses");
+        assert_eq!(parse_one(&rendered), stmt, "{rendered}");
+
+        // The bound defaults to one pending change and no wait
+        let stmt = parse_one(
+            "CREATE PIPELINE cdc ON CHANGE DATA FROM s AS (STAGE land (CONSUME CHANGES FROM s INTO t))",
+        );
+        let Statement::CreatePipeline(pipeline) = &stmt else {
+            panic!("Expected CREATE PIPELINE");
+        };
+        let trigger = pipeline.trigger.as_ref().expect("a trigger");
+        assert_eq!(trigger.min_rows, 1);
+        assert!(trigger.max_wait.is_none());
+    }
+
+    #[test]
+    fn a_consume_stage_refuses_a_bound_that_is_not_a_count() {
+        let err = crate::parse(
+            "CREATE PIPELINE p AS (STAGE s (CONSUME CHANGES FROM x MAX ROWS 0 INTO t))",
+        )
+        .expect_err("zero is refused");
+        assert!(err.to_string().contains("whole number above zero"), "{err}");
     }
 
     #[test]

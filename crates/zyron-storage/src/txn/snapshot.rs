@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::status_map::TxnStatusMap;
+use super::status_map::{TxnStatus, TxnStatusMap};
 
 /// Immutable snapshot of active transactions taken at BEGIN time.
 ///
@@ -201,6 +201,29 @@ impl Snapshot {
     #[inline]
     pub fn is_txn_active(&self, txn_id: u64) -> bool {
         self.active_txn_ids.binary_search(&txn_id).is_ok()
+    }
+
+    /// How a transaction ended, or that it has not, judged the way tuple
+    /// visibility judges it.
+    ///
+    /// The snapshot's own transaction and anything below the frozen horizon
+    /// read as committed. A transaction in the active set is in flight. One
+    /// that is neither is judged by the commit log, and one older than this
+    /// snapshot with nothing recorded there ended without a commit record,
+    /// which is what a transaction that died with its process leaves, so it
+    /// reads as aborted rather than as in flight forever. A newer one with
+    /// nothing recorded is still running
+    pub fn txn_outcome(&self, txn_id: u64) -> TxnStatus {
+        if txn_id == self.txn_id || txn_id < self.frozen_below {
+            return TxnStatus::Committed;
+        }
+        if self.is_txn_active(txn_id) {
+            return TxnStatus::Active;
+        }
+        match self.status.status(txn_id) {
+            TxnStatus::Active if txn_id < self.txn_id => TxnStatus::Aborted,
+            outcome => outcome,
+        }
     }
 
     /// Returns the number of active transactions at snapshot time.

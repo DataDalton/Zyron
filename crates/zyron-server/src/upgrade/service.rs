@@ -68,6 +68,39 @@ const ARTIFACT_TIMEOUT_SECS: u64 = 600;
 /// Seconds a notification post may take
 const NOTIFY_TIMEOUT_SECS: u64 = 30;
 
+/// The contact channels the operator configured, in the order they are
+/// notified.
+///
+/// A configured address outside the Discord webhook shape is refused here,
+/// so a configured alerting path is live or the node says why it is not
+pub fn contact_channels(config: &ZyronConfig) -> Result<Vec<ContactChannel>> {
+    let mut channels = Vec::new();
+    if !config.upgrade.notify_webhook_url.trim().is_empty() {
+        channels.push(ContactChannel::Webhook {
+            url: config.upgrade.notify_webhook_url.trim().to_string(),
+        });
+    }
+    if !config.upgrade.notify_slack_webhook_url.trim().is_empty() {
+        channels.push(ContactChannel::Slack {
+            webhook_url: config.upgrade.notify_slack_webhook_url.trim().to_string(),
+        });
+    }
+    let discord = config.upgrade.notify_discord_webhook_url.trim();
+    if !discord.is_empty() {
+        channels.push(ContactChannel::discord(discord).map_err(|reason| {
+            ZyronError::Internal(format!("upgrade.notify_discord_webhook_url, {reason}"))
+        })?);
+    }
+    Ok(channels)
+}
+
+/// A notifier over the operator's contact channels, delivering over HTTPS
+pub fn build_notifier(config: &ZyronConfig) -> Result<Notifier> {
+    let channels = contact_channels(config)?;
+    let sink = HttpNotificationSink::new(NOTIFY_TIMEOUT_SECS).map_err(ZyronError::Internal)?;
+    Ok(Notifier::new(channels, Arc::new(sink)))
+}
+
 /// What the server hands the service at boot
 pub struct ServiceParts {
     pub config: ZyronConfig,
@@ -88,6 +121,19 @@ pub struct ServiceParts {
     /// actor role off a replicated schema change. None on a node in no group,
     /// where nothing is replicated and there is nothing to hold back
     pub group_carries_actor_role: Option<Arc<AtomicBool>>,
+    /// Raised once every member of the group runs a binary that applies a
+    /// change stream advance. None on a node in no group
+    pub group_carries_stream_advance: Option<Arc<AtomicBool>>,
+    /// Raised once every member of the group runs a binary that reads the
+    /// row images a feed table's delete or update carries. None on a node
+    /// in no group
+    pub group_carries_feed_images: Option<Arc<AtomicBool>>,
+    /// Raised once every member of the group runs a binary that writes the
+    /// files a lake commit carries. None on a node in no group
+    pub group_carries_lake_files: Option<Arc<AtomicBool>>,
+    /// Raised once every member of the group runs a binary that records a
+    /// schedule's run. None on a node in no group
+    pub group_carries_schedule_runs: Option<Arc<AtomicBool>>,
 }
 
 /// What the post-upgrade migrations did on this node
@@ -126,6 +172,19 @@ pub struct UpgradeService {
     /// Raised once every member reads the actor role off a schema change, so
     /// the replication path knows it may carry one
     group_carries_actor_role: Option<Arc<AtomicBool>>,
+    /// Raised once every member applies a change stream advance, so the
+    /// replication path knows a consume may commit
+    group_carries_stream_advance: Option<Arc<AtomicBool>>,
+    /// Raised once every member reads the row images a feed table's delete
+    /// or update carries, so the replication path knows such a write may
+    /// commit
+    group_carries_feed_images: Option<Arc<AtomicBool>>,
+    /// Raised once every member writes the files a lake commit carries, so
+    /// the replication path knows a lake write may commit
+    group_carries_lake_files: Option<Arc<AtomicBool>>,
+    /// Raised once every member records a schedule's run, so the schedule
+    /// worker knows a schedule may run
+    group_carries_schedule_runs: Option<Arc<AtomicBool>>,
     last_poll: parking_lot::Mutex<Option<Instant>>,
     /// When the board last took the other members' rows, so the probe runs on
     /// its own interval rather than on every pass of the one-second loop
@@ -257,39 +316,7 @@ impl UpgradeService {
             controller = controller.with_poller(poller);
         }
 
-        let mut channels = Vec::new();
-        if !parts.config.upgrade.notify_webhook_url.trim().is_empty() {
-            channels.push(ContactChannel::Webhook {
-                url: parts.config.upgrade.notify_webhook_url.trim().to_string(),
-            });
-        }
-        if !parts
-            .config
-            .upgrade
-            .notify_slack_webhook_url
-            .trim()
-            .is_empty()
-        {
-            channels.push(ContactChannel::Slack {
-                webhook_url: parts
-                    .config
-                    .upgrade
-                    .notify_slack_webhook_url
-                    .trim()
-                    .to_string(),
-            });
-        }
-        let discord = parts.config.upgrade.notify_discord_webhook_url.trim();
-        if !discord.is_empty() {
-            // A configured address outside the Discord webhook shape stops
-            // the node here, so a configured alerting path is live or the
-            // node says why it is not
-            channels.push(ContactChannel::discord(discord).map_err(|reason| {
-                ZyronError::Internal(format!("upgrade.notify_discord_webhook_url, {reason}"))
-            })?);
-        }
-        let sink = HttpNotificationSink::new(NOTIFY_TIMEOUT_SECS).map_err(ZyronError::Internal)?;
-        let notifier = Notifier::new(channels, Arc::new(sink));
+        let notifier = build_notifier(&parts.config)?;
 
         let cluster_members = if parts.config.cluster.enabled {
             parts
@@ -324,6 +351,10 @@ impl UpgradeService {
             checkpoint_lsn: parts.checkpoint_lsn,
             shutdown: parts.shutdown,
             group_carries_actor_role: parts.group_carries_actor_role,
+            group_carries_stream_advance: parts.group_carries_stream_advance,
+            group_carries_feed_images: parts.group_carries_feed_images,
+            group_carries_lake_files: parts.group_carries_lake_files,
+            group_carries_schedule_runs: parts.group_carries_schedule_runs,
             last_poll: parking_lot::Mutex::new(None),
             setting_warning: parking_lot::Mutex::new(None),
         }))
@@ -430,7 +461,80 @@ impl UpgradeService {
     /// the one the version gate already caches, so this costs a map lookup on
     /// most passes rather than a round of mesh calls
     async fn refresh_actor_role_carriage(&self) {
-        let Some(flag) = self.group_carries_actor_role.as_ref() else {
+        self.refresh_carriage(
+            self.group_carries_actor_role.as_ref(),
+            crate::replication::ACTOR_ROLE_INTRODUCED_IN,
+        )
+        .await;
+    }
+
+    /// Reads whether every member of the group applies a change stream
+    /// advance, and lets the replication path know.
+    ///
+    /// Same shape as the actor role reading and lowered for the same
+    /// reasons. While it is down a transactional consume on this node is
+    /// refused, because an advance has no shorter form to fall back to
+    async fn refresh_stream_advance_carriage(&self) {
+        self.refresh_carriage(
+            self.group_carries_stream_advance.as_ref(),
+            crate::replication::STREAM_ADVANCE_INTRODUCED_IN,
+        )
+        .await;
+    }
+
+    /// Reads whether every member of the group reads the row images a feed
+    /// table's delete or update carries, and lets the replication path
+    /// know.
+    ///
+    /// Same shape as the two readings above. While it is down a delete or
+    /// update on a table with a change data feed is refused on this node,
+    /// because a key sent in place of the row would leave every member's
+    /// feed short of it
+    async fn refresh_feed_images_carriage(&self) {
+        self.refresh_carriage(
+            self.group_carries_feed_images.as_ref(),
+            crate::replication::FEED_IMAGES_INTRODUCED_IN,
+        )
+        .await;
+    }
+
+    /// Reads whether every member of the group writes the files a lake
+    /// commit carries. While it is down a lake write is refused on this
+    /// node, because a version sent without its files would name bytes a
+    /// member does not hold
+    async fn refresh_lake_files_carriage(&self) {
+        self.refresh_carriage(
+            self.group_carries_lake_files.as_ref(),
+            crate::replication::LAKE_FILES_INTRODUCED_IN,
+        )
+        .await;
+    }
+
+    /// Reads whether every member of the group records a schedule's run.
+    /// While it is down no schedule runs on this node, because a run
+    /// recorded here alone would be run again by the next leader
+    async fn refresh_schedule_runs_carriage(&self) {
+        self.refresh_carriage(
+            self.group_carries_schedule_runs.as_ref(),
+            crate::replication::SCHEDULE_RUNS_INTRODUCED_IN,
+        )
+        .await;
+    }
+
+    /// Raises `flag` when this node leads and the group's version floor
+    /// stands at `introduced_in` or later, and lowers it otherwise, which is
+    /// when this node stops leading, when a member joined on an older
+    /// release, and when half the members or more cannot be asked what they
+    /// run. A member that is away while the rest answer does not lower it,
+    /// because it commits nothing until it is back. The reading is the one
+    /// the version gate already caches, so this costs a map lookup on most
+    /// passes rather than a round of mesh calls
+    async fn refresh_carriage(
+        &self,
+        flag: Option<&Arc<AtomicBool>>,
+        introduced_in: zyron_common::format::BinaryVersion,
+    ) {
+        let Some(flag) = flag else {
             return;
         };
         let Some(raft) = self.raft.as_ref() else {
@@ -453,7 +557,7 @@ impl UpgradeService {
         };
         let carried = self
             .driver
-            .cluster_allows(crate::replication::ACTOR_ROLE_INTRODUCED_IN, &members)
+            .cluster_allows(introduced_in, &members)
             .await
             .is_ok();
         flag.store(carried, Ordering::Relaxed);
@@ -556,6 +660,10 @@ impl UpgradeService {
             }
             self.carry_cluster_settings().await;
             self.refresh_actor_role_carriage().await;
+            self.refresh_stream_advance_carriage().await;
+            self.refresh_feed_images_carriage().await;
+            self.refresh_lake_files_carriage().await;
+            self.refresh_schedule_runs_carriage().await;
             self.reconcile_board().await;
             if self
                 .board

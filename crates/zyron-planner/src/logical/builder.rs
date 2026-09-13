@@ -508,6 +508,22 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             positional_args: positional.clone(),
             output_columns: output_columns.clone(),
         }),
+        BoundFromItem::ChangeScan(spec) => Ok(LogicalPlan::ChangeScan {
+            spec: Box::new(spec.as_ref().clone()),
+            output_columns: spec
+                .data_columns
+                .iter()
+                .cloned()
+                .chain(spec.metadata.iter().map(|meta| LogicalColumn {
+                    table_idx: Some(spec.table_idx),
+                    column_id: crate::logical::change_metadata_column_id(*meta),
+                    name: meta.name().to_string(),
+                    type_id: meta.type_id(),
+                    nullable: false,
+                    fractional_digits: None,
+                }))
+                .collect(),
+        }),
         BoundFromItem::Expand(expand) => {
             // A LATERAL expansion reaching this arm is the first item in
             // FROM, so there is nothing before it to correlate to and the

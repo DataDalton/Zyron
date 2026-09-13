@@ -314,7 +314,7 @@ impl PartitionAccumulator {
                 .iter()
                 .map(|c| {
                     Column::with_nulls_ts(
-                        ColumnData::with_capacity(c.type_id, capacity),
+                        ColumnData::with_capacity_for(c.type_id, c.fractional_digits, capacity),
                         NullBitmap::empty(),
                         c.type_id,
                         c.fractional_digits,
@@ -336,7 +336,11 @@ impl PartitionAccumulator {
             .iter()
             .map(|c| {
                 Column::with_nulls_ts(
-                    ColumnData::with_capacity(c.type_id, self.rows.min(BATCH_SIZE)),
+                    ColumnData::with_capacity_for(
+                        c.type_id,
+                        c.fractional_digits,
+                        self.rows.min(BATCH_SIZE),
+                    ),
                     NullBitmap::empty(),
                     c.type_id,
                     c.fractional_digits,

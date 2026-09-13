@@ -1,0 +1,125 @@
+{
+  "id": "2026-09-13_012904_6e2ce74-local",
+  "date": "2026-09-13 01:29:06Z",
+  "ts": 1789262946,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "subquery": {
+      "Correlated EXISTS, subquery form": {
+        "average": 904.966667,
+        "runs": [890.90, 901.70, 922.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Correlated EXISTS, join form": {
+        "average": 935.600000,
+        "runs": [951.20, 925.90, 929.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "EXISTS growth, subquery at 1x outer rows": {
+        "average": 1822.200000,
+        "runs": [2352.40, 1620.30, 1493.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "EXISTS growth, subquery at 2x outer rows": {
+        "average": 1733.700000,
+        "runs": [1768.20, 1671.10, 1761.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "EXISTS growth, join at 1x outer rows": {
+        "average": 1031.733333,
+        "runs": [1070.70, 972.40, 1052.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "EXISTS growth, join at 2x outer rows": {
+        "average": 1799.900000,
+        "runs": [2060.40, 1610.30, 1729.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Correlated NOT EXISTS, subquery form": {
+        "average": 926.200000,
+        "runs": [931.50, 917.60, 929.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Correlated NOT EXISTS, join form": {
+        "average": 484.400000,
+        "runs": [489.90, 472.70, 490.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Correlated scalar, subquery form": {
+        "average": 779.133333,
+        "runs": [819.50, 763.30, 754.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Correlated scalar, join form": {
+        "average": 493.033333,
+        "runs": [504.80, 487.50, 486.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Uncorrelated IN, subquery form": {
+        "average": 2502.833333,
+        "runs": [2590.50, 2420.90, 2497.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "Uncorrelated IN, join form": {
+        "average": 961.066667,
+        "runs": [985.20, 943.00, 955.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

@@ -42,6 +42,9 @@ pub struct ChangeDescriptor {
     pub timestamp_us: i64,
     /// The database transaction the commit ran under, zero when standalone
     pub db_txn_id: u64,
+    /// The database transaction a commit made under an intent belongs to,
+    /// as its header records it, zero for every other commit
+    pub owner_txn_id: u64,
     /// The commit's operation, which is what separates an UPDATE's delete
     /// side from a plain DELETE
     pub operation: OperationKind,
@@ -50,6 +53,35 @@ pub struct ChangeDescriptor {
     /// Present when only the rows this predicate matches changed. None
     /// means every row the file contributed at `base_version`.
     pub predicate: Option<LakePredicate>,
+    /// True when the commit was a truncate of the whole table, which a
+    /// change feed reports as one truncate record rather than a delete
+    /// per row. A truncate commits as a delete of every file annotated
+    /// with [`TRUNCATE_COMMIT_INFO`]
+    pub truncate: bool,
+}
+
+/// The commit annotation a truncate carries, so the change feed can tell
+/// it from a delete that happened to remove every row
+pub const TRUNCATE_COMMIT_INFO: &str = "truncate";
+
+impl ChangeDescriptor {
+    /// Whether this is the removed side of an update, the rows as they
+    /// stood before it, which a feed reports as the update's preimages
+    pub fn is_update_preimage(&self) -> bool {
+        self.kind == ChangeKind::Delete && self.operation == OperationKind::Update
+    }
+}
+
+/// Whether a commit rewrote files without changing which rows the table
+/// holds.
+///
+/// A compaction merges small files into one and a re-clustering rewrites row
+/// order. Both remove every input file and add the survivor, which on the
+/// wire looks exactly like an update, so the operation is what separates
+/// them. Reporting one would tell a consumer that every row of the table was
+/// deleted and re-inserted, which is why a rewrite yields no change at all
+pub fn is_rewrite_only(operation: OperationKind) -> bool {
+    matches!(operation, OperationKind::Optimize)
 }
 
 /// Every change in versions `from..=to`, in version then entry order.
@@ -81,6 +113,18 @@ pub fn changes_between(
         let timestamp_us = data.header.timestamp_us;
         let operation = data.header.operation;
         let db_txn_id = data.header.db_txn_id;
+        let owner_txn_id = data.header.owner_txn_id;
+        let truncate = data
+            .audit
+            .as_ref()
+            .is_some_and(|audit| audit.commit_info == TRUNCATE_COMMIT_INFO);
+
+        // A rewrite moves rows between files and changes none of them, so it
+        // is skipped with the header in hand rather than after the files have
+        // been opened and their rows decoded
+        if is_rewrite_only(operation) {
+            continue;
+        }
 
         // The state after this commit, used to find which files a recorded
         // predicate attached to. Only read when the version records one
@@ -93,20 +137,24 @@ pub fn changes_between(
                     base_version,
                     timestamp_us,
                     db_txn_id,
+                    owner_txn_id,
                     operation,
                     kind: ChangeKind::Insert,
                     partition_id: file.partition_id,
                     predicate: None,
+                    truncate,
                 }),
                 LogEntry::RemoveFile { partition_id } => out.push(ChangeDescriptor {
                     version,
                     base_version,
                     timestamp_us,
                     db_txn_id,
+                    owner_txn_id,
                     operation,
                     kind: ChangeKind::Delete,
                     partition_id: *partition_id,
                     predicate: None,
+                    truncate,
                 }),
                 // An index file holds no rows of its own, it addresses rows
                 // the data files already reported. Reporting one here would
@@ -114,7 +162,8 @@ pub fn changes_between(
                 LogEntry::AddIndex(_)
                 | LogEntry::DropIndex { .. }
                 | LogEntry::AddIndexFile(_)
-                | LogEntry::RemoveIndexFile { .. } => {}
+                | LogEntry::RemoveIndexFile { .. }
+                | LogEntry::TypeHistory(_) => {}
                 LogEntry::AddDeletePredicate(del) => {
                     if after.is_none() {
                         after = Some(log.manifest_at(version)?);
@@ -130,10 +179,12 @@ pub fn changes_between(
                                 base_version,
                                 timestamp_us,
                                 db_txn_id,
+                                owner_txn_id,
                                 operation,
                                 kind: ChangeKind::Delete,
                                 partition_id: file.partition_id,
                                 predicate: Some(del.predicate.clone()),
+                                truncate,
                             });
                         }
                     }
@@ -158,14 +209,9 @@ pub fn changed_ordinals(
     log: &TransactionLog,
     descriptor: &ChangeDescriptor,
 ) -> Result<Vec<u64>, ZyronError> {
-    let reader = LakeFileReader::open(log.paths(), descriptor.partition_id)?;
-    let row_count = reader.row_count();
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-
     if descriptor.kind == ChangeKind::Insert {
-        return Ok((0..row_count as u64).collect());
+        let reader = LakeFileReader::open(log.paths(), descriptor.partition_id)?;
+        return Ok((0..reader.row_count() as u64).collect());
     }
 
     // The file as it stood before the commit, which is what "was live" means
@@ -176,6 +222,11 @@ pub fn changed_ordinals(
             descriptor.partition_id, descriptor.base_version
         )));
     };
+    let reader = LakeFileReader::open_in(&base, log.paths(), descriptor.partition_id)?;
+    let row_count = reader.row_count();
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
     let mut keep = reader.delete_survivors(&base.schema, &base, entry)?;
 
     // A descriptor predicate narrows the live rows before they are listed,
@@ -209,11 +260,78 @@ pub fn change_row_counts(
     log: &TransactionLog,
     from: u64,
     to: u64,
+    before_images: bool,
+) -> Result<(u64, u64), ZyronError> {
+    count_descriptors(log, &changes_between(log, from, to)?, before_images)
+}
+
+/// What one version yields to a change feed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionYield {
+    /// The change records the version's commit produces
+    pub records: u64,
+    /// The instant the version committed
+    pub timestamp_us: i64,
+    /// The transaction the commit ran under, zero when standalone
+    pub db_txn_id: u64,
+    /// The database transaction a commit made under an intent belongs to,
+    /// as its header records it, zero for every other commit
+    pub owner_txn_id: u64,
+}
+
+/// The change records one version yields, the instant it committed and
+/// the transaction it committed under, None for a version that yields
+/// none, such as a schema change or a rewrite. What a change feed reports
+/// for the version is what is counted, so an update's removed side counts
+/// only when the feed keeps before images and a truncate counts once
+pub fn change_records_at(
+    log: &TransactionLog,
+    version: u64,
+    before_images: bool,
+) -> Result<Option<VersionYield>, ZyronError> {
+    let descriptors = changes_between(log, version, version)?;
+    let Some(first) = descriptors.first() else {
+        return Ok(None);
+    };
+    let timestamp_us = first.timestamp_us;
+    let db_txn_id = first.db_txn_id;
+    let owner_txn_id = first.owner_txn_id;
+    let (inserted, deleted) = count_descriptors(log, &descriptors, before_images)?;
+    let records = inserted + deleted;
+    Ok((records > 0).then_some(VersionYield {
+        records,
+        timestamp_us,
+        db_txn_id,
+        owner_txn_id,
+    }))
+}
+
+/// Rows inserted and deleted over a set of descriptors, as a change feed
+/// reports them
+fn count_descriptors(
+    log: &TransactionLog,
+    descriptors: &[ChangeDescriptor],
+    before_images: bool,
 ) -> Result<(u64, u64), ZyronError> {
     let mut inserted = 0u64;
     let mut deleted = 0u64;
-    for descriptor in changes_between(log, from, to)? {
-        let rows = changed_ordinals(log, &descriptor)?.len() as u64;
+    // A truncate is one change however many rows it removed, counted once
+    // per version
+    let mut truncated_at: Option<u64> = None;
+    for descriptor in descriptors {
+        // An update's removed side is its preimage, which a feed keeping
+        // one image does not report
+        if !before_images && descriptor.is_update_preimage() {
+            continue;
+        }
+        if descriptor.truncate {
+            if truncated_at != Some(descriptor.version) {
+                truncated_at = Some(descriptor.version);
+                deleted += 1;
+            }
+            continue;
+        }
+        let rows = changed_ordinals(log, descriptor)?.len() as u64;
         match descriptor.kind {
             ChangeKind::Insert => inserted += rows,
             ChangeKind::Delete => deleted += rows,
@@ -308,7 +426,10 @@ mod tests {
 
         // Version one creates the table and changes nothing
         assert!(changes_between(&log, 1, 1).expect("changes").is_empty());
-        assert_eq!(change_row_counts(&log, 1, 99).expect("counts"), (3, 0));
+        assert_eq!(
+            change_row_counts(&log, 1, 99, true).expect("counts"),
+            (3, 0)
+        );
     }
 
     #[test]
@@ -339,7 +460,7 @@ mod tests {
         assert_eq!(changes[0].kind, ChangeKind::Delete);
         assert!(changes[0].predicate.is_none());
         assert_eq!(changed_ordinals(&log, &changes[0]).expect("rows").len(), 3);
-        assert_eq!(change_row_counts(&log, 3, 3).expect("counts"), (0, 3));
+        assert_eq!(change_row_counts(&log, 3, 3, true).expect("counts"), (0, 3));
     }
 
     #[test]
@@ -377,7 +498,7 @@ mod tests {
             3,
             "only the three rows below ten"
         );
-        assert_eq!(change_row_counts(&log, 3, 3).expect("counts"), (0, 3));
+        assert_eq!(change_row_counts(&log, 3, 3, true).expect("counts"), (0, 3));
     }
 
     #[test]
@@ -416,12 +537,15 @@ mod tests {
 
         // The second delete's predicate also matches ids 1 and 2, which the
         // first delete already removed, so only 3 and 40 are new deletions
-        let (inserted, deleted) = change_row_counts(&log, 4, 4).expect("counts");
+        let (inserted, deleted) = change_row_counts(&log, 4, 4, true).expect("counts");
         assert_eq!(inserted, 0);
         assert_eq!(deleted, 2);
         // Across the whole history every row is inserted once and the four
         // matching rows are deleted once each
-        assert_eq!(change_row_counts(&log, 1, 99).expect("counts"), (5, 4));
+        assert_eq!(
+            change_row_counts(&log, 1, 99, true).expect("counts"),
+            (5, 4)
+        );
     }
 
     #[test]
@@ -465,7 +589,7 @@ mod tests {
         );
         assert!(changes.iter().any(|c| c.kind == ChangeKind::Delete));
 
-        let (inserted, deleted) = change_row_counts(&log, 3, 3).expect("counts");
+        let (inserted, deleted) = change_row_counts(&log, 3, 3, true).expect("counts");
         assert_eq!(inserted, 2, "the two new images");
         assert_eq!(deleted, 2, "the two old images");
     }

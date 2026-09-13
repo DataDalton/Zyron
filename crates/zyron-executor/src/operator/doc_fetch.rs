@@ -217,7 +217,7 @@ fn fetch_lake_rows(
         };
         ordinals.sort_unstable();
         ordinals.dedup();
-        let reader = zyron_lake::LakeFileReader::open(&paths, partition_id)?;
+        let reader = zyron_lake::LakeFileReader::open_in(&manifest, &paths, partition_id)?;
         let row_count = reader.row_count();
         let keep = reader.delete_survivors(&manifest.schema, &manifest, entry)?;
 
@@ -232,10 +232,17 @@ fn fetch_lake_rows(
                         col.name
                     ))
                 })?;
+            // Read in the shape the plan declares, so a file written while
+            // the column was narrower hands its cells over widened
+            let wanted = crate::operator::lake_scan::declared_as(
+                lake_col,
+                col.type_id,
+                col.fractional_digits,
+            );
             decoded.push((
                 col.type_id,
-                lake_col.physical_type_id().fixed_size().unwrap_or(0),
-                reader.read_column(lake_col)?,
+                wanted.physical_type_id().fixed_size().unwrap_or(0),
+                reader.read_column(&wanted)?,
             ));
         }
 

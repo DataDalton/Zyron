@@ -48,6 +48,57 @@ fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
             let pushed_child = push_predicates(child);
             let effective_child = pushed_child.as_ref().unwrap_or(child);
             match effective_child {
+                // A filter over a change scan folds into the scan. A conjunct
+                // on _commit_version, _commit_ts or _change_type tightens the
+                // window the scan opens, which prunes whole change files
+                // before any record is decoded. Everything else runs inside
+                // the scan after decode, so nothing above it is left holding
+                // a filter over columns the scan could have pruned. A
+                // conjunct holding a subquery is the exception. It runs
+                // through the executor's subquery machinery, which only a
+                // filter above the scan reaches
+                LogicalPlan::ChangeScan {
+                    spec,
+                    output_columns,
+                } => {
+                    let mut narrowed = spec.as_ref().clone();
+                    let mut residual = Vec::new();
+                    let mut above = Vec::new();
+                    let mut folded = false;
+                    for conjunct in split_conjuncts(predicate) {
+                        if crate::binder::expr_contains_subquery(&conjunct) {
+                            above.push(conjunct);
+                        } else if fold_metadata_conjunct(&mut narrowed, &conjunct) {
+                            folded = true;
+                        } else {
+                            residual.push(conjunct);
+                        }
+                    }
+                    // A filter of subquery conjuncts alone over an unchanged
+                    // scan is already where it belongs
+                    if !folded && residual.is_empty() && pushed_child.is_none() {
+                        return None;
+                    }
+                    if !residual.is_empty() {
+                        let residual = combine_conjuncts(residual);
+                        narrowed.predicate = Some(match narrowed.predicate.take() {
+                            Some(existing) => combine_conjuncts(vec![existing, residual]),
+                            None => residual,
+                        });
+                    }
+                    let scan = LogicalPlan::ChangeScan {
+                        spec: Box::new(narrowed),
+                        output_columns: output_columns.clone(),
+                    };
+                    if above.is_empty() {
+                        Some(scan)
+                    } else {
+                        Some(LogicalPlan::Filter {
+                            predicate: combine_conjuncts(above),
+                            child: Arc::new(scan),
+                        })
+                    }
+                }
                 LogicalPlan::Join {
                     left,
                     right,
@@ -358,6 +409,116 @@ fn push_predicates(plan: &LogicalPlan) -> Option<LogicalPlan> {
     }
 }
 
+/// Folds one conjunct on a change scan's metadata into its window bounds.
+///
+/// Answers true when the conjunct was consumed, which is when it compares
+/// `_commit_version`, `_commit_ts` or `_change_type` of this scan against a
+/// literal with an operator a version window can express. A conjunct that
+/// is not that shape is left for the scan to evaluate after decode, which
+/// answers the same rows more slowly rather than wrongly
+fn fold_metadata_conjunct(spec: &mut crate::logical::ChangeScanSpec, conjunct: &BoundExpr) -> bool {
+    use crate::logical::ChangeMetadataColumn as M;
+    use zyron_parser::ast::LiteralValue;
+
+    let BoundExpr::BinaryOp {
+        left, op, right, ..
+    } = conjunct
+    else {
+        return false;
+    };
+    // Either side may hold the column, so `5 < _commit_version` reads the
+    // same way `_commit_version > 5` does
+    let (column, literal, op) = match (left.as_ref(), right.as_ref()) {
+        (BoundExpr::ColumnRef(reference), BoundExpr::Literal { value, .. }) => {
+            (reference, value, *op)
+        }
+        (BoundExpr::Literal { value, .. }, BoundExpr::ColumnRef(reference)) => {
+            let flipped = match op {
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::LtEq => BinaryOperator::GtEq,
+                BinaryOperator::GtEq => BinaryOperator::LtEq,
+                other => *other,
+            };
+            (reference, value, flipped)
+        }
+        _ => return false,
+    };
+    if column.table_idx != spec.table_idx {
+        return false;
+    }
+    let Some(metadata) = crate::logical::change_metadata_of(spec, column.column_id) else {
+        return false;
+    };
+
+    match (metadata, literal) {
+        (M::CommitVersion, LiteralValue::Integer(n)) => {
+            // A stream read's version window is where the stream's position
+            // stands when the read runs, resolved then, so a version bound
+            // stays a predicate the scan evaluates after decode rather than
+            // a narrowing the resolution would replace
+            if spec.stream.is_some() {
+                return false;
+            }
+            let n = (*n).max(0) as u64;
+            for window in spec.windows.iter_mut() {
+                match op {
+                    // The window is open at its lower end, so `>= n` starts one
+                    // below and `> n` starts at n
+                    BinaryOperator::Gt => window.from_exclusive = window.from_exclusive.max(n),
+                    BinaryOperator::GtEq => {
+                        window.from_exclusive = window.from_exclusive.max(n.saturating_sub(1))
+                    }
+                    BinaryOperator::Lt => {
+                        window.to_inclusive = window.to_inclusive.min(n.saturating_sub(1))
+                    }
+                    BinaryOperator::LtEq => window.to_inclusive = window.to_inclusive.min(n),
+                    BinaryOperator::Eq => {
+                        window.from_exclusive = window.from_exclusive.max(n.saturating_sub(1));
+                        window.to_inclusive = window.to_inclusive.min(n);
+                    }
+                    _ => return false,
+                }
+            }
+            true
+        }
+        (M::CommitTimestamp, LiteralValue::Integer(ts)) => {
+            for window in spec.windows.iter_mut() {
+                match op {
+                    BinaryOperator::Gt => {
+                        window.from_timestamp = window.from_timestamp.max(*ts + 1)
+                    }
+                    BinaryOperator::GtEq => window.from_timestamp = window.from_timestamp.max(*ts),
+                    BinaryOperator::Lt => window.to_timestamp = window.to_timestamp.min(*ts - 1),
+                    BinaryOperator::LtEq => window.to_timestamp = window.to_timestamp.min(*ts),
+                    BinaryOperator::Eq => {
+                        window.from_timestamp = window.from_timestamp.max(*ts);
+                        window.to_timestamp = window.to_timestamp.min(*ts);
+                    }
+                    _ => return false,
+                }
+            }
+            true
+        }
+        (M::ChangeType, LiteralValue::String(name)) => {
+            let Some(code) = zyron_common::change_type_code(name) else {
+                return false;
+            };
+            let bit = zyron_common::change_type_bit(code);
+            for window in spec.windows.iter_mut() {
+                let current = window.change_types.unwrap_or(u8::MAX);
+                window.change_types = Some(match op {
+                    BinaryOperator::Eq => current & bit,
+                    BinaryOperator::Neq => current & !bit,
+                    _ => return false,
+                });
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Splits an AND expression into its conjuncts.
 pub(crate) fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
     match expr {
@@ -409,6 +570,7 @@ pub(crate) fn collect_table_indices(plan: &LogicalPlan) -> Vec<usize> {
 fn collect_table_indices_recursive(plan: &LogicalPlan, out: &mut Vec<usize>) {
     match plan {
         LogicalPlan::Scan { table_idx, .. } => out.push(*table_idx),
+        LogicalPlan::ChangeScan { spec, .. } => out.push(spec.table_idx),
         // A relabeled projection is the boundary of a derived table: above
         // it only this index exists
         LogicalPlan::Project {

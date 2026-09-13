@@ -8,15 +8,15 @@
 
 use std::sync::Arc;
 
-use zyron_buffer::{BufferPool, BufferPoolConfig};
+use zyron_buffer::BufferPool;
 use zyron_catalog::{
     Catalog, CatalogCache, DatabaseId, HeapCatalogStorage, SYSTEM_DATABASE_ID, SchemaId,
 };
 use zyron_executor::batch::DataBatch;
 use zyron_executor::context::ExecutionContext;
+use zyron_storage::DiskManager;
 use zyron_storage::txn::{IsolationLevel, TransactionManager};
-use zyron_storage::{DiskManager, DiskManagerConfig};
-use zyron_wal::{WalWriter, WalWriterConfig};
+use zyron_wal::WalWriter;
 use zyron_wire::connection::ServerState;
 use zyron_wire::session::Session;
 
@@ -86,7 +86,6 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         publication_manager: None,
         cdc_stream_manager: None,
         cdc_ingest_manager: None,
-        trigger_manager: None,
         udf_registry: None,
         uda_registry: None,
         procedure_registry: None,
@@ -338,13 +337,29 @@ async fn run_vacuum_with_floor(
             continue;
         };
         let mut dead: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+        let mut changes = zyron_storage::PageVacuum::default();
         let modified = {
             let mut guard = frame.write_data();
             let data: &mut [u8] = &mut guard[..];
             if HeapPage::heap_header_from_slice(data).slot_count == 0 {
                 false
             } else {
-                HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead).1
+                let modified = HeapPage::vacuum_in_slice_collect(
+                    data,
+                    &is_dead,
+                    &is_aborted,
+                    &mut dead,
+                    &mut changes,
+                )
+                .1;
+                zyron_storage::heap_redo::log_vacuum(
+                    &server.wal,
+                    &server.buffer_pool,
+                    page_id,
+                    &changes,
+                )
+                .expect("log the vacuum");
+                modified
             }
         };
         server.buffer_pool.unpin_page(page_id, modified);

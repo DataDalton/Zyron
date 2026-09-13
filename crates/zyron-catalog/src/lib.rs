@@ -33,18 +33,19 @@ pub use resolver::NameResolver;
 pub use schema::SequenceEntry;
 pub use schema::{
     AggregateEntry, AnalyzerEntry, BackpressurePolicy, CatalogClassification,
-    CatalogStreamingWriteMode, CollationEntry, ColumnAttributes, ColumnEntry, CommentEntry,
-    ConstraintEntry, ConstraintType, CredentialProviderKind, DatabaseEntry, EndpointAuthMode,
-    EndpointEntry, EndpointKind, EndpointMessageFormat, EndpointOutputFormat, EpochColumns,
-    EventHandlerEntry, ExpectationAction, ExpectationEntry, ExternalBackend, ExternalFormat,
-    ExternalMode, ExternalSinkEntry, ExternalSourceEntry, FunctionEntry, HttpMethod,
-    IndexColumnEntry, IndexEntry, IndexState, IndexType, MaterializedViewEntry, PhysicalColumn,
-    PipelineEntry, ProcedureEntry, PublicationEntry, PublicationTableEntry, RateLimitPeriod,
-    RateLimitScope, RateLimitSpec, ReferentialAction, ResiliencePolicyEntry, ResiliencePolicyKind,
-    RowFormat, ScheduleEntry, SchemaEntry, SecurityMapEntry, SecurityMapKind, StreamingJobEntry,
-    StreamingJobStatus, SubscriptionEntry, SubscriptionMode, SubscriptionState,
-    SynonymDictionaryEntry, SynonymRuleEntry, TableEntry, TriggerEntry, UserTypeEntry,
-    VersionTagEntry, ViewEntry,
+    CatalogStreamingWriteMode, CdfColumnSet, CdfConfig, ChangeStreamEntry, ChangeStreamMode,
+    ChangeStreamOrigin, ChangeStreamSource, CollationEntry, ColumnAttributes, ColumnEntry,
+    CommentEntry, ConstraintEntry, ConstraintType, CredentialProviderKind, DatabaseEntry,
+    EndpointAuthMode, EndpointEntry, EndpointKind, EndpointMessageFormat, EndpointOutputFormat,
+    EpochColumns, EventHandlerEntry, ExpectationAction, ExpectationEntry, ExternalBackend,
+    ExternalFormat, ExternalMode, ExternalSinkEntry, ExternalSourceEntry, FunctionEntry,
+    HttpMethod, IndexColumnEntry, IndexEntry, IndexState, IndexType, MaterializedViewEntry,
+    PhysicalColumn, PipelineEntry, ProcedureEntry, PublicationEntry, PublicationTableEntry,
+    RateLimitPeriod, RateLimitScope, RateLimitSpec, ReferentialAction, ResiliencePolicyEntry,
+    ResiliencePolicyKind, RowFormat, ScheduleEntry, SchemaEntry, SecurityMapEntry, SecurityMapKind,
+    StreamPosition, StreamingJobEntry, StreamingJobStatus, SubscriptionEntry, SubscriptionMode,
+    SubscriptionState, SynonymDictionaryEntry, SynonymRuleEntry, TableEntry, TriggerEntry,
+    UserTypeEntry, VersionTagEntry, ViewEntry,
 };
 pub use sequence::LiveSequence;
 pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};

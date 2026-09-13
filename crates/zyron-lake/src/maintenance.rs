@@ -943,7 +943,7 @@ fn stage_outputs(
                 partition_id
             ))
         })?;
-        let reader = LakeFileReader::open(ctx.log.paths(), *partition_id)?;
+        let reader = LakeFileReader::open_in(ctx.base, ctx.log.paths(), *partition_id)?;
         let keep = reader.delete_survivors(schema, ctx.base, entry)?;
         let columns: Vec<DecodedColumn> = schema
             .columns
@@ -1303,9 +1303,21 @@ fn commit_pass(
     let log_for_staging = ctx.log;
     let mut attempt = attempt;
     attempt.operation = OperationKind::Optimize;
+    let planned_schema_id = ctx.base.schema.schema_id;
     let result = ctx.log.commit(attempt, move |base| {
         for path in staged_index.borrow_mut().drain(..) {
             discard_staged_file(&path);
+        }
+        // The outputs hold their cells in the shape the planned schema
+        // declared, and the log stamps them with the schema in force when
+        // they commit. A column whose type changed in between would make
+        // that stamp a lie about the bytes, so the pass loses instead
+        if base.types_changed_since(planned_schema_id) {
+            return Err(ZyronError::ClusteringRejected(format!(
+                "clustering pass {} wrote its outputs under schema {}, and a column's type \
+                 changed since",
+                pass_id, planned_schema_id
+            )));
         }
         for (partition_id, predicates) in &planned {
             match base.entry_for(*partition_id) {
@@ -1640,6 +1652,7 @@ mod tests {
             size_bytes: 4096,
             row_count: 100,
             added_version: 1,
+            schema_id: 1,
             cluster_spec_id: 3,
             column_stats: std::sync::Arc::new(vec![crate::manifest::ColumnStatsEntry {
                 ndv: Some(100),
@@ -1669,6 +1682,7 @@ mod tests {
             properties: BTreeMap::new(),
             indexes: Vec::new(),
             index_files: Vec::new(),
+            type_history: Vec::new(),
         }
     }
 
@@ -2501,7 +2515,9 @@ mod tests {
     }
 
     /// The staging sidecar is what resume reads instead of re-deriving
-    /// statistics, so it has to round trip an entry exactly
+    /// statistics, so it has to round trip an entry exactly. The entry is
+    /// an AddFile payload, whose schema id the log stamps when the commit
+    /// applies, so that one field is not the sidecar's to carry
     #[test]
     fn test_staged_entries_round_trip_and_stop_at_a_torn_record() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2513,7 +2529,12 @@ mod tests {
         let staging = dir.path().join("staging");
         fs::create_dir_all(&staging).expect("staging");
         append_staged_entry(&staging, &entry).expect("append entry");
-        assert_eq!(read_staged_entries(&staging).expect("read"), vec![entry]);
+        let mut as_payload = entry.clone();
+        as_payload.schema_id = 0;
+        assert_eq!(
+            read_staged_entries(&staging).expect("read"),
+            vec![as_payload]
+        );
 
         let mut file = OpenOptions::new()
             .append(true)

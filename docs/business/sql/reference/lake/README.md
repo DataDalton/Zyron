@@ -6,7 +6,7 @@
 - [ALTER TABLE CLUSTERING SCHEDULE](alter-table-clustering-schedule.md), Says when a table's clustering pass runs.
 - [ALTER TABLE FOLLOW](alter-table-follow.md), Keeps a table current with a table on another cluster.
 - [ALTER TABLE MOVE](alter-table-move.md), Moves rows to another storage tier.
-- [ALTER TABLE SET OPTIONS](alter-table-set-options.md), Changes the storage options recorded against a table.
+- [ALTER TABLE SET OPTIONS](alter-table-set-options.md), Changes the storage options recorded against a table, including its change data feed.
 - [ALTER TABLE SET TTL](alter-table-set-ttl.md), Says how long a row lives, measured from one of its columns.
 - [ALTER TABLE SET USING](alter-table-set-using.md), Moves a table between the row store and the lake.
 - [ARCHIVE TABLE](archive-table.md), Writes rows out to a destination and removes them from the table.

@@ -1,10 +1,16 @@
-//! Upgrade notification.
+//! Notification through the operator's contact channels.
 //!
-//! Every step of an upgrade is written to the audit hash chain and delivered
-//! to whatever contact channels the operator configured. The audit entry is
-//! the record that cannot be edited; the notification is the copy that
-//! reaches a person. A channel that fails delivery never fails the upgrade,
-//! it is recorded as undelivered so the gap is visible rather than silent
+//! Every step of an upgrade, and every alert a subsystem raises, is written
+//! to the audit hash chain and delivered to whatever contact channels the
+//! operator configured. The audit entry is the record that cannot be edited,
+//! and the notification is the copy that reaches a person. A channel that fails
+//! delivery never fails the work that raised the event, it is recorded as
+//! undelivered so the gap is visible rather than silent.
+//!
+//! The channels and the sink carry any [`NotificationEvent`]. The upgrade
+//! events are one implementation and the alert templates other subsystems
+//! declare are another, so an alert reaches the same webhook, Slack or
+//! Discord channel an upgrade step does
 
 use std::sync::Arc;
 
@@ -203,6 +209,109 @@ impl UpgradeEvent {
     }
 }
 
+/// Anything a contact channel carries, what to say, how to classify it
+/// and how to record it
+pub trait NotificationEvent: Send + Sync {
+    /// The subject line a channel carries
+    fn subject(&self) -> String;
+    /// The body a channel carries
+    fn body(&self) -> String;
+    /// The word a structured payload files the event under, an upgrade
+    /// phase or an alert template name
+    fn category(&self) -> String;
+    /// The subsystem the event came from, which the audit chain records
+    /// and a Discord footer names
+    fn source(&self) -> &'static str;
+    /// The audit event type the chain records
+    fn audit_event_type(&self) -> u8;
+    /// The color a Discord embed carries
+    fn embed_color(&self) -> u32;
+    /// Labeled details beside the title and body
+    fn detail_fields(&self) -> Vec<(&'static str, String)>;
+}
+
+impl NotificationEvent for UpgradeEvent {
+    fn subject(&self) -> String {
+        UpgradeEvent::subject(self)
+    }
+
+    fn body(&self) -> String {
+        UpgradeEvent::body(self)
+    }
+
+    fn category(&self) -> String {
+        self.phase().label().to_string()
+    }
+
+    fn source(&self) -> &'static str {
+        "upgrade"
+    }
+
+    fn audit_event_type(&self) -> u8 {
+        UpgradeEvent::audit_event_type(self)
+    }
+
+    fn embed_color(&self) -> u32 {
+        UpgradeEvent::embed_color(self)
+    }
+
+    fn detail_fields(&self) -> Vec<(&'static str, String)> {
+        UpgradeEvent::detail_fields(self)
+    }
+}
+
+/// An alert a subsystem raised from one of the templates it declares
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertEvent {
+    /// The template name, such as `cdc_stream_lag`
+    pub template: String,
+    /// The subsystem that declares the template
+    pub subsystem: &'static str,
+    /// The object the alert is about
+    pub object: String,
+    /// What was measured
+    pub detail: String,
+    /// True for a condition that stops work until someone acts, which is
+    /// what turns the embed red rather than orange
+    pub urgent: bool,
+}
+
+/// The compliance log event type every alert notification records under
+pub const ALERT_AUDIT_EVENT_TYPE: u8 = 27;
+
+impl NotificationEvent for AlertEvent {
+    fn subject(&self) -> String {
+        format!("Zyron alert {} on {}", self.template, self.object)
+    }
+
+    fn body(&self) -> String {
+        self.detail.clone()
+    }
+
+    fn category(&self) -> String {
+        self.template.clone()
+    }
+
+    fn source(&self) -> &'static str {
+        self.subsystem
+    }
+
+    fn audit_event_type(&self) -> u8 {
+        ALERT_AUDIT_EVENT_TYPE
+    }
+
+    fn embed_color(&self) -> u32 {
+        if self.urgent { 0xE74C3C } else { 0xF39C12 }
+    }
+
+    fn detail_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("Template", self.template.clone()),
+            ("Object", self.object.clone()),
+        ]
+    }
+}
+
 /// Where a notification goes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContactChannel {
@@ -284,13 +393,18 @@ pub struct Delivery {
 /// Delivers a notification to one channel
 #[async_trait::async_trait]
 pub trait NotificationSink: Send + Sync {
-    async fn deliver(&self, channel: &ContactChannel, event: &UpgradeEvent) -> Delivery;
+    async fn deliver(&self, channel: &ContactChannel, event: &dyn NotificationEvent) -> Delivery;
     fn describe(&self) -> String;
 }
 
-/// The footer every Discord embed carries, so an event is attributable in a
+/// The footer a Discord embed carries, so an event is attributable in a
 /// channel that carries more than one system's messages
-const DISCORD_FOOTER: &str = "Zyron auto-upgrade";
+fn discord_footer(event: &dyn NotificationEvent) -> String {
+    match event.source() {
+        "upgrade" => "Zyron auto-upgrade".to_string(),
+        source => format!("Zyron {source}"),
+    }
+}
 
 /// The longest `retry-after` a Discord delivery waits out. A channel asking
 /// for longer is reported undelivered, because one channel's rate limit
@@ -312,11 +426,18 @@ impl HttpNotificationSink {
         Ok(Self { client })
     }
 
-    async fn post(&self, url: &str, event: &UpgradeEvent, channel: &str, now: u64) -> Delivery {
+    async fn post(
+        &self,
+        url: &str,
+        event: &dyn NotificationEvent,
+        channel: &str,
+        now: u64,
+    ) -> Delivery {
         let payload = serde_json::json!({
             "subject": event.subject(),
             "body": event.body(),
-            "phase": event.phase().label(),
+            "phase": event.category(),
+            "source": event.source(),
         });
         match self.client.post(url).json(&payload).send().await {
             Ok(response) if response.status().is_success() => Delivery {
@@ -351,7 +472,7 @@ impl HttpNotificationSink {
     async fn post_discord(
         &self,
         url: &str,
-        event: &UpgradeEvent,
+        event: &dyn NotificationEvent,
         channel: &str,
         now: u64,
     ) -> Delivery {
@@ -426,7 +547,7 @@ impl HttpNotificationSink {
 /// One delivery outcome in the shape every caller reports it in
 fn settled(
     channel: &str,
-    event: &UpgradeEvent,
+    event: &dyn NotificationEvent,
     delivered: bool,
     detail: String,
     now: u64,
@@ -457,7 +578,7 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 
 /// The embed body a Discord webhook takes for one event
-pub fn discord_payload(event: &UpgradeEvent, now: u64) -> serde_json::Value {
+pub fn discord_payload(event: &dyn NotificationEvent, now: u64) -> serde_json::Value {
     let fields: Vec<serde_json::Value> = event
         .detail_fields()
         .into_iter()
@@ -469,7 +590,7 @@ pub fn discord_payload(event: &UpgradeEvent, now: u64) -> serde_json::Value {
             "description": event.body(),
             "color": event.embed_color(),
             "fields": fields,
-            "footer": { "text": DISCORD_FOOTER },
+            "footer": { "text": discord_footer(event) },
             "timestamp": iso8601_utc(now),
         }]
     })
@@ -508,7 +629,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[async_trait::async_trait]
 impl NotificationSink for HttpNotificationSink {
-    async fn deliver(&self, channel: &ContactChannel, event: &UpgradeEvent) -> Delivery {
+    async fn deliver(&self, channel: &ContactChannel, event: &dyn NotificationEvent) -> Delivery {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -562,7 +683,7 @@ impl RecordingSink {
 
 #[async_trait::async_trait]
 impl NotificationSink for RecordingSink {
-    async fn deliver(&self, channel: &ContactChannel, event: &UpgradeEvent) -> Delivery {
+    async fn deliver(&self, channel: &ContactChannel, event: &dyn NotificationEvent) -> Delivery {
         let delivery = Delivery {
             channel: channel.describe(),
             subject: event.subject(),
@@ -606,12 +727,12 @@ impl Notifier {
     /// Audits an event and delivers it
     pub async fn emit(
         &self,
-        event: &UpgradeEvent,
+        event: &dyn NotificationEvent,
         now_secs: u64,
     ) -> (zyron_catalog::schema::ComplianceLogEntry, Vec<Delivery>) {
         let entry = self.chain.next_entry(
             event.audit_event_type(),
-            "upgrade".to_string(),
+            event.source().to_string(),
             0,
             now_secs as i64,
             format!("{} :: {}", event.subject(), event.body()),
@@ -883,7 +1004,7 @@ mod tests {
             "{embed}"
         );
         assert_eq!(embed["color"], 0x2ECC71);
-        assert_eq!(embed["footer"]["text"], DISCORD_FOOTER);
+        assert_eq!(embed["footer"]["text"], "Zyron auto-upgrade");
         assert_eq!(embed["timestamp"], "2025-09-07T13:30:45Z");
         let fields = embed["fields"].as_array().expect("fields is an array");
         assert_eq!(fields.len(), 2);

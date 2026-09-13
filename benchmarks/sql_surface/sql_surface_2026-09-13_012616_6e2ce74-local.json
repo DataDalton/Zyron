@@ -1,0 +1,186 @@
+{
+  "id": "2026-09-13_012616_6e2ce74-local",
+  "date": "2026-09-13 01:29:03Z",
+  "ts": 1789262943,
+  "commit": "6e2ce74-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "array_transform throughput": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 11.20 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 11.20 },
+      "array_transform elements": {
+        "average": 70550717.016134,
+        "runs": [70586669.10, 70672401.97, 70486986.13, 70468289.97, 70539237.91],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "CREATE TEMP TABLE": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 11.20 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 11.18 },
+      "CREATE TEMP TABLE latency": {
+        "average": 161.956300,
+        "runs": [187.84, 159.12, 160.51, 153.37, 148.94],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "FLATTEN throughput": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 11.20 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 11.25 },
+      "FLATTEN leaves": {
+        "average": 5380300.659672,
+        "runs": [5369379.91, 5383733.98, 5390214.76, 5371612.16, 5386562.48],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "LATERAL overhead": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 11.14 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 11.10 },
+      "bare UNNEST": {
+        "average": 140556627.336342,
+        "runs": [141019855.60, 140079761.42, 141321582.91, 140377475.03, 139984461.72],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "LATERAL UNNEST": {
+        "average": 135380358.903892,
+        "runs": [136304870.38, 135173312.46, 136580395.66, 134497182.28, 134346033.74],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "LATERAL over bare": {
+        "average": 1.038235,
+        "runs": [1.04],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "PIVOT rewrite": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 10.56 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 10.55 },
+      "PIVOT": {
+        "average": 285.630000,
+        "runs": [297.35, 285.04, 282.38, 281.84, 281.54],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "hand-written aggregate": {
+        "average": 282.643020,
+        "runs": [280.24, 284.07, 282.31, 284.16, 282.44],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "PIVOT over hand-written": {
+        "average": 1.010568,
+        "runs": [1.01],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Temporary drop": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 10.48 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.49 },
+      "drop at session end": {
+        "average": 13.215580,
+        "runs": [4.65, 4.57, 4.41, 4.34, 48.11],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Temporary INSERT": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 10.30 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 10.63 },
+      "temporary table": {
+        "average": 5599551.953411,
+        "runs": [5719881.39, 5546284.02, 5652940.01, 5334525.42, 5744128.93],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "permanent heap": {
+        "average": 2338201.427276,
+        "runs": [2674703.62, 2469894.46, 1897840.39, 2310703.15, 2337865.52],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "temporary over permanent, no group": {
+        "average": 2.394812,
+        "runs": [2.39],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "UNNEST throughput": {
+      "util_before": { "cpu_pct": 15.0, "ram_used_gb": 11.87 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 12.27 },
+      "UNNEST elements": {
+        "average": 135946551.916785,
+        "runs": [134285453.00, 136461876.51, 136527345.06, 135870469.79, 136587615.22],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "UNPIVOT throughput": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 11.82 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 11.74 },
+      "UNPIVOT output rows": {
+        "average": 60920861.552066,
+        "runs": [61489144.09, 61567477.19, 60628597.30, 61203068.72, 59716020.46],
+        "target": 20000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

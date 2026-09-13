@@ -16,5 +16,5 @@ pub use background_writer::{
     BackgroundWriter, BackgroundWriterConfig, FsyncFn, WalBarrierFn, WriteFn,
 };
 pub use frame::{BufferFrame, FrameId};
-pub use pool::{BufferPool, BufferPoolConfig, EvictWriteFn, FlushOutcome};
+pub use pool::{BufferPool, BufferPoolConfig, DirtyPage, EvictWriteFn, FlushOutcome};
 pub use replacer::{ClockReplacer, Replacer};
