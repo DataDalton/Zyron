@@ -139,26 +139,6 @@ fn cleanup_governor_rate_limits_and_windows() {
 }
 
 #[test]
-fn audit_chain_detects_tampering() {
-    use zyron_catalog::schema::ComplianceLogEntry;
-    use zyron_lifecycle::audit_chain::AuditChain;
-    let chain = AuditChain::new();
-    let e1 = chain.next_entry(0, "s1".into(), 1, 100, "ttl".into());
-    let e2 = chain.next_entry(3, "s2".into(), 1, 200, "hold".into());
-    let good = vec![e1.clone(), e2.clone()];
-    let (n, intact) = AuditChain::verify(&good);
-    assert!(intact && n == 2);
-    // Tamper with the second entry's detail without recomputing the hash.
-    let mut bad = good.clone();
-    bad[1] = ComplianceLogEntry {
-        detail: "tampered".into(),
-        ..bad[1].clone()
-    };
-    let (_, intact2) = AuditChain::verify(&bad);
-    assert!(!intact2);
-}
-
-#[test]
 fn worm_write_lock_blocks_until_expiry() {
     use zyron_catalog::schema::{LifecycleConfig, TableEntry};
     use zyron_lifecycle::ttl::now_micros;

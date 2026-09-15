@@ -1,0 +1,97 @@
+# suite:   verify
+# run:     2026-09-15_004112_6f636f3-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Anchor write ===
+  latency [PASS/OK]:
+    Runs: [1.9741 ms, 2.0184 ms, 1.9098 ms, 1.9693 ms, 2.0786 ms]
+    Average: 1.9900 ms <= 5 ms (target)
+    Min/Max: 1.9098 ms / 2.0786 ms, StdDev: 0.0562 ms
+
+=== Chain storage per commit ===
+  bytes per commit [PASS/OK]:
+    Runs: [96 B, 96 B, 96 B, 96 B, 96 B]
+    Average: 96 B <= 96 B (target)
+    Min/Max: 96 B / 96 B, StdDev: 0 B
+
+=== INSERT, verified vs immutable-only, one commit of 1000000 rows ===
+  immutable only:
+    Runs: [0.6179 s, 0.5282 s, 0.5697 s, 0.5288 s, 0.5575 s]
+    Average: 0.5604 s (no target set)
+    Min/Max: 0.5282 s / 0.6179 s, StdDev: 0.0330 s
+  verified:
+    Runs: [0.5664 s, 0.5627 s, 0.5521 s, 0.5773 s, 0.5622 s]
+    Average: 0.5641 s (no target set)
+    Min/Max: 0.5521 s / 0.5773 s, StdDev: 0.0081 s
+  Verified adds 0.66% over immutable only (target 5%)
+  verified vs immutable-only delta [PASS]: 0.6585 <= 5 (target)
+
+=== 16 parallel writers, 1024 single-row commits ===
+  serial section: 0.42 us per commit, the first commit's file creation 253 us on its own, slowest commit 238 us, 0 commit(s) over a millisecond holding 0 us between them
+  one link hash: 64 ns as the chain computes it, 7271 ns as one SHA-256 call over the same bytes, 3458 ns through the row hasher
+  serial section: 0.35 us per commit, the first commit's file creation 283 us on its own, slowest commit 145 us, 0 commit(s) over a millisecond holding 0 us between them
+  one link hash: 65 ns as the chain computes it, 7333 ns as one SHA-256 call over the same bytes, 3488 ns through the row hasher
+  serial section: 0.33 us per commit, the first commit's file creation 292 us on its own, slowest commit 116 us, 0 commit(s) over a millisecond holding 0 us between them
+  one link hash: 64 ns as the chain computes it, 7334 ns as one SHA-256 call over the same bytes, 3466 ns through the row hasher
+  serial section: 0.48 us per commit, the first commit's file creation 296 us on its own, slowest commit 276 us, 0 commit(s) over a millisecond holding 0 us between them
+  one link hash: 64 ns as the chain computes it, 7277 ns as one SHA-256 call over the same bytes, 3457 ns through the row hasher
+  serial section: 0.46 us per commit, the first commit's file creation 240 us on its own, slowest commit 264 us, 0 commit(s) over a millisecond holding 0 us between them
+  one link hash: 64 ns as the chain computes it, 7298 ns as one SHA-256 call over the same bytes, 3488 ns through the row hasher
+  immutable only:
+    Runs: [102,719 commits/s, 110,315 commits/s, 113,165 commits/s, 114,180 commits/s, 111,070 commits/s]
+    Average: 110,290 commits/s (no target set)
+    Min/Max: 102,719 commits/s / 114,180 commits/s, StdDev: 4,033 commits/s
+  verified:
+    Runs: [107,323 commits/s, 104,056 commits/s, 113,677 commits/s, 95,764 commits/s, 96,813 commits/s]
+    Average: 103,526 commits/s (no target set)
+    Min/Max: 95,764 commits/s / 113,677 commits/s, StdDev: 6,679 commits/s
+  The chain adds 6.82% to sixteen writers' commits (target 10%)
+  verified vs immutable-only delta [PASS]: 6.8244 <= 10 (target)
+  chain serial section per commit [PASS/OK]:
+    Runs: [0.4203 us, 0.3500 us, 0.3294 us, 0.4821 us, 0.4619 us]
+    Average: 0.4088 us <= 5 us (target)
+    Min/Max: 0.3294 us / 0.4821 us, StdDev: 0.0602 us
+
+=== SHA-256 over commit rows ===
+  throughput [PASS/OK]:
+    Runs: [3,716,379,288 B/s, 3,714,909,703 B/s, 3,644,504,237 B/s, 3,748,073,805 B/s, 3,752,482,722 B/s]
+    Average: 3,715,269,951 B/s >= 1,000,000,000 B/s (target)
+    Min/Max: 3,644,504,237 B/s / 3,752,482,722 B/s, StdDev: 38,652,373 B/s
+
+=== VERIFY over 2000 commits of 50 rows ===
+  chain phase apart: reading 2000 entries 96 us, recomputing 2000 links 134 us
+  chain phase apart: reading 2000 entries 61 us, recomputing 2000 links 130 us
+  chain phase apart: reading 2000 entries 19 us, recomputing 2000 links 130 us
+  sampled: 2021 us total, 277 us in the chain, 309 us in the rows, 1435 us around them
+  full: 3326 us total, 312 us in the chain, 1466 us in the rows, 1548 us around them
+  sampled: 1580 us total, 236 us in the chain, 198 us in the rows, 1146 us around them
+  full: 2745 us total, 213 us in the chain, 1384 us in the rows, 1148 us around them
+  sampled: 1544 us total, 204 us in the chain, 179 us in the rows, 1161 us around them
+  full: 2856 us total, 209 us in the chain, 1349 us in the rows, 1298 us around them
+  sampled: 1779 us total, 195 us in the chain, 223 us in the rows, 1361 us around them
+  full: 2777 us total, 213 us in the chain, 1382 us in the rows, 1182 us around them
+  sampled: 1897 us total, 211 us in the chain, 266 us in the rows, 1420 us around them
+  full: 2765 us total, 223 us in the chain, 1488 us in the rows, 1054 us around them
+  latency [PASS/OK]:
+    Runs: [0.0020 s, 0.0016 s, 0.0015 s, 0.0018 s, 0.0019 s]
+    Average: 0.0018 s <= 60 s (target)
+    Min/Max: 0.0015 s / 0.0020 s, StdDev: 0.0002 s
+  throughput [PASS/OK]:
+    Runs: [962,116,657 B/s, 1,165,458,717 B/s, 1,120,291,276 B/s, 1,152,239,666 B/s, 1,157,072,606 B/s]
+    Average: 1,111,435,784 B/s >= 500,000,000 B/s (target)
+    Min/Max: 962,116,657 B/s / 1,165,458,717 B/s, StdDev: 76,211,253 B/s
+
+=== Writer throughput during a full VERIFY ===
+  alone:
+    Runs: [10,278 commits/s, 9,840 commits/s, 9,372 commits/s, 8,733 commits/s, 9,085 commits/s]
+    Average: 9,461 commits/s (no target set)
+    Min/Max: 8,733 commits/s / 10,278 commits/s, StdDev: 546.1040 commits/s
+  with a verification running:
+    Runs: [9,589 commits/s, 9,541 commits/s, 8,143 commits/s, 9,358 commits/s, 8,893 commits/s]
+    Average: 9,105 commits/s (no target set)
+    Min/Max: 8,143 commits/s / 9,589 commits/s, StdDev: 539.9087 commits/s
+  A running verification costs the writer 3.77% (target 10%)
+  throughput delta [PASS]: 3.7709 <= 10 (target)

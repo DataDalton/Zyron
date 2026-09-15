@@ -1682,6 +1682,32 @@ impl WalWriter {
         Ok(written)
     }
 
+    /// Logs one entry appended to a verifiable table's commit chain.
+    ///
+    /// Chained onto the transaction's own records, so the entry and the rows
+    /// it covers are one transaction: recovery replays it only where the
+    /// commit record that follows it is there
+    pub fn log_commit_chain_entry(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        table_id: u32,
+        sequence: u64,
+        record: &[u8],
+    ) -> Result<Lsn> {
+        let mut prefix = [0u8; crate::record::CommitChainEntry::PREFIX];
+        prefix[..4].copy_from_slice(&table_id.to_le_bytes());
+        prefix[4..12].copy_from_slice(&sequence.to_le_bytes());
+        self.append_split(
+            txn_id,
+            prev_lsn,
+            LogRecordType::CommitChainEntry,
+            WAL_RECORD_VERSION_BYTE,
+            &prefix,
+            record,
+        )
+    }
+
     /// Logs an update operation.
     #[inline]
     pub fn log_update(&self, txn_id: u64, prev_lsn: Lsn, payload: &[u8]) -> Result<Lsn> {

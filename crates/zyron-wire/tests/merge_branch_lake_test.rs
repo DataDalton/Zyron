@@ -142,6 +142,7 @@ async fn create_harness() -> Harness {
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: None,
     });
 
     let mut session = Session::new("test_user".into(), "testdb".into(), DatabaseId(1));

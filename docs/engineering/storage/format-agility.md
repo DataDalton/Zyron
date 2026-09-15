@@ -34,7 +34,7 @@ A format's framing says how much of the envelope it carries and how a migrator f
 | OwnTrailer | 20 bytes | 0 | ZyrColumnar, LakeManifest |
 | Stamp | 9 bytes | 0 | HeapPage, BTreeInternal, BTreeLeaf, Fsm, BloomFilter, Toast |
 | Text | 0 | 0 | ZyronTomlConfig, BackupArchive |
-| RecordTag | 1 byte | 0 | AuditHashChain, ReplicationApplyLog, DeletePredicate, LakeTransactionLog |
+| RecordTag | 1 byte | 0 | ComplianceLogRecord, ReplicationApplyLog, DeletePredicate, LakeTransactionLog |
 
 ### Formats that own their trailer
 

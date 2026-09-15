@@ -33,6 +33,11 @@ pub struct Session {
     /// the backend that sent it is on another member and its id means nothing
     /// here
     pub process_id: i32,
+    /// The secret a cancel request has to prove to reach this connection's
+    /// running statement, so a statement dispatched outside the query path
+    /// can publish itself as cancellable under the same key. Zero on a
+    /// session that belongs to no connection
+    pub secret_key: i32,
     /// The role a replicated schema change ran under on the node that
     /// originated it.
     ///
@@ -154,6 +159,7 @@ impl Session {
             sequence_state: std::sync::Arc::new(zyron_executor::sequence::SessionSeqState::new()),
             statement_timeout_override: None,
             process_id: 0,
+            secret_key: 0,
             replicated_actor: None,
             apply_txn_id: None,
             agreed_entry: None,

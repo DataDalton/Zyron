@@ -35,6 +35,17 @@ pub const TABLE_SCHEMA_VERSION: FormatVersion = FormatVersion::new(2, 0);
 /// The version an index row is written at. V2 carries the build state.
 pub const INDEX_SCHEMA_VERSION: FormatVersion = FormatVersion::new(2, 0);
 
+/// The Zyron version the compliance log became a verified table
+const VERIFIED_LOG_GATE: &str = "0.19.0";
+
+/// The version a compliance log row is written at.
+///
+/// V2 drops the two hash fields an entry used to carry. What states that
+/// the log is whole is the commit chain over the table the rows land in,
+/// which the commit that appends one extends, so a hash on the row is a
+/// second answer to one question and the weaker of the two.
+pub const COMPLIANCE_LOG_SCHEMA_VERSION: FormatVersion = FormatVersion::new(2, 0);
+
 /// One persistent catalog table
 struct Table {
     name: &'static str,
@@ -48,6 +59,9 @@ const TABLES_INDEX: usize = 2;
 /// Position of `zyron_sys.storage.indexes` in `TABLES`
 const INDEXES_INDEX: usize = 4;
 
+/// Position of `zyron_sys.compliance.log` in `TABLES`
+const COMPLIANCE_LOG_INDEX: usize = 25;
+
 /// The version one table's rows are written at.
 ///
 /// Two tables have moved past the shared version, so the row shape a
@@ -56,6 +70,7 @@ const fn version_of(index: usize) -> FormatVersion {
     match index {
         TABLES_INDEX => TABLE_SCHEMA_VERSION,
         INDEXES_INDEX => INDEX_SCHEMA_VERSION,
+        COMPLIANCE_LOG_INDEX => COMPLIANCE_LOG_SCHEMA_VERSION,
         _ => CATALOG_SCHEMA_VERSION,
     }
 }
@@ -64,6 +79,7 @@ const fn version_of(index: usize) -> FormatVersion {
 const fn gate_of(index: usize) -> &'static str {
     match index {
         TABLES_INDEX | INDEXES_INDEX => EPOCH_GATE,
+        COMPLIANCE_LOG_INDEX => VERIFIED_LOG_GATE,
         _ => GATE,
     }
 }
@@ -175,7 +191,7 @@ const TABLES: &[Table] = &[
     },
     Table {
         name: "zyron_sys.compliance.log",
-        doc: "The tamper-evident audit chain",
+        doc: "Every governed event, as an immutable and verified table",
     },
     Table {
         name: "zyron_sys.core.schedules",
@@ -344,6 +360,94 @@ inventory::submit! {
     }
 }
 
+/// Drops the two hash fields a compliance log row used to carry.
+///
+/// The fields held a CRC32 chain over the entries. CRC32 is a checksum
+/// rather than a one-way function, so anyone rewriting an entry could
+/// recompute every hash after it, and the chain stated only that nobody had
+/// edited a row by accident. The table is verified from here on and its
+/// commit chain is what states the log is whole, so the fields are removed
+/// rather than left as a second answer to the same question. What was
+/// written before this step is covered by the genesis entry the conversion
+/// writes, as a set rather than one commit at a time.
+fn drop_compliance_log_hashes(row: &mut Vec<u8>) -> std::result::Result<(), String> {
+    let mut at = 0usize;
+    let event_id = read_u64(row, &mut at)?;
+    let event_type = read_u8(row, &mut at)?;
+    let subject = read_string(row, &mut at)?;
+    let table_id = read_u32(row, &mut at)?;
+    let ts = read_u64(row, &mut at)? as i64;
+    let detail = read_string(row, &mut at)?;
+    // The two hashes, then the version tag
+    let _prev_hash = read_u32(row, &mut at)?;
+    let _entry_hash = read_u32(row, &mut at)?;
+    let record_version = read_u8(row, &mut at)?;
+    *row = crate::schema::ComplianceLogEntry {
+        event_id,
+        event_type,
+        subject,
+        table_id,
+        ts,
+        detail,
+        record_version,
+    }
+    .to_bytes();
+    Ok(())
+}
+
+fn read_u8(data: &[u8], at: &mut usize) -> std::result::Result<u8, String> {
+    let value = *data
+        .get(*at)
+        .ok_or_else(|| "a compliance log row ends inside one of its fields".to_string())?;
+    *at += 1;
+    Ok(value)
+}
+
+fn read_u32(data: &[u8], at: &mut usize) -> std::result::Result<u32, String> {
+    let bytes: [u8; 4] = data
+        .get(*at..*at + 4)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| "a compliance log row ends inside one of its fields".to_string())?;
+    *at += 4;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(data: &[u8], at: &mut usize) -> std::result::Result<u64, String> {
+    let bytes: [u8; 8] = data
+        .get(*at..*at + 8)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| "a compliance log row ends inside one of its fields".to_string())?;
+    *at += 8;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_string(data: &[u8], at: &mut usize) -> std::result::Result<String, String> {
+    let len = read_u32(data, at)? as usize;
+    let bytes = data
+        .get(*at..*at + len)
+        .ok_or_else(|| "a compliance log row ends inside one of its fields".to_string())?;
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("a compliance log row holds bad text, {e}"))?;
+    *at += len;
+    Ok(text)
+}
+
+inventory::submit! {
+    CatalogSchemaEvolution {
+        catalog_table: TABLES[COMPLIANCE_LOG_INDEX].name,
+        from_version: CATALOG_SCHEMA_VERSION,
+        to_version: COMPLIANCE_LOG_SCHEMA_VERSION,
+        migration_function_ref: "zyron_catalog::catalog_schema::drop_compliance_log_hashes",
+        // The two hashes cannot be put back once the table is verified,
+        // because the entries written after the conversion never had them
+        reversible: false,
+        introduced_in_binary_version: VERIFIED_LOG_GATE,
+        forward: drop_compliance_log_hashes,
+        backward: None,
+        description: "removes the CRC32 chain an entry carried, which the table's commit chain                       replaces, and records that entries before the conversion carried a chain                       that is a checksum rather than evidence",
+    }
+}
+
 inventory::submit! {
     CatalogSchemaEvolution {
         catalog_table: TABLES[INDEXES_INDEX].name,
@@ -411,7 +515,7 @@ mod tests {
                 .table(name)
                 .unwrap_or_else(|| panic!("`{name}` is in the registry"));
             assert_eq!(table.registration.current_schema_version, version_of(index));
-            if index == TABLES_INDEX || index == INDEXES_INDEX {
+            if index == TABLES_INDEX || index == INDEXES_INDEX || index == COMPLIANCE_LOG_INDEX {
                 assert_eq!(
                     table.steps.len(),
                     1,
@@ -430,6 +534,55 @@ mod tests {
     fn test_the_versioned_tables_sit_where_their_indices_say() {
         assert_eq!(TABLES[TABLES_INDEX].name, "zyron_sys.core.tables");
         assert_eq!(TABLES[INDEXES_INDEX].name, "zyron_sys.storage.indexes");
+        assert_eq!(
+            TABLES[COMPLIANCE_LOG_INDEX].name,
+            "zyron_sys.compliance.log"
+        );
+    }
+
+    /// The conversion drops the two hash fields and leaves every other
+    /// field where it was, so an auditor reading an entry written before it
+    /// reads the same event afterwards
+    #[test]
+    fn test_the_compliance_log_step_drops_the_hashes_and_keeps_the_event() {
+        // A row as the release before this one wrote it: the event's own
+        // fields, the two hashes, then the version tag
+        let mut row = Vec::new();
+        row.extend_from_slice(&7u64.to_le_bytes());
+        row.push(3);
+        row.extend_from_slice(&2u32.to_le_bytes());
+        row.extend_from_slice(b"h1");
+        row.extend_from_slice(&9u32.to_le_bytes());
+        row.extend_from_slice(&1_234u64.to_le_bytes());
+        row.extend_from_slice(&11u32.to_le_bytes());
+        row.extend_from_slice(b"create hold");
+        row.extend_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        row.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        row.push(1);
+
+        drop_compliance_log_hashes(&mut row).expect("converts");
+        let entry = crate::schema::ComplianceLogEntry::from_bytes(&row).expect("decodes");
+        assert_eq!(entry.event_id, 7);
+        assert_eq!(entry.event_type, 3);
+        assert_eq!(entry.subject, "h1");
+        assert_eq!(entry.table_id, 9);
+        assert_eq!(entry.ts, 1_234);
+        assert_eq!(entry.detail, "create hold");
+        assert_eq!(entry.record_version, 1);
+        assert_eq!(
+            row.len(),
+            entry.to_bytes().len(),
+            "the row holds exactly the fields an entry carries now"
+        );
+    }
+
+    /// A row that ends inside one of its fields fails the step rather than
+    /// producing an entry with whatever the bytes happened to hold
+    #[test]
+    fn test_a_truncated_compliance_row_fails_the_step() {
+        let mut row = vec![0u8; 4];
+        let refused = drop_compliance_log_hashes(&mut row).expect_err("refused");
+        assert!(refused.contains("ends inside"), "{refused}");
     }
 
     /// A table row that reached this binary without an epoch is unreadable,

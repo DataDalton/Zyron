@@ -708,7 +708,22 @@ mod tests {
             &self,
             _: &crate::schema::ComplianceLogEntry,
         ) -> Result<TupleId> {
-            unimplemented!()
+            Err(zyron_common::ZyronError::Internal(
+                "this catalog holds no compliance log".to_string(),
+            ))
+        }
+        fn compliance_log_file_ids(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        async fn store_compliance_log_under(
+            &self,
+            _: &crate::schema::ComplianceLogEntry,
+            _: u64,
+            _: Option<&std::sync::atomic::AtomicU32>,
+        ) -> Result<TupleId> {
+            Err(zyron_common::ZyronError::Internal(
+                "this catalog holds no compliance log".to_string(),
+            ))
         }
         async fn is_bootstrapped(&self) -> Result<bool> {
             Ok(true)

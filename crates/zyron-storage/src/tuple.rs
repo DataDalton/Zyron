@@ -57,6 +57,17 @@ impl TupleId {
         self.page_id.file_id != u32::MAX
     }
 
+    /// Where this row sits in its file, as one number that orders the rows
+    /// of a heap the way a scan reads them.
+    ///
+    /// A scan walks pages in order and each page's slots in order, so this
+    /// is the order a verification reads a commit's rows back in and the
+    /// order the write path hashes them in
+    #[inline]
+    pub const fn order_key(&self) -> u64 {
+        (self.page_id.page_num << 16) | self.slot_id as u64
+    }
+
     /// Storage agnostic locator for this heap row
     #[inline]
     pub fn locator(self) -> zyron_common::RowLocator {

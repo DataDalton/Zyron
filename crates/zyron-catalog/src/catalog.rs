@@ -316,10 +316,10 @@ pub struct Catalog {
     change_streams_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::ChangeStreamEntry>>>,
     change_streams_by_id: RwLock<HashMap<u32, Arc<crate::schema::ChangeStreamEntry>>>,
     change_streams_by_table: RwLock<HashMap<u32, Vec<u32>>>,
-    /// Serializes compliance-log appends so the tamper-evident hash chain is
-    /// linear. The load-compute-store sequence runs under this lock so two
-    /// concurrent appends cannot read the same tail and fork the chain.
-    compliance_append_lock: tokio::sync::Mutex<()>,
+    /// The event id the next compliance log entry takes, None until the
+    /// first append of this process reads it off the log's last row.
+    /// Appends run under this lock so two events never take the same id
+    compliance_next_event: tokio::sync::Mutex<Option<u64>>,
     /// Per-table serialization of whole-entry read-modify-write updates,
     /// lazily created and shared by every mutator of that table's entry.
     table_update_locks: scc::HashMap<TableId, Arc<tokio::sync::Mutex<()>>>,
@@ -410,7 +410,7 @@ impl Catalog {
             change_streams_by_name: RwLock::new(HashMap::new()),
             change_streams_by_id: RwLock::new(HashMap::new()),
             change_streams_by_table: RwLock::new(HashMap::new()),
-            compliance_append_lock: tokio::sync::Mutex::new(()),
+            compliance_next_event: tokio::sync::Mutex::new(None),
             table_update_locks: scc::HashMap::new(),
             system_catalog: RwLock::new(SystemCatalogIds::default()),
         };
@@ -3066,6 +3066,72 @@ impl Catalog {
         self.persist_counters().await?;
         self.cache.put_table(entry);
         Ok(table_id)
+    }
+
+    /// Registers the compliance audit log as a table of the system catalog.
+    ///
+    /// The log's rows already live in a heap of their own. Naming that heap
+    /// as a table is what lets the log carry the protections its rows need:
+    /// immutable, so no path rewrites or removes an event, and verified, so
+    /// every commit that appends one extends a chain the log can be held to.
+    ///
+    /// Called at start. A log already registered keeps the id it has, so a
+    /// restart does not produce a second table over the same heap
+    pub async fn register_compliance_log(&self, schema_id: SchemaId) -> Result<TableId> {
+        if let Some(existing) = self
+            .cache
+            .get_table_by_name(schema_id, COMPLIANCE_LOG_TABLE)
+        {
+            return Ok(existing.id);
+        }
+        let table_id = TableId(self.oid_allocator.next());
+        let (heap_file_id, fsm_file_id) = self.storage.compliance_log_file_ids();
+        let columns = compliance_log_columns(table_id);
+        let mut entry = TableEntry {
+            id: table_id,
+            schema_id,
+            name: COMPLIANCE_LOG_TABLE.to_string(),
+            heap_file_id,
+            fsm_file_id,
+            columns,
+            constraints: Vec::new(),
+            created_at: current_timestamp(),
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: crate::schema::LifecycleConfig {
+                immutable: true,
+                verified: true,
+                chain_algorithm: COMPLIANCE_LOG_CHAIN_ALGORITHM,
+                ..Default::default()
+            },
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
+            schema_epoch: 0,
+            schema_epochs: Vec::new(),
+            pre_stamp_columns: Vec::new(),
+            cdf: Default::default(),
+        };
+        entry.seal_initial_epoch();
+        self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
+        self.storage.store_table(&entry).await?;
+        self.persist_counters().await?;
+        self.cache.put_table(entry);
+        Ok(table_id)
+    }
+
+    /// The compliance log's table entry, once it is registered.
+    pub fn compliance_log_entry(&self, schema_id: SchemaId) -> Option<Arc<TableEntry>> {
+        self.cache
+            .get_table_by_name(schema_id, COMPLIANCE_LOG_TABLE)
     }
 
     /// Registers a table whose rows live on a peer.
@@ -7643,47 +7709,98 @@ impl Catalog {
         self.storage.load_compliance_log().await
     }
 
-    /// Appends a compliance log entry, chaining its hash over the latest
-    /// entry's hash so the audit log is tamper-evident.
+    /// Appends a compliance log entry under the next event id.
+    ///
+    /// The append is serialized so two events never take the same id. What
+    /// makes the log evidence is the commit chain over the table the rows
+    /// land in, which the commit writing them extends
     pub async fn append_compliance_log(
         &self,
-        mut entry: crate::schema::ComplianceLogEntry,
+        entry: crate::schema::ComplianceLogEntry,
     ) -> Result<()> {
-        // Serialize the read-modify-write so concurrent appends chain off the
-        // same tail in sequence rather than racing and forking the chain.
-        let _guard = self.compliance_append_lock.lock().await;
-        let existing = self.storage.load_compliance_log().await?;
-        let prev_hash = existing.last().map(|e| e.entry_hash).unwrap_or(0);
-        let next_id = existing.last().map(|e| e.event_id + 1).unwrap_or(1);
-        entry.event_id = next_id;
-        entry.prev_hash = prev_hash;
-        entry.entry_hash = entry.compute_hash();
-        self.storage.store_compliance_log(&entry).await?;
-        Ok(())
+        self.append_compliance_log_under(entry, 0, None)
+            .await
+            .map(|_| ())
     }
 
-    /// Verifies the compliance log hash chain. Returns the count of verified
-    /// entries and whether the whole chain is intact.
-    pub async fn verify_compliance_chain(&self) -> Result<(usize, bool)> {
-        let log = self.storage.load_compliance_log().await?;
-        let mut prev = 0u32;
-        let mut verified = 0usize;
-        let mut intact = true;
-        for e in &log {
-            if e.prev_hash != prev || e.entry_hash != e.compute_hash() {
-                intact = false;
-                break;
-            }
-            prev = e.entry_hash;
-            verified += 1;
-        }
-        Ok((verified, intact))
+    /// Appends a compliance log entry under a transaction.
+    ///
+    /// The row carries that transaction's stamp, which is what a
+    /// verification reads the commit's rows back by, and goes through the
+    /// transaction's cursor when the caller hands one, so the log's rows are
+    /// stored in the order its chain hashes them. Answers with the row as it
+    /// was stored and where it went, so the caller can hash it into the
+    /// chain entry the same commit appends.
+    ///
+    /// The event id comes from a counter read off the log's last row once
+    /// per process and held under the append lock from then on, so an
+    /// append costs one row rather than a read of the whole log
+    pub async fn append_compliance_log_under(
+        &self,
+        mut entry: crate::schema::ComplianceLogEntry,
+        txn_id: u64,
+        cursor: Option<&std::sync::atomic::AtomicU32>,
+    ) -> Result<(crate::schema::ComplianceLogEntry, zyron_storage::TupleId)> {
+        let mut next = self.compliance_next_event.lock().await;
+        let event_id = match *next {
+            Some(id) => id,
+            None => self.storage.last_compliance_event_id().await? + 1,
+        };
+        entry.event_id = event_id;
+        let tid = self
+            .storage
+            .store_compliance_log_under(&entry, txn_id, cursor)
+            .await?;
+        *next = Some(event_id + 1);
+        Ok((entry, tid))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
+
+/// The name the compliance audit log is registered under in the system
+/// catalog's compliance schema
+pub const COMPLIANCE_LOG_TABLE: &str = "log";
+
+/// The scheme the compliance log's chain links with, which is the one a
+/// chain is started with
+const COMPLIANCE_LOG_CHAIN_ALGORITHM: u16 = 4;
+
+/// The compliance log's columns, in the order its rows encode them.
+///
+/// These are the fields a compliance event has always carried. The two hash
+/// fields an entry used to hold are not among them: what states that the log
+/// is whole is the table's commit chain
+fn compliance_log_columns(table_id: TableId) -> Vec<ColumnEntry> {
+    use zyron_common::TypeId;
+    let column = |ordinal: u16, name: &str, type_id: TypeId| ColumnEntry {
+        id: ColumnId(ordinal),
+        table_id,
+        name: name.to_string(),
+        type_id,
+        ordinal,
+        nullable: false,
+        default_expr: None,
+        max_length: None,
+        fractional_digits: None,
+        tz_offset_secs: None,
+        element_type: None,
+        attrs: Default::default(),
+        absent_value: None,
+        dropped: false,
+    };
+    vec![
+        column(0, "event_id", TypeId::Int64),
+        column(1, "event_type", TypeId::Int16),
+        column(2, "subject", TypeId::Text),
+        column(3, "table_id", TypeId::Int32),
+        column(4, "ts", TypeId::Int64),
+        column(5, "detail", TypeId::Text),
+        column(6, "record_version", TypeId::Int16),
+    ]
+}
 
 /// Converts parser ColumnDefs to catalog ColumnEntries.
 /// Column count must already be validated to fit in u16.

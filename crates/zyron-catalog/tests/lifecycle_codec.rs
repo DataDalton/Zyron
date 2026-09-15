@@ -27,6 +27,9 @@ fn table_entry_lifecycle_roundtrip() {
     lc.data_key_id = 42;
     lc.residency_region = "EU".into();
     lc.immutable = true;
+    lc.verified = true;
+    lc.chain_algorithm = 4;
+    lc.genesis_at = 3;
 
     let entry = TableEntry {
         id: TableId(200),
@@ -409,46 +412,28 @@ fn lifecycle_system_entries_roundtrip() {
     assert_eq!(RetentionJobEntry::from_bytes(&j.to_bytes()).unwrap(), j);
 }
 
+/// A compliance entry carries its content and the version it was written
+/// at, and nothing else. What states that the log is whole is the commit
+/// chain over the table the rows land in
 #[test]
-fn compliance_log_hash_chain() {
-    let mut e1 = ComplianceLogEntry {
-        event_id: 1,
-        event_type: 3,
-        subject: "h1".into(),
-        table_id: 7,
-        ts: 100,
-        detail: "create legal hold".into(),
-        prev_hash: 0,
-        record_version: 1,
-        entry_hash: 0,
-    };
-    e1.entry_hash = e1.compute_hash();
-    let mut e2 = ComplianceLogEntry {
+fn compliance_log_entry_roundtrip() {
+    let entry = ComplianceLogEntry {
         event_id: 2,
         event_type: 4,
         subject: "u-1".into(),
-        table_id: 0,
+        table_id: 9,
         ts: 200,
         detail: "forget user".into(),
-        prev_hash: e1.entry_hash,
         record_version: 1,
-        entry_hash: 0,
     };
-    e2.entry_hash = e2.compute_hash();
-
-    // Chain verifies.
-    let mut prev = 0u32;
-    for e in [&e1, &e2] {
-        assert_eq!(e.prev_hash, prev);
-        assert_eq!(e.entry_hash, e.compute_hash());
-        prev = e.entry_hash;
-    }
-    // Round-trips through bytes.
-    assert_eq!(ComplianceLogEntry::from_bytes(&e2.to_bytes()).unwrap(), e2);
-    // Tampering breaks the recomputed hash.
-    let mut tampered = e2.clone();
-    tampered.detail = "forget user (changed)".into();
-    assert_ne!(tampered.compute_hash(), tampered.entry_hash);
+    assert_eq!(
+        ComplianceLogEntry::from_bytes(&entry.to_bytes()).unwrap(),
+        entry
+    );
+    // Every field is in the encoding, so an edit to any of them reads back
+    let mut other = entry.clone();
+    other.detail = "forget user (changed)".into();
+    assert_ne!(other.to_bytes(), entry.to_bytes());
 }
 
 #[test]

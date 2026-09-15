@@ -98,6 +98,32 @@ pub struct ZyronConfig {
     /// retention and size stay under, how many streams a table may carry,
     /// and the thresholds the stream alerts fire on
     pub cdc: CdcSection,
+    /// Verifiable tables, how often a chain's head is anchored and how many
+    /// commits a sampled verification reads the rows of
+    pub verify: VerifySection,
+}
+
+/// [verify] section of the config file
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VerifySection {
+    /// Seconds between anchoring passes. An anchor is what makes a chain's
+    /// truncation detectable, and `chain_not_anchored` fires on a head that
+    /// has gone twice this long without one
+    pub anchor_interval_secs: u64,
+    /// Commits a verification reads the rows of when the statement names no
+    /// number. Reading every commit's rows is `rows => 'all'`, which takes
+    /// MANAGE_VERIFICATION
+    pub default_sample: u64,
+}
+
+impl Default for VerifySection {
+    fn default() -> Self {
+        Self {
+            anchor_interval_secs: zyron_lifecycle::verify::anchor::DEFAULT_ANCHOR_INTERVAL_SECS,
+            default_sample: 64,
+        }
+    }
 }
 
 /// [cdc] section of the config file
@@ -470,6 +496,7 @@ impl Default for ZyronConfig {
             upgrade: UpgradeSection::default(),
             crypto: CryptoSection::default(),
             cdc: CdcSection::default(),
+            verify: VerifySection::default(),
         }
     }
 }
@@ -1521,6 +1548,8 @@ impl ZyronConfig {
             // Change data feeds and streams
             "cdc.cdf_max_bytes_per_table" => Some(self.cdc.cdf_max_bytes_per_table.to_string()),
             "cdc.cdf_max_retention_secs" => Some(self.cdc.cdf_max_retention_secs.to_string()),
+            "verify.anchor_interval_secs" => Some(self.verify.anchor_interval_secs.to_string()),
+            "verify.default_sample" => Some(self.verify.default_sample.to_string()),
             "cdc.change_streams_per_table" => Some(self.cdc.change_streams_per_table.to_string()),
             "cdc.stream_lag_rows" => Some(self.cdc.stream_lag_rows.to_string()),
             "cdc.stream_lag_seconds" => Some(self.cdc.stream_lag_seconds.to_string()),

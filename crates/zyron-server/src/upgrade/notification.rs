@@ -707,7 +707,9 @@ impl NotificationSink for RecordingSink {
 pub struct Notifier {
     channels: Vec<ContactChannel>,
     sink: Arc<dyn NotificationSink>,
-    chain: Arc<zyron_lifecycle::audit_chain::AuditChain>,
+    /// Ids the entries this notifier produced take, so two events of one
+    /// process are ordered against each other before either is appended
+    next_event_id: std::sync::atomic::AtomicU64,
 }
 
 impl Notifier {
@@ -715,13 +717,31 @@ impl Notifier {
         Self {
             channels,
             sink,
-            chain: Arc::new(zyron_lifecycle::audit_chain::AuditChain::new()),
+            next_event_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
-    /// The chain entry each notification produced, in order
-    pub fn chain(&self) -> Arc<zyron_lifecycle::audit_chain::AuditChain> {
-        Arc::clone(&self.chain)
+    /// Builds the compliance entry one event records.
+    ///
+    /// The id here orders the entries this process produced. What makes the
+    /// log evidence is the commit chain over the table the rows land in,
+    /// which the append extends, so the entry carries no hash of its own
+    pub fn audit_entry(
+        &self,
+        event: &dyn NotificationEvent,
+        now_secs: u64,
+    ) -> zyron_catalog::schema::ComplianceLogEntry {
+        zyron_catalog::schema::ComplianceLogEntry {
+            event_id: self
+                .next_event_id
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel),
+            event_type: event.audit_event_type(),
+            subject: event.source().to_string(),
+            table_id: 0,
+            ts: now_secs as i64,
+            detail: format!("{} :: {}", event.subject(), event.body()),
+            record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
+        }
     }
 
     /// Audits an event and delivers it
@@ -730,13 +750,7 @@ impl Notifier {
         event: &dyn NotificationEvent,
         now_secs: u64,
     ) -> (zyron_catalog::schema::ComplianceLogEntry, Vec<Delivery>) {
-        let entry = self.chain.next_entry(
-            event.audit_event_type(),
-            event.source().to_string(),
-            0,
-            now_secs as i64,
-            format!("{} :: {}", event.subject(), event.body()),
-        );
+        let entry = self.audit_entry(event, now_secs);
         let mut deliveries = Vec::with_capacity(self.channels.len());
         for channel in &self.channels {
             deliveries.push(self.sink.deliver(channel, event).await);
@@ -748,7 +762,6 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zyron_lifecycle::audit_chain::AuditChain;
 
     /// One channel of every kind the sink delivers to, so an assertion over
     /// this list covers each of them
@@ -822,13 +835,22 @@ mod tests {
             let (entry, _) = notifier.emit(event, 1_000 + index as u64).await;
             entries.push(entry);
         }
-        let (verified, intact) = AuditChain::verify(&entries);
-        assert_eq!(verified, 4);
-        assert!(intact, "every upgrade step is on an unbroken chain");
+        assert_eq!(entries.len(), 4);
+        // Each step is on the record under an id of its own and in the
+        // order it happened. What states that the record is whole is the
+        // chain over the table the rows land in, which the append extends
+        let ids: Vec<u64> = entries.iter().map(|entry| entry.event_id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.ts, 1_000 + index as i64);
+            assert!(!entry.detail.is_empty());
+        }
     }
 
+    /// Two events of one process take ids in the order they happened, so
+    /// the rows the log holds are ordered before either is appended
     #[tokio::test]
-    async fn test_a_tampered_entry_breaks_the_chain() {
+    async fn test_two_events_take_ids_in_the_order_they_happened() {
         let sink = RecordingSink::new();
         let notifier = Notifier::new(channels(), sink);
         let (first, _) = notifier
@@ -848,10 +870,11 @@ mod tests {
                 1,
             )
             .await;
-        let mut tampered = vec![first, second];
-        tampered[0].detail = "something else".to_string();
-        let (_, intact) = AuditChain::verify(&tampered);
-        assert!(!intact);
+        assert!(second.event_id > first.event_id);
+        assert_eq!(
+            first.record_version,
+            zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE
+        );
     }
 
     #[test]

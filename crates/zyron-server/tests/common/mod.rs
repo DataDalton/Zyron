@@ -128,6 +128,10 @@ impl Node {
             .replication
             .group_carries_schedule_runs
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        cluster
+            .replication
+            .group_carries_commit_chains
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Roles, users and grants live here rather than in the catalog, and
         // each node gets its own backed by its own heap. A shared one would
@@ -161,6 +165,11 @@ impl Node {
             .replication
             .machine
             .attach_ddl_runner(zyron_server::replication::DispatchedDdl::new(&server));
+        // The compliance log's rows from before its chain began are covered
+        // the way the server covers them at start
+        zyron_wire::verify_dispatch::cover_compliance_log(&server)
+            .await
+            .expect("the compliance log's genesis is written");
 
         Node {
             name: name.to_string(),
@@ -409,6 +418,15 @@ pub fn build_server_state(
         zyron_wire::dml_hooks::CdcHookBridge::new(Arc::clone(&cdc_registry))
             .with_catalog(Arc::clone(&catalog)),
     );
+    // The commit chains this member holds, registered from the catalog the
+    // way the server does, so every member links the entries a changeset
+    // carries into its own and a conformance case over a verified table can
+    // read what each one stands at
+    let chain_registry = Arc::new(
+        zyron_lifecycle::verify::ChainRegistry::open(data_dir.to_path_buf())
+            .expect("the commit chains open"),
+    );
+    zyron_wire::verify_dispatch::register_chained_tables(&chain_registry, &catalog);
     Arc::new(ServerState {
         raft: Some(Arc::clone(&cluster.node)),
         replication: Some(
@@ -531,6 +549,7 @@ pub fn build_server_state(
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: Some(chain_registry),
     })
 }
 

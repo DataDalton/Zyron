@@ -245,6 +245,7 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: None,
     });
 
     let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));

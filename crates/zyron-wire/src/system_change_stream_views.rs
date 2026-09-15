@@ -271,7 +271,7 @@ fn build_alert_templates() -> ViewRows {
         make_field("default_threshold", PG_TEXT_OID, -1),
         make_field("summary", PG_TEXT_OID, -1),
     ];
-    let rows = ALERT_TEMPLATES
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = ALERT_TEMPLATES
         .iter()
         .map(|template| {
             vec![
@@ -284,5 +284,21 @@ fn build_alert_templates() -> ViewRows {
             ]
         })
         .collect();
+    // Every subsystem that declares an alert is listed here, so one view
+    // answers what this node can raise rather than one view per subsystem
+    rows.extend(
+        crate::system_verify_views::ALERT_TEMPLATES
+            .iter()
+            .map(|template| {
+                vec![
+                    text(template.name),
+                    text("verify"),
+                    text(template.condition),
+                    text(template.threshold_setting),
+                    text(template.default_threshold),
+                    text(template.summary),
+                ]
+            }),
+    );
     (fields, rows)
 }

@@ -773,10 +773,24 @@ impl HeapFile {
     /// When the pool cannot take another frame, the guard carries the
     /// page's bytes itself, so the scan is complete either way.
     pub fn scan(&self) -> Result<ScanGuard<'_>> {
+        self.scan_window(0, self.heap_page_count(), true)
+    }
+
+    /// Pins a window of `pages` pages from `first_page` for a scan, so a
+    /// pass over a table larger than the pool holds one window at a time.
+    ///
+    /// A page the pool holds is pinned. One it does not is read from disk
+    /// and, with `install`, put into the pool for the readers that follow;
+    /// without it the page's bytes ride on the guard alone, so a pass that
+    /// reads a table once, a verification, leaves the pool's frames to the
+    /// statements the node is serving. A window past the table's end is
+    /// cut to it, and one starting past it holds nothing
+    pub fn scan_window(&self, first_page: u32, pages: u32, install: bool) -> Result<ScanGuard<'_>> {
         let num_pages = self.heap_page_count();
         let file_id = self.config.heap_file_id;
+        let last = first_page.saturating_add(pages).min(num_pages);
 
-        let page_ids: Vec<PageId> = (0..num_pages)
+        let page_ids: Vec<PageId> = (first_page..last)
             .map(|n| PageId::new(file_id, n as u64))
             .collect();
 
@@ -794,6 +808,10 @@ impl HeapFile {
                 continue;
             }
             let data = self.read_page_from_disk_sync(pid)?;
+            if !install {
+                guard.owned.push((pid, data));
+                continue;
+            }
             match self.pool.load_page(pid, data.as_ref()) {
                 Ok(_) => guard.page_ids.push(pid),
                 Err(ZyronError::BufferPoolFull) => guard.owned.push((pid, data)),
@@ -801,6 +819,12 @@ impl HeapFile {
             }
         }
         Ok(guard)
+    }
+
+    /// Pages the heap holds, for a caller walking it in windows
+    #[inline]
+    pub fn page_count(&self) -> u32 {
+        self.heap_page_count()
     }
 
     /// Reads one page's bytes for the scan path that runs without an async
@@ -971,15 +995,66 @@ impl HeapFile {
     /// this thread's insertion shard so concurrent writers append to distinct
     /// tail pages.
     pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
+        self.insert_batch_placed(tuples, self.insert_shard(), false)
+            .await
+    }
+
+    /// Batch insert through a cursor the caller owns, which only ever moves
+    /// forward.
+    ///
+    /// A transaction writing a verified table stores its rows through one
+    /// cursor per table, so every run it stores lands above the one before
+    /// it whatever thread stores it: the rows are then read back in the
+    /// order they were hashed. A cursor not yet placed starts from this
+    /// thread's tail page, so a small transaction shares a page the way a
+    /// thread's inserts do, and a page that fills rolls to a fresh page
+    /// rather than to one reclaimed space was found on. The thread's own
+    /// tail follows the cursor, so later inserts on the thread continue
+    /// from the newest page
+    pub async fn insert_batch_with_cursor(
+        &self,
+        tuples: &[Tuple],
+        cursor: &std::sync::atomic::AtomicU32,
+    ) -> Result<Vec<TupleId>> {
+        use std::sync::atomic::Ordering;
+
+        let insert_shard = self.insert_shard();
+        if cursor.load(Ordering::Acquire) == u32::MAX {
+            let seed = insert_shard.load(Ordering::Acquire);
+            let _ = cursor.compare_exchange(u32::MAX, seed, Ordering::AcqRel, Ordering::Acquire);
+        }
+        let placed = self.insert_batch_placed(tuples, cursor, true).await?;
+        let reached = cursor.load(Ordering::Acquire);
+        if reached != u32::MAX {
+            let mut current = insert_shard.load(Ordering::Acquire);
+            while current == u32::MAX || reached > current {
+                match insert_shard.compare_exchange_weak(
+                    current,
+                    reached,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+        Ok(placed)
+    }
+
+    /// The burst insert over one tail-page pointer. `monotonic` keeps a
+    /// rollover from reusing a page below the one that filled
+    async fn insert_batch_placed(
+        &self,
+        tuples: &[Tuple],
+        insert_shard: &std::sync::atomic::AtomicU32,
+        monotonic: bool,
+    ) -> Result<Vec<TupleId>> {
         use std::sync::atomic::Ordering;
 
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
-
-        // This thread's insertion shard, used for every single-page append and
-        // rollover below so concurrent writers do not share one tail page.
-        let insert_shard = self.insert_shard();
 
         let usable_per_page = PAGE_SIZE - DATA_START;
         let total_bytes: usize = tuples
@@ -1012,7 +1087,9 @@ impl HeapFile {
             } else {
                 let mut page_num = insert_shard.load(Ordering::Acquire);
                 if page_num == u32::MAX {
-                    page_num = self.advance_insert_page(insert_shard, u32::MAX).await?;
+                    page_num = self
+                        .advance_insert_page(insert_shard, u32::MAX, monotonic)
+                        .await?;
                 }
                 (
                     PageId::new(self.config.heap_file_id, page_num as u64),
@@ -1087,7 +1164,7 @@ impl HeapFile {
                 self.pool.unpin_page(page_id, false);
                 if !is_fresh {
                     let _ = self
-                        .advance_insert_page(insert_shard, page_id.page_num as u32)
+                        .advance_insert_page(insert_shard, page_id.page_num as u32, monotonic)
                         .await?;
                 }
                 continue;
@@ -1122,10 +1199,13 @@ impl HeapFile {
     /// Rolls `shard` to a successor page and publishes it via CAS; losers leak
     /// an empty page that SeqScan filters via slot_count == 0. Operating on the
     /// caller's shard keeps each writer's rollover independent of the others.
+    /// `monotonic` rolls to a fresh page only, for a cursor whose rows have
+    /// to land above the ones before them
     async fn advance_insert_page(
         &self,
         shard: &std::sync::atomic::AtomicU32,
         observed_page: u32,
+        monotonic: bool,
     ) -> Result<u32> {
         use std::sync::atomic::Ordering;
 
@@ -1146,7 +1226,8 @@ impl HeapFile {
         // unbounded between vacuum cycles. Require at least an eighth of a page
         // of contiguous free space so a reused page absorbs several inserts.
         const MIN_REUSE_SPACE: usize = PAGE_SIZE / 8;
-        if let Some(reuse_page) = self.hint_slots.find_page_with_space(MIN_REUSE_SPACE)
+        if !monotonic
+            && let Some(reuse_page) = self.hint_slots.find_page_with_space(MIN_REUSE_SPACE)
             && reuse_page != observed_page
         {
             match shard.compare_exchange(
@@ -1243,6 +1324,32 @@ impl<'a> ScanGuard<'a> {
         }
     }
 
+    /// Visits every page image the scan holds, in page order, until `f`
+    /// returns false.
+    ///
+    /// A reader that wants to check something between pages rather than
+    /// between rows, cancellation for one, walks the pages itself and reads
+    /// each one's tuples with [`try_for_each_tuple_in_page`]
+    pub fn try_for_each_page<F>(&self, mut f: F)
+    where
+        F: FnMut(PageId, &[u8; PAGE_SIZE]) -> bool,
+    {
+        for &page_id in &self.page_ids {
+            if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
+                // Safety: page is pinned and frame_data_ptr returned valid pointer
+                let data = unsafe { &*p };
+                if !f(page_id, data) {
+                    return;
+                }
+            }
+        }
+        for (page_id, data) in &self.owned {
+            if !f(*page_id, data) {
+                return;
+            }
+        }
+    }
+
     /// Fast tuple count without constructing TupleView for each tuple.
     #[inline]
     pub fn count(&self) -> usize {
@@ -1279,7 +1386,7 @@ where
 /// Every field this reads lives in the slot array, which is dense and walked
 /// in order, so the row data is never touched and no prefetch hint is needed
 #[inline]
-fn try_for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F) -> bool
+pub fn try_for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F) -> bool
 where
     F: FnMut(TupleId, TupleView<'_>) -> bool,
 {
@@ -1708,6 +1815,71 @@ mod tests {
             seen += 1;
         });
         assert_eq!(seen, inserted);
+    }
+
+    /// A pass in windows serves every row once across the windows, a
+    /// window past the end holds nothing, and a window read without
+    /// installing leaves the pool holding what it held
+    #[tokio::test]
+    async fn test_scan_windows_cover_the_heap_once_and_can_leave_the_pool_alone() {
+        let dir = tempdir().unwrap();
+        let config = DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+            ..Default::default()
+        };
+        let disk = Arc::new(DiskManager::new(config).await.unwrap());
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8 }));
+        install_evict_writer(&pool, &disk);
+        let heap = HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+
+        let mut inserted = 0usize;
+        for _ in 0..20 {
+            let tuples: Vec<Tuple> = (0..10).map(|_| Tuple::new(vec![9u8; 1500], 1)).collect();
+            heap.insert_batch(&tuples).await.unwrap();
+            inserted += 10;
+        }
+        let pages = heap.page_count();
+        assert!(pages > 8, "the heap is wider than the pool");
+
+        let resident_before: Vec<bool> = pool.batch_pin(
+            &(0..pages)
+                .map(|n| PageId::new(heap.heap_file_id(), n as u64))
+                .collect::<Vec<_>>(),
+        );
+        pool.batch_unpin(
+            &(0..pages)
+                .zip(resident_before.iter())
+                .filter(|(_, held)| **held)
+                .map(|(n, _)| PageId::new(heap.heap_file_id(), n as u64))
+                .collect::<Vec<_>>(),
+        );
+
+        let window = 3u32;
+        let mut seen = 0usize;
+        let mut first = 0u32;
+        while first < pages {
+            let guard = heap.scan_window(first, window, false).unwrap();
+            seen += guard.count();
+            first += window;
+        }
+        assert_eq!(seen, inserted, "every row is served exactly once");
+        assert_eq!(heap.scan_window(pages, window, false).unwrap().count(), 0);
+
+        // Nothing the windows read from disk was put into the pool
+        let resident_after: Vec<bool> = pool.batch_pin(
+            &(0..pages)
+                .map(|n| PageId::new(heap.heap_file_id(), n as u64))
+                .collect::<Vec<_>>(),
+        );
+        pool.batch_unpin(
+            &(0..pages)
+                .zip(resident_after.iter())
+                .filter(|(_, held)| **held)
+                .map(|(n, _)| PageId::new(heap.heap_file_id(), n as u64))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(resident_after, resident_before);
     }
 
     #[tokio::test]

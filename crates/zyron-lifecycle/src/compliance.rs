@@ -85,4 +85,11 @@ pub mod event {
     pub const CRYPTO_SHRED: u8 = 9;
     pub const PURGE: u8 = 10;
     pub const UNDROP: u8 = 11;
+    /// A verifiable table's chain head recorded, which is what makes a
+    /// later truncation of that chain detectable
+    pub const CHAIN_ANCHORED: u8 = 12;
+    /// A table was made verifiable, naming the algorithm its chain links with
+    pub const TABLE_VERIFICATION_ENABLED: u8 = 13;
+    /// A verification ran, whatever it found
+    pub const VERIFY_RUN: u8 = 14;
 }

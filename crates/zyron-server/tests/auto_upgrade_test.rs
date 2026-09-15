@@ -1124,9 +1124,13 @@ async fn a_completed_upgrade_notifies_and_audits_every_step() {
 }
 
 /// Every upgrade event carries a distinct audit type and readable text, and
-/// the chain that records them verifies
+/// the entries recording them are ordered and complete.
+///
+/// What states that the record is whole is the commit chain over the
+/// compliance log the entries land in, which the append extends, so the
+/// entries themselves carry no hash
 #[tokio::test]
-async fn the_audit_chain_over_a_sequence_verifies() {
+async fn the_audit_entries_over_a_sequence_are_ordered_and_complete() {
     let notifier = Notifier::new(
         vec![ContactChannel::Webhook {
             url: "https://example/hook".to_string(),
@@ -1160,9 +1164,24 @@ async fn the_audit_chain_over_a_sequence_verifies() {
         assert_eq!(deliveries.len(), 1);
         entries.push(entry);
     }
-    let (verified, intact) = zyron_lifecycle::audit_chain::AuditChain::verify(&entries);
-    assert_eq!(verified, events.len());
-    assert!(intact);
+    assert_eq!(entries.len(), events.len());
+    let ids: Vec<u64> = entries.iter().map(|entry| entry.event_id).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "each event is on the record in order"
+    );
+    let types: std::collections::HashSet<u8> =
+        entries.iter().map(|entry| entry.event_type).collect();
+    assert_eq!(types.len(), events.len(), "each carries a type of its own");
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.ts, 1_000 + index as i64);
+        assert!(!entry.detail.is_empty());
+        assert_eq!(
+            entry.record_version,
+            zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

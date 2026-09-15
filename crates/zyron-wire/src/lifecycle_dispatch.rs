@@ -29,8 +29,9 @@ pub(crate) fn expr_to_sql(e: &lc_ast::Expr) -> String {
     zyron_parser::expr_to_sql(e)
 }
 
-/// Appends a tamper-evident compliance log entry. A failed audit write fails
-/// the operation (compliance must not be silent).
+/// Appends a compliance log entry. A failed audit write fails the operation,
+/// because compliance must not be silent. The log is a verified table, so
+/// the commit that lands the row extends its chain.
 async fn audit(
     server: &Arc<ServerState>,
     event_type: u8,
@@ -45,13 +46,9 @@ async fn audit(
         table_id,
         ts: now_micros(),
         detail: detail.to_string(),
-        prev_hash: 0,
-        entry_hash: 0,
         record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
     };
-    server
-        .catalog
-        .append_compliance_log(entry)
+    crate::verify_dispatch::append_audit(server, entry)
         .await
         .map_err(ProtocolError::Database)
 }
@@ -150,7 +147,7 @@ fn priv_check(
 /// governance rule requires approval, this registers a pending request and
 /// rejects the solo attempt (the op cannot be performed single-handedly). No
 /// rule configured -> the op proceeds normally.
-fn two_person_gate(
+pub(crate) fn two_person_gate(
     server: &Arc<ServerState>,
     session: &Option<Session>,
     op: zyron_auth::TwoPersonOperation,
@@ -672,6 +669,10 @@ pub async fn handle_alter_table_options(
     // against leaving it where it was. Applied after the entry is written, so
     // a failure opening the feed leaves neither half changed
     let mut cdf_enable: Option<bool> = None;
+    // Whether this statement turned the commit chain on or off. Read after
+    // the option loop, because turning it on requires immutable and the two
+    // are set in one statement
+    let mut verified: Option<bool> = None;
     // The feed options this statement set beside the toggle, which is what
     // a reconfiguration audit names
     let mut cdf_reconfigured: Vec<String> = Vec::new();
@@ -728,6 +729,27 @@ pub async fn handle_alter_table_options(
             "recycle_window" => entry.lifecycle.recycle_window_seconds = parse_duration_secs(v)?,
             "data_residency" => entry.lifecycle.residency_region = v.clone(),
             "immutable" => entry.lifecycle.immutable = v == "true",
+            // Turning a chain on is what makes the table verifiable. It is
+            // read after the loop, where `immutable` has taken whatever this
+            // statement set it to, so the two can be set together
+            "verified" => verified = Some(v == "true"),
+            "chain_algorithm" => {
+                let substrate = zyron_common::format::substrate()
+                    .map_err(|e| ProtocolError::Database(ZyronError::Internal(e.to_string())))?;
+                let scheme = substrate.schemes.by_name(v).ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "chain_algorithm names '{v}', which is not a registered scheme"
+                    )))
+                })?;
+                if scheme.category != zyron_common::format::scheme::SchemeCategory::Hash {
+                    return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "chain_algorithm names '{}', which is a {} scheme rather than a hash",
+                        scheme.scheme_name,
+                        scheme.category.label()
+                    ))));
+                }
+                entry.lifecycle.chain_algorithm = scheme.scheme_id.0;
+            }
             "time_travel_retention" | "time_travel_retention_period" => {
                 entry.time_travel_retention_secs = parse_time_travel_retention(v)?;
             }
@@ -794,6 +816,69 @@ pub async fn handle_alter_table_options(
             }
         }
     }
+    // A chain states which rows each commit wrote. An operation that changes
+    // a row afterwards makes the chain report a mismatch it cannot tell from
+    // tampering, so the operations that would do that have to be refused
+    // before a chain is worth anything: DELETE, UPDATE, TRUNCATE and a
+    // schema change that re-encodes rows. `immutable` refuses all four,
+    // which is what makes it the way a table becomes verifiable
+    // Whether this statement makes the table verifiable, which fences it in
+    // the registry before the catalog records it and writes its genesis
+    // entry after
+    let mut becomes_verified = false;
+    match verified {
+        Some(true) => {
+            if !entry.lifecycle.immutable {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "'{}' cannot be verified while DELETE, UPDATE, TRUNCATE and a row-rewriting \
+                     schema change are still allowed on it, because a chain over rows that can \
+                     still change states nothing about them. Set immutable = true in the same \
+                     statement, which refuses all four",
+                    stmt.table
+                ))));
+            }
+            if server.chain_registry.is_none() {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "'{}' cannot be verified on this node, which holds no commit chains",
+                    stmt.table
+                ))));
+            }
+            becomes_verified = !entry.lifecycle.verified;
+            entry.lifecycle.verified = true;
+            if entry.lifecycle.chain_algorithm == 0 {
+                entry.lifecycle.chain_algorithm = zyron_lifecycle::verify::DEFAULT_CHAIN_ALGORITHM;
+            }
+        }
+        Some(false) => {
+            let commits = server
+                .chain_registry
+                .as_ref()
+                .and_then(|registry| registry.chain(entry.id.0).ok())
+                .map(|chain| chain.head().commits)
+                .unwrap_or(0);
+            if commits > 0 {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "'{}' carries {commits} chained commit(s), so verification cannot be turned \
+                     off: a chain that can be switched off is not evidence. The chain stands as \
+                     long as the table does",
+                    stmt.table
+                ))));
+            }
+            entry.lifecycle.verified = false;
+            entry.lifecycle.genesis_at = 0;
+        }
+        None => {}
+    }
+    // Taking immutable off a verified table would leave the chain covering
+    // rows that can change, which is the combination the chain exists to
+    // rule out
+    if entry.lifecycle.verified && !entry.lifecycle.immutable {
+        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+            "'{}' is verified, so it cannot stop being immutable while its chain stands",
+            stmt.table
+        ))));
+    }
+
     if let Some(enable) = cdf_enable {
         entry.cdf_enabled = enable;
         if enable && entry.cdf_retention_days == 0 && entry.cdf.retention_micros == 0 {
@@ -835,11 +920,84 @@ pub async fn handle_alter_table_options(
     let cdf_settings = (entry.id.0, entry.cdf_enabled, cdf_enable);
     let tid = entry.id.0;
     let retention = entry.time_travel_retention_secs;
-    server
-        .catalog
-        .update_table(entry)
-        .await
-        .map_err(ProtocolError::Database)?;
+    let chain_algorithm = entry.lifecycle.chain_algorithm;
+    let genesis_for = becomes_verified.then(|| entry.clone());
+    // The registry is what the write path asks, so the table becomes
+    // verifiable for writers here, at one transaction id, before the catalog
+    // records it: a transaction from this id on hashes what it writes to the
+    // table whatever entry its statement resolved, and one from before it
+    // that wrote to the table is refused at commit. Turning verification
+    // off unchains first for the same reason, so no commit lands on a chain
+    // the catalog no longer stands behind
+    if let Some(registry) = server.chain_registry.as_ref() {
+        if becomes_verified {
+            registry.chain_from(tid, server.txn_manager.next_txn_id(), chain_algorithm, 0);
+        } else if verified == Some(false) {
+            registry.unchain(tid);
+        }
+    }
+    if let Err(e) = server.catalog.update_table(entry).await {
+        if becomes_verified && let Some(registry) = server.chain_registry.as_ref() {
+            registry.unchain(tid);
+        }
+        return Err(ProtocolError::Database(e));
+    }
+    // A table that already holds rows is covered from the moment it becomes
+    // verifiable rather than from its next commit, so those rows are hashed
+    // into a genesis entry here. Written after the table records that it is
+    // verified, so a stop between the two leaves a verified table whose
+    // chain the next statement starts rather than a chain over a table that
+    // is not verified. On a member of a group the entry takes the index and
+    // instant of the log entry this statement runs under, which every
+    // member writes, so every member's genesis is the same entry
+    if let Some(table) = genesis_for {
+        let agreed = session.as_ref().and_then(|s| s.agreed_entry);
+        let genesis = crate::verify_dispatch::write_genesis(server, &table, agreed)
+            .await
+            .map_err(ProtocolError::Database)?;
+        if let Some(linked) = genesis.as_ref() {
+            let mut placed = (*server
+                .catalog
+                .get_table_by_id(zyron_catalog::TableId(tid))
+                .map_err(ProtocolError::Database)?)
+            .clone();
+            placed.lifecycle.genesis_at = linked.sequence + 1;
+            server
+                .catalog
+                .update_table(placed)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+        let scheme = zyron_common::format::substrate()
+            .ok()
+            .and_then(|substrate| {
+                substrate
+                    .schemes
+                    .by_id(zyron_common::format::scheme::SchemeId(chain_algorithm))
+                    .map(|scheme| scheme.scheme_name.to_string())
+            })
+            .unwrap_or_else(|| zyron_lifecycle::verify::DEFAULT_CHAIN_ALGORITHM_NAME.to_string());
+        audit(
+            server,
+            zyron_lifecycle::compliance::event::TABLE_VERIFICATION_ENABLED,
+            &stmt.table,
+            tid,
+            &match genesis {
+                Some(entry) => format!(
+                    "verification enabled with {scheme}, genesis covers {} existing row(s) as a set",
+                    entry.row_count
+                ),
+                None => format!("verification enabled with {scheme}"),
+            },
+        )
+        .await?;
+        tracing::info!(
+            target: "zyron::audit",
+            event = "TableVerificationEnabled",
+            table = %stmt.table,
+            algorithm = %scheme,
+        );
+    }
     // A finite or unlimited retention window dates deletes by commit LSN, so
     // commit-LSN tracking must be on from here forward (zero cost when unused).
     // The commit-LSN dawn watermark advances on the retention floor, so segments

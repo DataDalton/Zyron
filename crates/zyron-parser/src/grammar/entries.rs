@@ -4458,6 +4458,65 @@ pub const GRAMMAR: &[GrammarEntry] = &[
         returns: None,
     },
     GrammarEntry {
+        name: "VERIFY TABLE",
+        keywords: &["VERIFY", "TABLE"],
+        position: GrammarPosition::Statement,
+        category: Category::Ddl,
+        syntax: "VERIFY TABLE table [FROM VERSION n] [TO VERSION n] [WITH (rows => 'all' | 'sampled', sample => n)]",
+        summary: "Walks a verified table's commit chain and reports whether it still states what happened.",
+        description: "Walks the commit hash chain of a table that carries one. Every entry's link is recomputed from what the entry states, so an entry rewritten anywhere in the chain is reported. The rows a commit covered are read back and rehashed for a sample of the commits by default and for every commit under rows => 'all'. The chain is then held against the anchors taken over it, so a chain that was truncated and relinked is reported alongside one that was edited. The result names the mode that ran and the number of rows it read, so a sampled pass is never read as a full one. A run takes no lock, runs at background priority and is cancellable, and every run is recorded in zyron_sys.verify.runs. Columns: table, commits_checked, rows_checked, anchors_checked, mode, intact, detail.",
+        clauses: &[
+            Clause {
+                syntax: "FROM VERSION n",
+                field: Some("from_version"),
+                what: "Starts the walk at the first commit at or above that version.",
+                default: Some("The walk starts at the chain's first entry."),
+            },
+            Clause {
+                syntax: "TO VERSION n",
+                field: Some("to_version"),
+                what: "Ends the walk at the last commit at or below that version.",
+                default: Some("The walk ends at the chain's head."),
+            },
+            Clause {
+                syntax: "WITH (rows => 'all')",
+                field: Some("rows"),
+                what: "Reads back and rehashes the rows of every commit in range and the set a genesis entry covers, which requires MANAGE_VERIFICATION because it reads the whole table.",
+                default: Some(
+                    "A sample of the commits have their rows read back, and the set a genesis entry covers is not read.",
+                ),
+            },
+            Clause {
+                syntax: "WITH (sample => n)",
+                field: Some("sample"),
+                what: "Reads back the rows of that many commits, spread across the range with both ends included.",
+                default: Some("The node's verify.default_sample setting decides how many."),
+            },
+        ],
+        refusals: &[
+            Refusal {
+                when: "The table carries no commit chain",
+                message: "is not verified, so it carries no commit chain to walk",
+            },
+            Refusal {
+                when: "rows => 'all' is asked for without MANAGE_VERIFICATION",
+                message: "MANAGE_VERIFICATION",
+            },
+        ],
+        examples: &[
+            Example {
+                statement: "VERIFY TABLE ledger",
+                yields: "One row stating the commits walked, the rows the sampled commits covered, the anchors held against, and whether the chain is intact.",
+            },
+            Example {
+                statement: "VERIFY TABLE ledger FROM VERSION 100 TO VERSION 200 WITH (rows => 'all')",
+                yields: "One row stating that every commit between those versions was walked and every row it covered rehashed.",
+            },
+        ],
+        see_also: &["ALTER TABLE SET OPTIONS", "LEGAL HOLD"],
+        returns: None,
+    },
+    GrammarEntry {
         name: "FORGET USER",
         keywords: &["FORGET", "USER"],
         position: GrammarPosition::Statement,

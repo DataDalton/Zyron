@@ -559,6 +559,26 @@ fn table_options(node: &Node) -> String {
     )
 }
 
+/// Whether a table is verified and what its chain links with, which is what
+/// `ALTER TABLE SET (immutable, verified)` writes
+fn table_verification(node: &Node) -> String {
+    render(
+        node.catalog
+            .list_all_tables()
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{}:{}:{}",
+                    t.name,
+                    t.lifecycle.immutable,
+                    t.lifecycle.verified,
+                    t.lifecycle.chain_algorithm
+                )
+            })
+            .collect(),
+    )
+}
+
 /// The row TTL a table carries, which is the column it reads and how long
 fn table_ttl(node: &Node) -> String {
     render(
@@ -1533,6 +1553,12 @@ const CASES: &[Case] = &[
         proof: Proof::Catalog(table_options),
     },
     Case {
+        name: "ALTER TABLE SET (immutable, verified)",
+        setup: &["CREATE TABLE conf_verified (id BIGINT PRIMARY KEY, amount BIGINT)"],
+        sql: "ALTER TABLE conf_verified SET (immutable = true, verified = true)",
+        proof: Proof::Catalog(table_verification),
+    },
+    Case {
         name: "ALTER TABLE SET TTL",
         setup: &["CREATE TABLE conf_ttl (id BIGINT PRIMARY KEY, expires_at TIMESTAMP)"],
         sql: "ALTER TABLE conf_ttl SET TTL 15 MINUTES ON expires_at",
@@ -2300,6 +2326,294 @@ async fn a_branch_merged_into_main_reaches_every_member() {
     }
 
     client.terminate().await;
+    group.shutdown().await;
+}
+
+/// A verified table's chain reaches every member byte for byte.
+///
+/// The leader links each entry and it travels in the changeset, so every
+/// member writes the same bytes in the log's order. That is what makes
+/// `VERIFY TABLE` answerable on any member and an anchor meaningful for all
+/// of them: two members computing a link from their own clocks would produce
+/// different entries for one commit and no anchor would describe both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_member_computes_the_same_chain_head_for_the_same_version() {
+    let group = Group::start(3).await;
+    let leader = group.leader(Duration::from_secs(10)).await;
+    let addr = group.nodes[leader].serve_wire().await;
+
+    let mut client = WireClient::connect(addr).await;
+    for sql in [
+        "SET search_path = zyron_test",
+        "CREATE TABLE conf_chain (id BIGINT PRIMARY KEY, amount BIGINT)",
+        "ALTER TABLE conf_chain SET (immutable = true, verified = true)",
+    ] {
+        let (_, errors) = client.query(sql).await;
+        assert!(errors.is_empty(), "`{sql}` failed: {errors:?}");
+    }
+    group.settle(leader, Duration::from_secs(20)).await;
+
+    let table_id = group.nodes[leader]
+        .catalog
+        .list_all_tables()
+        .iter()
+        .find(|t| t.name == "conf_chain")
+        .map(|t| t.id.0)
+        .expect("the table is in the catalog");
+
+    // Every member agrees the table is verified before a row is written
+    for node in &group.nodes {
+        let entry = node
+            .catalog
+            .get_table_by_id(zyron_catalog::TableId(table_id))
+            .expect("the table reached this member");
+        assert!(
+            entry.lifecycle.verified && entry.lifecycle.immutable,
+            "{} does not hold the table as verified",
+            node.name
+        );
+    }
+
+    for id in 1..=6 {
+        let sql = format!(
+            "INSERT INTO conf_chain (id, amount) VALUES ({id}, {})",
+            id * 10
+        );
+        let (_, errors) = client.query(&sql).await;
+        assert!(errors.is_empty(), "`{sql}` failed: {errors:?}");
+    }
+    group.settle(leader, Duration::from_secs(20)).await;
+
+    // Each member's chain, read from its own files
+    let mut heads = Vec::new();
+    for node in &group.nodes {
+        let registry = node
+            ._server
+            .chain_registry
+            .as_ref()
+            .expect("every member holds chains");
+        let chain = registry.chain(table_id).expect("the chain opens");
+        let head = chain.head();
+        assert_eq!(
+            head.commits, 6,
+            "{} chained {} of the 6 commits",
+            node.name, head.commits
+        );
+        // Every entry links to the one before it, on this member's own copy
+        let entries = chain.read_range(0, head.commits - 1).expect("reads");
+        let mut prev = zyron_lifecycle::verify::NO_PREVIOUS;
+        for entry in &entries {
+            assert_eq!(
+                entry.prev_hash, prev,
+                "{} holds a broken link at {}",
+                node.name, entry.sequence
+            );
+            assert_eq!(
+                entry.compute_entry_hash(),
+                entry.entry_hash,
+                "{} holds an entry that does not hash to its link",
+                node.name
+            );
+            prev = entry.entry_hash;
+        }
+        heads.push((
+            node.name.clone(),
+            head.head_version,
+            zyron_lifecycle::verify::hex(&head.head_hash),
+            entries
+                .iter()
+                .map(|e| zyron_lifecycle::verify::hex(&e.entry_hash))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    let (first_name, first_version, first_head, first_entries) = &heads[0];
+    for (name, version, head, entries) in &heads[1..] {
+        assert_eq!(
+            version, first_version,
+            "{name} stands at a different version from {first_name}"
+        );
+        assert_eq!(
+            head, first_head,
+            "{name} computed a different head from {first_name} for the same version"
+        );
+        assert_eq!(
+            entries, first_entries,
+            "{name} holds different entries from {first_name}"
+        );
+    }
+
+    // VERIFY TABLE answers on the leader, which reads this member's own
+    // chain and its own rows
+    let (rows, errors) = client
+        .query_rows("VERIFY TABLE conf_chain WITH (rows => 'all')")
+        .await;
+    assert!(
+        errors.is_empty(),
+        "the verification was refused: {errors:?}"
+    );
+    let answered = rows
+        .iter()
+        .flat_map(|row| row.iter().map(|cell| cell.clone().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(answered.contains("conf_chain"), "{answered}");
+    assert!(answered.contains("true"), "not intact: {answered}");
+    assert!(
+        answered.contains("all"),
+        "the mode is not stated: {answered}"
+    );
+    assert!(
+        answered.contains(" 6 "),
+        "six commits were not checked: {answered}"
+    );
+
+    // Every member reads its own rows back by the stamps its own
+    // transactions put on them, and each one's chain covers exactly what it
+    // holds, which is what proves a member linked what it applied rather
+    // than what it was told
+    for node in &group.nodes {
+        let outcome = zyron_wire::verify_dispatch::run_verify(
+            &node._server,
+            zyron_wire::verify_dispatch::VerifyRequest {
+                table_id,
+                from_version: None,
+                to_version: None,
+                mode: zyron_lifecycle::verify::RowMode::All,
+                sample: 0,
+            },
+            0,
+            "conformance",
+            Arc::new(|| false),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{} could not verify its copy: {e}", node.name));
+        assert!(
+            outcome.intact,
+            "{} holds rows its chain does not cover: {:?}",
+            node.name, outcome.failure
+        );
+        assert_eq!(outcome.commits_checked, 6, "{}", node.name);
+        assert_eq!(outcome.commits_rehashed, 6, "{}", node.name);
+        assert_eq!(outcome.rows_checked, 6, "{}", node.name);
+    }
+
+    client.terminate().await;
+    group.shutdown().await;
+}
+
+/// Writers committing together to one verified table on a group link in
+/// the log's order on every member.
+///
+/// The connections hash their own rows and the group decides the order the
+/// commits apply in, so the order two commits are proposed in and the order
+/// they link in are one order, whichever connection reached its commit
+/// first. Every member's chain holds every commit, links clean, agrees with
+/// every other member's, and covers the rows the member holds
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_link_in_the_log_order_on_every_member() {
+    let group = Group::start(3).await;
+    let leader = group.leader(Duration::from_secs(10)).await;
+    let addr = group.nodes[leader].serve_wire().await;
+
+    let mut admin = WireClient::connect(addr).await;
+    for sql in [
+        "SET search_path = zyron_test",
+        "CREATE TABLE conf_race (id BIGINT PRIMARY KEY, writer BIGINT)",
+        "ALTER TABLE conf_race SET (immutable = true, verified = true)",
+    ] {
+        let (_, errors) = admin.query(sql).await;
+        assert!(errors.is_empty(), "`{sql}` failed: {errors:?}");
+    }
+    group.settle(leader, Duration::from_secs(20)).await;
+
+    let writers = 8u64;
+    let per_writer = 12u64;
+    let mut tasks = Vec::with_capacity(writers as usize);
+    for writer in 0..writers {
+        tasks.push(tokio::spawn(async move {
+            let mut client = WireClient::connect(addr).await;
+            let (_, errors) = client.query("SET search_path = zyron_test").await;
+            assert!(errors.is_empty(), "{errors:?}");
+            for run in 0..per_writer {
+                let id = writer * per_writer + run + 1;
+                let sql = format!("INSERT INTO conf_race (id, writer) VALUES ({id}, {writer})");
+                let (_, errors) = client.query(&sql).await;
+                assert!(errors.is_empty(), "`{sql}` failed: {errors:?}");
+            }
+            client.terminate().await;
+        }));
+    }
+    for task in tasks {
+        task.await.expect("the writer finished");
+    }
+    group.settle(leader, Duration::from_secs(30)).await;
+
+    let table_id = group.nodes[leader]
+        .catalog
+        .list_all_tables()
+        .iter()
+        .find(|t| t.name == "conf_race")
+        .map(|t| t.id.0)
+        .expect("the table is in the catalog");
+    let expected = writers * per_writer;
+
+    let mut heads = Vec::new();
+    for node in &group.nodes {
+        let registry = node
+            ._server
+            .chain_registry
+            .as_ref()
+            .expect("every member holds chains");
+        let chain = registry.chain(table_id).expect("the chain opens");
+        let head = chain.head();
+        assert_eq!(
+            head.commits, expected,
+            "{} chained {} of the {expected} commits",
+            node.name, head.commits
+        );
+        assert_eq!(
+            chain.pending_commits(),
+            0,
+            "{} holds entries whose commit never settled",
+            node.name
+        );
+        let outcome = zyron_wire::verify_dispatch::run_verify(
+            &node._server,
+            zyron_wire::verify_dispatch::VerifyRequest {
+                table_id,
+                from_version: None,
+                to_version: None,
+                mode: zyron_lifecycle::verify::RowMode::All,
+                sample: 0,
+            },
+            0,
+            "conformance",
+            Arc::new(|| false),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{} could not verify its copy: {e}", node.name));
+        assert!(
+            outcome.intact,
+            "{} holds rows its chain does not cover: {:?}",
+            node.name, outcome.failure
+        );
+        assert_eq!(outcome.commits_checked, expected, "{}", node.name);
+        assert_eq!(outcome.rows_checked, expected, "{}", node.name);
+        heads.push((
+            node.name.clone(),
+            zyron_lifecycle::verify::hex(&head.head_hash),
+        ));
+    }
+    let (first_name, first_head) = &heads[0];
+    for (name, head) in &heads[1..] {
+        assert_eq!(
+            head, first_head,
+            "{name} computed a different head from {first_name}"
+        );
+    }
+
+    admin.terminate().await;
     group.shutdown().await;
 }
 

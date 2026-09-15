@@ -318,6 +318,7 @@ async fn create_test_state(
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: None,
     });
 
     (state, wal, pool, disk, bg_writer, catalog)

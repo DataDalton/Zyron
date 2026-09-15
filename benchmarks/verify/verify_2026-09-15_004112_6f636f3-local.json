@@ -1,0 +1,166 @@
+{
+  "id": "2026-09-15_004112_6f636f3-local",
+  "date": "2026-09-15 00:41:22Z",
+  "ts": 1789432882,
+  "commit": "6f636f3-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Anchor write": {
+      "latency": {
+        "average": 1.990040,
+        "runs": [1.97, 2.02, 1.91, 1.97, 2.08],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Chain storage": {
+      "bytes per commit": {
+        "average": 96.000000,
+        "runs": [96.00, 96.00, 96.00, 96.00, 96.00],
+        "target": 96.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "INSERT one commit": {
+      "immutable only": {
+        "average": 0.560428,
+        "runs": [0.62, 0.53, 0.57, 0.53, 0.56],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "verified": {
+        "average": 0.564118,
+        "runs": [0.57, 0.56, 0.55, 0.58, 0.56],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "verified vs immutable-only delta": {
+        "average": 0.658458,
+        "runs": [0.66],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Parallel writers": {
+      "immutable only": {
+        "average": 110290.014660,
+        "runs": [102719.46, 110315.11, 113165.43, 114179.94, 111070.13],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "verified": {
+        "average": 103526.333271,
+        "runs": [107322.90, 104055.52, 113676.73, 95763.58, 96812.93],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "verified vs immutable-only delta": {
+        "average": 6.824371,
+        "runs": [6.82],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "chain serial section per commit": {
+        "average": 0.408750,
+        "runs": [0.42, 0.35, 0.33, 0.48, 0.46],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Row hash": {
+      "throughput": {
+        "average": 3715269951.025514,
+        "runs": [3716379288.44, 3714909703.02, 3644504237.09, 3748073804.84, 3752482721.72],
+        "target": 1000000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "VERIFY sampled": {
+      "latency": {
+        "average": 0.001765,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "VERIFY full": {
+      "throughput": {
+        "average": 1111435784.359970,
+        "runs": [962116656.64, 1165458717.27, 1120291275.73, 1152239665.85, 1157072606.31],
+        "target": 500000000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "Writer during VERIFY": {
+      "alone": {
+        "average": 9461.479635,
+        "runs": [10277.76, 9840.39, 9371.90, 8732.52, 9084.84],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "with a verification running": {
+        "average": 9104.701297,
+        "runs": [9588.51, 9541.03, 8143.29, 9357.60, 8893.08],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "throughput delta": {
+        "average": 3.770851,
+        "runs": [3.77],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

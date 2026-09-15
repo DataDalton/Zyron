@@ -1803,6 +1803,33 @@ pub(crate) fn write_statement(out: &mut String, statement: &Statement) -> Out {
             }
             (None, None) => out.push_str("SHOW CHANGE STREAMS"),
         },
+        Statement::VerifyTable(verify) => {
+            out.push_str("VERIFY TABLE ");
+            write_qualified(out, &verify.table);
+            if let Some(expr) = &verify.from_version {
+                out.push_str(" FROM VERSION ");
+                write_expr(out, expr)?;
+            }
+            if let Some(expr) = &verify.to_version {
+                out.push_str(" TO VERSION ");
+                write_expr(out, expr)?;
+            }
+            let rows = verify.rows == VerifyRowMode::All;
+            if rows || verify.sample.is_some() {
+                out.push_str(" WITH (");
+                if rows {
+                    out.push_str("rows => 'all'");
+                }
+                if let Some(expr) = &verify.sample {
+                    if rows {
+                        out.push_str(", ");
+                    }
+                    out.push_str("sample => ");
+                    write_expr(out, expr)?;
+                }
+                out.push(')');
+            }
+        }
         Statement::ApplyChanges(apply) => {
             out.push_str("APPLY CHANGES INTO ");
             write_qualified(out, &apply.target);

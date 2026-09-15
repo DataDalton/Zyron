@@ -51,6 +51,9 @@ pub enum SchemeCategory {
     Signature,
     /// Symmetric cipher or MAC
     Symmetric,
+    /// Cryptographic hash, which a commit chain names as the algorithm it
+    /// links its entries with
+    Hash,
 }
 
 impl SchemeCategory {
@@ -59,6 +62,7 @@ impl SchemeCategory {
             SchemeCategory::Kem => "kem",
             SchemeCategory::Signature => "signature",
             SchemeCategory::Symmetric => "symmetric",
+            SchemeCategory::Hash => "hash",
         }
     }
 }

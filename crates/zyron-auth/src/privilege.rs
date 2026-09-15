@@ -88,6 +88,9 @@ pub enum PrivilegeType {
     ManageChangeStream = 56,
     /// Changes a table's change data feed settings
     ManageChangeFeeds = 57,
+    /// Runs a verification that reads every row a table's chain covers,
+    /// which is real work over the whole table
+    ManageVerification = 58,
     All = 255,
 }
 
@@ -153,6 +156,7 @@ impl PrivilegeType {
             55 => Ok(Self::Peek),
             56 => Ok(Self::ManageChangeStream),
             57 => Ok(Self::ManageChangeFeeds),
+            58 => Ok(Self::ManageVerification),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -222,6 +226,7 @@ impl PrivilegeType {
             PrivilegeType::Peek,
             PrivilegeType::ManageChangeStream,
             PrivilegeType::ManageChangeFeeds,
+            PrivilegeType::ManageVerification,
         ]
     }
 

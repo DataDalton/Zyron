@@ -139,6 +139,13 @@ pub enum LogRecordType {
     ChangeFeedFrames = 19,
     /// Full page image (for recovery).
     FullPage = 20,
+    /// One entry appended to a verifiable table's commit hash chain.
+    /// Payload: table id, the entry's chain position, then the fixed chain
+    /// record. Written into the transaction's own chain ahead of its commit
+    /// record, so an entry reaches the chain exactly when the rows it covers
+    /// reach the table. Replayed from committed transactions only, because
+    /// an entry covering rows that never landed would state that they did
+    CommitChainEntry = 21,
     /// Checkpoint begin marker.
     CheckpointBegin = 30,
     /// Checkpoint end marker.
@@ -233,6 +240,53 @@ impl<'a> ChangeFeedFrames<'a> {
     }
 }
 
+/// One `CommitChainEntry` record decoded, the chain it names and the fixed
+/// record it appends at a position
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitChainEntry<'a> {
+    pub table_id: u32,
+    /// The entry's position in the chain, counted from zero
+    pub sequence: u64,
+    /// The chain's own fixed record, which the chain decodes
+    pub record: &'a [u8],
+}
+
+impl<'a> CommitChainEntry<'a> {
+    /// Bytes of the fixed fields ahead of the chain record
+    pub const PREFIX: usize = 4 + 8;
+
+    /// Builds the payload one record carries.
+    pub fn encode(table_id: u32, sequence: u64, record: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::PREFIX + record.len());
+        out.extend_from_slice(&table_id.to_le_bytes());
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(record);
+        out
+    }
+
+    /// Decodes a `CommitChainEntry` record's payload. A payload shorter than
+    /// its fixed fields is refused rather than read as an empty entry
+    pub fn decode(payload: &'a [u8]) -> Result<Self> {
+        if payload.len() < Self::PREFIX {
+            return Err(ZyronError::WalCorrupted {
+                lsn: 0,
+                reason: format!(
+                    "commit chain entry record holds {} bytes, fewer than its {} byte prefix",
+                    payload.len(),
+                    Self::PREFIX
+                ),
+            });
+        }
+        let mut sequence = [0u8; 8];
+        sequence.copy_from_slice(&payload[4..12]);
+        Ok(Self {
+            table_id: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+            sequence: u64::from_le_bytes(sequence),
+            record: &payload[Self::PREFIX..],
+        })
+    }
+}
+
 impl TryFrom<u8> for LogRecordType {
     type Error = ZyronError;
 
@@ -253,6 +307,7 @@ impl TryFrom<u8> for LogRecordType {
             18 => Ok(LogRecordType::HeapTruncate),
             19 => Ok(LogRecordType::ChangeFeedFrames),
             20 => Ok(LogRecordType::FullPage),
+            21 => Ok(LogRecordType::CommitChainEntry),
             30 => Ok(LogRecordType::CheckpointBegin),
             31 => Ok(LogRecordType::CheckpointEnd),
             40 => Ok(LogRecordType::Clr),

@@ -331,7 +331,7 @@ A few more numbers not shown in the charts above:
 | Cross-format | Bulk load to queryable, lake vs heap | ~1.5x (heap wins large batches) |
 | Cross-format | Trickle load to queryable, lake vs heap | ~9.7x (heap wins tiny commits) |
 
-46 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+47 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, raft, replication, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started

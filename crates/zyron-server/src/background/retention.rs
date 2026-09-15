@@ -532,8 +532,6 @@ async fn record_job(cx: &CycleCtx<'_>, table_id: u32, kind: u8, rows: u64, detai
             table_id,
             ts: now,
             detail: format!("{detail}: {rows} rows"),
-            prev_hash: 0,
-            entry_hash: 0,
             record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
         })
         .await;

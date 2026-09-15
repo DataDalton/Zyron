@@ -8,6 +8,7 @@ pub mod authority;
 pub mod cdc_ingest;
 pub mod cdc_stream_pump;
 pub mod cdc_writer;
+pub mod chain_anchor;
 pub mod change_data_trigger;
 pub mod change_stream_sweeper;
 pub mod checkpoint;

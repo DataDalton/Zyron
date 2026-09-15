@@ -329,6 +329,25 @@ async fn build_test_server(
         )
         .expect("the lake sources register");
     }
+    // The commit chains this node holds, opened the way the server opens
+    // them, so a verified table in a suite chains its commits exactly as
+    // one on a running server does
+    let chain_registry = Arc::new(
+        zyron_lifecycle::verify::ChainRegistry::open(data_dir.to_path_buf())
+            .expect("the commit chains open"),
+    );
+    zyron_wire::verify_dispatch::register_chained_tables(&chain_registry, &catalog);
+    if let Some(recovered) = recovered.as_ref() {
+        zyron_wire::verify_dispatch::restore_chain_entries(
+            &chain_registry,
+            &recovered.chain_records,
+        )
+        .expect("the logged chain entries go back into their chains");
+    }
+    // The registry the WORM and legal hold hook reads. One instance, shared
+    // with the hook, so a hold placed through a statement is the one the
+    // hook consults
+    let legal_holds = Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new());
     let cdc_hook: Option<Arc<dyn zyron_executor::context::CdcHook>> =
         cdc_registry.as_ref().map(|registry| {
             Arc::new(
@@ -412,6 +431,11 @@ async fn build_test_server(
         None
     };
 
+    let dml_hook: Arc<dyn zyron_executor::context::DmlHook> =
+        Arc::new(zyron_wire::dml_enforce::LegalHoldDmlHook::new(
+            Arc::clone(&legal_holds),
+            Arc::clone(&catalog),
+        ));
     let state = Arc::new(ServerState {
         raft: None,
         replication: None,
@@ -474,7 +498,7 @@ async fn build_test_server(
             zyron_types::spatial_index::SpatialIndexManager::new(),
         )),
         cdc_hook: cdc_hook.clone(),
-        dml_hook: None,
+        dml_hook: Some(dml_hook),
         notification_channels: None,
         tls_mode: zyron_wire::tls::TlsMode::Disabled,
         tls_acceptor: None,
@@ -488,7 +512,7 @@ async fn build_test_server(
         plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
-        legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        legal_holds: Arc::clone(&legal_holds),
         dlq_registry: Arc::new(zyron_streaming::dlq::DlqRegistry::new()),
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
@@ -508,7 +532,13 @@ async fn build_test_server(
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: Some(Arc::clone(&chain_registry)),
     });
+    // The compliance log's rows from before its chain began are covered
+    // the way the server covers them at start
+    zyron_wire::verify_dispatch::cover_compliance_log(&state)
+        .await
+        .expect("the compliance log's genesis is written");
     (state, public_schema, security_manager, tmp)
 }
 
@@ -556,15 +586,24 @@ pub async fn explain_text(server: &Arc<ServerState>, sql: &str) -> String {
 pub fn install_change_reads(
     server: &Arc<ServerState>,
     ctx: &mut zyron_executor::context::ExecutionContext,
-) {
+) -> Arc<zyron_lifecycle::verify::PendingChainWrites> {
     let advances = Arc::new(parking_lot::Mutex::new(Vec::new()));
     zyron_wire::change_feed_bridge::install_change_reads(server, ctx, &advances);
+    // The rows a write puts into a verified table are hashed here, the way
+    // a connection hashes them, so a commit through the harness extends the
+    // chain exactly as one through the wire does
+    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
+    zyron_wire::verify_dispatch::install_chain_writes(server, ctx, &chain_writes);
     // The server installs the capture hook on every context, so a write
     // through the harness records its changes the way one through the wire
     // does. Without it a suite would read a feed nothing ever wrote to
     if let Some(hook) = server.cdc_hook.as_ref() {
         ctx.cdc_hook = Some(Arc::clone(hook));
     }
+    if let Some(hook) = server.dml_hook.as_ref() {
+        ctx.dml_hook = Some(Arc::clone(hook));
+    }
+    chain_writes
 }
 
 /// Writes the advances a statement's reads recorded, the way a connection's
@@ -652,8 +691,11 @@ pub async fn exec_dml_script(
         .expect("begin");
     let txn_id = txn.txn_id;
     // One list for the whole script, so a stream read by any statement in
-    // it advances once when the script commits
+    // it advances once when the script commits, and one accumulator, so
+    // every statement's rows in a verified table reach the one entry the
+    // commit links
     let advances = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
     for sql in statements {
         let stmt = zyron_parser::parse(sql)
             .expect("parse")
@@ -721,20 +763,39 @@ pub async fn exec_dml_script(
         // through the harness resolves its feeds and takes its position lock
         // the way one through the wire does
         zyron_wire::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
+        zyron_wire::verify_dispatch::install_chain_writes(server, &mut ctx, &chain_writes);
         if let Some(hook) = server.cdc_hook.as_ref() {
             ctx.cdc_hook = Some(Arc::clone(hook));
+        }
+        if let Some(hook) = server.dml_hook.as_ref() {
+            ctx.dml_hook = Some(Arc::clone(hook));
         }
         let ctx = Arc::new(ctx);
         if let Err(e) = zyron_executor::execute(plan, &ctx).await {
             let _ = zyron_lake::abandon_txn(server.disk_manager.data_dir(), txn_id);
             let _ = server.txn_manager.abort(&mut txn);
+            chain_writes.clear();
             return Err(e);
         }
     }
     let held = std::mem::take(&mut *advances.lock());
     let advanced =
         zyron_wire::change_stream_dispatch::log_stream_advances(server, &mut txn, &held, 0)?;
+    // The chain entry goes into this transaction's own log chain, ahead of
+    // its commit record, the way a connection's commit writes one. A script
+    // the chain cannot cover is rolled back here the way a connection's
+    // commit rolls it back
+    let chained =
+        match zyron_wire::verify_dispatch::log_commit_chains(server, &mut txn, &chain_writes) {
+            Ok(chained) => chained,
+            Err(e) => {
+                let _ = zyron_lake::abandon_txn(server.disk_manager.data_dir(), txn_id);
+                let _ = server.txn_manager.abort(&mut txn);
+                return Err(e);
+            }
+        };
     server.txn_manager.commit(&mut txn).await.expect("commit");
+    zyron_wire::verify_dispatch::publish_commit_chains(server, &chained);
     let logs = zyron_lake::publish_txn(server.disk_manager.data_dir(), txn_id).expect("publish");
     zyron_wire::connection::refresh_lake_stats(server, &logs);
     zyron_wire::change_stream_dispatch::install_stream_advances(server, txn_id, advanced).await?;
@@ -797,7 +858,7 @@ pub async fn exec_dml_result(
     // The server installs these on every context, so a change read through
     // the harness resolves its feeds and takes its position lock the way one
     // through the wire does
-    install_change_reads(server, &mut ctx);
+    let chain_writes = install_change_reads(server, &mut ctx);
     if let Some(mgr) = &server.fts_manager {
         ctx.set_fts_manager(Arc::clone(mgr));
     }
@@ -814,12 +875,17 @@ pub async fn exec_dml_result(
         // abandoning them keeps the next statement's base clean
         let _ = zyron_lake::abandon_txn(server.disk_manager.data_dir(), txn_id);
         let _ = server.txn_manager.abort(&mut txn);
+        chain_writes.clear();
         return outcome;
     }
     let held = std::mem::take(&mut *ctx.pending_stream_advances.lock());
     let advanced =
         zyron_wire::change_stream_dispatch::log_stream_advances(server, &mut txn, &held, 0)?;
+    // The chain entry goes into this transaction's own log chain, ahead of
+    // its commit record, the way a connection's commit writes one
+    let chained = zyron_wire::verify_dispatch::log_commit_chains(server, &mut txn, &chain_writes)?;
     server.txn_manager.commit(&mut txn).await.expect("commit");
+    zyron_wire::verify_dispatch::publish_commit_chains(server, &chained);
     // Mirrors the wire layer, lake versions publish after the durable commit
     // and the manifest's statistics reach the planner with them
     let logs = zyron_lake::publish_txn(server.disk_manager.data_dir(), txn_id).expect("publish");
@@ -923,7 +989,7 @@ pub async fn query_batches(
     // The server installs these on every context, so a change read through
     // the harness resolves its feeds and takes its position lock the way one
     // through the wire does
-    install_change_reads(server, &mut ctx);
+    let _chain_writes = install_change_reads(server, &mut ctx);
     if let Some(mgr) = &server.fts_manager {
         ctx.set_fts_manager(Arc::clone(mgr));
     }
@@ -994,7 +1060,7 @@ pub async fn query_error(server: &Arc<ServerState>, sql: &str) -> String {
     // The server installs these on every context, so a change read through
     // the harness resolves its feeds and takes its position lock the way one
     // through the wire does
-    install_change_reads(server, &mut ctx);
+    let _chain_writes = install_change_reads(server, &mut ctx);
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
     let _ = end_statement(server, &ctx, &mut txn).await;
@@ -1062,7 +1128,7 @@ pub async fn query_result(
     // The server installs these on every context, so a change read through
     // the harness resolves its feeds and takes its position lock the way one
     // through the wire does
-    install_change_reads(server, &mut ctx);
+    let _chain_writes = install_change_reads(server, &mut ctx);
     let ctx = Arc::new(ctx);
     let result = zyron_executor::execute(plan, &ctx).await;
     let _ = end_statement(server, &ctx, &mut txn).await;
@@ -1146,7 +1212,7 @@ pub async fn query_values(server: &Arc<ServerState>, sql: &str) -> Vec<Vec<Scala
     // The server installs these on every context, so a change read through
     // the harness resolves its feeds and takes its position lock the way one
     // through the wire does
-    install_change_reads(server, &mut ctx);
+    let _chain_writes = install_change_reads(server, &mut ctx);
     if let Some(mgr) = &server.fts_manager {
         ctx.set_fts_manager(Arc::clone(mgr));
     }
@@ -1306,7 +1372,7 @@ pub async fn run_on_branch(
     // The server installs these on every context, so a change read through
     // the harness resolves its feeds and takes its position lock the way one
     // through the wire does
-    install_change_reads(server, &mut ctx);
+    let _chain_writes = install_change_reads(server, &mut ctx);
     ctx.active_branch_name = Some(std::sync::Arc::from(branch));
     // The heap routes copy-on-write pages by branch id and a write on the
     // branch is recorded in the branch's own feed, both the way a connection

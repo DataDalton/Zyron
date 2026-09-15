@@ -134,6 +134,7 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: None,
     });
     (state, public_schema, tmp)
 }

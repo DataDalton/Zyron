@@ -58,8 +58,14 @@ pub enum FormatKind {
     ZyronTomlConfig,
     /// Secret store persistence file
     SecretStorePersistence,
-    /// Audit hash chain file
-    AuditHashChain,
+    /// Compliance audit log entry encoding
+    ComplianceLogRecord,
+    /// Commit hash chain of a verifiable table
+    VerifiableCommitChain,
+    /// Anchor of a commit chain head, held inside the cluster and exported
+    VerificationAnchor,
+    /// Record of the verifications a node ran
+    VerificationRunLog,
     /// Volume metadata file
     VolumeMetadata,
     /// Prompt registry storage file
@@ -234,10 +240,28 @@ pub const MAGIC_ALLOCATIONS: &[MagicAllocation] = &[
         doc: "Secret store persistence holding wrapped credential material",
     },
     MagicAllocation {
-        kind: FormatKind::AuditHashChain,
+        kind: FormatKind::ComplianceLogRecord,
         magic: *b"ZAUD",
-        owner: "zyron-server",
-        doc: "Audit hash chain holding tamper-evident event records",
+        owner: "zyron-lifecycle",
+        doc: "Compliance audit log entry, one record per governed event",
+    },
+    MagicAllocation {
+        kind: FormatKind::VerifiableCommitChain,
+        magic: *b"ZVCH",
+        owner: "zyron-lifecycle",
+        doc: "Commit hash chain of a verifiable table, one fixed record per committing transaction",
+    },
+    MagicAllocation {
+        kind: FormatKind::VerificationAnchor,
+        magic: *b"ZVAN",
+        owner: "zyron-lifecycle",
+        doc: "Anchored commit chain heads, each naming a table, the version it stood at and the head hash",
+    },
+    MagicAllocation {
+        kind: FormatKind::VerificationRunLog,
+        magic: *b"ZVRL",
+        owner: "zyron-lifecycle",
+        doc: "Verifications this node ran, with the range each covered, the mode it ran in and its outcome",
     },
     MagicAllocation {
         kind: FormatKind::VolumeMetadata,
@@ -325,7 +349,10 @@ pub const ALL_FORMAT_KINDS: &[FormatKind] = &[
     FormatKind::BackupArchive,
     FormatKind::ZyronTomlConfig,
     FormatKind::SecretStorePersistence,
-    FormatKind::AuditHashChain,
+    FormatKind::ComplianceLogRecord,
+    FormatKind::VerifiableCommitChain,
+    FormatKind::VerificationAnchor,
+    FormatKind::VerificationRunLog,
     FormatKind::VolumeMetadata,
     FormatKind::PromptRegistryStorage,
     FormatKind::WorkflowDefinitionOnDisk,
@@ -416,7 +443,10 @@ impl FormatKind {
             FormatKind::BackupArchive => "backup_archive",
             FormatKind::ZyronTomlConfig => "zyron_toml_config",
             FormatKind::SecretStorePersistence => "secret_store_persistence",
-            FormatKind::AuditHashChain => "audit_hash_chain",
+            FormatKind::ComplianceLogRecord => "compliance_log_record",
+            FormatKind::VerifiableCommitChain => "verifiable_commit_chain",
+            FormatKind::VerificationAnchor => "verification_anchor",
+            FormatKind::VerificationRunLog => "verification_run_log",
             FormatKind::VolumeMetadata => "volume_metadata",
             FormatKind::PromptRegistryStorage => "prompt_registry_storage",
             FormatKind::WorkflowDefinitionOnDisk => "workflow_definition_on_disk",
@@ -469,16 +499,18 @@ impl FormatKind {
             // Hand-editable text, so the envelope is a declared section
             FormatKind::ZyronTomlConfig | FormatKind::BackupArchive => Framing::Text,
             // Records inside a stream, versioned per record
-            FormatKind::AuditHashChain
+            FormatKind::ComplianceLogRecord
             | FormatKind::ReplicationApplyLog
             | FormatKind::DeletePredicate
             | FormatKind::LakeTransactionLog => Framing::RecordTag,
             // An envelope header on a file whose trailer and checksums are
             // the format's own, so the substrate reads the header and moves
-            // the file forward whole
-            FormatKind::ZyrColumnar | FormatKind::LakeManifest | FormatKind::ChangeFeedSegment => {
-                Framing::OwnTrailer
-            }
+            // the file forward whole. A commit chain's integrity is the
+            // chain itself, each record covering the one before it
+            FormatKind::ZyrColumnar
+            | FormatKind::LakeManifest
+            | FormatKind::ChangeFeedSegment
+            | FormatKind::VerifiableCommitChain => Framing::OwnTrailer,
             // A whole envelope followed by the envelopes of every extension
             // appended since, each checksummed on its own, so a reader that
             // stops at the first envelope has read the file as it was first

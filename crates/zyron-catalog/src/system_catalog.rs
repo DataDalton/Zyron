@@ -27,6 +27,9 @@ pub const SYSTEM_CATALOG_NAME: &str = "zyron_sys";
 /// Owner recorded on the catalog and every schema in it.
 pub const SYSTEM_CATALOG_OWNER: &str = "system";
 
+/// The schema the compliance audit log's table is registered in
+pub const COMPLIANCE_SCHEMA: &str = "compliance";
+
 /// Schemas of the `zyron_sys` catalog, in the order they are documented.
 ///
 /// Order is load-bearing in one place: when two canonical names score the
@@ -93,6 +96,7 @@ pub const SYSTEM_SCHEMAS: &[&str] = &[
     "governance",
     "compliance",
     "retention",
+    "verify",
     // Operations
     "tenant",
     "usage",
@@ -719,6 +723,21 @@ pub const SYSTEM_OBJECTS: &[SystemObject] = &[
               retention, legal_hold, audit, or events",
     },
     // -----------------------------------------------------------------------
+    // verify
+    // -----------------------------------------------------------------------
+    SystemObject {
+        schema: "verify",
+        object: "tables",
+        kind: SystemObjectKind::View,
+        doc: "Every table carrying a commit chain, with the head it stands at, when it               was last anchored and last verified, and what its chain costs",
+    },
+    SystemObject {
+        schema: "verify",
+        object: "runs",
+        kind: SystemObjectKind::View,
+        doc: "Verifications this node ran, with who asked, the range each covered, the               mode it ran in, its outcome and how long it took",
+    },
+    // -----------------------------------------------------------------------
     // streaming
     // -----------------------------------------------------------------------
     SystemObject {
@@ -1016,6 +1035,14 @@ impl SystemCatalog {
         }
 
         catalog.adopt_system_catalog(database_id, schema_ids);
+
+        // The compliance audit log is the one system object whose rows are
+        // stored rather than computed, so it is registered as a table. That
+        // is what lets it carry the protections its rows need: immutable,
+        // so nothing rewrites an event, and verified, so the commit that
+        // appends one extends a chain the log can be held to
+        let compliance = catalog.get_schema(database_id, COMPLIANCE_SCHEMA)?.id;
+        catalog.register_compliance_log(compliance).await?;
         Ok(database_id)
     }
 }
@@ -1037,7 +1064,7 @@ mod tests {
         // 56 documented subsystem schemas, `pressure` for the
         // self-calibration substrate, and four for the format substrate:
         // crypto, deprecation, upgrade, wire
-        assert_eq!(SYSTEM_SCHEMAS.len(), 61);
+        assert_eq!(SYSTEM_SCHEMAS.len(), 62);
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub use external_credentials::{
 };
 pub use governance::{
     DelegationEdge, DelegationTracker, GovernanceManager, PendingApproval, PrivilegeAnalytics,
-    TwoPersonManager, TwoPersonOperation,
+    TwoPersonManager, TwoPersonOperation, TwoPersonRule,
 };
 pub use heap_storage::HeapAuthStorage;
 pub use ip_management::{IpBlockEntry, IpBlockSource, IpManager, TrustedIpEntry};

@@ -1,6 +1,6 @@
 # Defining Objects
 
-71 statements and constructs.
+72 statements and constructs.
 
 - [ADD EXPECTATION](add-expectation.md), States a property rows must have, and what happens to a write that breaks it.
 - [ALTER ANALYZER](alter-analyzer.md), Changes how an analyzer breaks text into words.
@@ -73,3 +73,4 @@
 - [REINDEX](reindex.md), Rebuilds an index from the rows it covers.
 - [REVOKE](revoke.md), Takes a privilege on an object back from a role.
 - [UNDROP TABLE](undrop-table.md), Brings back a dropped table, while its versions are still retained.
+- [VERIFY TABLE](verify-table.md), Walks a verified table's commit chain and reports whether it still states what happened.

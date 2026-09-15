@@ -95,6 +95,26 @@ inventory::submit! {
     }
 }
 
+/// The scheme a verifiable table's commit chain links its entries with.
+///
+/// Registered here beside the signature schemes because one registry answers
+/// what a stored artifact names, whether the artifact is a signature or a
+/// chained hash, and an entry written under one scheme stays readable when
+/// another is introduced
+pub const COMMIT_CHAIN_SCHEME: SchemeId = SchemeId(4);
+
+inventory::submit! {
+    SignatureSchemeRegistration {
+        scheme_name: "SHA-256",
+        scheme_id: COMMIT_CHAIN_SCHEME,
+        category: SchemeCategory::Hash,
+        status: SchemeStatus::Active,
+        first_available_version: "0.19.0",
+        retirement_date: None,
+        notes: "links the commit chain of a verifiable table",
+    }
+}
+
 inventory::submit! {
     SignatureSchemeRegistration {
         scheme_name: "ML-DSA-65",

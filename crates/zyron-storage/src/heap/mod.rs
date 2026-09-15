@@ -10,7 +10,7 @@ pub mod migrations;
 mod page;
 pub mod redo;
 
-pub use file::{HeapFile, HeapFileConfig};
+pub use file::{HeapFile, HeapFileConfig, ScanGuard, try_for_each_tuple_in_page};
 pub use page::{
     BurstPlacement, EpochCensus, HeapPage, HeapPageHeader, HeapPageIterator, PageVacuum, SlotId,
     TupleSlot,

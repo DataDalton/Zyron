@@ -1,79 +1,117 @@
-//! The audit hash chain format registration.
+//! Format registrations for the compliance log and the verification
+//! artifacts.
 //!
-//! The durable chain lives in the catalog's compliance log table rather than
-//! in a file of its own, so what is versioned here is the entry encoding.
-//! Each entry carries its version tag and the tag is folded into the chained
-//! hash, so an entry written before an upgrade verifies unchanged after one.
+//! The compliance log's rows live in a catalog table rather than in a file
+//! of its own, so what is versioned there is the entry encoding. Each entry
+//! carries its version tag and an entry is never rewritten, so entries of
+//! different versions coexist in one table.
 //!
-//! The chain is an immutable historical record. Rewriting an entry would
-//! break every hash after it, so entries of different versions coexist and
-//! nothing is ever migrated in place
+//! A commit chain is a run of fixed records behind an envelope header. It is
+//! appended to and never rewritten, and each record's integrity is the chain
+//! itself: a record states the link of the one before it. The anchor store
+//! and the verification history are small and rewritten whole, so both
+//! migrate eagerly on the next write.
 
 use zyron_common::format::registry::{DeprecationStatus, FormatRegistration, MigrationPolicy};
 use zyron_common::format::version::{FormatVersion, VersionWindow};
 use zyron_common::format::{FormatKind, RecordVersion};
 
-/// Version tag every audit entry carries
+use crate::verify::CHAIN_FORMAT_VERSION;
+use crate::verify::RUN_LOG_FORMAT_VERSION;
+use crate::verify::anchor::ANCHOR_FORMAT_VERSION;
+
+/// Version tag every compliance log entry carries
 pub const AUDIT_RECORD_VERSION: RecordVersion = RecordVersion::V1;
 
 /// The same tag as the raw byte an entry stores
 pub const AUDIT_RECORD_VERSION_BYTE: u8 = AUDIT_RECORD_VERSION.get();
 
-/// The format version the registry declares
-pub const AUDIT_CHAIN_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+/// The format version the registry declares for the entry encoding
+pub const AUDIT_RECORD_FORMAT_VERSION: FormatVersion = FormatVersion::V1;
+
+/// The release the verification formats were introduced in
+const VERIFY_GATE: &str = "0.19.0";
 
 inventory::submit! {
     FormatRegistration {
-        kind: FormatKind::AuditHashChain,
-        writer_current_version: AUDIT_CHAIN_FORMAT_VERSION,
-        reader_supported_versions: VersionWindow::single(AUDIT_CHAIN_FORMAT_VERSION),
+        kind: FormatKind::ComplianceLogRecord,
+        writer_current_version: AUDIT_RECORD_FORMAT_VERSION,
+        reader_supported_versions: VersionWindow::single(AUDIT_RECORD_FORMAT_VERSION),
         migration_policy: MigrationPolicy::Coexist,
         migration_reversible: true,
         binary_version_gate: "0.11.0",
         deprecation_status: DeprecationStatus::Active,
         retirement_date: None,
         downgrade_write_supported: false,
-        notes: "tamper-evident entries with a per-entry version tag, never rewritten",
+        notes: "compliance events with a per-entry version tag, never rewritten",
+    }
+}
+
+inventory::submit! {
+    FormatRegistration {
+        kind: FormatKind::VerifiableCommitChain,
+        writer_current_version: CHAIN_FORMAT_VERSION,
+        reader_supported_versions: VersionWindow::single(CHAIN_FORMAT_VERSION),
+        migration_policy: MigrationPolicy::Coexist,
+        migration_reversible: true,
+        binary_version_gate: VERIFY_GATE,
+        deprecation_status: DeprecationStatus::Active,
+        retirement_date: None,
+        downgrade_write_supported: false,
+        notes: "fixed commit entries appended in order, each carrying the link of the one before it",
+    }
+}
+
+inventory::submit! {
+    FormatRegistration {
+        kind: FormatKind::VerificationAnchor,
+        writer_current_version: ANCHOR_FORMAT_VERSION,
+        reader_supported_versions: VersionWindow::single(ANCHOR_FORMAT_VERSION),
+        migration_policy: MigrationPolicy::Eager,
+        migration_reversible: true,
+        binary_version_gate: VERIFY_GATE,
+        deprecation_status: DeprecationStatus::Active,
+        retirement_date: None,
+        downgrade_write_supported: false,
+        notes: "anchored chain heads, rewritten in full at the next anchor",
+    }
+}
+
+inventory::submit! {
+    FormatRegistration {
+        kind: FormatKind::VerificationRunLog,
+        writer_current_version: RUN_LOG_FORMAT_VERSION,
+        reader_supported_versions: VersionWindow::single(RUN_LOG_FORMAT_VERSION),
+        migration_policy: MigrationPolicy::Eager,
+        migration_reversible: true,
+        binary_version_gate: VERIFY_GATE,
+        deprecation_status: DeprecationStatus::Active,
+        retirement_date: None,
+        downgrade_write_supported: false,
+        notes: "verification history, rewritten in full after the next run",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit_chain::AuditChain;
 
-    #[test]
-    fn test_the_audit_chain_registers_once() {
-        let count = inventory::iter::<FormatRegistration>
+    fn registrations(kind: FormatKind) -> usize {
+        inventory::iter::<FormatRegistration>
             .into_iter()
-            .filter(|r| r.kind == FormatKind::AuditHashChain)
-            .count();
-        assert_eq!(count, 1);
+            .filter(|r| r.kind == kind)
+            .count()
     }
 
     #[test]
-    fn test_entries_carry_the_version_tag_and_still_chain() {
-        let chain = AuditChain::new();
-        let first = chain.next_entry(0, "subject".into(), 1, 100, "detail".into());
-        let second = chain.next_entry(1, "subject".into(), 1, 200, "detail".into());
-        assert_eq!(first.record_version, AUDIT_RECORD_VERSION_BYTE);
-        assert_eq!(second.record_version, AUDIT_RECORD_VERSION_BYTE);
-        assert_eq!(second.prev_hash, first.entry_hash);
-        let (verified, intact) = AuditChain::verify(&[first, second]);
-        assert_eq!(verified, 2);
-        assert!(intact);
-    }
-
-    #[test]
-    fn test_the_version_tag_is_covered_by_the_chained_hash() {
-        let chain = AuditChain::new();
-        let mut entry = chain.next_entry(0, "subject".into(), 1, 100, "detail".into());
-        let original = entry.entry_hash;
-        entry.record_version = entry.record_version.wrapping_add(1);
-        assert_ne!(
-            entry.compute_hash(),
-            original,
-            "changing the tag has to change the hash"
-        );
+    fn test_each_format_registers_once() {
+        for kind in [
+            FormatKind::ComplianceLogRecord,
+            FormatKind::VerifiableCommitChain,
+            FormatKind::VerificationAnchor,
+            FormatKind::VerificationRunLog,
+        ] {
+            assert_eq!(registrations(kind), 1, "{}", kind.catalog_name());
+        }
     }
 }

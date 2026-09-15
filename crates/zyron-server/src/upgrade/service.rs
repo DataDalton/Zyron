@@ -134,6 +134,9 @@ pub struct ServiceParts {
     /// Raised once every member of the group runs a binary that records a
     /// schedule's run. None on a node in no group
     pub group_carries_schedule_runs: Option<Arc<AtomicBool>>,
+    /// Raised once every member writes the commit chain entries a
+    /// transaction linked
+    pub group_carries_commit_chains: Option<Arc<AtomicBool>>,
 }
 
 /// What the post-upgrade migrations did on this node
@@ -185,6 +188,7 @@ pub struct UpgradeService {
     /// Raised once every member records a schedule's run, so the schedule
     /// worker knows a schedule may run
     group_carries_schedule_runs: Option<Arc<AtomicBool>>,
+    group_carries_commit_chains: Option<Arc<AtomicBool>>,
     last_poll: parking_lot::Mutex<Option<Instant>>,
     /// When the board last took the other members' rows, so the probe runs on
     /// its own interval rather than on every pass of the one-second loop
@@ -355,6 +359,7 @@ impl UpgradeService {
             group_carries_feed_images: parts.group_carries_feed_images,
             group_carries_lake_files: parts.group_carries_lake_files,
             group_carries_schedule_runs: parts.group_carries_schedule_runs,
+            group_carries_commit_chains: parts.group_carries_commit_chains,
             last_poll: parking_lot::Mutex::new(None),
             setting_warning: parking_lot::Mutex::new(None),
         }))
@@ -478,6 +483,21 @@ impl UpgradeService {
         self.refresh_carriage(
             self.group_carries_stream_advance.as_ref(),
             crate::replication::STREAM_ADVANCE_INTRODUCED_IN,
+        )
+        .await;
+    }
+
+    /// Reads whether every member of the group writes the commit chain
+    /// entries a transaction linked, and lets the replication path know.
+    ///
+    /// Same shape as the reading above. While it is down a write to a
+    /// verified table on this node is refused, because a chain that
+    /// advanced here alone leaves every other member unable to adopt any
+    /// later entry
+    async fn refresh_commit_chain_carriage(&self) {
+        self.refresh_carriage(
+            self.group_carries_commit_chains.as_ref(),
+            crate::replication::COMMIT_CHAINS_INTRODUCED_IN,
         )
         .await;
     }
@@ -661,6 +681,7 @@ impl UpgradeService {
             self.carry_cluster_settings().await;
             self.refresh_actor_role_carriage().await;
             self.refresh_stream_advance_carriage().await;
+            self.refresh_commit_chain_carriage().await;
             self.refresh_feed_images_carriage().await;
             self.refresh_lake_files_carriage().await;
             self.refresh_schedule_runs_carriage().await;

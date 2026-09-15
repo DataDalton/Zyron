@@ -513,6 +513,33 @@ pub trait CatalogStorage: Send + Sync {
         Ok(())
     }
 
+    /// The heap and free-space files the compliance log's rows already live
+    /// in, so registering the log as a table names the heap it has rather
+    /// than opening a second one beside it
+    fn compliance_log_file_ids(&self) -> (u32, u32);
+
+    /// Appends one compliance log row under a transaction, so the row
+    /// carries the stamp a verification reads its commit back by, through
+    /// the transaction's own cursor when it hands one
+    async fn store_compliance_log_under(
+        &self,
+        entry: &ComplianceLogEntry,
+        txn_id: u64,
+        cursor: Option<&std::sync::atomic::AtomicU32>,
+    ) -> Result<TupleId>;
+
+    /// The highest event id the compliance log holds, zero for an empty log.
+    ///
+    /// Read once per process by the first append, which counts on from it
+    async fn last_compliance_event_id(&self) -> Result<u64> {
+        Ok(self
+            .load_compliance_log()
+            .await?
+            .last()
+            .map(|entry| entry.event_id)
+            .unwrap_or(0))
+    }
+
     // File ID allocation for user tables and indexes
     fn next_heap_file_id(&self) -> (u32, u32);
     fn next_index_file_id(&self) -> u32;
@@ -2775,9 +2802,48 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn store_compliance_log(&self, entry: &ComplianceLogEntry) -> Result<TupleId> {
-        let tuple = Tuple::new(entry.to_bytes(), 0);
-        let ids = self.compliance_log_heap.insert_batch(&[tuple]).await?;
-        Ok(ids[0])
+        self.store_compliance_log_under(entry, 0, None).await
+    }
+
+    fn compliance_log_file_ids(&self) -> (u32, u32) {
+        (COMPLIANCE_LOG_HEAP_FILE_ID, COMPLIANCE_LOG_FSM_FILE_ID)
+    }
+
+    async fn store_compliance_log_under(
+        &self,
+        entry: &ComplianceLogEntry,
+        txn_id: u64,
+        cursor: Option<&std::sync::atomic::AtomicU32>,
+    ) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), txn_id);
+        let ids = match cursor {
+            Some(cursor) => {
+                self.compliance_log_heap
+                    .insert_batch_with_cursor(&[tuple], cursor)
+                    .await?
+            }
+            None => self.compliance_log_heap.insert_batch(&[tuple]).await?,
+        };
+        ids.first().copied().ok_or_else(|| {
+            zyron_common::ZyronError::Internal(
+                "a compliance log row was written to no slot".to_string(),
+            )
+        })
+    }
+
+    /// Reads the event id of every row and answers with the highest, without
+    /// decoding the rest of any row
+    async fn last_compliance_event_id(&self) -> Result<u64> {
+        let mut highest = 0u64;
+        let guard = self.compliance_log_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Some(bytes) = view.data.get(0..8)
+                && let Ok(word) = <[u8; 8]>::try_from(bytes)
+            {
+                highest = highest.max(u64::from_le_bytes(word));
+            }
+        });
+        Ok(highest)
     }
 
     async fn is_bootstrapped(&self) -> Result<bool> {

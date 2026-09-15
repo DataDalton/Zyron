@@ -321,6 +321,7 @@ pub enum Statement {
     ShowChangeStreams(Box<ShowChangeStreamsStatement>),
     /// APPLY CHANGES INTO target FROM source KEYS (...) ...
     ApplyChanges(Box<ApplyChangesStatement>),
+    VerifyTable(Box<VerifyTableStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +442,30 @@ pub enum ApplySource {
     /// Any relation carrying the metadata columns, including
     /// `table_changes(...)` and a subquery over one
     Relation(Box<TableRef>),
+}
+
+/// How much of a verified table's rows a `VERIFY TABLE` reads back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyRowMode {
+    /// A sample of the commits have their rows read back and rehashed
+    #[default]
+    Sampled,
+    /// Every commit in range has its rows read back and rehashed
+    All,
+}
+
+/// `VERIFY TABLE <t> [FROM VERSION n] [TO VERSION n] [WITH (rows => ..., sample => n)]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifyTableStatement {
+    pub table: String,
+    /// Lowest commit version the walk covers. None starts at the genesis
+    pub from_version: Option<Expr>,
+    /// Highest commit version the walk covers. None ends at the head
+    pub to_version: Option<Expr>,
+    pub rows: VerifyRowMode,
+    /// How many commits a sampled run reads the rows of. None takes the
+    /// node's default
+    pub sample: Option<Expr>,
 }
 
 /// `APPLY CHANGES INTO <target> FROM <source> KEYS (...) ...`
@@ -1069,6 +1094,8 @@ pub enum Privilege {
     Manage,
     /// Changes a table's change data feed settings
     ManageChangeFeeds,
+    /// Runs a verification that reads back every row a chain covers
+    ManageVerification,
     All,
 }
 

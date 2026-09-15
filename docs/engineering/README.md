@@ -15,6 +15,10 @@ Every document here has a user-facing counterpart under [../business/](../busine
 
 - [cdc/streams-and-positions.md](cdc/streams-and-positions.md), the change feed's segments and per-version counts, the position lock and its handover through the transaction manager, the window a stream read resolves across several sources, background writers and schedule runs on a member of a group, lake changes derived from the transaction log and the lake's data files carried in the replication log, schema epochs in the feed, branch feeds and the branch point, outbound delivery from a stream, and why a change stream is neither a queue nor a streaming job.
 
+## Data Lifecycle
+
+- [lifecycle/commit-chain.md](lifecycle/commit-chain.md), the per-commit hash chain of a verifiable table: why one entry covers a commit rather than a row, the fixed record and what it does not store, the canonical row encoding and its interaction with schema epochs, the lock scope and why the file is written at commit, the changeset operation that carries an entry to every member, anchors and their export, the walk, the compliance log's conversion, and the assertion that exactly one chain implementation exists.
+
 ## Operations
 
 - [operations/auto-upgrade.md](operations/auto-upgrade.md), the compatibility gate, upgrade coordination across nodes, and health baseline mechanics.

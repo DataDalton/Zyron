@@ -41,7 +41,7 @@ pub use freespace::{
 pub use heap::redo as heap_redo;
 pub use heap::{
     BurstPlacement, EpochCensus, HeapFile, HeapFileConfig, HeapPage, HeapPageHeader,
-    HeapPageIterator, PageVacuum, SlotId, TupleSlot,
+    HeapPageIterator, PageVacuum, ScanGuard, SlotId, TupleSlot, try_for_each_tuple_in_page,
 };
 pub use tuple::{
     Tuple, TupleFlags, TupleHeader, TupleId, TupleView, VERSIONED_TUPLE_HEADER_SIZE,

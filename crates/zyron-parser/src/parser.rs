@@ -117,6 +117,14 @@ impl<'a> Parser<'a> {
             {
                 self.parse_apply_changes()
             }
+            // VERIFY is matched as a soft keyword, so a column or a table
+            // called `verify` keeps working everywhere else
+            Token::Ident(word)
+                if word.eq_ignore_ascii_case("verify")
+                    && self.peek.token == Token::Keyword(Keyword::Table) =>
+            {
+                self.parse_verify_table()
+            }
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -4772,9 +4780,9 @@ impl<'a> Parser<'a> {
                 p.advance()?;
                 Ok(Privilege::Invoke)
             }
-            // PEEK, MANAGE and MANAGE_CHANGE_FEEDS are matched as soft
-            // keywords, so a column or a table called `peek` or `manage`
-            // keeps working everywhere else
+            // PEEK, MANAGE, MANAGE_CHANGE_FEEDS and MANAGE_VERIFICATION are
+            // matched as soft keywords, so a column or a table called `peek`
+            // or `manage` keeps working everywhere else
             Token::Ident(word) if word.eq_ignore_ascii_case("peek") => {
                 p.advance()?;
                 Ok(Privilege::Peek)
@@ -4786,6 +4794,10 @@ impl<'a> Parser<'a> {
             Token::Ident(word) if word.eq_ignore_ascii_case("manage_change_feeds") => {
                 p.advance()?;
                 Ok(Privilege::ManageChangeFeeds)
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("manage_verification") => {
+                p.advance()?;
+                Ok(Privilege::ManageVerification)
             }
             _ => Err(p.error(&format!("Expected privilege, found {}", p.current.token))),
         })
@@ -7974,6 +7986,90 @@ impl<'a> Parser<'a> {
         Ok(Statement::DropChangeStream(Box::new(
             DropChangeStreamStatement { name, if_exists },
         )))
+    }
+
+    /// `VERIFY TABLE <t> [FROM VERSION <n>] [TO VERSION <n>]
+    /// [WITH (rows => 'all' | 'sampled', sample => <n>)]`
+    ///
+    /// VERIFY, ROWS and SAMPLE are matched as soft keywords, so a relation
+    /// or a column carrying one of those names keeps working everywhere else
+    fn parse_verify_table(&mut self) -> Result<Statement> {
+        self.expect_ident_ignore_case("verify")?;
+        self.expect_keyword(Keyword::Table)?;
+        let table = self.parse_qualified_name()?;
+
+        let from_version = if self.at_keyword(Keyword::From) {
+            self.advance()?;
+            self.expect_keyword(Keyword::Version)?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let to_version = if self.at_keyword(Keyword::To) {
+            self.advance()?;
+            self.expect_keyword(Keyword::Version)?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let mut rows = VerifyRowMode::default();
+        let mut sample = None;
+        if self.at_keyword(Keyword::With) && self.peek.token == Token::LParen {
+            self.advance()?;
+            self.advance()?;
+            let options = self.parse_comma_separated(|p| p.parse_read_option())?;
+            self.expect_token(&Token::RParen)?;
+            for option in options {
+                match option.key.to_ascii_lowercase().as_str() {
+                    "rows" => {
+                        let word = match &option.value {
+                            TableOptionValue::String(s) | TableOptionValue::Identifier(s) => {
+                                s.clone()
+                            }
+                            other => {
+                                return Err(self.error(&format!(
+                                    "rows takes 'all' or 'sampled', found {other:?}"
+                                )));
+                            }
+                        };
+                        rows = match word.to_ascii_lowercase().as_str() {
+                            "all" => VerifyRowMode::All,
+                            "sampled" => VerifyRowMode::Sampled,
+                            other => {
+                                return Err(self.error(&format!(
+                                    "rows takes 'all' or 'sampled', found '{other}'"
+                                )));
+                            }
+                        };
+                    }
+                    "sample" => {
+                        let count = match &option.value {
+                            TableOptionValue::Integer(n) => *n,
+                            other => {
+                                return Err(self.error(&format!(
+                                    "sample takes a whole number of commits, found {other:?}"
+                                )));
+                            }
+                        };
+                        sample = Some(Expr::Literal(LiteralValue::Integer(count)));
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "VERIFY TABLE takes rows and sample, found '{other}'"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(Statement::VerifyTable(Box::new(VerifyTableStatement {
+            table,
+            from_version,
+            to_version,
+            rows,
+            sample,
+        })))
     }
 
     /// `APPLY CHANGES INTO <target> FROM <source> KEYS (...) [SEQUENCE BY ...]

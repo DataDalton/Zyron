@@ -181,6 +181,13 @@ struct StagedTxn {
     /// vacuum leaves them alone until the version naming them applies, and
     /// so an abandoned transaction takes its half written files with it
     lake_files: Vec<StagedLakeFile>,
+    /// What the rows this transaction put into verified tables hashed to
+    /// here, which is held against what the leader recorded before the
+    /// entry is linked
+    chain_writes: Arc<zyron_lifecycle::verify::PendingChainWrites>,
+    /// The chain entries this transaction linked, published once it commits
+    /// and dropped if it is abandoned
+    chain_entries: Vec<zyron_lifecycle::verify::CommitHash>,
 }
 
 /// One file a replicated lake commit carries, as far as it has arrived
@@ -216,8 +223,14 @@ struct StagedLakeFile {
 /// change feed as the write that produced it, and every one of those lives in
 /// a registry the server owns
 pub trait DdlRunner: Send + Sync {
-    /// A context wired the way a statement's context is wired
-    fn apply_context(&self, txn_id: u64, snapshot: Snapshot) -> Arc<ExecutionContext>;
+    /// A context wired the way a statement's context is wired, hashing what
+    /// it writes into verified tables into `chain_writes`
+    fn apply_context(
+        &self,
+        txn_id: u64,
+        snapshot: Snapshot,
+        chain_writes: &Arc<zyron_lifecycle::verify::PendingChainWrites>,
+    ) -> Arc<ExecutionContext>;
 
     /// `apply_txn_id` is the transaction this node is replaying the statement
     /// under. An online build waits for the transactions that were running
@@ -239,6 +252,10 @@ pub trait DdlRunner: Send + Sync {
     /// Where a change is recorded on this node, None when this node records
     /// no change feeds
     fn change_hook(&self) -> Option<Arc<dyn zyron_executor::context::CdcHook>>;
+
+    /// The commit chains this node holds, which the entries a changeset
+    /// carries are written into
+    fn chain_registry(&self) -> Option<Arc<zyron_lifecycle::verify::ChainRegistry>>;
 }
 
 /// Applies changesets and finishes locally originated transactions.
@@ -373,7 +390,8 @@ impl ChangesetMachine {
                     // of the applier but the changes it records, the
                     // statement recorded none, and this is their place in
                     // the log's order
-                    self.record_local_changes(origin.txn, index, header, reader)
+                    let ops: Vec<ChangesetOp<'_>> = reader.collect::<Result<Vec<_>>>()?;
+                    self.record_local_changes(origin.txn, index, header, &ops)
                         .await?;
                     return Ok(());
                 }
@@ -553,19 +571,46 @@ impl ChangesetMachine {
         // transaction becomes visible. A schedule run the entry carries is
         // recorded here as well, ahead of the commit record, so a restart
         // that finds the record finds the run recorded, and one that
-        // replays the entry records the run with the rows
-        if let Err(e) = self
-            .record_local_changes(txn_id, index, header, reader)
-            .await
-        {
+        // replays the entry records the run with the rows. The chain
+        // entries the rows extend are linked here too, onto the head this
+        // node's chain stands at, into this transaction's own log chain
+        let ops: Vec<ChangesetOp<'_>> = match reader.collect::<Result<Vec<_>>>() {
+            Ok(ops) => ops,
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = done.send(Err(e));
+                return Err(ZyronError::Internal(format!(
+                    "a committed transaction's changes could not be read back: {reason}"
+                )));
+            }
+        };
+        if let Err(e) = self.record_local_changes(txn_id, index, header, &ops).await {
             let reason = e.to_string();
             let _ = done.send(Err(e));
             return Err(ZyronError::Internal(format!(
                 "a committed transaction's changes could not be recorded locally: {reason}"
             )));
         }
+        let chained = match self.link_carried_chains(&ops, &mut txn, index, header.timestamp_us) {
+            Ok(chained) => chained,
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = done.send(Err(e));
+                return Err(ZyronError::Internal(format!(
+                    "a committed transaction's chain entries could not be linked locally: \
+                     {reason}"
+                )));
+            }
+        };
         let stamp = self.agreed_stamp(index, header.origin);
         let outcome = self.engine.txn_manager.commit_agreed(&mut txn, &stamp);
+        if let Some(registry) = self.ddl.get().and_then(|host| host.chain_registry()) {
+            zyron_wire::verify_dispatch::settle_applied_chains(
+                &registry,
+                &chained,
+                outcome.is_ok(),
+            );
+        }
         let answer = match outcome {
             Ok(lsn) => {
                 self.record_agreed(lsn, index, stamp.floor);
@@ -606,11 +651,70 @@ impl ChangesetMachine {
         txn_id: u64,
         index: u64,
         header: ChangesetHeader,
-        reader: ChangesetReader<'_>,
+        ops: &[ChangesetOp<'_>],
     ) -> Result<()> {
-        let ops: Vec<ChangesetOp<'_>> = reader.collect::<Result<Vec<_>>>()?;
-        self.record_entry_changes(txn_id, index, header, &ops, EntrySide::Proposed)?;
-        self.record_local_schedule_runs(&ops).await
+        self.record_entry_changes(txn_id, index, header, ops, EntrySide::Proposed)?;
+        self.record_local_schedule_runs(ops).await
+    }
+
+    /// Links the chain entries an entry carries onto this node's chains,
+    /// under the transaction that holds the rows they cover.
+    ///
+    /// Run in the log's order on every member, so every member's chain
+    /// takes the same entry at the same position. The record goes into the
+    /// transaction's own log chain ahead of its commit record, and the
+    /// entry is published once that commit is written
+    fn link_carried_chains(
+        &self,
+        ops: &[ChangesetOp<'_>],
+        txn: &mut Transaction,
+        index: u64,
+        timestamp_us: i64,
+    ) -> Result<Vec<zyron_lifecycle::verify::CommitHash>> {
+        let mut linked = Vec::new();
+        for op in ops {
+            let ChangesetOp::CommitChain {
+                table_id,
+                rows_hash,
+                row_count,
+                algorithm_id,
+            } = op
+            else {
+                continue;
+            };
+            let registry = self.chain_registry_for(*table_id)?;
+            linked.push(zyron_wire::verify_dispatch::link_applied_chain(
+                &registry,
+                &self.engine.wal,
+                txn,
+                *table_id,
+                *rows_hash,
+                *row_count,
+                *algorithm_id,
+                index,
+                timestamp_us,
+            )?);
+        }
+        Ok(linked)
+    }
+
+    /// The chains this node holds, for an entry that names a chained table
+    fn chain_registry_for(
+        &self,
+        table_id: u32,
+    ) -> Result<Arc<zyron_lifecycle::verify::ChainRegistry>> {
+        let Some(host) = self.ddl.get() else {
+            return Err(ZyronError::Internal(
+                "a commit chain entry reached the applier before this node finished starting"
+                    .into(),
+            ));
+        };
+        host.chain_registry().ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "a replicated commit chain entry names table {table_id} and this member holds no \
+                 chains, so the entry has nowhere to go"
+            ))
+        })
     }
 
     /// Records the schedule runs one of this node's own entries carries,
@@ -732,7 +836,8 @@ impl ChangesetMachine {
                 | ChangesetOp::Sequence { .. }
                 | ChangesetOp::ScheduleRun { .. }
                 | ChangesetOp::Ddl { .. }
-                | ChangesetOp::StreamAdvance { .. } => {}
+                | ChangesetOp::StreamAdvance { .. }
+                | ChangesetOp::CommitChain { .. } => {}
             }
         }
         Ok(())
@@ -783,7 +888,8 @@ impl ChangesetMachine {
                         .txn_manager
                         .begin(IsolationLevel::ReadCommitted)?;
                     let txn_id = txn.txn_id();
-                    let ctx = host.apply_context(txn_id, txn.snapshot.clone());
+                    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
+                    let ctx = host.apply_context(txn_id, txn.snapshot.clone(), &chain_writes);
                     staging.insert(
                         origin,
                         StagedTxn {
@@ -793,6 +899,8 @@ impl ChangesetMachine {
                             next_chunk: 0,
                             stream_advances: Vec::new(),
                             lake_files: Vec::new(),
+                            chain_writes,
+                            chain_entries: Vec::new(),
                         },
                     );
                     (txn_id, ctx)
@@ -842,11 +950,31 @@ impl ChangesetMachine {
             staged
         };
 
+        // The rows this member put into verified tables hashed to something
+        // here, and it has to be what the leader recorded, or this member
+        // holds different rows and says so rather than chaining them. The
+        // entries are linked onto this member's chains in the log's order,
+        // into the transaction's own log chain ahead of its commit record
+        if let Err(e) = self.link_staged_chains(&mut staged, &ops, index, header.timestamp_us) {
+            self.abandon_staged(staged);
+            return Err(e);
+        }
+
         let stamp = self.agreed_stamp(index, origin);
-        let lsn = self
+        let outcome = self
             .engine
             .txn_manager
-            .commit_agreed(&mut staged.txn, &stamp)?;
+            .commit_agreed(&mut staged.txn, &stamp);
+        if !staged.chain_entries.is_empty()
+            && let Some(registry) = self.ddl.get().and_then(|host| host.chain_registry())
+        {
+            zyron_wire::verify_dispatch::settle_applied_chains(
+                &registry,
+                &staged.chain_entries,
+                outcome.is_ok(),
+            );
+        }
+        let lsn = outcome?;
         self.record_agreed(lsn, index, stamp.floor);
         zyron_lake::publish_txn(&self.engine.data_dir, txn_id)?;
         // The advances are durable with the commit record, so this brings
@@ -859,6 +987,98 @@ impl ChangesetMachine {
         }
         self.applied_remote.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Holds what a staged transaction's rows hashed to here against what
+    /// the entry carries, and links the entries onto this member's chains.
+    ///
+    /// A table the leader recorded and this member hashed differently, or
+    /// did not hash at all, is a member holding different rows, which is
+    /// reported rather than chained
+    fn link_staged_chains(
+        &self,
+        staged: &mut StagedTxn,
+        ops: &[ChangesetOp<'_>],
+        index: u64,
+        timestamp_us: i64,
+    ) -> Result<()> {
+        let carried: Vec<(u32, [u8; 32], u64, u16)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                ChangesetOp::CommitChain {
+                    table_id,
+                    rows_hash,
+                    row_count,
+                    algorithm_id,
+                } => Some((*table_id, *rows_hash, *row_count, *algorithm_id)),
+                _ => None,
+            })
+            .collect();
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let registry = self.chain_registry_for(carried[0].0)?;
+        let txn_id = staged.txn.txn_id();
+        let hashed = staged.chain_writes.take(txn_id, &registry)?;
+        for (table_id, rows_hash, row_count, algorithm_id) in carried {
+            let Some(here) = hashed.iter().find(|table| table.table_id == table_id) else {
+                return Err(ZyronError::Internal(format!(
+                    "a replicated commit chain entry names table {table_id} and this member \
+                     applied no rows to it, so it holds different data"
+                )));
+            };
+            if here.rows_hash != rows_hash || here.row_count != row_count {
+                return Err(ZyronError::Internal(format!(
+                    "the rows this member applied to table {table_id} hash to {} over {} row(s) \
+                     and the leader recorded {} over {row_count}, so this member holds different \
+                     data",
+                    zyron_lifecycle::verify::hex(&here.rows_hash),
+                    here.row_count,
+                    zyron_lifecycle::verify::hex(&rows_hash)
+                )));
+            }
+            let linked = zyron_wire::verify_dispatch::link_applied_chain(
+                &registry,
+                &self.engine.wal,
+                &mut staged.txn,
+                table_id,
+                rows_hash,
+                row_count,
+                algorithm_id,
+                index,
+                timestamp_us,
+            )?;
+            staged.chain_entries.push(linked);
+        }
+        Ok(())
+    }
+
+    /// Abandons a staged transaction already taken out of the staging map,
+    /// the way `abandon` does one still in it
+    fn abandon_staged(&self, mut staged: StagedTxn) {
+        let txn_id = staged.txn.txn_id();
+        if let Some(registry) = self.ddl.get().and_then(|host| host.chain_registry()) {
+            zyron_wire::verify_dispatch::settle_applied_chains(
+                &registry,
+                &staged.chain_entries,
+                false,
+            );
+        }
+        if let Err(e) = self.engine.txn_manager.abort(&mut staged.txn) {
+            tracing::warn!(error = %e, "a staged transaction could not be abandoned cleanly");
+        }
+        zyron_lake::abandon_txn(&self.engine.data_dir, txn_id);
+        for file in &staged.lake_files {
+            if file.partial.exists()
+                && let Err(e) = std::fs::remove_file(&file.partial)
+            {
+                tracing::warn!(
+                    error = %e,
+                    path = %file.partial.display(),
+                    "an abandoned transaction's half written lake file could not be removed"
+                );
+            }
+        }
     }
 
     /// The stamp one agreed commit writes into its record: the entry that
@@ -983,6 +1203,9 @@ impl ChangesetMachine {
                 } => {
                     self.apply_stream_advance(origin, *stream_id, consumed, *at, *actor_role_id)?;
                 }
+                // Linked once every row of the transaction is in, against
+                // what this member's own hashing of those rows produced
+                ChangesetOp::CommitChain { .. } => {}
             }
         }
         ctx.set_capture_muted(false);
@@ -1381,26 +1604,11 @@ impl ChangesetMachine {
     fn abandon(&self, origin: Origin) {
         self.open_txns.lock().remove(&origin);
         let staged = self.staging.lock().remove(&origin);
-        if let Some(mut staged) = staged {
-            let txn_id = staged.txn.txn_id();
-            if let Err(e) = self.engine.txn_manager.abort(&mut staged.txn) {
-                tracing::warn!(error = %e, "a staged transaction could not be abandoned cleanly");
-            }
-            zyron_lake::abandon_txn(&self.engine.data_dir, txn_id);
+        if let Some(staged) = staged {
             // A file still arriving goes with the transaction. One that
             // landed whole is named by no version now and the vacuum
             // reclaims it once its registration drops with this state
-            for file in &staged.lake_files {
-                if file.partial.exists()
-                    && let Err(e) = std::fs::remove_file(&file.partial)
-                {
-                    tracing::warn!(
-                        error = %e,
-                        path = %file.partial.display(),
-                        "an abandoned transaction's half written lake file could not be removed"
-                    );
-                }
-            }
+            self.abandon_staged(staged);
         }
     }
 
@@ -1709,8 +1917,18 @@ pub struct ReplicationHandle {
     /// alone would be run again by the next leader, so while this is false
     /// no schedule runs on this node
     pub group_carries_schedule_runs: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether every member of the group writes the commit chain entries a
+    /// transaction linked.
+    ///
+    /// False until the upgrade service has seen the group's version floor
+    /// reach [`COMMIT_CHAINS_INTRODUCED_IN`]. A chain that advanced on the
+    /// leader alone leaves every other member unable to adopt any later
+    /// entry, so while this is false a write to a verified table is refused
+    /// rather than replicated short
+    pub group_carries_commit_chains: Arc<std::sync::atomic::AtomicBool>,
 }
 
+pub use zyron_executor::replication::COMMIT_CHAINS_INTRODUCED_IN;
 /// The release whose applier reads a delete or an update that carries row
 /// images beside its keys, which a table with a change data feed on ships
 pub use zyron_executor::replication::FEED_IMAGES_INTRODUCED_IN;
@@ -1943,6 +2161,32 @@ impl zyron_wire::connection::ReplicationRouter for ReplicationHandle {
                 .map(|(table_id, _, count)| (*table_id, *count))
                 .collect();
             changeset.capture_stream_advance(advance.stream_id, &consumed, at, actor)?;
+        }
+        Ok(())
+    }
+
+    fn capture_commit_chains(
+        &self,
+        changeset: &zyron_executor::replication::TxnChangeset,
+        tables: &[zyron_lifecycle::verify::PendingTable],
+    ) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        if !self.group_carries_commit_chains.load(Ordering::Relaxed) {
+            return Err(ZyronError::UpgradeRefused(format!(
+                "a verified table cannot be written to until every member of the group runs \
+                 {COMMIT_CHAINS_INTRODUCED_IN} or later, so the write is refused rather than \
+                 chained on this member alone"
+            )));
+        }
+        for table in tables {
+            changeset.capture_commit_chain(
+                table.table_id,
+                &table.rows_hash,
+                table.row_count,
+                table.algorithm_id,
+            )?;
         }
         Ok(())
     }
@@ -2186,9 +2430,18 @@ impl DispatchedDdl {
 }
 
 impl DdlRunner for DispatchedDdl {
-    fn apply_context(&self, txn_id: u64, snapshot: Snapshot) -> Arc<ExecutionContext> {
+    fn apply_context(
+        &self,
+        txn_id: u64,
+        snapshot: Snapshot,
+        chain_writes: &Arc<zyron_lifecycle::verify::PendingChainWrites>,
+    ) -> Arc<ExecutionContext> {
         match self.server.upgrade() {
-            Some(server) => Arc::new(server.apply_context(txn_id, snapshot)),
+            Some(server) => {
+                let mut ctx = server.apply_context(txn_id, snapshot);
+                zyron_wire::verify_dispatch::install_chain_writes(&server, &mut ctx, chain_writes);
+                Arc::new(ctx)
+            }
             // The server is gone, so nothing this context produced could be
             // served anyway. A bare context still refuses every write it is
             // asked for, loudly, rather than writing rows into a node that is
@@ -2296,5 +2549,11 @@ impl DdlRunner for DispatchedDdl {
         self.server
             .upgrade()
             .and_then(|server| server.cdc_hook.clone())
+    }
+
+    fn chain_registry(&self) -> Option<Arc<zyron_lifecycle::verify::ChainRegistry>> {
+        self.server
+            .upgrade()
+            .and_then(|server| server.chain_registry.clone())
     }
 }

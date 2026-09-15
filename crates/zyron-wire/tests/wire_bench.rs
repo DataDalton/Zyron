@@ -203,6 +203,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         admission: Arc::new(zyron_common::Admission::new()),
         query_metrics: Arc::new(zyron_common::QueryMetrics::new()),
         upgrade_control: None,
+        chain_registry: None,
     });
 
     (state, tmp)

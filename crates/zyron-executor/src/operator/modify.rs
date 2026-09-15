@@ -48,6 +48,22 @@ fn note_rows_written(ctx: &ExecutionContext, table: &zyron_catalog::TableEntry) 
     }
 }
 
+/// Records that rows of a table were stamped deleted, for the log wait and
+/// for the commit chain sink.
+///
+/// A delete or an update is refused on a table whose commits are chained,
+/// so the sink hears of one only from a transaction that started before the
+/// table became verifiable or one that resolved the table just before it
+/// did, and those are the transactions it refuses at commit: the rows they
+/// removed were counted into the genesis set
+#[inline]
+fn note_rows_deleted(ctx: &ExecutionContext, table: &zyron_catalog::TableEntry) {
+    note_rows_written(ctx, table);
+    if let Some(sink) = ctx.chain_sink.as_ref() {
+        sink.rows_removed(table.id.0);
+    }
+}
+
 /// Encodes a row's value at the given column position into a caller-provided
 /// buffer suitable for B+Tree key comparison. Big-endian for integers (matches
 /// the literal path in extract_scan_bounds), Utf8 as raw bytes
@@ -3908,13 +3924,32 @@ impl Operator for InsertOperator {
                 )
                 .await?;
 
+                // A verified table's rows go through this transaction's own
+                // cursor, so they are stored in the order they are hashed.
+                // The sink records the write either way, chained or not
+                let chain_cursor = self
+                    .ctx
+                    .chain_sink
+                    .as_ref()
+                    .and_then(|sink| sink.open_write(self.table_id.0));
+                if table_entry.lifecycle.verified && chain_cursor.is_none() {
+                    return Err(ZyronError::Internal(format!(
+                        "table '{}' is verified and this node chains no commits to it, so the \
+                         rows cannot be written without falling outside the chain",
+                        table_entry.name
+                    )));
+                }
+
                 // The heap logs each page it appends to, one record per
                 // burst carrying the rows and where they went, and stamps
                 // the page with the record before the append's lock drops
                 #[cfg(feature = "profile")]
                 let _heap_span =
                     zyron_common::profile::scope(zyron_common::profile::Phase::ExecHeapInsert);
-                let tuple_ids = heap_file.insert_batch(&tuples).await?;
+                let tuple_ids = match chain_cursor.as_ref() {
+                    Some(cursor) => heap_file.insert_batch_with_cursor(&tuples, cursor).await?,
+                    None => heap_file.insert_batch(&tuples).await?,
+                };
                 #[cfg(feature = "profile")]
                 drop(_heap_span);
                 note_rows_written(&self.ctx, &table_entry);
@@ -3979,6 +4014,23 @@ impl Operator for InsertOperator {
                 );
                 #[cfg(feature = "profile")]
                 drop(_idx_span);
+
+                // Hash the rows into this transaction's chain entry, where
+                // the table's commits are chained. Done here rather than at
+                // commit so the rows are hashed once, where they already
+                // are, and the commit finds one hash per table ready to link
+                if chain_cursor.is_some()
+                    && let Some(sink) = self.ctx.chain_sink.as_ref()
+                    && let (Some(first), Some(last)) = (tuple_ids.first(), tuple_ids.last())
+                {
+                    sink.rows(
+                        self.table_id.0,
+                        table_entry.schema_epoch,
+                        &mut tuples.iter().map(|t| t.data()),
+                        first.order_key(),
+                        last.order_key(),
+                    );
+                }
 
                 // Record the rows for the consensus group, when this node
                 // leads one
@@ -5213,7 +5265,7 @@ impl Operator for DeleteOperator {
                         retain_history,
                     )
                     .await?;
-                note_rows_written(&self.ctx, &table_entry);
+                note_rows_deleted(&self.ctx, &table_entry);
 
                 // A rewrite copying this table needs the delete too, or the
                 // swap would install a table still holding the row
@@ -6199,7 +6251,7 @@ impl Operator for UpdateOperator {
                         table_entry.time_travel_retention_secs != 0,
                     )
                     .await?;
-                note_rows_written(&self.ctx, &table_entry);
+                note_rows_deleted(&self.ctx, &table_entry);
 
                 if let Some(gm) = &self.ctx.graph_manager {
                     gm.invalidate_for_table(self.table_id.0);

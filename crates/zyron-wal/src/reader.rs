@@ -313,6 +313,7 @@ impl RecoveryManager {
         // files hold what the appends wrote whether or not the transaction
         // committed, and a reader answers to the transaction's status
         let mut feed_records = Vec::new();
+        let mut chain_records = Vec::new();
         let mut active_txns = std::collections::HashMap::with_capacity(256);
         // Maps each committed transaction to its commit-record LSN, which dates
         // the transaction for time-travel after recovery.
@@ -385,6 +386,9 @@ impl RecoveryManager {
                 LogRecordType::ChangeFeedFrames => {
                     feed_records.push(record);
                 }
+                LogRecordType::CommitChainEntry => {
+                    chain_records.push(record);
+                }
                 _ => {}
             }
         })?;
@@ -392,6 +396,11 @@ impl RecoveryManager {
         // Only redo committed transactions. retain() filters in-place
         // without allocating a second Vec or touching Bytes Arc refcounts.
         redo_records.retain(|r| committed_txns.contains_key(&r.txn_id));
+        // A chain entry states that a commit wrote the rows it names, so
+        // only a transaction that committed contributes one. An entry below
+        // the checkpoint boundary is dropped with its transaction's commit
+        // record and is already in the chain file the checkpoint flushed
+        chain_records.retain(|r| committed_txns.contains_key(&r.txn_id));
 
         let undo_txns: Vec<_> = active_txns.keys().copied().collect();
         let committed_txns: Vec<(u64, u64)> = committed_txns.into_iter().collect();
@@ -400,6 +409,7 @@ impl RecoveryManager {
             redo_records,
             page_records,
             feed_records,
+            chain_records,
             undo_txns,
             committed_txns,
             // Report the highest real record LSN observed, not segment offset 0,
@@ -421,6 +431,9 @@ pub struct RecoveryResult {
     /// Change feed appends to replay onto the feed segment files, in log
     /// order, from every transaction the log holds
     pub feed_records: Vec<LogRecord>,
+    /// Commit chain entries to put back into the chain files, in log order,
+    /// from the transactions that committed
+    pub chain_records: Vec<LogRecord>,
     /// Transaction IDs to undo (uncommitted at crash).
     pub undo_txns: Vec<u64>,
     /// Committed transactions paired with their commit-record LSN, used to date
@@ -439,6 +452,7 @@ impl RecoveryResult {
             redo_records: Vec::new(),
             page_records: Vec::new(),
             feed_records: Vec::new(),
+            chain_records: Vec::new(),
             undo_txns: Vec::new(),
             committed_txns: Vec::new(),
             last_lsn: None,

@@ -6,6 +6,8 @@
 //! retention policies against the regulatory floors, legal holds, the
 //! tamper-evident audit chain, or the raw compliance events.
 
+use std::sync::Arc;
+
 use zyron_common::ZyronError;
 use zyron_lifecycle::compliance::{RetentionRequirement, event, validate_retention};
 
@@ -163,27 +165,58 @@ async fn legal_hold_rows(server: &ServerState) -> Result<Vec<Row>, ZyronError> {
         .collect())
 }
 
-/// The tamper-evident chain over the compliance log, verified end to end.
+/// The commit chain over the compliance log, walked end to end.
+///
+/// The same walk `VERIFY TABLE zyron_sys.compliance.log` runs, through the
+/// same code, so this report and that statement answer with one result
 async fn audit_rows(server: &ServerState) -> Result<Vec<Row>, ZyronError> {
-    let (verified, intact) = server.catalog.verify_compliance_chain().await?;
-    let total = server.catalog.load_compliance_log().await?.len();
-    let detail = if intact {
-        format!("{} compliance events verified, hash chain intact", verified)
-    } else {
-        format!(
-            "hash chain broken after {} of {} events, entries beyond that point are not trustworthy",
-            verified, total
-        )
+    let Some(table) = compliance_log_table(server) else {
+        return Ok(vec![vec![
+            cell("audit"),
+            cell("compliance_log"),
+            None,
+            cell("INFO"),
+            cell("the compliance log is not open on this node, so its chain cannot be walked"),
+            None,
+        ]]);
     };
+    let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
+    let outcome = crate::verify_dispatch::run_verify(
+        server,
+        crate::verify_dispatch::VerifyRequest {
+            table_id: table.id.0,
+            from_version: None,
+            to_version: None,
+            mode: zyron_lifecycle::verify::RowMode::Sampled,
+            sample: crate::verify_dispatch::DEFAULT_SAMPLE,
+        },
+        0,
+        "compliance report",
+        cancelled,
+    )
+    .await?;
     Ok(vec![vec![
         cell("audit"),
-        cell("compliance_log"),
-        None,
-        cell(if intact { "PASS" } else { "FAIL" }),
-        cell(detail),
+        cell(&table.name),
+        cell(table.id.0),
+        cell(if outcome.intact { "PASS" } else { "FAIL" }),
+        cell(outcome.summary()),
         None,
     ]])
 }
+
+/// The compliance log's catalog entry, which the system catalog registers
+/// under its own schema
+fn compliance_log_table(server: &ServerState) -> Option<Arc<zyron_catalog::TableEntry>> {
+    server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .find(|table| table.name.eq_ignore_ascii_case(COMPLIANCE_LOG_TABLE))
+}
+
+/// The name the compliance log's rows are held under
+pub const COMPLIANCE_LOG_TABLE: &str = "compliance_log";
 
 /// The compliance log itself, one row per recorded event.
 async fn event_rows(server: &ServerState) -> Result<Vec<Row>, ZyronError> {
@@ -258,6 +291,9 @@ fn event_label(code: u8) -> &'static str {
         event::CRYPTO_SHRED => "crypto_shred",
         event::PURGE => "purge",
         event::UNDROP => "undrop",
+        event::CHAIN_ANCHORED => "chain_anchored",
+        event::TABLE_VERIFICATION_ENABLED => "table_verification_enabled",
+        event::VERIFY_RUN => "verify_run",
         _ => "unknown",
     }
 }

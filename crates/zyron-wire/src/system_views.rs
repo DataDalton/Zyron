@@ -580,6 +580,15 @@ pub async fn query_system_view(
         return filters.project(name, fields, rows).map(Some);
     }
 
+    // The verification views read the chains, their anchors and the runs
+    // this node recorded
+    if crate::system_verify_views::owns(object.schema, object.object) {
+        let (fields, rows) =
+            crate::system_verify_views::build(object.schema, object.object, server)?;
+        let rows = filters.apply(&fields, rows);
+        return filters.project(name, fields, rows).map(Some);
+    }
+
     // The change stream views read the catalog and the feed counters, and
     // the alert template view reads what each subsystem declares
     if crate::system_change_stream_views::owns(object.schema, object.object) {

@@ -29,3 +29,4 @@ Zyron upgrades itself, moves its own on-disk formats forward, and rotates its ow
 ## Security
 
 - [security/signature-agility.md](security/signature-agility.md), how signing schemes rotate without invalidating artifacts already issued. Which schemes are accepted, the DDL to rotate one, and how long an outgoing scheme keeps verifying.
+- [security/verifiable-tables.md](security/verifiable-tables.md), a hash chain over a table's own commits. What immutable guarantees and what the chain adds on top, why an anchor is what makes a truncation detectable, exporting an anchor to hold outside the cluster, what a sampled verification does and does not tell you, and what a chain costs per commit.

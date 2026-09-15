@@ -388,6 +388,11 @@ pub fn try_handle_ddl_utility<'a>(
         Statement::ApplyChanges(s) => Box::pin(async move {
             Some(crate::apply_changes::handle_apply_changes(s, server, session).await)
         }),
+        // VERIFY TABLE reads a chain and the rows it covers. It writes
+        // nothing to the table and returns one row of what it found
+        Statement::VerifyTable(s) => Box::pin(async move {
+            Some(crate::verify_dispatch::handle_verify_table(s, server, session).await)
+        }),
         Statement::CreateCdcIngest(s) => {
             Box::pin(async move { Some(handle_create_cdc_ingest(s, server, session).await) })
         }
@@ -2095,7 +2100,13 @@ async fn alter_heap_table_columns(
             };
             if !zyron_types::representation_compatible(from, to) {
                 // The stored bytes do not decode as the new type, so every row
-                // has to be re-encoded. That runs beside the live table
+                // has to be re-encoded. That rewrites rows a write-locked
+                // table holds, which is the same thing DELETE and UPDATE are
+                // refused for, so it answers with the same lock and the same
+                // reason. The widening path below re-encodes nothing and is
+                // left alone
+                refuse_write_locked(&old_table)?;
+                // That runs beside the live table
                 return run_shadow_rewrite(
                     server,
                     schema_id,
@@ -5655,7 +5666,60 @@ async fn drop_table_in_schema(
     // issued again. A soft drop keeps both, which is why this is not on that
     // path: an UNDROP restores the table with the grants it had
     forget_object_privileges(server, zyron_auth::ObjectType::Table, table.id.0).await?;
+    forget_commit_chain(server, &table).await?;
     reclaim_table_storage(server, &reclaim).await
+}
+
+/// Removes the commit chain of a table that is gone, and records that it
+/// went.
+///
+/// A chain over a table nothing holds describes nothing, and its id would be
+/// reissued to whatever is numbered that next. Removing a verified table is
+/// on the record because the chain went with it, so an auditor reading the
+/// log sees the evidence end rather than finding it absent
+pub(crate) async fn forget_commit_chain(
+    server: &Arc<ServerState>,
+    table: &zyron_catalog::schema::TableEntry,
+) -> Result<(), ProtocolError> {
+    let Some(registry) = server.chain_registry.as_ref() else {
+        return Ok(());
+    };
+    let commits = registry
+        .chain(table.id.0)
+        .map(|chain| chain.head().commits)
+        .unwrap_or(0);
+    registry
+        .remove(table.id.0)
+        .map_err(ProtocolError::Database)?;
+    if !table.lifecycle.verified && commits == 0 {
+        return Ok(());
+    }
+    crate::verify_dispatch::append_audit(
+        server,
+        zyron_catalog::schema::ComplianceLogEntry {
+            event_id: 0,
+            event_type: zyron_lifecycle::compliance::event::TABLE_VERIFICATION_ENABLED,
+            subject: table.name.clone(),
+            table_id: table.id.0,
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0),
+            detail: format!(
+                "verified table dropped, its chain of {commits} commit(s) went with it"
+            ),
+            record_version: zyron_lifecycle::format::AUDIT_RECORD_VERSION_BYTE,
+        },
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+    tracing::info!(
+        target: "zyron::audit",
+        event = "VerifiedTableDropped",
+        table = %table.name,
+        commits,
+    );
+    Ok(())
 }
 
 /// Drops every privilege recorded against an object that no longer exists.
@@ -5747,6 +5811,16 @@ async fn handle_drop_table(
             zyron_auth::PrivilegeType::Create,
             zyron_auth::ObjectType::Table,
             table.id.0,
+        )?;
+        // Removing a table is irreversible once its recycle window passes,
+        // so a tenant that requires two people for one says so through the
+        // governance rule rather than through a privilege nobody holds
+        // alone. A tenant with no rule configured is unaffected
+        crate::lifecycle_dispatch::two_person_gate(
+            server,
+            session,
+            zyron_auth::TwoPersonOperation::DropTable,
+            &format!("drop table '{}'", stmt.name),
         )?;
     }
 
@@ -8227,6 +8301,7 @@ async fn execute_call_body(
     // One record of stream advances for the whole body, so a stream that
     // more than one of its statements reads is read at one window and its
     // position moves once, in the body's own commit
+    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
     let advances: Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -8287,6 +8362,7 @@ async fn execute_call_body(
             ctx.dml_hook = Some(Arc::clone(hook));
         }
         crate::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
+        crate::verify_dispatch::install_chain_writes(server, &mut ctx, &chain_writes);
         ctx.params = params.clone();
         ctx.replication = changeset.clone();
         let ctx = Arc::new(ctx);
@@ -8313,7 +8389,8 @@ async fn execute_call_body(
     // The positions the body's reads took move in its own commit, so a
     // failure above left every one of them where it was
     let held = std::mem::take(&mut *advances.lock());
-    let outcome = commit_generated(server, txn, changeset, &held).await;
+    let outcome =
+        commit_generated_chained(server, txn, changeset, &held, Some(&chain_writes)).await;
     if outcome.is_err() {
         crate::change_stream_dispatch::release_stream_positions(server, txn_id);
     }
@@ -8359,6 +8436,7 @@ pub(crate) async fn run_apply_job(
         .map_err(ProtocolError::Database)?;
     let txn_id = txn.txn_id;
     let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
+    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
     let advances: Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -8394,6 +8472,7 @@ pub(crate) async fn run_apply_job(
         ctx.dml_hook = Some(Arc::clone(hook));
     }
     crate::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
+    crate::verify_dispatch::install_chain_writes(server, &mut ctx, &chain_writes);
     ctx.replication = changeset.clone();
     // The reader's own security, so the target rows the apply may touch
     // and the change rows it reads are the ones the reader may see. Moved
@@ -8434,7 +8513,8 @@ pub(crate) async fn run_apply_job(
     // The position the source consumed moves in this transaction's own
     // commit, so a failure above left it exactly where it was
     let held = std::mem::take(&mut *advances.lock());
-    let outcome = commit_generated(server, txn, changeset, &held).await;
+    let outcome =
+        commit_generated_chained(server, txn, changeset, &held, Some(&chain_writes)).await;
     if outcome.is_err() {
         // A commit that failed after the advances were logged still holds
         // the positions its reads took. A commit that succeeded released
@@ -8454,15 +8534,36 @@ pub(crate) async fn run_apply_job(
 /// same order a connection's own commit keeps
 pub async fn commit_generated(
     server: &Arc<ServerState>,
+    txn: zyron_storage::txn::Transaction,
+    changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
+    held: &[zyron_executor::context::PendingStreamAdvance],
+) -> Result<(), ProtocolError> {
+    commit_generated_chained(server, txn, changeset, held, None).await
+}
+
+/// The body of a generated commit, with the chain entries the rows it wrote
+/// into verified tables extend.
+///
+/// A body that wrote to no verified table passes None and pays nothing
+pub async fn commit_generated_chained(
+    server: &Arc<ServerState>,
     mut txn: zyron_storage::txn::Transaction,
     changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
     held: &[zyron_executor::context::PendingStreamAdvance],
+    chain_writes: Option<&Arc<zyron_lifecycle::verify::PendingChainWrites>>,
 ) -> Result<(), ProtocolError> {
     let txn_id = txn.txn_id;
     // A generated body runs under no session, which is what zero says of
     // the role that moved the position
     let advanced = crate::change_stream_dispatch::log_stream_advances(server, &mut txn, held, 0)
         .map_err(ProtocolError::Database)?;
+    // What the body wrote into verified tables, one hash per table, or a
+    // refusal for a transaction the chain cannot cover
+    let tables = match chain_writes {
+        Some(pending) => crate::verify_dispatch::take_commit_chains(server, txn_id, pending)
+            .map_err(ProtocolError::Database)?,
+        None => Vec::new(),
+    };
     // A lake commit the body staged is a write whether or not a heap row
     // went with it, and needs a commit record for its rows to read as
     // committed
@@ -8479,6 +8580,12 @@ pub async fn commit_generated(
                 abandon_generated(server, &mut txn, Some(&changeset));
                 return Err(ProtocolError::Database(e));
             }
+            // The hashes travel with the rows, and every member links the
+            // entry as it applies them, this member included
+            if let Err(e) = router.capture_commit_chains(&changeset, &tables) {
+                abandon_generated(server, &mut txn, Some(&changeset));
+                return Err(ProtocolError::Database(e));
+            }
             if changeset.is_dirty() {
                 let streamed = Arc::clone(&changeset);
                 if let Err(e) = router.commit(txn, changeset).await {
@@ -8491,6 +8598,16 @@ pub async fn commit_generated(
                     withdraw_streamed(server, Some(streamed.as_ref()));
                     return Err(ProtocolError::Database(e));
                 }
+            } else if !tables.is_empty() {
+                // Rows in a verified table are in the changeset, so a body
+                // that hashed rows and captured nothing is refused rather
+                // than committed on this member alone
+                abandon_generated(server, &mut txn, Some(&changeset));
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "transaction {txn_id} wrote to {} verified table(s) and produced nothing for \
+                     the group to agree on, so its chain entries cannot reach every member",
+                    tables.len()
+                ))));
             } else if txn.wrote_data() || staged_lake {
                 if let Err(e) = server.txn_manager.commit(&mut txn).await {
                     abandon_generated(server, &mut txn, None);
@@ -8505,13 +8622,21 @@ pub async fn commit_generated(
             }
         }
         _ => {
+            // The chain entry goes into this transaction's own log chain,
+            // ahead of its commit record, the same way a connection's
+            // commit writes one
+            let chained = crate::verify_dispatch::link_commit_chains(server, &mut txn, &tables)
+                .map_err(ProtocolError::Database)?;
             if txn.wrote_data() || staged_lake {
                 if let Err(e) = server.txn_manager.commit(&mut txn).await {
+                    crate::verify_dispatch::discard_commit_chains(server, &chained);
                     abandon_generated(server, &mut txn, None);
                     return Err(ProtocolError::Database(e));
                 }
+                crate::verify_dispatch::publish_commit_chains(server, &chained);
                 publish_generated_lake(server, txn_id)?;
             } else {
+                crate::verify_dispatch::discard_commit_chains(server, &chained);
                 server
                     .txn_manager
                     .commit_read_only(&mut txn)
@@ -9695,6 +9820,7 @@ async fn pipeline_context(
         Arc<zyron_executor::context::ExecutionContext>,
         Option<Arc<zyron_executor::replication::TxnChangeset>>,
         StageAdvances,
+        Arc<zyron_lifecycle::verify::PendingChainWrites>,
     ),
     ProtocolError,
 > {
@@ -9735,15 +9861,17 @@ async fn pipeline_context(
     if let Some(hook) = &server.dml_hook {
         ctx.dml_hook = Some(Arc::clone(hook));
     }
+    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
     let advances: StageAdvances = Arc::new(parking_lot::Mutex::new(Vec::new()));
     crate::change_feed_bridge::install_change_reads(server, &mut ctx, &advances);
+    crate::verify_dispatch::install_chain_writes(server, &mut ctx, &chain_writes);
     // A read that moves a change stream's position is a write to the
     // catalog every member must see, so even a stage that only reads
     // carries a changeset, which stays empty and reaches no one when the
     // stage moved nothing
     let changeset = server.replication.as_ref().map(|r| r.changeset(txn_id));
     ctx.replication = changeset.clone();
-    Ok((txn, Arc::new(ctx), changeset, advances))
+    Ok((txn, Arc::new(ctx), changeset, advances, chain_writes))
 }
 
 /// Runs one read statement (a SELECT) in its own transaction, returning the
@@ -9782,10 +9910,10 @@ async fn run_pipeline_read(
             (name, c.type_id)
         })
         .collect();
-    let (mut txn, ctx, changeset, advances) = pipeline_context(server).await?;
+    let (mut txn, ctx, changeset, advances, chain_writes) = pipeline_context(server).await?;
     match zyron_executor::execute(plan, &ctx).await {
         Ok(batches) => {
-            commit_pipeline_txn(server, txn, changeset, &advances).await?;
+            commit_pipeline_txn(server, txn, changeset, &advances, &chain_writes).await?;
             Ok((schema, batches))
         }
         Err(e) => {
@@ -9818,7 +9946,7 @@ async fn run_pipeline_write_txn(
             .map_err(ProtocolError::Database)?,
         );
     }
-    let (mut txn, ctx, changeset, advances) = pipeline_context(server).await?;
+    let (mut txn, ctx, changeset, advances, chain_writes) = pipeline_context(server).await?;
     let mut last = Vec::new();
     for plan in plans {
         match zyron_executor::execute(plan, &ctx).await {
@@ -9832,7 +9960,7 @@ async fn run_pipeline_write_txn(
     if ctx.wrote_wal() {
         txn.mark_wrote_data();
     }
-    commit_pipeline_txn(server, txn, changeset, &advances).await?;
+    commit_pipeline_txn(server, txn, changeset, &advances, &chain_writes).await?;
     Ok(last)
 }
 
@@ -9847,10 +9975,12 @@ async fn commit_pipeline_txn(
     txn: zyron_storage::txn::Transaction,
     changeset: Option<Arc<zyron_executor::replication::TxnChangeset>>,
     advances: &StageAdvances,
+    chain_writes: &Arc<zyron_lifecycle::verify::PendingChainWrites>,
 ) -> Result<(), ProtocolError> {
     let txn_id = txn.txn_id;
     let held = std::mem::take(&mut *advances.lock());
-    let outcome = commit_generated(server, txn, changeset, &held).await;
+    let outcome =
+        commit_generated_chained(server, txn, changeset, &held, Some(&chain_writes)).await;
     if outcome.is_err() {
         crate::change_stream_dispatch::release_stream_positions(server, txn_id);
     }
@@ -11244,8 +11374,9 @@ async fn merge_branch_into_main(
     // The merge wrote through the store's own logged paths, so the commit
     // record is what makes those writes read as committed
     txn.mark_wrote_data();
+    let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
     let advances: StageAdvances = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    commit_pipeline_txn(server, txn, changeset, &advances).await?;
+    commit_pipeline_txn(server, txn, changeset, &advances, &chain_writes).await?;
 
     // Lake side: every lake table holding a branch of this name replays
     // that branch's file set onto its main log, the same merge the
@@ -13554,6 +13685,9 @@ fn map_privilege(p: zyron_parser::ast::Privilege) -> Vec<zyron_auth::PrivilegeTy
         zyron_parser::ast::Privilege::Peek => vec![zyron_auth::PrivilegeType::Peek],
         zyron_parser::ast::Privilege::Manage => {
             vec![zyron_auth::PrivilegeType::ManageChangeStream]
+        }
+        zyron_parser::ast::Privilege::ManageVerification => {
+            vec![zyron_auth::PrivilegeType::ManageVerification]
         }
         zyron_parser::ast::Privilege::ManageChangeFeeds => {
             vec![zyron_auth::PrivilegeType::ManageChangeFeeds]

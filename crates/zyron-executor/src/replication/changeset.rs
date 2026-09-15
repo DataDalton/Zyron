@@ -107,6 +107,19 @@ const OP_SCHEDULE_RUN: u8 = 16;
 /// than the table's. Read by the same release that reads a lake file, so
 /// the leader holds a branch write back on the same terms
 const OP_LAKE_BRANCH_VERSION: u8 = 17;
+/// What a commit to a verifiable table hashed to, carried with the rows it
+/// covers so every member links the same entry in the log's order.
+///
+/// The link itself is computed by each member as it applies the entry,
+/// from this hash, the entry's index and its proposal instant, all of which
+/// are the same on every member, onto the head its own chain stands at,
+/// which the log's order makes the same as well. Carrying the hash rather
+/// than a link the leader computed is what keeps two commits proposed
+/// together from linking in one order and applying in the other. A member
+/// that does not know the tag refuses the whole entry, so the leader
+/// refuses the write until every member of the group runs a binary that
+/// reads it
+const OP_COMMIT_CHAIN: u8 = 18;
 
 /// The release whose applier reads a delete or an update that carries the
 /// old row images beside the keys. A write to a table with a change data
@@ -127,6 +140,13 @@ pub const LAKE_FILES_INTRODUCED_IN: zyron_common::format::BinaryVersion =
 /// leader alone would be run again by the next leader
 pub const SCHEDULE_RUNS_INTRODUCED_IN: zyron_common::format::BinaryVersion =
     zyron_common::format::BinaryVersion::new(0, 18, 0);
+
+/// The release whose applier writes a commit chain entry. A write to a
+/// verified table is refused on a group with a member below it, since a
+/// chain that advanced on the leader alone would leave that member unable
+/// to adopt any later entry
+pub const COMMIT_CHAINS_INTRODUCED_IN: zyron_common::format::BinaryVersion =
+    zyron_common::format::BinaryVersion::new(0, 19, 0);
 
 /// Written where an index id would go when rows are matched by their whole
 /// image instead
@@ -448,6 +468,16 @@ pub enum ChangesetOp<'a> {
         /// written before this build
         actor_role_id: Option<u32>,
     },
+    /// What this transaction's rows in a verifiable table hashed to, which
+    /// every member links onto its chain as it applies the entry
+    CommitChain {
+        table_id: u32,
+        /// Over the rows in the order they were stored
+        rows_hash: [u8; 32],
+        row_count: u64,
+        /// The registered scheme the leader hashed with
+        algorithm_id: u16,
+    },
     StreamAdvance {
         stream_id: u32,
         /// The count each source table's feed has been consumed to, which
@@ -547,6 +577,17 @@ impl<'a> ChangesetReader<'a> {
         }
         let out = &self.data[self.at..self.at + len];
         self.at += len;
+        Ok(out)
+    }
+
+    /// A field of a fixed width, written without a length
+    fn hash(&mut self) -> Result<[u8; 32]> {
+        if self.at + 32 > self.data.len() {
+            return Err(bad("changeset ends inside a hash"));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&self.data[self.at..self.at + 32]);
+        self.at += 32;
         Ok(out)
     }
 
@@ -746,6 +787,18 @@ impl<'a> ChangesetReader<'a> {
                     database,
                     search_path,
                     actor_role_id,
+                })
+            }
+            OP_COMMIT_CHAIN => {
+                let table_id = self.u32()?;
+                let rows_hash = self.hash()?;
+                let row_count = self.u64()?;
+                let algorithm_id = self.u16()?;
+                Ok(ChangesetOp::CommitChain {
+                    table_id,
+                    rows_hash,
+                    row_count,
+                    algorithm_id,
                 })
             }
             OP_STREAM_ADVANCE => {
@@ -1318,6 +1371,30 @@ impl TxnChangeset {
         put_u32(buf, schedule_id);
         put_optional_i64(buf, last_run);
         put_optional_i64(buf, next_run);
+        buffer.ops += 1;
+        self.maybe_stream(&mut buffer)
+    }
+
+    /// Records what this transaction's rows in a verifiable table hashed to.
+    ///
+    /// The rows it covers are already in the chunk. Every member links the
+    /// entry from this as it applies the chunk, onto the head its own chain
+    /// stands at, so every member's chain holds the same link at the same
+    /// position for the same commit
+    pub fn capture_commit_chain(
+        &self,
+        table_id: u32,
+        rows_hash: &[u8; 32],
+        row_count: u64,
+        algorithm_id: u16,
+    ) -> Result<()> {
+        let mut buffer = self.buffer.lock();
+        let buf = &mut buffer.payload;
+        buf.push(OP_COMMIT_CHAIN);
+        put_u32(buf, table_id);
+        buf.extend_from_slice(rows_hash);
+        put_u64(buf, row_count);
+        put_u16(buf, algorithm_id);
         buffer.ops += 1;
         self.maybe_stream(&mut buffer)
     }

@@ -405,6 +405,7 @@ pub async fn start_cluster(
         // because a run recorded here alone would be run again by the next
         // leader
         group_carries_schedule_runs: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        group_carries_commit_chains: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     tracing::info!(

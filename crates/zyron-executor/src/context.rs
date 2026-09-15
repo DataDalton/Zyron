@@ -467,6 +467,50 @@ pub struct PendingStreamAdvance {
     pub positions: Vec<(u32, u64, u64)>,
 }
 
+/// Takes the rows a write put into a verifiable table.
+///
+/// A verified table's commit extends a hash chain over the rows it wrote.
+/// Hashing them is the expensive half and it happens here, as the rows are
+/// written, so sixteen writers hash in parallel and meet only at the link
+/// their commit appends. Implemented above the executor, where the chain
+/// lives.
+///
+/// Every write to every table reports to the sink, chained or not: a
+/// transaction that wrote to a table before it became verifiable is what
+/// the sink has to know about at commit
+pub trait CommitChainSink: Send + Sync {
+    /// A write to `table_id` is about to store rows.
+    ///
+    /// Answers with the cursor the rows go through when the table's commits
+    /// are chained, so every run this transaction stores lands above the
+    /// one before it, and None when they are not. The table is recorded as
+    /// written either way
+    fn open_write(&self, table_id: u32) -> Option<Arc<std::sync::atomic::AtomicU32>>;
+
+    /// Rows of `table_id` were stamped deleted, by a delete or an update.
+    ///
+    /// A chain covers rows that stay. A transaction that removed rows from
+    /// a table whose commits are chained cannot be chained, and the sink
+    /// refuses it at commit
+    fn rows_removed(&self, table_id: u32);
+
+    /// Rows stored in `table_id` under `schema_epoch`, in the order they
+    /// were stored, for a table whose commits are chained. The rows are the
+    /// stored form, which is what a verification reads back and rehashes.
+    ///
+    /// `first_position` and `last_position` are where the run's first and
+    /// last row sit in the table, which is what orders the runs of one
+    /// transaction against each other
+    fn rows(
+        &self,
+        table_id: u32,
+        schema_epoch: u16,
+        rows: &mut dyn Iterator<Item = &[u8]>,
+        first_position: u64,
+        last_position: u64,
+    );
+}
+
 /// Hook for BEFORE triggers. Called before DML mutations to allow
 /// trigger logic to inspect, modify, or cancel the operation.
 pub trait DmlHook: Send + Sync {
@@ -667,6 +711,11 @@ pub struct ExecutionContext {
     pub replication_apply: bool,
     /// Optional DML hook invoked by DML operators before mutations (BEFORE triggers).
     pub dml_hook: Option<Arc<dyn DmlHook>>,
+    /// Where the rows written to a verifiable table are hashed, for the
+    /// chain entry this transaction's commit appends. None where no table
+    /// this statement writes to is verified, which is every statement on a
+    /// node that has none
+    pub chain_sink: Option<Arc<dyn CommitChainSink>>,
     /// Bound parameter values ($1, $2, ...) for prepared statements.
     pub params: Vec<ScalarValue>,
     /// Database the firing statement was planned against. A nested plan
@@ -839,6 +888,7 @@ impl ExecutionContext {
             replication: None,
             replication_apply: false,
             dml_hook: None,
+            chain_sink: None,
             params: Vec::new(),
             planning_database: zyron_catalog::DatabaseId(1),
             security_context: None,
@@ -932,6 +982,7 @@ impl ExecutionContext {
             replication: self.replication.clone(),
             replication_apply: self.replication_apply,
             dml_hook: self.dml_hook.clone(),
+            chain_sink: self.chain_sink.clone(),
             params,
             planning_database: self.planning_database,
             security_context: self.security_context.clone(),

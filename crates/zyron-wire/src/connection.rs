@@ -102,6 +102,20 @@ pub trait ReplicationRouter: Send + Sync {
         actor: u32,
     ) -> Result<(), ZyronError>;
 
+    /// Records what this transaction's rows in each verified table hashed
+    /// to, so every member links the same entry onto its chain as it
+    /// applies the entry, in the log's order.
+    ///
+    /// Refused, and the commit with it, while a member of the group runs a
+    /// binary that does not read the operation: a chain that advanced on
+    /// the other members alone would leave that member unable to link any
+    /// later entry
+    fn capture_commit_chains(
+        &self,
+        changeset: &zyron_executor::replication::TxnChangeset,
+        tables: &[zyron_lifecycle::verify::PendingTable],
+    ) -> Result<(), ZyronError>;
+
     /// Seals the changeset, agrees it with the group, and returns once the
     /// applier has committed the transaction locally
     fn commit<'a>(
@@ -507,6 +521,12 @@ pub fn replication_class(stmt: &zyron_parser::Statement) -> ReplicationClass {
         // A listing of the change streams this node holds, which every member
         // answers from its own catalog
         | S::ShowChangeStreams(_)
+        // A verification reads this node's own chain and its own copy of the
+        // rows, and records the run in this node's own history. Every member
+        // holds the same chain entries, written from the same bytes in the
+        // log's order, so each answers for the copy it holds and a run on
+        // one member states nothing about another
+        | S::VerifyTable(_)
         | S::AlterCluster(_) => Local,
     }
 }
@@ -727,6 +747,10 @@ pub struct ServerState {
     /// assembled without one, where TRIGGER MANUAL and ACKNOWLEDGE UPGRADE
     /// REWRITES are refused rather than recorded for nothing to act on
     pub upgrade_control: Option<Arc<dyn crate::format_dispatch::UpgradeControl>>,
+    /// The commit chains of this node's verifiable tables, with the anchors
+    /// taken over them and the verifications it has run. None where no data
+    /// directory was opened, which is what a harness built without one has
+    pub chain_registry: Option<Arc<zyron_lifecycle::verify::ChainRegistry>>,
     /// What the node measured about the machine it runs on, read back by
     /// zyron_sys.pressure.node_capabilities. None in a harness that assembled
     /// a server without probing, where the view reports no rows rather than
@@ -1362,6 +1386,16 @@ pub struct Connection<T: WireTransport> {
     /// held, which is what leaves a rolled back consume's position where it
     /// was
     stream_advances: Arc<parking_lot::Mutex<Vec<zyron_executor::context::PendingStreamAdvance>>>,
+    /// The rows this transaction's statements wrote into verified tables,
+    /// hashed as they were written.
+    ///
+    /// Shared into every execution context the connection builds, so a write
+    /// anywhere in a statement reaches the chain entry the commit links. A
+    /// rollback drops it with everything else the transaction held
+    chain_writes: Arc<zyron_lifecycle::verify::PendingChainWrites>,
+    /// The sink over `chain_writes`, built once and handed to every context
+    /// the connection builds. None on a node that holds no chains
+    chain_sink: Option<Arc<dyn zyron_executor::context::CommitChainSink>>,
     /// Cross-table lake commit opened by BEGIN ZYRONLAKE TRANSACTION. The
     /// transaction's lake writes commit under its intent, so several lake
     /// tables become visible together without waiting on the database
@@ -1569,6 +1603,8 @@ impl<T: WireTransport> Connection<T> {
         let pid = NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
         server.query_metrics.connection_opened();
         let session_guard = server.admission.open_session();
+        let chain_writes = Arc::new(zyron_lifecycle::verify::PendingChainWrites::new());
+        let chain_sink = crate::verify_dispatch::chain_sink(&server, &chain_writes);
 
         Self {
             stream,
@@ -1585,6 +1621,8 @@ impl<T: WireTransport> Connection<T> {
             error_responses: 0,
             changeset: None,
             stream_advances: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            chain_writes,
+            chain_sink,
             lake_txn: None,
             statements: HashMap::new(),
             portals: HashMap::new(),
@@ -1973,6 +2011,7 @@ impl<T: WireTransport> Connection<T> {
         let mut session =
             Session::with_security_context(user, database, database_id, security_context);
         session.process_id = self.process_id;
+        session.secret_key = self.secret_key;
 
         // Encode all startup responses into self.write_buf (reuses existing allocation
         // instead of creating a new BytesMut per handshake), then write once.
@@ -3325,6 +3364,7 @@ impl<T: WireTransport> Connection<T> {
             &mut ctx,
             &self.stream_advances,
         );
+        ctx.chain_sink = self.chain_sink.clone();
         if let Some(ref hook) = self.server.dml_hook {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
@@ -4400,6 +4440,7 @@ impl<T: WireTransport> Connection<T> {
             &mut ctx,
             &self.stream_advances,
         );
+        ctx.chain_sink = self.chain_sink.clone();
         if let Some(ref hook) = self.server.dml_hook {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
@@ -4736,12 +4777,32 @@ impl<T: WireTransport> Connection<T> {
             &advances,
             actor,
         )?;
+        // What this transaction wrote into verified tables, one hash per
+        // table, or a refusal for a transaction the chain cannot cover
+        let tables =
+            crate::verify_dispatch::take_commit_chains(&self.server, txn_id, &self.chain_writes)?;
         let changeset = self.changeset.take();
         let (Some(router), Some(changeset)) = (self.server.replication.as_ref(), changeset) else {
-            self.server.txn_manager.commit(&mut txn).await?;
+            // A verified table's chain entry goes into this transaction's
+            // own log chain, ahead of the commit record, so the entry and
+            // the rows it covers are one transaction
+            let chained =
+                crate::verify_dispatch::link_commit_chains(&self.server, &mut txn, &tables)?;
+            match self.server.txn_manager.commit(&mut txn).await {
+                Ok(()) => {
+                    crate::verify_dispatch::publish_commit_chains(&self.server, &chained);
+                }
+                Err(e) => {
+                    crate::verify_dispatch::discard_commit_chains(&self.server, &chained);
+                    return Err(e);
+                }
+            }
             self.install_after_commit(txn_id, advanced).await;
             return Ok(txn);
         };
+        // The hashes travel with the rows, and every member links the entry
+        // as it applies them, in the log's order, this member included
+        router.capture_commit_chains(&changeset, &tables)?;
 
         // A lake commit is described by its version files, and every lake
         // write path stages the same way, so reading what this transaction
@@ -4763,12 +4824,23 @@ impl<T: WireTransport> Connection<T> {
         if !changeset.is_dirty() {
             // Nothing to agree on. A read-only transaction never reaches the
             // group at all, which is what keeps a read-mostly node from
-            // paying for consensus it does not need
-            if txn.wrote_data() {
-                self.server.txn_manager.commit(&mut txn).await?;
-            } else {
-                self.server.txn_manager.commit_read_only(&mut txn)?;
+            // paying for consensus it does not need. A transaction that
+            // wrote to a verified table has rows in the changeset, so one
+            // that hashed rows and captured nothing is refused rather than
+            // committed on this member alone
+            if !tables.is_empty() {
+                return Err(ZyronError::Internal(format!(
+                    "transaction {txn_id} wrote to {} verified table(s) and produced nothing for \
+                     the group to agree on, so its chain entries cannot reach every member",
+                    tables.len()
+                )));
             }
+            let outcome = if txn.wrote_data() {
+                self.server.txn_manager.commit(&mut txn).await
+            } else {
+                self.server.txn_manager.commit_read_only(&mut txn)
+            };
+            outcome?;
             self.install_after_commit(txn_id, advanced).await;
             return Ok(txn);
         }
@@ -5045,6 +5117,7 @@ impl<T: WireTransport> Connection<T> {
                     // The advances this transaction's reads recorded go with
                     // it, so the positions stand where they did
                     self.stream_advances.lock().clear();
+                    self.chain_writes.clear();
                     self.server.txn_manager.abort(&mut txn)
                 } else {
                     Ok(())
@@ -6590,6 +6663,7 @@ impl<T: WireTransport> Connection<T> {
                     refresh_lake_stats(&self.server, &logs);
                     self.abandon_changeset();
                     self.stream_advances.lock().clear();
+                    self.chain_writes.clear();
                     if let Err(e) = self.server.txn_manager.abort(&mut txn) {
                         self.write_buf.truncate(buf_mark);
                         self.send_error(&e).await?;

@@ -759,6 +759,33 @@ impl Server {
                 )));
             }
         }
+        // The commit chains of this node's verifiable tables. Every entry a
+        // committing transaction linked is recorded in the log ahead of its
+        // commit record, so the entries of the transactions that committed
+        // go back into their chain files before anything reads one, and an
+        // entry whose transaction never committed is not among them
+        let chain_registry_arc = Arc::new(zyron_lifecycle::verify::ChainRegistry::open(
+            data_dir.clone(),
+        )?);
+        // The registry is what the write path asks before it hashes a row,
+        // so every table the catalog holds as verified is registered before
+        // anything writes
+        zyron_wire::verify_dispatch::register_chained_tables(&chain_registry_arc, &catalog);
+        if let Some(result) = recovery_result.as_mut() {
+            let logged = std::mem::take(&mut result.chain_records);
+            if !logged.is_empty() {
+                let restored = zyron_wire::verify_dispatch::restore_chain_entries(
+                    &chain_registry_arc,
+                    &logged,
+                )?;
+                info!(
+                    "Commit chain recovery put {} logged entr(ies) back into their chains, {}                      passed over as already held",
+                    restored,
+                    logged.len() - restored
+                );
+            }
+        }
+
         // The branches of the database, loaded before anything that names
         // a branch's head on a lake table
         let branch_mgr = zyron_versioning::BranchManager::new(data_dir.clone());
@@ -1719,6 +1746,9 @@ impl Server {
                 group_carries_lake_files: cluster
                     .as_ref()
                     .map(|c| Arc::clone(&c.replication.group_carries_lake_files)),
+                group_carries_commit_chains: cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.replication.group_carries_commit_chains)),
                 group_carries_schedule_runs: cluster
                     .as_ref()
                     .map(|c| Arc::clone(&c.replication.group_carries_schedule_runs)),
@@ -1991,6 +2021,7 @@ impl Server {
             query_metrics: Arc::clone(&self.query_metrics),
             upgrade_control: Some(Arc::clone(&upgrade_service)
                 as Arc<dyn zyron_wire::format_dispatch::UpgradeControl>),
+            chain_registry: Some(Arc::clone(&chain_registry_arc)),
         });
 
         // Service principal signing keys, put back before anything issues a
@@ -2008,6 +2039,11 @@ impl Server {
                 principal_keys.len()
             );
         }
+
+        // The compliance log's rows from before its chain began are covered
+        // by a genesis entry the first start after the conversion writes,
+        // before anything appends to the log
+        zyron_wire::verify_dispatch::cover_compliance_log(&server_state).await?;
 
         // Retention, schedules and lake maintenance run their writes through
         // the server state, which exists only now
@@ -2222,6 +2258,28 @@ impl Server {
                     sweep_config,
                     sweep_notifier,
                     Some(labeled_sweep),
+                )
+                .await;
+            }));
+
+            // The head of every verified table's chain, recorded on an
+            // interval so a truncation of one is detectable
+            let server_anchor = Arc::clone(&server_state);
+            let sh_anchor = Arc::clone(&self.shutdown);
+            let wake_anchor = Arc::clone(&self.shutdown_wake);
+            let anchor_config = background::chain_anchor::AnchorConfig {
+                interval_secs: self.config.verify.anchor_interval_secs,
+            };
+            let anchor_notifier = Some(Arc::new(crate::upgrade::service::build_notifier(
+                &self.config,
+            )?));
+            spawned_workers.push(tokio::spawn(async move {
+                background::chain_anchor::chain_anchor_loop(
+                    server_anchor,
+                    sh_anchor,
+                    wake_anchor,
+                    anchor_config,
+                    anchor_notifier,
                 )
                 .await;
             }));

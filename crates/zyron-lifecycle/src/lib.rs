@@ -2,14 +2,13 @@
 //!
 //! Retention/TTL, tiered storage, archival, soft delete, legal hold,
 //! GDPR erasure, data classification, compliance auditing, recycle bin,
-//! crypto-shredding, and a tamper-evident audit chain.
+//! crypto-shredding, and the commit hash chain of a verifiable table.
 //!
 //! Hot-path reads (legal hold lookup) are lock-free via RcuMap and atomics.
 //! Background workers own their own threads and may use local locks. No
 //! unwrap on any path; all fallible work returns Result.
 
 pub mod archive;
-pub mod audit_chain;
 pub mod classification;
 pub mod compliance;
 pub mod cryptoshred;
@@ -25,4 +24,5 @@ pub mod scheduling;
 pub mod soft_delete;
 pub mod tiered_storage;
 pub mod ttl;
+pub mod verify;
 pub mod worm;

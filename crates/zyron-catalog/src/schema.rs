@@ -1711,6 +1711,24 @@ pub struct LifecycleConfig {
     pub residency_region: String,
     /// Immutable (WORM) table: no UPDATE/DELETE permitted.
     pub immutable: bool,
+    /// Every committing transaction that writes to this table appends an
+    /// entry to its commit hash chain, and VERIFY TABLE walks that chain.
+    ///
+    /// Held only while DELETE, UPDATE, TRUNCATE and a row-rewriting schema
+    /// change are refused on the table, because each of those changes a row
+    /// the chain already covered and the chain cannot tell such a change
+    /// from tampering. `immutable` refuses all four. Dropping the table is
+    /// not among them: the chain states what happened while the table
+    /// existed, and it goes when the table does
+    pub verified: bool,
+    /// The registered scheme the chain links its entries with, as the
+    /// signature scheme registry's numeric tag
+    pub chain_algorithm: u16,
+    /// One past the chain position of the genesis entry over the rows the
+    /// table held when it became verifiable, zero when the chain has none.
+    /// Recorded here because a commit can link ahead of the genesis on a
+    /// node that leads no group, so its position is not always the first
+    pub genesis_at: u64,
 }
 
 impl Default for LifecycleConfig {
@@ -1736,6 +1754,9 @@ impl Default for LifecycleConfig {
             data_key_id: 0,
             residency_region: String::new(),
             immutable: false,
+            verified: false,
+            chain_algorithm: 0,
+            genesis_at: 0,
         }
     }
 }
@@ -1766,6 +1787,9 @@ impl LifecycleConfig {
         write_u64(buf, self.data_key_id);
         write_string(buf, &self.residency_region);
         buf.push(if self.immutable { 1 } else { 0 });
+        buf.push(if self.verified { 1 } else { 0 });
+        write_u16(buf, self.chain_algorithm);
+        write_u64(buf, self.genesis_at);
     }
 
     fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
@@ -1791,6 +1815,9 @@ impl LifecycleConfig {
         c.data_key_id = read_u64(data, off)?;
         c.residency_region = read_string(data, off)?;
         c.immutable = read_u8(data, off)? != 0;
+        c.verified = read_u8(data, off)? != 0;
+        c.chain_algorithm = read_u16(data, off)?;
+        c.genesis_at = read_u64(data, off)?;
         Ok(c)
     }
 }
@@ -4912,44 +4939,30 @@ impl RetentionJobEntry {
     }
 }
 
-/// Tamper-evident compliance audit log entry. `entry_hash` chains over
-/// `prev_hash` so the log is verifiable.
+/// One compliance audit log entry.
+///
+/// The rows live in `zyron_sys.compliance.log`, which is immutable and
+/// verified, so the evidence that the log is whole is the table's commit
+/// chain rather than a field of the row. VERIFY TABLE walks that chain
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComplianceLogEntry {
     pub event_id: u64,
     /// 0 ttl, 1 archive, 2 restore, 3 legal_hold, 4 forget_user,
     /// 5 export_user, 6 classification, 7 tier_move, 8 retention_lock,
-    /// 9 crypto_shred, 10 purge, 11 undrop.
+    /// 9 crypto_shred, 10 purge, 11 undrop, 12 chain_anchored,
+    /// 13 table_verification_enabled, 14 verify_run.
     pub event_type: u8,
     pub subject: String,
     pub table_id: u32,
     pub ts: i64,
     pub detail: String,
-    pub prev_hash: u32,
-    pub entry_hash: u32,
-    /// Version tag of the entry encoding. The chain is immutable and
-    /// verified forever, so an entry records the version it was written at
-    /// and both versions verify after an upgrade
+    /// Version tag of the entry encoding. An entry is never rewritten, so
+    /// it records the version it was written at and every version it
+    /// carries decodes after an upgrade
     pub record_version: u8,
 }
 
 impl ComplianceLogEntry {
-    /// Computes the chained hash over the previous hash plus this entry's
-    /// content fields. Uses CRC32C (hardware-accelerated, present in
-    /// zyron-common).
-    pub fn compute_hash(&self) -> u32 {
-        let mut payload = Vec::with_capacity(64);
-        payload.extend_from_slice(&self.prev_hash.to_le_bytes());
-        payload.extend_from_slice(&self.event_id.to_le_bytes());
-        payload.push(self.event_type);
-        payload.extend_from_slice(self.subject.as_bytes());
-        payload.extend_from_slice(&self.table_id.to_le_bytes());
-        payload.extend_from_slice(&self.ts.to_le_bytes());
-        payload.extend_from_slice(self.detail.as_bytes());
-        payload.push(self.record_version);
-        zyron_common::hash32(&payload)
-    }
-
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         write_u64(&mut buf, self.event_id);
@@ -4958,8 +4971,6 @@ impl ComplianceLogEntry {
         write_u32(&mut buf, self.table_id);
         write_u64(&mut buf, self.ts as u64);
         write_string(&mut buf, &self.detail);
-        write_u32(&mut buf, self.prev_hash);
-        write_u32(&mut buf, self.entry_hash);
         write_u8(&mut buf, self.record_version);
         buf
     }
@@ -4973,8 +4984,6 @@ impl ComplianceLogEntry {
             table_id: read_u32(data, &mut off)?,
             ts: read_u64(data, &mut off)? as i64,
             detail: read_string(data, &mut off)?,
-            prev_hash: read_u32(data, &mut off)?,
-            entry_hash: read_u32(data, &mut off)?,
             record_version: read_u8(data, &mut off)?,
         })
     }

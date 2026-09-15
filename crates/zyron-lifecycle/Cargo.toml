@@ -12,6 +12,7 @@ zyron-parser = { path = "../zyron-parser" }
 zyron-auth = { path = "../zyron-auth" }
 zyron-streaming = { path = "../zyron-streaming" }
 serde.workspace = true
+sha2.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
